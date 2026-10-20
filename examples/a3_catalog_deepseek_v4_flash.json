@@ -1,0 +1,118 @@
+{
+  "name": "catalog-deepseek-v4-flash-0731",
+  "machine": {
+    "name": "declared-a3-64-die-catalog-topology",
+    "arch_family": "A3",
+    "dies_per_package": 2,
+    "num_devices": 64,
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 270336000000000.0,
+      "vector_ops_per_s": 16896000000000.0,
+      "hbm_bw_bytes_per_s": 1200000000000.0,
+      "mte_bw_bytes_per_s": 2400000000000.0,
+      "launch_us": 20.0
+    },
+    "compute_peaks": {
+      "bf16": 270336000000000.0,
+      "fp8_e4m3": 270336000000000.0
+    },
+    "links": [
+      {
+        "name": "d2d",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 196,
+        "latency_us": 2.5,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31,
+          32,
+          33,
+          34,
+          35,
+          36,
+          37,
+          38,
+          39,
+          40,
+          41,
+          42,
+          43,
+          44,
+          45,
+          46,
+          47,
+          48,
+          49,
+          50,
+          51,
+          52,
+          53,
+          54,
+          55,
+          56,
+          57,
+          58,
+          59,
+          60,
+          61,
+          62,
+          63
+        ]
+      }
+    ]
+  },
+  "model": {
+    "catalog_key": "DeepSeek-V4-Flash-0731"
+  },
+  "workload": {
+    "requests": [
+      {
+        "prompt_tokens": 4,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8,
+    "max_num_seqs": 64,
+    "max_model_len": 64,
+    "tp": 1,
+    "ep": 64,
+    "dp": 64,
+    "pp": 1,
+    "graph_buckets": [],
+    "graph_mode": "eager",
+    "moe_recipe": "alltoall"
+  }
+}

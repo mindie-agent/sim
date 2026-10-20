@@ -10,6 +10,10 @@
     lines are skipped and an empty info capture raises a stable error.
   * ``hbm_total_mib`` is evidence from npu-smi, not the platform .ini value.
   * A3 dual-die ``Chip ID``/``Phy-ID`` pairs remain distinct per device row.
+  * Multi-NPU common captures keep each chip with the NPU block that declared
+    it.  The MCU tail block never overwrites the last chip row.
+  * Directory discovery uses the table parsers on explicit direct ``*.txt``
+    children; it never recursively scans arbitrary paths or runs npu-smi.
 
 [Timeouts & Locks]
   Pure in-memory parsing.  File reads happen only in ``load_npu_smi_snapshot``
@@ -187,26 +191,37 @@ def parse_npu_smi_common(text: str, *, source: str = "<npu-smi-common>") -> tupl
     chips: list[NpuSmiChip] = []
     current: dict[str, str] | None = None
     npu_id = 0
+
+    def flush() -> None:
+        nonlocal current
+        if current is not None:
+            chips.append(_chip_from_fields(npu_id, current))
+            current = None
+
     for line in text.splitlines():
         stripped = line.strip()
         if ":" not in stripped:
             continue
         key, value = (part.strip() for part in stripped.split(":", 1))
         if key == "NPU ID":
+            # The previous NPU's last chip belongs to the previous NPU block.
+            flush()
             try:
                 npu_id = int(value)
             except ValueError:
                 npu_id = 0
             continue
         if key == "Chip ID":
-            if current is not None:
-                chips.append(_chip_from_fields(npu_id, current))
+            flush()
             current = {"Chip ID": value}
+            continue
+        if key == "Chip Name":
+            # The trailing MCU block is not a compute-chip field block.
+            flush()
             continue
         if current is not None:
             current[key] = value
-    if current is not None:
-        chips.append(_chip_from_fields(npu_id, current))
+    flush()
     if not chips:
         raise HardwareError("npu_smi_common_no_chips")
     return tuple(chips)
@@ -261,19 +276,59 @@ def parse_npu_smi_snapshot(
     return NpuSmiSnapshot(devices=info.devices, chips=chips, board=board, source=source)
 
 
+def _read_capture(path: Path) -> str:
+    return path.read_text(encoding="utf-8-sig", errors="replace")
+
+
+def _is_common_capture(text: str) -> bool:
+    try:
+        return bool(parse_npu_smi_common(text))
+    except HardwareError:
+        return False
+
+
+def _is_board_capture(text: str) -> bool:
+    return "Product Name" in text and "Chip Count" in text
+
+
+def _one(candidates: list[tuple[str, str]], role: str) -> str | None:
+    if len(candidates) > 1:
+        raise HardwareError(f"npu_smi_{role}_ambiguous")
+    return candidates[0][1] if candidates else None
+
+
 def load_npu_smi_snapshot(path: str | Path) -> NpuSmiSnapshot:
     root = Path(path).expanduser()
     if not root.exists():
         raise HardwareError("npu_smi_path_missing")
     if root.is_dir():
-        texts = {p.name: p.read_text(encoding="utf-8-sig", errors="replace") for p in root.glob("*.txt")}
-        info = next((text for name, text in texts.items() if "npu-smi" in text and _BUS_RE.search(text)), None)
-        common = next((text for name, text in texts.items() if "Chip ID" in text and "Aicore Freq" in text), None)
-        board = next((text for name, text in texts.items() if "Product Name" in text and "Chip Count" in text), None)
-        if info is None:
+        info_candidates: list[tuple[str, str]] = []
+        common_candidates: list[tuple[str, str]] = []
+        board_candidates: list[tuple[str, str]] = []
+        for candidate in sorted(root.glob("*.txt")):
+            text = _read_capture(candidate)
+            try:
+                parse_npu_smi_info(text)
+            except HardwareError:
+                pass
+            else:
+                info_candidates.append((candidate.name, text))
+                continue
+            if _is_common_capture(text):
+                common_candidates.append((candidate.name, text))
+                continue
+            if _is_board_capture(text):
+                board_candidates.append((candidate.name, text))
+        info_text = _one(info_candidates, "info")
+        if info_text is None:
             raise HardwareError("npu_smi_info_missing")
-        return parse_npu_smi_snapshot(info, common_text=common, board_text=board, source=str(root))
-    text = root.read_text(encoding="utf-8-sig", errors="replace")
+        return parse_npu_smi_snapshot(
+            info_text,
+            common_text=_one(common_candidates, "common"),
+            board_text=_one(board_candidates, "board"),
+            source=str(root),
+        )
+    text = _read_capture(root)
     if "Product Name" in text and "Chip Count" in text and "npu-smi" not in text:
         return NpuSmiSnapshot(devices=(), chips=(), board=parse_npu_smi_board(text), source=str(root))
     if "Chip ID" in text and "Aicore Freq" in text and "npu-smi" not in text:

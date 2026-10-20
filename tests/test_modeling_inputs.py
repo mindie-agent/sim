@@ -343,6 +343,7 @@ def test_generic_hardware_report_without_workload_does_not_inject_golden_thermal
     assert thermal["cube_reference_cycles"] is None
     assert thermal["clock_table"] == []
     assert thermal["gap_sensitivity"] == []
+    assert thermal["workload_origin"] is None
     assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
 

@@ -1,0 +1,160 @@
+{
+ "models": [
+  {
+   "model_key": "deepseek-v4-flash-0731",
+   "body_layers": 43,
+   "hidden_size": 4096,
+   "parameter_count": 284332227479.0,
+   "logical_body_weight_bytes": 155997029852.0,
+   "reference_placement": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1
+   },
+   "case": "cases/deepseek-v4-flash-0731.json",
+   "search": "cases/deepseek-v4-flash-0731.search.json",
+   "should_constraints": "cases/deepseek-v4-flash-0731.should.json",
+   "structure": "structure/deepseek-v4-flash-0731.json"
+  },
+  {
+   "model_key": "deepseek-v4-pro-0813",
+   "body_layers": 61,
+   "hidden_size": 7168,
+   "parameter_count": 1572997171683.0,
+   "logical_body_weight_bytes": 850729468364.0,
+   "reference_placement": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1
+   },
+   "case": "cases/deepseek-v4-pro-0813.json",
+   "search": "cases/deepseek-v4-pro-0813.search.json",
+   "should_constraints": "cases/deepseek-v4-pro-0813.should.json",
+   "structure": "structure/deepseek-v4-pro-0813.json"
+  },
+  {
+   "model_key": "deepseek-v4-10t",
+   "body_layers": 61,
+   "hidden_size": 7168,
+   "parameter_count": 1572997171683.0,
+   "logical_body_weight_bytes": 850729468364.0,
+   "reference_placement": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1
+   },
+   "case": "cases/deepseek-v4-10t.json",
+   "search": "cases/deepseek-v4-10t.search.json",
+   "should_constraints": "cases/deepseek-v4-10t.should.json",
+   "structure": "structure/deepseek-v4-10t.json"
+  },
+  {
+   "model_key": "deepseek-v4.1-flash",
+   "body_layers": 40,
+   "hidden_size": 5120,
+   "parameter_count": 748980291701.0,
+   "logical_body_weight_bytes": 693169312212.0,
+   "reference_placement": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 4
+   },
+   "case": "cases/deepseek-v4.1-flash.json",
+   "search": "cases/deepseek-v4.1-flash.search.json",
+   "should_constraints": "cases/deepseek-v4.1-flash.should.json",
+   "structure": "structure/deepseek-v4.1-flash.json"
+  },
+  {
+   "model_key": "glm-5.3",
+   "body_layers": 78,
+   "hidden_size": 6144,
+   "parameter_count": 743377000704.0,
+   "logical_body_weight_bytes": 745584430656.0,
+   "reference_placement": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 2
+   },
+   "case": "cases/glm-5.3.json",
+   "search": "cases/glm-5.3.search.json",
+   "should_constraints": "cases/glm-5.3.should.json",
+   "structure": "structure/glm-5.3.json"
+  },
+  {
+   "model_key": "kimi-k3",
+   "body_layers": 93,
+   "hidden_size": 7168,
+   "parameter_count": 2779931776256.0,
+   "logical_body_weight_bytes": 1560860038144.0,
+   "reference_placement": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 3
+   },
+   "case": "cases/kimi-k3.json",
+   "search": "cases/kimi-k3.search.json",
+   "should_constraints": "cases/kimi-k3.should.json",
+   "structure": "structure/kimi-k3.json"
+  },
+  {
+   "model_key": "kimi-k3-dspark",
+   "body_layers": 5,
+   "hidden_size": 7168,
+   "parameter_count": 2249289344.0,
+   "logical_body_weight_bytes": 4498578688.0,
+   "reference_placement": {
+    "tp": 1,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1
+   },
+   "case": "cases/kimi-k3-dspark.json",
+   "search": "cases/kimi-k3-dspark.search.json",
+   "should_constraints": "cases/kimi-k3-dspark.should.json",
+   "structure": "structure/kimi-k3-dspark.json"
+  },
+  {
+   "model_key": "qwen3.8-2.4t-a95b",
+   "body_layers": 92,
+   "hidden_size": 8192,
+   "parameter_count": 2419804706816.0,
+   "logical_body_weight_bytes": 4839609413632.0,
+   "reference_placement": {
+    "tp": 32,
+    "dp": 1,
+    "ep": 32,
+    "pp": 4
+   },
+   "case": "cases/qwen3.8-2.4t-a95b.json",
+   "search": "cases/qwen3.8-2.4t-a95b.search.json",
+   "should_constraints": "cases/qwen3.8-2.4t-a95b.should.json",
+   "structure": "structure/qwen3.8-2.4t-a95b.json"
+  },
+  {
+   "model_key": "qwen3.8-27b",
+   "body_layers": 64,
+   "hidden_size": 5120,
+   "parameter_count": 27356486400.0,
+   "logical_body_weight_bytes": 54712972800.0,
+   "reference_placement": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1
+   },
+   "case": "cases/qwen3.8-27b.json",
+   "search": "cases/qwen3.8-27b.search.json",
+   "should_constraints": "cases/qwen3.8-27b.should.json",
+   "structure": "structure/qwen3.8-27b.json"
+  }
+ ],
+ "extra_cases": [
+  "cases/qwen3.8-27b-media.json"
+ ]
+}

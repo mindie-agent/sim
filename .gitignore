@@ -6,3 +6,15 @@ dist/
 *.egg-info/
 *.xml
 .mindie-local/
+/build/
+/.ruff_cache/
+
+# Rebuild campaign outputs from the checked-in campaign configuration.
+/examples/operator-campaign/manifest.json
+/examples/operator-campaign/conditions.json
+/examples/operator-campaign/inventory.json
+/examples/operator-campaign/unmeasured.json
+/examples/operator-campaign/coverage.md
+/examples/operator-campaign/results/dry-run-sample.json
+/examples/operator-campaign/analysis-dry-run/
+/examples/operator-attention/integration.patch

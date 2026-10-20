@@ -1,0 +1,55 @@
+{
+  "name": "a3-real-hardware-declared-model",
+  "machine": {
+    "name": "real-measurement-Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "arch_family": "A3",
+    "dies_per_package": 2,
+    "num_devices": 1,
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 2.70336e14,
+      "vector_ops_per_s": 1.6896e13,
+      "hbm_bw_bytes_per_s": 1.2e12,
+      "mte_bw_bytes_per_s": 2.4e12,
+      "launch_us": 20.0,
+      "l2_bytes": 201326592
+    },
+    "compute_peaks": {"bf16": 2.70336e14, "fp16": 2.70336e14},
+    "links": [{"name": "d2d", "channel": "d2d_intra_node", "capacity_gbps": 196, "latency_us": 2.5, "members": [0]}]
+  },
+  "model": {
+    "name": "real-hardware-probe-model",
+    "architecture": "gqa",
+    "layers": 2,
+    "hidden_size": 4096,
+    "num_heads": 32,
+    "num_kv_heads": 8,
+    "head_dim": 128,
+    "intermediate_size": 4096,
+    "vocab_size": 32000,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "compute_dtype": "bf16"
+  },
+  "workload": {
+    "requests": [{"id": "probe", "prompt_tokens": 128, "output_tokens": 2}]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 2048,
+    "max_num_seqs": 4,
+    "max_model_len": 4096,
+    "enable_chunked_prefill": true,
+    "kv_block_size": 128,
+    "gpu_memory_utilization": 0.9,
+    "tp": 1,
+    "ep": 1,
+    "dp": 1,
+    "pp": 1,
+    "graph_buckets": [16],
+    "graph_mode": "auto",
+    "moe_recipe": "auto"
+  },
+  "slo": {"ttft_ms": 60000, "tpot_ms": 6000, "e2e_ms": 180000}
+}

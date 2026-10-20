@@ -44,6 +44,7 @@ from .hardware_common import (
     A5_CANN_SIM_LINK_CEILINGS_BPC,
     SUSTAINED_MHZ_RANGE,
     HardwareError,
+    _finite,
     _float_value,
     _int_value,
 )
@@ -79,6 +80,21 @@ _FAMILY_DEFAULT_OPS_PER_CYCLE: dict[str, dict[str, int]] = {
     "A2": {"int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
     "A3": {"int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
     "A5": {"fp8_e4m3": 16384, "fp8_e5m2": 16384, "int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
+}
+
+# Dtype spelling aliases only.  They all resolve inside the one canonical
+# ``ops_per_cycle_per_aic`` map; there is no alternate capability source.
+_CUBE_DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "fp8": ("fp8", "fp8_e4m3", "fp8_e5m2"),
+    "fp8_e4m3": ("fp8_e4m3", "fp8"),
+    "fp8_e5m2": ("fp8_e5m2", "fp8"),
+    "bf16": ("bf16", "bfloat16"),
+    "bfloat16": ("bfloat16", "bf16"),
+    "fp16": ("fp16", "float16"),
+    "float16": ("float16", "fp16"),
+    "fp32": ("fp32", "float32"),
+    "float32": ("float32", "fp32"),
+    "int8": ("int8",),
 }
 
 _A2_A3_LINK_CEILINGS_BPC: dict[str, float] = {
@@ -186,13 +202,31 @@ class CubeSpec:
     l0a_kib: float
     l0b_kib: float
     l0c_kib: float
-    throughput: Mapping[str, float] = field(default_factory=dict)
+
+    def ops_per_cycle_per_die(self, dtype: str) -> float | None:
+        """Total per-die Cube ops/cycle for ``dtype``, or ``None`` if undeclared.
+
+        The stored map is per-AIC; this accessor is the single unit-explicit
+        normalization shared by hardware/thermal and A3.  Dtype spelling
+        aliases resolve within the same map.  A missing or non-positive entry
+        returns ``None`` rather than borrowing another architecture's peak.
+        """
+        if self.aic_count_per_die is None or int(self.aic_count_per_die) <= 0:
+            return None
+        key = str(dtype).strip().lower()
+        for candidate in _CUBE_DTYPE_ALIASES.get(key, (key,)):
+            raw = self.ops_per_cycle_per_aic.get(candidate)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            if not _finite(raw) or float(raw) <= 0:
+                continue
+            return float(raw) * float(self.aic_count_per_die)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "aic_count_per_die": self.aic_count_per_die,
             "ops_per_cycle_per_aic": dict(sorted(self.ops_per_cycle_per_aic.items())),
-            "throughput": dict(sorted(self.throughput.items())),
             "l1_kib": self.l1_kib,
             "l0a_kib": self.l0a_kib,
             "l0b_kib": self.l0b_kib,
@@ -564,10 +598,6 @@ def resolve_device_capability_profile(
     ops_map = dict(_FAMILY_DEFAULT_OPS_PER_CYCLE.get(family, _FAMILY_DEFAULT_OPS_PER_CYCLE["A5"]))
     if isinstance(cube_override.get("ops_per_cycle_per_aic"), Mapping):
         ops_map.update({str(k): int(v) for k, v in cube_override["ops_per_cycle_per_aic"].items()})
-    cube_throughput = (
-        {str(k): float(v) for k, v in cube_override["throughput"].items()}
-        if isinstance(cube_override.get("throughput"), Mapping) else {}
-    )
     intra_pkg_bw = (
         float(mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
         if (mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
@@ -606,7 +636,6 @@ def resolve_device_capability_profile(
             l0a_kib=float(cube_override.get("l0a_kib") or (config.l0_a_kib if config is not None else common_buf["l0a_kib"])),
             l0b_kib=float(cube_override.get("l0b_kib") or (config.l0_b_kib if config is not None else common_buf["l0b_kib"])),
             l0c_kib=float(cube_override.get("l0c_kib") or (config.l0_c_kib if config is not None else common_buf["l0c_kib"])),
-            throughput=cube_throughput,
         ),
         vector_spec=VectorSpec(
             aiv_count_per_die=resolved_aiv,

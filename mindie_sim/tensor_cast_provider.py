@@ -57,8 +57,6 @@ from .theoretical_model import (
 
 PINNED_MSMODELING_COMMIT = "1adde03a04264fa976893fdf50495270175043e6"
 PROVIDER_NAME = "msmodeling.tensor_cast.analytic"
-PROBE_SCHEMA = "mindie-profiler-provider-probe/1"
-ACCEPTANCE_SCHEMA = "mindie-profiler-provider-acceptance/1"
 GIT_TIMEOUT_S = 10.0
 GIT_MAX_BYTES = 1_048_576
 
@@ -161,10 +159,11 @@ class TensorCastProviderStatus:
     imported: bool
     verified: bool
     reason: str
+    semantic_contract: bool = False
+    strict_pinned_commit: bool = False
 
     def as_dict(self) -> dict[str, Any]:
         return {
-            "schema_version": PROBE_SCHEMA,
             "source_path": self.source_path,
             "source_present": self.source_present,
             "declared_version": self.declared_version,
@@ -178,16 +177,20 @@ class TensorCastProviderStatus:
             "imported": self.imported,
             "verified": self.verified,
             "reason": self.reason,
+            "semantic_contract": self.semantic_contract,
+            "strict_pinned_commit": self.strict_pinned_commit,
+            "revision_is_metadata_only": not self.strict_pinned_commit,
         }
 
 
 def probe_tensor_cast_provider(
     source_path: str | Path | None = None,
     *,
-    expected_commit: str = PINNED_MSMODELING_COMMIT,
+    expected_commit: str | None = None,
+    require_pinned_commit: bool = False,
 ) -> TensorCastProviderStatus:
-    """Validate explicit source identity and cleanliness without importing it."""
-    expected = expected_commit.strip().lower()
+    """Probe semantic compatibility; commit/cleanliness are optional metadata."""
+    expected = expected_commit.strip().lower() if expected_commit else ""
     if source_path is None:
         return TensorCastProviderStatus(
             source_path="",
@@ -203,9 +206,16 @@ def probe_tensor_cast_provider(
             imported=False,
             verified=False,
             reason="source_path_not_configured",
+            semantic_contract=False,
+            strict_pinned_commit=require_pinned_commit,
         )
     source = Path(source_path).expanduser().resolve()
-    present = (source / "tensor_cast" / "performance_model" / "analytic.py").is_file()
+    analytic = source / "tensor_cast" / "performance_model" / "analytic.py"
+    device = source / "tensor_cast" / "device.py"
+    present = analytic.is_file()
+    semantic_contract = present and device.is_file() and "AnalyticPerformanceModel" in analytic.read_text(
+        encoding="utf-8", errors="replace"
+    )
     version: str | None = None
     commit: str | None = None
     status_lines: list[str] | None = None
@@ -223,23 +233,25 @@ def probe_tensor_cast_provider(
                 status_lines = read_source_status(source)
             except ProviderUnmodeledError:
                 status_lines = None
-    matches = bool(commit and commit == expected)
+    matches = bool(commit and expected and commit == expected)
     if not present:
         reason = "source_missing"
+    elif not semantic_contract:
+        reason = "source_semantic_contract_missing"
     elif version is None:
         reason = "source_version_unreadable"
-    elif commit is None:
-        reason = "source_git_commit_unreadable"
-    elif not matches:
+    elif require_pinned_commit and not matches:
         reason = "source_commit_mismatch"
-    elif status_lines is None:
-        reason = "source_git_status_unavailable"
-    elif status_lines:
-        reason = "source_dirty"
     else:
-        reason = "source_commit_verified_clean_probe_only"
-    success = reason == "source_commit_verified_clean_probe_only"
-    provider_version = f"{version}+{commit}" if success else None
+        reason = (
+            "source_commit_verified_clean_probe_only"
+            if require_pinned_commit and status_lines == []
+            else "source_semantic_probe_ok"
+        )
+    success = reason in {"source_semantic_probe_ok", "source_commit_verified_clean_probe_only"}
+    provider_version = (
+        (f"{version}+{commit}" if commit else version) if success and version else None
+    )
     return TensorCastProviderStatus(
         source_path=str(source),
         source_present=present,
@@ -254,6 +266,8 @@ def probe_tensor_cast_provider(
         imported=False,
         verified=False,
         reason=reason,
+        semantic_contract=semantic_contract,
+        strict_pinned_commit=require_pinned_commit,
     )
 
 
@@ -265,13 +279,15 @@ class TensorCastAnalyticProvider:
         source_path: str | Path | None = None,
         *,
         device_name: str,
-        expected_commit: str = PINNED_MSMODELING_COMMIT,
+        expected_commit: str | None = None,
+        require_pinned_commit: bool = False,
         rms_norm_eps: float = 1e-6,
     ) -> None:
         if source_path is None:
             raise ProviderUnmodeledError("source_path_not_configured")
         self._source_path = Path(source_path).expanduser().resolve()
-        self._expected_commit = expected_commit.strip().lower()
+        self._expected_commit = expected_commit.strip().lower() if expected_commit else ""
+        self._require_pinned_commit = bool(require_pinned_commit)
         self._device_name = str(device_name)
         self._rms_norm_eps = float(rms_norm_eps)
         self._available = False
@@ -367,8 +383,12 @@ class TensorCastAnalyticProvider:
         }
 
     def _load(self) -> None:
-        status = probe_tensor_cast_provider(self._source_path, expected_commit=self._expected_commit)
-        if status.reason != "source_commit_verified_clean_probe_only":
+        status = probe_tensor_cast_provider(
+            self._source_path,
+            expected_commit=self._expected_commit or None,
+            require_pinned_commit=self._require_pinned_commit,
+        )
+        if status.reason not in {"source_semantic_probe_ok", "source_commit_verified_clean_probe_only"}:
             raise ProviderUnmodeledError(status.reason)
         if status.declared_version is None or status.commit is None:
             raise ProviderUnmodeledError("source_identity_incomplete")
@@ -514,7 +534,7 @@ class TensorCastAnalyticProvider:
         raw_ops = self._device.mma_ops if category == "mma" else self._device.gp_ops
         selected_peak = raw_ops.get(self._torch_dtype(str(request.inputs.dtype)))
         evidence = [
-            f"msmodeling_source:{self._source_path}@{self._commit}",
+            f"msmodeling_source:{self._source_path}@{self._commit or 'revision_metadata_unset'}",
             f"msmodeling_version:{self._source_version}",
             f"device_profile:{self._device.name}",
             "device_profile_mapping:caller_explicit_unverified",
@@ -594,7 +614,6 @@ def main(argv: Sequence[str] | None = None) -> int:
             provider,
         )
         payload = {
-            "schema_version": ACCEPTANCE_SCHEMA,
             "probe": probe.as_dict(),
             "provider": provider.status(),
             "inputs": inputs.canonical_payload(),
@@ -607,7 +626,6 @@ def main(argv: Sequence[str] | None = None) -> int:
         if probe is None:
             probe = probe_tensor_cast_provider(args.source)
         payload = {
-            "schema_version": ACCEPTANCE_SCHEMA,
             "probe": probe.as_dict(),
             "inputs": {
                 "shape": args.shape,
@@ -642,8 +660,6 @@ if __name__ == "__main__":
 __all__ = [
     "PINNED_MSMODELING_COMMIT",
     "PROVIDER_NAME",
-    "PROBE_SCHEMA",
-    "ACCEPTANCE_SCHEMA",
     "TensorCastProviderStatus",
     "TensorCastAnalyticProvider",
     "read_source_commit",

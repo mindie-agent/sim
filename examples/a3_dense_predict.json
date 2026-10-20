@@ -1,0 +1,61 @@
+{
+  "name": "a3-dense-4L-gqa",
+  "source": "declared-example; not an A3 measurement",
+  "machine": {
+    "name": "a3-8-die-declared",
+    "arch_family": "A3",
+    "dies_per_package": 2,
+    "num_devices": 8,
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 3.6e14,
+      "vector_ops_per_s": 3.0e13,
+      "hbm_bw_bytes_per_s": 1.6e12,
+      "mte_bw_bytes_per_s": 3.2e12,
+      "launch_us": 20.0,
+      "l2_bytes": 201326592
+    },
+    "compute_peaks": {"bf16": 3.6e14, "fp16": 3.6e14},
+    "links": [
+      {"name": "d2d", "channel": "d2d_intra_node", "capacity_gbps": 196, "latency_us": 2.5, "members": [0,1,2,3,4,5,6,7]}
+    ]
+  },
+  "model": {
+    "name": "dense-gqa-example",
+    "architecture": "gqa",
+    "layers": 4,
+    "hidden_size": 512,
+    "num_heads": 8,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "intermediate_size": 2048,
+    "vocab_size": 32000,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "compute_dtype": "bf16"
+  },
+  "workload": {
+    "requests": [
+      {"id": "short-a", "prompt_tokens": 512, "output_tokens": 8},
+      {"id": "long-b", "prompt_tokens": 4096, "output_tokens": 4}
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "max_model_len": 16384,
+    "enable_chunked_prefill": true,
+    "kv_block_size": 128,
+    "gpu_memory_utilization": 0.9,
+    "tp": 2,
+    "ep": 1,
+    "dp": 1,
+    "pp": 1,
+    "graph_buckets": [16, 32],
+    "graph_mode": "auto",
+    "moe_recipe": "auto"
+  },
+  "slo": {"ttft_ms": 60000, "tpot_ms": 6000, "e2e_ms": 180000},
+  "metadata": {"revision": "example-r1", "note": "declared values only"}
+}

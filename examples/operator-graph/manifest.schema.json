@@ -1,0 +1,430 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindie-agent.example/schemas/mindie-sim-a3-operator-graph-manifest",
+  "title": "MindIE Sim A3 operator-graph timing manifest",
+  "description": "Versioned manifest for the isolated A3 native-operator eager/graph timing lane. N is a declared API invocation count, not a hardware kernel count. RMSNorm/SwiGLU use only installed default outputs; no .out overload exists.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "manifest_id",
+    "protocol",
+    "expectations",
+    "cases"
+  ],
+  "properties": {
+    "kind": {
+      "const": "a3_operator_graph_manifest"
+    },
+    "manifest_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "description": {
+      "type": "string",
+      "maxLength": 4096
+    },
+    "protocol": {
+      "$ref": "#/$defs/protocol"
+    },
+    "expectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_conditions",
+        "raw_blocks"
+      ],
+      "properties": {
+        "protocol_conditions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "raw_blocks": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup_iterations",
+        "trials",
+        "samples_per_condition",
+        "seed",
+        "reference",
+        "budgets_seconds"
+      ],
+      "properties": {
+        "warmup_iterations": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "trials": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 100
+        },
+        "samples_per_condition": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 1000
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 9223372036854775807
+        },
+        "reference": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "rtol",
+            "atol",
+            "rstd_rtol",
+            "rstd_atol"
+          ],
+          "properties": {
+            "rtol": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.25
+            },
+            "atol": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.25
+            },
+            "rstd_rtol": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.25
+            },
+            "rstd_atol": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 0.25
+            }
+          }
+        },
+        "budgets_seconds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "case",
+            "global_work",
+            "setup",
+            "cleanup"
+          ],
+          "properties": {
+            "case": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 24
+            },
+            "global_work": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1200
+            },
+            "setup": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 60
+            },
+            "cleanup": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 120
+            }
+          }
+        }
+      }
+    },
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "operator",
+        "dtype",
+        "layout",
+        "shape",
+        "ns",
+        "modes",
+        "data"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "operator": {
+          "enum": [
+            "rms_norm",
+            "swiglu",
+            "copy"
+          ]
+        },
+        "dtype": {
+          "enum": [
+            "bfloat16",
+            "uint8"
+          ]
+        },
+        "layout": {
+          "const": "contiguous"
+        },
+        "shape": {
+          "type": "object"
+        },
+        "epsilon": {
+          "const": 1e-06
+        },
+        "ns": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              1,
+              32,
+              128
+            ]
+          }
+        },
+        "modes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "eager_block",
+              "graph_single_repeated",
+              "graph_block"
+            ]
+          }
+        },
+        "data": {
+          "type": "object"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "rms_norm"
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "required": [
+              "epsilon"
+            ],
+            "properties": {
+              "dtype": {
+                "const": "bfloat16"
+              },
+              "epsilon": {
+                "const": 1e-06
+              },
+              "shape": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tokens",
+                  "hidden"
+                ],
+                "properties": {
+                  "tokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "hidden": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              },
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "seed",
+                  "input_low",
+                  "input_high",
+                  "gamma_low",
+                  "gamma_high"
+                ],
+                "properties": {
+                  "seed": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "input_low": {
+                    "type": "number"
+                  },
+                  "input_high": {
+                    "type": "number"
+                  },
+                  "gamma_low": {
+                    "type": "number"
+                  },
+                  "gamma_high": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "swiglu"
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "properties": {
+              "dtype": {
+                "const": "bfloat16"
+              },
+              "shape": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "tokens",
+                  "ffn"
+                ],
+                "properties": {
+                  "tokens": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "ffn": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              },
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "seed",
+                  "input_low",
+                  "input_high"
+                ],
+                "properties": {
+                  "seed": {
+                    "type": "integer",
+                    "minimum": 0
+                  },
+                  "input_low": {
+                    "type": "number"
+                  },
+                  "input_high": {
+                    "type": "number"
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "copy"
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "properties": {
+              "dtype": {
+                "const": "uint8"
+              },
+              "shape": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "rows",
+                  "row_bytes"
+                ],
+                "properties": {
+                  "rows": {
+                    "type": "integer",
+                    "minimum": 1
+                  },
+                  "row_bytes": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              },
+              "data": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "seed"
+                ],
+                "properties": {
+                  "seed": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "enum": [
+                  "swiglu",
+                  "copy"
+                ]
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "not": {
+              "required": [
+                "epsilon"
+              ]
+            }
+          }
+        }
+      ]
+    }
+  }
+}

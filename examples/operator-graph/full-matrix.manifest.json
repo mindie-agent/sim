@@ -1,0 +1,181 @@
+{
+  "kind": "a3_operator_graph_manifest",
+  "manifest_id": "a3-native-operator-graph-full-matrix-v1",
+  "description": "Predeclared full train-side capability matrix: RMSNorm BF16 (T8,H5120) and (T512,H5120); SwiGLU BF16 (T8,F2048) and (T512,F2048) with packed [T,2F] input; uint8 contiguous copy (rows8,row_bytes1024) and (rows512,row_bytes1024). Each shape uses N=1/32/128 and eager_block / graph_single_repeated / graph_block, giving 54 protocol conditions, 2 trials x 30 samples (3240 raw blocks). These are train-side shapes, not heldout or mixed measurements.",
+  "protocol": {
+    "warmup_iterations": 10,
+    "trials": 2,
+    "samples_per_condition": 30,
+    "seed": 20261021,
+    "reference": {
+      "rtol": 0.02,
+      "atol": 0.02,
+      "rstd_rtol": 0.02,
+      "rstd_atol": 0.02
+    },
+    "budgets_seconds": {
+      "case": 24,
+      "global_work": 1200,
+      "setup": 60,
+      "cleanup": 120
+    }
+  },
+  "expectations": {
+    "protocol_conditions": 54,
+    "raw_blocks": 3240
+  },
+  "cases": [
+    {
+      "case_id": "rmsnorm-bf16-t8-h5120",
+      "operator": "rms_norm",
+      "dtype": "bfloat16",
+      "layout": "contiguous",
+      "shape": {
+        "tokens": 8,
+        "hidden": 5120
+      },
+      "epsilon": 1e-06,
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 1101,
+        "input_low": -1.0,
+        "input_high": 1.0,
+        "gamma_low": 0.5,
+        "gamma_high": 1.5
+      }
+    },
+    {
+      "case_id": "rmsnorm-bf16-t512-h5120",
+      "operator": "rms_norm",
+      "dtype": "bfloat16",
+      "layout": "contiguous",
+      "shape": {
+        "tokens": 512,
+        "hidden": 5120
+      },
+      "epsilon": 1e-06,
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 1102,
+        "input_low": -1.0,
+        "input_high": 1.0,
+        "gamma_low": 0.5,
+        "gamma_high": 1.5
+      }
+    },
+    {
+      "case_id": "swiglu-bf16-t8-f2048",
+      "operator": "swiglu",
+      "dtype": "bfloat16",
+      "layout": "contiguous",
+      "shape": {
+        "tokens": 8,
+        "ffn": 2048
+      },
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 2101,
+        "input_low": -1.5,
+        "input_high": 1.5
+      }
+    },
+    {
+      "case_id": "swiglu-bf16-t512-f2048",
+      "operator": "swiglu",
+      "dtype": "bfloat16",
+      "layout": "contiguous",
+      "shape": {
+        "tokens": 512,
+        "ffn": 2048
+      },
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 2102,
+        "input_low": -1.5,
+        "input_high": 1.5
+      }
+    },
+    {
+      "case_id": "copy-uint8-rows8-row-bytes1024",
+      "operator": "copy",
+      "dtype": "uint8",
+      "layout": "contiguous",
+      "shape": {
+        "rows": 8,
+        "row_bytes": 1024
+      },
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 3101
+      }
+    },
+    {
+      "case_id": "copy-uint8-rows512-row-bytes1024",
+      "operator": "copy",
+      "dtype": "uint8",
+      "layout": "contiguous",
+      "shape": {
+        "rows": 512,
+        "row_bytes": 1024
+      },
+      "ns": [
+        1,
+        32,
+        128
+      ],
+      "modes": [
+        "eager_block",
+        "graph_single_repeated",
+        "graph_block"
+      ],
+      "data": {
+        "seed": 3102
+      }
+    }
+  ]
+}
