@@ -313,7 +313,7 @@ def test_cube_reference_cycles_and_sustained_reference_lower_bounds():
     for mhz, value in expected.items():
         assert hw.reference_time_us(cycles, mhz) == pytest.approx(value, rel=1e-12)
 
-    thermal = hw.thermal_bounds()
+    thermal = hw.thermal_bounds(**hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD)
     assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
     required = thermal["required_mhz_for_target"]
@@ -322,6 +322,50 @@ def test_cube_reference_cycles_and_sustained_reference_lower_bounds():
     assert required["wall_mhz"] == pytest.approx(1618.1260714285713, rel=1e-12)
     assert thermal["sustained_reference_us"][0] > 350.0
     assert thermal["short_burst_reference_us"][0] < 300.0
+
+
+def test_thermal_bounds_without_workload_or_cycles_is_unmodeled():
+    thermal = hw.thermal_bounds()
+    assert thermal["status"] == "unmodeled"
+    assert thermal["unmodeled_reason"] == "missing_workload_or_cycle_inputs"
+    assert thermal["cube_reference_cycles"] is None
+    assert thermal["clock_table"] == []
+    assert thermal["gap_sensitivity"] == []
+    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
+
+    reference_only = hw.thermal_bounds(
+        fp8_flops=hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD["fp8_flops"],
+        bf16_flops=hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD["bf16_flops"],
+    )
+    assert reference_only["status"] == "partial_reference_only"
+    assert reference_only["cube_reference_cycles"] == pytest.approx(442918.5024, rel=1e-12)
+    assert reference_only["clock_table"]
+    assert all(row["wall_us"] is None for row in reference_only["clock_table"])
+    assert all(row["counted_us"] is None for row in reference_only["clock_table"])
+    assert reference_only["gap_sensitivity"] == []
+
+    full = hw.thermal_bounds(**hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD)
+    assert full["status"] == "ok"
+    assert full["cube_reference_cycles"] is not None
+    assert full["gap_sensitivity"]
+    assert full["clock_table"][0]["wall_us"] is not None
+    assert full["clock_table"][0]["counted_us"] is not None
+
+
+def test_a2_fp8_workload_is_unmodeled_instead_of_borrowing_a5_peak():
+    config = hw.parse_platform_ini(FIXTURES / "Ascend910B4.ini")
+    fp8_report = hw.hardware_report(config=config, fp8_flops=1e9)
+    thermal = fp8_report["thermal"]
+    assert thermal["status"] == "unmodeled"
+    assert thermal["unmodeled_reason"] == "unsupported_dtype_or_missing_sku_cube_throughput"
+    assert thermal["cube_reference_cycles"] is None
+
+    bf16_report = hw.hardware_report(config=config, bf16_flops=12884901888.0)
+    assert bf16_report["thermal"]["status"] in {"partial_reference_only", "ok"}
+    assert bf16_report["thermal"]["cube_reference_cycles"] == pytest.approx(
+        12884901888.0 / (20 * 8192), rel=1e-12
+    )
 
 
 def test_gap_elimination_sensitivity_matrix_is_reproducible():

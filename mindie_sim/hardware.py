@@ -15,7 +15,8 @@
     overlap, overflow and misalignment are diagnostics, never silently fixed.
   * Thermal reference times use caller-supplied peaks/frequencies and are lower
     bounds, not measured sustained performance.  Short-burst clocks never
-    replace sustained clocks.
+    replace sustained clocks.  Cube peaks come from the resolved SKU profile;
+    an unsupported dtype is ``unmodeled`` rather than borrowing A5 peaks.
   * The (W-C) sensitivity table is reproducible arithmetic, not a promise that
     the gap is removable.
 
@@ -30,8 +31,7 @@ from __future__ import annotations
 
 import configparser
 import json
-import re
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -64,6 +64,16 @@ from .hardware_common import (
     align_up,
     default_link_ceilings,
 )
+from .hardware_probe import (
+    NpuSmiChip,
+    NpuSmiDevice,
+    NpuSmiSnapshot,
+    load_npu_smi_snapshot,
+    parse_npu_smi_board,
+    parse_npu_smi_common,
+    parse_npu_smi_info,
+    parse_npu_smi_snapshot,
+)
 from .sku_profile import (
     AMBIGUOUS_SKU_REASON,
     BUILTIN_SKU_CATALOG,
@@ -78,12 +88,14 @@ from .sku_profile import (
     resolve_device_capability_profile,
 )
 from .thermal import (
+    A5_FLASHMLA_C8_GOLDEN_WORKLOAD,
     cube_reference_cycles,
     cycles_to_us,
     link_reference_bounds,
     reference_time_us,
     sensitivity_matrix,
     thermal_bounds,
+    unmodeled_thermal_bounds,
 )
 
 SCHEMA_VERSION = "mindie-sim-hardware/1"
@@ -238,259 +250,6 @@ def parse_platform_ini_text(text: str, *, source: str = "<text>") -> PlatformCon
     )
 
 
-@dataclass(frozen=True)
-class NpuSmiDevice:
-    npu_id: int
-    chip_id: int
-    phy_id: int | None
-    name: str
-    health: str | None
-    power_w: float | None
-    temp_c: float | None
-    aicore_pct: float | None
-    memory_used_mib: int | None
-    memory_total_mib: int | None
-    hbm_used_mib: int | None
-    hbm_total_mib: int | None
-    bus_id: str | None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class NpuSmiChip:
-    npu_id: int
-    chip_id: int
-    hbm_usage_rate_pct: float | None
-    aicore_freq_mhz: float | None
-    aicore_current_freq_mhz: float | None
-    aicore_count: int | None
-    temp_c: float | None
-    power_w: float | None
-
-    def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
-
-
-@dataclass(frozen=True)
-class NpuSmiSnapshot:
-    devices: tuple[NpuSmiDevice, ...]
-    chips: tuple[NpuSmiChip, ...]
-    board: Mapping[str, str]
-    source: str = "<text>"
-
-    @property
-    def chip_count(self) -> int:
-        raw = self.board.get("Chip Count", "")
-        try:
-            return int(raw)
-        except (TypeError, ValueError):
-            return max((device.chip_id for device in self.devices), default=-1) + 1
-
-    @property
-    def dual_die(self) -> bool:
-        return self.chip_count > 1
-
-    @property
-    def phy_ids(self) -> tuple[int, ...]:
-        return tuple(sorted({d.phy_id for d in self.devices if d.phy_id is not None}))
-
-    @property
-    def hbm_totals_mib(self) -> tuple[int, ...]:
-        return tuple(sorted({d.hbm_total_mib for d in self.devices if d.hbm_total_mib}))
-
-    @property
-    def min_hbm_mib(self) -> float | None:
-        values = self.hbm_totals_mib
-        return float(min(values)) if values else None
-
-    @property
-    def max_hbm_mib(self) -> float | None:
-        values = self.hbm_totals_mib
-        return float(max(values)) if values else None
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "source": self.source,
-            "chip_count": self.chip_count,
-            "dual_die": self.dual_die,
-            "phy_ids": list(self.phy_ids),
-            "verified_runtime_hbm_mib": self.min_hbm_mib,
-            "verified_runtime_hbm_mib_max": self.max_hbm_mib,
-            "devices": [device.to_dict() for device in self.devices],
-            "chips": [chip.to_dict() for chip in self.chips],
-            "board": dict(sorted(self.board.items())),
-        }
-
-
-_BUS_RE = re.compile(r"^[0-9A-Fa-f]{4}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.")
-_PAIR_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
-
-
-def _number(text: str | None) -> float | None:
-    if text is None:
-        return None
-    try:
-        return float(text.strip())
-    except ValueError:
-        return None
-
-
-def parse_npu_smi_info(text: str, *, source: str = "<npu-smi-info>") -> NpuSmiSnapshot:
-    devices: list[NpuSmiDevice] = []
-    pending: tuple[int, str, str | None, float | None, float | None] | None = None
-    for line in text.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("|"):
-            continue
-        cells = [cell.strip() for cell in stripped.strip("|").split("|")]
-        if len(cells) < 3:
-            continue
-        first = cells[0].split()
-        if not first or not first[0].isdigit():
-            continue
-        if first[0].lower() in {"npu", "chip"}:
-            continue
-        if len(first) >= 2 and not first[1].isdigit():
-            stats = cells[2].split()
-            pending = (
-                int(first[0]),
-                first[1],
-                cells[1] or None,
-                _number(stats[0]) if stats else None,
-                _number(stats[1]) if len(stats) > 1 else None,
-            )
-            continue
-        bus_index = next((i for i, cell in enumerate(cells) if _BUS_RE.match(cell)), None)
-        if bus_index is None or pending is None:
-            continue
-        chip_id = int(first[0])
-        phy_id = int(first[1]) if len(first) > 1 and first[1].isdigit() else None
-        stats = cells[bus_index + 1].split() if len(cells) > bus_index + 1 else []
-        pairs = _PAIR_RE.findall(cells[bus_index + 1]) if len(cells) > bus_index + 1 else []
-        memory = (int(pairs[0][0]), int(pairs[0][1])) if pairs else (None, None)
-        hbm = (int(pairs[1][0]), int(pairs[1][1])) if len(pairs) > 1 else (None, None)
-        devices.append(
-            NpuSmiDevice(
-                npu_id=pending[0],
-                chip_id=chip_id,
-                phy_id=phy_id,
-                name=pending[1],
-                health=pending[2],
-                power_w=pending[3],
-                temp_c=pending[4],
-                aicore_pct=_number(stats[0]) if stats else None,
-                memory_used_mib=memory[0],
-                memory_total_mib=memory[1],
-                hbm_used_mib=hbm[0],
-                hbm_total_mib=hbm[1],
-                bus_id=cells[bus_index],
-            )
-        )
-    if not devices:
-        raise HardwareError("npu_smi_info_no_devices")
-    return NpuSmiSnapshot(devices=tuple(devices), chips=(), board={}, source=source)
-
-
-def parse_npu_smi_common(text: str, *, source: str = "<npu-smi-common>") -> tuple[NpuSmiChip, ...]:
-    chips: list[NpuSmiChip] = []
-    current: dict[str, str] | None = None
-    npu_id = 0
-    for line in text.splitlines():
-        stripped = line.strip()
-        if ":" not in stripped:
-            continue
-        key, value = (part.strip() for part in stripped.split(":", 1))
-        if key == "NPU ID":
-            try:
-                npu_id = int(value)
-            except ValueError:
-                npu_id = 0
-            continue
-        if key == "Chip ID":
-            if current is not None:
-                chips.append(_chip_from_fields(npu_id, current))
-            current = {"Chip ID": value}
-            continue
-        if current is not None:
-            current[key] = value
-    if current is not None:
-        chips.append(_chip_from_fields(npu_id, current))
-    if not chips:
-        raise HardwareError("npu_smi_common_no_chips")
-    return tuple(chips)
-
-
-def _chip_from_fields(npu_id: int, fields: Mapping[str, str]) -> NpuSmiChip:
-    def value(key: str) -> float | None:
-        return _number(fields.get(key))
-
-    def integer(key: str) -> int | None:
-        raw = fields.get(key)
-        try:
-            return int(raw) if raw is not None else None
-        except ValueError:
-            return None
-
-    return NpuSmiChip(
-        npu_id=npu_id,
-        chip_id=integer("Chip ID") or 0,
-        hbm_usage_rate_pct=value("HBM Usage Rate(%)"),
-        aicore_freq_mhz=value("Aicore Freq(MHZ)"),
-        aicore_current_freq_mhz=value("Aicore curFreq(MHZ)"),
-        aicore_count=integer("Aicore Count"),
-        temp_c=value("Temperature(C)"),
-        power_w=value("NPU Real-time Power(W)"),
-    )
-
-
-def parse_npu_smi_board(text: str) -> dict[str, str]:
-    board: dict[str, str] = {}
-    for line in text.splitlines():
-        if ":" not in line:
-            continue
-        key, value = (part.strip() for part in line.split(":", 1))
-        if key and value:
-            board[key] = value
-    if not board:
-        raise HardwareError("npu_smi_board_empty")
-    return board
-
-
-def parse_npu_smi_snapshot(
-    info_text: str,
-    *,
-    common_text: str | None = None,
-    board_text: str | None = None,
-    source: str = "<npu-smi>",
-) -> NpuSmiSnapshot:
-    info = parse_npu_smi_info(info_text, source=source)
-    chips = parse_npu_smi_common(common_text) if common_text else ()
-    board = parse_npu_smi_board(board_text) if board_text else {}
-    return NpuSmiSnapshot(devices=info.devices, chips=chips, board=board, source=source)
-
-
-def load_npu_smi_snapshot(path: str | Path) -> NpuSmiSnapshot:
-    root = Path(path).expanduser()
-    if not root.exists():
-        raise HardwareError("npu_smi_path_missing")
-    if root.is_dir():
-        texts = {p.name: p.read_text(encoding="utf-8-sig", errors="replace") for p in root.glob("*.txt")}
-        info = next((text for name, text in texts.items() if "npu-smi" in text and _BUS_RE.search(text)), None)
-        common = next((text for name, text in texts.items() if "Chip ID" in text and "Aicore Freq" in text), None)
-        board = next((text for name, text in texts.items() if "Product Name" in text and "Chip Count" in text), None)
-        if info is None:
-            raise HardwareError("npu_smi_info_missing")
-        return parse_npu_smi_snapshot(info, common_text=common, board_text=board, source=str(root))
-    text = root.read_text(encoding="utf-8-sig", errors="replace")
-    if "Product Name" in text and "Chip Count" in text and "npu-smi" not in text:
-        return NpuSmiSnapshot(devices=(), chips=(), board=parse_npu_smi_board(text), source=str(root))
-    if "Chip ID" in text and "Aicore Freq" in text and "npu-smi" not in text:
-        return NpuSmiSnapshot(devices=(), chips=parse_npu_smi_common(text), board={}, source=str(root))
-    return parse_npu_smi_info(text, source=str(root))
-
-
 def cross_check_capacities(
     config: PlatformConfig,
     snapshot: NpuSmiSnapshot | None = None,
@@ -622,9 +381,118 @@ def parse_cannsim_link_ceilings(path_or_text: str | Path) -> dict[str, Any]:
     }
 
 
+def _dtype_ops_per_cycle(values: Mapping[str, Any], names: Sequence[str]) -> float | None:
+    for name in names:
+        raw = values.get(name)
+        if isinstance(raw, Mapping):
+            raw = raw.get("ops_per_cycle", raw.get("value"))
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and float(raw) > 0:
+            return float(raw)
+    return None
+
+
+def _profile_cube_ops_per_cycle(
+    profile: DeviceCapabilityProfile,
+) -> tuple[float | None, float | None]:
+    cube = profile.cube_spec
+    if isinstance(cube, Mapping):
+        throughput = cube.get("throughput")
+        ops_map = cube.get("ops_per_cycle_per_aic")
+        aic_count = cube.get("aic_count_per_die")
+    else:
+        throughput = getattr(cube, "throughput", None)
+        ops_map = getattr(cube, "ops_per_cycle_per_aic", None)
+        aic_count = getattr(cube, "aic_count_per_die", None)
+    fp8 = bf16 = None
+    if isinstance(ops_map, Mapping) and aic_count is not None and float(aic_count) > 0:
+        fp8_per_aic = _dtype_ops_per_cycle(ops_map, ("fp8", "fp8_e4m3", "fp8_e5m2"))
+        bf16_per_aic = _dtype_ops_per_cycle(ops_map, ("bf16",))
+        fp8 = fp8_per_aic * float(aic_count) if fp8_per_aic is not None else None
+        bf16 = bf16_per_aic * float(aic_count) if bf16_per_aic is not None else None
+    if isinstance(throughput, Mapping):
+        throughput_fp8 = _dtype_ops_per_cycle(throughput, ("fp8", "fp8_e4m3", "fp8_e5m2"))
+        throughput_bf16 = _dtype_ops_per_cycle(throughput, ("bf16",))
+        if throughput_fp8 is not None:
+            fp8 = throughput_fp8
+        if throughput_bf16 is not None:
+            bf16 = throughput_bf16
+    return fp8, bf16
+
+
+def _thermal_input(
+    direct: float | None,
+    workload: Mapping[str, Any] | None,
+    *keys: str,
+) -> float | None:
+    if direct is not None:
+        return float(direct)
+    for key in keys:
+        value = workload.get(key) if workload else None
+        if value is not None:
+            return float(value)
+    return None
+
+
+def _thermal_for_profile(
+    profile: DeviceCapabilityProfile,
+    *,
+    sustained_mhz_range: Sequence[float],
+    workload: Mapping[str, Any] | None,
+    fp8_flops: float | None,
+    bf16_flops: float | None,
+    target_us: float | None,
+    wall_cycles: float | None,
+    counted_cycles: float | None,
+    vector_cycles: float | None,
+    fix_cycles: float | None,
+    cube_reference_cycles: float | None,
+    fp8_ops_per_cycle: float | None,
+    bf16_ops_per_cycle: float | None,
+) -> dict[str, Any]:
+    fp8 = _thermal_input(fp8_flops, workload, "fp8_flops", "flops_fp8")
+    bf16 = _thermal_input(bf16_flops, workload, "bf16_flops", "flops_bf16")
+    target = _thermal_input(target_us, workload, "target_us")
+    wall = _thermal_input(wall_cycles, workload, "wall_cycles")
+    counted = _thermal_input(counted_cycles, workload, "counted_cycles")
+    vector = _thermal_input(vector_cycles, workload, "vector_cycles")
+    fix = _thermal_input(fix_cycles, workload, "fix_cycles")
+    explicit_cycles = _thermal_input(cube_reference_cycles, workload, "cube_reference_cycles")
+    profile_fp8, profile_bf16 = _profile_cube_ops_per_cycle(profile)
+    fp8_ops = _thermal_input(fp8_ops_per_cycle, workload, "fp8_ops_per_cycle")
+    bf16_ops = _thermal_input(bf16_ops_per_cycle, workload, "bf16_ops_per_cycle")
+    if fp8_ops is None:
+        fp8_ops = profile_fp8
+    if bf16_ops is None:
+        bf16_ops = profile_bf16
+    unsupported = (
+        (fp8 is not None and fp8 > 0 and fp8_ops is None)
+        or (bf16 is not None and bf16 > 0 and bf16_ops is None)
+    )
+    if unsupported:
+        return unmodeled_thermal_bounds(
+            "unsupported_dtype_or_missing_sku_cube_throughput",
+            sustained_mhz_range=sustained_mhz_range,
+            target_us=target,
+        )
+    return thermal_bounds(
+        fp8_flops=fp8,
+        bf16_flops=bf16,
+        sustained_mhz_range=sustained_mhz_range,
+        target_us=target,
+        wall_cycles=wall,
+        counted_cycles=counted,
+        vector_cycles=vector,
+        fix_cycles=fix,
+        cube_reference_cycles=explicit_cycles,
+        fp8_ops_per_cycle=fp8_ops,
+        bf16_ops_per_cycle=bf16_ops,
+    )
+
+
 def hardware_report(
     config: PlatformConfig | None = None,
     *,
+    ini_text: str | None = None,
     soc: str | None = None,
     sku_profile: str | Path | Mapping[str, Any] | None = None,
     snapshot: NpuSmiSnapshot | None = None,
@@ -638,7 +506,21 @@ def hardware_report(
     workload: Mapping[str, Any] | None = None,
     transfer_plan: Mapping[str, Any] | None = None,
     cannsim_links: Mapping[str, Any] | None = None,
+    fp8_flops: float | None = None,
+    bf16_flops: float | None = None,
+    target_us: float | None = None,
+    wall_cycles: float | None = None,
+    counted_cycles: float | None = None,
+    vector_cycles: float | None = None,
+    fix_cycles: float | None = None,
+    cube_reference_cycles: float | None = None,
+    fp8_ops_per_cycle: float | None = None,
+    bf16_ops_per_cycle: float | None = None,
 ) -> dict[str, Any]:
+    if config is not None and ini_text is not None:
+        raise HardwareError("hardware_config_and_ini_text_conflict")
+    if config is None and ini_text is not None:
+        config = parse_platform_ini_text(ini_text)
     profile = resolve_device_capability_profile(
         config=config,
         soc=soc,
@@ -678,12 +560,11 @@ def hardware_report(
                 alignment_bytes=int(buffer_plan.get("alignment_bytes", DEFAULT_ALIGNMENT_BYTES)),
                 ping_pong=buffer_plan.get("ping_pong"),
             )
-        if workload:
-            payload["thermal"] = {
-                "status": "unmodeled",
-                "unmodeled_reason": profile.unmodeled_reason,
-                "ideal_hardware_lower_bound_us": None,
-            }
+        payload["thermal"] = unmodeled_thermal_bounds(
+            profile.unmodeled_reason or AMBIGUOUS_SKU_REASON,
+            sustained_mhz_range=sustained_mhz_range,
+            target_us=_thermal_input(target_us, workload, "target_us"),
+        )
         return payload
 
     if config is None:
@@ -748,27 +629,31 @@ def hardware_report(
             alignment_bytes=int(buffer_plan.get("alignment_bytes", DEFAULT_ALIGNMENT_BYTES)),
             ping_pong=buffer_plan.get("ping_pong"),
         )
-    if workload:
-        thermal = thermal_bounds(
-            fp8_flops=float(workload.get("flops_fp8", 206158430208.0)),
-            bf16_flops=float(workload.get("flops_bf16", 12884901888.0)),
-            sustained_mhz_range=sustained_mhz_range,
-            target_us=float(workload.get("target_us", 350.0)),
-            wall_cycles=float(workload.get("wall_cycles", 566344.125)),
-            counted_cycles=float(workload.get("counted_cycles", 476981.3125)),
-            vector_cycles=float(workload.get("vector_cycles", 456026.906)),
-            fix_cycles=float(workload.get("fix_cycles", 437384.344)),
+    thermal = _thermal_for_profile(
+        profile,
+        sustained_mhz_range=sustained_mhz_range,
+        workload=workload,
+        fp8_flops=fp8_flops,
+        bf16_flops=bf16_flops,
+        target_us=target_us,
+        wall_cycles=wall_cycles,
+        counted_cycles=counted_cycles,
+        vector_cycles=vector_cycles,
+        fix_cycles=fix_cycles,
+        cube_reference_cycles=cube_reference_cycles,
+        fp8_ops_per_cycle=fp8_ops_per_cycle,
+        bf16_ops_per_cycle=bf16_ops_per_cycle,
+    )
+    traffic = workload.get("link_traffic_bytes_per_aic") if workload else None
+    if traffic:
+        links_source = cannsim_links or default_link_ceilings()
+        ceilings = links_source.get("ceilings_bpc", links_source) if isinstance(links_source, Mapping) else {}
+        thermal["link_bounds"] = link_reference_bounds(
+            traffic,
+            ceilings_bpc=ceilings,
+            mhz=float(workload.get("link_reference_mhz", 1280.0)),
         )
-        traffic = workload.get("link_traffic_bytes_per_aic")
-        if traffic:
-            links_source = cannsim_links or default_link_ceilings()
-            ceilings = links_source.get("ceilings_bpc", links_source) if isinstance(links_source, Mapping) else {}
-            thermal["link_bounds"] = link_reference_bounds(
-                traffic,
-                ceilings_bpc=ceilings,
-                mhz=float(workload.get("link_reference_mhz", 1280.0)),
-            )
-        payload["thermal"] = thermal
+    payload["thermal"] = thermal
     return payload
 
 
@@ -782,6 +667,7 @@ __all__ = [
     "DeviceCapabilityProfile", "NpuSmiDevice", "NpuSmiChip", "NpuSmiSnapshot", "BufferAllocation",
     "A5_CANN_SIM_LINK_CEILINGS_BPC", "A5_REFERENCE_PEAKS", "SUSTAINED_MHZ_RANGE",
     "SHORT_BURST_MHZ_RANGE", "DEFAULT_ALIGNMENT_BYTES", "PING_PONG_ALIGNMENT_BYTES",
+    "A5_FLASHMLA_C8_GOLDEN_WORKLOAD", "unmodeled_thermal_bounds",
     "align_up", "infer_arch_family", "is_ambiguous_family_token", "load_sku_profile",
     "resolve_device_capability_profile", "parse_platform_ini", "parse_platform_ini_text",
     "parse_ini", "parse_npu_smi_info", "parse_npu_smi_common", "parse_npu_smi_board",

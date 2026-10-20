@@ -25,6 +25,7 @@ from .hardware import (
     BUILTIN_SKU_CATALOG,
     A5_CANN_SIM_LINK_CEILINGS_BPC,
     A5_REFERENCE_PEAKS,
+    A5_FLASHMLA_C8_GOLDEN_WORKLOAD,
     BufferAllocation,
     ClockAndTopologySpec,
     CubeSpec,
@@ -62,6 +63,7 @@ from .hardware import (
     solve_collective_bound,
     solve_transfer_bound,
     thermal_bounds,
+    unmodeled_thermal_bounds,
     validate_buffer_allocations,
 )
 from .pipeline import (
@@ -90,6 +92,7 @@ __all__ = [
     "__version__",
     "A5_CANN_SIM_LINK_CEILINGS_BPC",
     "A5_REFERENCE_PEAKS",
+    "A5_FLASHMLA_C8_GOLDEN_WORKLOAD",
     "BufferAllocation",
     "HardwareError",
     "NpuSmiChip",
@@ -108,6 +111,7 @@ __all__ = [
     "reference_time_us",
     "sensitivity_matrix",
     "thermal_bounds",
+    "unmodeled_thermal_bounds",
     "validate_buffer_allocations",
     "PipelineError",
     "PipelineGraph",
