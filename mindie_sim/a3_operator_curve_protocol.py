@@ -9,11 +9,14 @@
 
 [Invariants]
   * Outcome/provenance fields (address counts, run IDs, timing values,
-    capture outcome, observed API/backend, duplicates) never define
-    applicability.
+    capture outcome, observed API/backend, duplicates, per-run clock/board/
+    package identity, batch-size attestation and descriptive scope prose) never
+    define applicability; unknown fields still do (strict identity).
   * Unknown/missing physical protocol fields are not defaulted: strict equality
     of the canonical protocol is required by consumers.  A legacy artifact with
     no `mode` cannot match a graph-mode query.
+  * Hardware series is physical identity: an A3 curve never answers an A2
+    query, and no prefix/look-alike key wildcards another series.
   * This module does not divide block intervals into per-invocation service,
     infer a pure device model, or alter declared host/idle/lifetime semantics.
 
@@ -29,8 +32,10 @@ import json
 from typing import Any, Mapping
 
 # Fields that describe observations, outcomes or collection provenance rather
-# than the pre-use execution contract.  Unknown fields are preserved.
+# than the pre-use execution contract.  Unknown fields are preserved (strict
+# identity), so a new physical fact can never be silently dropped.
 _NON_PHYSICAL_KEYS = {
+    # Collection identity and outcome fields.
     "run_id", "run_ids", "measurement_id", "request_id", "case_id",
     "condition_id", "split", "campaign_id",
     "capture_unique_address_count", "eager_unique_address_count",
@@ -41,7 +46,22 @@ _NON_PHYSICAL_KEYS = {
     "observed_at", "profiler", "start", "end", "timestamp",
     "not_a3_measured", "seed", "execution_kind", "worker_recipe",
     "requested_backend", "backend", "source_class",
-    "requested_accumulation_dtype",
+    "requested_accumulation_dtype", "measurement_flags",
+    # Round-2 batched-amortized run provenance (outcome free, per run): clock,
+    # board and package identity.  The same declared contract measured on
+    # another die, at another clock or through another container is the same
+    # execution contract, not another protocol.
+    "clock_gate", "clock", "die_identity", "board", "package_provenance",
+    "device", "device_name", "phy_id", "visible_devices", "visible",
+    "host", "container",
+    # Worker attestation of how the batched interval was produced.  The batch
+    # length K is chosen per condition (interval >= 2 ms), so it must never
+    # become protocol identity: every condition would otherwise be its own
+    # one-point series.  These facts stay in the artifact as evidence.
+    "repeats_per_sample", "pilot_calls", "pre_soak_seconds",
+    "warmup_events_total", "warmup_iterations_per_trial",
+    "batched_timing", "amortized_per_call",
+    "declared_iterations", "declared_trials", "declared_warmup",
 }
 
 
@@ -49,6 +69,10 @@ def _is_non_physical(key: str) -> bool:
     if key in _NON_PHYSICAL_KEYS:
         return True
     if key.startswith("observed") or key.startswith("profiler"):
+        return True
+    if key.startswith("declared"):
+        return True
+    if key.startswith("clock") or key.startswith("die_"):
         return True
     if "address" in key:
         return True
@@ -152,7 +176,51 @@ def protocol_equal(left: Mapping[str, Any] | None,
     return canonical_protocol(left) == canonical_protocol(right)
 
 
+# Hardware series tokens.  A curve measured on one Ascend series must never
+# answer a query from another, even if a caller supplies a look-alike key: the
+# series is part of physical identity, not a display label.  Unknown keys map to
+# ``None`` (unknown series), which can only match the same unknown key.
+_HARDWARE_SERIES_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("a5", ("910_95", "910_96", "910_97", "ascend950", "ascend960")),
+    ("a3", ("910_93", "910c", "ascend910_93")),
+    ("a2", ("910b", "910_94", "ascend910b")),
+    ("310p", ("310p",)),
+    ("310b", ("310b",)),
+)
+
+
+def hardware_series(hardware_key: str | None) -> str | None:
+    """Return the Ascend series token for a hardware key, or ``None`` if unknown.
+
+    Matching rules are substring-based and case-insensitive because captured
+    keys are board/SKU strings (``Ascend910_9362``, ``Ascend910B4``,
+    ``Ascend910B4-1``).  A3 boards contain ``910_93``; A2 boards contain
+    ``910B``/``910_94``; there is no prefix wildcard between them.
+    """
+    key = str(hardware_key or "").strip().lower()
+    if not key:
+        return None
+    for series, tokens in _HARDWARE_SERIES_RULES:
+        if any(token in key for token in tokens):
+            return series
+    return None
+
+
+def hardware_compatible(curve_key: str | None, query_key: str | None) -> bool:
+    """Strict physical hardware compatibility: same key *and* same series.
+
+    An A3 curve can never answer an A2 query.  Two keys with the same series but
+    a different SKU are still different physical boards and do not match.
+    """
+    curve = str(curve_key or "")
+    query = str(query_key or "")
+    if not curve or not query or curve != query:
+        return False
+    return hardware_series(curve) == hardware_series(query)
+
+
 __all__ = [
     "canonical_protocol", "protocol_key",
     "protocol_signature", "protocol_equal",
+    "hardware_series", "hardware_compatible",
 ]

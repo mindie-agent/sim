@@ -54,6 +54,8 @@ from .hardware_common import (
     DEFAULT_ALIGNMENT_BYTES,
     PING_PONG_ALIGNMENT_BYTES,
     SHORT_BURST_MHZ_RANGE,
+    # Deprecated alias re-exported for callers that still import it here; this
+    # module no longer defaults any clock range to it.
     SUSTAINED_MHZ_RANGE,
     HardwareError,
     _canonical_link_key,
@@ -63,6 +65,7 @@ from .hardware_common import (
     _mib,
     align_up,
     default_link_ceilings,
+    parse_mhz_range,
 )
 from .hardware_probe import (
     NpuSmiChip,
@@ -310,8 +313,11 @@ def cross_check_capacities(
                     {chip.aicore_current_freq_mhz for chip in snapshot.chips if chip.aicore_current_freq_mhz}
                 ),
             })
-    if sustained_mhz_range is not None:
-        low, high = sorted(float(v) for v in sustained_mhz_range)
+    # An empty/None band means unmeasured (no "configured clock is not
+    # sustained" claim can be made without a measured band).
+    sustained_band = parse_mhz_range(sustained_mhz_range, reason="hardware_sustained_mhz_range_invalid")
+    if sustained_band is not None:
+        low, high = sustained_band
         if high < config.cube_freq_mhz:
             flags.append("platform_clock_is_not_sustained_clock")
             diagnostics.append({
@@ -406,7 +412,7 @@ def _profile_cube_ops_per_cycle(
 def _thermal_for_profile(
     profile: DeviceCapabilityProfile,
     *,
-    sustained_mhz_range: Sequence[float],
+    sustained_mhz_range: Sequence[float] | None,
     short_burst_mhz_range: Sequence[float],
     extra_frequencies_mhz: Sequence[float],
     workload: Mapping[str, Any] | None,
@@ -579,7 +585,9 @@ def hardware_report(
     verified_runtime_hbm_mib: float | None = None,
     simulator_ub_kib: float | None = 256.0,
     allocatable_ub_kib: float | None = None,
-    sustained_mhz_range: Sequence[float] = SUSTAINED_MHZ_RANGE,
+    # A sustained band is caller-supplied evidence; ``None`` leaves the profile
+    # and the thermal report explicitly unmeasured (no family constant).
+    sustained_mhz_range: Sequence[float] | None = None,
     short_burst_mhz_range: Sequence[float] = SHORT_BURST_MHZ_RANGE,
     extra_frequencies_mhz: Sequence[float] = (),
     buffer_plan: Mapping[str, Any] | None = None,
@@ -623,6 +631,8 @@ def hardware_report(
             "status": "ambiguous_sku",
             "unmodeled_reason": profile.unmodeled_reason,
             "device_capability_profile": profile.to_dict(),
+            "effective_clock_mhz": profile.effective_clock_mhz(),
+            "effective_clock_source": profile.clock_and_topology_spec.clock_source(),
             "soc": None,
             "capacity_cross_check": None,
             "cannsim_links": dict(cannsim_links) if cannsim_links else default_link_ceilings(),
@@ -703,6 +713,8 @@ def hardware_report(
         "status": "modeled" if cross["runtime_verified"] else "runtime_unverified",
         "unmodeled_reason": None,
         "device_capability_profile": profile.to_dict(),
+        "effective_clock_mhz": profile.effective_clock_mhz(),
+        "effective_clock_source": profile.clock_and_topology_spec.clock_source(),
         "soc": config.to_dict(),
         "capacity_cross_check": cross,
         "cannsim_links": dict(cannsim_links) if cannsim_links else default_link_ceilings(),
@@ -770,6 +782,8 @@ __all__ = [
     "AMBIGUOUS_SKU_REASON", "BUILTIN_SKU_CATALOG", "HardwareError",
     "PlatformConfig", "CubeSpec", "VectorSpec", "MemoryHierarchySpec", "ClockAndTopologySpec",
     "DeviceCapabilityProfile", "NpuSmiDevice", "NpuSmiChip", "NpuSmiSnapshot", "BufferAllocation",
+    # ``SUSTAINED_MHZ_RANGE`` is a deprecated alias for the A5 cannsim reference
+    # ladder; no report defaults to it any more.
     "A5_CANN_SIM_LINK_CEILINGS_BPC", "A5_REFERENCE_PEAKS", "SUSTAINED_MHZ_RANGE",
     "SHORT_BURST_MHZ_RANGE", "DEFAULT_ALIGNMENT_BYTES", "PING_PONG_ALIGNMENT_BYTES",
     "align_up", "infer_arch_family", "is_ambiguous_family_token", "load_sku_profile",

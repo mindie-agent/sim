@@ -206,7 +206,10 @@ def _hardware(args: argparse.Namespace) -> dict[str, Any]:
         verified_runtime_hbm_mib=args.verified_runtime_hbm_mib,
         simulator_ub_kib=simulator_ub,
         allocatable_ub_kib=args.allocatable_ub_kib,
-        sustained_mhz_range=_mhz_range(args.sustained_mhz) or (1250.0, 1300.0),
+        # No measured sustained band is the default: 1250-1300 MHz was the A5
+        # cannsim reference ladder, never a soak of any device, and injecting it
+        # as a CLI default made every report claim a band nobody measured.
+        sustained_mhz_range=_mhz_range(args.sustained_mhz),
         short_burst_mhz_range=_mhz_range(args.short_burst_mhz) or (1640.0, 1650.0),
         buffer_plan=buffer_plan,
         workload=workload,
@@ -289,6 +292,39 @@ def _calibration_from_args(args: argparse.Namespace) -> Any:
     return None
 
 
+def _physical_calibration_from_args(args: argparse.Namespace) -> Any:
+    """Load a fitted physical-calibration artifact, refusing a malformed one.
+
+    The artifact is one machine's calibration: this only decodes it, and the
+    hardware-key agreement with the case machine is enforced by
+    ``a3_framework.predict``.
+    """
+    path = getattr(args, "physical_calibration", None)
+    if not path:
+        return None
+    from .a3_physical_calibration import PhysicalCalibration, PhysicalCalibrationError
+
+    try:
+        return PhysicalCalibration.load(path)
+    except (OSError, ValueError, PhysicalCalibrationError) as exc:
+        raise A3InputError(
+            f"physical_calibration_unreadable:{path}:{type(exc).__name__}:{exc}"
+        ) from exc
+
+
+def _timing_scope_from_args(args: argparse.Namespace) -> str | None:
+    scope = str(getattr(args, "timing_scope", None) or "").strip()
+    if not scope:
+        return None
+    from .a3_physical_calibration import ACCEPTED_TIMING_SCOPES
+
+    if scope not in ACCEPTED_TIMING_SCOPES:
+        raise A3InputError(
+            f"timing_scope_unknown:{scope}:expected_one_of:{','.join(ACCEPTED_TIMING_SCOPES)}"
+        )
+    return scope
+
+
 def _attach_curve_artifact(case: Any, path: str | None) -> Any:
     if not path:
         return case
@@ -301,6 +337,8 @@ def _attach_curve_artifact(case: Any, path: str | None) -> Any:
 def _predict(args: argparse.Namespace) -> dict[str, Any]:
     case = _attach_curve_artifact(_a3_case(args.input), args.curve_artifact)
     calibration = _calibration_from_args(args)
+    physical_calibration = _physical_calibration_from_args(args)
+    timing_scope = _timing_scope_from_args(args)
     if args.calibration_db:
         source = SQLiteCalibrationStore(args.calibration_db)
         comm = CommunicationCalibration.from_store(source)
@@ -310,7 +348,10 @@ def _predict(args: argparse.Namespace) -> dict[str, Any]:
         case = _dataclass_replace(
             case, communication_calibration=comm, cv_calibration=cv,
         )
-    payload = predict(case, calibration=calibration)
+    payload = predict(
+        case, calibration=calibration,
+        physical_calibration=physical_calibration, timing_scope=timing_scope,
+    )
     if args.record_misses:
         if not args.calibration_db:
             raise A3InputError("record_misses_requires_calibration_db")
@@ -547,7 +588,10 @@ def build_parser() -> argparse.ArgumentParser:
     hardware.add_argument("--bf16-ops-per-cycle", type=float, default=None, help="explicit total per-die BF16 Cube ops/cycle")
     hardware.add_argument("--measurement-mhz", type=float, default=None, help="explicit clock basis for W/C PMU cycles")
     hardware.add_argument("--transfers", default=None, help="D2D/H2D/D2H/RH2D/RD2H transfer & collective plan JSON")
-    hardware.add_argument("--sustained-mhz", default="1250:1300", help="sustained thermal range, e.g. 1250:1300")
+    hardware.add_argument(
+        "--sustained-mhz", default=None,
+        help="measured sustained thermal range, e.g. 1650:1650; omitted = unmeasured",
+    )
     hardware.add_argument("--short-burst-mhz", default="1640:1650", help="short-burst thermal range, e.g. 1640:1650")
     hardware.add_argument("--simulator-ub-kib", type=float, default=256.0, help="simulator UB reference in KiB; 0 disables")
     hardware.add_argument("--allocatable-ub-kib", type=float, default=None, help="explicit allocatable UB capacity in KiB")
@@ -587,6 +631,17 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--calibration", default=None, help="optional calibration observations JSON")
     predict_parser.add_argument("--calibration-db", default=None, help="optional SQLite calibration store")
     predict_parser.add_argument("--curve-artifact", default=None, help="optional public train-only piecewise curve artifact")
+    predict_parser.add_argument(
+        "--physical-calibration", default=None,
+        help="fitted physical-calibration artifact JSON (one hardware key)",
+    )
+    predict_parser.add_argument(
+        "--timing-scope", default=None,
+        help=(
+            "declared measurement protocol scope for the analytic and fitted "
+            "physical paths, e.g. device_event_warm or device_event_warm_batched"
+        ),
+    )
     predict_parser.add_argument("--record-misses", action="store_true", help="opt in: record uncalibrated ops as pending measurement requests")
     predict_parser.add_argument("--requests-output", default=None, help="optional pending-request manifest output path")
     predict_parser.add_argument("--run-id", default=None, help="external run id for recorded requests")

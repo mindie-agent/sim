@@ -314,13 +314,18 @@ def test_cube_reference_cycles_and_sustained_reference_lower_bounds():
         assert hw.reference_time_us(cycles, mhz) == pytest.approx(value, rel=1e-12)
 
     thermal = hw.thermal_bounds(**hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD)
-    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    # The 1250-1300 MHz ladder was a cannsim *reference* ladder, never a
+    # device sustained claim: the standing A2 module only ever showed 800 MHz
+    # idle / 1650 MHz loaded (`.workstreams/a2-recon/a2-hardware-evidence.md`
+    # §4.2).  With no measured sustained band the default is empty and there is
+    # no sustained reference, while the declared short-burst band still is.
+    assert thermal["sustained_mhz_range"] == []
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
     required = thermal["required_mhz_for_target"]
     assert required["counted_mac_mhz"] == pytest.approx(1362.80375, rel=1e-12)
     assert required["vector_mhz"] == pytest.approx(1302.934017142857, rel=1e-12)
     assert required["wall_mhz"] == pytest.approx(1618.1260714285713, rel=1e-12)
-    assert thermal["sustained_reference_us"][0] > 350.0
+    assert thermal["sustained_reference_us"] is None
     assert thermal["short_burst_reference_us"][0] < 300.0
 
 
@@ -331,7 +336,7 @@ def test_thermal_bounds_without_workload_or_cycles_is_unmodeled():
     assert thermal["cube_reference_cycles"] is None
     assert thermal["clock_table"] == []
     assert thermal["gap_sensitivity"] == []
-    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    assert thermal["sustained_mhz_range"] == []
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
 
     golden = hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD

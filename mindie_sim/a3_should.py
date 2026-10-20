@@ -37,7 +37,9 @@ import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
 
-from .a3_cost import CalibrationStore, PredictiveCostModel
+from .a3_cost import (
+    CalibrationStore, PredictiveCostModel, communication_placement_for_machine,
+)
 from .a3_async import (
     add_prepare_tasks, prepare_residency_report, prepare_summary,
 )
@@ -95,6 +97,32 @@ def _assign_requests(case: CaseSpec, dp: int) -> list[list[Any]]:
     for index, request in enumerate(case.workload.requests):
         replicas[index % max(1, dp)].append(request)
     return replicas
+
+
+def _shared_communication_placement(
+    machine: MachineSpec,
+    replica_links: Sequence[Mapping[str, Any]],
+    active_replicas: Sequence[int],
+) -> str:
+    """The one fabric every active replica's collectives use, or ``""``.
+
+    The normative cost model is shared by all replicas, so it may only declare a
+    placement when the plan puts every active replica on the same declared
+    fabric.  A mixed node (SIO pair + HCCS switch) names no single placement:
+    the value stays empty and each collective is reported as unmodeled rather
+    than priced on an arbitrary one of the two.
+    """
+    by_replica = {item["replica"]: item for item in replica_links}
+    placements = {
+        communication_placement_for_machine(
+            machine, link=by_replica[index].get("link"),
+            ranks=by_replica[index].get("ranks"),
+        )
+        for index in active_replicas if index in by_replica
+    }
+    if len(placements) == 1:
+        return placements.pop()
+    return ""
 
 
 
@@ -193,6 +221,14 @@ def _evaluate_normative_plan(
         weight_dtype=case.model.weight_dtype,
         activation_dtype=case.model.activation_dtype,
         quantization=case.model.quantization,
+        # A collective is priced on the fabric its rank group actually uses: the
+        # machine's declared transfer channel, not a link name.  When the active
+        # replicas disagree about the fabric (a heterogeneous node), no single
+        # placement can describe the plan, so it stays unspecified and the comm
+        # calibration is explicitly unmodeled instead of guessed.
+        communication_placement=_shared_communication_placement(
+            case.machine, replica_links, active_replicas,
+        ),
         # Normative should is independent of measured residuals and operator
         # curve observations; only the predictive product may consume them.
     )

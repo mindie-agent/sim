@@ -11,6 +11,14 @@
     per-die capacity, never a package or node total.
   * A parallel plan is ``dp * pp * tp`` ranks; EP is a sub-group inside each TP
     group and is never multiplied into the world size as an independent axis.
+  * Links are a projection of the declared transfer channels
+    (``comm.default_transfer_channels``): a single-die A2 package has an
+    intra-node HCCS fabric and no intra-package SIO; a dual-die A3 package has
+    one dedicated SIO wire per package plus the intra-node switch.  No family
+    string selects a rate here.
+  * A link declares its contention semantics (``mesh``/``switched``/``direct``
+    /``unknown``); an explicit fixture that omits it is a shared pipe, never a
+    silently assumed mesh.
   * Revisions and source paths are metadata: they do not affect semantic input
     keys, cost formulas or compatibility.  Compatibility is validated by
     shape/feature contracts in this module.
@@ -31,6 +39,8 @@ import json
 import math
 from dataclasses import dataclass, field, replace
 from typing import Any, Mapping, Sequence
+
+from .comm import TransferChannelSpec, default_transfer_channels
 
 _CASE_PROVENANCE_FIELDS = (
     "source", "revision", "commit", "git_commit", "source_sha", "name",
@@ -172,6 +182,13 @@ class LinkSpec:
     members: tuple[int, ...]
     scope: str = "shared"
     source: str = "declared"
+    # Declared contention semantics of the physical fabric: ``mesh`` (every
+    # pair owns a wire, A2 HCCS), ``switched`` (one aggregate pipe, A3
+    # HCCS_SW / RoCE), ``direct`` (dedicated point-to-point, SIO die pair),
+    # ``unknown`` (an explicit fixture that did not declare it -- treated as a
+    # shared pipe, never silently as a mesh).
+    semantics: str = "unknown"
+    protocol: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -183,7 +200,29 @@ class LinkSpec:
             "members": list(self.members),
             "scope": self.scope,
             "source": self.source,
+            "transport_semantics": self.semantics,
+            "protocol": self.protocol,
         }
+
+
+#: Scope tokens that address a physical fabric rather than a link instance.
+#: ``d2d`` is the legacy generic token used by every pre-A2 workload op; it
+#: means "the machine's intra-node D2D fabric", not "the first link in a list".
+LINK_SCOPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "d2d": ("d2d_intra_node",),
+    "hccs": ("d2d_intra_node",),
+    "hccssw": ("d2d_intra_node",),
+    "hccs_sw": ("d2d_intra_node",),
+    "intra_node": ("d2d_intra_node",),
+    "d2d_intra_node": ("d2d_intra_node",),
+    "sio": ("d2d_intra_package",),
+    "intra_package": ("d2d_intra_package",),
+    "d2d_intra_package": ("d2d_intra_package",),
+    "die_pair": ("d2d_intra_package",),
+    "inter_node": ("d2d_inter_node",),
+    "roce": ("d2d_inter_node",),
+    "d2d_inter_node": ("d2d_inter_node",),
+}
 
 
 @dataclass(frozen=True)
@@ -244,6 +283,59 @@ class MachineSpec:
     compute_peaks: tuple[tuple[str, float], ...] = ()
     hardware_key: str = ""
     metadata: tuple[tuple[str, str], ...] = ()
+    #: The declared transfer-channel view this machine's ``links`` were derived
+    #: from (``comm.TransferChannelSpec`` values).  Kept as a tuple so the
+    #: machine stays hashable/frozen; consumers index it by ``.channel``.
+    transfer_channels: tuple[TransferChannelSpec, ...] = ()
+
+    def channel(self, name: str) -> TransferChannelSpec | None:
+        key = str(name).strip().lower()
+        for item in self.transfer_channels:
+            if item.channel.lower() == key:
+                return item
+        return None
+
+    def link_for_scope(self, scope: str) -> LinkSpec | None:
+        """Resolve a fabric scope token to exactly one physical link.
+
+        Resolution order: an exact link name / scope / channel, then a declared
+        channel alias (``sio`` -> ``d2d_intra_package``, ``hccs`` ->
+        ``d2d_intra_node``), then -- only for an *unrecognised* token on a
+        single-fabric machine -- that one fabric.  A token that names a fabric
+        the machine does not have (``sio`` on A2) is an explicit error instead
+        of silently pricing traffic on an unrelated link.
+        """
+        key = str(scope or "").strip().lower()
+        links = list(self.links)
+        if not key:
+            raise A3InputError("link_scope_missing")
+        if not links:
+            raise A3InputError(f"machine_has_no_links:{key}")
+        exact = [
+            link for link in links
+            if key in {
+                link.name.lower(), link.scope.lower(), link.channel.lower(),
+            }
+        ]
+        if not exact:
+            channels = LINK_SCOPE_ALIASES.get(key)
+            if channels is not None:
+                exact = [link for link in links if link.channel.lower() in channels]
+                if not exact and key == "d2d" and len(links) == 1:
+                    # The generic legacy token means "this machine's D2D
+                    # fabric"; a single-fabric machine has exactly one.
+                    return links[0]
+                if not exact:
+                    raise A3InputError(f"link_scope_unresolved:{key}")
+            elif len(links) == 1:
+                # A machine that declares exactly one fabric has no ambiguity.
+                return links[0]
+            else:
+                raise A3InputError(f"link_scope_unknown:{key}")
+        # Deterministic and conservative: among equal-token matches the
+        # smallest capacity wins, with the name as tie-break, so declaration
+        # order never decides which wire is priced.
+        return min(exact, key=lambda link: (link.capacity_bytes_per_ms, link.name))
 
     @classmethod
     def from_mapping(cls, value: Any) -> "MachineSpec":
@@ -254,7 +346,7 @@ class MachineSpec:
             "cube_flops_per_s", "vector_ops_per_s", "hbm_bw_bytes_per_s",
             "mte_bw_bytes_per_s", "launch_us", "l2_bytes", "l1_bytes",
             "l0a_bytes", "l0b_bytes", "l0c_bytes", "ub_bytes", "aic_count",
-            "aiv_count", "mte1_bw_bytes_per_s",
+            "aiv_count", "mte1_bw_bytes_per_s", "transfer_channels",
             "compute_peaks", "dtype_peaks", "hardware_key", "dies", "note",
         }
         _unknown(raw, allowed, "machine")
@@ -359,6 +451,30 @@ class MachineSpec:
         )
         arch = str(raw.get("arch_family", merged.get("arch_family", "custom"))).strip().upper()
         name = str(raw.get("name", sku or f"custom-{num_devices}x")).strip()
+        memory = getattr(profile, "memory_hierarchy_spec", None) if profile is not None else None
+        channel_overrides: dict[str, Any] | None = None
+        if raw.get("transfer_channels") is not None:
+            raw_channels = raw["transfer_channels"]
+            if (not isinstance(raw_channels, Sequence)
+                    or isinstance(raw_channels, (str, bytes))):
+                raise A3InputError("machine.transfer_channels_invalid")
+            channel_overrides = {}
+            for index, entry in enumerate(raw_channels):
+                item = _mapping(entry, "machine.transfer_channel_invalid")
+                channel_name = str(item.get("channel") or "").strip()
+                if not channel_name:
+                    raise A3InputError(
+                        f"machine.transfer_channel_invalid:{index}"
+                    )
+                channel_overrides[channel_name.lower()] = dict(item)
+        channels = default_transfer_channels(
+            arch,
+            dies_per_package=dies_per_package,
+            intra_package_die_bw_gbps=getattr(memory, "intra_package_die_bw_gbps", None),
+            intra_node_hccs_bw_gbps=getattr(memory, "intra_node_hccs_bw_gbps", None),
+            inter_node_roce_bw_gbps=getattr(memory, "inter_node_roce_bw_gbps", None),
+            overrides=channel_overrides,
+        )
         dies: list[DieResources] = list(explicit_dies)
         if not explicit_dies:
             for rank in range(num_devices):
@@ -381,7 +497,11 @@ class MachineSpec:
                     mte1_bw_bytes_per_s=mte1_bw,
                     source="sku_profile" if profile is not None else "declared",
                 ))
-        links = _parse_links(raw.get("links"), num_devices, arch)
+        links = _parse_links(
+            raw.get("links"), num_devices, arch,
+            dies_per_package=dies_per_package, ranks_per_node=ranks_per_node,
+            channels=channels,
+        )
         peaks_raw = raw.get("compute_peaks", raw.get("dtype_peaks", {}))
         peaks: list[tuple[str, float]] = []
         if peaks_raw is not None:
@@ -395,6 +515,7 @@ class MachineSpec:
             compute_peaks=tuple(sorted(peaks)),
             hardware_key=str(raw.get("hardware_key", sku or name)).strip(),
             metadata=_metadata(raw),
+            transfer_channels=tuple(channels.values()),
         )
 
     def validate_placement(self, parallel: "ParallelSpec") -> None:
@@ -435,12 +556,92 @@ class MachineSpec:
             "compute_peaks": dict(self.compute_peaks),
             "hardware_key": self.hardware_key,
             "metadata": dict(self.metadata),
+            "transfer_channels": [item.to_dict() for item in self.transfer_channels],
             "note": "hbm_bytes is per die; package/node totals are not stored here",
         }
 
+    @classmethod
+    def from_profile(
+        cls,
+        profile: Any,
+        *,
+        name: str = "",
+        sku: str = "",
+        hardware_key: str = "",
+        num_devices: int | None = None,
+        ranks_per_node: int | None = None,
+        clock_mhz: float | None = None,
+        launch_us: float | None = None,
+        vector_ops_per_s: float | None = None,
+        metadata: Mapping[str, Any] | None = None,
+    ) -> "MachineSpec":
+        """Build a machine from a resolved ``DeviceCapabilityProfile``.
 
-def _profile_defaults(profile: Any, merged: dict[str, Any]) -> dict[str, Any]:
-    clock_mhz = profile.clock_and_topology_spec.configured_clock_mhz
+        Every per-die quantity is derived from the declared capability (ops per
+        cycle, HBM, L2, buffers).  ``clock_mhz`` defaults to the profile's
+        documented clock precedence (explicit override -> verified runtime
+        clock -> configured clock); a caller may pass the clock it used so the
+        configured-vs-runtime discrepancy stays readable in ``metadata``.
+
+        ``vector_ops_per_s`` is a *caller declaration* for the one capability
+        A2/A3 do not publish (B8: no ``ops_per_cycle_per_aiv`` exists, and the
+        ``.ini`` ``vec_calc_size`` is a SIMD byte width, not an element-op
+        rate).  When the profile does declare it, that value wins; when the
+        caller declares nothing either, ``_profile_defaults`` keeps the
+        historical ``aiv x simd_width x clock`` nominal and the caller is
+        expected to label it unverified in ``metadata``.  A quantity nothing
+        can supply (launch/dispatch intercept) stays an explicit argument.
+        """
+        topology = profile.clock_and_topology_spec
+        resolved_soc = str(topology.soc_version or sku or "").strip()
+        effective_clock = getattr(profile, "effective_clock_mhz", None)
+        resolved_clock = float(clock_mhz) if clock_mhz is not None else (
+            effective_clock() if callable(effective_clock) else topology.configured_clock_mhz
+        )
+        if resolved_clock is None:
+            raise A3InputError("machine_clock_undeclared")
+        merged: dict[str, Any] = {}
+        if launch_us is not None:
+            merged["launch_us"] = float(launch_us)
+        defaults = _profile_defaults(profile, merged, clock_mhz=resolved_clock)
+        if vector_ops_per_s is not None:
+            defaults["vector_ops_per_s"] = float(vector_ops_per_s)
+        devices = int(
+            num_devices
+            or max(1, int(topology.dies_per_package or 1))
+        )
+        device = {
+            key: defaults[key] for key in (
+                "hbm_bytes", "cube_flops_per_s", "vector_ops_per_s",
+                "hbm_bw_bytes_per_s", "mte_bw_bytes_per_s", "launch_us",
+                "l2_bytes", "l1_bytes", "l0a_bytes", "l0b_bytes",
+                "l0c_bytes", "ub_bytes", "aic_count", "aiv_count",
+                "mte1_bw_bytes_per_s",
+            )
+        }
+        mapping: dict[str, Any] = {
+            "name": name or f"profile-{resolved_soc or 'unknown'}",
+            "arch_family": defaults["arch_family"],
+            "dies_per_package": defaults["dies_per_package"],
+            "num_devices": devices,
+            "ranks_per_node": int(ranks_per_node or devices),
+            "device": device,
+            "hardware_key": hardware_key or resolved_soc,
+        }
+        if resolved_soc:
+            mapping["sku"] = resolved_soc
+        if metadata:
+            mapping["metadata"] = dict(metadata)
+        return cls.from_mapping(mapping)
+
+
+def _profile_defaults(
+    profile: Any, merged: dict[str, Any], *, clock_mhz: float | None = None,
+) -> dict[str, Any]:
+    clock_mhz = (
+        float(clock_mhz) if clock_mhz is not None
+        else profile.clock_and_topology_spec.configured_clock_mhz
+    )
     hz = float(clock_mhz) * 1e6
     cube = profile.cube_spec
     bf16_ops_per_die = cube.ops_per_cycle_per_die("bf16")
@@ -456,8 +657,13 @@ def _profile_defaults(profile: Any, merged: dict[str, Any]) -> dict[str, Any]:
     defaults = {
         "hbm_bytes": int(round(float(hbm_mib) * 1024 ** 2)),
         "cube_flops_per_s": float(bf16_ops_per_die) * hz,
-        "vector_ops_per_s": float(profile.vector_spec.aiv_count_per_die or 1)
-        * float(profile.vector_spec.simd_width_bytes or 32) * hz,
+        # Declared per-AIV ops/cycle wins when the profile publishes it.  A2/A3
+        # currently declare nothing (B8), so the historical
+        # ``aiv x simd_width_bytes x clock`` nominal is kept -- that nominal is
+        # *unverified*, not physical (bytes/cycle is not element-ops/cycle).
+        # ``MachineSpec.from_profile(vector_ops_per_s=...)`` exists so a caller
+        # that owns a measured effective rate can replace it explicitly.
+        "vector_ops_per_s": _profile_vector_ops_per_s(profile, hz),
         "hbm_bw_bytes_per_s": float(hbm_bw_gbps) * 1e9,
         "mte_bw_bytes_per_s": 2.0 * float(hbm_bw_gbps) * 1e9,
         "launch_us": 20.0,
@@ -477,22 +683,125 @@ def _profile_defaults(profile: Any, merged: dict[str, Any]) -> dict[str, Any]:
     return defaults
 
 
-def _parse_links(raw: Any, num_devices: int, arch: str) -> list[LinkSpec]:
+def _profile_vector_ops_per_s(profile: Any, hz: float) -> float:
+    """Per-die vector peak for a profile: declared, else the legacy nominal."""
+    declared = getattr(profile, "peak_vector_ops_per_s", None)
+    if callable(declared):
+        value = declared("bf16")
+        if value is not None:
+            return float(value)
+    # No A2/A3 profile publishes ``ops_per_cycle_per_aiv``.  Keep the rate the
+    # existing machines were built with so switching the fixture path cannot
+    # halve the vector engine; the value is an unverified nominal and a caller
+    # with a measured effective rate overrides it via ``from_profile``.
+    return (
+        float(profile.vector_spec.aiv_count_per_die or 1)
+        * float(profile.vector_spec.simd_width_bytes or 32) * hz
+    )
+
+
+def _channel_links(
+    channels: Mapping[str, TransferChannelSpec],
+    *,
+    num_devices: int,
+    dies_per_package: int,
+    ranks_per_node: int,
+) -> list[LinkSpec]:
+    """Materialize links from the declared transfer channels.
+
+    This is the single place a fabric rate becomes a ``LinkSpec``.  It encodes
+    only physical structure, never a family literal:
+
+    * ``d2d_intra_package`` (SIO) exists only when the package really has two
+      dies; each package gets its own dedicated pair wire, so a single-die A2
+      part has **no** SIO link at all.
+    * ``d2d_intra_node`` exists for every rank set and carries the declared
+      protocol (A2 ``HCCS`` mesh, A3 ``HCCS_SW`` switch).
+    * ``d2d_inter_node`` exists only when devices exceed one node.
+    """
+    links: list[LinkSpec] = []
+    intra_package = channels.get("d2d_intra_package")
+    if (intra_package is not None and intra_package.effective_uni_bw_gbps
+            and dies_per_package > 1):
+        packages = math.ceil(num_devices / dies_per_package)
+        for package in range(packages):
+            members = tuple(range(
+                package * dies_per_package,
+                min(num_devices, (package + 1) * dies_per_package),
+            ))
+            if len(members) < 2:
+                continue
+            name = (
+                "d2d_intra_package" if packages == 1
+                else f"d2d_intra_package:package{package}"
+            )
+            links.append(LinkSpec(
+                name=name, channel="d2d_intra_package",
+                capacity_bytes_per_ms=float(intra_package.effective_uni_bw_gbps) * 1e6,
+                latency_us=float(intra_package.alpha_us),
+                members=members,
+                scope="fabric:d2d_intra_package",
+                source="comm_default_transfer_channels_not_measured",
+                semantics=str(intra_package.channel_semantics or "direct"),
+                protocol=str(intra_package.protocol),
+            ))
+    intra_node = channels.get("d2d_intra_node")
+    if intra_node is not None and intra_node.effective_uni_bw_gbps:
+        links.append(LinkSpec(
+            name="d2d_intra_node", channel="d2d_intra_node",
+            capacity_bytes_per_ms=float(intra_node.effective_uni_bw_gbps) * 1e6,
+            latency_us=float(intra_node.alpha_us),
+            members=tuple(range(num_devices)),
+            scope="fabric:d2d_intra_node",
+            source="comm_default_transfer_channels_not_measured",
+            semantics=str(intra_node.channel_semantics or "unknown"),
+            protocol=str(intra_node.protocol),
+        ))
+    inter_node = channels.get("d2d_inter_node")
+    if (inter_node is not None and inter_node.effective_uni_bw_gbps
+            and num_devices > max(1, ranks_per_node)):
+        links.append(LinkSpec(
+            name="d2d_inter_node", channel="d2d_inter_node",
+            capacity_bytes_per_ms=float(inter_node.effective_uni_bw_gbps) * 1e6,
+            latency_us=float(inter_node.alpha_us),
+            members=tuple(range(num_devices)),
+            scope="fabric:d2d_inter_node",
+            source="comm_default_transfer_channels_not_measured",
+            semantics=str(inter_node.channel_semantics or "switched"),
+            protocol=str(inter_node.protocol),
+        ))
+    return links
+
+
+def _parse_links(
+    raw: Any,
+    num_devices: int,
+    arch: str,
+    *,
+    dies_per_package: int = 1,
+    ranks_per_node: int | None = None,
+    channels: Mapping[str, TransferChannelSpec] | None = None,
+) -> list[LinkSpec]:
+    if channels is None:
+        channels = default_transfer_channels(
+            arch, dies_per_package=dies_per_package,
+        )
     if raw is None:
-        rate_gbps = 196.0 if arch == "A3" else 392.0 if arch == "A5" else 168.0
-        return [LinkSpec(
-            name="d2d", channel="d2d_intra_node",
-            capacity_bytes_per_ms=rate_gbps * 1e6,
-            latency_us=2.5, members=tuple(range(num_devices)),
-            scope="fabric:default",
-            source="arch_default_not_measured",
-        )]
+        return _channel_links(
+            channels, num_devices=num_devices,
+            dies_per_package=dies_per_package,
+            ranks_per_node=int(ranks_per_node or num_devices),
+        )
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raise A3InputError("machine.links_invalid")
     links: list[LinkSpec] = []
     for index, item in enumerate(raw):
         entry = _mapping(item, "machine.link_invalid")
-        allowed = {"name", "channel", "capacity_bytes_per_ms", "capacity_gbps", "latency_us", "members", "scope", "source"}
+        allowed = {
+            "name", "channel", "capacity_bytes_per_ms", "capacity_gbps",
+            "latency_us", "members", "scope", "source", "semantics",
+            "transport_semantics", "protocol",
+        }
         _unknown(entry, allowed, f"machine.links[{index}]")
         capacity = entry.get("capacity_bytes_per_ms")
         if capacity is None and entry.get("capacity_gbps") is not None:
@@ -503,14 +812,41 @@ def _parse_links(raw: Any, num_devices: int, arch: str) -> list[LinkSpec]:
         members = tuple(sorted({_int(v, "machine.link_member_invalid") for v in members_raw}))
         if not members or any(member >= num_devices for member in members):
             raise A3InputError("machine.link_member_out_of_range")
+        channel = _text(entry.get("channel", "d2d_intra_node"), "machine.link_channel_invalid")
+        declared_protocol = channels.get(channel)
+        protocol = str(
+            entry.get("protocol")
+            or (declared_protocol.protocol if declared_protocol is not None else "")
+        )
+        # An explicit fixture must *declare* mesh vs switched; when it names a
+        # channel the machine itself declares, that channel's semantics carry
+        # over (A2 HCCS mesh, A3 HCCS_SW switch, SIO pair).  A link on no
+        # declared channel is a shared pipe instead of being silently promoted
+        # to a dedicated-pair fabric.
+        semantics = str(
+            entry.get("semantics")
+            or entry.get("transport_semantics")
+            or (
+                declared_protocol.channel_semantics
+                if declared_protocol is not None
+                and declared_protocol.channel_semantics in {
+                    "mesh", "direct", "switched",
+                }
+                else "unknown"
+            )
+        ).strip().lower()
+        if semantics not in {"mesh", "switched", "direct", "unknown"}:
+            raise A3InputError(f"machine.link_semantics_invalid:{semantics}")
         links.append(LinkSpec(
             name=_text(entry.get("name", f"link{index}"), "machine.link_name_invalid"),
-            channel=_text(entry.get("channel", "d2d_intra_node"), "machine.link_channel_invalid"),
+            channel=channel,
             capacity_bytes_per_ms=_positive_float(capacity, "machine.link_capacity_invalid"),
             latency_us=_positive_float(entry.get("latency_us", 0.0), "machine.link_latency_invalid", allow_zero=True),
             members=members,
-            scope=_text(entry.get("scope", f"link{index}"), "machine.link_scope_invalid"),
+            scope=_text(entry.get("scope", f"fabric:{channel}"), "machine.link_scope_invalid"),
             source=str(entry.get("source", "declared")),
+            semantics=semantics,
+            protocol=protocol,
         ))
     return links
 

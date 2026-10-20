@@ -41,3 +41,36 @@ python -m mindie_sim predict --input examples/a3_mla_moe_predict.json
 python -m mindie_sim should  --input examples/a3_should_dense.json
 python -m mindie_sim search  --input examples/a3_search_dense.json
 ```
+
+## A2 predictive support and fitted physical calibration (v0.8, measured round)
+
+The predictive path now targets **A2 (`Ascend910B4`) and A3 (`Ascend910_9362`)**
+through the same machine-physics layer, with no per-SKU fudge factors:
+
+* **A2 first-class**: profile-derived `MachineSpec` (clock precedence
+  override > live `npu-smi` > CANN `.ini`), evidence-corrected AIC/L2 catalog,
+  HCCS mesh + no-SIO link model, mesh vs switched semantics, and per-op fabric
+  scope instead of `links[0]`.
+* **Physical calibration** (`mindie_sim/a3_physical_calibration.py`): a versioned,
+  provenance-bearing artifact fitted only on train measurements
+  (`launch + max(compute, memory)` with fitted tiles, wave quantization,
+  L2 blend and shape-tail terms). `predict --physical-calibration PATH
+  --timing-scope SCOPE` uses it; unmodeled families fall back with the artifact's
+  own reason. Timing scopes (batched amortized vs per-call) are never mixed.
+* **Structural fixes**: additive launch (no max-composed 20 µs floor), AIC count
+  from the machine, invented efficiency floors removed, correct PV contraction
+  axis, exact `machine_key` calibration joins.
+
+Measured on real A2/A3 hardware in this round (train-only fits; blinded test set 2
+frozen before any outcome): A2 344 train conditions / 66 heldout, A3 212 train /
+80 heldout. Fitted CV: **A2 GEMM 9.71 %**, A2 add/rmsnorm/swiglu/softmax 2.4–4.0 %,
+**A3 GEMM 16.05 % (per-call) / 16.10 % (batched)**, A3 rmsnorm 6.13 %, softmax 6.98 %.
+Frozen held-out test set 2: **A2 22.80 % WAPE (coverage 0.9545)**,
+**A3 45.72 % WAPE (coverage 0.9125)**, combined 29.67 % over 136/146 conditions.
+Both verdicts are **rejected** against the predeclared gates; the fitted layer is
+strongest where it applies (A2 GEMM 4.78 %, A3 GEMM 16.87 %), and the remaining
+error is concentrated in unmodeled batched families and protocol/declaration
+mismatches. A5 is deliberately deferred.
+
+Full method, tables, gates, limitations and evidence paths:
+[`docs/a2-a3-measured-accuracy.md`](docs/a2-a3-measured-accuracy.md).

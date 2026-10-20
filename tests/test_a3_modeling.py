@@ -607,6 +607,10 @@ def test_calibration_changes_prediction_and_revision_is_metadata():
         "analytic_ms": float(qk["analytic_ms"]),
         "source": "normalized-observed", "source_class": "measured",
         "dtype": "bf16", "layout": "contiguous",
+        # A measured residual is hardware-keyed.  This observation used to omit
+        # the identity and matched every machine through an empty-machine_key
+        # wildcard -- the exact mechanism that let A3 residuals reach A2.
+        "machine_key": "normalized-test-die",
         "features": {"weight_dtype": "bf16", "activation_dtype": "bf16",
                      "compute_dtype": "bf16", "accumulation_dtype": "backend_default",
                      "quantization": "none"},
@@ -1437,6 +1441,8 @@ def test_public_calibration_features_separate_bf16_and_w8a16():
         "shape": {"m": 8, "n": 16, "k": 64}, "duration_ms": 2.0,
         "analytic_ms": 1.0, "source_class": "measured", "source": "real-label",
         "dtype": "bf16", "layout": "contiguous",
+        # Hardware identity is required to consume a residual (no wildcard).
+        "machine_key": "normalized-test-die",
         "features": {"weight_dtype": "bf16", "activation_dtype": "bf16",
                      "compute_dtype": "bf16", "accumulation_dtype": "backend_default",
                      "quantization": "none"},
@@ -1911,11 +1917,16 @@ def test_communication_backend_is_first_class_for_matching_and_resources():
     from mindie_sim.a3_cost import PredictiveCostModel
     from mindie_sim.a3_types import CaseSpec
 
+    # The measurement is bound to the machine it ran on: an unbound observation
+    # is refused for every keyed query (the old empty-key wildcard is how A3
+    # curves reached other parts).
     conditions = [
         CommCondition("sio", "all_reduce_only", 1024, 0.5, 1,
+                      hardware_key="normalized-test-die",
                       ranks=2, dtype="bf16", algorithm="all_reduce_only",
                       execution_backend="aiv"),
         CommCondition("sio", "all_reduce_only", 1024, 0.5, 1,
+                      hardware_key="normalized-test-die",
                       ranks=2, dtype="bf16", algorithm="all_reduce_only",
                       execution_backend="aicpu"),
     ]
@@ -1944,7 +1955,14 @@ def test_communication_backend_is_first_class_for_matching_and_resources():
         "max_num_batched_tokens": 16, "max_model_len": 128, "tp": 2,
         "communication_backend": "aiv",
     })
-    payload["machine"]["links"][0]["name"] = "sio"
+    # The collective placement is a physical fabric.  Renaming an HCCS link to
+    # "sio" used to be enough for the cost model to *guess* SIO placement from
+    # the name; placement now comes from the declared channel, so the fixture
+    # declares a real intra-package SIO pair.
+    payload["machine"]["links"] = [{
+        "name": "d2d_intra_package", "channel": "d2d_intra_package",
+        "capacity_gbps": 100, "latency_us": 1.0, "members": [0, 1],
+    }]
     case_spec = CaseSpec.from_mapping(payload)
     baseline = predict(payload)
     with_backend = CaseSpec(
@@ -1996,7 +2014,15 @@ def test_actual_paired_steady_typed_whole_span_bridge():
             "vector_ops_per_s": 1e13, "hbm_bw_bytes_per_s": 1e12,
             "mte_bw_bytes_per_s": 2e12,
         },
-        "links": [{"name": "d2d", "capacity_gbps": 196, "members": [0, 1]}],
+        # A measured "sio" collective ran on the dual-die pair wire; a fixture
+        # that only declares an HCCS link now fails link resolution instead of
+        # silently pricing SIO traffic on it.
+        "links": [
+            {"name": "d2d_intra_node", "channel": "d2d_intra_node",
+             "capacity_gbps": 196, "members": [0, 1]},
+            {"name": "d2d_intra_package", "channel": "d2d_intra_package",
+             "capacity_gbps": 190, "latency_us": 0.8, "members": [0, 1]},
+        ],
     })
     model = PredictiveCostModel(
         machine_spec,
@@ -2089,7 +2115,18 @@ def test_typed_whole_span_without_stages_is_envelope_only_and_errors_visible():
     from mindie_sim.a3_ops import OpSpec
 
     machine_spec = MachineSpec.from_mapping({
-        **machine(2), "hardware_key": "Ascend910_9362",
+        **{
+            **machine(2),
+            # The measured condition is an intra-package SIO collective, so the
+            # machine must declare the pair wire it actually ran on.
+            "links": [
+                {"name": "d2d_intra_node", "channel": "d2d_intra_node",
+                 "capacity_gbps": 100, "latency_us": 1.0, "members": [0, 1]},
+                {"name": "d2d_intra_package", "channel": "d2d_intra_package",
+                 "capacity_gbps": 190, "latency_us": 0.8, "members": [0, 1]},
+            ],
+        },
+        "hardware_key": "Ascend910_9362",
     })
     condition = CommCondition(
         placement="sio", mode="all_reduce_only", size_bytes=2048,
@@ -2173,7 +2210,7 @@ def test_communication_backend_survives_store_and_controls_matching():
         op_family="all_reduce", phase="communication", recipe="toy",
         shape={"bytes": 1024, "ranks": 2}, duration_ms=0.5, analytic_ms=1.0,
         source="synthetic-contract", source_class="measured", split="train",
-        hardware_key="A3:sio", dtype="bf16", layout="lane",
+        hardware_key="A3", dtype="bf16", layout="lane",
         timing_scope="communication_lane",
         features={"placement": "sio", "mode": "all_reduce_only", "ranks": 2,
                   "dtype": "bf16", "algorithm": "all_reduce_only",
@@ -2215,7 +2252,8 @@ def test_typed_aiv_communication_expands_to_real_stages_not_scalar_label():
          "reservation_capacities": {"aiv_slots": 2.0}},
     )
     condition = CommCondition(
-        "sio", "all_reduce_only", 1024, 0.5, 1, ranks=2, dtype="bf16",
+        "sio", "all_reduce_only", 1024, 0.5, 1,
+        hardware_key="normalized-test-die", ranks=2, dtype="bf16",
         algorithm="all_reduce_only", execution_backend="aiv",
         observed_execution="aiv", collective="all_reduce", reduction="sum",
         group_size=2, execution_stages=stages,
@@ -2231,7 +2269,11 @@ def test_typed_aiv_communication_expands_to_real_stages_not_scalar_label():
         "communication_backend": "aiv",
         "communication_observed_backend": "aiv",
     })
-    payload["machine"]["links"][0]["name"] = "sio"
+    payload["machine"]["links"] = [{
+        # Declared SIO pair: placement comes from the channel, not the name.
+        "name": "d2d_intra_package", "channel": "d2d_intra_package",
+        "capacity_gbps": 100, "latency_us": 1.0, "members": [0, 1],
+    }]
     spec = CaseSpec.from_mapping(payload)
     typed = CaseSpec(
         machine=spec.machine, model=spec.model, workload=spec.workload,

@@ -3,6 +3,23 @@
 The curve is expressed in per-call normalized work; the engine receives total
 loop work and the caller's requested delay once.  Missing curves produce an
 explicit machine-gap or analytic status, never a calibrated zero.
+
+[Invariants]
+  * Hardware identity is an exact join.  A query that names a machine key only
+    sees observations for that same key; an observation imported without a key
+    (or for another machine) is refused and counted in the result's ``identity``
+    block, never pooled across SKUs.
+  * Placement is a declared fabric token.  An unknown token is kept as declared
+    so it cannot match another fabric's measured curve.
+  * No measured curve means the analytic link/topology estimate, with the
+    reason attached.
+
+[Timeouts & Locks]
+  Pure in-memory arithmetic and one bounded resource-engine run; no I/O, locks,
+  device or sleep.
+
+[Side-Effect Policy]
+  No filesystem/network/global writes.
 """
 from __future__ import annotations
 
@@ -95,6 +112,30 @@ class CommCondition:
     algorithm_regime: str = ""
 
 
+#: Declared fabric tokens.  A token maps to itself or to the canonical spelling
+#: of the same physical fabric; anything else is *not* mapped (an unknown token
+#: stays unknown so it can never borrow a measured curve from another fabric).
+COMM_PLACEMENT_ALIASES: dict[str, str] = {
+    "sio": "sio", "d2d_intra_package": "sio", "intra_package": "sio",
+    "die_pair": "sio",
+    "hccssw": "hccssw", "hccs_sw": "hccssw", "hccs_switch": "hccssw",
+    "hccs": "hccs", "intra_node": "hccs", "d2d_intra_node": "hccs",
+    "roce": "roce", "inter_node": "roce", "d2d_inter_node": "roce",
+    "ub": "ub", "ub_mesh": "ub", "ubmesh": "ub",
+}
+
+
+def communication_placement_token(placement: str) -> str:
+    """Canonical fabric token for a declared placement.
+
+    The previous rule collapsed everything that did not contain ``sio`` onto
+    ``hccssw``, which silently mapped an A5 UB-Mesh fabric (and RoCE) onto
+    A3-measured HCCS switch curves.  An unrecognised token is preserved instead.
+    """
+    key = str(placement or "").strip().lower()
+    return COMM_PLACEMENT_ALIASES.get(key, key)
+
+
 class CommunicationCalibration:
     """Affine size curves + shared-engine contention from measured training."""
 
@@ -102,6 +143,77 @@ class CommunicationCalibration:
         self.conditions = list(conditions)
         self._by = {(item.placement, item.mode, item.size_bytes): item for item in self.conditions}
         self._placements = sorted({item.placement for item in self.conditions})
+
+    @staticmethod
+    def _strip_placement_suffix(key: str, placement: str) -> str:
+        """Remove a redundant ``<machine>:<placement>`` suffix.
+
+        The comm importer writes ``<device>:<placement>``.  The placement is
+        already a first-class condition field and is an exact query filter, so
+        the suffix is redundant identity, not a wildcard: stripping it makes the
+        join *more* specific (same machine **and** same fabric), never broader.
+        A suffix that is not this condition's placement is left intact and can
+        therefore only match a query that names it verbatim.
+        """
+        text = str(key or "").strip()
+        placement = str(placement or "").strip()
+        if placement and text.endswith(":" + placement):
+            return text[: -len(placement) - 1]
+        return text
+
+    @classmethod
+    def observation_machine_key(cls, item: "CommCondition") -> str:
+        """Machine identity of one observation; empty means unbound."""
+        return cls._strip_placement_suffix(
+            str(item.hardware_key or ""), str(item.placement or ""),
+        )
+
+    @classmethod
+    def _identity_matches(cls, item: "CommCondition", hardware_key: str) -> bool:
+        """Exact machine join.  An unkeyed query is an explicit fleet query."""
+        key = str(hardware_key or "").strip()
+        if not key:
+            return True
+        query = cls._strip_placement_suffix(key, str(item.placement or ""))
+        identity = cls.observation_machine_key(item)
+        return bool(identity) and identity == query
+
+    def _identity_audit(
+        self, placement: str, modes: Sequence[str], hardware_key: str,
+    ) -> dict[str, Any] | None:
+        """Conditions refused for this machine, with the reason each was refused."""
+        key = str(hardware_key or "").strip()
+        if not key:
+            return None
+        scope = [
+            item for item in self.conditions
+            if item.placement == placement and item.mode in modes
+        ]
+        refused = [item for item in scope if not self._identity_matches(item, key)]
+        if not refused:
+            return None
+        unbound = [item for item in refused if not self.observation_machine_key(item)]
+        return {
+            "machine_key": key,
+            "refused_observations": {
+                "count": len(refused),
+                "unbound": len(unbound),
+                "mismatched": len(refused) - len(unbound),
+                "examples": [
+                    {
+                        "mode": item.mode,
+                        "size_bytes": int(item.size_bytes),
+                        "hardware_key": str(item.hardware_key or ""),
+                        "reason": (
+                            "hardware_key_unbound"
+                            if not self.observation_machine_key(item)
+                            else "hardware_key_mismatch"
+                        ),
+                    }
+                    for item in refused[:8]
+                ],
+            },
+        }
 
     @classmethod
     def from_store(cls, store: SQLiteCalibrationStore) -> "CommunicationCalibration":
@@ -181,10 +293,9 @@ class CommunicationCalibration:
         return sorted(
             (item.size_bytes, item.median_ms) for item in self.conditions
             if item.placement == placement and item.mode == mode
-            and (not hardware_key or not item.hardware_key
-                 or item.hardware_key == hardware_key
-                 or item.hardware_key.startswith(hardware_key + ":")
-                 or hardware_key.startswith(item.hardware_key + ":"))
+            # Identity is an exact join; an unbound observation is refused for
+            # every keyed query instead of being pooled across SKUs.
+            and self._identity_matches(item, hardware_key)
             and (not timing_scope or not item.timing_scope or item.timing_scope == timing_scope)
             and (ranks is None or int(item.ranks) == int(ranks))
             and (not dtype or not item.dtype or item.dtype == dtype)
@@ -459,11 +570,33 @@ class CommunicationCalibration:
         observed_aiv_cores: int | None = None,
         algorithm_regime: str = "",
     ) -> dict[str, Any]:
-        placement = "sio" if "sio" in placement.lower() else "hccssw"
+        placement = communication_placement_token(placement)
         if machine is not None and not hardware_key:
             hardware_key = machine.hardware_key
         if not timing_scope:
             timing_scope = "communication_lane"
+        identity = self._identity_audit(
+            placement,
+            ("all_reduce_only", "p2p_only", "all_reduce_plus_p2p"),
+            hardware_key,
+        )
+
+        def finish(result: dict[str, Any]) -> dict[str, Any]:
+            """Attach the machine-identity audit to every answer.
+
+            Refused observations are reported, never silently pooled: an
+            uncalibrated answer caused by identity keeps its own reason so a
+            caller can tell "never measured" from "measured on another part".
+            """
+            if identity is None:
+                return result
+            out = dict(result)
+            out["identity"] = identity
+            if not str(out.get("status", "")).startswith("calibrated"):
+                out["identity_reason"] = (
+                    "measured_conditions_exist_only_for_another_machine_key"
+                )
+            return out
         c_iso = self._lane_ms(
             placement, "all_reduce_only", size_bytes,
             hardware_key=hardware_key, timing_scope=timing_scope,
@@ -529,8 +662,7 @@ class CommunicationCalibration:
             and (ranks is None or item.ranks == int(ranks))
             and (not algorithm or not item.algorithm
                  or item.algorithm == algorithm)
-            and (not hardware_key or not item.hardware_key
-                 or item.hardware_key.split(":")[0] == hardware_key)
+            and self._identity_matches(item, hardware_key)
             and (not timing_scope or not item.timing_scope
                  or item.timing_scope == timing_scope)
             and (not topology_class or not item.topology_class
@@ -576,7 +708,7 @@ class CommunicationCalibration:
                 placement, size_bytes, requested_delay_ms, repetitions, mode,
                 machine,
             )
-            return {
+            return finish({
                 **analytic,
                 "status": "uncalibrated_ambiguous_execution",
                 "reason": "same-size rows differ in route/timing/cores/regime; "
@@ -589,7 +721,7 @@ class CommunicationCalibration:
                     {item.route for item in nearest if item.route}
                 ),
                 "stages": [],
-            }
+            })
         selected_stage_condition = (
             min(nearest, key=lambda item: (
                 abs(item.size_bytes - size_bytes), item.size_bytes,
@@ -608,13 +740,13 @@ class CommunicationCalibration:
             query_size=int(size_bytes),
         )
         if mode == "all_reduce_only" and c_iso <= 0:
-            return self._analytic_prediction(
+            return finish(self._analytic_prediction(
                 placement, size_bytes, requested_delay_ms, repetitions, mode, machine,
-            )
+            ))
         if mode == "p2p_only" and v_iso <= 0:
-            return self._analytic_prediction(
+            return finish(self._analytic_prediction(
                 placement, size_bytes, requested_delay_ms, repetitions, mode, machine,
-            )
+            ))
         def size_support_for(mode_name: str) -> dict[str, Any]:
             points = self._curve_points(
                 placement, mode_name,
@@ -746,12 +878,12 @@ class CommunicationCalibration:
                         "internal phase occupancy/stage work remains unknown; no fabricated stages",
                     ],
                 }
-            return self._analytic_prediction(
+            return finish(self._analytic_prediction(
                 placement, size_bytes, requested_delay_ms, repetitions, mode, machine,
-            )
+            ))
         if mode in {"all_reduce_only"}:
             lane_support = size_support_for("all_reduce_only")
-            return {
+            return finish({
                 "status": calibrated_status("calibrated_affine", lane_support),
                 **support_fields("all_reduce_only", "all_reduce"),
                 "placement": placement,
@@ -763,11 +895,11 @@ class CommunicationCalibration:
                 "span_ms": c_repeat,
                 "per_repetition": {"span_ms": c_iso, "all_reduce_ms": c_iso},
                 "assumptions": ["affine isolated-lane curve from measured training"],
-            }
+            })
         if mode in {"p2p_only"}:
             delay = max(0.0, float(requested_delay_ms))
             lane_support = size_support_for("p2p_only")
-            return {
+            return finish({
                 "status": calibrated_status("calibrated_affine", lane_support),
                 **support_fields("p2p_only", "p2p"),
                 "placement": placement,
@@ -779,7 +911,7 @@ class CommunicationCalibration:
                 "span_ms": delay + v_repeat,
                 "per_repetition": {"span_ms": v_iso, "p2p_ms": v_iso},
                 "assumptions": ["affine isolated-lane curve from measured training"],
-            }
+            })
         joint_intercept, joint_slope = self._curve(
             placement, "all_reduce_plus_p2p",
             hardware_key=hardware_key, timing_scope=timing_scope,
@@ -811,7 +943,7 @@ class CommunicationCalibration:
         v_duration = max(0.0, v_end - v_start)
         span = result["makespan_ms"]
         joint_support = size_support_for("all_reduce_plus_p2p")
-        return {
+        return finish({
             "status": calibrated_status(
                 "calibrated_affine_shared_lane", joint_support,
             ),
@@ -845,9 +977,10 @@ class CommunicationCalibration:
                 "shared-lane remaining work is advanced by ResourceEngine at the requested start offset",
                 "measured raw offsets/spans remain in the store; not used as condition identity",
             ],
-        }
+        })
 
 
 __all__ = [
-    "CommCondition", "CommunicationCalibration", "CommunicationExecutionSpec",
+    "COMM_PLACEMENT_ALIASES", "CommCondition", "CommunicationCalibration",
+    "CommunicationExecutionSpec", "communication_placement_token",
 ]

@@ -6,20 +6,41 @@
   shape/feature coverage, and produce an executable manifest.  Ingest keeps
   train and heldout split labels separate.
 
+[Estimator contract]
+  The calibration target of a condition is ``duration_trial_median`` =
+  ``median over trials of (median over that trial's raw repeats)``.  A trial is
+  one runner invocation, identified by ``(run_id, case_id)``; a repeat without a
+  ``case_id`` is its own single-repeat trial.  The acceptance scorer scores
+  exactly this statistic (``median of trial medians``), so the pooled median
+  over every repeat (``duration_median``) is retained as a *diagnostic* only and
+  exported next to the target as ``pooled_over_target``.  The two differ
+  whenever trials disagree or carry unequal repeat counts; a fit against the
+  pooled median is fitted to a different functional than the score.
+
 [Invariants]
+  * Only ``source_class in {measured, observed}``, ``synthetic = false``,
+    non-empty ``source``, positive duration/analytic and ``split = train``
+    repeats may calibrate.  Heldout is write-only (leakage rule L5):
+    ``as_calibration_store(include_heldout=True)`` is refused outright.
   * Independent measurements at the same semantic condition are never dropped:
     only an explicitly identified run/case/repeat is idempotent.
   * ``sample_key`` includes hardware, op family, phase, recipe, shape, dtype,
-    layout, features, competition and split.  Revision/source are metadata.
-  * Calibration statistics include only measured/observed, non-synthetic
-    samples.  Synthetic-as-measured is rejected.
-  * Raw repeats, timing protocol/environment and details survive ingestion.
+    layout, features, competition, protocol, environment, timing scope and
+    split.  Revision, source, die and visible devices are provenance, not
+    semantics.
+  * An observation with an empty hardware key never responds to a query that
+    names a machine (audit blocker B7).  ``MachineBoundCalibrationStore``
+    refuses that wildcard and reports the refusal reason.
+  * Provenance survives ingestion: run id, case id, repeat ordinal, die,
+    visible devices, protocol signature, timing scope, source class and the raw
+    repeat value are columns of ``measurements``.
   * Pending request deduplication is separate from measurement deduplication.
   * Heldout rows stay heldout and are excluded from the default calibration
     view.
   * Status is pending/running/completed/failed; no NPU job/lease is created.
-  * One current contract: business tables are created directly from executable
-    SQL.  No schema-version row, migration ladder or reflection gate exists.
+  * The schema version lives in ``PRAGMA user_version``.  Migrations are
+    additive ``ALTER TABLE ... ADD COLUMN`` statements only; aggregates are
+    recomputed from the unmodified measurement rows.
 
 [Timeouts & Locks]
   SQLite WAL and ``busy_timeout=5000`` on every connection.  No filesystem
@@ -36,11 +57,12 @@ import math
 import sqlite3
 import statistics
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterator, Mapping, Sequence
 
-from .a3_cost import CalibrationObservation, CalibrationStore
-from .a3_operator_curve_protocol import canonical_protocol
+from .a3_cost import CalibrationObservation, CalibrationResult, CalibrationStore
+from .a3_operator_curve_protocol import canonical_protocol, protocol_signature
 from .a3_store_types import (
     SampleRecord, _json, _measurement_key, _percentile, _semantic_key,
     _utc_now, canonical_timing_scope,
@@ -48,6 +70,10 @@ from .a3_store_types import (
 from .a3_types import A3InputError
 
 STATUSES = ("pending", "running", "completed", "failed")
+#: ``PRAGMA user_version`` of the current contract; additive migrations only.
+SCHEMA_VERSION = 1
+#: Explicit "not attested" state for provenance columns, never a wildcard.
+UNKNOWN_IDENTITY = "unknown"
 _REQUEST_COLUMNS = (
     "request_id", "request_key", "hardware_key", "op_family", "phase", "recipe",
     "shape_json", "dtype", "layout", "features_json", "competition_json", "status",
@@ -84,6 +110,125 @@ def _shape_field(value: Any, reason: str) -> dict[str, float]:
     return shape
 
 
+def _identity_text(value: Any) -> str:
+    """Normalize an attested identity field; absence is ``""``, never a guess."""
+    if isinstance(value, (list, tuple)):
+        return ",".join(str(item).strip() for item in value if str(item).strip())
+    return str(value or "").strip()
+
+
+def _attested(*values: Any) -> str:
+    """First non-empty attestation, else the explicit ``unknown`` state."""
+    for value in values:
+        text = _identity_text(value)
+        if text:
+            return text
+    return UNKNOWN_IDENTITY
+
+
+def _protocol_signature(protocol: Mapping[str, Any] | None) -> str:
+    """Canonical protocol signature (same helper the curve layer groups on)."""
+    canonical = canonical_protocol(protocol)
+    return protocol_signature(canonical) if canonical else ""
+
+
+def _calibratable_repeat(item: Mapping[str, Any]) -> bool:
+    """Leakage rule L5: measured/observed, attributable, non-synthetic, positive."""
+    try:
+        duration = float(item["duration_ms"])
+        analytic = float(item["analytic_ms"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    return (
+        str(item.get("source_class", "")) in {"measured", "observed"}
+        and not item.get("synthetic")
+        and bool(str(item.get("source", "")).strip())
+        and math.isfinite(duration) and duration > 0
+        and math.isfinite(analytic) and analytic > 0
+    )
+
+
+def _trial_medians(calibratable: Sequence[Mapping[str, Any]]) -> list[float]:
+    """One trial = one runner invocation, keyed by ``(run_id, case_id)``.
+
+    Raw repeats that share a case id are events of the same invocation and never
+    become independent trials (leakage rule L7); repeats without a case id are
+    independent single-repeat trials.
+    """
+    groups: dict[tuple[str, str], list[float]] = {}
+    for item in calibratable:
+        case_id = str(item.get("case_id", "") or "")
+        trial = (
+            (str(item.get("run_id", "") or ""), case_id)
+            if case_id else ("", f"#{int(item['measurement_id'])}")
+        )
+        groups.setdefault(trial, []).append(float(item["duration_ms"]))
+    medians = [_percentile(values, 0.5) for values in groups.values()]
+    return [float(value) for value in medians if value is not None]
+
+
+class MachineBoundCalibrationStore(CalibrationStore):
+    """Calibration view whose machine identity is an exact join, never a wildcard.
+
+    A store row imported without a hardware key must not calibrate a machine it
+    was never measured on (audit blocker B7).  The view keeps every observation
+    for inspection, but a query that names a machine only sees observations
+    keyed to that same machine.  Refused observations are reported in the result
+    evidence with an explicit ``hardware_key_unbound`` / ``hardware_key_mismatch``
+    reason.  The store owns this guarantee rather than relying on the caller or
+    on the cost matcher's current filtering.
+    """
+
+    def __init__(
+        self,
+        observations: Sequence[CalibrationObservation] = (),
+        *,
+        rejections: Sequence[Mapping[str, Any]] = (),
+    ) -> None:
+        super().__init__(observations)
+        self._rejections = tuple(dict(item) for item in rejections)
+
+    def rejections(self) -> tuple[dict[str, Any], ...]:
+        """Conditions excluded when this view was built, each with its reason."""
+        return self._rejections
+
+    def factor_for(self, **query: Any) -> CalibrationResult:
+        machine_key = str(query.get("machine_key") or "").strip()
+        if not machine_key:
+            return super().factor_for(**query)
+        bound = tuple(
+            item for item in self.observations() if item.machine_key == machine_key
+        )
+        result = CalibrationStore(bound).factor_for(**query)
+        family = str(query.get("op_family", ""))
+        phase = str(query.get("phase", ""))
+        refused = [
+            item for item in self.observations()
+            if item.machine_key != machine_key
+            and item.op_family == family and item.phase == phase
+        ]
+        if not refused:
+            return result
+        evidence = dict(result.evidence or {})
+        evidence["machine_key"] = machine_key
+        evidence["refused_observations"] = {
+            "count": len(refused),
+            "unbound": sum(1 for item in refused if not item.machine_key),
+            "mismatched": sum(1 for item in refused if item.machine_key),
+            "examples": tuple(
+                {
+                    "recipe": item.recipe, "machine_key": item.machine_key,
+                    "reason": (
+                        "hardware_key_unbound" if not item.machine_key
+                        else "hardware_key_mismatch"
+                    ),
+                }
+                for item in refused[:8]
+            ),
+        }
+        return replace(result, evidence=evidence)
+
+
 class SQLiteCalibrationStore:
     """WAL SQLite raw-sample store; each operation opens a bounded connection."""
 
@@ -92,6 +237,7 @@ class SQLiteCalibrationStore:
         if self.path != ":memory:":
             Path(self.path).expanduser().parent.mkdir(parents=True, exist_ok=True)
         self._memory_connection: sqlite3.Connection | None = None
+        self.schema_upgraded = False
         self._ensure_tables()
 
     @contextmanager
@@ -122,8 +268,7 @@ class SQLiteCalibrationStore:
         with self._connect() as connection:
             self._create_tables(connection)
 
-    @staticmethod
-    def _create_tables(connection: sqlite3.Connection) -> None:
+    def _create_tables(self, connection: sqlite3.Connection) -> None:
         connection.executescript(
             """
             CREATE TABLE IF NOT EXISTS measurements (
@@ -153,7 +298,10 @@ class SQLiteCalibrationStore:
                 protocol_json TEXT NOT NULL DEFAULT '{}',
                 environment_json TEXT NOT NULL DEFAULT '{}',
                 details_json TEXT NOT NULL DEFAULT '{}',
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                die TEXT NOT NULL DEFAULT 'unknown',
+                visible_devices TEXT NOT NULL DEFAULT 'unknown',
+                protocol_signature TEXT NOT NULL DEFAULT ''
             );
             CREATE INDEX IF NOT EXISTS ix_measurements_sample
                 ON measurements(sample_key, split);
@@ -185,7 +333,12 @@ class SQLiteCalibrationStore:
                 timing_scope TEXT NOT NULL DEFAULT '',
                 protocol_json TEXT NOT NULL DEFAULT '{}',
                 environment_json TEXT NOT NULL DEFAULT '{}',
-                updated_at TEXT NOT NULL
+                updated_at TEXT NOT NULL,
+                duration_trial_median REAL,
+                trial_count INTEGER NOT NULL DEFAULT 0,
+                protocol_signature TEXT NOT NULL DEFAULT '',
+                die_values_json TEXT NOT NULL DEFAULT '[]',
+                visible_devices_json TEXT NOT NULL DEFAULT '[]'
             );
             CREATE TABLE IF NOT EXISTS measurement_requests (
                 request_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -220,6 +373,122 @@ class SQLiteCalibrationStore:
                 ON measurement_requests(status, priority DESC);
             """
         )
+        self._migrate(connection)
+
+    # Columns added after the first frozen round-1 schema.  Append-only: the
+    # migration never rewrites or renames an existing column, and existing rows
+    # keep their measurement/sample keys.
+    _SCHEMA_MIGRATIONS: Mapping[str, Mapping[str, str]] = {
+        "measurements": {
+            "die": "TEXT NOT NULL DEFAULT 'unknown'",
+            "visible_devices": "TEXT NOT NULL DEFAULT 'unknown'",
+            "protocol_signature": "TEXT NOT NULL DEFAULT ''",
+        },
+        "sample_statistics": {
+            "duration_trial_median": "REAL",
+            "trial_count": "INTEGER NOT NULL DEFAULT 0",
+            "protocol_signature": "TEXT NOT NULL DEFAULT ''",
+            "die_values_json": "TEXT NOT NULL DEFAULT '[]'",
+            "visible_devices_json": "TEXT NOT NULL DEFAULT '[]'",
+        },
+    }
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Upgrade an older DB in place; aggregates are recomputed, rows untouched."""
+        version = int(connection.execute("PRAGMA user_version").fetchone()[0] or 0)
+        if version > SCHEMA_VERSION:
+            raise A3InputError(
+                f"calibration.schema_too_new:{version}>{SCHEMA_VERSION}"
+            )
+        if version == SCHEMA_VERSION:
+            return
+        added = 0
+        provenance_backfill = False
+        for table, columns in self._SCHEMA_MIGRATIONS.items():
+            present = {
+                str(row[1])
+                for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            for name, declaration in columns.items():
+                if name in present:
+                    continue
+                connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN {name} {declaration}"
+                )
+                added += 1
+                if table == "measurements" and name in {
+                    "die", "visible_devices", "protocol_signature",
+                }:
+                    provenance_backfill = True
+        if provenance_backfill:
+            self._backfill_provenance(connection)
+        if added:
+            self.schema_upgraded = True
+            # Trial medians and provenance aggregates are derived state: rebuild
+            # them from the measurement rows so an upgraded DB is immediately
+            # usable, without touching a single raw sample.
+            keys = connection.execute(
+                "SELECT DISTINCT sample_key FROM measurements ORDER BY sample_key"
+            ).fetchall()
+            for (key,) in keys:
+                self._recompute_statistics(connection, str(key))
+        connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+    @staticmethod
+    def _backfill_provenance(connection: sqlite3.Connection) -> None:
+        """Fill newly added provenance columns from each row's retained evidence.
+
+        Only the added columns are written; measured values, keys, splits and
+        timestamps are never touched (no destructive rewrite).  An attestation
+        already present in the row wins over the evidence fallback.
+        """
+        updates: list[tuple[str, str, str, int]] = []
+        for row in connection.execute(
+            """SELECT measurement_id, die, visible_devices, protocol_signature,
+                      protocol_json, environment_json, details_json
+               FROM measurements"""
+        ):
+            protocol_json = json.loads(row[4] or "{}")
+            environment_json = json.loads(row[5] or "{}")
+            details_json = json.loads(row[6] or "{}")
+            die = _attested(
+                "" if row[1] in {"", UNKNOWN_IDENTITY} else row[1],
+                environment_json.get("die"), environment_json.get("die_id"),
+                protocol_json.get("die"), details_json.get("die"),
+            )
+            visible = _attested(
+                "" if row[2] in {"", UNKNOWN_IDENTITY} else row[2],
+                environment_json.get("visible_devices"),
+                details_json.get("visible_devices"),
+            )
+            signature = str(row[3] or "") or _protocol_signature(protocol_json)
+            if (die, visible, signature) == (row[1], row[2], row[3]):
+                continue
+            updates.append((die, visible, signature, int(row[0])))
+        if updates:
+            connection.executemany(
+                """UPDATE measurements
+                   SET die = ?, visible_devices = ?, protocol_signature = ?
+                   WHERE measurement_id = ?""",
+                updates,
+            )
+
+    def schema_info(self) -> dict[str, Any]:
+        """Current schema version and the additive columns it guarantees."""
+        with self._connect() as connection:
+            version = int(connection.execute("PRAGMA user_version").fetchone()[0] or 0)
+            columns = {
+                table: [str(row[1]) for row in connection.execute(
+                    f"PRAGMA table_info({table})"
+                )]
+                for table in self._SCHEMA_MIGRATIONS
+            }
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "user_version": version,
+            "upgraded_from_legacy_schema": bool(getattr(self, "schema_upgraded", False)),
+            "columns": columns,
+        }
 
     # -- raw samples / statistics ---------------------------------------
     def record_sample(
@@ -248,6 +517,8 @@ class SQLiteCalibrationStore:
         protocol: Mapping[str, Any] | None = None,
         environment: Mapping[str, Any] | None = None,
         details: Mapping[str, Any] | None = None,
+        die: str = "",
+        visible_devices: str = "",
         measurement_key: str = "",
     ) -> dict[str, Any]:
         source_class = str(source_class).strip().lower()
@@ -299,6 +570,18 @@ class SQLiteCalibrationStore:
         }
         key = _semantic_key(payload)
         mkey = measurement_key or _measurement_key(run_id, case_id, repeat_index, key)
+        # Provenance, not semantics: an unattested die/device set is stored as
+        # the explicit "unknown" state and never enters ``sample_key``, so a
+        # missing attestation cannot fork or wildcard a measured condition.
+        die_value = _attested(
+            die, environment_json.get("die"), environment_json.get("die_id"),
+            protocol_json.get("die"), details_json.get("die"),
+        )
+        visible_value = _attested(
+            visible_devices, environment_json.get("visible_devices"),
+            details_json.get("visible_devices"),
+        )
+        signature = _protocol_signature(protocol_json)
         now = _utc_now()
         with self._connect() as connection:
             existing = connection.execute(
@@ -314,14 +597,16 @@ class SQLiteCalibrationStore:
                     shape_json, dtype, layout, features_json, competition_json,
                     duration_ms, analytic_ms, source, source_class, synthetic,
                     revision, run_id, case_id, repeat_index, split, timing_scope,
-                    protocol_json, environment_json, details_json, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    protocol_json, environment_json, details_json, created_at,
+                    die, visible_devices, protocol_signature
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     mkey, key, hardware_key, op_family, phase, recipe, _json(shape_json),
                     dtype, layout, _json(features_json), _json(competition_json),
                     duration, analytic, source, source_class, int(synthetic),
                     revision, run_id, case_id, int(repeat_index), split, timing_scope,
                     _json(protocol_json), _json(environment_json), _json(details_json), now,
+                    die_value, visible_value, signature,
                 ),
             )
             measurement_id = int(cursor.lastrowid)
@@ -329,36 +614,74 @@ class SQLiteCalibrationStore:
         return {"status": "inserted", "sample_key": key, "measurement_key": mkey,
                 "measurement_id": measurement_id}
 
-    @staticmethod
-    def _recompute_statistics(connection: sqlite3.Connection, sample_key: str) -> None:
-        row = connection.execute(
+    _STAT_MEASUREMENT_COLUMNS = (
+        "measurement_id", "duration_ms", "analytic_ms", "source",
+        "source_class", "synthetic", "run_id", "case_id", "timing_scope",
+        "protocol_json", "environment_json", "die", "visible_devices",
+    )
+    _SAMPLE_COLUMNS = (
+        "measurement_id", "measurement_key", "sample_key", "hardware_key",
+        "op_family", "phase", "recipe", "shape_json", "dtype", "layout",
+        "features_json", "competition_json", "duration_ms", "analytic_ms",
+        "source", "source_class", "synthetic", "revision", "run_id", "case_id",
+        "repeat_index", "split", "timing_scope", "protocol_json",
+        "environment_json", "details_json", "created_at", "die",
+        "visible_devices", "protocol_signature",
+    )
+    _STATISTICS_COLUMNS = (
+        "sample_key", "hardware_key", "op_family", "phase", "recipe",
+        "shape_json", "dtype", "layout", "features_json", "competition_json",
+        "split", "measurement_count", "calibratable_count", "run_count",
+        "run_ids_json", "duration_median", "duration_mean", "duration_min",
+        "duration_max", "duration_p90", "duration_std", "analytic_median",
+        "source_classes_json", "synthetic_count", "timing_scope",
+        "protocol_json", "environment_json", "updated_at",
+        "duration_trial_median", "trial_count", "protocol_signature",
+        "die_values_json", "visible_devices_json",
+    )
+    _JSON_COLUMNS = (
+        "shape", "features", "competition", "run_ids", "source_classes",
+        "protocol", "environment", "die_values", "visible_devices",
+    )
+
+    @classmethod
+    def _recompute_statistics(cls, connection: sqlite3.Connection, sample_key: str) -> None:
+        identity = connection.execute(
             """SELECT hardware_key, op_family, phase, recipe, shape_json, dtype,
                       layout, features_json, competition_json, split
                FROM measurements WHERE sample_key = ? LIMIT 1""",
             (sample_key,),
         ).fetchone()
-        if row is None:
+        if identity is None:
             return
-        rows = connection.execute(
-            """SELECT duration_ms, analytic_ms, source_class, synthetic, run_id,
-                      timing_scope, protocol_json, environment_json
-               FROM measurements WHERE sample_key = ?""",
-            (sample_key,),
-        ).fetchall()
-        calibratable = [
-            item for item in rows
-            if item[2] in {"measured", "observed"} and not item[3]
+        rows = [
+            dict(zip(cls._STAT_MEASUREMENT_COLUMNS, item))
+            for item in connection.execute(
+                "SELECT " + ", ".join(cls._STAT_MEASUREMENT_COLUMNS)
+                + " FROM measurements WHERE sample_key = ? ORDER BY measurement_id",
+                (sample_key,),
+            ).fetchall()
         ]
-        durations = [float(item[0]) for item in calibratable]
-        analytics = [float(item[1]) for item in calibratable]
-        run_ids = sorted({str(item[4]) for item in calibratable if item[4]})
-        source_classes = sorted({str(item[2]) for item in rows})
+        calibratable = [item for item in rows if _calibratable_repeat(item)]
+        durations = [float(item["duration_ms"]) for item in calibratable]
+        analytics = [float(item["analytic_ms"]) for item in calibratable]
+        # Calibration target = median over trials of per-trial repeat medians.
+        # The pooled median stays as the diagnostic column ``duration_median``.
+        trials = _trial_medians(calibratable)
+        run_ids = sorted({
+            str(item["run_id"]) for item in calibratable if item["run_id"]
+        })
+        source_classes = sorted({str(item["source_class"]) for item in rows})
         protocol = (
-            canonical_protocol(json.loads(calibratable[-1][6]))
+            canonical_protocol(json.loads(calibratable[-1]["protocol_json"]))
             if calibratable else {}
         )
-        environment = json.loads(calibratable[-1][7]) if calibratable else {}
-        timing_scope = str(calibratable[-1][5]) if calibratable else ""
+        environment = json.loads(calibratable[-1]["environment_json"]) if calibratable else {}
+        timing_scope = str(calibratable[-1]["timing_scope"]) if calibratable else ""
+        die_values = sorted({_attested(item["die"]) for item in rows})
+        visible_values = sorted({
+            _attested(item["visible_devices"]) for item in rows
+        })
         updated = _utc_now()
         connection.execute(
             """INSERT INTO sample_statistics(
@@ -367,8 +690,10 @@ class SQLiteCalibrationStore:
                 measurement_count, calibratable_count, run_count, run_ids_json,
                 duration_median, duration_mean, duration_min, duration_max,
                 duration_p90, duration_std, analytic_median, source_classes_json,
-                synthetic_count, timing_scope, protocol_json, environment_json, updated_at
-            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                synthetic_count, timing_scope, protocol_json, environment_json,
+                updated_at, duration_trial_median, trial_count, protocol_signature,
+                die_values_json, visible_devices_json
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             ON CONFLICT(sample_key) DO UPDATE SET
                 measurement_count=excluded.measurement_count,
                 calibratable_count=excluded.calibratable_count,
@@ -380,21 +705,39 @@ class SQLiteCalibrationStore:
                 source_classes_json=excluded.source_classes_json,
                 synthetic_count=excluded.synthetic_count,
                 timing_scope=excluded.timing_scope, protocol_json=excluded.protocol_json,
-                environment_json=excluded.environment_json, updated_at=excluded.updated_at""",
+                environment_json=excluded.environment_json, updated_at=excluded.updated_at,
+                duration_trial_median=excluded.duration_trial_median,
+                trial_count=excluded.trial_count,
+                protocol_signature=excluded.protocol_signature,
+                die_values_json=excluded.die_values_json,
+                visible_devices_json=excluded.visible_devices_json""",
             (
-                sample_key, row[0], row[1], row[2], row[3], row[4], row[5], row[6],
-                row[7], row[8], row[9], len(rows), len(calibratable), len(run_ids),
-                _json(run_ids), _percentile(durations, 0.5), statistics.fmean(durations) if durations else None,
-                min(durations) if durations else None, max(durations) if durations else None,
-                _percentile(durations, 0.9), statistics.pstdev(durations) if len(durations) > 1 else 0.0,
+                sample_key, identity[0], identity[1], identity[2], identity[3],
+                identity[4], identity[5], identity[6], identity[7], identity[8],
+                identity[9], len(rows), len(calibratable), len(run_ids),
+                _json(run_ids), _percentile(durations, 0.5),
+                statistics.fmean(durations) if durations else None,
+                min(durations) if durations else None,
+                max(durations) if durations else None,
+                _percentile(durations, 0.9),
+                statistics.pstdev(durations) if len(durations) > 1 else 0.0,
                 _percentile(analytics, 0.5), _json(source_classes),
-                sum(1 for item in rows if item[3]), timing_scope, _json(protocol),
-                _json(environment), updated,
+                sum(1 for item in rows if item["synthetic"]), timing_scope,
+                _json(protocol), _json(environment), updated,
+                _percentile(trials, 0.5), len(trials),
+                _protocol_signature(protocol), _json(die_values),
+                _json(visible_values),
             ),
         )
 
-    def samples(self, *, split: str | None = None) -> list[SampleRecord]:
-        query = "SELECT * FROM measurements"
+    def sample_rows(self, *, split: str | None = None) -> list[dict[str, Any]]:
+        """Every stored sample row plus its provenance columns.
+
+        ``SampleRecord`` predates the provenance columns; this view keeps die,
+        visible devices and the protocol signature alongside the raw repeat so
+        an import can be audited without re-reading the source JSON.
+        """
+        query = "SELECT " + ", ".join(self._SAMPLE_COLUMNS) + " FROM measurements"
         params: tuple[Any, ...] = ()
         if split is not None:
             query += " WHERE split = ?"
@@ -404,61 +747,108 @@ class SQLiteCalibrationStore:
             rows = connection.execute(query, params).fetchall()
         result = []
         for row in rows:
-            result.append(SampleRecord(
-                id=int(row[0]), measurement_key=str(row[1]), sample_key=str(row[2]),
-                hardware_key=str(row[3]), op_family=str(row[4]), phase=str(row[5]),
-                recipe=str(row[6]), shape=json.loads(row[7]), dtype=str(row[8]),
-                layout=str(row[9]), features=json.loads(row[10]),
-                competition=json.loads(row[11]), duration_ms=float(row[12]),
-                analytic_ms=float(row[13]), source=str(row[14]),
-                source_class=str(row[15]), synthetic=bool(row[16]),
-                revision=str(row[17]), run_id=str(row[18]), case_id=str(row[19]),
-                repeat_index=int(row[20]), split=str(row[21]), timing_scope=str(row[22]),
-                protocol=json.loads(row[23]), environment=json.loads(row[24]),
-                details=json.loads(row[25]),
-            ))
+            record = dict(zip(self._SAMPLE_COLUMNS, row))
+            for key in ("shape", "features", "competition", "protocol",
+                        "environment", "details"):
+                record[key] = json.loads(record.pop(key + "_json"))
+            result.append(record)
         return result
 
+    def samples(self, *, split: str | None = None) -> list[SampleRecord]:
+        return [
+            SampleRecord(
+                id=int(row["measurement_id"]),
+                measurement_key=str(row["measurement_key"]),
+                sample_key=str(row["sample_key"]),
+                hardware_key=str(row["hardware_key"]),
+                op_family=str(row["op_family"]), phase=str(row["phase"]),
+                recipe=str(row["recipe"]), shape=row["shape"],
+                dtype=str(row["dtype"]), layout=str(row["layout"]),
+                features=row["features"], competition=row["competition"],
+                duration_ms=float(row["duration_ms"]),
+                analytic_ms=float(row["analytic_ms"]),
+                source=str(row["source"]), source_class=str(row["source_class"]),
+                synthetic=bool(row["synthetic"]), revision=str(row["revision"]),
+                run_id=str(row["run_id"]), case_id=str(row["case_id"]),
+                repeat_index=int(row["repeat_index"]), split=str(row["split"]),
+                timing_scope=str(row["timing_scope"]),
+                protocol=row["protocol"], environment=row["environment"],
+                details=row["details"],
+            )
+            for row in self.sample_rows(split=split)
+        ]
+
     def statistics(self, *, split: str | None = "train") -> list[dict[str, Any]]:
-        query = "SELECT * FROM sample_statistics"
+        query = "SELECT " + ", ".join(self._STATISTICS_COLUMNS) + " FROM sample_statistics"
         params: tuple[Any, ...] = ()
         if split is not None:
             query += " WHERE split = ?"
             params = (split,)
         query += " ORDER BY op_family, phase, sample_key"
         with self._connect() as connection:
-            columns = [
-                "sample_key", "hardware_key", "op_family", "phase", "recipe",
-                "shape_json", "dtype", "layout", "features_json", "competition_json",
-                "split", "measurement_count", "calibratable_count", "run_count",
-                "run_ids_json", "duration_median", "duration_mean", "duration_min",
-                "duration_max", "duration_p90", "duration_std", "analytic_median",
-                "source_classes_json", "synthetic_count", "timing_scope",
-                "protocol_json", "environment_json", "updated_at",
-            ]
             rows = connection.execute(query, params).fetchall()
         result = []
         for row in rows:
-            record = dict(zip(columns, row))
-            for key in ("shape_json", "features_json", "competition_json",
-                        "run_ids_json", "source_classes_json", "protocol_json",
-                        "environment_json"):
-                record[key.removesuffix("_json")] = json.loads(record.pop(key))
+            record = dict(zip(self._STATISTICS_COLUMNS, row))
+            for key in self._JSON_COLUMNS:
+                record[key] = json.loads(record.pop(key + "_json"))
+            target = record["duration_trial_median"]
+            if target is None:
+                # Pre-trial-median aggregate: never silently keep fitting the
+                # pooled statistic, fall back only to report the target as the
+                # pooled median and let the estimator ratio stay 1.0.
+                target = record["duration_median"]
+            pooled = record["duration_median"]
+            record["calibration_target_ms"] = target
+            record["pooled_over_target"] = (
+                float(pooled) / float(target)
+                if pooled is not None and target not in (None, 0) else None
+            )
             result.append(record)
         return result
 
-    def as_calibration_store(self, *, include_heldout: bool = False) -> CalibrationStore:
-        observations = []
-        for record in self.statistics(split=None if include_heldout else "train"):
-            if int(record["calibratable_count"]) <= 0:
+    def as_calibration_store(
+        self, *, include_heldout: bool = False, hardware_key: str = "",
+    ) -> CalibrationStore:
+        """Build the fitting view; heldout is refused, never silently included.
+
+        ``hardware_key`` binds the view to one machine: unbound or
+        differently-keyed conditions are excluded with an explicit rejection
+        reason instead of wildcarding every machine (audit blocker B7).
+        """
+        if include_heldout:
+            # Leakage rule L5: heldout outcomes are write-only.  The previous
+            # ``pass`` here silently put them into the fit store.
+            raise A3InputError("calibration.heldout_fit_forbidden")
+        scope = str(hardware_key or "").strip()
+        observations: list[CalibrationObservation] = []
+        rejections: list[dict[str, Any]] = []
+        for record in self.statistics(split=None):
+            if record["split"] != "train":
+                reason = "heldout_excluded_from_fit"
+            elif int(record["calibratable_count"]) <= 0:
+                reason = "no_calibratable_repeats"
+            elif record["calibration_target_ms"] is None:
+                reason = "calibration_target_missing"
+            elif not str(record["hardware_key"]).strip():
+                reason = "hardware_key_unbound" if scope else ""
+            elif scope and str(record["hardware_key"]) != scope:
+                reason = "hardware_key_mismatch"
+            else:
+                reason = ""
+            if reason:
+                rejections.append({
+                    "sample_key": record["sample_key"],
+                    "op_family": record["op_family"], "phase": record["phase"],
+                    "recipe": record["recipe"], "split": record["split"],
+                    "hardware_key": record["hardware_key"], "reason": reason,
+                })
                 continue
-            if include_heldout and record["split"] != "train":
-                pass
             observations.append(CalibrationObservation(
                 op_family=record["op_family"], phase=record["phase"],
                 recipe=record["recipe"],
                 shape=tuple(sorted((str(k), float(v)) for k, v in record["shape"].items())),
-                duration_ms=float(record["duration_median"]),
+                duration_ms=float(record["calibration_target_ms"]),
                 analytic_ms=float(record["analytic_median"]),
                 source_class="measured", source="sqlite_calibration_statistics",
                 revision="", machine_key=record["hardware_key"],
@@ -472,7 +862,7 @@ class SQLiteCalibrationStore:
                     sort_keys=True, default=str,
                 ),
             ))
-        return CalibrationStore(observations)
+        return MachineBoundCalibrationStore(observations, rejections=rejections)
 
     def inventory(self) -> dict[str, Any]:
         from .a3_calibration_report import inventory_report
@@ -856,5 +1246,6 @@ class SQLiteCalibrationStore:
 
 
 __all__ = [
-    "STATUSES", "SampleRecord", "SQLiteCalibrationStore",
+    "MachineBoundCalibrationStore", "SCHEMA_VERSION", "STATUSES", "SampleRecord",
+    "SQLiteCalibrationStore", "UNKNOWN_IDENTITY",
 ]

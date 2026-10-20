@@ -16,7 +16,9 @@
   * Reference cycles use caller/profile per-die ops-per-cycle peaks and are
     lower bounds, not board-certified measurements or whole-kernel predictions.
   * Sustained clocks and short-burst clocks remain separate ranges; a boost
-    observation never becomes a sustained guarantee.
+    observation never becomes a sustained guarantee.  A sustained band is a
+    measurement: it is empty (``sustained_reference_us=None``) unless the caller
+    supplies one, and no family constant is substituted for it.
   * ``T(r,f) = [C + (1-r)*(W-C)]/f_MHz`` is reproducible arithmetic; ``r`` is a
     hypothetical removed fraction, not an identified bubble.
   * Link bounds are individual ceilings and are not summed across shared ports.
@@ -35,11 +37,11 @@ from .hardware_common import (
     A5_CANN_SIM_LINK_CEILINGS_BPC,
     A5_REFERENCE_PEAKS,
     SHORT_BURST_MHZ_RANGE,
-    SUSTAINED_MHZ_RANGE,
     HardwareError,
     _canonical_link_key,
     _finite,
     _float_value,
+    parse_mhz_range,
 )
 
 # Explicit A5 C8 FlashMLA Golden workload fixture.  The peaks are the A5
@@ -103,19 +105,17 @@ def _clock_value(value: Any, reason: str) -> float:
 
 
 def _resolve_clock_ranges(
-    sustained_mhz_range: Sequence[float],
-    short_burst_mhz_range: Sequence[float],
+    sustained_mhz_range: Sequence[float] | None,
+    short_burst_mhz_range: Sequence[float] | None,
 ) -> tuple[list[float], list[float]]:
-    try:
-        sustained = [_clock_value(value, "thermal_clock_range_invalid") for value in sustained_mhz_range]
-        burst = [_clock_value(value, "thermal_clock_range_invalid") for value in short_burst_mhz_range]
-    except TypeError as exc:
-        raise HardwareError("thermal_clock_range_invalid") from exc
-    if len(sustained) != 2 or len(burst) != 2:
+    # A sustained band is measured evidence: ``None``/empty stays unmeasured
+    # (empty list), and a supplied band is validated without substitution.  The
+    # short-burst band keeps its historical two-value contract.
+    sustained = parse_mhz_range(sustained_mhz_range, reason="thermal_clock_range_invalid")
+    burst = parse_mhz_range(short_burst_mhz_range, reason="thermal_clock_range_invalid")
+    if burst is None:
         raise HardwareError("thermal_clock_range_invalid")
-    sustained.sort()
-    burst.sort()
-    return sustained, burst
+    return (list(sustained) if sustained is not None else []), list(burst)
 
 
 def _frequencies(
@@ -156,8 +156,8 @@ def _time_basis(measurement_mhz: float | None) -> dict[str, Any]:
         ),
         "reference_mhz_for_cycles": None,
         "frequency_source": (
-            "caller/default sustained and short-burst ranges plus caller-supplied "
-            "extra/measurement frequencies"
+            "caller-supplied sustained (empty when unmeasured) and short-burst "
+            "ranges plus caller-supplied extra/measurement frequencies"
         ),
     }
 
@@ -207,7 +207,7 @@ def _result_shell(
 def unmodeled_thermal_bounds(
     reason: str,
     *,
-    sustained_mhz_range: Sequence[float] = SUSTAINED_MHZ_RANGE,
+    sustained_mhz_range: Sequence[float] | None = None,
     short_burst_mhz_range: Sequence[float] = SHORT_BURST_MHZ_RANGE,
     extra_frequencies_mhz: Sequence[float] = (),
     target_us: float | None = None,
@@ -319,7 +319,7 @@ def thermal_bounds(
     *,
     fp8_flops: float | None = None,
     bf16_flops: float | None = None,
-    sustained_mhz_range: Sequence[float] = SUSTAINED_MHZ_RANGE,
+    sustained_mhz_range: Sequence[float] | None = None,
     short_burst_mhz_range: Sequence[float] = SHORT_BURST_MHZ_RANGE,
     extra_frequencies_mhz: Sequence[float] = (),
     target_us: float | None = None,
@@ -410,10 +410,10 @@ def thermal_bounds(
             for frequency in frequencies
         }
         result["reference_lower_bounds_us"] = lower_bounds
-        result["sustained_reference_us"] = [
-            reference_time_us(cycles, sustained[0]),
-            reference_time_us(cycles, sustained[1]),
-        ]
+        if sustained:
+            result["sustained_reference_us"] = [
+                reference_time_us(cycles, frequency) for frequency in sustained
+            ]
         result["short_burst_reference_us"] = [
             reference_time_us(cycles, burst[0]),
             reference_time_us(cycles, burst[1]),
@@ -469,6 +469,11 @@ def thermal_bounds(
     result["assumptions"] = [
         f"cube reference source: {source_label}",
         "sustained thermal range is supplied evidence, not inferred from the configured clock",
+        (
+            f"sustained MHz band supplied by the caller: {sustained[0]:g}-{sustained[1]:g}"
+            if sustained
+            else "no sustained MHz band supplied; sustained_reference_us is null"
+        ),
         "short-burst clocks are never extrapolated to sustained performance",
         "the reference lower bound excludes launch, prologue/drain and resource contention",
         "W and C are aggregate PMU cycle counts; a missing half of the pair is not invented",

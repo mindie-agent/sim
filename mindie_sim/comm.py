@@ -71,6 +71,14 @@ class TransferChannelSpec:
     alpha_us: float = 1.5
     transport_mode: str = "direct"
     notes: str | None = None
+    # Declared contention semantics of the physical fabric behind this channel:
+    #   "mesh"     -- every endpoint pair owns a dedicated wire (A2 HCCS mesh);
+    #   "switched" -- one aggregate switch/pipe shared by all endpoints;
+    #   "direct"   -- a dedicated point-to-point wire (SIO die pair, PCIe);
+    #   "none"     -- the channel does not exist on this package.
+    # ``plan_replica_links`` divides one link's capacity only for "switched";
+    # mesh/direct channels scale by concurrent users of the *same* wire.
+    channel_semantics: str = "unknown"
 
     @property
     def effective_uni_bw_gbps(self) -> float | None:
@@ -112,6 +120,7 @@ class TransferChannelSpec:
             "pageable_uni_bw_gbps": self.pageable_uni_bw_gbps,
             "alpha_us": self.alpha_us,
             "transport_mode": self.transport_mode,
+            "channel_semantics": self.channel_semantics,
             "notes": self.notes,
         }
 
@@ -273,6 +282,73 @@ def parse_pcie_link_info(path_or_text: str | Path, *, source: str = "<lspci>") -
     )
 
 
+def _channel_semantics(protocol: str) -> str:
+    """Declared contention semantics implied by a fabric protocol name.
+
+    The protocol is physical evidence (``npu-smi info -t topo`` reports
+    ``HCCS`` / ``HCCS_SW`` / ``SIO``); the family string is not.  This keeps a
+    new SKU from silently inheriting another family's shared-pipe behaviour.
+    """
+    key = str(protocol).strip().upper()
+    if key == "HCCS":
+        # A2: every chip pair has its own HCCS wire (npu-smi -t topo shows the
+        # full 8x8 mesh, 7 links per chip) -- not one shared pipe.
+        return "mesh"
+    if key in {"HCCS_SW", "UB_SW", "SIO_SW"}:
+        return "switched"
+    if key.startswith("SIO"):
+        return "direct"
+    if key.startswith("ROCE") or key in {"AUTO"}:
+        return "switched"
+    if key in {"NONE_SINGLE_DIE", "NONE"}:
+        return "none"
+    if key.startswith("PCIE"):
+        return "direct"
+    # UB_MESH and any unlabelled protocol stay "unknown": an A5 unified-bus
+    # contention rule is not established here, so it keeps the conservative
+    # shared-pipe treatment instead of borrowing A2's mesh rule.
+    return "unknown"
+
+
+#: The single declared table of interconnect rates that no platform config or
+#: SKU catalog entry supplies.  Per-SKU values passed by the caller (or read
+#: from ``DeviceCapabilityProfile.memory_hierarchy_spec``) always win.  A
+#: channel absent here is *undeclared*, never silently borrowed from a family.
+_FAMILY_CHANNEL_DEFAULTS: dict[str, dict[str, float | str]] = {
+    "A2": {
+        "hccs_uni_gbps": 168.0, "roce_uni_gbps": 25.0,
+        "pcie_peak_uni_gbps": 50.0, "pageable_uni_gbps": 14.0,
+        "intra_node_protocol": "HCCS", "intra_node_alpha_us": 2.5,
+        "h2d_alpha_us": 2.0, "roce_alpha_us": 5.0,
+    },
+    "A3": {
+        "hccs_uni_gbps": 196.0, "roce_uni_gbps": 25.0,
+        "pcie_peak_uni_gbps": 50.0, "pageable_uni_gbps": 14.0,
+        "intra_node_protocol": "HCCS_SW", "intra_node_alpha_us": 2.5,
+        "h2d_alpha_us": 2.0, "roce_alpha_us": 5.0,
+    },
+    "A5": {
+        "hccs_uni_gbps": 392.0, "roce_uni_gbps": 50.0,
+        "pcie_peak_uni_gbps": 64.0, "pageable_uni_gbps": 20.0,
+        "intra_node_protocol": "UB_MESH", "intra_node_alpha_us": 1.8,
+        "h2d_alpha_us": 2.0, "roce_alpha_us": 5.0,
+    },
+}
+# An unlabelled arch_family keeps the conservative A2/A3-adjacent rate (the
+# same number the previous ``else 168.0`` branch produced) but declares the
+# protocol as UNKNOWN: an undeclared family is not evidence of a mesh.
+_UNKNOWN_FAMILY_CHANNEL_DEFAULTS: dict[str, float | str] = {
+    "hccs_uni_gbps": 168.0, "roce_uni_gbps": 25.0,
+    "pcie_peak_uni_gbps": 50.0, "pageable_uni_gbps": 14.0,
+    "intra_node_protocol": "UNKNOWN", "intra_node_alpha_us": 2.5,
+    "h2d_alpha_us": 2.0, "roce_alpha_us": 5.0,
+}
+#: Declared SIO (intra-package die-to-die) peak when the SKU profile does not
+#: supply ``intra_package_die_bw_gbps``.  Only used for a multi-die package (or
+#: an observed SIO topology), never for a single-die part.
+_DEFAULT_SIO_GBPS = 190.0
+
+
 def default_transfer_channels(
     arch_family: str,
     *,
@@ -285,22 +361,24 @@ def default_transfer_channels(
     overrides: Mapping[str, Any] | None = None,
 ) -> dict[str, TransferChannelSpec]:
     fam = arch_family.upper()
+    defaults = _FAMILY_CHANNEL_DEFAULTS.get(fam, _UNKNOWN_FAMILY_CHANNEL_DEFAULTS)
     sio_bw = intra_package_die_bw_gbps if intra_package_die_bw_gbps is not None else (
-        190.0 if (dies_per_package > 1 or (topo_snapshot and topo_snapshot.has_sio_intra_package)) else None
+        _DEFAULT_SIO_GBPS if (dies_per_package > 1 or (topo_snapshot and topo_snapshot.has_sio_intra_package)) else None
     )
-    hccs_uni = intra_node_hccs_bw_gbps if intra_node_hccs_bw_gbps is not None else (
-        392.0 if fam == "A5" else 196.0 if fam == "A3" else 168.0
+    hccs_uni = intra_node_hccs_bw_gbps if intra_node_hccs_bw_gbps is not None else float(
+        defaults["hccs_uni_gbps"]
     )
-    roce_uni = inter_node_roce_bw_gbps if inter_node_roce_bw_gbps is not None else (
-        50.0 if fam == "A5" else 25.0
+    roce_uni = inter_node_roce_bw_gbps if inter_node_roce_bw_gbps is not None else float(
+        defaults["roce_uni_gbps"]
     )
-    pcie_peak_uni = 50.0 if fam in {"A2", "A3"} else 64.0
+    pcie_peak_uni = float(defaults["pcie_peak_uni_gbps"])
     pcie_cal_uni = round(pcie_snapshot.effective_pinned_uni_bw_gbps, 3) if pcie_snapshot is not None else None
     pcie_cal_bi = round(pcie_cal_uni * 1.75, 3) if pcie_cal_uni is not None else None
-    pageable_uni = 14.0 if fam in {"A2", "A3"} else 20.0
-    intra_proto = topo_snapshot.intra_node_fabric if (topo_snapshot and topo_snapshot.intra_node_fabric != "UNKNOWN") else (
-        "UB_MESH" if fam == "A5" else "HCCS_SW" if fam == "A3" else "HCCS"
+    pageable_uni = float(defaults["pageable_uni_gbps"])
+    intra_proto = topo_snapshot.intra_node_fabric if (topo_snapshot and topo_snapshot.intra_node_fabric != "UNKNOWN") else str(
+        defaults["intra_node_protocol"]
     )
+    intra_semantics = _channel_semantics(intra_proto)
     channels: dict[str, TransferChannelSpec] = {
         "d2d_intra_package": TransferChannelSpec(
             channel="d2d_intra_package",
@@ -309,22 +387,25 @@ def default_transfer_channels(
             bi_peak_bw_gbps=(sio_bw * 1.85) if sio_bw is not None else None,
             alpha_us=0.8 if sio_bw is not None else 0.0,
             transport_mode="sio_die_to_die" if sio_bw is not None else "unavailable_single_die",
+            channel_semantics="direct" if sio_bw is not None else "none",
         ),
         "d2d_intra_node": TransferChannelSpec(
             channel="d2d_intra_node",
             protocol=intra_proto,
             uni_peak_bw_gbps=hccs_uni,
             bi_peak_bw_gbps=round(hccs_uni * 1.85, 2),
-            alpha_us=1.8 if fam == "A5" else 2.5,
+            alpha_us=float(defaults["intra_node_alpha_us"]),
             transport_mode="direct_fabric",
+            channel_semantics=intra_semantics,
         ),
         "d2d_inter_node": TransferChannelSpec(
             channel="d2d_inter_node",
             protocol="RoCEv2_400G" if roce_uni >= 45.0 else "RoCEv2_200G",
             uni_peak_bw_gbps=roce_uni,
             bi_peak_bw_gbps=round(roce_uni * 1.8, 2),
-            alpha_us=5.0,
+            alpha_us=float(defaults["roce_alpha_us"]),
             transport_mode="roce_rdma",
+            channel_semantics="switched",
         ),
         "h2d": TransferChannelSpec(
             channel="h2d",
@@ -334,8 +415,9 @@ def default_transfer_channels(
             derived_uni_bw_gbps=pcie_cal_uni,
             derived_bi_bw_gbps=pcie_cal_bi,
             pageable_uni_bw_gbps=pageable_uni,
-            alpha_us=2.0,
+            alpha_us=float(defaults["h2d_alpha_us"]),
             transport_mode="pcie_dma",
+            channel_semantics="direct",
         ),
         "d2h": TransferChannelSpec(
             channel="d2h",
@@ -345,8 +427,9 @@ def default_transfer_channels(
             derived_uni_bw_gbps=pcie_cal_uni,
             derived_bi_bw_gbps=pcie_cal_bi,
             pageable_uni_bw_gbps=pageable_uni,
-            alpha_us=2.0,
+            alpha_us=float(defaults["h2d_alpha_us"]),
             transport_mode="pcie_dma",
+            channel_semantics="direct",
         ),
         "rh2d": TransferChannelSpec(
             channel="rh2d",
@@ -355,6 +438,7 @@ def default_transfer_channels(
             bi_peak_bw_gbps=round(min(roce_uni, pcie_cal_uni or pcie_peak_uni) * 1.6, 2),
             alpha_us=6.5,
             transport_mode="auto",
+            channel_semantics="switched",
             notes="Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)",
         ),
         "rd2h": TransferChannelSpec(
@@ -364,6 +448,7 @@ def default_transfer_channels(
             bi_peak_bw_gbps=round(min(roce_uni, pcie_cal_uni or pcie_peak_uni) * 1.6, 2),
             alpha_us=6.5,
             transport_mode="auto",
+            channel_semantics="switched",
             notes="Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)",
         ),
     }
@@ -384,6 +469,7 @@ def default_transfer_channels(
                 pageable_uni_bw_gbps=float(raw["pageable_uni_bw_gbps"]) if raw.get("pageable_uni_bw_gbps") is not None else base.pageable_uni_bw_gbps,
                 alpha_us=float(raw.get("alpha_us", base.alpha_us)),
                 transport_mode=str(raw.get("transport_mode", base.transport_mode)),
+                channel_semantics=str(raw.get("channel_semantics", base.channel_semantics)),
                 notes=raw.get("notes", base.notes),
             )
     return channels

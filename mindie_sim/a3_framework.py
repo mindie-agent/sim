@@ -21,6 +21,11 @@
     wall time is the maximum replica completion, not a product of TP*EP*DP.
   * No measured field is synthesized.  If a request cannot be served under the
     declared capacity, it is reported unserved with a reason.
+  * A supplied fitted physical artifact is one machine's calibration: a foreign
+    hardware key is refused, and every op carries the artifact's own answer (or
+    its refusal reason).  The measurement timing scope is a declared input
+    (``device_event_warm`` / ``device_event_warm_batched`` / ...), never inferred
+    from a shape, because each scope carries a different launch intercept.
 
 [Timeouts & Locks]
   Deterministic virtual time only.  Iteration guard prevents infinite loops;
@@ -32,10 +37,14 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping, Sequence
 
-from .a3_cost import CalibrationStore, PredictiveCostModel
+from .a3_cost import (
+    PHYSICAL_CALIBRATED, PHYSICAL_LOW_CONFIDENCE, PHYSICAL_UNMODELED,
+    CalibrationStore, PredictiveCostModel, communication_placement_for_machine,
+    physical_calibration_provenance,
+)
 from .a3_resources import (
     ResourceEngine, ResourceSpec, add_costed_ops, build_resource_specs,
     fusion_pool_capacities, plan_replica_links, select_link_for_ranks,
@@ -56,6 +65,104 @@ from .a3_workload import (
 )
 
 MAX_ITERATIONS = 100_000
+#: Timing scope the analytic path has always declared.  A caller may override it
+#: (``predict(..., timing_scope=...)`` or ``--timing-scope``), and the scope is
+#: then handed unchanged to the fitted physical layer: ``device_event_warm``
+#: (per-call interval) and ``device_event_warm_batched`` (kernel service inside a
+#: batched graph) carry *different* launch intercepts and are never pooled.
+DEFAULT_TIMING_SCOPE = "device_event_warm"
+
+
+@dataclass(frozen=True)
+class _PredictiveCase(CaseSpec):
+    """A case carrying the per-run physical-calibration context.
+
+    ``CaseSpec`` has no field for a fitted artifact and lives in
+    ``a3_types.py`` (outside this work item), while ``predict_global_replicas``
+    builds every ``_ReplicaRunner`` from the case it is given.  The context
+    therefore rides on the case as two additive, non-serialized fields: nothing
+    in ``to_plan``/``semantic_payload`` reads them, so the case's public shape
+    and signature are unchanged.
+    """
+
+    physical_calibration: Any = None
+    timing_scope: str = ""
+
+
+def _predictive_case(
+    case: CaseSpec, *, physical_calibration: Any, timing_scope: str,
+) -> _PredictiveCase:
+    if isinstance(case, _PredictiveCase):
+        return replace(
+            case, physical_calibration=physical_calibration,
+            timing_scope=timing_scope,
+        )
+    values = {item.name: getattr(case, item.name) for item in fields(CaseSpec)}
+    return _PredictiveCase(
+        **values, physical_calibration=physical_calibration,
+        timing_scope=timing_scope,
+    )
+
+
+def _machine_key_for(case: CaseSpec) -> str:
+    return str(
+        case.machine.hardware_key or case.machine.sku or case.machine.name or ""
+    ).strip()
+
+
+def _refuse_foreign_physical_calibration(
+    case: CaseSpec, physical_calibration: Any,
+) -> None:
+    """A fitted artifact is one machine's calibration; never retarget silently."""
+    if physical_calibration is None:
+        return
+    artifact_key = str(getattr(physical_calibration, "hardware_key", "") or "")
+    machine_key = _machine_key_for(case)
+    if artifact_key and machine_key and artifact_key != machine_key:
+        raise A3InputError(
+            f"physical_calibration_hardware_key_conflict:{artifact_key}!={machine_key}"
+        )
+
+
+def _physical_calibration_summary(
+    physical_calibration: Any, *, timing_scope: str, replica_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Artifact provenance plus how the fitted layer was actually used."""
+    provenance = physical_calibration_provenance(
+        physical_calibration, timing_scope=timing_scope,
+    )
+    counts: dict[str, int] = {}
+    reasons: dict[str, int] = {}
+    transfers: dict[str, int] = {}
+    for result in replica_results:
+        for trace in result.get("traces", ()) or ():
+            for op in trace.get("ops", ()) or ():
+                record = op.get("physical")
+                if not isinstance(record, Mapping):
+                    continue
+                status = str(record.get("status") or "")
+                counts[status] = counts.get(status, 0) + 1
+                if status != PHYSICAL_CALIBRATED:
+                    reason = str(record.get("reason") or "")
+                    key = f"{status}:{reason}"
+                    reasons[key] = reasons.get(key, 0) + 1
+                source = record.get("transfer_from")
+                if status == PHYSICAL_CALIBRATED and isinstance(source, Mapping):
+                    target = dict(record.get("transfer_to") or {})
+                    key = (
+                        f"{source.get('family')}->{target.get('family')}/"
+                        f"{target.get('recipe')}"
+                    )
+                    transfers[key] = transfers.get(key, 0) + 1
+    provenance["applied_op_count"] = counts.get(PHYSICAL_CALIBRATED, 0)
+    provenance["low_confidence_op_count"] = counts.get(PHYSICAL_LOW_CONFIDENCE, 0)
+    provenance["unmodeled_op_count"] = counts.get(PHYSICAL_UNMODELED, 0)
+    provenance["unmodeled_reasons"] = dict(sorted(reasons.items()))
+    # A transferred row is a declared approximation, not the op's own fit: it is
+    # counted separately so a reader can see how much of the answer is transfer.
+    provenance["applied_transfer_op_count"] = sum(transfers.values())
+    provenance["transfer_counts"] = dict(sorted(transfers.items()))
+    return provenance
 
 
 
@@ -121,6 +228,20 @@ class _ReplicaRunner:
         self.allocated_blocks = sum(state.kv_blocks for state in self.states)
         self.traces: list[dict[str, Any]] = []
         self._last_draft_next: tuple[str, ...] = ()
+        # A collective runs on a physical fabric.  It is derived from the
+        # machine's declared transfer channels for this replica's rank group --
+        # not guessed from a link name -- so a measured comm curve is looked up
+        # for the fabric the traffic actually uses.  An unresolvable topology
+        # stays empty and the cost model reports the comm calibration as
+        # explicitly unmodeled instead of borrowing another fabric's curve.
+        self.communication_placement = communication_placement_for_machine(
+            case.machine, link=(replica_link or {}).get("link"),
+            ranks=(replica_link or {}).get("ranks"),
+        )
+        self.timing_scope = str(
+            getattr(case, "timing_scope", "") or DEFAULT_TIMING_SCOPE
+        )
+        self.physical_calibration = getattr(case, "physical_calibration", None)
         self.cost_model = PredictiveCostModel(
             case.machine,
             calibration=CalibrationStore.from_mapping(case.calibration),
@@ -128,8 +249,9 @@ class _ReplicaRunner:
             weight_dtype=case.model.weight_dtype,
             activation_dtype=case.model.activation_dtype,
             quantization=case.model.quantization,
-            timing_scope="device_event_warm",
+            timing_scope=self.timing_scope,
             communication_calibration=case.communication_calibration,
+            communication_placement=self.communication_placement,
             communication_ranks=case.runtime.parallel.tp,
             communication_backend=case.runtime.communication_backend,
             communication_observed_backend=case.runtime.communication_observed_backend,
@@ -155,6 +277,7 @@ class _ReplicaRunner:
             ),
             graph_mode=case.runtime.graph_mode,
             calibration_protocol=_calibration_protocol(case),
+            physical_calibration=self.physical_calibration,
         )
         link_scale = float((replica_link or {}).get("capacity_scale", 1.0))
         link = (replica_link or {}).get("link")
@@ -412,6 +535,10 @@ class _ReplicaRunner:
                 "curve_result": (
                     dict(cost.curve_result)
                     if cost is not None and cost.curve_result else None
+                ),
+                "physical": (
+                    dict(cost.physical)
+                    if cost is not None and cost.physical else None
                 ),
             })
         return result
@@ -792,13 +919,36 @@ def predict(
     *,
     calibration: Any = None,
     cost_backend: Any = None,
+    physical_calibration: Any = None,
+    timing_scope: str | None = None,
 ) -> dict[str, Any]:
-    """Run the predictive path for one declared case."""
+    """Run the predictive path for one declared case.
+
+    ``physical_calibration`` is a loaded
+    :class:`mindie_sim.a3_physical_calibration.PhysicalCalibration` (or
+    ``None``).  It must belong to this case's machine: a foreign hardware key is
+    refused rather than retargeted.  ``timing_scope`` selects the measurement
+    protocol the analytic *and* physical layers price against; it defaults to
+    the case's declared scope, then to ``device_event_warm``.
+    """
     if isinstance(case, Mapping):
         case = CaseSpec.from_mapping(case)
     if not isinstance(case, CaseSpec):
         raise A3InputError("case_invalid")
     case = with_media_runtime(case)
+    if physical_calibration is None:
+        physical_calibration = getattr(case, "physical_calibration", None)
+    _refuse_foreign_physical_calibration(case, physical_calibration)
+    effective_scope = str(
+        timing_scope
+        or getattr(case, "timing_scope", "")
+        or dict(case.runtime.metadata or ()).get("timing_scope")
+        or DEFAULT_TIMING_SCOPE
+    )
+    case = _predictive_case(
+        case, physical_calibration=physical_calibration,
+        timing_scope=effective_scope,
+    )
     memory = memory_plan(case.model, case.runtime, case.machine)
     if memory.status != "fits":
         return {
@@ -810,17 +960,15 @@ def predict(
             "oom_guidance": _oom_guidance(case, memory),
             "requests": [],
             "traces": [],
+            "timing_scope": effective_scope,
+            "physical_calibration": _physical_calibration_summary(
+                physical_calibration, timing_scope=effective_scope,
+                replica_results=(),
+            ),
             "plan": case.to_plan(),
         }
     if calibration is not None:
-        case = CaseSpec(
-            machine=case.machine, model=case.model, workload=case.workload,
-            runtime=case.runtime, slo=case.slo, calibration=calibration,
-            communication_calibration=case.communication_calibration,
-            cv_calibration=case.cv_calibration,
-            curve_artifact=case.curve_artifact,
-            metadata=case.metadata,
-        )
+        case = replace(case, calibration=calibration)
     dp = case.runtime.parallel.dp
     states_by_replica: list[list[RequestState]] = [[] for _ in range(dp)]
     for index, request in enumerate(case.workload.requests):
@@ -864,6 +1012,11 @@ def predict(
             "memory": memory.to_dict(),
             "requests": [],
             "traces": [],
+            "timing_scope": effective_scope,
+            "physical_calibration": _physical_calibration_summary(
+                physical_calibration, timing_scope=effective_scope,
+                replica_results=(),
+            ),
             "plan": case.to_plan(),
         }
     arbitration_rounds: list[dict[str, Any]] = []
@@ -923,6 +1076,11 @@ def predict(
         },
         "requests": merged["requests"],
         "traces": merged["traces"],
+        "timing_scope": effective_scope,
+        "physical_calibration": _physical_calibration_summary(
+            physical_calibration, timing_scope=effective_scope,
+            replica_results=replica_results,
+        ),
         "link_arbitration": {
             "rounds": arbitration_rounds,
             "final_scales": {

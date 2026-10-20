@@ -18,6 +18,13 @@
     depends on chunk 0 is not blocked by chunk 1.
   * Distinct resource names are physically disjoint.  Local MTE and global HBM
     are separate resources, so a local-only conflict does not serialize HBM.
+  * One engine resource per declared physical link.  A task charges the wire
+    its fabric scope names (SIO pair vs intra-node switch vs RoCE); an op that
+    names a fabric the machine does not declare raises instead of silently
+    charging the default link.
+  * Replica sharing follows the declared fabric semantics: a switched pipe is
+    equal-shared by concurrent replicas, while a mesh/direct pair wire is only
+    shared by a concurrent replica whose rank set occupies the same wire.
   * A whole-kernel calibrated duration is represented by work on this engine,
     not re-added as a separate memory duration.
 
@@ -34,7 +41,7 @@ import math
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Sequence
 
-from .a3_types import MachineSpec
+from .a3_types import A3InputError, LINK_SCOPE_ALIASES, MachineSpec
 
 _EPS = 1e-12
 
@@ -44,21 +51,59 @@ from .a3_resource_engine import (
 )
 
 
-def select_link_for_ranks(machine: MachineSpec, ranks: Sequence[int]) -> Any:
-    """Choose a physical link by membership, never by array order."""
+def select_link_for_ranks(
+    machine: MachineSpec, ranks: Sequence[int], *,
+    channel: str | None = None, semantics: str | None = None,
+) -> Any:
+    """Choose a physical link by membership, never by array order.
+
+    ``channel``/``semantics`` are optional declared filters so a caller that
+    knows which fabric it needs (SIO vs HCCS vs RoCE) cannot be handed an
+    unrelated link merely because it also covers the rank set.
+
+    Among covering links the *most specific* one wins (fewest members): a
+    two-die TP group inside one A3 package really runs on its SIO pair, not on
+    the 8-way switch that also happens to cover it.  When two wires cover the
+    same rank set (a single-package model: SIO pair and intra-node switch both
+    cover ranks 0..1) the faster dedicated wire wins; the name breaks any
+    remaining tie so the result never depends on declaration order.
+    """
     rank_set = set(int(rank) for rank in ranks)
-    covering = [
+    candidates = [
         link for link in machine.links
+        if (channel is None or link.channel == channel)
+        and (semantics is None or link.semantics == semantics)
+    ]
+    covering = [
+        link for link in candidates
         if rank_set and rank_set.issubset(set(link.members))
     ]
     if covering:
-        return min(covering, key=lambda link: (link.capacity_bytes_per_ms, link.name))
+        return min(
+            covering,
+            key=lambda link: (
+                len(link.members), -link.capacity_bytes_per_ms, link.name,
+            ),
+        )
     overlapping = [
-        link for link in machine.links
+        link for link in candidates
         if rank_set & set(link.members)
     ]
     if overlapping:
-        return min(overlapping, key=lambda link: (link.capacity_bytes_per_ms, link.name))
+        return min(
+            overlapping,
+            key=lambda link: (
+                len(link.members), -link.capacity_bytes_per_ms, link.name,
+            ),
+        )
+    if candidates:
+        return sorted(candidates, key=lambda link: link.name)[0]
+    if channel is not None or semantics is not None:
+        # The caller named a fabric the machine does not declare.  Returning an
+        # unrelated link here would silently price traffic on the wrong wire.
+        raise ResourceError(
+            f"link_fabric_unavailable:{channel or ''}:{semantics or ''}"
+        )
     if machine.links:
         return sorted(machine.links, key=lambda link: link.name)[0]
     return None
@@ -68,7 +113,15 @@ def plan_replica_links(
     machine: MachineSpec, parallel: Any,
     active_replicas: Sequence[int] | None = None,
 ) -> list[dict[str, Any]]:
-    """Resolve each DP replica's ranks/link and equal link sharing count."""
+    """Resolve each DP replica's ranks/link and its declared sharing rule.
+
+    A switched fabric is one aggregate pipe: concurrent replicas equal-share
+    it.  A mesh (A2's full 8x8 HCCS) or a direct pair wire (A3 SIO) gives each
+    rank pair its own wire, so the only contention is another *concurrent
+    replica that occupies an overlapping rank*, i.e. the number of pair streams
+    on the same wire.  Dividing a mesh by the replica count (the old rule)
+    under-predicts A2 bandwidth by up to the DP degree.
+    """
     groups = []
     ranks_per_replica = max(1, parallel.pp * parallel.tp)
     for replica in range(parallel.dp):
@@ -85,12 +138,37 @@ def plan_replica_links(
     if active_replicas is not None:
         active = set(int(index) for index in active_replicas)
         groups = [group for group in groups if group["replica"] in active]
-    counts: dict[str | None, int] = {}
+    switched_counts: dict[str | None, int] = {}
     for group in groups:
-        counts[group["link_name"]] = counts.get(group["link_name"], 0) + 1
+        semantics = str(getattr(group["link"], "semantics", "") or "unknown")
+        group["transport_semantics"] = semantics
+        if semantics in {"mesh", "direct"}:
+            # Pair-dedicated wire: concurrency is measured by overlapping rank
+            # sets, not by how many replicas exist in total.
+            concurrent = 1 + sum(
+                1 for other in groups
+                if other is not group
+                and other["link_name"] == group["link_name"]
+                and set(other["ranks"]) & set(group["ranks"])
+            )
+            group["concurrent_pairs"] = concurrent
+            group["share_count"] = concurrent
+            group["capacity_scale"] = 1.0 / concurrent
+            group["sharing_rule"] = (
+                "mesh_pair_wire" if semantics == "mesh" else "dedicated_pair_wire"
+            )
+        else:
+            switched_counts[group["link_name"]] = (
+                switched_counts.get(group["link_name"], 0) + 1
+            )
     for group in groups:
-        group["share_count"] = counts.get(group["link_name"], 1)
-        group["capacity_scale"] = 1.0 / max(1, counts.get(group["link_name"], 1))
+        if "sharing_rule" in group:
+            continue
+        count = switched_counts.get(group["link_name"], 1)
+        group["concurrent_pairs"] = 1
+        group["share_count"] = count
+        group["capacity_scale"] = 1.0 / max(1, count)
+        group["sharing_rule"] = "switched_equal_share"
     return groups
 
 
@@ -149,14 +227,39 @@ def build_resource_specs(
         link = next((item for item in machine.links if item.name == link_name), None)
     if link is None and machine.links:
         link = sorted(machine.links, key=lambda item: item.name)[0]
+    # One engine resource per declared physical link.  Ops that name a fabric
+    # (SIO vs HCCS vs RoCE) then charge their own wire and do not serialize on
+    # an unrelated one; ops that do not name one keep the replica's default.
+    link_resources: dict[str, str] = {}
+    for item in machine.links:
+        name = f"link:{item.name}"
+        if name in resources:
+            link_resources.setdefault(item.name, name)
+            continue
+        capacity = max(_EPS, item.capacity_bytes_per_ms)
+        if link is not None and item.name == link.name:
+            capacity = max(_EPS, item.capacity_bytes_per_ms * link_capacity_scale)
+        resources[name] = ResourceSpec(name, capacity, "bytes", scope=item.scope)
+        link_resources[item.name] = name
     if link is not None:
-        name = f"link:{link.name}"
-        resources[name] = ResourceSpec(
-            name, max(_EPS, link.capacity_bytes_per_ms * link_capacity_scale), "bytes",
-            scope=link.scope,
-        )
+        default_name = link_resources[link.name]
         for stage in stage_map:
-            stage_map[stage]["link"] = name
+            # Insert the default first: preparation tasks pick the first
+            # ``link:`` value in iteration order as their transfer wire.
+            stage_map[stage]["link"] = default_name
+            for item in machine.links:
+                # Instance-scoped tokens only: channel tokens are resolved
+                # through ``link_for_scope`` below so several wires of one
+                # channel (A3 SIO per package) resolve deterministically.
+                for token in {item.name.lower(), item.scope.lower()}:
+                    stage_map[stage][f"link_scope:{token}"] = link_resources[item.name]
+            for alias in sorted(LINK_SCOPE_ALIASES):
+                try:
+                    resolved = machine.link_for_scope(alias)
+                except A3InputError:
+                    continue
+                if resolved is not None:
+                    stage_map[stage][f"link_scope:{alias}"] = link_resources[resolved.name]
     return resources, stage_map
 
 
@@ -211,6 +314,26 @@ def _ensure_core_resource(
     return name
 
 
+def _link_resource_for_op(
+    op: Any, stage_names: Mapping[str, str], override: str | None,
+) -> str:
+    """Pick the engine link resource for an op's declared fabric scope."""
+    if override:
+        return override
+    default = stage_names.get("link")
+    declared = str(getattr(op, "link_scope", "") or "").strip().lower()
+    if not declared or declared in {"d2d", "default", "shared"}:
+        if default is None:
+            raise ResourceError(f"link_resource_missing_for:{op.op_id}")
+        return default
+    mapped = stage_names.get(f"link_scope:{declared}")
+    if mapped is None:
+        # The op names a fabric the machine does not declare.  Charging the
+        # default link here would silently price SIO traffic on HCCS.
+        raise ResourceError(f"link_scope_unresolved:{op.op_id}:{declared}")
+    return mapped
+
+
 def add_costed_ops(
     engine: ResourceEngine,
     costed_ops: Sequence[Any],
@@ -242,9 +365,7 @@ def add_costed_ops(
         stage_names = stage_map.get(op.stage, {})
         for key, value in demands.items():
             if key == "link":
-                resource = link_scope or stage_names.get("link")
-                if resource is None:
-                    raise ResourceError(f"link_resource_missing_for:{source_id}")
+                resource = _link_resource_for_op(op, stage_names, link_scope)
                 mapped[resource] = mapped.get(resource, 0.0) + value
             else:
                 resource = stage_names.get(key)
@@ -314,7 +435,11 @@ def add_costed_ops(
                 ):
                     number = float(work.get(logical, 0.0) or 0.0)
                     if number > 0:
-                        resource = stage_names.get(resource_key)
+                        resource = (
+                            _link_resource_for_op(op, stage_names, link_scope)
+                            if resource_key == "link"
+                            else stage_names.get(resource_key)
+                        )
                         if resource is None:
                             raise ResourceError(
                                 f"stage_resource_missing:{op.stage}:{resource_key}"

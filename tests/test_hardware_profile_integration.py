@@ -29,6 +29,15 @@ def _a5_config() -> hw.PlatformConfig:
     return hw.parse_platform_ini(FIXTURES / "Ascend950DT_9581.ini")
 
 
+def _a2_snapshot() -> hw.NpuSmiSnapshot:
+    """The real 910B4 capture: ``Aicore Freq`` 1650 (rated), ``curFreq`` 800."""
+    return hw.parse_npu_smi_snapshot(
+        (FIXTURES / "npu-smi-a2-info.txt").read_text(encoding="utf-8"),
+        common_text=(FIXTURES / "npu-smi-a2-common.txt").read_text(encoding="utf-8"),
+        board_text=(FIXTURES / "npu-smi-a2-board.txt").read_text(encoding="utf-8"),
+    )
+
+
 def _a3_capture_dir(destination: Path) -> Path:
     destination.mkdir(parents=True, exist_ok=True)
     for name in ("npu-smi-a3-info.txt", "npu-smi-a3-common.txt", "npu-smi-a3-board.txt"):
@@ -47,6 +56,37 @@ def test_cube_capability_has_one_unit_explicit_source() -> None:
     assert a5.cube_spec.ops_per_cycle_per_die("fp8_e4m3") == 32 * 16384
     assert a5.cube_spec.ops_per_cycle_per_die("bf16") == 32 * 8192
     assert a5.cube_spec.ops_per_cycle_per_die("int4") is None
+
+
+def test_a2_profile_derives_cube_peak_from_the_verified_runtime_clock() -> None:
+    # Real 910B4 capture: the .ini declares cube_freq=1500 while npu-smi reports
+    # "Aicore Freq" 1650 (rated, reached under load) and "curFreq" 800 (DVFS).
+    profile = hw.resolve_device_capability_profile(soc="Ascend910B4", snapshot=_a2_snapshot())
+    clock = profile.clock_and_topology_spec
+    assert clock.configured_clock_mhz == 1500.0
+    assert clock.runtime_clock_mhz == 1650.0
+    assert clock.runtime_current_clock_mhz == 800.0
+    assert profile.effective_clock_mhz() == 1650.0
+    assert clock.clock_source() == "npu_smi_runtime"
+    assert profile.peak_cube_ops_per_s("bf16") == pytest.approx(20 * 8192 * 1.65e9, rel=1e-12)
+    entry = next(item for item in profile.discrepancies if item["field"] == "configured_clock_mhz")
+    assert entry["platform_config_clock_mhz"] == 1500.0
+    assert entry["runtime_aicore_freq_mhz"] == 1650.0
+    assert entry["observed_current_freq_mhz"] == 800.0
+    assert entry["caller_override_clock_mhz"] is None
+    assert entry["authority"] == "npu_smi_runtime"
+
+
+def test_a2_profile_without_a_snapshot_reports_the_configured_clock_only() -> None:
+    profile = hw.resolve_device_capability_profile(soc="Ascend910B4")
+    clock = profile.clock_and_topology_spec
+    assert clock.configured_clock_mhz == 1500.0
+    assert clock.runtime_clock_mhz is None
+    assert clock.runtime_current_clock_mhz is None
+    assert profile.effective_clock_mhz() == 1500.0
+    assert clock.clock_source() == "platform_config"
+    assert profile.peak_cube_ops_per_s("bf16") == pytest.approx(20 * 8192 * 1.5e9, rel=1e-12)
+    assert [item for item in profile.discrepancies if "clock" in str(item["field"])] == []
 
 
 def test_custom_dtype_overrides_and_a3_default_formula_agree() -> None:
@@ -111,7 +151,11 @@ def test_golden_fixture_is_explicit_and_origin_labeled() -> None:
     assert thermal["wall_us"] is None
     assert thermal["counted_us"] is None
     assert thermal["gap_us"] is None
-    assert thermal["frequencies_mhz"] == [1250.0, 1300.0, 1640.0, 1650.0]
+    # No sustained band is supplied, so the frequency table is the caller's
+    # short-burst band only (the old 1250-1300 ladder was a fabricated default).
+    assert thermal["sustained_mhz_range"] == []
+    assert thermal["sustained_reference_us"] is None
+    assert thermal["frequencies_mhz"] == [1640.0, 1650.0]
     assert thermal["sensitivity"]["frequencies_mhz"] == thermal["frequencies_mhz"]
     assert {row["frequency_mhz"] for row in thermal["clock_table"]} == set(thermal["frequencies_mhz"])
     assert thermal["ideal_hardware_lower_bound_us"] == pytest.approx(442918.5024 / 1650.0, rel=1e-12)

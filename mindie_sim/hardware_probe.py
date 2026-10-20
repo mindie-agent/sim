@@ -9,6 +9,9 @@
   * Parsing never fabricates a device row or a runtime capacity; unsupported
     lines are skipped and an empty info capture raises a stable error.
   * ``hbm_total_mib`` is evidence from npu-smi, not the platform .ini value.
+  * ``Aicore Freq(MHZ)`` (rated maximum) and ``Aicore curFreq(MHZ)`` (the
+    instantaneous DVFS point) stay separate: only the rated value is a clock a
+    peak may be derived from, and neither is ever replaced by a default.
   * A3 dual-die ``Chip ID``/``Phy-ID`` pairs remain distinct per device row.
   * Multi-NPU common captures keep each chip with the NPU block that declared
     it.  The MCU tail block never overwrites the last chip row.
@@ -108,6 +111,23 @@ class NpuSmiSnapshot:
         values = self.hbm_totals_mib
         return float(max(values)) if values else None
 
+    @property
+    def rated_aicore_freq_mhz(self) -> float | None:
+        """``Aicore Freq(MHZ)``: the rated (max) clock declared by npu-smi.
+
+        One value for a homogeneous node.  A mixed snapshot is an ambiguity the
+        caller must resolve; the lowest value is returned so a derived peak is
+        never overstated.  ``None`` when no ``-t common`` capture was loaded.
+        """
+        values = sorted({chip.aicore_freq_mhz for chip in self.chips if chip.aicore_freq_mhz})
+        return float(values[0]) if values else None
+
+    @property
+    def observed_aicore_freq_mhz(self) -> float | None:
+        """``Aicore curFreq(MHZ)``: the instantaneous DVFS point, never a peak."""
+        values = sorted({chip.aicore_current_freq_mhz for chip in self.chips if chip.aicore_current_freq_mhz})
+        return float(values[0]) if values else None
+
     def to_dict(self) -> dict[str, Any]:
         return {
             "source": self.source,
@@ -116,6 +136,8 @@ class NpuSmiSnapshot:
             "phy_ids": list(self.phy_ids),
             "verified_runtime_hbm_mib": self.min_hbm_mib,
             "verified_runtime_hbm_mib_max": self.max_hbm_mib,
+            "rated_aicore_freq_mhz": self.rated_aicore_freq_mhz,
+            "observed_aicore_freq_mhz": self.observed_aicore_freq_mhz,
             "devices": [device.to_dict() for device in self.devices],
             "chips": [chip.to_dict() for chip in self.chips],
             "board": dict(sorted(self.board.items())),
