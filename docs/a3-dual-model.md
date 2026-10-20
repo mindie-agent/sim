@@ -14,6 +14,25 @@ lower bound. `L` is not a runnable schedule. Neither path adds a single global
 No A3 measurements are bundled in this repository. Declared examples are
 explicitly labelled as declared inputs, never as `measured`.
 
+## Acceptance status on 2026-10-21
+
+The current implementation passed 386 local tests, with four live-device
+tests skipped in the final local run. Nine complete model reference packages
+passed 128 independent structure, resource and result-consistency checks.
+These checks establish implementation behavior, not end-to-end latency accuracy.
+
+Independent predictions were frozen before reading 159 heldout physical
+conditions. On all 75 heldout GEMM conditions, public analytic WAPE was 22.51%;
+database calibration reduced it to 14.53%. Direct curves produced numbers for
+69/159 conditions; the remaining 90 retain explicit coverage gaps. Supported
+subsets and primitive measurements do not establish whole-model TTFT/TPOT
+accuracy. **Overall performance-accuracy acceptance has not passed.**
+
+The nine-model references and executable pending-measurement inventory are in
+[`examples/model-reference`](../examples/model-reference/README.md). The full
+measurement and acceptance record is maintained in the architecture repository's
+[`a3-performance-modeling-acceptance.md`](https://github.com/mindie-agent/mindie-agent/blob/main/docs/a3-performance-modeling-acceptance.md).
+
 ## Predictive inputs
 
 A case is one JSON object:
