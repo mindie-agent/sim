@@ -658,6 +658,12 @@ def hardware_report(
 
 
 # Public aliases used by the CLI and tests.
+from .theoretical_model import (  # noqa: E402
+    OperatorHapEvaluation,
+    compute_hap_score,
+    evaluate_operator_hap,
+)
+
 parse_ini = parse_platform_ini
 cross_check = cross_check_capacities
 parse_cannsim = parse_cannsim_link_ceilings
@@ -678,4 +684,5 @@ __all__ = [
     "link_reference_bounds", "hardware_report", "TRANSFER_CHANNELS", "TransferChannelSpec",
     "NpuTopologySnapshot", "PcieLinkSnapshot", "parse_npu_smi_topo", "parse_pcie_link_info",
     "default_transfer_channels", "solve_transfer_bound", "solve_collective_bound", "evaluate_transfer_plan",
+    "OperatorHapEvaluation", "compute_hap_score", "evaluate_operator_hap",
 ]

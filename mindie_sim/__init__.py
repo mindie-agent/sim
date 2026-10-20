@@ -77,6 +77,11 @@ from .pipeline import (
     solve_periodic_pipeline,
 )
 from .subgraph import SubgraphError, analyze_subgraph_fusion
+from .theoretical_model import (
+    OperatorHapEvaluation,
+    compute_hap_score,
+    evaluate_operator_hap,
+)
 
 __version__ = "0.5.0"
 
@@ -123,5 +128,8 @@ __all__ = [
     "solve_periodic_pipeline",
     "SubgraphError",
     "analyze_subgraph_fusion",
+    "OperatorHapEvaluation",
+    "compute_hap_score",
+    "evaluate_operator_hap",
     "net_report",
 ]
