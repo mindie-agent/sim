@@ -1,0 +1,8 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+dist/
+*.egg-info/
+*.xml
+.mindie-local/
