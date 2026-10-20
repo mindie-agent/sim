@@ -1,0 +1,20 @@
+{
+ "tp": [
+  8
+ ],
+ "dp": [
+  1
+ ],
+ "ep": [
+  8
+ ],
+ "pp": [
+  1
+ ],
+ "fusion": [
+  false,
+  true
+ ],
+ "graph_padding": false,
+ "search_budget": 3
+}

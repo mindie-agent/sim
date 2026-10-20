@@ -1,0 +1,270 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindie-agent.example/schemas/mindie-sim-a3-attention-capability-manifest",
+  "title": "A3 native FA/RoPE capability manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "manifest_id",
+    "protocol",
+    "expectations",
+    "cases"
+  ],
+  "properties": {
+    "kind": {
+      "const": "a3_attention_rope_manifest"
+    },
+    "manifest_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "description": {
+      "type": "string"
+    },
+    "source_contract": {
+      "type": "object",
+      "description": "Optional attribution; absence yields {} and never gates a valid measurement."
+    },
+    "protocol": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "warmup_iterations",
+        "trials",
+        "samples_per_trial",
+        "seed",
+        "reference",
+        "budgets_seconds"
+      ],
+      "properties": {
+        "warmup_iterations": {
+          "const": 10
+        },
+        "trials": {
+          "const": 2
+        },
+        "samples_per_trial": {
+          "const": 30
+        },
+        "seed": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "reference": {
+          "type": "object",
+          "required": [
+            "atol",
+            "rtol"
+          ]
+        },
+        "budgets_seconds": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "case",
+            "setup",
+            "global_work",
+            "cleanup"
+          ],
+          "properties": {
+            "case": {
+              "type": "number",
+              "maximum": 24
+            },
+            "setup": {
+              "type": "number",
+              "maximum": 60
+            },
+            "global_work": {
+              "type": "number",
+              "maximum": 240
+            },
+            "cleanup": {
+              "type": "number",
+              "maximum": 60
+            }
+          }
+        },
+        "supervisor_seconds_min": {
+          "type": "number",
+          "minimum": 370
+        }
+      }
+    },
+    "expectations": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cases",
+        "planned_raw_blocks"
+      ],
+      "properties": {
+        "cases": {
+          "const": 4
+        },
+        "planned_raw_blocks": {
+          "const": 240
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "case_id",
+        "operator",
+        "dtype",
+        "layout",
+        "shape",
+        "data",
+        "source",
+        "split",
+        "target_match"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+        },
+        "operator": {
+          "enum": [
+            "fusion_attention",
+            "rotary_mul"
+          ]
+        },
+        "dtype": {
+          "const": "bfloat16"
+        },
+        "layout": {
+          "enum": [
+            "BNSD",
+            "BSND"
+          ]
+        },
+        "shape": {
+          "type": "object"
+        },
+        "mask": {
+          "enum": [
+            "causal_bottom_right",
+            "full_visible"
+          ]
+        },
+        "scale": {
+          "type": "number"
+        },
+        "rotary_mode": {
+          "const": "half"
+        },
+        "positions": {
+          "type": "object",
+          "required": [
+            "start",
+            "end"
+          ]
+        },
+        "inv_freq_base": {
+          "type": "number"
+        },
+        "data": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "seed",
+            "low",
+            "high"
+          ],
+          "properties": {
+            "seed": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "low": {
+              "type": "number"
+            },
+            "high": {
+              "type": "number"
+            }
+          }
+        },
+        "source": {
+          "type": "object",
+          "required": [
+            "model",
+            "source_scope",
+            "primitive_scope"
+          ]
+        },
+        "split": {
+          "enum": [
+            "train",
+            "heldout"
+          ]
+        },
+        "target_match": {
+          "const": false
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "fusion_attention"
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "required": [
+              "mask",
+              "scale"
+            ],
+            "properties": {
+              "layout": {
+                "const": "BNSD"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "operator": {
+                "const": "rotary_mul"
+              }
+            },
+            "required": [
+              "operator"
+            ]
+          },
+          "then": {
+            "required": [
+              "rotary_mode",
+              "positions"
+            ],
+            "properties": {
+              "layout": {
+                "const": "BSND"
+              }
+            }
+          }
+        }
+      ],
+      "description": "Manifest declares train or heldout; the worker preserves it exactly."
+    }
+  }
+}

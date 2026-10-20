@@ -1,0 +1,175 @@
+{
+  "kind": "a3_attention_rope_manifest",
+  "manifest_id": "a3-native-attention-rope-capability-v1",
+  "description": "Predeclared train-only native capability matrix. FA is a small standalone primitive representative of Qwen27B TP8 GQA (24Q/4KV replicated to 3Q/1KV), not full model/cache/framework. RoPE is the standalone 64-dim rotated plane corresponding to partial_rotary_factor 0.25 of 256, not mRoPE/QK composite. All target_match=false; no prior same-recipe heldout is claimed.",
+  "source_contract": {
+    "native_functions_yaml": "/tmp/mindie-a3-dsh.DNIfZY/installed-torch-npu-2.9.0-npu_native_functions_by_codegen.yaml",
+    "schema_lines": {
+      "npu_fusion_attention": 323,
+      "npu_rotary_mul": 613
+    },
+    "sha256": "0b2265792c52bae1cc4fc4946ea72f02fd3fd1e6f1024e43cfbe2251a04f604c",
+    "scope": "read-only installed schema lines; no device execution"
+  },
+  "protocol": {
+    "warmup_iterations": 10,
+    "trials": 2,
+    "samples_per_trial": 30,
+    "seed": 20261021,
+    "reference": {
+      "atol": 0.02,
+      "rtol": 0.02
+    },
+    "budgets_seconds": {
+      "case": 24,
+      "setup": 60,
+      "global_work": 240,
+      "cleanup": 60
+    },
+    "supervisor_seconds_min": 370
+  },
+  "expectations": {
+    "cases": 4,
+    "planned_raw_blocks": 240
+  },
+  "cases": [
+    {
+      "case_id": "fa-prefill-b1-hq3-hkv1-q32-kv32-d256-causal",
+      "operator": "fusion_attention",
+      "dtype": "bfloat16",
+      "layout": "BNSD",
+      "shape": {
+        "batch": 1,
+        "q_heads": 3,
+        "kv_heads": 1,
+        "q_tokens": 32,
+        "kv_tokens": 32,
+        "qk_dim": 256,
+        "v_dim": 256
+      },
+      "mask": "causal_bottom_right",
+      "scale": 0.0625,
+      "data": {
+        "seed": 4201,
+        "low": -1.0,
+        "high": 1.0
+      },
+      "source": {
+        "model": "qwen3.8-27b",
+        "topology": "TP8",
+        "global_q_heads": 24,
+        "global_kv_heads": 4,
+        "head_dim": 256,
+        "kv_heads_replicated": 1,
+        "source_scope": "Qwen27B TP8 local GQA geometry 24Q/4KV, 1 replicated KV head, head_dim 256",
+        "primitive_scope": "standalone BNSD npu_fusion_attention primitive only; not full model, cache, framework, MLA, sparse or FP8 coverage",
+        "target_match": false
+      },
+      "target_match": false,
+      "split": "train"
+    },
+    {
+      "case_id": "fa-decode-b1-hq3-hkv1-q1-kv128-d256-fullvisible",
+      "operator": "fusion_attention",
+      "dtype": "bfloat16",
+      "layout": "BNSD",
+      "shape": {
+        "batch": 1,
+        "q_heads": 3,
+        "kv_heads": 1,
+        "q_tokens": 1,
+        "kv_tokens": 128,
+        "qk_dim": 256,
+        "v_dim": 256
+      },
+      "mask": "full_visible",
+      "scale": 0.0625,
+      "data": {
+        "seed": 4202,
+        "low": -1.0,
+        "high": 1.0
+      },
+      "source": {
+        "model": "qwen3.8-27b",
+        "topology": "TP8",
+        "global_q_heads": 24,
+        "global_kv_heads": 4,
+        "head_dim": 256,
+        "kv_heads_replicated": 1,
+        "source_scope": "Qwen27B TP8 local GQA geometry 24Q/4KV, 1 replicated KV head, head_dim 256",
+        "primitive_scope": "standalone BNSD npu_fusion_attention primitive only; not full model, cache, framework, MLA, sparse or FP8 coverage",
+        "target_match": false
+      },
+      "target_match": false,
+      "split": "train"
+    },
+    {
+      "case_id": "rope-half-b1-s8-h3-d64",
+      "operator": "rotary_mul",
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "shape": {
+        "batch": 1,
+        "seq": 8,
+        "heads": 3,
+        "dim": 64
+      },
+      "rotary_mode": "half",
+      "positions": {
+        "start": 0,
+        "end": 7
+      },
+      "inv_freq_base": 10000.0,
+      "data": {
+        "seed": 4301,
+        "low": -1.0,
+        "high": 1.0
+      },
+      "source": {
+        "model": "qwen3.8-27b",
+        "partial_rotary_factor": 0.25,
+        "full_head_dim": 256,
+        "rotated_dim": 64,
+        "source_scope": "Qwen source partial_rotary_factor 0.25 gives 64 of 256 rotated dims",
+        "primitive_scope": "standalone BSND half-RoPE rotated plane only; no mRoPE, concat or QK-composite claim",
+        "target_match": false
+      },
+      "target_match": false,
+      "split": "train"
+    },
+    {
+      "case_id": "rope-half-b1-s128-h3-d64",
+      "operator": "rotary_mul",
+      "dtype": "bfloat16",
+      "layout": "BSND",
+      "shape": {
+        "batch": 1,
+        "seq": 128,
+        "heads": 3,
+        "dim": 64
+      },
+      "rotary_mode": "half",
+      "positions": {
+        "start": 0,
+        "end": 127
+      },
+      "inv_freq_base": 10000.0,
+      "data": {
+        "seed": 4302,
+        "low": -1.0,
+        "high": 1.0
+      },
+      "source": {
+        "model": "qwen3.8-27b",
+        "partial_rotary_factor": 0.25,
+        "full_head_dim": 256,
+        "rotated_dim": 64,
+        "source_scope": "Qwen source partial_rotary_factor 0.25 gives 64 of 256 rotated dims",
+        "primitive_scope": "standalone BSND half-RoPE rotated plane only; no mRoPE, concat or QK-composite claim",
+        "target_match": false
+      },
+      "target_match": false,
+      "split": "train"
+    }
+  ]
+}

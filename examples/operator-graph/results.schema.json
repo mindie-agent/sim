@@ -1,0 +1,705 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindie-agent.example/schemas/mindie-sim-a3-operator-graph-results",
+  "title": "MindIE Sim A3 operator-graph timing results",
+  "description": "Versioned results contract. Raw blocks keep CPU-submit, device-event and host-wall clocks separately; per-invocation fields are explicitly derived block/N descriptions, never analytic time. Requested conditions are separate from terminal/measured conditions. A condition is measurement-complete only when measured status, every declared trial/sample, passed FP32 CPU correctness and no timing anomaly are all present. Completeness is not prediction ingestion, fit quality or accuracy evidence. Cleanup and persistence failures are reported separately and force failure.",
+  "type": "object",
+  "required": [
+    "kind",
+    "run_id",
+    "manifest",
+    "worker",
+    "device",
+    "environment",
+    "protocol",
+    "budgets",
+    "requested",
+    "progress",
+    "schedule",
+    "setup",
+    "cleanup",
+    "conditions",
+    "failures",
+    "stop_reason",
+    "status",
+    "started_at_utc",
+    "updated_at_utc",
+    "finished_at_utc",
+    "interpretation",
+    "cleanup_ok",
+    "persistence",
+    "persistence_ok"
+  ],
+  "properties": {
+    "kind": {
+      "const": "a3_operator_graph_timing_results"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "manifest_id",
+        "path",
+        "sha256"
+      ]
+    },
+    "worker": {
+      "type": "object",
+      "required": [
+        "module",
+        "source_files_sha256",
+        "device_owner",
+        "lease_implemented_here"
+      ]
+    },
+    "device": {
+      "type": "object",
+      "required": [
+        "requested",
+        "selected",
+        "logical_index",
+        "selection"
+      ],
+      "properties": {
+        "requested": {
+          "const": "npu:0"
+        },
+        "selected": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "logical_index": {
+          "const": 0
+        }
+      }
+    },
+    "environment": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "protocol": {
+      "type": "object"
+    },
+    "budgets": {
+      "type": "object"
+    },
+    "requested": {
+      "type": "object",
+      "required": [
+        "conditions",
+        "condition_count",
+        "trials",
+        "samples_per_condition",
+        "planned_condition_executions",
+        "planned_raw_blocks",
+        "warmup_iterations"
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "required": [
+        "requested_conditions",
+        "attempted_conditions",
+        "terminal_conditions",
+        "measured_conditions",
+        "failed_conditions",
+        "pending_conditions",
+        "not_run_conditions",
+        "complete_conditions",
+        "completed_trials",
+        "planned_condition_executions",
+        "completed_condition_executions",
+        "recorded_condition_executions",
+        "raw_blocks",
+        "planned_raw_blocks",
+        "fraction_of_requested_conditions_terminal",
+        "fraction_of_planned_raw_blocks_collected"
+      ],
+      "properties": {
+        "requested_conditions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "attempted_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "terminal_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measured_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pending_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_run_conditions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "completed_trials": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "planned_condition_executions": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "completed_condition_executions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "recorded_condition_executions": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "planned_raw_blocks": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "complete_conditions": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "schedule": {
+      "type": "object",
+      "required": [
+        "seed",
+        "base_order",
+        "trial_orders",
+        "order_rule",
+        "counterbalanced"
+      ]
+    },
+    "setup": {
+      "type": "object",
+      "required": [
+        "status"
+      ]
+    },
+    "cleanup": {
+      "type": "object",
+      "required": [
+        "status"
+      ]
+    },
+    "conditions": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/condition"
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "stop_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "runtime_error": {
+      "type": "object"
+    },
+    "write_errors": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "status": {
+      "enum": [
+        "running",
+        "partial",
+        "completed",
+        "completed_with_incomplete_measurements",
+        "completed_with_failures",
+        "failed",
+        "invalid_empty",
+        "completed_with_cleanup_failure",
+        "completed_with_persistence_failure"
+      ],
+      "description": "completed requires every requested condition measured and measurement-complete, with successful cleanup and persistence. completed_with_incomplete_measurements means all conditions were measured but at least one lacks completeness (for example a timing anomaly); it is never a success exit. completed_with_failures includes failed/pending/not_run conditions; partial stopped before all conditions were terminal; failed includes fatal setup or persistence failure. Cleanup/persistence-specific completed statuses are never success exits."
+    },
+    "started_at_utc": {
+      "type": "string"
+    },
+    "updated_at_utc": {
+      "type": "string"
+    },
+    "finished_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "interpretation": {
+      "type": "object",
+      "required": [
+        "clock_semantics",
+        "derived",
+        "no_analytic_prediction",
+        "no_empty_event_subtraction"
+      ]
+    },
+    "cleanup_ok": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "persistence_ok": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "persistence": {
+      "type": "object",
+      "required": [
+        "ok",
+        "errors"
+      ],
+      "properties": {
+        "ok": {
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "condition": {
+      "type": "object",
+      "required": [
+        "condition_id",
+        "case_id",
+        "operator",
+        "mode",
+        "n",
+        "requested",
+        "status",
+        "measurement_complete",
+        "reason",
+        "condition_identity",
+        "geometry",
+        "reference_plan",
+        "data_contract",
+        "timing_protocol",
+        "execution",
+        "graph_capture",
+        "allocation",
+        "correctness",
+        "warmup",
+        "debug_dump",
+        "active_case_seconds",
+        "trials",
+        "summary",
+        "completeness",
+        "errors"
+      ],
+      "properties": {
+        "condition_id": {
+          "type": "string",
+          "pattern": "::(eager_block|graph_single_repeated|graph_block)::n(1|32|128)$"
+        },
+        "case_id": {
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "rms_norm",
+            "swiglu",
+            "copy"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "eager_block",
+            "graph_single_repeated",
+            "graph_block"
+          ]
+        },
+        "n": {
+          "enum": [
+            1,
+            32,
+            128
+          ]
+        },
+        "requested": {
+          "const": true
+        },
+        "status": {
+          "enum": [
+            "requested",
+            "measuring",
+            "measured",
+            "failed",
+            "pending",
+            "not_run"
+          ]
+        },
+        "reason": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "active_case_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "trials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/trial"
+          }
+        },
+        "summary": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "graph_capture": {
+          "type": "object",
+          "required": [
+            "attempted",
+            "status",
+            "timing_excluded",
+            "no_eager_fallback"
+          ]
+        },
+        "debug_dump": {
+          "type": "object"
+        },
+        "allocation": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "correctness": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "warmup": {
+          "type": "object",
+          "required": [
+            "policy",
+            "timed",
+            "trials"
+          ],
+          "properties": {
+            "policy": {
+              "type": "string"
+            },
+            "timed": {
+              "const": false
+            },
+            "trials": {
+              "type": "array",
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "measurement_complete": {
+          "type": "boolean"
+        },
+        "completeness": {
+          "type": "object",
+          "required": [
+            "complete",
+            "blockers",
+            "requirements"
+          ],
+          "properties": {
+            "complete": {
+              "type": "boolean"
+            },
+            "blockers": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "requirements": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    "trial": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "trial_index",
+        "condition_id",
+        "mode",
+        "n",
+        "status",
+        "samples",
+        "warmup"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "trial_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "condition_id": {
+          "type": "string"
+        },
+        "mode": {
+          "enum": [
+            "eager_block",
+            "graph_single_repeated",
+            "graph_block"
+          ]
+        },
+        "n": {
+          "enum": [
+            1,
+            32,
+            128
+          ]
+        },
+        "status": {
+          "enum": [
+            "measuring",
+            "measured",
+            "failed"
+          ]
+        },
+        "samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sample"
+          }
+        },
+        "summary": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "errors": {
+          "type": "array",
+          "items": {
+            "type": "object"
+          }
+        },
+        "warmup": {
+          "type": "object",
+          "required": [
+            "status",
+            "timed",
+            "excluded_from_samples"
+          ],
+          "properties": {
+            "status": {
+              "enum": [
+                "ok",
+                "failed"
+              ]
+            },
+            "timed": {
+              "const": false
+            },
+            "excluded_from_samples": {
+              "const": true
+            },
+            "trial_index": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "block_invocations": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "policy": {
+              "type": "string"
+            },
+            "error": {
+              "type": "object"
+            }
+          }
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "required": [
+        "run_id",
+        "condition_id",
+        "case_id",
+        "operator",
+        "mode",
+        "n",
+        "trial_index",
+        "sample_index",
+        "block_invocations",
+        "host_calls",
+        "replay_calls",
+        "cpu_submit_ms",
+        "device_interval_ms",
+        "wall_complete_ms",
+        "derived",
+        "anomalies"
+      ],
+      "properties": {
+        "run_id": {
+          "type": "string"
+        },
+        "condition_id": {
+          "type": "string"
+        },
+        "case_id": {
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "rms_norm",
+            "swiglu",
+            "copy"
+          ]
+        },
+        "mode": {
+          "enum": [
+            "eager_block",
+            "graph_single_repeated",
+            "graph_block"
+          ]
+        },
+        "n": {
+          "enum": [
+            1,
+            32,
+            128
+          ]
+        },
+        "trial_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "sample_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "block_invocations": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "capture_invocations": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "host_calls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "replay_calls": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "cpu_submit_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "device_interval_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "wall_complete_ms": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "derived": {
+          "type": "object",
+          "required": [
+            "label",
+            "denominator",
+            "denominator_kind",
+            "cpu_submit_per_invocation_ms",
+            "device_interval_per_invocation_ms",
+            "wall_complete_per_invocation_ms"
+          ],
+          "properties": {
+            "label": {
+              "const": "derived"
+            },
+            "denominator": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "denominator_kind": {
+              "const": "declared_operator_api_invocations_not_measured_kernel_launches"
+            }
+          }
+        },
+        "anomalies": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "n_kind": {
+          "const": "declared_operator_api_invocations_not_measured_kernel_launches"
+        }
+      }
+    }
+  }
+}

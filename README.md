@@ -12,3 +12,32 @@ Standalone Ascend NPU 4-layer simulation and theoretical boundary solver for Min
    - Upfront Phase 0 producer-consumer subgraph fusion analyzer (`removable_gm_bytes`, hard feasibility gates for collective barriers, `L1`/`UB` residency limits, non-elidable `DCP` normalization, and concurrent critical-path overlap `max(P+C, Q+G)`).
 4. **Layer 4 (`net`)**:
    - Multi-dimensional parallel step decomposition (`DP x TP x EP x PP x DCP`, `DSpark` acceptance length, `Prefix Cache` hit rate, `D2D`/`RH2D` transfer overlap) and read-only bridge to pinned `msmodeling` (`tensor_cast`).
+
+
+## A3 predictive and normative dual model (v0.7)
+
+The package also provides a runnable A3 dual-model path:
+
+* `predict`/`mindie_sim.predict`: typed machine/model/workload/runtime input,
+  Dense/GQA/MLA/MoE shape lowering, graph/KV/MoE recipes, request scheduler,
+  event-driven Cube/Vector/MTE/HBM/D2D contention, TTFT/ITL/TPOT/E2E,
+  throughput/SLO goodput and iteration/shape traces.
+* `should`/`mindie_sim.should_cost`: a separate semantic normative path with
+  optimistic lower bound `L`, enumerated legal plans and feasible target `U`
+  plus a witness timeline. It is not a predictive result multiplied by an
+  efficiency factor.
+* `SQLiteCalibrationStore`: raw-sample inventory/coverage, deduplicated
+  measurement requests, executable manifest, CPU closed loop and optional
+  managed `torch_npu` runner. `predict` writes requests only with explicit
+  opt-in. No A3 measurement is bundled or fabricated.
+* `search`: full predictive simulation of every legal candidate, OOM/SLO
+  filtering and an independently rechecked recommendation.
+
+See `docs/a3-dual-model.md` and `examples/README.md`. Quick commands:
+
+```bash
+python -m mindie_sim predict --input examples/a3_dense_predict.json
+python -m mindie_sim predict --input examples/a3_mla_moe_predict.json
+python -m mindie_sim should  --input examples/a3_should_dense.json
+python -m mindie_sim search  --input examples/a3_search_dense.json
+```

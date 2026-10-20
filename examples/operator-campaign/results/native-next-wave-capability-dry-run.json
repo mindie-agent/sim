@@ -1,0 +1,279 @@
+{
+ "environment": {
+  "dry_run": true,
+  "not_a3_measured": true
+ },
+ "manifest": "native-next-wave-capability-pilot",
+ "not_a3_measured": true,
+ "protocol": {
+  "cache_policy": "same_preallocated_buffers_reused_no_cache_flush",
+  "iterations": 30,
+  "preallocated": true,
+  "seed": 20261021,
+  "timer": "device_event",
+  "trials": 2,
+  "warmup": 10,
+  "warmup_scope": "before_each_trial"
+ },
+ "results": [
+  {
+   "analytic_ms": null,
+   "backend": "torch",
+   "condition_key": "cond:pilot-softmax-lastdim",
+   "condition_keys": [
+    "cond:pilot-softmax-lastdim"
+   ],
+   "correctness": {
+    "status": "not_executed_cpu_dry_run"
+   },
+   "details": {
+    "dry_run": true,
+    "shape": {
+     "tokens": 8,
+     "width": 128
+    },
+    "validated_recipe": "torch_softmax"
+   },
+   "duration_ms": null,
+   "environment": {
+    "dry_run": true,
+    "not_a3_measured": true
+   },
+   "execution_kind": "primitive",
+   "measurement_id": "pilot-softmax-lastdim",
+   "observed_context": {
+    "not_a3_measured": true,
+    "observed": false
+   },
+   "protocol": {
+    "cache_policy": "same_preallocated_buffers_reused_no_cache_flush",
+    "iterations": 30,
+    "preallocated": true,
+    "seed": 20261021,
+    "timer": "device_event",
+    "timing_scope": "device_event_warm_operator",
+    "trials": 2,
+    "warmup": 10,
+    "warmup_scope": "before_each_trial"
+   },
+   "query_context": {
+    "scope": "native_next_capability_pilot",
+    "shape": {
+     "tokens": 8,
+     "width": 128
+    }
+   },
+   "raw_samples_ms": [],
+   "reason": "manifest and recipe wiring validated; no device call",
+   "request_key": "pilot-softmax-lastdim",
+   "required_backend": null,
+   "source": "cpu_dry_run_validator",
+   "source_class": "derived",
+   "split": "train",
+   "status": "dry_run_validated",
+   "target_match": null,
+   "trials": [],
+   "work": null,
+   "worker_recipe": "torch_softmax"
+  },
+  {
+   "analytic_ms": null,
+   "backend": "torch_npu_installed_api",
+   "condition_key": "cond:pilot-scaled-masked-softmax",
+   "condition_keys": [
+    "cond:pilot-scaled-masked-softmax"
+   ],
+   "correctness": {
+    "status": "not_executed_cpu_dry_run"
+   },
+   "details": {
+    "dry_run": true,
+    "shape": {
+     "heads": 1,
+     "kv": 32,
+     "q": 32
+    },
+    "validated_recipe": "npu_scaled_masked_softmax"
+   },
+   "duration_ms": null,
+   "environment": {
+    "dry_run": true,
+    "not_a3_measured": true
+   },
+   "execution_kind": "fused_kernel",
+   "measurement_id": "pilot-scaled-masked-softmax",
+   "observed_context": {
+    "not_a3_measured": true,
+    "observed": false
+   },
+   "protocol": {
+    "cache_policy": "same_preallocated_buffers_reused_no_cache_flush",
+    "iterations": 30,
+    "preallocated": true,
+    "seed": 20261021,
+    "timer": "device_event",
+    "timing_scope": "device_event_warm_operator",
+    "trials": 2,
+    "warmup": 10,
+    "warmup_scope": "before_each_trial"
+   },
+   "query_context": {
+    "scope": "native_next_capability_pilot",
+    "shape": {
+     "heads": 1,
+     "kv": 32,
+     "q": 32
+    }
+   },
+   "raw_samples_ms": [],
+   "reason": "manifest and recipe wiring validated; no device call",
+   "request_key": "pilot-scaled-masked-softmax",
+   "required_backend": null,
+   "source": "cpu_dry_run_validator",
+   "source_class": "derived",
+   "split": "train",
+   "status": "dry_run_validated",
+   "target_match": null,
+   "trials": [],
+   "work": null,
+   "worker_recipe": "npu_scaled_masked_softmax"
+  },
+  {
+   "analytic_ms": null,
+   "backend": "torch_npu_installed_api",
+   "condition_key": "cond:pilot-dynamic-int8",
+   "condition_keys": [
+    "cond:pilot-dynamic-int8"
+   ],
+   "correctness": {
+    "status": "not_executed_cpu_dry_run"
+   },
+   "details": {
+    "dry_run": true,
+    "shape": {
+     "tokens": 8,
+     "width": 128
+    },
+    "validated_recipe": "npu_dynamic_quant"
+   },
+   "duration_ms": null,
+   "environment": {
+    "dry_run": true,
+    "not_a3_measured": true
+   },
+   "execution_kind": "fused_kernel",
+   "measurement_id": "pilot-dynamic-int8",
+   "observed_context": {
+    "not_a3_measured": true,
+    "observed": false
+   },
+   "protocol": {
+    "cache_policy": "same_preallocated_buffers_reused_no_cache_flush",
+    "iterations": 30,
+    "preallocated": true,
+    "seed": 20261021,
+    "timer": "device_event",
+    "timing_scope": "device_event_warm_operator",
+    "trials": 2,
+    "warmup": 10,
+    "warmup_scope": "before_each_trial"
+   },
+   "query_context": {
+    "scope": "native_next_capability_pilot",
+    "shape": {
+     "tokens": 8,
+     "width": 128
+    }
+   },
+   "raw_samples_ms": [],
+   "reason": "manifest and recipe wiring validated; no device call",
+   "request_key": "pilot-dynamic-int8",
+   "required_backend": null,
+   "source": "cpu_dry_run_validator",
+   "source_class": "derived",
+   "split": "train",
+   "status": "dry_run_validated",
+   "target_match": null,
+   "trials": [],
+   "work": null,
+   "worker_recipe": "npu_dynamic_quant"
+  },
+  {
+   "analytic_ms": null,
+   "backend": "torch_npu_installed_api",
+   "condition_key": "cond:pilot-grouped-bf16-list",
+   "condition_keys": [
+    "cond:pilot-grouped-bf16-list"
+   ],
+   "correctness": {
+    "status": "not_executed_cpu_dry_run"
+   },
+   "details": {
+    "dry_run": true,
+    "shape": {
+     "experts": 4,
+     "k": 128,
+     "n": 128,
+     "routed_tokens": 8
+    },
+    "validated_recipe": "npu_grouped_matmul_list_bf16"
+   },
+   "duration_ms": null,
+   "environment": {
+    "dry_run": true,
+    "not_a3_measured": true
+   },
+   "execution_kind": "fused_kernel",
+   "measurement_id": "pilot-grouped-bf16-list",
+   "observed_context": {
+    "not_a3_measured": true,
+    "observed": false
+   },
+   "protocol": {
+    "cache_policy": "same_preallocated_buffers_reused_no_cache_flush",
+    "iterations": 30,
+    "preallocated": true,
+    "seed": 20261021,
+    "timer": "device_event",
+    "timing_scope": "device_event_warm_operator",
+    "trials": 2,
+    "warmup": 10,
+    "warmup_scope": "before_each_trial"
+   },
+   "query_context": {
+    "scope": "native_next_capability_pilot",
+    "shape": {
+     "experts": 4,
+     "k": 128,
+     "n": 128,
+     "routed_tokens": 8
+    }
+   },
+   "raw_samples_ms": [],
+   "reason": "manifest and recipe wiring validated; no device call",
+   "request_key": "pilot-grouped-bf16-list",
+   "required_backend": null,
+   "source": "cpu_dry_run_validator",
+   "source_class": "derived",
+   "split": "train",
+   "status": "dry_run_validated",
+   "target_match": null,
+   "trials": [],
+   "work": null,
+   "worker_recipe": "npu_grouped_matmul_list_bf16"
+  }
+ ],
+ "run_id": "capabilities-dry-run",
+ "status": "dry_run",
+ "summary": {
+  "attempted": 4,
+  "completed": 0,
+  "dry_run_validated": 4,
+  "failed": 0,
+  "measured_samples": 0,
+  "pending": 0,
+  "status_counts": {
+   "dry_run_validated": 4
+  }
+ }
+}

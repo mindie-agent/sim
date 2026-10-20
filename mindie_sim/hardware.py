@@ -13,10 +13,10 @@
     yields ``verified_runtime_hbm_mib=None`` and ``runtime_unverified``.
   * Buffer sizes/offsets are rounded only by the requested 32B/256B alignment;
     overlap, overflow and misalignment are diagnostics, never silently fixed.
-  * Thermal reference times use caller-supplied peaks/frequencies and are lower
-    bounds, not measured sustained performance.  Short-burst clocks never
-    replace sustained clocks.  Cube peaks come from the resolved SKU profile;
-    an unsupported dtype is ``unmodeled`` rather than borrowing A5 peaks.
+  * Thermal reference times use caller/profile per-die peaks and caller-supplied
+    frequencies; they are lower bounds, not measured sustained performance.
+    Short-burst clocks never replace sustained clocks.  An unsupported dtype is
+    ``unmodeled`` rather than borrowing A5 peaks.
   * The (W-C) sensitivity table is reproducible arithmetic, not a promise that
     the gap is removable.
 
@@ -97,8 +97,6 @@ from .thermal import (
     thermal_bounds,
     unmodeled_thermal_bounds,
 )
-
-SCHEMA_VERSION = "mindie-sim-hardware/1"
 
 
 @dataclass(frozen=True)
@@ -381,62 +379,36 @@ def parse_cannsim_link_ceilings(path_or_text: str | Path) -> dict[str, Any]:
     }
 
 
-def _dtype_ops_per_cycle(values: Mapping[str, Any], names: Sequence[str]) -> float | None:
-    for name in names:
-        raw = values.get(name)
-        if isinstance(raw, Mapping):
-            raw = raw.get("ops_per_cycle", raw.get("value"))
-        if isinstance(raw, (int, float)) and not isinstance(raw, bool) and float(raw) > 0:
-            return float(raw)
+def _thermal_input(
+    direct: Any,
+    workload: Mapping[str, Any] | None,
+    *keys: str,
+) -> Any:
+    if direct is not None:
+        return direct
+    if workload is not None:
+        for key in keys:
+            value = workload.get(key)
+            if value is not None:
+                return value
     return None
 
 
 def _profile_cube_ops_per_cycle(
     profile: DeviceCapabilityProfile,
 ) -> tuple[float | None, float | None]:
-    cube = profile.cube_spec
-    if isinstance(cube, Mapping):
-        throughput = cube.get("throughput")
-        ops_map = cube.get("ops_per_cycle_per_aic")
-        aic_count = cube.get("aic_count_per_die")
-    else:
-        throughput = getattr(cube, "throughput", None)
-        ops_map = getattr(cube, "ops_per_cycle_per_aic", None)
-        aic_count = getattr(cube, "aic_count_per_die", None)
-    fp8 = bf16 = None
-    if isinstance(ops_map, Mapping) and aic_count is not None and float(aic_count) > 0:
-        fp8_per_aic = _dtype_ops_per_cycle(ops_map, ("fp8", "fp8_e4m3", "fp8_e5m2"))
-        bf16_per_aic = _dtype_ops_per_cycle(ops_map, ("bf16",))
-        fp8 = fp8_per_aic * float(aic_count) if fp8_per_aic is not None else None
-        bf16 = bf16_per_aic * float(aic_count) if bf16_per_aic is not None else None
-    if isinstance(throughput, Mapping):
-        throughput_fp8 = _dtype_ops_per_cycle(throughput, ("fp8", "fp8_e4m3", "fp8_e5m2"))
-        throughput_bf16 = _dtype_ops_per_cycle(throughput, ("bf16",))
-        if throughput_fp8 is not None:
-            fp8 = throughput_fp8
-        if throughput_bf16 is not None:
-            bf16 = throughput_bf16
-    return fp8, bf16
-
-
-def _thermal_input(
-    direct: float | None,
-    workload: Mapping[str, Any] | None,
-    *keys: str,
-) -> float | None:
-    if direct is not None:
-        return float(direct)
-    for key in keys:
-        value = workload.get(key) if workload else None
-        if value is not None:
-            return float(value)
-    return None
+    accessor = getattr(profile.cube_spec, "ops_per_cycle_per_die", None)
+    if not callable(accessor):
+        return None, None
+    return accessor("fp8"), accessor("bf16")
 
 
 def _thermal_for_profile(
     profile: DeviceCapabilityProfile,
     *,
     sustained_mhz_range: Sequence[float],
+    short_burst_mhz_range: Sequence[float],
+    extra_frequencies_mhz: Sequence[float],
     workload: Mapping[str, Any] | None,
     fp8_flops: float | None,
     bf16_flops: float | None,
@@ -448,6 +420,8 @@ def _thermal_for_profile(
     cube_reference_cycles: float | None,
     fp8_ops_per_cycle: float | None,
     bf16_ops_per_cycle: float | None,
+    measurement_mhz: float | None,
+    workload_origin: str | None,
 ) -> dict[str, Any]:
     fp8 = _thermal_input(fp8_flops, workload, "fp8_flops", "flops_fp8")
     bf16 = _thermal_input(bf16_flops, workload, "bf16_flops", "flops_bf16")
@@ -456,37 +430,141 @@ def _thermal_for_profile(
     counted = _thermal_input(counted_cycles, workload, "counted_cycles")
     vector = _thermal_input(vector_cycles, workload, "vector_cycles")
     fix = _thermal_input(fix_cycles, workload, "fix_cycles")
-    explicit_cycles = _thermal_input(cube_reference_cycles, workload, "cube_reference_cycles")
+    explicit = _thermal_input(cube_reference_cycles, workload, "cube_reference_cycles")
+    measurement = _thermal_input(measurement_mhz, workload, "measurement_mhz")
+    origin = _thermal_input(workload_origin, workload, "workload_origin")
+    fp8_override = _thermal_input(fp8_ops_per_cycle, workload, "fp8_ops_per_cycle")
+    bf16_override = _thermal_input(bf16_ops_per_cycle, workload, "bf16_ops_per_cycle")
+    if (wall is None) != (counted is None):
+        raise HardwareError("thermal_cycles_pair_incomplete")
+
+    fp8_value = None if fp8 is None else _float_value(fp8, "cube_reference_flops_invalid")
+    bf16_value = None if bf16 is None else _float_value(bf16, "cube_reference_flops_invalid")
     profile_fp8, profile_bf16 = _profile_cube_ops_per_cycle(profile)
-    fp8_ops = _thermal_input(fp8_ops_per_cycle, workload, "fp8_ops_per_cycle")
-    bf16_ops = _thermal_input(bf16_ops_per_cycle, workload, "bf16_ops_per_cycle")
-    if fp8_ops is None:
-        fp8_ops = profile_fp8
-    if bf16_ops is None:
-        bf16_ops = profile_bf16
-    unsupported = (
-        (fp8 is not None and fp8 > 0 and fp8_ops is None)
-        or (bf16 is not None and bf16 > 0 and bf16_ops is None)
-    )
+    fp8_ops = fp8_override if fp8_override is not None else profile_fp8
+    bf16_ops = bf16_override if bf16_override is not None else profile_bf16
+    peak_sources = {
+        "fp8": (
+            "caller_explicit" if fp8_override is not None
+            else "sku_profile.cube_spec.ops_per_cycle_per_die" if profile_fp8 is not None
+            else None
+        ),
+        "bf16": (
+            "caller_explicit" if bf16_override is not None
+            else "sku_profile.cube_spec.ops_per_cycle_per_die" if profile_bf16 is not None
+            else None
+        ),
+    }
+    unsupported: list[str] = []
+    if fp8_value is not None and fp8_value > 0 and fp8_ops is None:
+        unsupported.append("fp8")
+    if bf16_value is not None and bf16_value > 0 and bf16_ops is None:
+        unsupported.append("bf16")
+
+    if explicit is not None:
+        thermal = thermal_bounds(
+            fp8_flops=fp8_value,
+            bf16_flops=bf16_value,
+            sustained_mhz_range=sustained_mhz_range,
+            short_burst_mhz_range=short_burst_mhz_range,
+            extra_frequencies_mhz=extra_frequencies_mhz,
+            target_us=target,
+            wall_cycles=wall,
+            counted_cycles=counted,
+            vector_cycles=vector,
+            fix_cycles=fix,
+            cube_reference_cycles=explicit,
+            fp8_ops_per_cycle=fp8_ops,
+            bf16_ops_per_cycle=bf16_ops,
+            measurement_mhz=measurement,
+            workload_origin=origin,
+        )
+        thermal["unsupported_dtypes"] = unsupported
+        thermal["peak_sources"] = peak_sources
+        return thermal
+
     if unsupported:
-        return unmodeled_thermal_bounds(
+        if wall is not None and counted is not None:
+            thermal = thermal_bounds(
+                sustained_mhz_range=sustained_mhz_range,
+                short_burst_mhz_range=short_burst_mhz_range,
+                extra_frequencies_mhz=extra_frequencies_mhz,
+                target_us=target,
+                wall_cycles=wall,
+                counted_cycles=counted,
+                vector_cycles=vector,
+                fix_cycles=fix,
+                measurement_mhz=measurement,
+                workload_origin=origin,
+            )
+            thermal["unsupported_dtypes"] = unsupported
+            thermal["peak_sources"] = peak_sources
+            return thermal
+        thermal = unmodeled_thermal_bounds(
             "unsupported_dtype_or_missing_sku_cube_throughput",
             sustained_mhz_range=sustained_mhz_range,
+            short_burst_mhz_range=short_burst_mhz_range,
+            extra_frequencies_mhz=extra_frequencies_mhz,
             target_us=target,
+            measurement_mhz=measurement,
+            workload_origin=origin,
+            unsupported_dtypes=unsupported,
         )
-    return thermal_bounds(
-        fp8_flops=fp8,
-        bf16_flops=bf16,
+        thermal["peak_sources"] = peak_sources
+        return thermal
+
+    uses_profile = (
+        (fp8_value is not None and fp8_value > 0 and fp8_override is None and profile_fp8 is not None)
+        or (bf16_value is not None and bf16_value > 0 and bf16_override is None and profile_bf16 is not None)
+    )
+    uses_caller = (
+        (fp8_value is not None and fp8_value > 0 and fp8_override is not None)
+        or (bf16_value is not None and bf16_value > 0 and bf16_override is not None)
+    )
+    if uses_profile and uses_caller:
+        cycle_source = "mixed caller/profile per-die ops/cycle"
+    elif uses_profile:
+        cycle_source = "sku profile cube_spec.ops_per_cycle_per_die"
+    else:
+        cycle_source = "caller-supplied per-die ops/cycle"
+    thermal = thermal_bounds(
+        fp8_flops=fp8_value,
+        bf16_flops=bf16_value,
         sustained_mhz_range=sustained_mhz_range,
+        short_burst_mhz_range=short_burst_mhz_range,
+        extra_frequencies_mhz=extra_frequencies_mhz,
         target_us=target,
         wall_cycles=wall,
         counted_cycles=counted,
         vector_cycles=vector,
         fix_cycles=fix,
-        cube_reference_cycles=explicit_cycles,
+        cube_reference_cycles=explicit,
         fp8_ops_per_cycle=fp8_ops,
         bf16_ops_per_cycle=bf16_ops,
+        measurement_mhz=measurement,
+        workload_origin=origin,
+        cycle_source=cycle_source,
     )
+    thermal["peak_sources"] = peak_sources
+    return thermal
+
+
+def _attach_link_bounds(
+    thermal: dict[str, Any],
+    workload: Mapping[str, Any] | None,
+    cannsim_links: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    traffic = workload.get("link_traffic_bytes_per_aic") if workload else None
+    if not traffic:
+        return thermal
+    links_source = cannsim_links or default_link_ceilings()
+    ceilings = links_source.get("ceilings_bpc", links_source) if isinstance(links_source, Mapping) else {}
+    thermal["link_bounds"] = link_reference_bounds(
+        traffic,
+        ceilings_bpc=ceilings,
+        mhz=float(workload.get("link_reference_mhz", 1280.0)),
+    )
+    return thermal
 
 
 def hardware_report(
@@ -502,6 +580,8 @@ def hardware_report(
     simulator_ub_kib: float | None = 256.0,
     allocatable_ub_kib: float | None = None,
     sustained_mhz_range: Sequence[float] = SUSTAINED_MHZ_RANGE,
+    short_burst_mhz_range: Sequence[float] = SHORT_BURST_MHZ_RANGE,
+    extra_frequencies_mhz: Sequence[float] = (),
     buffer_plan: Mapping[str, Any] | None = None,
     workload: Mapping[str, Any] | None = None,
     transfer_plan: Mapping[str, Any] | None = None,
@@ -516,11 +596,15 @@ def hardware_report(
     cube_reference_cycles: float | None = None,
     fp8_ops_per_cycle: float | None = None,
     bf16_ops_per_cycle: float | None = None,
+    measurement_mhz: float | None = None,
+    workload_origin: str | None = None,
 ) -> dict[str, Any]:
     if config is not None and ini_text is not None:
         raise HardwareError("hardware_config_and_ini_text_conflict")
     if config is None and ini_text is not None:
         config = parse_platform_ini_text(ini_text)
+    if workload is not None and not isinstance(workload, Mapping):
+        raise HardwareError("hardware_workload_invalid")
     profile = resolve_device_capability_profile(
         config=config,
         soc=soc,
@@ -536,7 +620,6 @@ def hardware_report(
     )
     if profile.status == "ambiguous_sku":
         payload: dict[str, Any] = {
-            "schema_version": SCHEMA_VERSION,
             "status": "ambiguous_sku",
             "unmodeled_reason": profile.unmodeled_reason,
             "device_capability_profile": profile.to_dict(),
@@ -560,11 +643,33 @@ def hardware_report(
                 alignment_bytes=int(buffer_plan.get("alignment_bytes", DEFAULT_ALIGNMENT_BYTES)),
                 ping_pong=buffer_plan.get("ping_pong"),
             )
-        payload["thermal"] = unmodeled_thermal_bounds(
-            profile.unmodeled_reason or AMBIGUOUS_SKU_REASON,
+        thermal = _thermal_for_profile(
+            profile,
             sustained_mhz_range=sustained_mhz_range,
-            target_us=_thermal_input(target_us, workload, "target_us"),
+            short_burst_mhz_range=short_burst_mhz_range,
+            extra_frequencies_mhz=extra_frequencies_mhz,
+            workload=workload,
+            fp8_flops=fp8_flops,
+            bf16_flops=bf16_flops,
+            target_us=target_us,
+            wall_cycles=wall_cycles,
+            counted_cycles=counted_cycles,
+            vector_cycles=vector_cycles,
+            fix_cycles=fix_cycles,
+            cube_reference_cycles=cube_reference_cycles,
+            fp8_ops_per_cycle=fp8_ops_per_cycle,
+            bf16_ops_per_cycle=bf16_ops_per_cycle,
+            measurement_mhz=measurement_mhz,
+            workload_origin=workload_origin,
         )
+        if thermal["status"] == "unmodeled":
+            thermal["unmodeled_reason"] = profile.unmodeled_reason or AMBIGUOUS_SKU_REASON
+            thermal["assumptions"] = [
+                f"thermal inputs are insufficient: {thermal['unmodeled_reason']}",
+                "explicit reference cycles or a complete W/C pair remain independently usable",
+                "no implicit A5/K3 FlashMLA golden workload was injected",
+            ]
+        payload["thermal"] = _attach_link_bounds(thermal, workload, cannsim_links)
         return payload
 
     if config is None:
@@ -595,7 +700,6 @@ def hardware_report(
         sustained_mhz_range=sustained_mhz_range,
     )
     payload = {
-        "schema_version": SCHEMA_VERSION,
         "status": "modeled" if cross["runtime_verified"] else "runtime_unverified",
         "unmodeled_reason": None,
         "device_capability_profile": profile.to_dict(),
@@ -632,6 +736,8 @@ def hardware_report(
     thermal = _thermal_for_profile(
         profile,
         sustained_mhz_range=sustained_mhz_range,
+        short_burst_mhz_range=short_burst_mhz_range,
+        extra_frequencies_mhz=extra_frequencies_mhz,
         workload=workload,
         fp8_flops=fp8_flops,
         bf16_flops=bf16_flops,
@@ -643,17 +749,10 @@ def hardware_report(
         cube_reference_cycles=cube_reference_cycles,
         fp8_ops_per_cycle=fp8_ops_per_cycle,
         bf16_ops_per_cycle=bf16_ops_per_cycle,
+        measurement_mhz=measurement_mhz,
+        workload_origin=workload_origin,
     )
-    traffic = workload.get("link_traffic_bytes_per_aic") if workload else None
-    if traffic:
-        links_source = cannsim_links or default_link_ceilings()
-        ceilings = links_source.get("ceilings_bpc", links_source) if isinstance(links_source, Mapping) else {}
-        thermal["link_bounds"] = link_reference_bounds(
-            traffic,
-            ceilings_bpc=ceilings,
-            mhz=float(workload.get("link_reference_mhz", 1280.0)),
-        )
-    payload["thermal"] = thermal
+    payload["thermal"] = _attach_link_bounds(thermal, workload, cannsim_links)
     return payload
 
 
@@ -662,12 +761,11 @@ parse_ini = parse_platform_ini
 cross_check = cross_check_capacities
 parse_cannsim = parse_cannsim_link_ceilings
 __all__ = [
-    "SCHEMA_VERSION", "AMBIGUOUS_SKU_REASON", "BUILTIN_SKU_CATALOG", "HardwareError",
+    "AMBIGUOUS_SKU_REASON", "BUILTIN_SKU_CATALOG", "HardwareError",
     "PlatformConfig", "CubeSpec", "VectorSpec", "MemoryHierarchySpec", "ClockAndTopologySpec",
     "DeviceCapabilityProfile", "NpuSmiDevice", "NpuSmiChip", "NpuSmiSnapshot", "BufferAllocation",
     "A5_CANN_SIM_LINK_CEILINGS_BPC", "A5_REFERENCE_PEAKS", "SUSTAINED_MHZ_RANGE",
     "SHORT_BURST_MHZ_RANGE", "DEFAULT_ALIGNMENT_BYTES", "PING_PONG_ALIGNMENT_BYTES",
-    "A5_FLASHMLA_C8_GOLDEN_WORKLOAD", "unmodeled_thermal_bounds",
     "align_up", "infer_arch_family", "is_ambiguous_family_token", "load_sku_profile",
     "resolve_device_capability_profile", "parse_platform_ini", "parse_platform_ini_text",
     "parse_ini", "parse_npu_smi_info", "parse_npu_smi_common", "parse_npu_smi_board",
@@ -675,6 +773,7 @@ __all__ = [
     "parse_cannsim_link_ceilings", "parse_cannsim", "default_link_ceilings",
     "validate_buffer_allocations", "check_mx_scale_layout", "cube_reference_cycles",
     "cycles_to_us", "reference_time_us", "sensitivity_matrix", "thermal_bounds",
+    "unmodeled_thermal_bounds", "A5_FLASHMLA_C8_GOLDEN_WORKLOAD",
     "link_reference_bounds", "hardware_report", "TRANSFER_CHANNELS", "TransferChannelSpec",
     "NpuTopologySnapshot", "PcieLinkSnapshot", "parse_npu_smi_topo", "parse_pcie_link_info",
     "default_transfer_channels", "solve_transfer_bound", "solve_collective_bound", "evaluate_transfer_plan",

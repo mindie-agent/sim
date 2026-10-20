@@ -1,0 +1,584 @@
+{
+ "scope": "pending measurement inventory derived from current catalog OpSpec lowering; no measured samples or heldout values included",
+ "campaign": {
+  "config": "examples/operator-campaign/campaign-config.json",
+  "conditions": 11386,
+  "derived_cases": 180,
+  "inventory_entries": 145,
+  "inventory_status_counts": {
+   "executable_not_selected_budget": 4,
+   "pending_backend": 41,
+   "selected": 59,
+   "selected_with_pending_target": 27,
+   "unsupported": 14
+  },
+  "selected_requests": 318,
+  "selected_train": 233,
+  "selected_heldout": 85,
+  "selected_extrapolation": 60,
+  "pending_conditions": 4902,
+  "pending_family_recipe_count": 82,
+  "derivation_failures": 0,
+  "budget": {
+   "limit": 320,
+   "max_points_per_condition": 8,
+   "max_working_set_bytes": 4294967296,
+   "omitted": {
+    "budget_exhausted": 2
+   },
+   "selected_requests": 318
+  }
+ },
+ "models": {
+  "deepseek-v4-10t": {
+   "condition_count": 1714,
+   "selected_points": 75,
+   "emitted_families": 30
+  },
+  "deepseek-v4-flash-0731": {
+   "condition_count": 1834,
+   "selected_points": 64,
+   "emitted_families": 30
+  },
+  "deepseek-v4-pro-0813": {
+   "condition_count": 1714,
+   "selected_points": 75,
+   "emitted_families": 30
+  },
+  "deepseek-v4.1-flash": {
+   "condition_count": 2650,
+   "selected_points": 59,
+   "emitted_families": 37
+  },
+  "glm-5.3": {
+   "condition_count": 1500,
+   "selected_points": 54,
+   "emitted_families": 32
+  },
+  "kimi-k3": {
+   "condition_count": 1640,
+   "selected_points": 83,
+   "emitted_families": 36
+  },
+  "kimi-k3-dspark": {
+   "condition_count": 228,
+   "selected_points": 45,
+   "emitted_families": 16
+  },
+  "qwen3.8-2.4t-a95b": {
+   "condition_count": 1100,
+   "selected_points": 48,
+   "emitted_families": 31
+  },
+  "qwen3.8-27b": {
+   "condition_count": 720,
+   "selected_points": 16,
+   "emitted_families": 25
+  }
+ },
+ "pending_family_recipes": [
+  "allgather:catalog_group_fallback_allgather",
+  "allgather:catalog_logits_allgather",
+  "allreduce:catalog_shared_tp_allreduce",
+  "allreduce:catalog_tp_allreduce",
+  "attention_output_gate:catalog_gqa_out_gate",
+  "attention_pv:catalog_dsa_pv",
+  "attention_pv:catalog_gqa_pv",
+  "attention_pv:catalog_mla_pv",
+  "attention_qk:catalog_dsa_qk",
+  "attention_qk:catalog_gqa_qk",
+  "attention_qk:catalog_mla_qk",
+  "barrier:catalog_dspark_proposal_heads",
+  "barrier:catalog_engram_reverse_matrix_join",
+  "barrier:catalog_index_cache_no_new_rows",
+  "barrier:catalog_long_cache_no_new_rows",
+  "barrier:catalog_routing_control_dependency",
+  "cache_transfer:catalog_cross_stage_index_transfer",
+  "candidate_blocks:catalog_dsa_candidate_blocks",
+  "compress_pool:catalog_compressor_pool",
+  "down_projection:catalog_dense_down",
+  "elementwise:catalog_attn_residual_projection",
+  "elementwise:catalog_mlp_residual_projection",
+  "elementwise:catalog_shared_router_gate",
+  "embedding:catalog_dspark_markov_lookup",
+  "embedding:catalog_dspark_target_embedding_read",
+  "embedding:catalog_embedding_gather",
+  "engram_apply:catalog_engram_gate_apply",
+  "engram_broadcast:catalog_engram_tp_broadcast",
+  "engram_gather:catalog_engram_device_gather",
+  "engram_ids:catalog_engram_node_exchange",
+  "engram_query:catalog_engram_query",
+  "ep_combine:catalog_alltoallv_combine",
+  "ep_dispatch:catalog_alltoallv_dispatch",
+  "gate_up_projection:catalog_dense_gate_up",
+  "gemm:catalog_mhc_fn",
+  "gemm:catalog_mhc_post_fn",
+  "gemm:dsa_compressor_gate_ring",
+  "gemm:dsa_compressor_kv",
+  "gemm:dsa_index_query",
+  "gemm:glm_index_k_projection",
+  "gemm:grouped_output_wo_a",
+  "gemm:grouped_output_wo_a_fallback",
+  "gemm:grouped_output_wo_b",
+  "gemm:grouped_output_wo_b_fallback",
+  "hash_router:catalog_hash_router",
+  "linear_conv:catalog_gdn_conv",
+  "linear_conv:catalog_kda_conv",
+  "linear_gate:catalog_gdn_gate",
+  "linear_gate:catalog_kda_beta_gate",
+  "linear_output_gate:catalog_gdn_out_gate",
+  "linear_output_gate:catalog_kda_out_gate",
+  "linear_output_gate:catalog_mla_out_gate_act",
+  "linear_output_gate:catalog_mla_out_gate_mul",
+  "logits_add:catalog_dspark_markov_add",
+  "mhc:catalog_mhc_post_mix",
+  "mhc:catalog_mhc_post_sinkhorn",
+  "mhc:catalog_mhc_residual_mix",
+  "mhc:catalog_mhc_sinkhorn",
+  "mla_kv_a:mla_kv_a_replicated",
+  "mla_kv_a:mla_wkv_replicated",
+  "mla_kv_b:mla_kv_b_value_expand_after_absorption",
+  "mla_q_a:mla_q_a_replicated",
+  "mla_q_absorb:mla_q_absorb_kv_b_nope",
+  "mla_q_b:mla_q_b_local_heads",
+  "moe_down:grouped_expert_down",
+  "moe_gate_up:grouped_expert_gate_up",
+  "o_projection:mla_o_proj",
+  "pp_p2p:catalog_pp_p2p",
+  "qk_gate:catalog_gqa_q_gate",
+  "qk_norm:catalog_gdn_split_norm",
+  "quantize:catalog_index_k_quantize",
+  "recurrent_state:catalog_c2_ring",
+  "recurrent_state:catalog_gdn_recurrent",
+  "recurrent_state:catalog_kda_recurrent",
+  "rope:catalog_inplace_latent_rope",
+  "rope:catalog_mla_rope",
+  "router_softmax:catalog_moe_router_score",
+  "sampling:catalog_dspark_sequential_sample",
+  "sampling:catalog_sampling",
+  "shared_expert_down:shared_expert_down",
+  "shared_expert_gate_up:shared_expert_full_width",
+  "topk_selection:catalog_dsa_topk"
+ ],
+ "commands": {
+  "plan": "python -m mindie_sim.a3_operator_campaign plan --config examples/operator-campaign/campaign-config.json --output-dir /tmp/campaign-current --budget 320",
+  "dry_run": "python -m mindie_sim.a3_operator_worker --manifest /tmp/campaign-current/manifest.json --results /tmp/campaign-current/results/dry-run.json --dry-run",
+  "inspect": "python -m mindie_sim.a3_operator_campaign inspect --manifest /tmp/campaign-current/manifest.json",
+  "materialize": "python -m mindie_sim.a3_operator_campaign materialize --conditions /tmp/campaign-current/conditions.json --condition-key cond:... --output /tmp/materialized.json"
+ },
+ "pending_examples": [
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 1048576
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 1048576
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 134217728
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 16777216
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 262144
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 32768
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 32768
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 4194304
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 4194304
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_group_fallback_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "elements": 536870912
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-flash-0731"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4.1-flash"
+   ]
+  },
+  {
+   "family": "allgather",
+   "recipe": "catalog_logits_allgather",
+   "status": "excluded_communication",
+   "reason": "collective/transfer/barrier work is owned by the communication lane; this campaign does not measure A5 or merge communication cost",
+   "shape": {
+    "tokens": 1,
+    "width": 129280
+   },
+   "models": [
+    "deepseek-v4-10t",
+    "deepseek-v4-pro-0813"
+   ]
+  }
+ ],
+ "pending_example_policy": "bounded first 32 current pending conditions from the 4,902-condition index; complete table via conditions.json/campaign command"
+}

@@ -46,7 +46,6 @@ from .theoretical_model import (
 
 from .comm import default_transfer_channels, evaluate_transfer_plan
 
-SCHEMA_VERSION = "mindie-sim-net/1"
 PARALLEL_KEYS = ("dp", "tp", "ep", "pp", "dcp")
 DEFAULT_SHARD_DIVISORS = {
     "compute": "tp",
@@ -179,12 +178,15 @@ def decompose_step(
             "step_ms": None,
         }
     per_token_ms = sum(per_component.values())
+    # This is a steady-state stage estimate, not a request latency.  Dividing
+    # compute, communication and overhead by PP hides pipeline fill/drain and
+    # cannot answer "how long does one request take?".
     step_ms = per_token_ms / degrees["pp"] * float(imbalance) + float(pp_bubble)
     assumptions = [
         "step components are caller-supplied milliseconds",
         "compute is divided by TP, attention by TP*DCP, MoE by EP (explicit defaults)",
         "DP is a replica axis and does not divide one replica's step time",
-        "PP divides per-token work and adds the explicit pp_bubble_ms",
+        "PP divides per-token work for a steady-state stage estimate only; this is not request latency",
         "DP load imbalance is applied only when explicitly supplied",
     ]
     result: dict[str, Any] = {
@@ -198,6 +200,11 @@ def decompose_step(
         "pp_bubble_ms": float(pp_bubble),
         "dp_load_imbalance_factor": float(imbalance),
         "step_ms": step_ms,
+        "latency_semantics": "pipeline_stage_steady_state_estimate_not_request_latency",
+        "legacy_step_ms_is_not_request_latency": True,
+        "request_latency_ms": None,
+        "request_latency_unmodeled_reason": "finite_pipeline_schedule_and_arrival_trace_required",
+        "pipeline_stages": degrees["pp"],
         "assumptions": assumptions,
     }
     dspark = model_spec.get("dspark")
@@ -209,7 +216,8 @@ def decompose_step(
                 "acceptance_length": float(acceptance),
                 "tokens_per_target_step": tokens,
                 "tpot_ms": step_ms / tokens,
-                "formula": "TPOT = step_ms / (1 + acceptance_length)",
+                "formula": "scenario TPOT = stage_estimate_ms / (1 + acceptance_length)",
+                "scenario_only": True,
             }
         else:
             result["dspark"] = {"status": "unmodeled", "reason": "acceptance_length_invalid"}
@@ -248,20 +256,37 @@ def decompose_step(
             overrides=transfer_plan.get("channel_overrides") if isinstance(transfer_plan.get("channel_overrides"), Mapping) else None,
         )
         evaluated = evaluate_transfer_plan(transfer_plan, channels, dies_per_package=dies_pkg)
+        all_items = [*evaluated["transfers"], *evaluated["collectives"]]
         known_us = [
-            float(item["lower_bound_us"])
-            for item in (*evaluated["transfers"], *evaluated["collectives"])
+            float(item["lower_bound_us"]) for item in all_items
             if item.get("lower_bound_us") is not None
         ]
-        total_transfer_ms = sum(known_us) / 1000.0
+        unknown_items = [
+            {
+                "channel": item.get("channel"),
+                "collective": item.get("collective"),
+                "status": item.get("status", "unmodeled"),
+                "flags": list(item.get("flags", ())),
+            }
+            for item in all_items
+            if item.get("lower_bound_us") is None
+        ]
+        known_transfer_ms = sum(known_us) / 1000.0
+        complete = not unknown_items
         overlap_compute_ms = float(transfer_plan.get("overlapped_compute_ms", 0.0) or 0.0)
-        exposed_transfer_ms = max(0.0, total_transfer_ms - overlap_compute_ms)
+        exposed_transfer_ms = max(0.0, known_transfer_ms - overlap_compute_ms) if complete else None
         result["communication_and_transfers"] = {
             **evaluated,
-            "total_transfer_lower_bound_ms": total_transfer_ms,
+            "complete": complete,
+            "known_transfer_lower_bound_ms": known_transfer_ms,
+            "unknown_transfer_count": len(unknown_items),
+            "unknown_transfer_items": unknown_items,
+            # A partial sum is never presented as a complete transfer total.
+            "total_transfer_lower_bound_ms": known_transfer_ms if complete else None,
             "overlapped_compute_ms": overlap_compute_ms,
             "exposed_transfer_ms": exposed_transfer_ms,
-            "step_ms_with_exposed_transfer": step_ms + exposed_transfer_ms,
+            "step_ms_with_exposed_transfer": (step_ms + exposed_transfer_ms) if complete else None,
+            "partial_total_not_a_prediction": not complete,
         }
     return result
 
@@ -384,7 +409,6 @@ def net_report(
     else:
         status = "unmodeled"
     return {
-        "schema_version": SCHEMA_VERSION,
         "status": status,
         "ideal_hardware_lower_bound_ms": ideal_bound,
         "model_predicted_ms": predicted,
@@ -414,7 +438,6 @@ def net_report(
 
 
 __all__ = [
-    "SCHEMA_VERSION",
     "NetError",
     "PARALLEL_KEYS",
     "DEFAULT_SHARD_DIVISORS",
