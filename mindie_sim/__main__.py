@@ -46,6 +46,7 @@ from .hardware import (
 from .net import NetError, net_report
 from .pipeline import PipelineError, compare_pipeline_variants, solve_periodic_pipeline
 from .subgraph import SubgraphError, analyze_subgraph_fusion
+from .thermal import A5_FLASHMLA_C8_GOLDEN_WORKLOAD
 
 ERROR_SCHEMA = "mindie-sim-error/1"
 
@@ -161,6 +162,24 @@ def _hardware(args: argparse.Namespace) -> dict[str, Any]:
     buffer_plan = _load_json(args.buffers) if args.buffers else None
     transfer_plan = _load_json(args.transfers) if args.transfers else None
     simulator_ub = None if args.simulator_ub_kib is None or args.simulator_ub_kib <= 0 else float(args.simulator_ub_kib)
+    thermal_overrides = {
+        key: value
+        for key, value in {
+            "fp8_flops": args.fp8_flops,
+            "bf16_flops": args.bf16_flops,
+            "target_us": args.target_us,
+            "wall_cycles": args.wall_cycles,
+            "counted_cycles": args.counted_cycles,
+            "vector_cycles": args.vector_cycles,
+            "fix_cycles": args.fix_cycles,
+            "cube_reference_cycles": args.cube_reference_cycles,
+            "fp8_ops_per_cycle": args.fp8_ops_per_cycle,
+            "bf16_ops_per_cycle": args.bf16_ops_per_cycle,
+        }.items()
+        if value is not None
+    }
+    if args.golden_a5_flashmla:
+        thermal_overrides = {**A5_FLASHMLA_C8_GOLDEN_WORKLOAD, **thermal_overrides}
     payload = hardware_report(
         config,
         soc=args.soc,
@@ -176,6 +195,7 @@ def _hardware(args: argparse.Namespace) -> dict[str, Any]:
         workload=workload,
         transfer_plan=transfer_plan,
         cannsim_links=cannsim,
+        **thermal_overrides,
     )
     payload["command"] = "hardware"
     return payload
@@ -258,6 +278,21 @@ def build_parser() -> argparse.ArgumentParser:
     hardware.add_argument("--cannsim-constants", default=None, help="explicit cannsim link constants")
     hardware.add_argument("--buffers", default=None, help="buffer allocation plan JSON")
     hardware.add_argument("--workload", default=None, help="workload/thermal JSON")
+    hardware.add_argument(
+        "--golden-a5-flashmla",
+        action="store_true",
+        help="use the explicit A5 C8 FlashMLA Golden workload fixture",
+    )
+    hardware.add_argument("--fp8-flops", type=float, default=None, help="explicit FP8 FLOPs")
+    hardware.add_argument("--bf16-flops", type=float, default=None, help="explicit BF16 FLOPs")
+    hardware.add_argument("--target-us", type=float, default=None, help="explicit target latency in us")
+    hardware.add_argument("--wall-cycles", type=float, default=None, help="measured wall cycles W")
+    hardware.add_argument("--counted-cycles", type=float, default=None, help="measured counted cycles C")
+    hardware.add_argument("--vector-cycles", type=float, default=None, help="measured vector cycles")
+    hardware.add_argument("--fix-cycles", type=float, default=None, help="measured fix cycles")
+    hardware.add_argument("--cube-reference-cycles", type=float, default=None, help="explicit reference Cube cycles")
+    hardware.add_argument("--fp8-ops-per-cycle", type=float, default=None, help="explicit FP8 Cube ops/cycle")
+    hardware.add_argument("--bf16-ops-per-cycle", type=float, default=None, help="explicit BF16 Cube ops/cycle")
     hardware.add_argument("--transfers", default=None, help="D2D/H2D/D2H/RH2D/RD2H transfer & collective plan JSON")
     hardware.add_argument("--sustained-mhz", default="1250:1300", help="sustained thermal range, e.g. 1250:1300")
     hardware.add_argument("--simulator-ub-kib", type=float, default=256.0, help="simulator UB reference in KiB; 0 disables")

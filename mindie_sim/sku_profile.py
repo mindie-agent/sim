@@ -186,11 +186,13 @@ class CubeSpec:
     l0a_kib: float
     l0b_kib: float
     l0c_kib: float
+    throughput: Mapping[str, float] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "aic_count_per_die": self.aic_count_per_die,
             "ops_per_cycle_per_aic": dict(sorted(self.ops_per_cycle_per_aic.items())),
+            "throughput": dict(sorted(self.throughput.items())),
             "l1_kib": self.l1_kib,
             "l0a_kib": self.l0a_kib,
             "l0b_kib": self.l0b_kib,
@@ -562,6 +564,10 @@ def resolve_device_capability_profile(
     ops_map = dict(_FAMILY_DEFAULT_OPS_PER_CYCLE.get(family, _FAMILY_DEFAULT_OPS_PER_CYCLE["A5"]))
     if isinstance(cube_override.get("ops_per_cycle_per_aic"), Mapping):
         ops_map.update({str(k): int(v) for k, v in cube_override["ops_per_cycle_per_aic"].items()})
+    cube_throughput = (
+        {str(k): float(v) for k, v in cube_override["throughput"].items()}
+        if isinstance(cube_override.get("throughput"), Mapping) else {}
+    )
     intra_pkg_bw = (
         float(mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
         if (mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
@@ -600,6 +606,7 @@ def resolve_device_capability_profile(
             l0a_kib=float(cube_override.get("l0a_kib") or (config.l0_a_kib if config is not None else common_buf["l0a_kib"])),
             l0b_kib=float(cube_override.get("l0b_kib") or (config.l0_b_kib if config is not None else common_buf["l0b_kib"])),
             l0c_kib=float(cube_override.get("l0c_kib") or (config.l0_c_kib if config is not None else common_buf["l0c_kib"])),
+            throughput=cube_throughput,
         ),
         vector_spec=VectorSpec(
             aiv_count_per_die=resolved_aiv,
