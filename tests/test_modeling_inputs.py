@@ -6,10 +6,14 @@ msmodeling installation or hardware measurement happened on this machine.
 from __future__ import annotations
 
 import math
+from pathlib import Path
 
 import pytest
 
+from mindie_sim import hardware as hw
 from mindie_sim import theoretical_model as tm
+
+FIXTURES = Path(__file__).parent / "fixtures" / "mindie_sim"
 
 
 def _hardware() -> tm.HardwareSpec:
@@ -326,3 +330,19 @@ def test_exported_dt_dtype_alias_is_normalized_for_ideal_bound():
 
     assert result.status == tm.MODELED
     assert "workload_source=matmul_contiguous" in result.assumptions
+
+
+def test_generic_hardware_report_without_workload_does_not_inject_golden_thermal():
+    report = hw.hardware_report(
+        ini_text=(FIXTURES / "Ascend950DT_9581.ini").read_text(encoding="utf-8"),
+    )
+
+    thermal = report["thermal"]
+    assert thermal["status"] == "unmodeled"
+    assert thermal["unmodeled_reason"] == "missing_workload_or_cycle_inputs"
+    assert thermal["cube_reference_cycles"] is None
+    assert thermal["clock_table"] == []
+    assert thermal["gap_sensitivity"] == []
+    assert thermal["workload_origin"] is None
+    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]

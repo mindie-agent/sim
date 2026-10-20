@@ -1,0 +1,72 @@
+{
+  "name": "a3-mla-moe-4L",
+  "source": "declared-example; not an A3 measurement",
+  "machine": {
+    "name": "a3-8-die-declared",
+    "arch_family": "A3",
+    "dies_per_package": 2,
+    "num_devices": 8,
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 3.6e14,
+      "vector_ops_per_s": 3.0e13,
+      "hbm_bw_bytes_per_s": 1.6e12,
+      "mte_bw_bytes_per_s": 3.2e12,
+      "launch_us": 20.0
+    },
+    "compute_peaks": {"bf16": 3.6e14, "fp16": 3.6e14},
+    "links": [
+      {"name": "d2d", "channel": "d2d_intra_node", "capacity_gbps": 196, "latency_us": 2.5, "members": [0,1,2,3,4,5,6,7]}
+    ]
+  },
+  "model": {
+    "name": "mla-moe-example",
+    "architecture": "moe",
+    "attention": "mla",
+    "layers": 4,
+    "hidden_size": 512,
+    "num_heads": 8,
+    "head_dim": 64,
+    "intermediate_size": 1024,
+    "vocab_size": 32000,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "mla": {
+      "q_lora_rank": 128,
+      "kv_lora_rank": 64,
+      "qk_nope_head_dim": 48,
+      "qk_rope_head_dim": 16,
+      "v_head_dim": 64
+    },
+    "num_experts": 8,
+    "top_k": 2,
+    "moe_intermediate_size": 256,
+    "num_shared_experts": 1,
+    "expert_routing_histogram": [0.30, 0.20, 0.12, 0.10, 0.08, 0.08, 0.07, 0.05]
+  },
+  "workload": {
+    "requests": [
+      {"id": "mla-a", "prompt_tokens": 1024, "output_tokens": 6},
+      {"id": "mla-b", "prompt_tokens": 2048, "output_tokens": 4}
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 4096,
+    "max_num_seqs": 8,
+    "max_model_len": 8192,
+    "enable_chunked_prefill": true,
+    "kv_block_size": 128,
+    "gpu_memory_utilization": 0.9,
+    "tp": 2,
+    "ep": 2,
+    "dp": 2,
+    "pp": 1,
+    "graph_buckets": [16, 32],
+    "graph_mode": "auto",
+    "moe_recipe": "mc2",
+    "mc2_chunks": 2
+  },
+  "slo": {"ttft_ms": 60000, "tpot_ms": 6000, "e2e_ms": 180000}
+}

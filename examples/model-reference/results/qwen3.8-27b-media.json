@@ -1,0 +1,28 @@
+{
+ "model_key": "qwen3.8-27b-media",
+ "case": "cases/qwen3.8-27b-media.json",
+ "commands": {
+  "predict": "python -m mindie_sim predict --input examples/model-reference/cases/qwen3.8-27b-media.json"
+ },
+ "predict": {
+  "status": "modeled",
+  "seconds": 0.184,
+  "metrics": {
+   "ttft_ms": 30.86409626666642,
+   "tpot_ms": 24.145217546666775,
+   "e2e_ms": 55.00931381333319
+  },
+  "errors": null,
+  "unserved_requests": 0,
+  "attempted": true
+ },
+ "scope": "analytic catalog reference; token-ready figures; not measured NPU latency",
+ "forward_only": true,
+ "preparation": {
+  "enabled_by_model_prepare": false,
+  "predict_prep_tasks": 0,
+  "should_prep_tasks": 0,
+  "note": "no model-derived prep tasks in this media predict case"
+ },
+ "preparation_note": "model-derived preparation is enabled for some cases; prep-task counts and engine-drain timestamps are stored separately from token-ready metrics"
+}

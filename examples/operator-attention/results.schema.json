@@ -1,0 +1,352 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mindie-agent.example/schemas/mindie-sim-a3-attention-capability-results",
+  "title": "A3 native FA/RoPE capability results",
+  "type": "object",
+  "required": [
+    "kind",
+    "run_id",
+    "manifest",
+    "worker",
+    "device",
+    "environment",
+    "protocol",
+    "budgets",
+    "analytic_ms",
+    "requested",
+    "progress",
+    "cases",
+    "failures",
+    "cleanup",
+    "cleanup_ok",
+    "persistence",
+    "persistence_ok",
+    "stop_reason",
+    "status",
+    "started_at_utc",
+    "finished_at_utc"
+  ],
+  "properties": {
+    "kind": {
+      "const": "a3_attention_rope_capability"
+    },
+    "run_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "manifest": {
+      "type": "object",
+      "required": [
+        "path",
+        "sha256"
+      ],
+      "properties": {
+        "path": {},
+        "sha256": {},
+        "source_contract": {
+          "type": "object"
+        }
+      },
+      "description": "Optional source_contract attribution is preserved when supplied and {} when absent."
+    },
+    "worker": {
+      "type": "object",
+      "required": [
+        "module",
+        "source_files_sha256"
+      ]
+    },
+    "device": {
+      "type": "object",
+      "required": [
+        "requested",
+        "selected"
+      ]
+    },
+    "environment": {
+      "type": [
+        "object",
+        "null"
+      ]
+    },
+    "protocol": {
+      "type": "object"
+    },
+    "budgets": {
+      "type": "object"
+    },
+    "analytic_ms": {
+      "type": "null"
+    },
+    "requested": {
+      "type": "object",
+      "required": [
+        "case_ids",
+        "cases",
+        "planned_raw_blocks"
+      ]
+    },
+    "progress": {
+      "type": "object",
+      "required": [
+        "requested_cases",
+        "completed_cases",
+        "measured_cases",
+        "failed_cases",
+        "pending_cases",
+        "not_run_cases",
+        "terminal_cases",
+        "raw_blocks",
+        "planned_raw_blocks"
+      ],
+      "properties": {
+        "requested_cases": {
+          "const": 4
+        },
+        "completed_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "measured_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "failed_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pending_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "not_run_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "terminal_cases": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "raw_blocks": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "planned_raw_blocks": {
+          "const": 240
+        }
+      }
+    },
+    "cases": {
+      "type": "array",
+      "minItems": 4,
+      "items": {
+        "$ref": "#/$defs/case"
+      }
+    },
+    "failures": {
+      "type": "array",
+      "items": {
+        "type": "object"
+      }
+    },
+    "cleanup": {
+      "type": "object",
+      "required": [
+        "status"
+      ]
+    },
+    "cleanup_ok": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "persistence": {
+      "type": "object",
+      "required": [
+        "ok",
+        "errors"
+      ]
+    },
+    "persistence_ok": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "stop_reason": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "status": {
+      "enum": [
+        "running",
+        "partial",
+        "completed",
+        "completed_with_failures",
+        "completed_with_cleanup_failure",
+        "completed_with_persistence_failure",
+        "failed"
+      ]
+    },
+    "started_at_utc": {
+      "type": "string"
+    },
+    "finished_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ]
+    }
+  },
+  "$defs": {
+    "case": {
+      "type": "object",
+      "required": [
+        "case_id",
+        "operator",
+        "requested",
+        "status",
+        "target_match",
+        "split",
+        "source",
+        "trials",
+        "analytic_ms"
+      ],
+      "properties": {
+        "case_id": {
+          "type": "string"
+        },
+        "operator": {
+          "enum": [
+            "fusion_attention",
+            "rotary_mul"
+          ]
+        },
+        "requested": {
+          "const": true
+        },
+        "status": {
+          "enum": [
+            "requested",
+            "measured",
+            "failed",
+            "pending",
+            "not_run"
+          ]
+        },
+        "target_match": {
+          "const": false
+        },
+        "split": {
+          "enum": [
+            "train",
+            "heldout"
+          ]
+        },
+        "source": {
+          "type": "object"
+        },
+        "trials": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/trial"
+          }
+        },
+        "analytic_ms": {
+          "type": "null"
+        },
+        "correctness": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "native": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "error": {
+          "type": [
+            "object",
+            "null"
+          ]
+        }
+      },
+      "description": "Split is copied from the manifest-declared case; no inference or relabelling."
+    },
+    "trial": {
+      "type": "object",
+      "required": [
+        "trial_index",
+        "status",
+        "warmup",
+        "samples"
+      ],
+      "properties": {
+        "trial_index": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "status": {
+          "enum": [
+            "measuring",
+            "measured",
+            "failed"
+          ]
+        },
+        "warmup": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "samples": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/sample"
+          }
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "required": [
+        "trial_index",
+        "sample_index",
+        "api_invocations",
+        "cpu_submit_ms",
+        "device_interval_ms",
+        "wall_complete_ms",
+        "analytic_ms"
+      ],
+      "properties": {
+        "trial_index": {
+          "type": "integer"
+        },
+        "sample_index": {
+          "type": "integer"
+        },
+        "api_invocations": {
+          "const": 1
+        },
+        "cpu_submit_ms": {
+          "type": "number"
+        },
+        "device_interval_ms": {
+          "type": "number"
+        },
+        "wall_complete_ms": {
+          "type": "number"
+        },
+        "analytic_ms": {
+          "type": "null"
+        }
+      }
+    }
+  }
+}

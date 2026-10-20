@@ -25,6 +25,7 @@ from .hardware import (
     BUILTIN_SKU_CATALOG,
     A5_CANN_SIM_LINK_CEILINGS_BPC,
     A5_REFERENCE_PEAKS,
+    A5_FLASHMLA_C8_GOLDEN_WORKLOAD,
     BufferAllocation,
     ClockAndTopologySpec,
     CubeSpec,
@@ -62,6 +63,7 @@ from .hardware import (
     solve_collective_bound,
     solve_transfer_bound,
     thermal_bounds,
+    unmodeled_thermal_bounds,
     validate_buffer_allocations,
 )
 from .pipeline import (
@@ -75,8 +77,28 @@ from .pipeline import (
     solve_periodic_pipeline,
 )
 from .subgraph import SubgraphError, analyze_subgraph_fusion
+from .a3_types import A3InputError, CaseSpec, MachineSpec, ModelSpec, RuntimeSpec, WorkloadSpec
+from .a3_cost import CalibrationStore, PredictiveCostModel, attention_flops, gemm_flops
+from .a3_workload import derive_iteration_work, memory_plan
+from .a3_resources import ResourceEngine, ResourceSpec, simulate_microbatch_pipeline
+from .a3_comm_identity import (
+    CommIdentityRecord, identity_fixture, parse_profile_identity,
+)
+from .a3_framework import TokenLinearCostBackend, predict, run_predictive
+from .a3_should import should_cost, normalized_shared_cv_search, normalized_chunked_pipeline_search
+from .a3_search import search
+from .a3_calibration_store import SQLiteCalibrationStore
+from .a3_measurement import record_prediction_misses
+from .a3_measurement import (
+    CpuMatmulRunner, TorchNpuRunner, run_manifest_file, run_pending,
+)
+from .model_catalog import CATALOG, list_models, load_model
+from .a3_real_data import (
+    CommunicationCalibration, CvCalibration, import_a3_measurements,
+    import_communication_measurements, machine_from_environment,
+)
 
-__version__ = "0.5.0"
+__version__ = "0.7.0"
 
 
 def net_report(*args, **kwargs):
@@ -90,6 +112,7 @@ __all__ = [
     "__version__",
     "A5_CANN_SIM_LINK_CEILINGS_BPC",
     "A5_REFERENCE_PEAKS",
+    "A5_FLASHMLA_C8_GOLDEN_WORKLOAD",
     "BufferAllocation",
     "HardwareError",
     "NpuSmiChip",
@@ -108,6 +131,7 @@ __all__ = [
     "reference_time_us",
     "sensitivity_matrix",
     "thermal_bounds",
+    "unmodeled_thermal_bounds",
     "validate_buffer_allocations",
     "PipelineError",
     "PipelineGraph",
@@ -120,4 +144,43 @@ __all__ = [
     "SubgraphError",
     "analyze_subgraph_fusion",
     "net_report",
+    "A3InputError",
+    "CaseSpec",
+    "MachineSpec",
+    "ModelSpec",
+    "RuntimeSpec",
+    "WorkloadSpec",
+    "CalibrationStore",
+    "PredictiveCostModel",
+    "attention_flops",
+    "gemm_flops",
+    "derive_iteration_work",
+    "memory_plan",
+    "ResourceEngine",
+    "ResourceSpec",
+    "simulate_microbatch_pipeline",
+    "TokenLinearCostBackend",
+    "CommIdentityRecord",
+    "identity_fixture",
+    "parse_profile_identity",
+    "predict",
+    "run_predictive",
+    "should_cost",
+    "normalized_shared_cv_search",
+    "normalized_chunked_pipeline_search",
+    "search",
+    "SQLiteCalibrationStore",
+    "record_prediction_misses",
+    "CpuMatmulRunner",
+    "TorchNpuRunner",
+    "run_pending",
+    "run_manifest_file",
+    "CATALOG",
+    "list_models",
+    "load_model",
+    "CommunicationCalibration",
+    "CvCalibration",
+    "import_a3_measurements",
+    "import_communication_measurements",
+    "machine_from_environment",
 ]

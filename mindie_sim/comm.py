@@ -65,6 +65,8 @@ class TransferChannelSpec:
     bi_peak_bw_gbps: float | None
     calibrated_uni_bw_gbps: float | None = None
     calibrated_bi_bw_gbps: float | None = None
+    derived_uni_bw_gbps: float | None = None
+    derived_bi_bw_gbps: float | None = None
     pageable_uni_bw_gbps: float | None = None
     alpha_us: float = 1.5
     transport_mode: str = "direct"
@@ -72,11 +74,27 @@ class TransferChannelSpec:
 
     @property
     def effective_uni_bw_gbps(self) -> float | None:
-        return self.calibrated_uni_bw_gbps if self.calibrated_uni_bw_gbps is not None else self.uni_peak_bw_gbps
+        if self.calibrated_uni_bw_gbps is not None:
+            return self.calibrated_uni_bw_gbps
+        if self.derived_uni_bw_gbps is not None:
+            return self.derived_uni_bw_gbps
+        return self.uni_peak_bw_gbps
 
     @property
     def effective_bi_bw_gbps(self) -> float | None:
-        return self.calibrated_bi_bw_gbps if self.calibrated_bi_bw_gbps is not None else self.bi_peak_bw_gbps
+        if self.calibrated_bi_bw_gbps is not None:
+            return self.calibrated_bi_bw_gbps
+        if self.derived_bi_bw_gbps is not None:
+            return self.derived_bi_bw_gbps
+        return self.bi_peak_bw_gbps
+
+    @property
+    def bandwidth_provenance(self) -> str:
+        if self.calibrated_uni_bw_gbps is not None:
+            return "caller_calibrated"
+        if self.derived_uni_bw_gbps is not None:
+            return "derived_from_lnksta_times_encoding_efficiency_not_measured"
+        return "declared_peak"
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -86,6 +104,9 @@ class TransferChannelSpec:
             "bi_peak_bw_gbps": self.bi_peak_bw_gbps,
             "calibrated_uni_bw_gbps": self.calibrated_uni_bw_gbps,
             "calibrated_bi_bw_gbps": self.calibrated_bi_bw_gbps,
+            "derived_uni_bw_gbps": self.derived_uni_bw_gbps,
+            "derived_bi_bw_gbps": self.derived_bi_bw_gbps,
+            "bandwidth_provenance": self.bandwidth_provenance,
             "effective_uni_bw_gbps": self.effective_uni_bw_gbps,
             "effective_bi_bw_gbps": self.effective_bi_bw_gbps,
             "pageable_uni_bw_gbps": self.pageable_uni_bw_gbps,
@@ -137,6 +158,7 @@ class PcieLinkSnapshot:
     cap_raw_uni_bw_gbps: float
     sta_raw_uni_bw_gbps: float
     effective_pinned_uni_bw_gbps: float
+    bandwidth_provenance: str = "derived_from_lnksta_times_encoding_efficiency_not_measured"
     source: str = "<lspci>"
 
     def to_dict(self) -> dict[str, Any]:
@@ -150,6 +172,8 @@ class PcieLinkSnapshot:
             "cap_raw_uni_bw_gbps": round(self.cap_raw_uni_bw_gbps, 3),
             "sta_raw_uni_bw_gbps": round(self.sta_raw_uni_bw_gbps, 3),
             "effective_pinned_uni_bw_gbps": round(self.effective_pinned_uni_bw_gbps, 3),
+            "bandwidth_provenance": self.bandwidth_provenance,
+            "calibrated": False,
         }
 
 
@@ -307,8 +331,8 @@ def default_transfer_channels(
             protocol="PCIe_Downgraded" if (pcie_snapshot and pcie_snapshot.downgraded) else "PCIe",
             uni_peak_bw_gbps=pcie_peak_uni,
             bi_peak_bw_gbps=round(pcie_peak_uni * 1.75, 2),
-            calibrated_uni_bw_gbps=pcie_cal_uni,
-            calibrated_bi_bw_gbps=pcie_cal_bi,
+            derived_uni_bw_gbps=pcie_cal_uni,
+            derived_bi_bw_gbps=pcie_cal_bi,
             pageable_uni_bw_gbps=pageable_uni,
             alpha_us=2.0,
             transport_mode="pcie_dma",
@@ -318,8 +342,8 @@ def default_transfer_channels(
             protocol="PCIe_Downgraded" if (pcie_snapshot and pcie_snapshot.downgraded) else "PCIe",
             uni_peak_bw_gbps=pcie_peak_uni,
             bi_peak_bw_gbps=round(pcie_peak_uni * 1.75, 2),
-            calibrated_uni_bw_gbps=pcie_cal_uni,
-            calibrated_bi_bw_gbps=pcie_cal_bi,
+            derived_uni_bw_gbps=pcie_cal_uni,
+            derived_bi_bw_gbps=pcie_cal_bi,
             pageable_uni_bw_gbps=pageable_uni,
             alpha_us=2.0,
             transport_mode="pcie_dma",
@@ -355,6 +379,8 @@ def default_transfer_channels(
                 bi_peak_bw_gbps=float(raw["bi_peak_bw_gbps"]) if raw.get("bi_peak_bw_gbps") is not None else base.bi_peak_bw_gbps,
                 calibrated_uni_bw_gbps=float(raw["calibrated_uni_bw_gbps"]) if raw.get("calibrated_uni_bw_gbps") is not None else base.calibrated_uni_bw_gbps,
                 calibrated_bi_bw_gbps=float(raw["calibrated_bi_bw_gbps"]) if raw.get("calibrated_bi_bw_gbps") is not None else base.calibrated_bi_bw_gbps,
+                derived_uni_bw_gbps=float(raw["derived_uni_bw_gbps"]) if raw.get("derived_uni_bw_gbps") is not None else base.derived_uni_bw_gbps,
+                derived_bi_bw_gbps=float(raw["derived_bi_bw_gbps"]) if raw.get("derived_bi_bw_gbps") is not None else base.derived_bi_bw_gbps,
                 pageable_uni_bw_gbps=float(raw["pageable_uni_bw_gbps"]) if raw.get("pageable_uni_bw_gbps") is not None else base.pageable_uni_bw_gbps,
                 alpha_us=float(raw.get("alpha_us", base.alpha_us)),
                 transport_mode=str(raw.get("transport_mode", base.transport_mode)),

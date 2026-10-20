@@ -44,6 +44,7 @@ from .hardware_common import (
     A5_CANN_SIM_LINK_CEILINGS_BPC,
     SUSTAINED_MHZ_RANGE,
     HardwareError,
+    _finite,
     _float_value,
     _int_value,
 )
@@ -79,6 +80,21 @@ _FAMILY_DEFAULT_OPS_PER_CYCLE: dict[str, dict[str, int]] = {
     "A2": {"int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
     "A3": {"int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
     "A5": {"fp8_e4m3": 16384, "fp8_e5m2": 16384, "int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
+}
+
+# Dtype spelling aliases only.  They all resolve inside the one canonical
+# ``ops_per_cycle_per_aic`` map; there is no alternate capability source.
+_CUBE_DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
+    "fp8": ("fp8", "fp8_e4m3", "fp8_e5m2"),
+    "fp8_e4m3": ("fp8_e4m3", "fp8"),
+    "fp8_e5m2": ("fp8_e5m2", "fp8"),
+    "bf16": ("bf16", "bfloat16"),
+    "bfloat16": ("bfloat16", "bf16"),
+    "fp16": ("fp16", "float16"),
+    "float16": ("float16", "fp16"),
+    "fp32": ("fp32", "float32"),
+    "float32": ("float32", "fp32"),
+    "int8": ("int8",),
 }
 
 _A2_A3_LINK_CEILINGS_BPC: dict[str, float] = {
@@ -186,6 +202,26 @@ class CubeSpec:
     l0a_kib: float
     l0b_kib: float
     l0c_kib: float
+
+    def ops_per_cycle_per_die(self, dtype: str) -> float | None:
+        """Total per-die Cube ops/cycle for ``dtype``, or ``None`` if undeclared.
+
+        The stored map is per-AIC; this accessor is the single unit-explicit
+        normalization shared by hardware/thermal and A3.  Dtype spelling
+        aliases resolve within the same map.  A missing or non-positive entry
+        returns ``None`` rather than borrowing another architecture's peak.
+        """
+        if self.aic_count_per_die is None or int(self.aic_count_per_die) <= 0:
+            return None
+        key = str(dtype).strip().lower()
+        for candidate in _CUBE_DTYPE_ALIASES.get(key, (key,)):
+            raw = self.ops_per_cycle_per_aic.get(candidate)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            if not _finite(raw) or float(raw) <= 0:
+                continue
+            return float(raw) * float(self.aic_count_per_die)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {

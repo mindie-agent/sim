@@ -313,7 +313,7 @@ def test_cube_reference_cycles_and_sustained_reference_lower_bounds():
     for mhz, value in expected.items():
         assert hw.reference_time_us(cycles, mhz) == pytest.approx(value, rel=1e-12)
 
-    thermal = hw.thermal_bounds()
+    thermal = hw.thermal_bounds(**hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD)
     assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
     required = thermal["required_mhz_for_target"]
@@ -322,6 +322,68 @@ def test_cube_reference_cycles_and_sustained_reference_lower_bounds():
     assert required["wall_mhz"] == pytest.approx(1618.1260714285713, rel=1e-12)
     assert thermal["sustained_reference_us"][0] > 350.0
     assert thermal["short_burst_reference_us"][0] < 300.0
+
+
+def test_thermal_bounds_without_workload_or_cycles_is_unmodeled():
+    thermal = hw.thermal_bounds()
+    assert thermal["status"] == "unmodeled"
+    assert thermal["unmodeled_reason"] == "missing_workload_or_cycle_inputs"
+    assert thermal["cube_reference_cycles"] is None
+    assert thermal["clock_table"] == []
+    assert thermal["gap_sensitivity"] == []
+    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
+
+    golden = hw.A5_FLASHMLA_C8_GOLDEN_WORKLOAD
+    reference_only = hw.thermal_bounds(
+        fp8_flops=golden["fp8_flops"],
+        bf16_flops=golden["bf16_flops"],
+        fp8_ops_per_cycle=golden["fp8_ops_per_cycle"],
+        bf16_ops_per_cycle=golden["bf16_ops_per_cycle"],
+    )
+    assert reference_only["status"] == "partial_reference_only"
+    assert reference_only["cube_reference_cycles"] == pytest.approx(442918.5024, rel=1e-12)
+    assert reference_only["clock_table"]
+    assert all(row["wall_us"] is None for row in reference_only["clock_table"])
+    assert all(row["counted_us"] is None for row in reference_only["clock_table"])
+    assert reference_only["gap_sensitivity"] == []
+
+    full = hw.thermal_bounds(**golden)
+    assert full["status"] == "ok"
+    assert full["workload_origin"] == "A5_C8_FLASHMLA_GOLDEN_FIXTURE"
+    assert full["cube_reference_cycles"] is not None
+    assert full["gap_sensitivity"]
+    assert full["clock_table"][0]["wall_us"] is not None
+    assert full["clock_table"][0]["counted_us"] is not None
+
+
+def test_a2_fp8_workload_is_unmodeled_instead_of_borrowing_a5_peak():
+    config = hw.parse_platform_ini(FIXTURES / "Ascend910B4.ini")
+    fp8_report = hw.hardware_report(config=config, fp8_flops=1e9)
+    thermal = fp8_report["thermal"]
+    assert thermal["status"] == "unmodeled"
+    assert thermal["unmodeled_reason"] == "unsupported_dtype_or_missing_sku_cube_throughput"
+    assert thermal["cube_reference_cycles"] is None
+    assert thermal["unsupported_dtypes"] == ["fp8"]
+
+    bf16_report = hw.hardware_report(config=config, bf16_flops=12884901888.0)
+    assert bf16_report["thermal"]["status"] in {"partial_reference_only", "ok"}
+    assert bf16_report["thermal"]["cube_reference_cycles"] == pytest.approx(
+        12884901888.0 / (20 * 8192), rel=1e-12
+    )
+
+
+def test_explicit_cycle_basis_survives_unsupported_fp8():
+    config = hw.parse_platform_ini(FIXTURES / "Ascend910B4.ini")
+    thermal = hw.hardware_report(
+        config=config,
+        fp8_flops=1e9,
+        cube_reference_cycles=1000.0,
+    )["thermal"]
+    assert thermal["status"] == "partial_reference_only"
+    assert thermal["unmodeled_reason"] is None
+    assert thermal["cube_reference_cycles"] == 1000.0
+    assert thermal["unsupported_dtypes"] == ["fp8"]
 
 
 def test_gap_elimination_sensitivity_matrix_is_reproducible():
@@ -405,7 +467,10 @@ def test_c8_karp_solves_346us_and_identifies_m_pipe_critical_cycle():
     assert result["status"] == "modeled"
     assert result["minimum_period_ns"] == pytest.approx(1802.24, rel=1e-12)
     assert result["minimum_tile_ii_ns"] == pytest.approx(901.12, rel=1e-12)
-    assert result["total_time_us"] == pytest.approx(346.03008, rel=1e-12)
+    assert result["steady_state_time_us"] == pytest.approx(346.03008, rel=1e-12)
+    assert result["total_time_us"] > result["steady_state_time_us"]
+    assert result["total_time_us"] == pytest.approx(348.91366400180215, rel=1e-12)
+    assert result["total_time_semantics"] == "finite_task_lower_bound_not_II_times_tiles"
     assert result["bottleneck_pipes"] == ["M"]
     assert result["critical_cycles"][0]["distance"] == 1
     assert set(result["critical_cycles"][0]["unique_stages"]) == M_STAGES
@@ -933,7 +998,9 @@ def test_interconnect_topo_pcie_downgrade_and_d2d_h2d_rh2d_rd2h_bounds(tmp_path:
     ch = a2_prof.memory_hierarchy_spec.transfer_channels
     assert set(ch) == set(hw.TRANSFER_CHANNELS)
     assert ch["d2d_intra_package"].effective_uni_bw_gbps is None
-    assert ch["h2d"].calibrated_uni_bw_gbps == pytest.approx(24.576, rel=1e-3)
+    assert ch["h2d"].calibrated_uni_bw_gbps is None
+    assert ch["h2d"].derived_uni_bw_gbps == pytest.approx(24.576, rel=1e-3)
+    assert ch["h2d"].bandwidth_provenance.startswith("derived_from_lnksta")
 
     # 2. H2D / D2H pinned vs pageable & Root Complex contention, plus RH2D / RD2H direct_rdma vs host_staged
     h2d_pinned = hw.solve_transfer_bound("h2d", 64 * MIB, ch, memory_type="pinned")

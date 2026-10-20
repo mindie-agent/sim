@@ -47,7 +47,6 @@ from .pipeline_graph import (
     parse_pipeline_graph,
 )
 
-SCHEMA_VERSION = "mindie-sim-pipeline/1"
 MAX_CYCLES = 64
 MAX_EXPANSIONS = 200_000
 DEFAULT_TOLERANCE = 1e-9
@@ -350,8 +349,18 @@ def _solve_expanded(
         total_tiles = _int_value(total_tiles, "total_tiles_invalid")
         if total_tiles <= 0:
             raise PipelineError("total_tiles_invalid")
+        max_offset_ns = (max(offsets) - min(offsets)) if offsets else 0.0
+        steady_state_us = tile_ii * total_tiles / 1000.0
+        fill_and_drain_ns = max_offset_ns + max_service
+        finite_us = ((total_tiles - 1) * tile_ii + fill_and_drain_ns) / 1000.0
         payload["total_tiles"] = total_tiles
-        payload["total_time_us"] = tile_ii * total_tiles / 1000.0
+        payload["steady_state_time_us"] = steady_state_us
+        payload["finite_task_lower_bound_us"] = finite_us
+        payload["fill_and_drain_ns"] = fill_and_drain_ns
+        payload["total_time_us"] = finite_us
+        payload["total_time_semantics"] = "finite_task_lower_bound_not_II_times_tiles"
+        payload["total_time_is_finite_wall_clock"] = True
+        payload["steady_state_throughput_time_us"] = steady_state_us
     if target_us is not None and total_tiles is not None:
         target = float(target_us)
         if not _finite(target) or target <= 0:
@@ -364,8 +373,10 @@ def _solve_expanded(
             "target_tile_ii_ns": target_tile_ii,
             "target_ns_per_tile": target_tile_ii,
             "target_super_period_ns": target_period,
-            "feasible": tile_ii <= target_tile_ii + DEFAULT_TOLERANCE * max(1.0, target_tile_ii),
+            "feasible": finite_us <= target + DEFAULT_TOLERANCE * max(1.0, target),
+            "steady_state_feasible": tile_ii <= target_tile_ii + DEFAULT_TOLERANCE * max(1.0, target_tile_ii),
             "headroom_ns_per_tile": target_tile_ii - tile_ii,
+            "finite_headroom_us": target - finite_us,
         }
         if reference_mhz is not None and _finite(reference_mhz) and float(reference_mhz) > 0:
             target_payload["allowed_service_cycles_per_tile_at_mhz"] = target_tile_ii * float(reference_mhz) / 1000.0
@@ -614,7 +625,6 @@ def solve_periodic_pipeline(
     }
     if not calibration.calibrated:
         return {
-            "schema_version": SCHEMA_VERSION,
             "status": "uncalibrated_durations",
             "fabricated_prediction": False,
             "graph": summary,
@@ -648,7 +658,6 @@ def solve_periodic_pipeline(
         reference_mhz=reference_mhz,
     )
     payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
         "graph": summary,
         "durations": {
             "status": calibration.status,
@@ -686,7 +695,6 @@ def compare_pipeline_variants(
         reference_mhz=reference_mhz, source=variant_graph.source,
     )
     payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
         "status": "modeled" if base_result.get("status") == "modeled" and variant_result.get("status") == "modeled" else "uncalibrated_or_infeasible",
         "base": base_result,
         "variant": variant_result,
@@ -705,7 +713,6 @@ def compare_pipeline_variants(
 
 
 __all__ = [
-    "SCHEMA_VERSION",
     "MAX_CYCLES",
     "MAX_EXPANSIONS",
     "DEFAULT_TOLERANCE",

@@ -1,0 +1,145 @@
+{
+ "model_key": "qwen3.8-27b",
+ "case": "cases/qwen3.8-27b.json",
+ "commands": {
+  "predict": "python -m mindie_sim predict --input examples/model-reference/cases/qwen3.8-27b.json",
+  "should": "python -m mindie_sim should --input examples/model-reference/cases/qwen3.8-27b.json --constraints examples/model-reference/cases/qwen3.8-27b.should.json --search-budget 3",
+  "search": "python -m mindie_sim search --input examples/model-reference/cases/qwen3.8-27b.json --search-spec examples/model-reference/cases/qwen3.8-27b.search.json"
+ },
+ "predict": {
+  "status": "modeled",
+  "seconds": 0.119,
+  "metrics": {
+   "ttft_ms": 24.152289973333424,
+   "tpot_ms": null,
+   "e2e_ms": 24.152289973333424
+  },
+  "errors": null,
+  "unserved_requests": 0,
+  "prepare_tasks": 0,
+  "attempted": true
+ },
+ "should": {
+  "status": "modeled",
+  "seconds": 0.447,
+  "L": 5.35497504,
+  "U": 23.513758715151585,
+  "gap_ms": 18.158783675151586,
+  "gap_ratio": 3.3910118234933146,
+  "plans_generated": 5,
+  "plans_evaluated": 3,
+  "plans_feasible": 3,
+  "search_budget": 3,
+  "reason": null,
+  "selected": {
+   "tp": 8,
+   "ep": 1,
+   "dp": 1,
+   "pp": 1,
+   "fusion": true,
+   "graph_padding": false,
+   "moe_recipe": "dense",
+   "worker_count": 1
+  },
+  "plans": [
+   {
+    "status": "modeled",
+    "reason": null,
+    "target_ms": 23.513758715151585,
+    "ttft_ms": 23.513758715151585,
+    "fusion_effect_claimed": true
+   },
+   {
+    "status": "modeled",
+    "reason": null,
+    "target_ms": 23.833269134545578,
+    "ttft_ms": 23.833269134545578,
+    "fusion_effect_claimed": true
+   },
+   {
+    "status": "modeled",
+    "reason": null,
+    "target_ms": 24.152289973333424,
+    "ttft_ms": 24.152289973333424,
+    "fusion_effect_claimed": false
+   }
+  ],
+  "attempted": true,
+  "prepare_tasks": 0,
+  "engine_drain_makespan_ms": 23.513758715151585,
+  "constraints": {
+   "tp": [
+    8
+   ],
+   "dp": [
+    1
+   ],
+   "ep": [
+    1
+   ],
+   "pp": [
+    1
+   ],
+   "fusion": [
+    false,
+    true
+   ],
+   "graph_padding": false,
+   "search_budget": 3
+  }
+ },
+ "search": {
+  "status": "modeled",
+  "seconds": 0.293,
+  "reason": null,
+  "candidates": [
+   {
+    "feasible": true,
+    "reason": null,
+    "fusion": false,
+    "worker_count": 1,
+    "tp": 8,
+    "ep": 1,
+    "pp": 1,
+    "metrics": {
+     "ttft_ms": 24.152289973333424,
+     "tpot_ms": null,
+     "e2e_ms": 24.152289973333424
+    }
+   },
+   {
+    "feasible": true,
+    "reason": null,
+    "fusion": true,
+    "worker_count": 1,
+    "tp": 8,
+    "ep": 1,
+    "pp": 1,
+    "metrics": {
+     "ttft_ms": 23.513758715151585,
+     "tpot_ms": null,
+     "e2e_ms": 23.513758715151585
+    }
+   }
+  ],
+  "recommended": {
+   "status": "modeled",
+   "fusion": true,
+   "worker_count": 1,
+   "metrics": {
+    "ttft_ms": 23.513758715151585,
+    "tpot_ms": null,
+    "e2e_ms": 23.513758715151585
+   }
+  },
+  "attempted": true
+ },
+ "preparation": {
+  "enabled_by_model_prepare": false,
+  "predict_prep_tasks": 0,
+  "should_prep_tasks": 0,
+  "note": "token-ready target and background preparation/drain are separate; preparation task counts are retained even when they finish by token-ready",
+  "should_engine_drain_ms": 23.513758715151585
+ },
+ "case_should_constraints": "cases/qwen3.8-27b.should.json"
+}

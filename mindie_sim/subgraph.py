@@ -34,8 +34,19 @@ from typing import Any, Mapping, Sequence
 
 from .hardware import validate_buffer_allocations, DEFAULT_ALIGNMENT_BYTES
 
-SCHEMA_VERSION = "mindie-sim-subgraph/1"
 DEFAULT_CAPACITIES_KIB = {"L1": 512, "L0A": 64, "L0B": 64, "L0C": 256, "UB": 248}
+A2_A3_CAPACITIES_KIB = {"L1": 512, "L0A": 64, "L0B": 64, "L0C": 128, "UB": 192}
+
+
+def _family_capacities(dag: Mapping[str, Any], candidate: Mapping[str, Any]) -> tuple[dict[str, float], str]:
+    family = str(candidate.get("arch_family", dag.get("arch_family", ""))).strip().upper()
+    if family in {"A2", "A3"}:
+        return dict(A2_A3_CAPACITIES_KIB), f"{family}_family_reference"
+    if family == "A5":
+        return dict(DEFAULT_CAPACITIES_KIB), "A5_family_reference"
+    # Unknown family: use the smaller A2/A3 UB/L0C reference so an omitted
+    # platform profile cannot silently inherit A5 headroom.
+    return dict(A2_A3_CAPACITIES_KIB), "conservative_unknown_family_a2_a3_reference"
 _AICPU_LAUNCH_KINDS = {"aicpu_hccl_launch", "aicpu_launch", "hccl_launch", "aicpu"}
 _DEVICE_COMM_KINDS = {"device_comm", "hccl", "device", "collective_device"}
 
@@ -333,7 +344,13 @@ def _buffer_gate(
                 allocations.append(allocation)
     if not allocations:
         return _gate(True, "live_buffer_limit", {"checked": False, "reason": "no_live_buffers_supplied"})
-    capacities = candidate.get("capacities_kib", dag.get("capacities_kib", DEFAULT_CAPACITIES_KIB))
+    capacities = candidate.get("capacities_kib")
+    capacity_source = "candidate"
+    if capacities is None:
+        capacities = dag.get("capacities_kib")
+        capacity_source = "dag"
+    if capacities is None:
+        capacities, capacity_source = _family_capacities(dag, candidate)
     if not isinstance(capacities, Mapping):
         return _gate(False, "live_buffer_limit", {"reason": "capacities_invalid"})
     check = validate_buffer_allocations(
@@ -348,7 +365,7 @@ def _buffer_gate(
         "live_buffer_limit",
         {
             "checked": True,
-            "capacity_source": "candidate_or_dag" if "capacities_kib" in candidate or "capacities_kib" in dag else "default_a5_reference",
+            "capacity_source": capacity_source,
             "status": check["status"],
             "diagnostics": check["diagnostics"],
         },
@@ -522,6 +539,8 @@ def analyze_subgraph_fusion(
         savings = max(0.0, latency_before["critical_path_us"] - latency_after["critical_path_us"])
     overlap = _overlap_analysis(dag, candidate, nodes)
     capacities = candidate.get("capacities_kib", dag.get("capacities_kib"))
+    if capacities is None:
+        capacities, _ = _family_capacities(dag, candidate)
     l2_cache_mib = candidate.get("l2_cache_mib", dag.get("l2_cache_mib"))
     working_set_mib = candidate.get("working_set_mib", dag.get("working_set_mib"))
     residency = None
@@ -537,7 +556,6 @@ def analyze_subgraph_fusion(
     if overlap.get("status") == "invalid_communication_duration":
         status = "invalid_communication_duration"
     payload: dict[str, Any] = {
-        "schema_version": SCHEMA_VERSION,
         "status": status,
         "fusion": {
             "name": candidate.get("name", "candidate"),
@@ -578,7 +596,7 @@ def analyze_subgraph_fusion(
             "L2 residency is evaluated when a working set is supplied; otherwise it stays unknown",
             "critical-path savings are theoretical and do not replace a matched A/B measurement",
             "AICPU HcclLaunch is not device communication completion time",
-            "buffer capacities default to an A5 reference only when the caller omits platform capacities",
+            "buffer capacities use the declared family reference when platform capacities are omitted; unknown family falls back to A2/A3, not A5",
         ],
     }
     if capacities is not None:
@@ -587,7 +605,6 @@ def analyze_subgraph_fusion(
 
 
 __all__ = [
-    "SCHEMA_VERSION",
     "SubgraphError",
     "DEFAULT_CAPACITIES_KIB",
     "analyze_subgraph_fusion",
