@@ -77,6 +77,11 @@ from .pipeline import (
     solve_periodic_pipeline,
 )
 from .subgraph import SubgraphError, analyze_subgraph_fusion
+from .theoretical_model import (
+    OperatorHapEvaluation,
+    compute_hap_score,
+    evaluate_operator_hap,
+)
 from .a3_types import A3InputError, CaseSpec, MachineSpec, ModelSpec, RuntimeSpec, WorkloadSpec
 from .a3_cost import CalibrationStore, PredictiveCostModel, attention_flops, gemm_flops
 from .a3_workload import derive_iteration_work, memory_plan
@@ -143,6 +148,9 @@ __all__ = [
     "solve_periodic_pipeline",
     "SubgraphError",
     "analyze_subgraph_fusion",
+    "OperatorHapEvaluation",
+    "compute_hap_score",
+    "evaluate_operator_hap",
     "net_report",
     "A3InputError",
     "CaseSpec",

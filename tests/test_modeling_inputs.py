@@ -346,3 +346,89 @@ def test_generic_hardware_report_without_workload_does_not_inject_golden_thermal
     assert thermal["workload_origin"] is None
     assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
+
+
+def test_compute_hap_score_anchoring_and_edge_cases():
+    # Equal to baseline -> 0.5
+    assert tm.compute_hap_score(50.0, 50.0, 10.0) == pytest.approx(0.5)
+    # Reaches hardware Roofline floor -> 1.0
+    assert tm.compute_hap_score(10.0, 50.0, 10.0) == pytest.approx(1.0)
+    # Candidate cuts hardware gap in half -> 40 / (20 + 40) = 2/3
+    assert tm.compute_hap_score(30.0, 50.0, 10.0) == pytest.approx(2.0 / 3.0)
+    # Candidate slower than baseline -> 40 / (80 + 40) = 1/3 < 0.5
+    assert tm.compute_hap_score(90.0, 50.0, 10.0) == pytest.approx(1.0 / 3.0)
+    # Invalid or degenerate anchors -> None (never negative or infinite)
+    assert tm.compute_hap_score(0.0, 50.0, 10.0) is None
+    assert tm.compute_hap_score(30.0, 50.0, 0.0) is None
+    assert tm.compute_hap_score(30.0, 10.0, 10.0) is None
+    assert tm.compute_hap_score(30.0, 8.0, 10.0) is None
+    assert tm.compute_hap_score(math.nan, 50.0, 10.0) is None
+
+
+def test_evaluate_operator_hap_cube_vector_and_mte_bound_diagnosis():
+    # 1. Cube-bound GEMM on Ascend910B3 (20 AIC, 1800 MHz, bf16 8192 ops/cyc -> 294.912 TFLOPS, 1600 GB/s HBM)
+    gemm_ops = 2.0 * 4096 * 4096 * 4096  # 137.438953472 GFLOPs
+    gemm_bytes = 3.0 * 4096 * 4096 * 2    # 100.663296 MB
+    cube_res = tm.evaluate_operator_hap(
+        "Ascend910B3",
+        compute_ops=gemm_ops,
+        bytes_moved=gemm_bytes,
+        t_cand_us=600.0,
+        t_baseline_us=900.0,
+        dtype="bf16",
+    )
+    expected_cube_us = gemm_ops / (20 * 8192 * 1800 * 1e6) * 1e6
+    expected_mte_us = gemm_bytes / (1600.0 * 1e9) * 1e6
+    assert cube_res["status"] == "modeled"
+    assert cube_res.bound_pipe == "cube_bound"
+    assert cube_res["t_cube_us"] == pytest.approx(expected_cube_us)
+    assert cube_res["t_mte_us"] == pytest.approx(expected_mte_us)
+    assert cube_res["t_hw_us"] == pytest.approx(expected_cube_us)
+    assert cube_res["achieved_mfu"] == pytest.approx(expected_cube_us / 600.0)
+    assert cube_res["achieved_hbm_bw_utilization"] == pytest.approx(expected_mte_us / 600.0)
+    assert cube_res["hap_score"] == pytest.approx(
+        tm.compute_hap_score(600.0, 900.0, expected_cube_us)
+    )
+    assert 0.5 < cube_res["hap_score"] < 1.0
+
+    # 2. MTE-bound operator on Ascend950DT_9581 (4000 GB/s HBM -> 400 MB = 100 us)
+    mte_res = tm.evaluate_operator_hap(
+        "Ascend950DT_9581",
+        compute_ops=1e8,
+        bytes_moved=400_000_000.0,
+        t_cand_us=125.0,
+        t_baseline_us=150.0,
+        dtype="bf16",
+    )
+    assert mte_res["status"] == "modeled"
+    assert mte_res["bound_pipe"] == "mte_bound"
+    assert mte_res["t_mte_us"] == pytest.approx(100.0)
+    assert mte_res["t_hw_us"] == pytest.approx(100.0)
+    assert mte_res["achieved_hbm_bw_utilization"] == pytest.approx(0.8)
+    assert mte_res["hap_score"] == pytest.approx((150.0 - 100.0) / ((125.0 - 100.0) + (150.0 - 100.0)))
+
+    # 3. Vector-bound operator on Ascend950DT_9581 (64 AIV, 256B SIMD -> 64 fp32 ops/cyc/AIV @ 1650 MHz = 6.7584 TFLOPS)
+    vec_ops = 6.7584e9  # 1000 us on Vector pipe
+    vec_bytes = 40_000_000.0  # 10 us on HBM MTE pipe
+    vec_res = tm.evaluate_operator_hap(
+        "Ascend950DT_9581",
+        compute_ops=vec_ops,
+        bytes_moved=vec_bytes,
+        t_cand_us=1200.0,
+        t_baseline_us=1400.0,
+        dtype="fp32",
+        op_pipe="vector",
+    )
+    assert vec_res["status"] == "modeled"
+    assert vec_res["bound_pipe"] == "vector_bound"
+    assert vec_res["t_vector_us"] == pytest.approx(1000.0)
+    assert vec_res["t_hw_us"] == pytest.approx(1000.0)
+    assert vec_res["achieved_mfu"] == pytest.approx(1000.0 / 1200.0)
+    assert vec_res["hap_score"] == pytest.approx(400.0 / (200.0 + 400.0))
+
+    # 4. Ambiguous family token is explicitly rejected without fabricating peaks
+    ambig = tm.evaluate_operator_hap("A3", compute_ops=1e9, bytes_moved=1e6, t_cand_us=10.0, t_baseline_us=20.0)
+    assert ambig["status"] == "ambiguous_sku"
+    assert ambig["unmodeled_reason"] == hw.AMBIGUOUS_SKU_REASON
+    assert ambig["t_hw_us"] is None
+    assert ambig["hap_score"] is None
