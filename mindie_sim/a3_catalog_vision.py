@@ -113,4 +113,3 @@ def _engram(c: Mapping[str, Any]) -> EngramSpec | None:
         pad_token_id=_int(c, "engram_pad_token_id", 0),
         source=merge_source({"engram_layers": str(len(tables))}),
     )
-

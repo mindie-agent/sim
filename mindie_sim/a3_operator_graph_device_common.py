@@ -304,5 +304,3 @@ def _collect_environment(torch: Any, torch_npu: Any, device: Any,
         },
     }
     return facts
-
-

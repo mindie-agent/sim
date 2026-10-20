@@ -168,4 +168,3 @@ def _gqa_attention(
         attention_outputs=tuple(last for _ in views),
         cache_write_rows=padded_tokens,
     )
-

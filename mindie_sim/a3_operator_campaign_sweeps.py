@@ -661,5 +661,3 @@ def _point_priority(point: Mapping[str, Any]) -> int:
     if point.get("boundary_probe"):
         return 70
     return 50
-
-

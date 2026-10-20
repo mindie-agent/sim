@@ -421,5 +421,3 @@ class TimingMixin:
             and info["duration_s"] <= float(self.budgets["cleanup"]))
         info["outer_supervisor_seconds_min"] = OUTER_SUPERVISOR_SECONDS_MIN
         return info
-
-

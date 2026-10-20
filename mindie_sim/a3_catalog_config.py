@@ -58,4 +58,3 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
     if "qwen3_5" in model_type or "Qwen3_5" in archs or "qwen3" in model_type:
         return "qwen"
     raise A3InputError(f"model_catalog_profile_unsupported:{model_type or archs}")
-

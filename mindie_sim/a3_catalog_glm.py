@@ -116,4 +116,3 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         notes=("GLM body is 78 layers; MTP is one optional layer",),
     )
     return AuxiliarySpec(mtp=mtp, notes=("body78_mtp1_distinct",))
-

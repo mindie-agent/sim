@@ -726,5 +726,3 @@ def _condition_record(condition: Mapping[str, Any], *, point_count: int,
         "materialized_point_count": point_count,
         "axis_rejections": list(rejections),
     }
-
-

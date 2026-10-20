@@ -144,4 +144,3 @@ def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
         dspark=dspark, external_draft_key="kimi-k3-dspark",
         notes=("native K3 num_nextn_predict_layers=0 does not remove selected external DSpark",),
     )
-

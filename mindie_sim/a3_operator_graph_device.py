@@ -668,4 +668,3 @@ class DeviceRunner(TimingMixin):
             elapsed = time.monotonic() - start
             metadata["active_case_seconds"] = float(active_case_before) + elapsed
             raise ConditionFailure(phase, exc, metadata) from exc
-

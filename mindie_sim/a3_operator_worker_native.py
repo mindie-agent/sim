@@ -365,4 +365,3 @@ class NativeRecipesMixin:
                             "declared_scale_format": str(
                                 request["condition"]["precision"].get("scale_format") or ""),
                             "native_output_allocation": True, "copy_in_timed_region": False}}
-

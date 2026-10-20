@@ -747,5 +747,3 @@ def normalized_conditions(manifest: Mapping[str, Any],
         "conditions": rows,
         "note": "pre-use query_context only; observed_context is intentionally excluded; split conflicts are preserved, not dropped",
     }
-
-

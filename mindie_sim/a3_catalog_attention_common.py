@@ -136,4 +136,3 @@ def _qkv_widths(plan: LayerPlan, parallel: ParallelSpec) -> tuple[int, int, int,
     q_width = (2 if plan.q_output_gate else 1) * local_heads * plan.head_dim
     kv_width = local_kv * plan.head_dim
     return local_heads, local_kv, q_width, kv_width
-

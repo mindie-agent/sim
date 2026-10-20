@@ -109,5 +109,3 @@ def _predict_query(fit: Mapping[str, Any], x: float) -> dict[str, Any]:
 
 def _predict(fit: Mapping[str, Any], x: float) -> float | None:
     return _predict_query(fit, x)["prediction_ms"]
-
-

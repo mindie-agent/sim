@@ -793,5 +793,3 @@ class TorchNpuOperatorRunner(NativeRecipesMixin):
             },
             "work": request.get("work", {}),
         }
-
-

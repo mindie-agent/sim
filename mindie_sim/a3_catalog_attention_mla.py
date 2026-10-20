@@ -583,4 +583,3 @@ def _mla_attention(
         ) if index_store is not None else None,
         candidate_id=candidate_id,
     )
-

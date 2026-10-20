@@ -179,5 +179,3 @@ def _markdown(analysis: Mapping[str, Any]) -> str:
         "",
     ]
     return "\n".join(lines)
-
-

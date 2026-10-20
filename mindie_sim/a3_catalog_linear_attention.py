@@ -263,4 +263,3 @@ def _linear_attention(
         cache_store_id=None, attention_outputs=(last,),
         cache_write_rows=padded_tokens,
     )
-

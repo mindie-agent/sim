@@ -198,4 +198,3 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         mtp=draft, dspark=None,
         notes=("mtp_and_dspark_names_do_not_prove_two_modes",),
     )
-

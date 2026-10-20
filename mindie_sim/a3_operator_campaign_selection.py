@@ -312,5 +312,3 @@ def _select_conditions(conditions: Mapping[str, Mapping[str, Any]],
         "covered_groups": sorted([list(group) for group in covered_groups]),
         "omitted": omitted,
     }
-
-

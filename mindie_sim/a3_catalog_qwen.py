@@ -172,4 +172,3 @@ def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
         notes=("DSpark draft model is its own body; target features are model inputs",),
     )
     return AuxiliarySpec(dspark=spec, standalone_draft=True)
-
