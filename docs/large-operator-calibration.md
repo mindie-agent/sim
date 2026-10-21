@@ -143,7 +143,7 @@ After the attention and decode fixes, the model reproduces:
 
 | metric (c=1), `device_event_warm_operator` | model | measured | error |
 | --- | ---: | ---: | ---: |
-| graph TPOT 128 / 1024 / 4096 | **14.64 / 14.69 / 14.84 ms** | 15.71 / 15.24 / 15.10 | −6.8 % / −3.6 % / −1.7 % |
+| graph TPOT 128 / 1024 / 4096 | **14.64 / 14.69 / 14.84 ms** | **14.44 / 14.73 / 15.11** | +1.4 % / −0.3 % / −1.8 % |
 | graph TTFT 4096 | 303.6 ms | 342.6 ms | −11.4 % (per-call scope; the batched scope gives 252.7 ms) |
 | graph TTFT 1024 | 70.4 ms | 101.2 ms | floor is 50–66, so operator prefill is +8…+40 % |
 | graph TTFT 128 | 23.6 ms | 50.9 ms | floor dominates; not a prefill error |
@@ -158,6 +158,30 @@ Eager TPOT is **not** reproduced (model 18.9 / 19.3 / 20.7 ms vs measured
 token) and the artifact carries no eager-specific intercept above the measured
 per-call one, so the model still charges ~20 µs. This is the main declared
 residual; graph mode is the deployment mode the model targets.
+
+The measured TP1 column uses the **exact per-request estimator**
+`(E2E − TTFT)/(n_out − 1)`. The earlier published TP1 numbers
+(15.71 / 15.24 / 15.10 graph, 31.34 / 30.14 / 28.98 eager) are ~8.8 % high
+because vLLM merged two output tokens into one SSE delta on some requests
+(chunk counts 16/31/32 for 32 tokens); TTFT and E2E are unaffected. Against the
+exact estimator the model is within **±2 %** on graph TPOT.
+
+**TP2 / TP4 measured scaling** (Qwen2.5-7B, A3, c=1, exact estimator):
+
+| graph TPOT | TP1 | TP2 | TP4 | TP2 / TP4 speed-up |
+| --- | ---: | ---: | ---: | ---: |
+| 1024-token prompt | 14.73 | 9.48 | 7.95 | 1.55× / 1.85× |
+| 4096-token prompt | 15.11 | 9.95 | 8.13 | 1.52× / 1.86× |
+
+Scaling is sub-linear: the implied communication/parallel share of decode is
+22–25 % at TP2 and 54–56 % at TP4 (roughly doubling per TP doubling). Eager
+TPOT **regresses** with TP (0.72–0.80× of TP1) because eager decode is
+launch-bound, so collectives are pure cost. Predicted vs measured graph TPOT is
+within ~10 % mean absolute error at TP2/TP4; the model reproduces the trend
+through its launch/collective terms. Prefill marginal rate is 78.6 → 48.2 →
+28.7 µs/token (1.63× / 2.74×). Data:
+`/Volumes/data/mindie-sim-data/a3/2026-10-20/multicard-20261021/`.
+
 
 ### The bug that dominated the pre-fix whole-network error
 
@@ -233,6 +257,22 @@ before/after tables: `.workstreams/model-decode-stream/report.md`.
   drop the per-kernel host dispatch; a **replayed** bucket charges the declared
   **device dispatch per kernel** (`graph_replay_device_launch`) because its host
   submit is amortized across the bucket.
+
+## 4b. A5 (Ascend950DT) bf16 calibration
+
+The first real A5 campaign ran on rack06os5 (`Ascend950DT_9582`, one die, 8×950DT
+per host): 96 physical conditions / 117 train observations / 5,616 device-event
+samples, 11 fitted rows, held-out guard clean. Artifact:
+`.workstreams/model-physical/a5-950dt-9582-bf16-physical-calibration.json`
+(sha256 `89661048…`). CV: gemm **0.59 %**, copy 0.28 %, moe_down 1.54 %,
+grouped_matmul 1.87 %, moe_gate_up 3.14 %, add 2.58/4.67 %, absorbed-MLA
+attention **8.29/8.71 %**, GQA attention 18.18/18.34 % (`low_confidence`).
+Held-out WAPE: gemm 0.41 %, copy 1.26 %, moe_down 0.75 %, grouped 0.76 %,
+moe_gate_up 2.05 %, MLA attention 2.29 %. Measured physics: 430.2 TFLOPS
+(99.46 % of the declared peak), copy 3.33 TB/s, dispatch 29.39 µs per-call vs
+6.74 µs batched. A5 fp8 is still unmeasured; the fp8 probe and 37-condition
+plan are staged. There is no A5 end-to-end serving measurement yet, so A5
+whole-network numbers are predictions only.
 
 ## 5. Residual gaps (ranked)
 

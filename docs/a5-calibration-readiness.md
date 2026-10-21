@@ -1,9 +1,36 @@
-# A5 physical-calibration readiness (A5 hardware available, measurements still absent)
+# A5 physical calibration: bf16 artifact published, fp8 pending
 
-Status: the **calibration layer is code-ready for A5 and data-blocked**. Four A5 machine
-blocks exist and load, the fp8 byte-width regression is fixed, and no A5 artifact is
-published because A5 has **zero timed measurements** today. This note records the evidence,
-the fixes, the remaining blockers (with owners) and the minimum measurement set.
+Status: the **A5 bf16 artifact is published** from a real 950DT campaign
+(`Ascend950DT_9582`, rack06os5, 96 physical conditions / 117 train observations /
+5,616 device-event samples, held-out guard clean). fp8 is still unmeasured: the
+fp8 probe is prepared but no fp8 fit exists yet. This note records the campaign,
+the remaining blockers and the minimum set; the sections below that say "not
+measured" describe the state before the campaign and are kept for provenance.
+
+### Published A5 bf16 rows (train-only 5-fold CV / held-out WAPE)
+
+| family | CV | held-out |
+| --- | ---: | ---: |
+| gemm | **0.59 %** | 0.41 % |
+| copy | **0.28 %** | 1.26 % |
+| moe_down | 1.54 % | 0.75 % |
+| grouped_matmul | 1.87 % | 0.76 % |
+| add (batched / per-call) | 2.58 / 4.67 % | 8.27 / 9.90 % |
+| moe_gate_up | 3.14 % | 2.05 % |
+| attention absorbed MLA (device / block) | **8.29 / 8.71 %** | 2.29 / 2.28 % |
+| attention GQA (device / block) | 18.18 / 18.34 % (`low_confidence`) | — |
+
+Artifact: `.workstreams/model-physical/a5-950dt-9582-bf16-physical-calibration.json`
+sha256 `89661048efbd09d97487dcef81e5905a05ee1adbc5b3a072d4883661844f2be6`.
+Measured physics: dense bf16 430.2 TFLOPS = **99.46 %** of the declared
+4.325376e14 peak; copy **3.33 TB/s** (η_m 0.833 of 4.0 TB/s); dispatch
+**29.39 µs per-call vs 6.74 µs batched** (22.65 µs submission tax). The A5
+fitter adopted a topology split (GQA vs shared-KV/MLA) on CV. GQA *decode* is
+over-predicted (0.995 vs 0.300 ms at kv=65536) because the flat-additive form
+has no decode-latency term; flagged `low_confidence`. Environment deviation:
+rack06 runs firmware 9.2.0.101.235 / software 25.1.rc3 / torch_npu 2.10.0.post6
+with the `megamoe-c00588804:ready` image (the `v0.30.0rc2-a5` image exists only
+on rack08), and `--init` is unavailable there.
 
 ## 1. A5 machine blocks (declared, not measured)
 
