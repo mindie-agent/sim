@@ -89,23 +89,27 @@ class _PredictiveCase(CaseSpec):
     physical_calibration: Any = None
     timing_scope: str = ""
     op_estimator: Any = None
+    framework_profile: Any = None
 
 
 def _predictive_case(
     case: CaseSpec, *, physical_calibration: Any, timing_scope: str,
     op_estimator: Any = None,
+    framework_profile: Any = None,
 ) -> _PredictiveCase:
     if isinstance(case, _PredictiveCase):
         return replace(
             case, physical_calibration=physical_calibration,
             timing_scope=timing_scope,
             op_estimator=op_estimator,
+            framework_profile=framework_profile,
         )
     values = {item.name: getattr(case, item.name) for item in fields(CaseSpec)}
     return _PredictiveCase(
         **values, physical_calibration=physical_calibration,
         timing_scope=timing_scope,
         op_estimator=op_estimator,
+        framework_profile=framework_profile,
     )
 
 
@@ -1042,6 +1046,7 @@ def predict(
     physical_calibration: Any = None,
     timing_scope: str | None = None,
     op_estimator: Any = None,
+    framework_profile: Any = None,
 ) -> dict[str, Any]:
     """Run the predictive path for one declared case.
 
@@ -1053,11 +1058,23 @@ def predict(
     the case's declared scope, then to ``device_event_warm``.
     ``op_estimator`` optionally supplies finite device-side operator plans;
     it does not replace the scheduler or the whole-iteration cost backend.
+    ``framework_profile`` optionally declares CPU and stream lifecycle work.
+    Engine commit gates scheduling; ordered stream completion is reported in
+    separate client timestamps and metrics. Zero profiles retain old output.
     """
     if isinstance(case, Mapping):
         case = CaseSpec.from_mapping(case)
     if not isinstance(case, CaseSpec):
         raise A3InputError("case_invalid")
+    from .framework_tasks import FrameworkProfile
+    if framework_profile is None:
+        framework_profile = getattr(case, "framework_profile", None)
+    if isinstance(framework_profile, Mapping):
+        framework_profile = FrameworkProfile.from_mapping(framework_profile)
+    if framework_profile is not None and not isinstance(framework_profile, FrameworkProfile):
+        raise A3InputError("framework_profile_invalid")
+    if framework_profile is not None and framework_profile.is_zero:
+        framework_profile = None
     case = with_media_runtime(case)
     if physical_calibration is None:
         physical_calibration = getattr(case, "physical_calibration", None)
@@ -1068,10 +1085,13 @@ def predict(
         or dict(case.runtime.metadata or ()).get("timing_scope")
         or DEFAULT_TIMING_SCOPE
     )
+    if framework_profile is not None and effective_scope.startswith(("host", "block_interval")):
+        raise A3InputError("framework_requires_separable_device_cost_scope")
     case = _predictive_case(
         case, physical_calibration=physical_calibration,
         timing_scope=effective_scope,
         op_estimator=op_estimator if op_estimator is not None else getattr(case, "op_estimator", None),
+        framework_profile=framework_profile,
     )
     memory = memory_plan(case.model, case.runtime, case.machine)
     if memory.status != "fits":
@@ -1154,6 +1174,16 @@ def predict(
     goodput = _slo_goodput(merged["requests"], case.slo)
     capacity_tokens = sum(request.prompt_tokens + request.output_tokens
                           for request in case.workload.requests)
+    framework_report = {}
+    if framework_profile is not None:
+        from .framework_runtime import client_metrics
+        framework_report = {"framework": {
+            "profile": framework_profile.to_dict(),
+            "metric_scope": "engine_output_state_commit",
+            "client_metric_scope": "ordered_stream_completion",
+            "client_metrics": client_metrics(replica_results),
+            "note": "stream completion does not gate the next engine iteration; all costs are declared analytic inputs",
+        }}
     return {
         "status": status,
         "prediction_kind": "predictive_operational",
@@ -1164,6 +1194,7 @@ def predict(
             "all durations are analytic/calibrated simulator output, not measured NPU timings",
         ],
         "metrics": merged["metrics"],
+        **framework_report,
         "slo_goodput": goodput,
         "served_requests": merged["served_requests"],
         "unserved_requests": merged["unserved_requests"],

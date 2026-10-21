@@ -73,6 +73,15 @@ def predict_global_replicas(
             }
         stage_maps[index] = renamed
     engine = ResourceEngine(all_resources)
+    profile = getattr(case, "framework_profile", None)
+    if profile is not None:
+        from .framework_runtime import (
+            after_device, before_device, request_with_client_times,
+            separate_host_intercepts, submission_ids,
+        )
+    last_output: dict[int, str] = {}
+    last_stream: dict[str, str] = {}
+    stream_records: dict[str, list[tuple[str, int]]] = {}
     prepare_ids: dict[int, list[str]] = {index: [] for index in active}
     prepared_names: dict[int, set[str]] = {index: set() for index in active}
     model_prepare_gaps: list[dict[str, Any]] = []
@@ -225,12 +234,26 @@ def predict_global_replicas(
                 if chosen:
                     active_replacements[op_id] = tuple(dict.fromkeys(chosen))
             task_count_before = len(engine.tasks)
+            if profile is not None:
+                separate_host_intercepts(step, case, profile, cost_model=runner.cost_model)
+                kernels = submission_ids(step, active_replacements)
+                info, submit_deps = before_device(
+                    engine, profile, step, index, kernels, last_output.get(index),
+                )
+                step["framework"] = info
+                active_forward = [*active_forward, info["input_task"]]
+                for op_id, dependencies in submit_deps.items():
+                    active_forward_specific[op_id] = tuple(dict.fromkeys(
+                        (*active_forward_specific.get(op_id, ()), *dependencies)
+                    ))
             if cost_backend is not None:
                 duration = _backend_duration(cost_backend, step["work"], case)
                 task_id = f"{prefix}:backend"
                 engine.add_task(
                     task_id, {"simulated_time": duration},
-                    dependencies=tuple(active_forward),
+                    dependencies=tuple(dict.fromkeys(
+                        (*active_forward, *active_forward_specific.get("backend", ()))
+                    )),
                     release_ms=runner.now,
                 )
                 targets = (task_id,)
@@ -244,17 +267,42 @@ def predict_global_replicas(
                     specific_deps["draft.prev_proposals_ready"] = (
                         last_draft_next[index]
                     )
-                id_map = add_costed_ops(
-                    engine, step["costed"], stage_maps[index], prefix=prefix,
-                    start_ms=runner.now,
+                common_args = dict(
+                    prefix=prefix, start_ms=runner.now,
                     external_deps=tuple(active_forward),
                     replacement_tasks=active_replacements,
                     op_external_deps=specific_deps,
-                    core_counts={
-                        "aic": case.machine.dies[0].aic_count,
-                        "aiv": case.machine.dies[0].aiv_count,
-                    },
+                    core_counts={"aic": case.machine.dies[0].aic_count,
+                                 "aiv": case.machine.dies[0].aiv_count},
                 )
+                if profile is not None:
+                    id_map = {}
+                    for cost in step["costed"]:
+                        # Ordinary eager ops have a separate declared device
+                        # dispatch gate. Finite plans register their own gate.
+                        op_id = cost.op.op_id
+                        if (cost.execution_plan is None and cost.launch_ms > 0
+                                and op_id in kernels):
+                            parents = tuple(f"{prefix}:{dep}" for dep in cost.op.deps)
+                            parents = parents or tuple(active_forward)
+                            parents = tuple(dict.fromkeys(
+                                (*parents, *specific_deps.get(op_id, ()))
+                            ))
+                            dispatch = f"{prefix}:{op_id}:device_dispatch"
+                            stage = stage_maps[index].get(cost.op.stage, stage_maps[index][0])
+                            engine.add_task(
+                                dispatch, {stage["launch"]: cost.launch_ms},
+                                dependencies=parents, release_ms=runner.now,
+                                owner=f"{prefix}:{op_id}",
+                            )
+                            specific_deps[op_id] = (*specific_deps.get(op_id, ()), dispatch)
+                        id_map.update(add_costed_ops(
+                            engine, [cost], stage_maps[index], **common_args,
+                        ))
+                else:
+                    id_map = add_costed_ops(
+                        engine, step["costed"], stage_maps[index], **common_args,
+                    )
                 last_draft_next[index] = tuple(
                     id_map[item.op.op_id] for item in step["costed"]
                     if item.op.op_id.startswith("draft.next.")
@@ -275,6 +323,11 @@ def predict_global_replicas(
             else:
                 token_gate = step["forward_gate"]
             step["gate"] = token_gate
+            if profile is not None:
+                step["gate"] = after_device(
+                    engine, profile, step, index, token_gate, last_stream, stream_records,
+                )
+                last_output[index] = step["gate"]
             step["events"] = []
             step["task_ids"] = set(list(engine.tasks)[task_count_before:]) | {step["gate"]}
             pending[index] = step
@@ -323,10 +376,28 @@ def predict_global_replicas(
                 background_remaining=result.get("remaining_tasks", ()),
                 deadline_slack=result.get("deadline_slack_ms", {}),
             )
+            if profile is not None:
+                info = step["framework"]
+                info["device_end_ms"] = float(engine.completed_at[info["device_gate"]])
+                info["engine_commit_ms"] = end
+                runners[index].traces[-1]["framework"] = info
             del pending[index]
     drain = engine.run(start_ms=max(
         (runner.now for runner in runners.values()), default=0.0,
     ))
+    if profile is not None:
+        # Stream tasks can finish after their iteration's engine commit. Attach
+        # those late events to their owning trace after draining the timeline.
+        final_events = {event.task_id: event.to_dict() for event in engine.trace}
+        for runner in runners.values():
+            for trace in runner.traces:
+                info = trace["framework"]
+                tasks = info["stream_tasks"]
+                info["client_stream_end_ms"] = {
+                    rid: float(engine.completed_at[task]) for rid, task in tasks.items()
+                }
+                seen = {event["task_id"] for event in trace["events"]}
+                trace["events"].extend(final_events[task] for task in tasks.values() if task not in seen)
     token_end = max(
         (state.finish_ms or runner.now
          for runner in runners.values() for state in runner.states),
@@ -344,7 +415,12 @@ def predict_global_replicas(
             ),
             "iterations": runner.iteration,
             "served": len(served), "unserved": len(unserved),
-            "requests": [state.to_dict() for state in runner.states],
+            "requests": [
+                request_with_client_times(
+                    state, stream_records.get(state.request.request_id, ()), engine,
+                ) if profile is not None else state.to_dict()
+                for state in runner.states
+            ],
             "traces": runner.traces,
             "prepare": prepare_summary(
                 drain,
