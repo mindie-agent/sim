@@ -69,10 +69,22 @@ campaigns checked against the declared heldout sets: **0 collisions**.
 | A3 | moe_down | per-call | 12 | 2.36 % |
 | A3 | grouped_matmul (experts=8) | per-call | 10 | 1.65 % |
 | A3 | gemm (per-call / batched) | — | 367 / 107 | **8.84 % / 11.50 %** |
+| A3 | moe_gate_up / moe_down (MC2 legs, own recipe) | per-call | 14 / 14 | **3.71 / 4.18 %** |
 | A2 | attention_fused | per-call | 28 | 22.93 % |
 | A2 | attention_fused | operator/batched/block | 11 each | 20.76 / 32.17 / 37.45 % |
 | A2 | grouped_matmul | per-call | 22 | 13.51 % |
+| A2 | moe_gate_up / moe_down (MC2 legs) | per-call | 8 / 8 | 5.08 / 7.13 % |
 | A2 | gemm (batched / per-call) | — | — | 7.40 % / 12.56 % |
+
+The MC2 chunk's measured gate/up and down legs are ingested as their own recipe
+(`npu_grouped_matmul_list_bf16_mc2`, 28 A3 + 16 A2 observations) next to the
+prefill grouped rows; pooling them into the prefill row was rejected on a
+measured counterfactual. Across the eight measured MC2 chain conditions the
+chain error falls from 15.3 % to **7.6 % mean** and the compute leg from 18.8 %
+to **7.7 %** (worst +35.7 % → +14.3 %; the eight rows are training rows, so this
+is in-sample — the CVs above are the generalization estimate). The ep4/ep8 chain
+residual (−18 / −26 %) is the declared chain factor plus the unpriced `swiglu`
+leg, reported per condition.
 
 The A3 GEMM improvement (16.05 → 8.84 %) comes from fixing an IRLS linearization
 bug for `flat_additive` rows, not from tuning. The attention topology split
