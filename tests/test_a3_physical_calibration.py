@@ -1835,3 +1835,104 @@ def test_grouped_weight_width_split_is_adopted_only_when_it_pays():
     assert len(single_records) == 1
     assert single_records[0].corpus_class == ""
     assert single_records[0].model_selection["shape_split"]["adopted"] is False
+
+
+def test_resident_prefix_is_bounded_and_the_capacity_warning_is_reanchored():
+    # A resident-prefix claim above 62.5 % of the declared L2 capacity is not
+    # identifiable from a corpus whose measured memory-bound rate is far below
+    # the declared L2 rate (the A3 per-call GEMM plateau is flat from 120 to
+    # 192 MiB, so every candidate in the tolerance band sits on the L2-rate cap).
+    assert max(physical.L2_USABLE_FRACTIONS) == 0.625
+    blended_truth = dict(TRUTH, memory_model="l2_blend", l2_usable_bytes=L2_BYTES, l2_bw=2.2e12)
+    calibration = fit(observations(blended_truth))
+    parameters = only_family(calibration)
+    assert parameters.memory_model == "l2_blend"
+    assert parameters.l2_usable_bytes <= 0.625 * L2_BYTES
+    # The declared-capacity warning means the declared capacity, not the largest
+    # grid fraction, so an allowed prefix is never flagged as "at capacity".
+    assert "l2_usable_at_declared_capacity" not in parameters.warnings
+
+
+# ---------------------------------------------------------------------------
+# Declared dtype byte widths (A5 fp8 readiness)
+# ---------------------------------------------------------------------------
+def test_byte_widths_are_declared_for_quantized_dtypes_and_never_guessed():
+    # A5's headline dtype is fp8; pricing it at bf16's two bytes doubles every
+    # byte term and the fitted eta_memory silently absorbs the error.
+    assert physical.dtype_itemsize("fp8_e4m3") == 1.0
+    assert physical.dtype_itemsize("fp8_e5m2") == 1.0
+    assert physical.dtype_itemsize("float8_e4m3fn") == 1.0
+    assert physical.dtype_itemsize("int8") == 1.0
+    assert physical.dtype_itemsize("int4") == 0.5
+    assert physical.dtype_itemsize("bf16") == 2.0
+    with pytest.raises(physical.PhysicalCalibrationError, match="dtype_byte_width_undeclared"):
+        physical.dtype_itemsize("fp6")
+    # The table mirrors the package's single source of truth.
+    a3_types = pytest.importorskip("mindie_sim.a3_types")
+    assert physical.DTYPE_BYTES == dict(a3_types._DTYPE_BYTES)
+
+
+def test_an_undeclared_dtype_is_rejected_with_a_reason_not_priced_at_bf16():
+    rows = grouped_observations()
+    odd = dict(rows[0], condition_key="odd-dtype", dtype="fp6")
+    calibration = fit(rows + [odd])
+    reasons = calibration.provenance["rejections"]["by_reason"]
+    assert reasons.get("dtype_byte_width_undeclared:fp6") == 1
+    assert calibration.provenance["condition_count"] == len(rows)
+    # A hand-built artifact whose dtype has no declared width is refused at
+    # prediction time instead of being priced at a guessed width.
+    document = calibration.to_dict()
+    key = next(iter(document["families"]))
+    document["families"][key]["compute_dtype"] = "fp6"
+    hand_built = physical.PhysicalCalibration.from_mapping(document)
+    explained = hand_built.predict_op_explained(
+        grouped_op(2048, 32, 7168, 7168), MACHINE, compute_dtype="fp6",
+    )
+    assert explained.duration_ms is None
+    assert explained.reason.startswith("dtype_byte_width_undeclared")
+
+
+def test_fp8_observations_fit_with_one_byte_widths():
+    # The same durations priced at fp8 bytes (1 B) instead of bf16 (2 B) give
+    # half the byte term, so the fitted eta_memory must double.
+    bf16 = fit(grouped_observations())
+    fp8_rows = grouped_observations()
+    for row in fp8_rows:
+        row["dtype"] = "fp8_e4m3"
+        row["hbm_bytes"] = row["hbm_bytes"] / 2.0
+    fp8 = physical.fit_calibration(
+        fp8_rows, MACHINE, hardware_key=MACHINE["hardware_key"],
+        arch_family="TEST", compute_dtype="fp8_e4m3",
+    )
+    bf16_parameters = only_family(bf16)
+    fp8_parameters = only_family(fp8)
+    assert fp8_parameters.compute_dtype == "fp8_e4m3"
+    assert fp8_parameters.eta_memory == pytest.approx(bf16_parameters.eta_memory / 2.0, rel=0.05)
+
+
+def test_per_launch_cost_is_never_pinned_from_another_hardware_key():
+    # A grouped corpus with fewer than 3 rows above the 128-expert cap cannot
+    # identify the per-launch cost. On a part with a measured dispatch it is
+    # pinned to that measurement; on a part without one it must stay unset
+    # rather than importing another SKU's number.
+    assert physical.DISPATCH_OVERHEAD_MS_BY_HARDWARE["Ascend910_9362"] == 0.020
+    shapes = tuple(
+        (tokens, experts, n, k)
+        for tokens, experts, n, k in GROUPED_SHAPES
+        if experts <= physical.GROUPED_LAUNCH_CAPACITY
+    ) + ((2048 * 256, 256, 4096, 7168),)  # one multi-launch row only
+    a3_rows = grouped_observations(shapes=shapes, hardware_key="Ascend910_9362")
+    a3_machine = dict(MACHINE, hardware_key="Ascend910_9362")
+    pinned = physical.fit_calibration(
+        a3_rows, a3_machine, hardware_key="Ascend910_9362", arch_family="A3",
+    )
+    rows = grouped_observations(shapes=shapes)
+    pinned_parameters = only_family(pinned)
+    assert pinned_parameters.per_launch_ms == pytest.approx(0.020)
+    assert "per_launch_ms_pinned_to_measured_dispatch" in pinned_parameters.warnings
+    unknown = physical.fit_calibration(
+        rows, MACHINE, hardware_key=MACHINE["hardware_key"], arch_family="TEST",
+    )
+    unknown_parameters = only_family(unknown)
+    assert unknown_parameters.per_launch_ms is None
+    assert "per_launch_ms_unidentified_no_dispatch_measurement" in unknown_parameters.warnings

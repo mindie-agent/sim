@@ -94,7 +94,14 @@ LAUNCH_BOUNDS_MS = (0.0, 0.060)
 # Efficiency bounds; eta = 1 is the declared peak, never exceeded on HBM.
 ETA_BOUNDS = (0.05, 1.0)
 # L2 usable-capacity candidates as a fraction of the declared L2 capacity.
-L2_USABLE_FRACTIONS = (0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1.0)
+# Capped at 62.5 %: the resident prefix is not identifiable above it.  On the A3
+# per-call GEMM corpus a 144 MiB claim (75 %) needs a 4.8 TB/s L2 rate -- the
+# declared 4x ceiling, which no observation in that corpus reaches (the measured
+# memory-bound ladder tops out at 1.48 TB/s) -- and the training-WAPE plateau is
+# flat from 120 to 192 MiB, so every candidate in the tolerance band carries an
+# L2 rate sitting on the cap.  The cap costs 0.28 pp of train-only CV on that row
+# (9.02 / 9.12 % vs 8.72 / 8.84 %) and removes a claim the data does not support.
+L2_USABLE_FRACTIONS = (0.0625, 0.125, 0.25, 0.375, 0.5, 0.625)
 # Fitted L2 read bandwidth, as a multiple of the declared HBM peak.
 L2_BW_MULTIPLE_BOUNDS = (1.0, 4.0)
 # `l2_usable` and `eta_memory` trade off on a flat plateau once every binding row
@@ -262,6 +269,11 @@ DISPATCH_LAUNCH_BOUNDS_MS = (0.0, 0.025)
 # narrow bound is declared per hardware key and a part without an entry keeps the
 # generic launch bounds.
 DISPATCH_LAUNCH_BOUNDS_BY_HARDWARE = {"Ascend910_9362": DISPATCH_LAUNCH_BOUNDS_MS}
+# The 20 us dispatch prior is per hardware key, exactly like the launch bound: a
+# pin that borrows another SKU's measurement would import an A3 number into, say,
+# an A5 artifact whose grouped corpus has fewer than MIN_IDENTIFYING_ROWS rows
+# above the 128-expert cap.  A part without a measured dispatch does not pin.
+DISPATCH_OVERHEAD_MS_BY_HARDWARE = {"Ascend910_9362": ATTENTION_DISPATCH_OVERHEAD_MS}
 # A working set this many times the declared L2 capacity cannot be resident, so
 # the L2 blend must not credit it.  The largest A3 training working set is
 # 3.5x the declared L2, so the multi-GB weight-streaming regime of a decode
@@ -401,7 +413,38 @@ MC2_GROUPED_LEGS = (
 # because it is a vector kernel of the ``swiglu`` family and pricing it here
 # would silently re-fit another family from a single campaign.
 MC2_ACTIVATION_LEG = "swiglu"
-DTYPE_BYTES = {"bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0, "float16": 2.0, "fp32": 4.0, "float32": 4.0}
+# Declared byte width per compute dtype.  This module is stdlib-only by design,
+# so the table is mirrored from ``a3_types._DTYPE_BYTES`` (the package's single
+# source of truth) and a unit test asserts the two stay identical.  A dtype that
+# is not declared here is a rejection with a reason -- never a silent bf16 width:
+# an A5 fp8 GEMM priced at 2 bytes doubles ``hbm_bytes`` and the fitted
+# ``eta_memory`` absorbs the error invisibly.
+DTYPE_BYTES = {
+    "fp32": 4.0, "float32": 4.0, "bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0,
+    "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
+    "int8": 1.0, "int4": 0.5, "int32": 4.0, "bool": 1.0,
+}
+# Quantized dtypes whose "bytes" are a packed fraction of a byte are not
+# supported by the readers: an element that is not byte-aligned needs the
+# caller's packing convention, so they are declared here for prediction only.
+BYTE_ALIGNED_DTYPES = frozenset(
+    name for name, width in DTYPE_BYTES.items() if width >= 1.0
+)
+
+
+def dtype_itemsize(dtype: Any, *, default: str = "") -> float:
+    """Declared byte width of one dtype; raises instead of guessing.
+
+    ``default`` is only for a caller that already knows the value is absent and
+    wants the declared compute dtype substituted (the CLI predict path does).
+    """
+    text = _normalise_dtype(dtype) or _normalise_dtype(default)
+    if not text:
+        raise PhysicalCalibrationError("dtype_undeclared")
+    width = DTYPE_BYTES.get(text)
+    if width is None:
+        raise PhysicalCalibrationError("dtype_byte_width_undeclared:%s" % (text,))
+    return float(width)
 
 
 class PhysicalCalibrationError(ValueError):
@@ -675,6 +718,13 @@ class Observation:
                 raise PhysicalCalibrationError("grouped_observation_missing_tokens_experts_n_k")
         if kind == "vector" and not (elements > 0 or hbm_bytes > 0):
             raise PhysicalCalibrationError("vector_observation_missing_elements_and_bytes")
+        declared_dtype = str(value.get("dtype") or value.get("compute_dtype") or "")
+        if declared_dtype and _normalise_dtype(declared_dtype) not in DTYPE_BYTES:
+            # The byte width of the shape is part of the observation, so an
+            # undeclared dtype is rejected here instead of being priced at bf16.
+            raise PhysicalCalibrationError(
+                "dtype_byte_width_undeclared:%s" % (_normalise_dtype(declared_dtype),)
+            )
         return cls(
             condition_key=str(value.get("condition_key") or ""),
             hardware_key=str(value.get("hardware_key") or ""),
@@ -1455,7 +1505,7 @@ def _grouped_activation_bytes(obs: Observation) -> float:
     """Bytes the per-expert activation read moves (``experts x tpe x k``)."""
     tokens = float(obs.shape.get("tokens") or 0.0)
     k = float(obs.shape.get("k") or 0.0)
-    itemsize = DTYPE_BYTES.get(str(obs.dtype or "").lower(), 2.0)
+    itemsize = dtype_itemsize(obs.dtype)
     return tokens * k * itemsize
 
 
@@ -1510,7 +1560,7 @@ def _design_row(
         geometry = {key: float(value) for key, value in geo.items()}
         broadcast = terms.get("kv_broadcast")
         if broadcast:
-            itemsize = DTYPE_BYTES.get(str(obs.dtype or "").lower(), 2.0)
+            itemsize = dtype_itemsize(obs.dtype)
             extra_bytes = attention_kv_extra_bytes(obs.shape, int(broadcast), itemsize)
             memory_bytes = obs.hbm_bytes + extra_bytes
             geometry["kv_broadcast"] = float(broadcast)
@@ -2650,7 +2700,7 @@ def _dense_transfer_observations(observations: Sequence[Observation]) -> list[Ob
         tokens = float(observation.shape.get("tokens") or 0.0)
         n = float(observation.shape.get("n") or 0.0)
         k = float(observation.shape.get("k") or 0.0)
-        itemsize = DTYPE_BYTES.get(str(observation.dtype or "").lower(), 2.0)
+        itemsize = dtype_itemsize(observation.dtype)
         proxies.append(
             dataclasses.replace(
                 observation,
@@ -2949,9 +2999,9 @@ def _fit_scope_group(
         elif value >= LAUNCH_BOUNDS_MS[1] - 1e-9:
             warnings.append("launch_at_upper_bound:%s" % scope)
             identified["launch"] = False
-    if chosen["memory_model"] == "l2_blend" and chosen["l2_usable"] >= int(
-        round(machine.l2_bytes * max(L2_USABLE_FRACTIONS))
-    ):
+    if chosen["memory_model"] == "l2_blend" and chosen["l2_usable"] >= int(round(machine.l2_bytes)):
+        # The declared capacity itself, not the largest grid fraction: with the
+        # grid capped at 62.5 % the old test would flag every allowed prefix.
         warnings.append("l2_usable_at_declared_capacity")
     if n_align and parameters["align_penalty"] is not None:
         if parameters["align_penalty"] <= ALIGN_PENALTY_BOUNDS[0] + 1e-9:
@@ -2986,10 +3036,17 @@ def _fit_scope_group(
         # cap, so the per-launch cost cannot be fitted.  Every extra launch is one
         # measured device dispatch (20 us), so that measured prior is pinned and
         # reported instead of the parameter drifting to a bound.
-        parameters["per_launch_ms"] = ATTENTION_DISPATCH_OVERHEAD_MS
-        pinned.append("per_launch_ms")
-        identified["per_launch"] = False
-        warnings.append("per_launch_ms_pinned_to_measured_dispatch")
+        measured_dispatch = DISPATCH_OVERHEAD_MS_BY_HARDWARE.get(machine.hardware_key)
+        if measured_dispatch is not None:
+            parameters["per_launch_ms"] = measured_dispatch
+            pinned.append("per_launch_ms")
+            identified["per_launch"] = False
+            warnings.append("per_launch_ms_pinned_to_measured_dispatch")
+        else:
+            # No dispatch measurement on this part: leave the term unset rather
+            # than importing another SKU's fixed cost.
+            identified["per_launch"] = False
+            warnings.append("per_launch_ms_unidentified_no_dispatch_measurement")
     quality = _quality(metrics, chosen["cv"].get("wape_pct"))
     if kind == "grouped_gemm":
         expert_counts = {
@@ -3522,6 +3579,12 @@ class PhysicalCalibration:
                 from_artifact,
                 parameters,
             )
+        try:
+            itemsize = dtype_itemsize(parameters.compute_dtype)
+        except PhysicalCalibrationError as exc:
+            # A hand-built artifact could declare a dtype this module has no byte
+            # width for; refuse rather than price it at a guessed width.
+            return self._unmodeled(op, str(exc), source, from_artifact, parameters)
         shape = op.get("shape")
         shape = dict(shape) if isinstance(shape, Mapping) else {}
         for key in ("m", "n", "k", "elements", "q", "kv", "heads", "dim",
@@ -3586,7 +3649,7 @@ class PhysicalCalibration:
                 else 0.0
             )
             breakdown["compute_ms"] = compute_ms
-            itemsize = DTYPE_BYTES.get(dtype, 2.0)
+            itemsize = dtype_itemsize(dtype, default=parameters.compute_dtype)
             qkv_heads = _as_float(shape.get("kv_heads"), "kv_heads", allow_none=True) or heads
             if hbm_bytes is None:
                 hbm_bytes = (
@@ -3625,7 +3688,7 @@ class PhysicalCalibration:
                     op, "missing_shape_tokens_experts_n_k", source, from_artifact, parameters
                 )
             grouped_shape = {"tokens": tokens, "experts": experts, "n": n, "k": k}
-            itemsize = DTYPE_BYTES.get(dtype, 2.0)
+            itemsize = dtype_itemsize(dtype, default=parameters.compute_dtype)
             if flops is None:
                 flops = 2.0 * tokens * n * k
             if hbm_bytes is None:
@@ -3673,7 +3736,7 @@ class PhysicalCalibration:
             if flops is None:
                 flops = 2.0 * m * n * k
             if hbm_bytes is None:
-                hbm_bytes = (m * k + k * n + m * n) * DTYPE_BYTES.get(dtype, 2.0)
+                hbm_bytes = (m * k + k * n + m * n) * dtype_itemsize(dtype, default=parameters.compute_dtype)
             wave_eff = 1.0
             shape_only = _ShapeOnly(family, shape, elements or 0.0, flops, hbm_bytes)
             effective_flops = _padded_flops(shape_only, parameters.block_m, parameters.tail or {})
@@ -3703,7 +3766,7 @@ class PhysicalCalibration:
             if parameters.memory_model == "l2_blend" and parameters.l2_usable_bytes > 0:
                 stream = weight_stream_basis(
                     model_kind=parameters.model_kind, m=m, k=k, n=n,
-                    itemsize=DTYPE_BYTES.get(dtype, 2.0),
+                    itemsize=dtype_itemsize(dtype, default=parameters.compute_dtype),
                     l2_usable_bytes=parameters.l2_usable_bytes,
                     l2_bytes=limits.l2_bytes,
                 )
@@ -3715,7 +3778,7 @@ class PhysicalCalibration:
             if elements is None:
                 return self._unmodeled(op, "missing_elements", source, from_artifact, parameters)
             if hbm_bytes is None:
-                hbm_bytes = elements * 2.0 * DTYPE_BYTES.get(dtype, 2.0)
+                hbm_bytes = elements * 2.0 * dtype_itemsize(dtype, default=parameters.compute_dtype)
             compute_ms = (
                 elements / parameters.vec_ops_per_s * 1000.0
                 if parameters.vec_ops_per_s
@@ -5237,7 +5300,12 @@ def read_sqlite_observations(
             continue
         kind = MODEL_KINDS[op_family]
         shape = json.loads(shape_json)
-        itemsize = DTYPE_BYTES.get(str(dtype).lower(), 2.0)
+        itemsize = _reader_itemsize(dtype)
+        if itemsize is None:
+            # An undeclared dtype width is a rejection with a reason, never a
+            # silent bf16 (2-byte) assumption.
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         shape = {k: float(v) for k, v in shape.items() if v is not None}
         if kind == "gemm":
             m, n, k = shape.get("m"), shape.get("n"), shape.get("k")
@@ -5306,7 +5374,17 @@ DECLARED_CACHE_POLICY = "same_preallocated_buffers_reused_no_cache_flush"
 _DTYPE_ALIASES = {
     "bfloat16": "bf16", "bf16": "bf16", "float16": "fp16", "fp16": "fp16",
     "float32": "fp32", "fp32": "fp32", "float8": "fp8", "fp8": "fp8",
+    "float8_e4m3": "fp8_e4m3", "float8_e4m3fn": "fp8_e4m3",
+    "fp8_e4m3fn": "fp8_e4m3", "e4m3": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2", "fp8_e5m2": "fp8_e5m2", "e5m2": "fp8_e5m2",
+    "int8": "int8", "int4": "int4", "int32": "int32", "bool": "bool",
 }
+
+
+def _reader_itemsize(dtype: Any) -> float | None:
+    """Byte width for a reader; ``None`` means the dtype is not declared."""
+    text = _normalise_dtype(dtype)
+    return DTYPE_BYTES.get(text) if text else None
 
 
 def _normalise_dtype(value: Any) -> str:
@@ -5654,7 +5732,7 @@ def read_attention_results(
         or ""
     )
     observations: list[dict[str, Any]] = []
-    skipped = {"split": 0, "family": 0, "shape": 0, "duration": 0, "failed_case": 0}
+    skipped = {"split": 0, "family": 0, "shape": 0, "duration": 0, "failed_case": 0, "dtype": 0}
     for item in results:
         if not isinstance(item, Mapping):
             skipped["shape"] += 1
@@ -5713,7 +5791,10 @@ def read_attention_results(
         shape["topology"] = attention_topology(shape["heads"], shape.get("kv_heads") or shape["heads"])
         shape["phase"] = attention_phase(shape["q"])
         dtype = _normalise_dtype(geometry.get("dtype") or details.get("dtype") or "bfloat16")
-        itemsize = DTYPE_BYTES.get(dtype, 2.0)
+        itemsize = DTYPE_BYTES.get(dtype)
+        if itemsize is None:
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         q, kv, heads = shape["q"], shape["kv"], shape["heads"]
         kv_heads = shape.get("kv_heads") or heads
         dim, v_dim = shape["dim"], shape.get("v_dim") or shape["dim"]
@@ -5928,7 +6009,7 @@ def read_campaign_results(
         or ""
     )
     observations = []
-    skipped = {"split": 0, "shape": 0, "duration": 0, "family": 0, "failed_case": 0}
+    skipped = {"split": 0, "shape": 0, "duration": 0, "family": 0, "failed_case": 0, "dtype": 0}
     for item in results:
         if not isinstance(item, Mapping):
             skipped["shape"] += 1
@@ -5988,7 +6069,10 @@ def read_campaign_results(
             or item.get("dtype")
             or "bf16"
         )
-        itemsize = DTYPE_BYTES.get(dtype.lower(), 2.0)
+        itemsize = _reader_itemsize(dtype)
+        if itemsize is None:
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         if family == "gemm":
             shape = {
                 key: float(raw_shape[key])
@@ -6313,9 +6397,12 @@ def read_mc2_grouped_results(
                 skipped["duration"] += 1
                 continue
             rows = float(best.get("rows_per_rank") or 0.0)
+            leg_itemsize = _reader_itemsize(best.get("dtype") or "bf16")
+            if leg_itemsize is None:
+                skipped["dtype"] = skipped.get("dtype", 0) + 1
+                continue
             geometry = _mc2_leg_shape(
-                leg_name, rows, local_experts, intermediate, hidden,
-                DTYPE_BYTES.get(str(best.get("dtype") or "bf16").lower(), 2.0),
+                leg_name, rows, local_experts, intermediate, hidden, leg_itemsize,
             )
             if geometry is None:
                 skipped["rows"] += 1
