@@ -135,6 +135,7 @@ pytest -m "not live_npu"
 | **`mindie-sim calibration`** | **Empirical calibration store (`SQLiteCalibrationStore`)**: Tracks measured samples, emits pending manifests, and fits $\alpha/\beta$ curves from `mindie-profiler` / `torch_npu` runs | `--db <cal.db>` + `inventory` / `coverage` / `manifest` / `ingest` / `import-a3` / `import-comm` / `run` | Shape coverage report, deduplicated measurement manifests, and fitted compute/communication curves |
 | **`mindie-sim models` / `model-info`** | Inspect built-in production LLM architecture configs (DeepSeek V4, GLM-5.3, Kimi K3, Qwen3.8, etc.) | `mindie-sim models` or `mindie-sim model-info --key <model_key>` | Layer counts, attention type (MLA/GQA), MoE routing specs, and parameter breakdown |
 | **`mindie-sim pipeline-microbatches`** | Exact finite-microbatch PP timeline and bubble simulator (rather than naive `total / PP`) | `--stages 3,5 --microbatches 8 --transfer-ms 0.2` | Stage bubble ratios, total schedule span, and microbatch timeline |
+| **`mindie-sim operator-plan`** | Opt-in Vector instruction streams and finite BF16 Cube plans on the existing resource DAG | `--input examples/operator-plans/mixed.json` | Stage timelines, capacity certificates, provenance and explicit fallback; [guide](docs/operator-execution-plans.md) |
 
 ---
 

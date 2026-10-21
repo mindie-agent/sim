@@ -47,7 +47,8 @@
     remains available with an explicit ``uncalibrated_analytic`` source.
 
 [Timeouts & Locks]
-  Pure computation.  No timeouts, locks, I/O, subprocesses or provider imports.
+  The default path is pure computation. Explicit optional providers may run a
+  bounded, read-only external evaluator; no NPU or network service is started.
 
 [Side-Effect Policy]
   No filesystem/network/global-state writes.  Calibration data is read-only.
@@ -63,6 +64,7 @@ from .a3_curve_binding import build_curve_base_query, query_curve_for_op
 from .a3_operator_curve_protocol import canonical_protocol, protocol_equal
 from .a3_types import A3InputError, MachineSpec, dtype_bytes
 from .a3_workload import IterationWork, OpSpec
+from .operator_plan import EstimateContext, KernelPlan, evaluate_kernel_plan
 
 COMPUTE_FAMILIES = {
     "attention_qk", "attention_pv", "qkv_projection", "o_projection",
@@ -482,12 +484,14 @@ class CostedOp:
     #: parameter quality/level.  ``None`` when no artifact was supplied, so the
     #: analytic/curve record is exactly what it was before.
     physical: Mapping[str, Any] | None = None
+    execution_plan: KernelPlan | None = None
+    operator_estimation: Mapping[str, Any] | None = None
 
     def demand_map(self) -> dict[str, float]:
         return dict(self.demands)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "op_id": self.op.op_id, "family": self.op.family,
             "demands": dict(self.demands),
             "analytic_ms": self.analytic_ms, "estimated_ms": self.estimated_ms,
@@ -497,6 +501,11 @@ class CostedOp:
             "coverage": self.coverage, "recipe": self.op.recipe,
             "physical": dict(self.physical) if self.physical else None,
         }
+        if self.operator_estimation is not None:
+            payload["operator_estimation"] = dict(self.operator_estimation)
+        if self.execution_plan is not None:
+            payload["execution_plan"] = self.execution_plan.to_dict()
+        return payload
 
 
 def _gemm_efficiency(op: OpSpec, aic_count: int) -> tuple[float, dict[str, float]]:
@@ -953,6 +962,9 @@ class PredictiveCostModel:
     #: op's own family/recipe.  The transfer is always recorded on the op and
     #: counted in the provenance; set ``False`` to demand an exact row.
     physical_allow_family_transfer: bool = True
+    # Optional per-op provider. The whole-iteration cost_backend is deliberately
+    # separate: it cannot preserve stage work and cross-operator contention.
+    op_estimator: Any = None
 
     def calibration_features(self) -> dict[str, str]:
         return {
@@ -1266,6 +1278,60 @@ class PredictiveCostModel:
         )
 
     def cost(self, op: OpSpec) -> CostedOp:
+        baseline = self._legacy_cost(op)
+        if self.op_estimator is None:
+            return baseline
+        metadata = dict(op.metadata)
+        reason = ""
+        if metadata.get("witness_only") or metadata.get("not_execution"):
+            reason = "non_executable_witness"
+        elif metadata.get("fusion_stages") or metadata.get("comm_stages"):
+            reason = "existing_stage_plan_precedence"
+        elif metadata.get("serial_ms", 0):
+            reason = "explicit_serial_cost_precedence"
+        elif (baseline.calibration.observations_used > 0
+              or baseline.calibration.status.startswith("calibrated")
+              or baseline.calibration.status.startswith("physical_calibrated")
+              or (baseline.curve_result and baseline.curve_result.get("status") == "calibrated")):
+            reason = "existing_calibration_precedence"
+        elif op.link_bytes > 0 or op.family in COMM_FAMILIES:
+            reason = "communication_owned_by_existing_model"
+        if reason:
+            return replace(baseline, operator_estimation={
+                "status": "preserved", "reason": reason,
+                "baseline_ms": baseline.estimated_ms,
+            })
+        context = EstimateContext(
+            compute_dtype=self.compute_dtype, weight_dtype=self.weight_dtype,
+            activation_dtype=self.activation_dtype, timing_scope=self.timing_scope,
+            quantization=self.quantization,
+        )
+        estimate = self.op_estimator.estimate(op, self.machine, context)
+        if estimate.plan is None:
+            if getattr(self.op_estimator, "strict", False):
+                raise A3InputError(f"operator_estimator_unsupported:{op.op_id}:{estimate.unsupported_reason}")
+            return replace(baseline, operator_estimation={
+                "status": "fallback", "reason": estimate.unsupported_reason,
+                "baseline_ms": baseline.estimated_ms,
+            })
+        plan = estimate.plan
+        isolated = evaluate_kernel_plan(plan, self.machine, context, baseline.launch_ms, stage=op.stage)
+        elapsed = float(isolated["elapsed_ms"])
+        launch = 0.0 if plan.includes_dispatch else baseline.launch_ms
+        return replace(
+            baseline, execution_plan=plan,
+            demands=tuple(sorted(plan.resource_totals().items())),
+            estimated_ms=elapsed, launch_ms=launch, service_ms=max(0.0, elapsed-launch),
+            operator_estimation={
+                "status": "analytic_plan", "backend": plan.backend,
+                "version": plan.version, "baseline_ms": baseline.estimated_ms,
+                "isolated_plan_ms": elapsed, "timing_scope": self.timing_scope,
+                "provenance": dict(plan.provenance),
+                "not_npu_measured": True,
+            },
+        )
+
+    def _legacy_cost(self, op: OpSpec) -> CostedOp:
         op_metadata = dict(op.metadata)
         if (bool(op_metadata.get("witness_only"))
                 or bool(op_metadata.get("not_execution"))):

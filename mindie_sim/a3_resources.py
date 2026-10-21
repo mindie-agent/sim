@@ -418,6 +418,15 @@ def add_costed_ops(
                 },
             )
             continue
+        plan = getattr(costed, "execution_plan", None)
+        if plan is not None:
+            from .operator_plan import register_kernel_plan
+            register_kernel_plan(
+                engine, plan, stage_names, task_id=task_id, dependencies=deps,
+                start_ms=released.get(source_id, start_ms),
+                launch_ms=costed.launch_ms,
+            )
+            continue
         comm_stages = tuple(
             dict(stage) for stage in dict(op.metadata).get("comm_stages", ())
         )
