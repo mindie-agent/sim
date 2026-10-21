@@ -408,7 +408,38 @@ MC2_GROUPED_LEGS = (
 # because it is a vector kernel of the ``swiglu`` family and pricing it here
 # would silently re-fit another family from a single campaign.
 MC2_ACTIVATION_LEG = "swiglu"
-DTYPE_BYTES = {"bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0, "float16": 2.0, "fp32": 4.0, "float32": 4.0}
+# Declared byte width per compute dtype.  This module is stdlib-only by design,
+# so the table is mirrored from ``a3_types._DTYPE_BYTES`` (the package's single
+# source of truth) and a unit test asserts the two stay identical.  A dtype that
+# is not declared here is a rejection with a reason -- never a silent bf16 width:
+# an A5 fp8 GEMM priced at 2 bytes doubles ``hbm_bytes`` and the fitted
+# ``eta_memory`` absorbs the error invisibly.
+DTYPE_BYTES = {
+    "fp32": 4.0, "float32": 4.0, "bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0,
+    "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
+    "int8": 1.0, "int4": 0.5, "int32": 4.0, "bool": 1.0,
+}
+# Quantized dtypes whose "bytes" are a packed fraction of a byte are not
+# supported by the readers: an element that is not byte-aligned needs the
+# caller's packing convention, so they are declared here for prediction only.
+BYTE_ALIGNED_DTYPES = frozenset(
+    name for name, width in DTYPE_BYTES.items() if width >= 1.0
+)
+
+
+def dtype_itemsize(dtype: Any, *, default: str = "") -> float:
+    """Declared byte width of one dtype; raises instead of guessing.
+
+    ``default`` is only for a caller that already knows the value is absent and
+    wants the declared compute dtype substituted (the CLI predict path does).
+    """
+    text = _normalise_dtype(dtype) or _normalise_dtype(default)
+    if not text:
+        raise PhysicalCalibrationError("dtype_undeclared")
+    width = DTYPE_BYTES.get(text)
+    if width is None:
+        raise PhysicalCalibrationError("dtype_byte_width_undeclared:%s" % (text,))
+    return float(width)
 
 
 class PhysicalCalibrationError(ValueError):
@@ -682,6 +713,13 @@ class Observation:
                 raise PhysicalCalibrationError("grouped_observation_missing_tokens_experts_n_k")
         if kind == "vector" and not (elements > 0 or hbm_bytes > 0):
             raise PhysicalCalibrationError("vector_observation_missing_elements_and_bytes")
+        declared_dtype = str(value.get("dtype") or value.get("compute_dtype") or "")
+        if declared_dtype and _normalise_dtype(declared_dtype) not in DTYPE_BYTES:
+            # The byte width of the shape is part of the observation, so an
+            # undeclared dtype is rejected here instead of being priced at bf16.
+            raise PhysicalCalibrationError(
+                "dtype_byte_width_undeclared:%s" % (_normalise_dtype(declared_dtype),)
+            )
         return cls(
             condition_key=str(value.get("condition_key") or ""),
             hardware_key=str(value.get("hardware_key") or ""),
@@ -1462,7 +1500,7 @@ def _grouped_activation_bytes(obs: Observation) -> float:
     """Bytes the per-expert activation read moves (``experts x tpe x k``)."""
     tokens = float(obs.shape.get("tokens") or 0.0)
     k = float(obs.shape.get("k") or 0.0)
-    itemsize = DTYPE_BYTES.get(str(obs.dtype or "").lower(), 2.0)
+    itemsize = dtype_itemsize(obs.dtype)
     return tokens * k * itemsize
 
 
@@ -1517,7 +1555,7 @@ def _design_row(
         geometry = {key: float(value) for key, value in geo.items()}
         broadcast = terms.get("kv_broadcast")
         if broadcast:
-            itemsize = DTYPE_BYTES.get(str(obs.dtype or "").lower(), 2.0)
+            itemsize = dtype_itemsize(obs.dtype)
             extra_bytes = attention_kv_extra_bytes(obs.shape, int(broadcast), itemsize)
             memory_bytes = obs.hbm_bytes + extra_bytes
             geometry["kv_broadcast"] = float(broadcast)
@@ -2657,7 +2695,7 @@ def _dense_transfer_observations(observations: Sequence[Observation]) -> list[Ob
         tokens = float(observation.shape.get("tokens") or 0.0)
         n = float(observation.shape.get("n") or 0.0)
         k = float(observation.shape.get("k") or 0.0)
-        itemsize = DTYPE_BYTES.get(str(observation.dtype or "").lower(), 2.0)
+        itemsize = dtype_itemsize(observation.dtype)
         proxies.append(
             dataclasses.replace(
                 observation,
@@ -3529,6 +3567,12 @@ class PhysicalCalibration:
                 from_artifact,
                 parameters,
             )
+        try:
+            itemsize = dtype_itemsize(parameters.compute_dtype)
+        except PhysicalCalibrationError as exc:
+            # A hand-built artifact could declare a dtype this module has no byte
+            # width for; refuse rather than price it at a guessed width.
+            return self._unmodeled(op, str(exc), source, from_artifact, parameters)
         shape = op.get("shape")
         shape = dict(shape) if isinstance(shape, Mapping) else {}
         for key in ("m", "n", "k", "elements", "q", "kv", "heads", "dim",
@@ -3593,7 +3637,7 @@ class PhysicalCalibration:
                 else 0.0
             )
             breakdown["compute_ms"] = compute_ms
-            itemsize = DTYPE_BYTES.get(dtype, 2.0)
+            itemsize = dtype_itemsize(dtype, default=parameters.compute_dtype)
             qkv_heads = _as_float(shape.get("kv_heads"), "kv_heads", allow_none=True) or heads
             if hbm_bytes is None:
                 hbm_bytes = (
@@ -3632,7 +3676,7 @@ class PhysicalCalibration:
                     op, "missing_shape_tokens_experts_n_k", source, from_artifact, parameters
                 )
             grouped_shape = {"tokens": tokens, "experts": experts, "n": n, "k": k}
-            itemsize = DTYPE_BYTES.get(dtype, 2.0)
+            itemsize = dtype_itemsize(dtype, default=parameters.compute_dtype)
             if flops is None:
                 flops = 2.0 * tokens * n * k
             if hbm_bytes is None:
@@ -3680,7 +3724,7 @@ class PhysicalCalibration:
             if flops is None:
                 flops = 2.0 * m * n * k
             if hbm_bytes is None:
-                hbm_bytes = (m * k + k * n + m * n) * DTYPE_BYTES.get(dtype, 2.0)
+                hbm_bytes = (m * k + k * n + m * n) * dtype_itemsize(dtype, default=parameters.compute_dtype)
             wave_eff = 1.0
             shape_only = _ShapeOnly(family, shape, elements or 0.0, flops, hbm_bytes)
             effective_flops = _padded_flops(shape_only, parameters.block_m, parameters.tail or {})
@@ -3710,7 +3754,7 @@ class PhysicalCalibration:
             if parameters.memory_model == "l2_blend" and parameters.l2_usable_bytes > 0:
                 stream = weight_stream_basis(
                     model_kind=parameters.model_kind, m=m, k=k, n=n,
-                    itemsize=DTYPE_BYTES.get(dtype, 2.0),
+                    itemsize=dtype_itemsize(dtype, default=parameters.compute_dtype),
                     l2_usable_bytes=parameters.l2_usable_bytes,
                     l2_bytes=limits.l2_bytes,
                 )
@@ -3722,7 +3766,7 @@ class PhysicalCalibration:
             if elements is None:
                 return self._unmodeled(op, "missing_elements", source, from_artifact, parameters)
             if hbm_bytes is None:
-                hbm_bytes = elements * 2.0 * DTYPE_BYTES.get(dtype, 2.0)
+                hbm_bytes = elements * 2.0 * dtype_itemsize(dtype, default=parameters.compute_dtype)
             compute_ms = (
                 elements / parameters.vec_ops_per_s * 1000.0
                 if parameters.vec_ops_per_s
@@ -5244,7 +5288,12 @@ def read_sqlite_observations(
             continue
         kind = MODEL_KINDS[op_family]
         shape = json.loads(shape_json)
-        itemsize = DTYPE_BYTES.get(str(dtype).lower(), 2.0)
+        itemsize = _reader_itemsize(dtype)
+        if itemsize is None:
+            # An undeclared dtype width is a rejection with a reason, never a
+            # silent bf16 (2-byte) assumption.
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         shape = {k: float(v) for k, v in shape.items() if v is not None}
         if kind == "gemm":
             m, n, k = shape.get("m"), shape.get("n"), shape.get("k")
@@ -5313,7 +5362,17 @@ DECLARED_CACHE_POLICY = "same_preallocated_buffers_reused_no_cache_flush"
 _DTYPE_ALIASES = {
     "bfloat16": "bf16", "bf16": "bf16", "float16": "fp16", "fp16": "fp16",
     "float32": "fp32", "fp32": "fp32", "float8": "fp8", "fp8": "fp8",
+    "float8_e4m3": "fp8_e4m3", "float8_e4m3fn": "fp8_e4m3",
+    "fp8_e4m3fn": "fp8_e4m3", "e4m3": "fp8_e4m3",
+    "float8_e5m2": "fp8_e5m2", "fp8_e5m2": "fp8_e5m2", "e5m2": "fp8_e5m2",
+    "int8": "int8", "int4": "int4", "int32": "int32", "bool": "bool",
 }
+
+
+def _reader_itemsize(dtype: Any) -> float | None:
+    """Byte width for a reader; ``None`` means the dtype is not declared."""
+    text = _normalise_dtype(dtype)
+    return DTYPE_BYTES.get(text) if text else None
 
 
 def _normalise_dtype(value: Any) -> str:
@@ -5661,7 +5720,7 @@ def read_attention_results(
         or ""
     )
     observations: list[dict[str, Any]] = []
-    skipped = {"split": 0, "family": 0, "shape": 0, "duration": 0, "failed_case": 0}
+    skipped = {"split": 0, "family": 0, "shape": 0, "duration": 0, "failed_case": 0, "dtype": 0}
     for item in results:
         if not isinstance(item, Mapping):
             skipped["shape"] += 1
@@ -5720,7 +5779,10 @@ def read_attention_results(
         shape["topology"] = attention_topology(shape["heads"], shape.get("kv_heads") or shape["heads"])
         shape["phase"] = attention_phase(shape["q"])
         dtype = _normalise_dtype(geometry.get("dtype") or details.get("dtype") or "bfloat16")
-        itemsize = DTYPE_BYTES.get(dtype, 2.0)
+        itemsize = DTYPE_BYTES.get(dtype)
+        if itemsize is None:
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         q, kv, heads = shape["q"], shape["kv"], shape["heads"]
         kv_heads = shape.get("kv_heads") or heads
         dim, v_dim = shape["dim"], shape.get("v_dim") or shape["dim"]
@@ -5935,7 +5997,7 @@ def read_campaign_results(
         or ""
     )
     observations = []
-    skipped = {"split": 0, "shape": 0, "duration": 0, "family": 0, "failed_case": 0}
+    skipped = {"split": 0, "shape": 0, "duration": 0, "family": 0, "failed_case": 0, "dtype": 0}
     for item in results:
         if not isinstance(item, Mapping):
             skipped["shape"] += 1
@@ -5995,7 +6057,10 @@ def read_campaign_results(
             or item.get("dtype")
             or "bf16"
         )
-        itemsize = DTYPE_BYTES.get(dtype.lower(), 2.0)
+        itemsize = _reader_itemsize(dtype)
+        if itemsize is None:
+            skipped["dtype"] = skipped.get("dtype", 0) + 1
+            continue
         if family == "gemm":
             shape = {
                 key: float(raw_shape[key])
@@ -6320,9 +6385,12 @@ def read_mc2_grouped_results(
                 skipped["duration"] += 1
                 continue
             rows = float(best.get("rows_per_rank") or 0.0)
+            leg_itemsize = _reader_itemsize(best.get("dtype") or "bf16")
+            if leg_itemsize is None:
+                skipped["dtype"] = skipped.get("dtype", 0) + 1
+                continue
             geometry = _mc2_leg_shape(
-                leg_name, rows, local_experts, intermediate, hidden,
-                DTYPE_BYTES.get(str(best.get("dtype") or "bf16").lower(), 2.0),
+                leg_name, rows, local_experts, intermediate, hidden, leg_itemsize,
             )
             if geometry is None:
                 skipped["rows"] += 1
