@@ -1908,3 +1908,31 @@ def test_fp8_observations_fit_with_one_byte_widths():
     fp8_parameters = only_family(fp8)
     assert fp8_parameters.compute_dtype == "fp8_e4m3"
     assert fp8_parameters.eta_memory == pytest.approx(bf16_parameters.eta_memory / 2.0, rel=0.05)
+
+
+def test_per_launch_cost_is_never_pinned_from_another_hardware_key():
+    # A grouped corpus with fewer than 3 rows above the 128-expert cap cannot
+    # identify the per-launch cost. On a part with a measured dispatch it is
+    # pinned to that measurement; on a part without one it must stay unset
+    # rather than importing another SKU's number.
+    assert physical.DISPATCH_OVERHEAD_MS_BY_HARDWARE["Ascend910_9362"] == 0.020
+    shapes = tuple(
+        (tokens, experts, n, k)
+        for tokens, experts, n, k in GROUPED_SHAPES
+        if experts <= physical.GROUPED_LAUNCH_CAPACITY
+    ) + ((2048 * 256, 256, 4096, 7168),)  # one multi-launch row only
+    a3_rows = grouped_observations(shapes=shapes, hardware_key="Ascend910_9362")
+    a3_machine = dict(MACHINE, hardware_key="Ascend910_9362")
+    pinned = physical.fit_calibration(
+        a3_rows, a3_machine, hardware_key="Ascend910_9362", arch_family="A3",
+    )
+    rows = grouped_observations(shapes=shapes)
+    pinned_parameters = only_family(pinned)
+    assert pinned_parameters.per_launch_ms == pytest.approx(0.020)
+    assert "per_launch_ms_pinned_to_measured_dispatch" in pinned_parameters.warnings
+    unknown = physical.fit_calibration(
+        rows, MACHINE, hardware_key=MACHINE["hardware_key"], arch_family="TEST",
+    )
+    unknown_parameters = only_family(unknown)
+    assert unknown_parameters.per_launch_ms is None
+    assert "per_launch_ms_unidentified_no_dispatch_measurement" in unknown_parameters.warnings
