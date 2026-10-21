@@ -211,6 +211,13 @@ ATTENTION_DIM_TILE = 128
 # Per-ragged-tile tail cost in ms (a partial q or kv tile is rounded up to a
 # full tile of extra cube work).  Bounded like the launch intercept.
 ATTENTION_TAIL_BOUNDS_MS = (0.0, 0.060)
+# Per-KV-token latency: a decode kernel walks the cache sequentially and pays a
+# fixed cost per visited KV position, which a byte-rate model cannot see when the
+# query row is a single token (measured: kv=32769 with 3 query heads takes 0.93 ms
+# against 33.6 MB of KV bytes, i.e. 28 ns per visited position).  The coefficient is
+# ``visible_kv``, so it stays well defined with or without a fitted tile grid.
+# Forward-selected like every other tail.
+ATTENTION_TOKEN_LATENCY_BOUNDS_MS = (0.0, 0.001)
 # Workspace bytes per (query token x query head): the fused kernel keeps two
 # fp32 row-statistic buffers of 8 elements (softmax max / sum), which is what the
 # attention worker's ``allocation.auxiliaries`` reports (96 bytes each at q=1).
@@ -232,6 +239,13 @@ GROUPED_PER_EXPERT_BOUNDS_MS = (0.0, 0.020)
 # charges one fitted fixed cost per extra launch; the 128 cap is a declared API
 # limit of the measured backend, not a tuned threshold.
 GROUPED_LAUNCH_CAPACITY = 128
+# Declared grouped weight-width classes.  The measured A3 corpus pools two model
+# configurations of the same projection family: ``moe_intermediate_size=2048``
+# (gate_up n=4096) and ``7168`` (n=14336).  They overlap compute and weight
+# streaming differently -- an additive fit is exact on the wide class and needs a
+# negative intercept on the narrow one -- so the split is offered to train-only
+# CV as a model-form decision (adopted only above the variant margin).
+GROUPED_NARROW_N = 8192
 GROUPED_PER_LAUNCH_BOUNDS_MS = (0.0, 0.060)
 # Measured fresh/hot per-call device dispatch on the A3 die
 # (``.workstreams/bigops-a3/results/dispatch-overhead.json``:
@@ -861,6 +875,8 @@ class FamilyParameters:
     align_penalty: float | None = None
     # Attention: per-ragged-tile tail cost (q/kv alignment) in ms.
     tail_tile_ms: float | None = None
+    # Attention: per-KV-token latency (sequential cache walk) in ms.
+    kv_token_ms: float | None = None
     # Grouped matmul: per-expert fixed cost in ms and the fitted expert-count
     # scaling exponent it is charged with (``experts ** expert_scaling``).
     per_expert_ms: float | None = None
@@ -871,6 +887,8 @@ class FamilyParameters:
     per_launch_ms: float | None = None
     # Attention: which declared topology this row answers for ('' when pooled).
     topology: str = ""
+    # Grouped matmul: which declared weight-width class this row answers for.
+    corpus_class: str = ""
     # Set on a returned row when the requested timing scope was answered by a
     # different spelling inside the same scope family.
     scope_alias_from: str = ""
@@ -908,11 +926,13 @@ class FamilyParameters:
             "k_fill_ms": self.k_fill_ms,
             "align_penalty": self.align_penalty,
             "tail_tile_ms": self.tail_tile_ms,
+            "kv_token_ms": self.kv_token_ms,
             "per_expert_ms": self.per_expert_ms,
             "expert_scaling": self.expert_scaling,
             "activation_read": self.activation_read,
             "per_launch_ms": self.per_launch_ms,
             "topology": self.topology,
+            "corpus_class": self.corpus_class,
             "scope_alias_from": self.scope_alias_from,
             "scope_alias_to": self.scope_alias_to,
             "streaming_measured": self.streaming_measured,
@@ -979,6 +999,9 @@ class FamilyParameters:
                 tail_tile_ms=(
                     None if value.get("tail_tile_ms") is None else float(value["tail_tile_ms"])
                 ),
+                kv_token_ms=(
+                    None if value.get("kv_token_ms") is None else float(value["kv_token_ms"])
+                ),
                 per_expert_ms=(
                     None if value.get("per_expert_ms") is None else float(value["per_expert_ms"])
                 ),
@@ -990,6 +1013,7 @@ class FamilyParameters:
                     None if value.get("per_launch_ms") is None else float(value["per_launch_ms"])
                 ),
                 topology=str(value.get("topology") or ""),
+                corpus_class=str(value.get("corpus_class") or ""),
                 scope_alias_from=str(value.get("scope_alias_from") or ""),
                 scope_alias_to=str(value.get("scope_alias_to") or ""),
                 streaming_measured=bool(value.get("streaming_measured", True)),
@@ -1172,6 +1196,12 @@ def weight_stream_basis(
     )
     return basis
 
+
+
+def grouped_shape_class(shape: Mapping[str, Any]) -> str:
+    """Declared weight-width class of one grouped matmul (shape-only)."""
+    n = float(shape.get("n") or 0.0)
+    return "narrow" if n <= GROUPED_NARROW_N else "wide"
 
 
 def _short_k(obs: Observation, threshold: float = K_FILL_MAX_K) -> bool:
@@ -1410,6 +1440,8 @@ def _term_specs(
     specs: list[tuple[str, tuple[float, float]]] = []
     if kind == "attention" and tail.get("tile"):
         specs.append(("tail_tile_ms", ATTENTION_TAIL_BOUNDS_MS))
+    if kind == "attention" and tail.get("token_latency"):
+        specs.append(("kv_token_ms", ATTENTION_TOKEN_LATENCY_BOUNDS_MS))
     if kind == "grouped_gemm" and terms.get("include_per_expert", True):
         specs.append(("per_expert_ms", GROUPED_PER_EXPERT_BOUNDS_MS))
     if kind == "grouped_gemm" and terms.get("include_per_launch", True):
@@ -1525,6 +1557,8 @@ def _design_row(
         additive_names.append(name)
         if name == "tail_tile_ms":
             additive.append(geometry.get("tail_tiles", 0.0))
+        elif name == "kv_token_ms":
+            additive.append(geometry.get("visible_kv", 0.0))
         elif name == "per_expert_ms":
             gamma = float(terms.get("expert_scaling", 1.0))
             additive.append(float(obs.shape.get("experts") or 0.0) ** gamma)
@@ -1655,7 +1689,7 @@ def _parameter_bounds(
     if n_align:
         bounds.append(ALIGN_PENALTY_BOUNDS)
     specs = _term_specs(
-        kind, {"n": n_align, "tile": bool(tail_map.get("tile"))}, k_fill, model_terms
+        kind, dict(tail_map, n=n_align, tile=bool(tail_map.get("tile"))), k_fill, model_terms
     )[1]
     for _name, spec_bounds in specs:
         bounds.append(spec_bounds)
@@ -1843,6 +1877,7 @@ def _theta_to_parameters(
         "k_fill_ms": None,
         "align_penalty": None,
         "tail_tile_ms": None,
+        "kv_token_ms": None,
         "per_expert_ms": None,
         "per_launch_ms": None,
     }
@@ -1862,12 +1897,14 @@ def _theta_to_parameters(
         out["align_penalty"] = float(theta[i_slot])
         i_slot += 1
     for name, _bounds in _term_specs(
-        kind, {"n": n_align, "tile": bool(tail_map.get("tile"))}, k_fill, model_terms
+        kind, dict(tail_map, n=n_align, tile=bool(tail_map.get("tile"))), k_fill, model_terms
     )[1]:
         if name == "k_fill_ms":
             out["k_fill_ms"] = float(theta[i_slot])
         elif name == "tail_tile_ms":
             out["tail_tile_ms"] = float(theta[i_slot])
+        elif name == "kv_token_ms":
+            out["kv_token_ms"] = float(theta[i_slot])
         elif name == "per_expert_ms":
             out["per_expert_ms"] = float(theta[i_slot])
         elif name == "per_launch_ms":
@@ -2269,7 +2306,7 @@ FORM_DESCRIPTIONS = {
 }
 TAIL_ORDER = ("m", "n", "k")
 # Attention tail: the ragged q / kv edge tile is rounded up to a whole tile.
-ATTENTION_TAIL_ORDER = ("tile",)
+ATTENTION_TAIL_ORDER = ("tile", "token_latency")
 
 
 def _tail_order(kind: str) -> tuple[str, ...]:
@@ -2690,6 +2727,7 @@ def _fit_scope_group(
     compute_dtype: str,
     folds: int,
     topology: str = "",
+    corpus_class: str = "",
     fold_assignment: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     """Select base form, tail terms and memory model by train-only CV."""
@@ -2852,6 +2890,7 @@ def _fit_scope_group(
         ),
         "k_fill": bool(chosen["k_fill"]),
         "attention_tail": bool(tail_chosen.get("tile")),
+        "attention_token_latency": bool(tail_chosen.get("token_latency")),
         "per_expert": bool(parameters.get("per_expert_ms") is not None),
         "per_launch": bool(parameters.get("per_launch_ms") is not None),
         "expert_scaling": bool(
@@ -2931,6 +2970,11 @@ def _fit_scope_group(
         warnings.append("p90_ape_above_%.0f_pct" % MAX_TRUSTED_P90_APE_PCT)
     if kind in CUBE_KINDS and not identified["eta_compute"]:
         warnings.append("compute_branch_weakly_identified")
+    if kind == "attention" and tail_chosen.get("token_latency") and parameters["kv_token_ms"] is not None:
+        if parameters["kv_token_ms"] <= ATTENTION_TOKEN_LATENCY_BOUNDS_MS[0] + 1e-12:
+            warnings.append("kv_token_latency_at_lower_bound")
+        elif parameters["kv_token_ms"] >= ATTENTION_TOKEN_LATENCY_BOUNDS_MS[1] - 1e-12:
+            warnings.append("kv_token_latency_at_upper_bound")
     if kind == "attention" and tail_chosen.get("tile") and parameters["tail_tile_ms"] is not None:
         if parameters["tail_tile_ms"] <= ATTENTION_TAIL_BOUNDS_MS[0] + 1e-9:
             warnings.append("attention_tail_at_lower_bound")
@@ -3117,9 +3161,11 @@ def _fit_scope_group(
         "k_fill": bool(chosen["k_fill"]),
         "align_penalty": parameters["align_penalty"],
         "tail_tile_ms": parameters["tail_tile_ms"],
+        "kv_token_ms": parameters["kv_token_ms"],
         "per_expert_ms": parameters["per_expert_ms"],
         "per_launch_ms": parameters["per_launch_ms"],
         "topology": topology,
+        "corpus_class": corpus_class,
         "expert_scaling": (
             float(model_terms.get("expert_scaling"))
             if kind == "grouped_gemm" and parameters["per_expert_ms"] is not None
@@ -3256,6 +3302,7 @@ class PhysicalCalibration:
         protocol_signature: str = "",
         timing_scope: str = "",
         topology: str = "",
+        corpus_class: str = "",
     ) -> FamilyParameters | None:
         """Exact ``(family, recipe)`` match, else the pooled ``family`` fit.
 
@@ -3287,6 +3334,7 @@ class PhysicalCalibration:
                     or (item.fit_level == "family_scope_shared" and not item.protocol_signature)
                 ]
             candidates = [item for item in candidates if item.topology == topology]
+            candidates = [item for item in candidates if item.corpus_class == corpus_class]
             # Ambiguity is resolved by the declared scope family (or refused);
             # an empty signature is not itself a reason to refuse when the
             # caller named a scope.
@@ -3414,14 +3462,28 @@ class PhysicalCalibration:
                     derived,
                     "",
                 )
+        class_candidates: tuple[str, ...] = ("",)
+        if family in GROUPED_KINDS:
+            raw_shape = op.get("shape") if isinstance(op.get("shape"), Mapping) else {}
+            n_value = raw_shape.get("n") if raw_shape.get("n") is not None else op.get("n")
+            if n_value is not None:
+                class_candidates = (grouped_shape_class({"n": n_value}), "")
         parameters = None
         for topology_key in topology_candidates:
             parameters = self.parameters_for(
                 family, recipe, protocol_signature=signature, timing_scope=scope,
-                topology=topology_key,
+                topology=topology_key, corpus_class=class_candidates[0],
             )
             if parameters is not None:
                 break
+            if class_candidates[0]:
+                parameters = self.parameters_for(
+                    family, recipe, protocol_signature=signature, timing_scope=scope,
+                    topology=topology_key, corpus_class="",
+                )
+                if parameters is not None:
+                    class_candidates = ("",)
+                    break
         alias = ""
         if parameters is None and family in FAMILY_ALIASES:
             aliased = FAMILY_ALIASES[family]
@@ -3549,6 +3611,10 @@ class PhysicalCalibration:
             if parameters.tail.get("tile") and parameters.tail_tile_ms:
                 additive_ms += parameters.tail_tile_ms * geo["tail_tiles"]
                 breakdown["tail_tile_ms"] = additive_ms
+            if parameters.tail.get("token_latency") and parameters.kv_token_ms:
+                walk_ms = parameters.kv_token_ms * geo["visible_kv"]
+                additive_ms += walk_ms
+                breakdown["kv_token_ms"] = walk_ms
         elif parameters.model_kind == "grouped_gemm":
             tokens = _as_float(shape.get("tokens"), "tokens", allow_none=True)
             experts = _as_float(shape.get("experts"), "experts", allow_none=True)
@@ -3739,7 +3805,9 @@ class PhysicalCalibration:
                 "per_launch_ms": parameters.per_launch_ms,
                 "activation_read": parameters.activation_read,
                 "topology": parameters.topology,
+                "corpus_class": parameters.corpus_class,
                 "kv_broadcast": parameters.kv_broadcast,
+                "kv_token_ms": parameters.kv_token_ms,
                 "scope_alias_from": parameters.scope_alias_from or None,
                 "scope_alias_to": parameters.scope_alias_to or None,
                 "tail": dict(parameters.tail),
@@ -4244,6 +4312,97 @@ def _attention_topology_split(
     return comparison
 
 
+def _grouped_shape_split(
+    record: Mapping[str, Any],
+    observations: Sequence[Observation],
+    machine: MachineLimits,
+    *,
+    recipe: str,
+    protocol_signature: str,
+    protocol_core_signature: str,
+    timing_scope: str,
+    fit_level: str,
+    compute_dtype: str,
+    folds: int,
+    min_samples: int,
+) -> dict[str, Any] | None:
+    """Weight-width class alternative for a grouped family, scored on the same folds.
+
+    The narrow and wide classes overlap compute and weight streaming differently,
+    and the pooled additive form can only satisfy both by sitting at a bound.  The
+    split is a model-form decision: one row per declared class, same folds, pooled
+    out-of-fold WAPE compared with the single row, adopted only when it improves by
+    ``MIN_CV_IMPROVEMENT_PCT``.
+    """
+    groups: dict[str, list[Observation]] = {}
+    for observation in observations:
+        groups.setdefault(grouped_shape_class(observation.shape), []).append(observation)
+    comparison: dict[str, Any] = {
+        "chosen_on": "train_only_cv",
+        "margin_pct": MIN_CV_IMPROVEMENT_PCT,
+        "axis": "weight_width_class",
+        "threshold_n": GROUPED_NARROW_N,
+        "single_cv_wape_pct": record.get("cv_wape_pct"),
+        "groups": {
+            label: {"samples": len(items)} for label, items in sorted(groups.items())
+        },
+    }
+    if len(groups) < 2:
+        comparison.update(adopted=False, reason="single_weight_width_class")
+        return comparison
+    if any(len(items) < min_samples for items in groups.values()):
+        comparison.update(adopted=False, reason="insufficient_samples_per_group")
+        return comparison
+    assignment = _fold_index(observations, folds)
+    position = {id(item): index for index, item in enumerate(observations)}
+    records: list[dict[str, Any]] = []
+    for label in sorted(groups):
+        subset = groups[label]
+        subset_folds = [assignment[position[id(item)]] for item in subset]
+        records.append(
+            _fit_scope_group(
+                sorted(subset, key=lambda item: (item.identity, item.condition_key)),
+                machine,
+                family=record["family"],
+                recipe=recipe,
+                protocol_signature=protocol_signature,
+                protocol_core_signature=protocol_core_signature,
+                timing_scope=timing_scope,
+                launch_scopes=(timing_scope,),
+                fit_level="%s_weight_width" % fit_level,
+                compute_dtype=compute_dtype,
+                folds=folds,
+                corpus_class=label,
+                fold_assignment=subset_folds,
+            )
+        )
+    pooled, samples = _pooled_cv(records)
+    gain = _difference(record.get("cv_wape_pct"), pooled)
+    comparison.update(
+        pooled_cv_wape_pct=pooled,
+        cv_samples=samples,
+        cv_improvement_pct=gain,
+        groups={
+            item["corpus_class"]: {
+                "samples": len(groups[item["corpus_class"]]),
+                "cv_wape_pct": item["cv_wape_pct"],
+                "model_form": item["model_form"],
+                "block_m": item["block_m"],
+                "block_n": item["block_n"],
+                "eta_compute": item["eta_compute"],
+                "eta_memory": item["eta_memory"],
+            }
+            for item in records
+        },
+    )
+    if gain is not None and gain >= MIN_CV_IMPROVEMENT_PCT:
+        comparison.update(adopted=True, reason="weight_width_split_supported_by_train_only_cv",
+                          records=records)
+    else:
+        comparison.update(adopted=False, reason="pooled_grouped_row_kept")
+    return comparison
+
+
 def _merge_repeat_conditions(
     observations: Sequence[Observation],
 ) -> tuple[list[Observation], dict[str, int]]:
@@ -4551,6 +4710,47 @@ def fit_calibration(
                 resolved.append(record)
         bundle["per_scope"] = resolved
 
+    # Grouped matmul: a weight-width split is scored out-of-fold on the same folds
+    # and adopted only when it beats the pooled row by the margin.
+    for family, bundle in sorted(family_fits.items()):
+        records = bundle["per_scope"]
+        if not records or all(item["model_kind"] != "grouped_gemm" for item in records):
+            continue
+        resolved: list[dict[str, Any]] = []
+        for record in records:
+            if record["model_kind"] != "grouped_gemm":
+                resolved.append(record)
+                continue
+            comparison = _grouped_shape_split(
+                record,
+                record.get("_observations") or (),
+                limits,
+                recipe=record["recipe"],
+                protocol_signature=record["protocol_signature"],
+                protocol_core_signature=record["protocol_core_signature"],
+                timing_scope=record["timing_scope"],
+                fit_level=record["fit_level"],
+                compute_dtype=compute_dtype,
+                folds=cv_folds,
+                min_samples=min_samples,
+            )
+            if comparison is None:
+                resolved.append(record)
+                continue
+            record["model_selection"] = dict(
+                record["model_selection"], shape_split=comparison
+            )
+            if comparison.get("adopted"):
+                split_records = comparison.pop("records")
+                for item in split_records:
+                    item["model_selection"] = dict(
+                        item["model_selection"], shape_split=comparison
+                    )
+                resolved.extend(split_records)
+            else:
+                resolved.append(record)
+        bundle["per_scope"] = resolved
+
     # Cross-scope shared variant: one efficiency / tile / L2 set, one launch per
     # scope.  Adopted only when the pooled train-only CV beats the per-scope fits.
     for family, bundle in sorted(family_fits.items()):
@@ -4679,6 +4879,8 @@ def fit_calibration(
             key = "%s/%s" % (record["family"], record["recipe"])
             if record.get("topology"):
                 key = "%s@%s" % (key, record["topology"])
+            if record.get("corpus_class"):
+                key = "%s@%s" % (key, record["corpus_class"])
             if key in families:
                 suffix = (record["protocol_signature"] or record["protocol_core_signature"]).replace(
                     "sha256:", ""
