@@ -132,14 +132,14 @@ After the attention and decode fixes, the model reproduces:
 
 | metric (c=1), `device_event_warm_operator` | model | measured | error |
 | --- | ---: | ---: | ---: |
-| graph TPOT 128 / 1024 / 4096 | **14.70 / 15.14 / 16.52 ms** | 15.71 / 15.24 / 15.10 | −6.4 % / −0.7 % / +9.4 % |
-| graph TTFT 4096 | 323.0 ms | 342.6 ms | −5.7 % (per-call scope; the batched scope gives 252.7 ms) |
-| graph TTFT 1024 | 75.0 ms | 101.2 ms | floor is 50–66, so operator prefill is +25…+50 % |
+| graph TPOT 128 / 1024 / 4096 | **14.64 / 14.69 / 14.84 ms** | 15.71 / 15.24 / 15.10 | −6.8 % / −3.6 % / −1.7 % |
+| graph TTFT 4096 | 303.6 ms | 342.6 ms | −11.4 % (per-call scope; the batched scope gives 252.7 ms) |
+| graph TTFT 1024 | 70.4 ms | 101.2 ms | floor is 50–66, so operator prefill is +8…+40 % |
 | graph TTFT 128 | 23.6 ms | 50.9 ms | floor dominates; not a prefill error |
 
 The batched scope (`device_event_warm_operator_batched_amortized`) brackets the
-same measurements from the other side: graph TPOT 14.64 / 14.68 / 14.83 ms
-(−6.8 % / −3.7 % / −1.8 %). Its prefill is under-costed (252.7 ms at 4096), which
+same measurements from the other side: graph TPOT 14.67 / 14.66 / 14.68 ms
+(−6.6 % / −3.8 % / −2.8 %). Its prefill is under-costed (252.7 ms at 4096), which
 is why the per-call/operator scope is the declared one.
 
 Eager TPOT is **not** reproduced (model 18.9 / 19.3 / 20.7 ms vs measured
