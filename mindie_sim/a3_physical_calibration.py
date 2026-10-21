@@ -94,7 +94,14 @@ LAUNCH_BOUNDS_MS = (0.0, 0.060)
 # Efficiency bounds; eta = 1 is the declared peak, never exceeded on HBM.
 ETA_BOUNDS = (0.05, 1.0)
 # L2 usable-capacity candidates as a fraction of the declared L2 capacity.
-L2_USABLE_FRACTIONS = (0.0625, 0.125, 0.25, 0.375, 0.5, 0.625, 0.75, 1.0)
+# Capped at 62.5 %: the resident prefix is not identifiable above it.  On the A3
+# per-call GEMM corpus a 144 MiB claim (75 %) needs a 4.8 TB/s L2 rate -- the
+# declared 4x ceiling, which no observation in that corpus reaches (the measured
+# memory-bound ladder tops out at 1.48 TB/s) -- and the training-WAPE plateau is
+# flat from 120 to 192 MiB, so every candidate in the tolerance band carries an
+# L2 rate sitting on the cap.  The cap costs 0.28 pp of train-only CV on that row
+# (9.02 / 9.12 % vs 8.72 / 8.84 %) and removes a claim the data does not support.
+L2_USABLE_FRACTIONS = (0.0625, 0.125, 0.25, 0.375, 0.5, 0.625)
 # Fitted L2 read bandwidth, as a multiple of the declared HBM peak.
 L2_BW_MULTIPLE_BOUNDS = (1.0, 4.0)
 # `l2_usable` and `eta_memory` trade off on a flat plateau once every binding row
@@ -2949,9 +2956,9 @@ def _fit_scope_group(
         elif value >= LAUNCH_BOUNDS_MS[1] - 1e-9:
             warnings.append("launch_at_upper_bound:%s" % scope)
             identified["launch"] = False
-    if chosen["memory_model"] == "l2_blend" and chosen["l2_usable"] >= int(
-        round(machine.l2_bytes * max(L2_USABLE_FRACTIONS))
-    ):
+    if chosen["memory_model"] == "l2_blend" and chosen["l2_usable"] >= int(round(machine.l2_bytes)):
+        # The declared capacity itself, not the largest grid fraction: with the
+        # grid capped at 62.5 % the old test would flag every allowed prefix.
         warnings.append("l2_usable_at_declared_capacity")
     if n_align and parameters["align_penalty"] is not None:
         if parameters["align_penalty"] <= ALIGN_PENALTY_BOUNDS[0] + 1e-9:

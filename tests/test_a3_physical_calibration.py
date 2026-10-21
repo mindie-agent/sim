@@ -1835,3 +1835,19 @@ def test_grouped_weight_width_split_is_adopted_only_when_it_pays():
     assert len(single_records) == 1
     assert single_records[0].corpus_class == ""
     assert single_records[0].model_selection["shape_split"]["adopted"] is False
+
+
+def test_resident_prefix_is_bounded_and_the_capacity_warning_is_reanchored():
+    # A resident-prefix claim above 62.5 % of the declared L2 capacity is not
+    # identifiable from a corpus whose measured memory-bound rate is far below
+    # the declared L2 rate (the A3 per-call GEMM plateau is flat from 120 to
+    # 192 MiB, so every candidate in the tolerance band sits on the L2-rate cap).
+    assert max(physical.L2_USABLE_FRACTIONS) == 0.625
+    blended_truth = dict(TRUTH, memory_model="l2_blend", l2_usable_bytes=L2_BYTES, l2_bw=2.2e12)
+    calibration = fit(observations(blended_truth))
+    parameters = only_family(calibration)
+    assert parameters.memory_model == "l2_blend"
+    assert parameters.l2_usable_bytes <= 0.625 * L2_BYTES
+    # The declared-capacity warning means the declared capacity, not the largest
+    # grid fraction, so an allowed prefix is never flagged as "at capacity".
+    assert "l2_usable_at_declared_capacity" not in parameters.warnings
