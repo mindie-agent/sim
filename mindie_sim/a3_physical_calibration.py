@@ -269,6 +269,11 @@ DISPATCH_LAUNCH_BOUNDS_MS = (0.0, 0.025)
 # narrow bound is declared per hardware key and a part without an entry keeps the
 # generic launch bounds.
 DISPATCH_LAUNCH_BOUNDS_BY_HARDWARE = {"Ascend910_9362": DISPATCH_LAUNCH_BOUNDS_MS}
+# The 20 us dispatch prior is per hardware key, exactly like the launch bound: a
+# pin that borrows another SKU's measurement would import an A3 number into, say,
+# an A5 artifact whose grouped corpus has fewer than MIN_IDENTIFYING_ROWS rows
+# above the 128-expert cap.  A part without a measured dispatch does not pin.
+DISPATCH_OVERHEAD_MS_BY_HARDWARE = {"Ascend910_9362": ATTENTION_DISPATCH_OVERHEAD_MS}
 # A working set this many times the declared L2 capacity cannot be resident, so
 # the L2 blend must not credit it.  The largest A3 training working set is
 # 3.5x the declared L2, so the multi-GB weight-streaming regime of a decode
@@ -3031,10 +3036,17 @@ def _fit_scope_group(
         # cap, so the per-launch cost cannot be fitted.  Every extra launch is one
         # measured device dispatch (20 us), so that measured prior is pinned and
         # reported instead of the parameter drifting to a bound.
-        parameters["per_launch_ms"] = ATTENTION_DISPATCH_OVERHEAD_MS
-        pinned.append("per_launch_ms")
-        identified["per_launch"] = False
-        warnings.append("per_launch_ms_pinned_to_measured_dispatch")
+        measured_dispatch = DISPATCH_OVERHEAD_MS_BY_HARDWARE.get(machine.hardware_key)
+        if measured_dispatch is not None:
+            parameters["per_launch_ms"] = measured_dispatch
+            pinned.append("per_launch_ms")
+            identified["per_launch"] = False
+            warnings.append("per_launch_ms_pinned_to_measured_dispatch")
+        else:
+            # No dispatch measurement on this part: leave the term unset rather
+            # than importing another SKU's fixed cost.
+            identified["per_launch"] = False
+            warnings.append("per_launch_ms_unidentified_no_dispatch_measurement")
     quality = _quality(metrics, chosen["cv"].get("wape_pct"))
     if kind == "grouped_gemm":
         expert_counts = {
