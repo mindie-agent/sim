@@ -308,8 +308,9 @@ grouped matmul) physics, fitted train-only with 5-fold CV, and it is validated
 against a real serving benchmark on A3 (Qwen2.5-7B, TP1, vLLM-Ascend, eager and
 ACLGraph):
 
-* A3 fitted CV: attention **4.19 %**, `moe_gate_up` 10.98 %, `moe_down` 2.36 %,
-  grouped matmul 1.65 %, dense GEMM 8.84 % (per-call) / 11.50 % (batched).
+* A3 fitted CV: attention **4.19 %**, `moe_gate_up` **3.44 / 5.59 %**
+  (narrow / wide), `moe_down` 2.36 %, grouped matmul 1.65 %, dense GEMM
+  8.84 % (per-call) / 11.50 % (batched).
 * Whole-network graph mode (after the attention-byte, weight-streaming and
   replayed-graph launch fixes): TPOT **14.64 / 14.69 / 14.84 ms** for
   128 / 1024 / 4096-token prompts vs measured **15.71 / 15.24 / 15.10 ms**;
