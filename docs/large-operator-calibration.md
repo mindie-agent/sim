@@ -63,16 +63,25 @@ campaigns checked against the declared heldout sets: **0 collisions**.
 
 | artifact | family | scope | n | CV WAPE |
 | --- | --- | --- | ---: | ---: |
-| A3 | attention_fused | device-event | 66 | **5.47 %** |
-| A3 | attention_fused | block-interval | 66 | 5.74 % |
+| A3 | attention_fused | device-event | 66 | **4.19 %** |
+| A3 | attention_fused | block-interval | 66 | 4.98 % |
 | A3 | moe_gate_up | per-call | 15 | 10.98 % |
 | A3 | moe_down | per-call | 12 | 2.36 % |
 | A3 | grouped_matmul (experts=8) | per-call | 10 | 1.65 % |
 | A3 | gemm (per-call / batched) | — | 367 / 107 | **8.84 % / 11.50 %** |
-| A2 | attention_fused | per-call | 28 | 22.93 % |
-| A2 | attention_fused | operator/batched/block | 11 each | 20.76 / 32.17 / 37.45 % |
+| A2 | attention_fused | per-call | 28 | 13.61 % |
+| A2 | attention_fused | operator/batched/block | 11 each | 20.76 / 8.14 / 37.45 % |
 | A2 | grouped_matmul | per-call | 22 | 13.51 % |
 | A2 | gemm (batched / per-call) | — | — | 7.40 % / 12.56 % |
+
+The attention fits include a declared KV-cache **broadcast limit**:
+`KV bytes = kv * max(kv_heads, ceil(q_heads / B)) * (qk_dim + v_dim)`, with `B`
+selected on train-only CV (`None` = one read per KV head). A3 adopts `B = 4`
+(`kv > 16k` band 64.4 % → 26.7 %), A2's big-operator rows `B = 8/4`
+(`kv > 16k` 91.6 % → 6.4 %). The A2 attention-worker rows at
+`device_event_warm_operator` (20.76 %) and `block_interval` (37.45 %) remain
+intercept-bound; lowering the 60 µs bound makes them worse, so the limit is the
+parameterization, not the bound.
 
 The A3 GEMM improvement (16.05 → 8.84 %) comes from fixing an IRLS linearization
 bug for `flat_additive` rows, not from tuning. The attention topology split

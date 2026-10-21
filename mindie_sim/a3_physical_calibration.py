@@ -215,6 +215,13 @@ ATTENTION_TAIL_BOUNDS_MS = (0.0, 0.060)
 # fp32 row-statistic buffers of 8 elements (softmax max / sum), which is what the
 # attention worker's ``allocation.auxiliaries`` reports (96 bytes each at q=1).
 ATTENTION_WORKSPACE_BYTES_PER_QUERY_HEAD = 64.0
+# KV-cache broadcast limit: one KV read can feed at most this many query heads.
+# Beyond it the kernel re-reads the cache per query head, so the effective KV
+# traffic is ``kv * max(kv_heads, ceil(q_heads / B)) * (qk_dim + v_dim)``.
+# ``None`` is the declared base formula (one read per KV head); the alternatives
+# are CV variants.  The A3 MLA decode case (64 query heads, 1 KV head) measures
+# 9.84 ms against 142 MB of base KV bytes, which only the re-read explains.
+ATTENTION_KV_BROADCAST_CHOICES = (None, 16, 8, 4)
 # Grouped-matmul per-expert fixed cost (dispatch / padding / histogram walk),
 # in ms per fitted expert-count scaling.  One list-API call launches one kernel
 # (``single_list_call``), so an expert costs a few microseconds of serialization
@@ -868,6 +875,8 @@ class FamilyParameters:
     # different spelling inside the same scope family.
     scope_alias_from: str = ""
     scope_alias_to: str = ""
+    # Attention: KV-cache broadcast limit (None = one read per KV head).
+    kv_broadcast: int | None = None
     # Whether the fitted corpus contains a row in the multi-GB streaming regime.
     # When it does not, a streaming prediction uses the declared measured rate
     # instead of extrapolating the (warm) fitted efficiency.
@@ -907,6 +916,7 @@ class FamilyParameters:
             "scope_alias_from": self.scope_alias_from,
             "scope_alias_to": self.scope_alias_to,
             "streaming_measured": self.streaming_measured,
+            "kv_broadcast": self.kv_broadcast,
             "fit_level": self.fit_level,
             "block_m": self.block_m,
             "block_n": self.block_n,
@@ -983,6 +993,9 @@ class FamilyParameters:
                 scope_alias_from=str(value.get("scope_alias_from") or ""),
                 scope_alias_to=str(value.get("scope_alias_to") or ""),
                 streaming_measured=bool(value.get("streaming_measured", True)),
+                kv_broadcast=(
+                    None if value.get("kv_broadcast") is None else int(value["kv_broadcast"])
+                ),
                 fit_level=str(value["fit_level"]),
                 block_m=None if value.get("block_m") is None else int(value["block_m"]),
                 block_n=None if value.get("block_n") is None else int(value["block_n"]),
@@ -1248,6 +1261,33 @@ def scope_fallback_order(scope: str) -> tuple[str, ...]:
     return ()
 
 
+def attention_kv_heads_effective(q_heads: float, kv_heads: float, broadcast: int | None) -> float:
+    """KV re-read multiplicity for one declared broadcast limit (None = base)."""
+    heads = max(1.0, float(q_heads or 0.0))
+    kv_heads = max(1.0, float(kv_heads or 0.0))
+    if not broadcast:
+        return kv_heads
+    return float(max(kv_heads, math.ceil(heads / float(broadcast))))
+
+
+def attention_kv_extra_bytes(
+    shape: Mapping[str, Any], broadcast: int | None, itemsize: float
+) -> float:
+    """Extra KV-cache bytes the kernel re-reads beyond the declared base."""
+    if not broadcast:
+        return 0.0
+    q_heads = float(shape.get("heads") or 0.0)
+    kv_heads = float(shape.get("kv_heads") or q_heads or 0.0)
+    effective = attention_kv_heads_effective(q_heads, kv_heads, broadcast)
+    extra_heads = effective - max(1.0, kv_heads)
+    if extra_heads <= 0:
+        return 0.0
+    kv = float(shape.get("kv") or 0.0)
+    dim = float(shape.get("dim") or 0.0)
+    v_dim = float(shape.get("v_dim") or dim)
+    return extra_heads * kv * (dim + v_dim) * itemsize
+
+
 def attention_topology(q_heads: float, kv_heads: float) -> str:
     """Declared attention topology from the head geometry alone.
 
@@ -1436,6 +1476,18 @@ def _design_row(
             geo["wave_eff"] = 1.0
         flops = obs.flops * geo["causal_factor"]
         geometry = {key: float(value) for key, value in geo.items()}
+        broadcast = terms.get("kv_broadcast")
+        if broadcast:
+            itemsize = DTYPE_BYTES.get(str(obs.dtype or "").lower(), 2.0)
+            extra_bytes = attention_kv_extra_bytes(obs.shape, int(broadcast), itemsize)
+            memory_bytes = obs.hbm_bytes + extra_bytes
+            geometry["kv_broadcast"] = float(broadcast)
+            geometry["kv_heads_effective"] = attention_kv_heads_effective(
+                float(obs.shape.get("heads") or 0.0),
+                float(obs.shape.get("kv_heads") or obs.shape.get("heads") or 0.0),
+                int(broadcast),
+            )
+            geometry["kv_extra_bytes"] = extra_bytes
         geometry["flops_effective"] = flops
         if flops > 0:
             compute_coef = (
@@ -2494,6 +2546,12 @@ def _declared_variants(
       ``include_per_expert``.
     * attention and dense GEMM: one declared convention.
     """
+    if kind == "attention":
+        return [{}] + [
+            {"kv_broadcast": int(broadcast)}
+            for broadcast in ATTENTION_KV_BROADCAST_CHOICES
+            if broadcast
+        ]
     if kind != "grouped_gemm":
         return [{}]
     forced = dict(member_terms or {})
@@ -2768,6 +2826,7 @@ def _fit_scope_group(
         "expert_scaling": model_terms.get("expert_scaling"),
         "include_per_expert": bool(model_terms.get("include_per_expert", kind != "grouped_gemm")),
         "include_per_launch": bool(model_terms.get("include_per_launch", kind != "grouped_gemm")),
+        "kv_broadcast": model_terms.get("kv_broadcast"),
         "attention_dim_tile": ATTENTION_DIM_TILE if kind == "attention" else None,
         "causal_model": (
             "visible_kv = kv - (q-1)/2 for causal masks, kv otherwise"
@@ -3071,6 +3130,9 @@ def _fit_scope_group(
             and model_terms.get("activation_read", GROUPED_DEFAULT_ACTIVATION_READ)
         ),
         "streaming_measured": streaming_rows > 0,
+        "kv_broadcast": (
+            int(model_terms["kv_broadcast"]) if model_terms.get("kv_broadcast") else None
+        ),
         "fit_level": fit_level,
         "block_m": chosen["block_m"],
         "block_n": chosen["block_n"],
@@ -3462,14 +3524,28 @@ class PhysicalCalibration:
                 else 0.0
             )
             breakdown["compute_ms"] = compute_ms
+            itemsize = DTYPE_BYTES.get(dtype, 2.0)
+            qkv_heads = _as_float(shape.get("kv_heads"), "kv_heads", allow_none=True) or heads
             if hbm_bytes is None:
-                itemsize = DTYPE_BYTES.get(dtype, 2.0)
-                qkv_heads = _as_float(shape.get("kv_heads"), "kv_heads", allow_none=True) or heads
                 hbm_bytes = (
                     q * heads * dim
                     + kv * qkv_heads * (dim + v_dim)
                     + q * heads * v_dim
                 ) * itemsize + ATTENTION_WORKSPACE_BYTES_PER_QUERY_HEAD * q * heads
+            if parameters.kv_broadcast:
+                kv_shape = {
+                    "heads": heads, "kv_heads": qkv_heads, "kv": kv,
+                    "dim": dim, "v_dim": v_dim,
+                }
+                extra_bytes = attention_kv_extra_bytes(
+                    kv_shape, parameters.kv_broadcast, itemsize
+                )
+                hbm_bytes += extra_bytes
+                breakdown["kv_broadcast"] = float(parameters.kv_broadcast)
+                breakdown["kv_heads_effective"] = attention_kv_heads_effective(
+                    heads, qkv_heads, parameters.kv_broadcast
+                )
+                breakdown["kv_extra_mb"] = extra_bytes / 1e6
             if parameters.tail.get("tile") and parameters.tail_tile_ms:
                 additive_ms += parameters.tail_tile_ms * geo["tail_tiles"]
                 breakdown["tail_tile_ms"] = additive_ms
@@ -3663,6 +3739,7 @@ class PhysicalCalibration:
                 "per_launch_ms": parameters.per_launch_ms,
                 "activation_read": parameters.activation_read,
                 "topology": parameters.topology,
+                "kv_broadcast": parameters.kv_broadcast,
                 "scope_alias_from": parameters.scope_alias_from or None,
                 "scope_alias_to": parameters.scope_alias_to or None,
                 "tail": dict(parameters.tail),
@@ -4811,6 +4888,19 @@ def fit_calibration(
                 "clears min_samples), scored out-of-fold on the same folds; adopted only when "
                 "train-only CV improves by %.1f pp" % MIN_CV_IMPROVEMENT_PCT
             ),
+            "kv_broadcast": {
+                "choices": list(ATTENTION_KV_BROADCAST_CHOICES),
+                "rule": (
+                    "effective KV traffic is kv * max(kv_heads, ceil(q_heads / B)) * "
+                    "(qk_dim + v_dim); None is the declared base formula (one read per KV "
+                    "head). B is a CV variant, adopted only above the variant margin."
+                ),
+                "evidence": (
+                    "MLA decode q=1 kv=65536 with 64 query heads and 1 KV head measures "
+                    "9.84 ms against 142 MB of base KV bytes, which only a per-query-head "
+                    "re-read explains"
+                ),
+            },
             "absorbed_mla": (
                 "qk_dim and v_dim are separate measured axes: fused FLOPs are "
                 "2*q*kv*heads*(qk_dim + v_dim) and are never assumed equal"
