@@ -348,9 +348,14 @@ def _predict(args: argparse.Namespace) -> dict[str, Any]:
         case = _dataclass_replace(
             case, communication_calibration=comm, cv_calibration=cv,
         )
+    estimator = None
+    if args.operator_config:
+        from .operator_estimation import create_operator_estimator
+        estimator = create_operator_estimator(_load_json(args.operator_config))
     payload = predict(
         case, calibration=calibration,
         physical_calibration=physical_calibration, timing_scope=timing_scope,
+        op_estimator=estimator,
     )
     if args.record_misses:
         if not args.calibration_db:
@@ -369,6 +374,11 @@ def _predict(args: argparse.Namespace) -> dict[str, Any]:
     payload["command"] = "predict"
     payload["purpose"] = "predictive_operational"
     return payload
+
+
+def _operator_plan(args: argparse.Namespace) -> dict[str, Any]:
+    from .operator_estimation import operator_plan_report
+    return operator_plan_report(_load_json(args.input))
 
 
 def _should(args: argparse.Namespace) -> dict[str, Any]:
@@ -626,7 +636,12 @@ def build_parser() -> argparse.ArgumentParser:
     net.add_argument("--measured-ms", type=float, default=None)
     net.add_argument("--output", default=None)
     net.set_defaults(handler=_net)
+    operator_parser = subparsers.add_parser("operator-plan", help="Finite Vector/Cube operator DAG with explicit profiles")
+    operator_parser.add_argument("--input", required=True)
+    operator_parser.add_argument("--output", default=None)
+    operator_parser.set_defaults(handler=_operator_plan)
     predict_parser = subparsers.add_parser("predict", help="Predictive operational performance for one A3 case")
+    predict_parser.add_argument("--operator-config", default=None, help="optional per-op Vector/Cube profiles JSON")
     predict_parser.add_argument("--input", required=True, help="case JSON: machine/model/workload/runtime")
     predict_parser.add_argument("--calibration", default=None, help="optional calibration observations JSON")
     predict_parser.add_argument("--calibration-db", default=None, help="optional SQLite calibration store")

@@ -81,27 +81,31 @@ class _PredictiveCase(CaseSpec):
     ``CaseSpec`` has no field for a fitted artifact and lives in
     ``a3_types.py`` (outside this work item), while ``predict_global_replicas``
     builds every ``_ReplicaRunner`` from the case it is given.  The context
-    therefore rides on the case as two additive, non-serialized fields: nothing
+    therefore rides on the case as additive, non-serialized fields: nothing
     in ``to_plan``/``semantic_payload`` reads them, so the case's public shape
     and signature are unchanged.
     """
 
     physical_calibration: Any = None
     timing_scope: str = ""
+    op_estimator: Any = None
 
 
 def _predictive_case(
     case: CaseSpec, *, physical_calibration: Any, timing_scope: str,
+    op_estimator: Any = None,
 ) -> _PredictiveCase:
     if isinstance(case, _PredictiveCase):
         return replace(
             case, physical_calibration=physical_calibration,
             timing_scope=timing_scope,
+            op_estimator=op_estimator,
         )
     values = {item.name: getattr(case, item.name) for item in fields(CaseSpec)}
     return _PredictiveCase(
         **values, physical_calibration=physical_calibration,
         timing_scope=timing_scope,
+        op_estimator=op_estimator,
     )
 
 
@@ -325,6 +329,7 @@ class _ReplicaRunner:
         self.physical_calibration = getattr(case, "physical_calibration", None)
         self.cost_model = PredictiveCostModel(
             case.machine,
+            op_estimator=getattr(case, "op_estimator", None),
             calibration=CalibrationStore.from_mapping(case.calibration),
             compute_dtype=case.model.compute_dtype,
             weight_dtype=case.model.weight_dtype,
@@ -646,6 +651,15 @@ class _ReplicaRunner:
                     dict(cost.launch_detail)
                     if cost is not None and cost.launch_detail else None
                 ),
+                # Opt-in fine-grained operator plans are reported only when the
+                # provider saw the op, so the pre-existing trace shape is stable.
+                **({
+                    "operator_estimation": dict(cost.operator_estimation),
+                    "execution_plan": (
+                        cost.execution_plan.to_dict()
+                        if cost.execution_plan else None
+                    ),
+                } if cost is not None and cost.operator_estimation is not None else {}),
             })
         return result
 
@@ -1027,6 +1041,7 @@ def predict(
     cost_backend: Any = None,
     physical_calibration: Any = None,
     timing_scope: str | None = None,
+    op_estimator: Any = None,
 ) -> dict[str, Any]:
     """Run the predictive path for one declared case.
 
@@ -1036,6 +1051,8 @@ def predict(
     refused rather than retargeted.  ``timing_scope`` selects the measurement
     protocol the analytic *and* physical layers price against; it defaults to
     the case's declared scope, then to ``device_event_warm``.
+    ``op_estimator`` optionally supplies finite device-side operator plans;
+    it does not replace the scheduler or the whole-iteration cost backend.
     """
     if isinstance(case, Mapping):
         case = CaseSpec.from_mapping(case)
@@ -1054,6 +1071,7 @@ def predict(
     case = _predictive_case(
         case, physical_calibration=physical_calibration,
         timing_scope=effective_scope,
+        op_estimator=op_estimator if op_estimator is not None else getattr(case, "op_estimator", None),
     )
     memory = memory_plan(case.model, case.runtime, case.machine)
     if memory.status != "fits":

@@ -1,0 +1,46 @@
+{
+  "schema_version": "mindie-release-suite/1",
+  "suite": "core",
+  "publishable": true,
+  "cases": [
+    {
+      "id": "four-layer-roofline-boundary-subgraph",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "four-layer"
+      ]
+    },
+    {
+      "id": "a3-qwen25-7b-physical-whole-network",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "qwen25-7b-physical"
+      ]
+    },
+    {
+      "id": "operator-plan-vector-gemm",
+      "kind": "microbenchmark",
+      "required": true,
+      "repetitions": 5,
+      "timeout_seconds": 20,
+      "command": [
+        "{python}",
+        "benchmarks/release.py",
+        "--case",
+        "operator-plan"
+      ]
+    }
+  ]
+}

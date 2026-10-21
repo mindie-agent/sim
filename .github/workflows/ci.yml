@@ -1,0 +1,47 @@
+name: sim-ci
+
+on:
+  push:
+    branches: [main, 'codex/**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.11', '3.13']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - run: uv venv
+      - run: uv pip install -e ".[test]"
+      - run: uv run --no-project python -m pytest -q -m "not live_npu" --junitxml=results.xml
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sim-${{ matrix.os }}-${{ matrix.python }}
+          path: results.xml
+
+  wheel:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+      - run: uv build
+      - run: |
+          uv venv /tmp/sim-wheel
+          uv pip install --python /tmp/sim-wheel/bin/python --no-deps dist/*.whl
+          cd /tmp
+          /tmp/sim-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-sim') or [] if 'extra ==' not in x]"
+          /tmp/sim-wheel/bin/mindie-sim --help
