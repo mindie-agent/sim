@@ -45,6 +45,11 @@ from .theoretical_model import (
 )
 
 from .comm import default_transfer_channels, evaluate_transfer_plan
+from .serving_planner import (
+    ServingPlannerError,
+    optimize_pd_disaggregation_ratio,
+    plan_hbm_kv_capacity,
+)
 
 PARALLEL_KEYS = ("dp", "tp", "ep", "pp", "dcp")
 DEFAULT_SHARD_DIVISORS = {
@@ -288,6 +293,26 @@ def decompose_step(
             "step_ms_with_exposed_transfer": (step_ms + exposed_transfer_ms) if complete else None,
             "partial_total_not_a_prediction": not complete,
         }
+    hbm_spec = model_spec.get("hbm_capacity_plan")
+    if isinstance(hbm_spec, Mapping):
+        merged_hbm = {**model_spec, **hbm_spec}
+        try:
+            result["hbm_capacity_plan"] = plan_hbm_kv_capacity(merged_hbm, parallel=degrees)
+        except ServingPlannerError as exc:
+            result["hbm_capacity_plan"] = {
+                "status": "unmodeled",
+                "unmodeled_reason": exc.reason,
+            }
+    pd_spec = model_spec.get("pd_disaggregation")
+    if isinstance(pd_spec, Mapping):
+        merged_pd = {**model_spec, **pd_spec}
+        try:
+            result["pd_disaggregation"] = optimize_pd_disaggregation_ratio(merged_pd)
+        except ServingPlannerError as exc:
+            result["pd_disaggregation"] = {
+                "status": "unmodeled",
+                "unmodeled_reason": exc.reason,
+            }
     return result
 
 
@@ -439,9 +464,12 @@ def net_report(
 
 __all__ = [
     "NetError",
+    "ServingPlannerError",
     "PARALLEL_KEYS",
     "DEFAULT_SHARD_DIVISORS",
     "decompose_step",
+    "optimize_pd_disaggregation_ratio",
+    "plan_hbm_kv_capacity",
     "provider_bridge",
     "net_report",
 ]

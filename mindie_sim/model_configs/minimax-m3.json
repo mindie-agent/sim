@@ -1,0 +1,38 @@
+{
+  "model_key": "minimax-m3",
+  "name": "MiniMax-M3-VL",
+  "model_type": "minimax_m3_vl",
+  "family": "minimax_m3",
+  "num_layers": 60,
+  "num_mtp_layers": 1,
+  "vocab_size": 152064,
+  "hidden_size": 6144,
+  "num_attention_heads": 64,
+  "num_key_value_heads": 8,
+  "head_dim": 128,
+  "attention_type": "gqa",
+  "first_k_dense_layers": 3,
+  "ffn_type": "moe",
+  "ffn_hidden_size": 16384,
+  "moe_intermediate_size": 2048,
+  "num_routed_experts": 64,
+  "num_shared_experts": 1,
+  "top_k": 8,
+  "swiglu_limit": 7.0,
+  "sparse_attention_config": {
+    "sparse_layers_start": 3,
+    "index_n_heads": 8,
+    "index_head_dim": 128,
+    "index_topk_blocks": 64,
+    "index_block_size": 64,
+    "index_local_blocks": 16
+  },
+  "kv_owner_layers": [
+    0, 2, 4, 6, 8, 10, 12, 14, 16, 18,
+    20, 22, 24, 26, 28, 30, 32, 34, 36, 38,
+    40, 42, 44, 46, 48, 50, 52, 54, 56, 58
+  ],
+  "weight_dtype": "fp8",
+  "kv_dtype": "bf16",
+  "activation_dtype": "bf16"
+}
