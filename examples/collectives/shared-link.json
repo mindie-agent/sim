@@ -1,0 +1,196 @@
+{
+  "schema_version": 1,
+  "name": "two-groups-one-wire",
+  "source": "synthetic CPU-only dependency and conservation fixture; not hardware performance",
+  "resources": [
+    {
+      "name": "local:0",
+      "capacity": 1,
+      "unit": "ms",
+      "scope": "rank:0"
+    },
+    {
+      "name": "local:1",
+      "capacity": 1,
+      "unit": "ms",
+      "scope": "rank:1"
+    },
+    {
+      "name": "local:2",
+      "capacity": 1,
+      "unit": "ms",
+      "scope": "rank:2"
+    },
+    {
+      "name": "local:3",
+      "capacity": 1,
+      "unit": "ms",
+      "scope": "rank:3"
+    },
+    {
+      "name": "link:fabric",
+      "capacity": 100,
+      "unit": "bytes",
+      "scope": "shared",
+      "policy": "equal_share"
+    }
+  ],
+  "producers": [
+    {
+      "task_id": "r0.produce",
+      "demands": {
+        "local:0": 2
+      }
+    },
+    {
+      "task_id": "r1.produce",
+      "demands": {
+        "local:1": 5
+      }
+    },
+    {
+      "task_id": "r2.produce",
+      "demands": {
+        "local:2": 1
+      }
+    },
+    {
+      "task_id": "r3.produce",
+      "demands": {
+        "local:3": 1
+      }
+    }
+  ],
+  "collectives": [
+    {
+      "kind": "all_to_all",
+      "epoch": 0,
+      "stage": 0,
+      "layer": 0,
+      "group": "a",
+      "participants": [
+        0,
+        1
+      ],
+      "payload_bytes_by_rank": {
+        "0": 1024,
+        "1": 0
+      },
+      "producers_by_rank": {
+        "0": [
+          "r0.produce"
+        ],
+        "1": [
+          "r1.produce"
+        ]
+      },
+      "link_stages": [
+        {
+          "name": "wire",
+          "link_bytes": {
+            "link:fabric": 500
+          }
+        }
+      ],
+      "source": "synthetic normalized physical work; not an AllToAll byte formula"
+    },
+    {
+      "kind": "all_to_all",
+      "epoch": 0,
+      "stage": 0,
+      "layer": 0,
+      "group": "b",
+      "participants": [
+        2,
+        3
+      ],
+      "payload_bytes_by_rank": {
+        "2": 512,
+        "3": 512
+      },
+      "producers_by_rank": {
+        "2": [
+          "r2.produce"
+        ],
+        "3": [
+          "r3.produce"
+        ]
+      },
+      "link_stages": [
+        {
+          "name": "wire",
+          "link_bytes": {
+            "link:fabric": 600
+          }
+        }
+      ],
+      "source": "synthetic normalized physical work; not an AllToAll byte formula"
+    }
+  ],
+  "consumers": [
+    {
+      "task_id": "r0.consume",
+      "rank": 0,
+      "wait_for": [
+        {
+          "kind": "all_to_all",
+          "epoch": 0,
+          "stage": 0,
+          "layer": 0,
+          "group": "a"
+        }
+      ],
+      "demands": {
+        "local:0": 1
+      }
+    },
+    {
+      "task_id": "r1.consume",
+      "rank": 1,
+      "wait_for": [
+        {
+          "kind": "all_to_all",
+          "epoch": 0,
+          "stage": 0,
+          "layer": 0,
+          "group": "a"
+        }
+      ],
+      "demands": {
+        "local:1": 1
+      }
+    },
+    {
+      "task_id": "r2.consume",
+      "rank": 2,
+      "wait_for": [
+        {
+          "kind": "all_to_all",
+          "epoch": 0,
+          "stage": 0,
+          "layer": 0,
+          "group": "b"
+        }
+      ],
+      "demands": {
+        "local:2": 1
+      }
+    },
+    {
+      "task_id": "r3.consume",
+      "rank": 3,
+      "wait_for": [
+        {
+          "kind": "all_to_all",
+          "epoch": 0,
+          "stage": 0,
+          "layer": 0,
+          "group": "b"
+        }
+      ],
+      "demands": {
+        "local:3": 1
+      }
+    }
+  ]
+}
