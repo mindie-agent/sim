@@ -1,10 +1,11 @@
-"""Layer 3 producer-consumer subgraph and cross-operator fusion analyzer.
+"""Layer 3 producer-consumer subgraph and Phase 0 canonical fusion analyzer.
 
 [Role]
-  Account removable logical GM round-trip bytes for a candidate fusion, enforce
-  hard feasibility gates (collective barriers, L1/UB live-buffer limits,
-  non-elidable DCP normalization, route/layout contracts), and compute the
-  critical-path saving interval under the concurrent tail ``max(P+C, Q+G)``.
+  Account removable logical GM round-trip bytes for a candidate fusion or
+  canonical Phase 0 Ascend inference subgraph pattern, enforce hard feasibility
+  gates (collective barriers, L1/UB live-buffer limits, non-elidable DCP
+  normalization, route/layout contracts), and compute the critical-path saving
+  interval ``[0, delta_max_us]`` under ``max(P+C, Q+G)``.
 
 [Invariants]
   * ``removable_gm_bytes`` is logical GM traffic.  It is never divided by HBM
@@ -604,8 +605,157 @@ def analyze_subgraph_fusion(
     return payload
 
 
+CANONICAL_FUSION_PATTERNS: dict[str, dict[str, Any]] = {
+    "add_rmsnorm_dynamic_quant": {"fused_kernel": "npu_add_rms_norm_dynamic_quant", "ops": ("add", "rmsnorm", "dynamic_quant"), "description": "Add + RMSNorm + DynamicQuant fused vector epilogue", "ub_buffers_per_token_factor": 2.0},
+    "qkv_rope_reshape_cache": {"fused_kernel": "npu_rope_reshape_and_cache", "ops": ("qkv_split", "rope", "kv_cache_write"), "description": "QKV Split + RoPE + Paged KV Cache Write", "ub_buffers_per_token_factor": 2.0},
+    "mla_prologue_epilogue": {"fused_kernel": "npu_mla_prolog_v3", "ops": ("mla_up_down_proj", "rope", "quant_page_write"), "description": "MLA Up/Down Proj + RMSNorm/RoPE + Quant/PageWrite", "ub_buffers_per_token_factor": 2.5},
+    "lightning_indexer_topk": {"fused_kernel": "npu_lightning_indexer_topk", "ops": ("query_dequant", "lightning_indexer", "topk"), "description": "Query Dequant + Lightning Indexer Score + TopK Selection", "ub_buffers_per_token_factor": 1.5},
+    "moe_gating_topk_dispatch": {"fused_kernel": "npu_moe_gating_top_k_distribute_dispatch", "ops": ("moe_gating_topk", "log2phy", "moe_distribute_dispatch"), "description": "MoE Router TopK + Log2Phy Mapping + MoeDistributeDispatch", "ub_buffers_per_token_factor": 1.0},
+    "gmm_swiglu_dynamic_quant": {"fused_kernel": "npu_grouped_matmul_swiglu_quant", "ops": ("grouped_matmul", "swiglu", "dynamic_quant"), "description": "GroupedMatmul + SwiGLU + DynamicQuant", "ub_buffers_per_token_factor": 3.0},
+    "dit_usp_teacache_block": {"fused_kernel": "npu_dit_usp_teacache_fused_block", "ops": ("dit_attention_usp", "teacache_skip_gate", "dit_residual_update"), "alt_ops": ("dit_attention_usp", "teacache_skip_gate"), "description": "DiT Attention USP + TeaCache Skip Gate", "ub_buffers_per_token_factor": 2.0},
+}
+
+_OP_ALIASES: dict[str, str] = {
+    "add": "add", "aten.add": "add", "aten.add.tensor": "add", "rmsnorm": "rmsnorm", "rms_norm": "rmsnorm", "npu_rms_norm": "rmsnorm",
+    "dynamic_quant": "dynamic_quant", "dynamicquant": "dynamic_quant", "npu_dynamic_quant": "dynamic_quant",
+    "qkv_split": "qkv_split", "split": "qkv_split", "aten.split": "qkv_split", "rope": "rope", "apply_rope": "rope", "rotary_embedding": "rope", "npu_rotary_mul": "rope",
+    "kv_cache_write": "kv_cache_write", "reshape_and_cache": "kv_cache_write", "mla_up_down_proj": "mla_up_down_proj", "mla_proj": "mla_up_down_proj",
+    "quant_page_write": "quant_page_write", "mla_page_write": "quant_page_write", "query_dequant": "query_dequant", "dequant": "query_dequant",
+    "lightning_indexer": "lightning_indexer", "indexer": "lightning_indexer", "topk": "topk", "aten.topk": "topk",
+    "moe_gating_topk": "moe_gating_topk", "router_topk": "moe_gating_topk", "moe_gating_top_k": "moe_gating_topk", "log2phy": "log2phy", "log2phy_map": "log2phy",
+    "moe_distribute_dispatch": "moe_distribute_dispatch", "distribute_dispatch": "moe_distribute_dispatch",
+    "grouped_matmul": "grouped_matmul", "gmm": "grouped_matmul", "npu_grouped_matmul": "grouped_matmul", "swiglu": "swiglu", "npu_swiglu": "swiglu", "m3_swiglu": "swiglu",
+    "dit_attention_usp": "dit_attention_usp", "dit_usp_attention": "dit_attention_usp", "dit_modulate_norm": "dit_attention_usp",
+    "teacache_skip_gate": "teacache_skip_gate", "teacache_gate": "teacache_skip_gate", "dit_residual_update": "dit_residual_update", "apply_gate": "dit_residual_update",
+}
+
+
+def _dtype_bytes_local(dtype: str) -> float:
+    token = str(dtype).strip().lower()
+    return 4.0 if token in {"fp32", "float32", "int32"} else (1.0 if token in {"fp8", "int8", "uint8", "mxfp8"} else 2.0)
+
+
+def _pattern_edge_bytes(pattern_name: str, cfg: Mapping[str, Any]) -> tuple[float, float, float]:
+    tokens, hidden = int(cfg.get("num_tokens", 128)), int(cfg.get("hidden_size", 4096))
+    heads, kv_heads, head_dim = int(cfg.get("num_heads", 32)), int(cfg.get("num_kv_heads", 8)), int(cfg.get("head_dim", 128))
+    moe_inter, top_k = int(cfg.get("moe_intermediate_size", 2048)), int(cfg.get("top_k", 8))
+    q_lora, kv_lora, qk_rope = int(cfg.get("q_lora_rank", 1536)), int(cfg.get("kv_lora_rank", 512)), int(cfg.get("qk_rope_head_dim", 64))
+    idx_heads, idx_dim, cand_rows = int(cfg.get("index_n_heads", 8)), int(cfg.get("index_head_dim", 128)), int(cfg.get("candidate_rows", 2048))
+    b = _dtype_bytes_local(str(cfg.get("dtype", "bf16")))
+    if tokens <= 0 or hidden <= 0:
+        raise SubgraphError("canonical_pattern_shape_invalid")
+    if pattern_name == "add_rmsnorm_dynamic_quant":
+        return float(tokens * hidden * b), float(tokens * hidden * b), float(hidden * b)
+    if pattern_name == "qkv_rope_reshape_cache":
+        return float(tokens * (heads + 2 * kv_heads) * head_dim * b), float(tokens * 2 * kv_heads * head_dim * b), float((heads + 2 * kv_heads) * head_dim * b)
+    if pattern_name == "mla_prologue_epilogue":
+        return float(tokens * (q_lora + kv_lora + qk_rope) * b), float(tokens * (kv_lora + qk_rope) * b), float((q_lora + kv_lora + qk_rope) * b)
+    if pattern_name == "lightning_indexer_topk":
+        return float(tokens * idx_heads * idx_dim * b), float(tokens * cand_rows * b), float((idx_heads * idx_dim + cand_rows) * b)
+    if pattern_name == "moe_gating_topk_dispatch":
+        return float(tokens * top_k * 8.0), float(tokens * top_k * 8.0), float(top_k * 16.0)
+    if pattern_name == "gmm_swiglu_dynamic_quant":
+        return float(tokens * top_k * 2 * moe_inter * b), float(tokens * top_k * moe_inter * b), float(2 * moe_inter * b)
+    return float(tokens * hidden * b), float(tokens * hidden * b), float(hidden * b)
+
+
+def evaluate_canonical_fusion_opportunity(pattern_name: str, shape: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Deterministically evaluate a canonical Phase 0 fusible subgraph pattern."""
+    key = str(pattern_name).strip().lower()
+    if key not in CANONICAL_FUSION_PATTERNS:
+        raise SubgraphError(f"canonical_pattern_unknown:{pattern_name}")
+    meta = CANONICAL_FUSION_PATTERNS[key]
+    cfg: dict[str, Any] = {}
+    if shape is not None:
+        if not isinstance(shape, Mapping):
+            raise SubgraphError("canonical_pattern_shape_invalid")
+        cfg.update(shape)
+    cfg.update(kwargs)
+    e1_bytes, e2_bytes, row_bytes = _pattern_edge_bytes(key, cfg)
+    tokens = int(cfg.get("num_tokens", 128))
+    auto_tile = bool(cfg.get("auto_tile", True))
+    max_fit = max(1, int((160.0 * 1024.0) // max(1.0, row_bytes * float(meta["ub_buffers_per_token_factor"]))))
+    tile_tokens = int(cfg.get("tile_tokens", min(tokens, 8, max_fit) if auto_tile else tokens))
+    ub_live_kib = (tile_tokens * row_bytes * float(meta["ub_buffers_per_token_factor"])) / 1024.0
+    l1_live_kib = float(cfg.get("l1_live_kib", min(256.0, ub_live_kib)))
+    raw_durations = cfg.get("op_durations_us")
+    d0 = d1 = d2 = None
+    if isinstance(raw_durations, Sequence) and not isinstance(raw_durations, (str, bytes)) and len(raw_durations) >= 3:
+        d0, d1, d2 = _duration(raw_durations[0]), _duration(raw_durations[1]), _duration(raw_durations[2])
+    elif isinstance(raw_durations, Mapping):
+        ops = meta["ops"]
+        d0, d1, d2 = (_duration(raw_durations.get(ops[i])) for i in range(3))
+    fused_us = _duration(cfg.get("fused_duration_us"))
+    fused_extra_us = 0.0
+    if d0 is not None and d1 is not None and d2 is not None:
+        fused_extra_us = max(0.0, fused_us - d0) if fused_us is not None else float(cfg.get("fused_extra_us", 0.5 * (d1 + d2)))
+    ops = meta["ops"]
+    dag = {
+        "arch_family": cfg.get("arch_family", "A3"),
+        "nodes": [
+            {"id": ops[0], "op": ops[0], "duration_us": d0},
+            {"id": ops[1], "op": ops[1], "duration_us": d1, "live_buffers": [{"buffer": "UB", "name": "ub_tile", "size_kib": ub_live_kib}]},
+            {"id": ops[2], "op": ops[2], "duration_us": d2, "live_buffers": [{"buffer": "L1", "name": "l1_tile", "size_kib": l1_live_kib}]},
+        ],
+        "edges": [{"src": ops[0], "dst": ops[1], "tensor": {"bytes": e1_bytes}}, {"src": ops[1], "dst": ops[2], "tensor": {"bytes": e2_bytes}}],
+    }
+    candidate = {"name": key, "producer": ops[0], "remove_nodes": [ops[1], ops[2]], "fused_extra_us": fused_extra_us, "allow_collective_barrier": bool(cfg.get("allow_collective_barrier", True))}
+    analysis = analyze_subgraph_fusion(dag, candidate)
+    feasible = bool(analysis["feasibility"]["feasible"])
+    max_saving = analysis["latency"]["max_saving_us"] if feasible else None
+    return {
+        "status": analysis["status"], "pattern_name": key, "fused_kernel": meta["fused_kernel"], "description": meta["description"],
+        "unfused_ops": list(ops), "eliminated_gm_read_bytes": analysis["removable_gm_read_bytes"], "eliminated_gm_write_bytes": analysis["removable_gm_write_bytes"],
+        "eliminated_gm_roundtrip_bytes": analysis["removable_gm_bytes"], "kernel_launches_before": 3, "kernel_launches_after": 1,
+        "kernel_launch_reduction": analysis["removed_kernel_launches"], "tile_tokens": tile_tokens, "ub_live_kib": ub_live_kib,
+        "ub_l1_feasible": feasible, "feasibility": analysis["feasibility"], "latency_savings_us_interval": [0.0, max_saving] if max_saving is not None else None,
+        "unmodeled_reason": None if max_saving is not None else ("infeasible_fusion" if not feasible else "missing_op_durations"),
+    }
+
+
+def scan_fusible_subgraph_patterns(op_sequence: Sequence[Any], shape: Mapping[str, Any] | None = None, **kwargs: Any) -> dict[str, Any]:
+    """Scan an operator sequence and greedily match canonical Phase 0 fusion patterns."""
+    if not isinstance(op_sequence, Sequence) or isinstance(op_sequence, (str, bytes)):
+        raise SubgraphError("op_sequence_invalid")
+    normalized: list[str] = []
+    durations: list[float | None] = []
+    for item in op_sequence:
+        raw_name = str(item.get("op", item.get("name", "")) if isinstance(item, Mapping) else item).strip().lower()
+        durations.append(_duration(item.get("duration_us")) if isinstance(item, Mapping) else None)
+        normalized.append(_OP_ALIASES.get(raw_name, raw_name))
+    matches: list[dict[str, Any]] = []
+    idx, n = 0, len(normalized)
+    while idx < n:
+        matched_eval: dict[str, Any] | None = None
+        step = 1
+        for pat_name, meta in CANONICAL_FUSION_PATTERNS.items():
+            for seq_ops, pad_zero in ((tuple(meta["ops"]), False), (tuple(meta.get("alt_ops", ())), True)):
+                if seq_ops and idx + len(seq_ops) <= n and tuple(normalized[idx:idx + len(seq_ops)]) == seq_ops:
+                    span_durs = durations[idx:idx + len(seq_ops)]
+                    eval_kwargs = dict(kwargs)
+                    if all(d is not None for d in span_durs):
+                        eval_kwargs["op_durations_us"] = [*span_durs, 0.0] if pad_zero else span_durs
+                    matched_eval = evaluate_canonical_fusion_opportunity(pat_name, shape, **eval_kwargs)
+                    matched_eval["span"] = [idx, idx + len(seq_ops)]
+                    step = len(seq_ops)
+                    break
+            if matched_eval is not None:
+                break
+        if matched_eval is not None:
+            matches.append(matched_eval)
+        idx += step
+    total_gm = sum(float(m["eliminated_gm_roundtrip_bytes"] or 0.0) for m in matches if m["ub_l1_feasible"])
+    total_launches = sum(int(m["kernel_launch_reduction"]) for m in matches if m["ub_l1_feasible"])
+    all_have_savings = bool(matches) and all(m["latency_savings_us_interval"] is not None for m in matches)
+    total_max_us = sum(float(m["latency_savings_us_interval"][1]) for m in matches) if all_have_savings else None
+    return {
+        "status": "modeled" if matches else "no_matches", "match_count": len(matches), "matches": matches,
+        "total_eliminated_gm_bytes": total_gm, "total_kernel_launch_reduction": total_launches,
+        "total_latency_savings_us_interval": [0.0, total_max_us] if total_max_us is not None else None,
+    }
+
+
 __all__ = [
-    "SubgraphError",
-    "DEFAULT_CAPACITIES_KIB",
-    "analyze_subgraph_fusion",
+    "SubgraphError", "DEFAULT_CAPACITIES_KIB", "CANONICAL_FUSION_PATTERNS",
+    "analyze_subgraph_fusion", "evaluate_canonical_fusion_opportunity", "scan_fusible_subgraph_patterns",
 ]

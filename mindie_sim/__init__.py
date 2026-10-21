@@ -76,7 +76,18 @@ from .pipeline import (
     pipeline_self_check,
     solve_periodic_pipeline,
 )
-from .subgraph import SubgraphError, analyze_subgraph_fusion
+from .subgraph import (
+    CANONICAL_FUSION_PATTERNS,
+    SubgraphError,
+    analyze_subgraph_fusion,
+    evaluate_canonical_fusion_opportunity,
+    scan_fusible_subgraph_patterns,
+)
+from .serving_planner import (
+    ServingPlannerError,
+    optimize_pd_disaggregation_ratio,
+    plan_hbm_kv_capacity,
+)
 from .theoretical_model import (
     OperatorHapEvaluation,
     compute_hap_score,
@@ -97,7 +108,17 @@ from .a3_measurement import record_prediction_misses
 from .a3_measurement import (
     CpuMatmulRunner, TorchNpuRunner, run_manifest_file, run_pending,
 )
-from .model_catalog import CATALOG, list_models, load_model
+from .model_catalog import (
+    ARCHITECTURE_PRESET_ALIASES,
+    ARCHITECTURE_PRESET_CATALOG,
+    CATALOG,
+    ModelArchitectureProfile,
+    build_architecture_profile,
+    list_architecture_profiles,
+    list_models,
+    load_architecture_profile,
+    load_model,
+)
 from .a3_real_data import (
     CommunicationCalibration, CvCalibration, import_a3_measurements,
     import_communication_measurements, machine_from_environment,
@@ -147,7 +168,13 @@ __all__ = [
     "pipeline_self_check",
     "solve_periodic_pipeline",
     "SubgraphError",
+    "CANONICAL_FUSION_PATTERNS",
     "analyze_subgraph_fusion",
+    "evaluate_canonical_fusion_opportunity",
+    "scan_fusible_subgraph_patterns",
+    "ServingPlannerError",
+    "plan_hbm_kv_capacity",
+    "optimize_pd_disaggregation_ratio",
     "OperatorHapEvaluation",
     "compute_hap_score",
     "evaluate_operator_hap",
@@ -183,8 +210,14 @@ __all__ = [
     "TorchNpuRunner",
     "run_pending",
     "run_manifest_file",
+    "ARCHITECTURE_PRESET_ALIASES",
+    "ARCHITECTURE_PRESET_CATALOG",
     "CATALOG",
+    "ModelArchitectureProfile",
+    "build_architecture_profile",
+    "list_architecture_profiles",
     "list_models",
+    "load_architecture_profile",
     "load_model",
     "CommunicationCalibration",
     "CvCalibration",
