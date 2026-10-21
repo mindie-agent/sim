@@ -132,13 +132,13 @@ pytest -m "not live_npu"
 | **`mindie-sim subgraph`** | Layer 3 Phase 0 生产者-消费者子图融合可行性与 GM 流量消除收益评估 | `--dag <dag.json>`、`--candidate-fusion`、`--profile-report` | `removable_gm_bytes`、可行性门禁判定、融合前后关键路径耗时对比 |
 | **`mindie-sim net`** | Layer 4 整网多维并行（`DP×TP×EP×PP×DCP`）步骤拆解与 `msmodeling` 对齐 | `--model-spec`、`--parallel`、`--measured-ms` | 并行步耗时分解、通信暴露占比与三值对齐报告 |
 | **`mindie-sim predict`** | **白盒物理下界 + 实测校准预测**：下降 Dense / GQA / MLA / MoE 算子图，结合物理校准（`--physical-calibration`）或校准库输出端到端指标 | `--input <case.json>`、`--calibration-db`、`--physical-calibration` | TTFT / ITL / TPOT / E2E 时延、吞吐/SLO Goodput、显存规划与逐算子耗时明细 |
+| **`mindie-sim predict --framework-config`** | 显式调度、host提交、输出处理与异步流传输成本 | `--input examples/framework/case.json --framework-config examples/framework/profile.json` | 引擎与客户端token时间；[使用说明](docs/framework-lifecycle.md) |
 | **`mindie-sim should`** | **Go / No-Go 优化顾问（应达成本模型）**：不靠拍脑袋乘效率系数，而是枚举合法执行计划，给出乐观物理下界 $L$、可行目标上界 $U$ 与见证时间线 | `--input <case.json>`、`--constraints`、`--search-budget` | 理论乐观下界 `L`、合法计划可行目标 `U`、瓶颈证人与优化空间评估 |
 | **`mindie-sim search`** | **候选并行与运行配置寻优**：对搜索域内所有合法候选执行完整预测仿真，自动过滤 OOM 与违反 SLO 的配置并给出独立复核的最优推荐 | `--input <case.json>`、`--search-spec`、`--calibration-db` | 候选配置排名表、OOM/SLO 淘汰原因与最优配置推荐回执 |
 | **`mindie-sim calibration`** | **实测校准数据库（`SQLiteCalibrationStore`）**：管理 `mindie-profiler` / `torch_npu` 实测样本、生成待测 Manifest、拟合通信与算子 $\alpha/\beta$ 曲线 | `--db <cal.db>` + `inventory` / `coverage` / `manifest` / `ingest` / `import-a3` / `import-comm` / `run` | 样本覆盖率报告、去重待测请求清单、拟合后的算子与通信带宽模型 |
 | **`mindie-sim models` / `model-info`** | 查看内置的真实大模型配置目录（DeepSeek V4、GLM-5.3、Kimi K3、Qwen3.8 等）及单模型层结构参数 | `mindie-sim models` 或 `mindie-sim model-info --key <model_key>` | 模型层数、注意力机制（MLA/GQA）、MoE 专家规格与参数字典 |
 | **`mindie-sim pipeline-microbatches`** | 有限微批次（Microbatch）PP 流水气泡与时间线仿真（非简单除以 PP） | `--stages 3,5 --microbatches 8 --transfer-ms 0.2` | 精确的 Stage 气泡率、总跨度与微批次时间线 |
 | **`mindie-sim operator-plan`** | 可选 Vector 指令流与 BF16 Cube 有限流水，接入既有资源 DAG | `--input examples/operator-plans/mixed.json` | 细化阶段、容量、来源、回退及资源时间线；[使用说明](docs/operator-execution-plans.md) |
-| **`mindie-sim predict --framework-config`** | 显式调度、host提交、输出处理与异步流传输成本 | `--input examples/framework/case.json --framework-config examples/framework/profile.json` | 引擎与客户端token时间；[使用说明](docs/framework-lifecycle.md) |
 
 ---
 
