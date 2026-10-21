@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import copy
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
@@ -9,6 +14,22 @@ from mindie_sim.a3_framework import predict
 from mindie_sim.a3_resource_engine import ResourceEngine, ResourceSpec
 from mindie_sim.a3_types import A3InputError
 from test_a3_modeling import case, dense_model
+
+
+@pytest.mark.skipif(os.name != "posix", reason="probe uses POSIX CPU/memory accounting")
+def test_prediction_has_a_real_cpu_wall_time_and_peak_memory_budget():
+    payload = case(dense_model(layers=8), runtime={"max_model_len": 256},
+                   workload={"requests": [{"prompt_tokens": 8, "output_tokens": 128}]})
+    completed = subprocess.run(
+        [sys.executable, "-I", str(Path(__file__).with_name("measure_prediction_resources.py"))],
+        input=json.dumps(payload), text=True, capture_output=True, timeout=8, check=True,
+    )
+    report = json.loads(completed.stdout)
+    assert report["status"] == "modeled" and report["output_tokens"] == 128
+    assert report["cpu_s"] < 5
+    assert report["elapsed_s"] < 8
+    assert report["peak_rss_bytes"] < 160 * 1024**2
+    assert not report["trace_capture"][0]["detail_complete"]
 
 
 def test_large_prediction_refused_before_any_dag_is_built(monkeypatch):

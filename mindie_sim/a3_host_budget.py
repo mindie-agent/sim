@@ -41,6 +41,5 @@ def check_prediction_host(case: CaseSpec, trace_detail: str = "bounded") -> None
         raise A3InputError(
             "host_capacity_requires_remote:"
             f"layer_iterations={layer_iterations}>desktop_limit={limit};"
-            "run this case on a remote Linux server with remote-dev;"
-            "do not retry locally or fan out local subagents"
+            "required_execution=remote_linux"
         )
