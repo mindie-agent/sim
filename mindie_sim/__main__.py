@@ -381,6 +381,11 @@ def _operator_plan(args: argparse.Namespace) -> dict[str, Any]:
     return operator_plan_report(_load_json(args.input))
 
 
+def _collective_plan(args: argparse.Namespace) -> dict[str, Any]:
+    from .collective_plan import collective_plan_report
+    return collective_plan_report(_load_json(args.input))
+
+
 def _should(args: argparse.Namespace) -> dict[str, Any]:
     case = _attach_curve_artifact(_a3_case(args.input), args.curve_artifact)
     constraints = dict(_load_json(args.constraints)) if args.constraints else {}
@@ -640,6 +645,10 @@ def build_parser() -> argparse.ArgumentParser:
     operator_parser.add_argument("--input", required=True)
     operator_parser.add_argument("--output", default=None)
     operator_parser.set_defaults(handler=_operator_plan)
+    collective_parser = subparsers.add_parser("collective-plan", help="Explicit participant rendezvous and shared physical link DAG")
+    collective_parser.add_argument("--input", required=True)
+    collective_parser.add_argument("--output", default=None)
+    collective_parser.set_defaults(handler=_collective_plan)
     predict_parser = subparsers.add_parser("predict", help="Predictive operational performance for one A3 case")
     predict_parser.add_argument("--operator-config", default=None, help="optional per-op Vector/Cube profiles JSON")
     predict_parser.add_argument("--input", required=True, help="case JSON: machine/model/workload/runtime")
