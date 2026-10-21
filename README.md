@@ -138,6 +138,7 @@ pytest -m "not live_npu"
 | **`mindie-sim models` / `model-info`** | 查看内置的真实大模型配置目录（DeepSeek V4、GLM-5.3、Kimi K3、Qwen3.8 等）及单模型层结构参数 | `mindie-sim models` 或 `mindie-sim model-info --key <model_key>` | 模型层数、注意力机制（MLA/GQA）、MoE 专家规格与参数字典 |
 | **`mindie-sim pipeline-microbatches`** | 有限微批次（Microbatch）PP 流水气泡与时间线仿真（非简单除以 PP） | `--stages 3,5 --microbatches 8 --transfer-ms 0.2` | 精确的 Stage 气泡率、总跨度与微批次时间线 |
 | **`mindie-sim operator-plan`** | 可选 Vector 指令流与 BF16 Cube 有限流水，接入既有资源 DAG | `--input examples/operator-plans/mixed.json` | 细化阶段、容量、来源、回退及资源时间线；[使用说明](docs/operator-execution-plans.md) |
+| **`mindie-sim predict --framework-config`** | 显式调度、host提交、输出处理与异步流传输成本 | `--input examples/framework/case.json --framework-config examples/framework/profile.json` | 引擎与客户端token时间；[使用说明](docs/framework-lifecycle.md) |
 
 ---
 

@@ -136,6 +136,7 @@ pytest -m "not live_npu"
 | **`mindie-sim models` / `model-info`** | Inspect built-in production LLM architecture configs (DeepSeek V4, GLM-5.3, Kimi K3, Qwen3.8, etc.) | `mindie-sim models` or `mindie-sim model-info --key <model_key>` | Layer counts, attention type (MLA/GQA), MoE routing specs, and parameter breakdown |
 | **`mindie-sim pipeline-microbatches`** | Exact finite-microbatch PP timeline and bubble simulator (rather than naive `total / PP`) | `--stages 3,5 --microbatches 8 --transfer-ms 0.2` | Stage bubble ratios, total schedule span, and microbatch timeline |
 | **`mindie-sim operator-plan`** | Opt-in Vector instruction streams and finite BF16 Cube plans on the existing resource DAG | `--input examples/operator-plans/mixed.json` | Stage timelines, capacity certificates, provenance and explicit fallback; [guide](docs/operator-execution-plans.md) |
+| **`mindie-sim predict --framework-config`** | Explicit scheduler, host submission, output processing and asynchronous streaming costs | `--input examples/framework/case.json --framework-config examples/framework/profile.json` | Engine and client token timestamps; [guide](docs/framework-lifecycle.md) |
 
 ---
 
