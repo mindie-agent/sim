@@ -63,6 +63,7 @@ from .a3_operator_campaign_conditions import (
     _build_condition, _condition_record, _execution_variants, _hash, _merge_origin,
     _origin_summary, _precision, _shape_kind, _shape_map, _source_summary, _tuple_ints,
 )
+from .a3_operator_campaign_machine import resolve_campaign_machine
 from .a3_operator_campaign_report import (
     _coverage_markdown, _counts, _pending_summary, _runner_contract, write_campaign,
     load_conditions,
@@ -137,7 +138,7 @@ class CampaignConfig:
             ),
             ladder_factors=factors,
             protocol=protocol,
-            machine={**DEFAULT_MACHINE, **dict(raw.get("machine") or {})},
+            machine=resolve_campaign_machine(raw.get("machine")),
             holdout_fraction=float(raw.get("holdout_fraction", 0.34)),
         )
 

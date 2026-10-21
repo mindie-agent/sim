@@ -404,13 +404,13 @@ _PLACEMENT_CHANNEL = {
 
 
 #: B8: neither A2 nor A3 publishes an ``ops_per_cycle_per_aiv`` declaration, so
-#: a profile-derived vector peak can only be a nominal.  The measurement
-#: campaign this importer serves declared the AIV engine at 2 element-ops per
-#: byte of SIMD width (256 element-ops/clk/AIV for 16-bit), and every A3
-#: fixture in this tree asserts that value.  It stays one named, documented
-#: nominal here -- never scattered through the formulas -- until a measured
-#: effective vector rate (or a declared capability) replaces it.
-_MEASUREMENT_VECTOR_OPS_PER_SIMD_BYTE = 2.0
+#: a profile-derived vector peak can only be a nominal.  The one convention is
+#: ``aiv_count x simd_width_bytes x clock``: a lane vector is ``simd_width_bytes``
+#: wide, so that is also its element-ops per cycle (A5 64 AIV x 256 x 1.65 GHz =
+#: 2.70336e13, the value every A5 machine block declares).  An earlier variant
+#: multiplied by 2 (counting an FMA as two element-ops) and produced 5.40672e13
+#: for the same part, so A5 vector families depended on which builder ran; that
+#: derivation is deleted rather than kept as a second nominal.
 
 
 def _measurement_vector_ops_per_s(profile: Any, clock_mhz: float) -> tuple[float, str]:
@@ -425,8 +425,8 @@ def _measurement_vector_ops_per_s(profile: Any, clock_mhz: float) -> tuple[float
     if aiv <= 0 or simd <= 0:
         raise A3InputError("machine_sku_vector_capability_missing")
     return (
-        aiv * simd * _MEASUREMENT_VECTOR_OPS_PER_SIMD_BYTE * clock_mhz * 1e6,
-        "legacy_measurement_nominal_2_element_ops_per_simd_byte_unverified",
+        aiv * simd * clock_mhz * 1e6,
+        "legacy_measurement_nominal_1_element_op_per_simd_byte_unverified",
     )
 
 

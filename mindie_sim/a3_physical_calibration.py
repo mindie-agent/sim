@@ -570,12 +570,23 @@ class MachineLimits:
         lanes = _as_float(
             value.get("vec_elements_per_cycle_per_aiv"), "vec_elements_per_cycle_per_aiv", allow_none=True
         )
-        vec_peak = _as_float(value.get("vec_peak_ops_per_s"), "vec_peak_ops_per_s", allow_none=True)
-        if lanes is None and vec_peak is not None and aiv > 0:
-            lanes = vec_peak / (float(aiv) * sustained * 1e6)
+        declared_vec_peak = _as_float(
+            value.get("vec_peak_ops_per_s"), "vec_peak_ops_per_s", allow_none=True
+        )
+        if lanes is None and declared_vec_peak is not None and aiv > 0:
+            lanes = declared_vec_peak / (float(aiv) * sustained * 1e6)
         if lanes is None or aiv <= 0:
             raise PhysicalCalibrationError("vec_peak_underivable")
         vec_peak = float(aiv) * lanes * sustained * 1e6
+        if (declared_vec_peak is not None
+                and abs(declared_vec_peak - vec_peak) > 1e-3 * vec_peak):
+            # A declared engine peak is a constraint, not documentation: a block
+            # whose lanes and vec_peak disagree would silently price whichever
+            # one this loader happened to recompute (B-4's 2x split).
+            raise PhysicalCalibrationError(
+                "vec_peak_contradicts_components: declared=%r derivable=%r"
+                % (declared_vec_peak, vec_peak)
+            )
         vec_max = float(aiv) * VEC_ISSUE_MAX_PER_AIV * sustained * 1e6
         declared_vec_max = _as_float(value.get("vec_max_ops_per_s"), "vec_max_ops_per_s", allow_none=True)
         if declared_vec_max is not None and declared_vec_max < vec_peak:

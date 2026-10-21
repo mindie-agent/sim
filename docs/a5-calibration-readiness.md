@@ -15,7 +15,8 @@ the fixes, the remaining blockers (with owners) and the minimum measurement set.
 | `machine-a5-950pr-9579-fp8.json` | Ascend950PR_9579 | fp8 | 32/64 | 1650 MHz | **8.650 752e14** | 1.6 TB/s | 128 MiB |
 
 All four load through `MachineLimits.from_mapping` (the loader re-derives
-`aic_count x ops_per_cycle x sustained_clock` and rejects a contradicting declared peak).
+`aic_count x ops_per_cycle x sustained_clock` and the vector peak, and rejects a declared
+value that contradicts either).
 Sources per field are in `analysis/a5-machine-blocks.md`; every block carries an explicit
 `measured: false` evidence note. `Ascend950DT_9582` (96 GiB) uses the same 9581 block except
 the HBM capacity, which is **not** a `MachineLimits` field, so it does not enter a fit.
@@ -63,13 +64,18 @@ prefill + decode), `moe_gate_up`, `moe_down` and `grouped_matmul`, at bf16 and f
 
 | id | file:line | consequence | owner layer |
 | --- | --- | --- | --- |
-| **B-1/P5** | `a3_types.py:529-540`, `:638-683` | **silent**: `peak_flops_for("fp8_e4m3")` returns the bf16 peak, so an A5 fp8 5120³ GEMM is priced **0.6406 ms instead of 0.3303 ms** | `a3_types` |
-| **P6** | `a3_types.py:505-515`, `:563-635` | `compute_peaks` never comes from `DeviceCapabilityProfile.cube_spec`, so `{"sku": "Ascend950DT_9582"}` yields `{}` | `a3_types` |
-| **B-4** | `a3_types.py:686-700` | two vector-peak derivations differ by exactly 2× (`2.703 36e13` vs `5.406 72e13`), so A5 vector families depend on which machine builder ran | `a3_types` |
-| **P15** | `a3_operator_campaign_conditions.py:170-187` | `DEFAULT_MACHINE` is an A3 literal with `fp8 == bf16`; a campaign declaring only an A5 SKU silently gets an A3 machine under an A5 key | campaign |
-| **B-5** | `sku_profile.py:620-664` | an exact-but-unregistered SKU is reported as `ambiguous_sku` with a wrong reason (no wrong number reaches a cost model) | catalog |
+| **B-1/P5** | `a3_types.MachineSpec.peak_flops_for` | **FIXED**: the peak now comes from the declared `compute_peaks` (fp8 = 2× bf16 on A5), and a dtype with no declared peak is `machine_compute_peak_undeclared:<dtype>` instead of the bf16 base. A 5120³ fp8 GEMM on the A5 fp8 block is **0.3303 ms**, not 0.6406 ms | — |
+| **P6** | `a3_types._profile_defaults` | **FIXED**: `compute_peaks` is derived from `profile.cube_spec.ops_per_cycle_per_aic × AIC × clock` (or an explicit caller map), so `{"sku": "Ascend950DT_9582"}` yields all six declared peaks instead of `{}` | — |
+| **B-4** | `a3_types._profile_vector_ops_per_s` | **FIXED**: one convention, `aiv × simd_width × clock` (A5 `64 × 256 × 1.65 GHz = 2.70336e13`); the 2× measurement nominal is deleted, and `MachineLimits` refuses a block whose declared vector peak contradicts its components | — |
+| **P15** | `a3_operator_campaign_machine.resolve_campaign_machine` | **FIXED**: a campaign that names a non-A3 SKU derives the machine from that SKU's profile (A5 gets single-die, 4 TB/s, fp8 2× bf16); a declaration whose family or cube peak contradicts the SKU is refused. An A3 SKU keeps the tuned A3 baseline | — |
+| **B-5** | `sku_profile.resolve_device_capability_profile` | **FIXED**: an exact-but-unregistered SKU reports `sku_not_registered:<soc>` (provenance `unregistered_exact_soc`) instead of the family-token reason; a bare family/model prefix keeps `ambiguous_soc_sku_...` | — |
 | **D2/D10** | `.workstreams/accuracy-protocol/acceptance-schema.json:85-96`, `tools/accuracy/score_frozen.py:66-74` | the acceptance schema cannot express an fp8 peak (bf16-only block, defaults to `1.0`) and the frozen limitation list is A2/A3-only | acceptance tooling |
 | **B-2** | `a3_cost.py`, `a3_communication.py` | **FIXED**: an A5 UB-Mesh collective records `uncalibrated_comm_placement` instead of borrowing an HCCS curve | — |
+
+The five fixed rows are covered by `tests/test_a5_code_blockers.py`. A2/A3 per-die
+capabilities and bf16 prices are unchanged by those fixes; the only A2/A3 number that moved
+is the *measurement-environment* A3 vector peak, which now equals the A3 machine block
+(`8.448e12`) instead of twice it (`1.6896e13`), so ingest and fit use one engine.
 
 ## 5. What is modeled / unmodeled for A5 today
 
