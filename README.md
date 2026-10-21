@@ -317,9 +317,14 @@ ACLGraph):
   8.84 % (per-call) / 11.50 % (batched).
 * Whole-network graph mode (after the attention-byte, weight-streaming and
   replayed-graph launch fixes): TPOT **14.64 / 14.69 / 14.84 ms** for
-  128 / 1024 / 4096-token prompts vs measured **15.71 / 15.24 / 15.10 ms**;
+  128 / 1024 / 4096-token prompts vs measured **14.44 / 14.73 / 15.11 ms**
+  (exact per-request estimator; the earlier 15.71/15.24/15.10 was ~8.8% high from
+  merged SSE token deltas);
   the batched scope brackets them at 14.67 / 14.66 / 14.68 ms.
 * MC2 is a **sum**, not an overlap: chain = 1.0–1.2× the measured legs.
+* A5 (`Ascend950DT_9582`) bf16 is now measured and fitted: gemm **0.59 %** CV,
+  absorbed-MLA attention 8.29 %, copy 0.28 %, MoE grouped 1.5–3.1 %; fp8 is
+  still pending.
 * The pre-fix long-prompt error was traced to materialising the attention score
   matrix to HBM (18.15 GB/layer → 0.305 GB/layer); prefill prediction dropped
   1147.6 → 225.3 ms analytic (323.1 ms fitted) for a measured 342.6 ms TTFT.

@@ -27,6 +27,9 @@ def machine(*, arch="TEST", metadata=None, cores=2, bandwidth=1e30):
                    "vector_ops_per_s": 1e30, "hbm_bw_bytes_per_s": bandwidth,
                    "mte_bw_bytes_per_s": bandwidth, "launch_us": 0,
                    "aiv_count": cores, "ub_bytes": 4096},
+        # The plan's compute dtype is fp32; a real profile declares its peaks
+        # and peak_flops_for no longer guesses an undeclared dtype.
+        "compute_peaks": {"fp32": 1e30, "bf16": 1e30, "fp16": 1e30},
         "metadata": metadata or {},
     })
 

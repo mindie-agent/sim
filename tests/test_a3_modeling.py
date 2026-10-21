@@ -179,11 +179,17 @@ def test_moe_mc2_preserves_dispatch_plus_combine_bytes_and_dependencies():
 
 def test_low_precision_peak_is_declared_not_inferred_from_dtype():
     base = MachineSpec.from_mapping(machine())
-    assert base.peak_flops_for("fp8") == base.peak_flops_for("bf16")
-    assert base.peak_flops_for("int4") == base.peak_flops_for("bf16")
+    assert base.peak_flops_for("bf16") == base.peak_flops_for("fp16") == 1e14
+    # An undeclared low-precision dtype is a loud rejection, never the bf16
+    # peak: borrowing it prices an A5 fp8 GEMM 2x too slow (B-1/P5).
+    with pytest.raises(A3InputError, match="machine_compute_peak_undeclared:fp8"):
+        base.peak_flops_for("fp8")
+    with pytest.raises(A3InputError, match="machine_compute_peak_undeclared:int4"):
+        base.peak_flops_for("int4")
     declared = MachineSpec.from_mapping({**machine(), "compute_peaks": {"fp8": 2e14}})
     assert declared.peak_flops_for("fp8") == 2e14
-    assert declared.peak_flops_for("int4") == 1e14
+    with pytest.raises(A3InputError, match="machine_compute_peak_undeclared:int4"):
+        declared.peak_flops_for("int4")
 
 
 # ---------------------------------------------------------------------------

@@ -61,6 +61,26 @@ _DTYPE_PEAK = {
     "fp32": 0.5, "float32": 0.5, "fp8": 2.0, "fp8_e4m3": 2.0,
     "fp8_e5m2": 2.0, "int8": 2.0, "int4": 4.0,
 }
+#: Dtype spellings only, resolved *inside* a declared ``compute_peaks`` map.
+#: A declaration may key its fp8 peak as ``fp8`` or ``fp8_e4m3``; these aliases
+#: let either spelling find it.  They never synthesize a multiplier from the
+#: dtype: an undeclared dtype is a rejection, not a scaled guess.
+_PEAK_DTYPE_ALIASES = {
+    "fp8": ("fp8", "fp8_e4m3", "fp8_e5m2"),
+    "fp8_e4m3": ("fp8_e4m3", "fp8"),
+    "fp8_e5m2": ("fp8_e5m2", "fp8"),
+    "bf16": ("bf16", "bfloat16"),
+    "bfloat16": ("bfloat16", "bf16"),
+    "fp16": ("fp16", "float16"),
+    "float16": ("float16", "fp16"),
+    "fp32": ("fp32", "float32"),
+    "float32": ("float32", "fp32"),
+}
+#: Cube dtypes that share the ``DieResources.cube_flops_per_s`` baseline.  Every
+#: part in this tree declares bf16/fp16 cube throughput at the same ops/cycle,
+#: and bf16 is what that per-die baseline is derived from, so this is a hardware
+#: identity rather than a dtype speedup.
+_BASE_PEAK_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
 
 
 class A3InputError(ValueError):
@@ -502,7 +522,11 @@ class MachineSpec:
             dies_per_package=dies_per_package, ranks_per_node=ranks_per_node,
             channels=channels,
         )
-        peaks_raw = raw.get("compute_peaks", raw.get("dtype_peaks", {}))
+        peaks_raw = raw.get("compute_peaks", raw.get("dtype_peaks"))
+        if peaks_raw is None:
+            # A profile-derived machine carries the peaks its SKU declares
+            # (``_profile_defaults``); an explicit caller map above always wins.
+            peaks_raw = merged.get("compute_peaks")
         peaks: list[tuple[str, float]] = []
         if peaks_raw is not None:
             if not isinstance(peaks_raw, Mapping):
@@ -527,17 +551,24 @@ class MachineSpec:
             raise A3InputError(f"tp_exceeds_devices:{parallel.tp}")
 
     def peak_flops_for(self, dtype: str) -> float:
+        """Declared compute peak for ``dtype``; never a dtype-scaled guess.
+
+        A dtype the machine declares in ``compute_peaks`` wins (aliases are
+        spelling-only).  ``bf16``/``fp16`` without an explicit declaration is
+        the per-die cube baseline the machine was built from.  Every other
+        dtype must be declared: borrowing the bf16 peak prices an A5 fp8 GEMM
+        2x too slow, and prices an A2 (which declares no fp8 cube capability)
+        as if it had one, so an undeclared dtype is a loud rejection instead of
+        a silent fallback.
+        """
         key = str(dtype).strip().lower()
         declared = dict(self.compute_peaks)
-        if key in declared:
-            return declared[key]
-        base = self.dies[0].cube_flops_per_s
-        if key in {"bf16", "bfloat16", "fp16", "float16"}:
-            return base
-        # Do not infer a 2x/4x low-precision multiplier from the dtype.  A3
-        # fp8/int4 is only modeled at a speedup when the caller declares the
-        # corresponding hardware/kernel peak.
-        return base
+        for candidate in _PEAK_DTYPE_ALIASES.get(key, (key,)):
+            if candidate in declared:
+                return declared[candidate]
+        if key in _BASE_PEAK_DTYPES:
+            return self.dies[0].cube_flops_per_s
+        raise A3InputError(f"machine_compute_peak_undeclared:{key}")
 
     def die_for(self, dp_rank: int, stage: int, tp_rank: int, pp: int = 1, tp: int = 1) -> DieResources:
         index = ((dp_rank * max(1, pp) + stage) * max(1, tp) + tp_rank) % len(self.dies)
@@ -573,6 +604,7 @@ class MachineSpec:
         clock_mhz: float | None = None,
         launch_us: float | None = None,
         vector_ops_per_s: float | None = None,
+        compute_peaks: Mapping[str, float] | None = None,
         metadata: Mapping[str, Any] | None = None,
     ) -> "MachineSpec":
         """Build a machine from a resolved ``DeviceCapabilityProfile``.
@@ -582,6 +614,11 @@ class MachineSpec:
         documented clock precedence (explicit override -> verified runtime
         clock -> configured clock); a caller may pass the clock it used so the
         configured-vs-runtime discrepancy stays readable in ``metadata``.
+
+        ``compute_peaks`` is the per-dtype cube peak map (``dtype -> ops/s``).
+        It defaults to ``profile.cube_spec`` x the effective clock for every
+        dtype the SKU declares, so an A5 fp8 machine publishes its 2x bf16 fp8
+        peak instead of an empty map.  An explicit caller map replaces it.
 
         ``vector_ops_per_s`` is a *caller declaration* for the one capability
         A2/A3 do not publish (B8: no ``ops_per_cycle_per_aiv`` exists, and the
@@ -603,6 +640,8 @@ class MachineSpec:
         merged: dict[str, Any] = {}
         if launch_us is not None:
             merged["launch_us"] = float(launch_us)
+        if compute_peaks is not None:
+            merged["compute_peaks"] = dict(compute_peaks)
         defaults = _profile_defaults(profile, merged, clock_mhz=resolved_clock)
         if vector_ops_per_s is not None:
             defaults["vector_ops_per_s"] = float(vector_ops_per_s)
@@ -626,6 +665,7 @@ class MachineSpec:
             "num_devices": devices,
             "ranks_per_node": int(ranks_per_node or devices),
             "device": device,
+            "compute_peaks": dict(defaults["compute_peaks"]),
             "hardware_key": hardware_key or resolved_soc,
         }
         if resolved_soc:
@@ -664,6 +704,17 @@ def _profile_defaults(
         # ``MachineSpec.from_profile(vector_ops_per_s=...)`` exists so a caller
         # that owns a measured effective rate can replace it explicitly.
         "vector_ops_per_s": _profile_vector_ops_per_s(profile, hz),
+        # Every dtype the SKU declares a cube rate for becomes a named peak, so
+        # ``peak_flops_for`` reads the declaration instead of borrowing bf16.
+        # The map is per AIC, so the per-die peak is ``aic x ops x clock``.  A5
+        # declares fp8 at 2x bf16; A2 declares no fp8 at all, so an A2 fp8 query
+        # stays a loud rejection instead of pricing an absent capability.
+        "compute_peaks": {
+            str(dtype).strip().lower(): float(ops) * float(cube.aic_count_per_die) * hz
+            for dtype, ops in cube.ops_per_cycle_per_aic.items()
+            if not isinstance(ops, bool) and isinstance(ops, (int, float))
+            and math.isfinite(float(ops)) and float(ops) > 0
+        },
         "hbm_bw_bytes_per_s": float(hbm_bw_gbps) * 1e9,
         "mte_bw_bytes_per_s": 2.0 * float(hbm_bw_gbps) * 1e9,
         "launch_us": 20.0,
@@ -684,16 +735,21 @@ def _profile_defaults(
 
 
 def _profile_vector_ops_per_s(profile: Any, hz: float) -> float:
-    """Per-die vector peak for a profile: declared, else the legacy nominal."""
+    """Per-die vector peak for a profile: declared, else one nominal.
+
+    The nominal is ``aiv_count x simd_width_bytes x clock``: ``simd_width_bytes``
+    is the width of one lane vector, so it is also the number of element-ops a
+    lane issues per cycle.  That is the single convention every builder uses
+    (``a3_real_data`` measurement machines and the A2/A3/A5 machine blocks), so
+    an A5 part is ``64 x 256 x 1.65 GHz = 2.70336e13`` ops/s everywhere.  A
+    second derivation that multiplied by 2 (counting an FMA as two element-ops)
+    was a 2x engine that no block declared; it is deleted.
+    """
     declared = getattr(profile, "peak_vector_ops_per_s", None)
     if callable(declared):
         value = declared("bf16")
         if value is not None:
             return float(value)
-    # No A2/A3 profile publishes ``ops_per_cycle_per_aiv``.  Keep the rate the
-    # existing machines were built with so switching the fixture path cannot
-    # halve the vector engine; the value is an unverified nominal and a caller
-    # with a measured effective rate overrides it via ``from_profile``.
     return (
         float(profile.vector_spec.aiv_count_per_die or 1)
         * float(profile.vector_spec.simd_width_bytes or 32) * hz

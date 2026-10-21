@@ -13,6 +13,9 @@
     Passing a family name without an exact SKU, ``.ini``, ``sku_profile`` or
     disambiguating ``npu-smi`` snapshot yields ``status="ambiguous_sku"`` and
     ``unmodeled_reason="ambiguous_soc_sku_requires_exact_soc_or_ini_or_probe"``.
+    An *exact* SKU the registry does not know is not that case: it yields
+    ``unmodeled_reason="sku_not_registered:<soc>"`` so a catalog gap is not
+    reported as a caller mistake (blocker B-5).
   * Architecture inference requires *positive* evidence: an ``910_93`` /
     ``910C`` token, a dual-die package or an A5 arch id.  ``NpuArch=2201`` is
     shared by A2 (910B4, CANN 9.1) and A3, so it never selects A3 by itself.
@@ -510,6 +513,30 @@ def is_ambiguous_family_token(soc_or_family: str | None) -> bool:
     return soc_or_family.strip().upper() in _AMBIGUOUS_FAMILY_TOKENS
 
 
+def is_exact_sku_token(soc: str | None) -> bool:
+    """Whether ``soc`` names one SKU rather than a family/model prefix.
+
+    ``Ascend910`` is a model prefix (a family selection), while
+    ``Ascend910B4``, ``Ascend910_9362`` and ``Ascend950DT_9599`` name a part:
+    the registry may or may not have a row for it, but the caller did supply an
+    exact identity.  This only separates the *diagnosis*; it never grants a
+    capability.
+    """
+    if not soc:
+        return False
+    token = soc.strip()
+    if is_ambiguous_family_token(token):
+        return False
+    rest = token.lower()
+    if not rest.startswith("ascend"):
+        return False
+    rest = rest[len("ascend"):]
+    digits = 0
+    while digits < len(rest) and rest[digits].isdigit():
+        digits += 1
+    return digits >= 3 and len(rest) > digits
+
+
 def load_sku_profile(path_or_mapping: str | Path | Mapping[str, Any]) -> dict[str, Any]:
     if isinstance(path_or_mapping, Mapping):
         return dict(path_or_mapping)
@@ -618,13 +645,28 @@ def resolve_device_capability_profile(
 
     # Check if we only have an ambiguous family token and no exact SKU / INI / probe disambiguation.
     has_exact_sku = bool(config is not None or catalog_entry or custom.get("soc_version") or clk_override.get("soc_version") or snap_soc)
+    # An exact token that no tier registers is *not* an ambiguous family name:
+    # the caller named one SKU, and the resolution failed because the registry
+    # has no row for it.  Reporting the family-token reason there hides a
+    # catalog gap behind a caller mistake (blocker B-5).
+    unregistered_exact_soc = bool(
+        is_exact_sku_token(str(explicit_soc)) if explicit_soc else False
+    ) and not catalog_entry and config is None and snap_soc is None
     if not has_exact_sku:
         phys_ub = float(simulator_ub_kib) if simulator_ub_kib is not None else common_buf["physical_ub_kib"]
         alloc_ub = float(allocatable_ub_kib) if allocatable_ub_kib is not None else common_buf["allocatable_ub_kib"]
         links = dict(_A2_A3_LINK_CEILINGS_BPC if family in {"A2", "A3"} else A5_CANN_SIM_LINK_CEILINGS_BPC)
+        unmodeled_reason = (
+            f"sku_not_registered:{explicit_soc}"
+            if unregistered_exact_soc else AMBIGUOUS_SKU_REASON
+        )
+        provenance = (
+            ("unregistered_exact_soc",)
+            if unregistered_exact_soc else tuple(sources or ["ambiguous_family_only"])
+        )
         return DeviceCapabilityProfile(
             status="ambiguous_sku",
-            unmodeled_reason=AMBIGUOUS_SKU_REASON,
+            unmodeled_reason=unmodeled_reason,
             cube_spec=CubeSpec(
                 aic_count_per_die=None,
                 ops_per_cycle_per_aic=dict(_FAMILY_DEFAULT_OPS_PER_CYCLE.get(family, _FAMILY_DEFAULT_OPS_PER_CYCLE["A5"])),
@@ -660,7 +702,7 @@ def resolve_device_capability_profile(
                 clock_override_mhz=override_f,
             ),
             discrepancies=(),
-            resolution_sources=tuple(sources or ["ambiguous_family_only"]),
+            resolution_sources=provenance,
         )
 
     discrepancies: list[dict[str, Any]] = []
@@ -915,6 +957,7 @@ __all__ = [
     "DeviceCapabilityProfile",
     "infer_arch_family",
     "is_ambiguous_family_token",
+    "is_exact_sku_token",
     "load_sku_profile",
     "resolve_device_capability_profile",
 ]
