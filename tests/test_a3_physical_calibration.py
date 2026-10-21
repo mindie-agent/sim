@@ -1097,8 +1097,167 @@ def test_scope_families_never_cross_batched_and_per_call():
 
 
 # ---------------------------------------------------------------------------
-# Multi-GB working sets: measured streaming rate, no L2 credit
+# Weight streaming: the L2 blend only credits what can be resident
 # ---------------------------------------------------------------------------
+#: A fitted blend truth with a 48 MiB resident prefix, so the declared residency
+#: threshold is ``48 MiB / STREAMING_L2_RATIO`` = 6 MiB: a 4 MB weight is
+#: genuinely resident, a 135 MB decode weight is not.
+BLEND_TRUTH = dict(TRUTH, memory_model="l2_blend", l2_usable_bytes=50331648, l2_bw=2.2e12)
+#: A 135 MB bf16 weight (7168 x 9408), m=1: one fetch per call, evicted long
+#: before its next use by the ~14 GiB a decode token streams.
+STREAMED_SHAPE = (1, 9408, 7168)
+#: A 4 MB bf16 weight (1024 x 2048), m=1: it fits the 6 MiB threshold.
+RESIDENT_SHAPE = (1, 2048, 1024)
+DECLARED_STREAM_RATE = 1.01e12
+
+
+def blended_calibration(monkeypatch, rate=DECLARED_STREAM_RATE):
+    """Calibration whose fitted family carries an L2 blend, plus that family."""
+    monkeypatch.setitem(physical.STREAMING_BW_BYTES_PER_S, MACHINE["hardware_key"], rate)
+    calibration = fit(observations(BLEND_TRUTH))
+    parameters = only_family(calibration)
+    assert parameters.memory_model == "l2_blend"
+    assert parameters.l2_usable_bytes > 0
+    return calibration, parameters
+
+
+def blend_price_ms(hbm_bytes, parameters, credit):
+    """What the fitted blend would price if it credited ``credit`` bytes."""
+    return (
+        (hbm_bytes - credit) / (PEAK_BW * parameters.eta_memory)
+        + credit / parameters.l2_bw_bytes_per_s
+    ) * 1000.0
+
+
+def test_a_streamed_weight_gets_no_l2_credit_and_the_declared_rate(monkeypatch):
+    """A 135 MB decode weight is a stream: no credit, declared measured rate.
+
+    The blend would have credited ``min(bytes, l2_usable)`` = the whole 48 MiB
+    prefix at ~2.2 TB/s even though the tensor is read once and evicted; the
+    declared rule withdraws that and prices every byte at the part's measured
+    streaming bound.
+    """
+    calibration, parameters = blended_calibration(monkeypatch)
+    threshold = parameters.l2_usable_bytes * physical.STREAMING_WEIGHT_RESIDENT_SHARE
+    m, n, k = STREAMED_SHAPE
+    weight_bytes = k * n * 2.0
+    hbm_bytes = (m * k + k * n + m * n) * 2.0
+    # The premise: bytes are far above the residency threshold, so the blend had
+    # a real credit to give.
+    assert weight_bytes > 10.0 * threshold
+    assert min(hbm_bytes, parameters.l2_usable_bytes) > 0.9 * parameters.l2_usable_bytes
+    explained = calibration.predict_op_explained(op(m, n, k), MACHINE)
+    assert explained.status == "predicted"
+    assert explained.breakdown["memory_regime"] == "weight_stream"
+    assert explained.breakdown["streaming_regime"] == 1.0
+    assert explained.breakdown["l2_credit_bytes"] == 0.0
+    assert explained.breakdown["streaming_rate_source"] == "declared_measured_bound"
+    assert explained.breakdown["eta_memory_effective"] == pytest.approx(
+        DECLARED_STREAM_RATE / PEAK_BW
+    )
+    assert explained.breakdown["memory_ms"] == pytest.approx(
+        hbm_bytes / DECLARED_STREAM_RATE * 1000.0, rel=1e-9
+    )
+    assert explained.breakdown["streaming_basis"].startswith("weight_stream:")
+    assert "weights=%.1fMiB" % (weight_bytes / 2**20) in explained.breakdown["streaming_basis"]
+    # The withdrawn credit is not a rounding effect: the blend would have priced
+    # the whole 48 MiB prefix at the L2 rate and come out more than a fifth faster.
+    blend_ms = blend_price_ms(hbm_bytes, parameters, min(hbm_bytes, parameters.l2_usable_bytes))
+    assert blend_ms < 0.8 * explained.breakdown["memory_ms"]
+    assert min(hbm_bytes, parameters.l2_usable_bytes) > 0.3 * hbm_bytes
+    # The streamed price is the model's memory term, not an extra term.
+    assert explained.duration_ms == pytest.approx(
+        explained.breakdown["launch_ms"]
+        + max(explained.breakdown["compute_ms"], explained.breakdown["memory_ms"]),
+        rel=1e-9,
+    )
+
+
+def test_a_resident_working_set_keeps_the_fitted_l2_blend(monkeypatch):
+    """A 4 MB weight is genuinely resident: the fitted blend still prices it."""
+    calibration, parameters = blended_calibration(monkeypatch)
+    threshold = parameters.l2_usable_bytes * physical.STREAMING_WEIGHT_RESIDENT_SHARE
+    m, n, k = RESIDENT_SHAPE
+    weight_bytes = k * n * 2.0
+    hbm_bytes = (m * k + k * n + m * n) * 2.0
+    assert weight_bytes < threshold
+    explained = calibration.predict_op_explained(op(m, n, k), MACHINE)
+    credit = min(hbm_bytes, parameters.l2_usable_bytes)
+    assert credit == pytest.approx(hbm_bytes)
+    assert explained.breakdown["memory_regime"] == "l2_blend"
+    assert explained.breakdown["streaming_regime"] == 0.0
+    assert explained.breakdown["l2_credit_bytes"] == pytest.approx(credit)
+    assert explained.breakdown["eta_memory_effective"] == pytest.approx(parameters.eta_memory)
+    assert explained.breakdown["streaming_basis"].startswith("resident:")
+    assert explained.breakdown["memory_ms"] == pytest.approx(
+        blend_price_ms(hbm_bytes, parameters, credit), rel=1e-9
+    )
+
+
+def test_a_wide_activation_gemm_keeps_the_weight_in_l2(monkeypatch):
+    """The rule follows the shape, not just the byte count.
+
+    The same 135 MB weight with 512 activation rows is walked in several row
+    tiles, so the weight really is re-read from L2 inside the call; the blend is
+    the right price there and the rule must not fire.
+    """
+    calibration, parameters = blended_calibration(monkeypatch)
+    _, n, k = STREAMED_SHAPE
+    wide = calibration.predict_op_explained(op(int(physical.STREAMING_WEIGHT_MAX_M) * 4, n, k), MACHINE)
+    assert wide.breakdown["memory_regime"] == "l2_blend"
+    assert wide.breakdown["streaming_regime"] == 0.0
+    assert wide.breakdown["l2_credit_bytes"] == pytest.approx(parameters.l2_usable_bytes)
+    assert wide.breakdown["streaming_basis"].startswith("activation_reuse:")
+
+
+def test_a_part_without_a_declared_streaming_bound_uses_its_own_peak(monkeypatch):
+    """No measured streaming bound is never borrowed from another part."""
+    calibration, parameters = blended_calibration(monkeypatch)
+    monkeypatch.delitem(physical.STREAMING_BW_BYTES_PER_S, MACHINE["hardware_key"])
+    m, n, k = STREAMED_SHAPE
+    hbm_bytes = (m * k + k * n + m * n) * 2.0
+    explained = calibration.predict_op_explained(op(m, n, k), MACHINE)
+    assert explained.breakdown["memory_regime"] == "weight_stream"
+    assert explained.breakdown["l2_credit_bytes"] == 0.0
+    assert explained.breakdown["streaming_rate_source"] == "declared_peak_bound"
+    assert explained.breakdown["eta_memory_effective"] == pytest.approx(1.0)
+    # Still no L2 credit: at the declared SKU peak, not at the fitted blend.
+    assert explained.breakdown["memory_ms"] == pytest.approx(hbm_bytes / PEAK_BW * 1000.0)
+
+
+def test_the_streaming_rule_does_not_depend_on_the_family_or_part_name(monkeypatch):
+    """Same shape, another family name, another part: same rule, same bytes.
+
+    The decision is a function of the shape, the byte counts and the declared
+    constants only -- so a row whose family is named differently and an artifact
+    for a differently named part reach the same verdict, and the only difference
+    is the part's own declared streaming rate.
+    """
+    machine_b = dict(MACHINE, hardware_key="Synthetic910_Y2")
+    rate_a, rate_b = 1.01e12, 6.6e11
+    monkeypatch.setitem(physical.STREAMING_BW_BYTES_PER_S, MACHINE["hardware_key"], rate_a)
+    monkeypatch.setitem(physical.STREAMING_BW_BYTES_PER_S, machine_b["hardware_key"], rate_b)
+    rename = {"family": "decode_ffn", "recipe": "synthetic_mm_projection"}
+    kinds = {"decode_ffn": "gemm"}
+    calibration_a = fit(observations(BLEND_TRUTH, **rename), family_kinds=kinds)
+    calibration_b = physical.fit_calibration(
+        observations(BLEND_TRUTH, hardware_key=machine_b["hardware_key"], **rename),
+        machine_b, hardware_key=machine_b["hardware_key"], arch_family="TEST",
+        family_kinds=kinds,
+    )
+    m, n, k = STREAMED_SHAPE
+    a = calibration_a.predict_op_explained(op(m, n, k, **rename), MACHINE)
+    b = calibration_b.predict_op_explained(op(m, n, k, **rename), machine_b)
+    assert a.status == b.status == "predicted"
+    assert a.family == "decode_ffn"
+    assert a.breakdown["memory_regime"] == b.breakdown["memory_regime"] == "weight_stream"
+    assert a.breakdown["l2_credit_bytes"] == b.breakdown["l2_credit_bytes"] == 0.0
+    assert a.breakdown["streaming_basis"] == b.breakdown["streaming_basis"]
+    hbm_bytes = (m * k + k * n + m * n) * 2.0
+    assert a.breakdown["memory_ms"] == pytest.approx(hbm_bytes / rate_a * 1000.0, rel=1e-9)
+    assert b.breakdown["memory_ms"] == pytest.approx(hbm_bytes / rate_b * 1000.0, rel=1e-9)
+
+
 def test_streaming_working_sets_use_the_measured_rate_not_the_warm_fit(monkeypatch):
     # The streaming rate is declared per hardware key; teach the synthetic part
     # the measured rate so the rule is exercised end to end.
@@ -1115,6 +1274,7 @@ def test_streaming_working_sets_use_the_measured_rate_not_the_warm_fit(monkeypat
     assert big.breakdown["streaming_regime"] == 1.0
     measured_rate = physical.STREAMING_BW_BYTES_PER_S[MACHINE["hardware_key"]]
     assert big.breakdown["eta_memory_effective"] == pytest.approx(measured_rate / PEAK_BW)
+    assert big.breakdown["l2_credit_bytes"] == 0.0
     hbm_bytes = (1 * 7168 + 7168 * 145408 + 1 * 145408) * 2.0
     assert big.breakdown["memory_ms"] == pytest.approx(
         hbm_bytes / measured_rate * 1000.0, rel=1e-9
@@ -1124,9 +1284,13 @@ def test_streaming_working_sets_use_the_measured_rate_not_the_warm_fit(monkeypat
         + max(big.breakdown["compute_ms"], big.breakdown["memory_ms"]),
         rel=1e-9,
     )
-    # Below the streaming threshold the fitted (warm) model still applies.
+    # A family without a blend has no residency credit to withdraw, so a
+    # sub-threshold working set keeps its fitted rate and reports the basis.
     small = calibration.predict_op_explained(op(1, 8192, 7168), MACHINE)
-    assert small.breakdown.get("streaming_regime") is None
+    assert small.breakdown["streaming_regime"] == 0.0
+    assert small.breakdown["memory_regime"] == "hbm"
+    assert small.breakdown["l2_credit_bytes"] == 0.0
+    assert small.breakdown["streaming_basis"] == "family_has_no_l2_blend"
     # A corpus that *did* measure the streaming regime keeps its own fitted
     # efficiency there instead of the declared rate.
     heavy_shapes = SHAPES + ((1, 145408, 7168), (2, 145408, 7168), (4, 145408, 7168))
@@ -1134,9 +1298,357 @@ def test_streaming_working_sets_use_the_measured_rate_not_the_warm_fit(monkeypat
     heavy_parameters = only_family(heavy)
     assert heavy_parameters.streaming_measured is True
     heavy_big = heavy.predict_op_explained(op(1, 145408, 7168), MACHINE)
-    assert heavy_big.breakdown.get("streaming_regime") is None
+    assert heavy_big.breakdown["streaming_regime"] == 1.0
+    assert heavy_big.breakdown["streaming_rate_source"] == "fitted_streaming_efficiency"
+    assert heavy_big.breakdown["l2_credit_bytes"] == 0.0
+    assert heavy_big.breakdown["eta_memory_effective"] == pytest.approx(
+        heavy_parameters.eta_memory
+    )
     assert heavy_big.duration_ms == pytest.approx(
         heavy_parameters.launch_ms
         + max(heavy_big.breakdown["compute_ms"], heavy_big.breakdown["memory_ms"]),
         rel=1e-6,
+    )
+
+
+# ---------------------------------------------------------------------------
+# MC2 fused-chunk compute legs: the few-tokens-per-expert regime
+# ---------------------------------------------------------------------------
+#: The MC2 campaign's own geometry: 7168 hidden, 2048 intermediate, 8..64 local
+#: experts and 32..2057 routed rows per expert.  Every row is a *measured leg*
+#: (gate/up or down) of the fused decode chunk, so this is the regime the
+#: published prefill grouped corpus does not cover.
+MC2_GEOMETRY = (
+    (2037, 64, 4096, 7168), (4059, 64, 4096, 7168),
+    (2070, 32, 4096, 7168), (4051, 32, 4096, 7168),
+    (2093, 16, 4096, 7168), (4109, 16, 4096, 7168),
+    (2053, 8, 4096, 7168), (4154, 8, 4096, 7168),
+    (32723, 64, 4096, 7168), (32888, 32, 4096, 7168), (65812, 32, 4096, 7168),
+    (2059, 64, 7168, 2048), (4133, 64, 7168, 2048),
+    (2070, 32, 7168, 2048), (4141, 32, 7168, 2048),
+    (2093, 16, 7168, 2048), (4109, 16, 7168, 2048),
+    (2056, 8, 7168, 2048), (4094, 8, 7168, 2048),
+    (32723, 64, 7168, 2048), (32648, 32, 7168, 2048), (65812, 32, 7168, 2048),
+)
+#: Declared member truth: a fused-chunk member carries the per-work physics and
+#: no call-level term (no intercept, no per-expert tax -- see
+#: ``physical.FUSED_CHUNK_MEMBER_TERMS``).
+MC2_TRUTH = {"eta_compute": 0.62, "eta_memory": 1.35}
+
+
+def mc2_leg_family(n):
+    return "moe_gate_up" if n == 4096 else "moe_down"
+
+
+def mc2_leg_roofline(truth, tokens, experts, n, k):
+    """The declared grouped physics of one MC2 compute leg (additive roofline).
+
+    The campaign's legs are the two grouped matmuls of one fused layer, so the
+    only free quantities are the cube and the memory efficiency -- the intercept
+    and the expert-count terms belong to the call, which the fused kernel's
+    composer charges once (``physical.FUSED_CHUNK_MEMBER_TERMS``).
+    """
+    flops = 2.0 * tokens * n * k
+    hbm_bytes = (experts * n * k + tokens * k + tokens * n) * 2.0
+    compute_ms = flops / (PEAK_FLOPS * truth["eta_compute"]) * 1000.0
+    memory_ms = hbm_bytes / (PEAK_BW * truth["eta_memory"]) * 1000.0
+    return compute_ms + memory_ms, flops, hbm_bytes
+
+
+def mc2_leg_observations(truth=MC2_TRUTH, shapes=MC2_GEOMETRY, *, noise=0.01, **overrides):
+    rows = []
+    for index, (tokens, experts, n, k) in enumerate(shapes):
+        duration, flops, hbm_bytes = mc2_leg_roofline(truth, tokens, experts, n, k)
+        row = {
+            "condition_key": "mc2-leg-%03d" % index,
+            "hardware_key": MACHINE["hardware_key"],
+            "die": "phy0",
+            "arch_family": "TEST",
+            "family": mc2_leg_family(n),
+            "recipe": physical.MC2_GROUPED_RECIPE,
+            "protocol_signature": "sha256:mc2-leg-fixture",
+            "run_id": "fixture-mc2",
+            "split": "train",
+            "shape": {"tokens": tokens, "experts": experts, "n": n, "k": k},
+            "flops": flops,
+            "hbm_bytes": hbm_bytes,
+            "duration_ms": duration * (1.0 + noise * math.sin(index * 2.399963)),
+            "dtype": "bf16",
+            "source_class": "measured",
+            "timing_scope": physical.MC2_GROUPED_SCOPE,
+            "raw_event_count": 40,
+        }
+        row.update(overrides)
+        rows.append(row)
+    return rows
+
+
+def mc2_leg_op(tokens, experts, n, k, **overrides):
+    value = {
+        "family": mc2_leg_family(n),
+        "recipe": physical.MC2_GROUPED_RECIPE,
+        "timing_scope": physical.MC2_GROUPED_SCOPE,
+        "shape": {"tokens": tokens, "experts": experts, "n": n, "k": k},
+    }
+    value.update(overrides)
+    return value
+
+
+@pytest.fixture(scope="module")
+def mc2_leg_calibration():
+    return fit(mc2_leg_observations())
+
+
+def test_mc2_legs_recover_the_few_tokens_per_expert_regime(mc2_leg_calibration):
+    """The few-rows-per-expert regime is inside the declared roofline's span.
+
+    The campaign's legs run at 32..2057 rows per expert on 8..64 local experts,
+    where the weight stream dominates and a per-expert tax or a banded
+    efficiency would be a shape-specific correction.  The declared additive
+    roofline recovers the generating efficiencies from these rows alone, at
+    every band, with no `tokens_per_expert` feature.
+    """
+    families = {item.family for item in mc2_leg_calibration.families.values()}
+    assert families == {"moe_gate_up", "moe_down"}
+    for parameters in mc2_leg_calibration.families.values():
+        assert parameters.model_form == "flat_additive"
+        assert parameters.eta_compute == pytest.approx(MC2_TRUTH["eta_compute"], rel=0.03)
+        assert parameters.eta_memory == pytest.approx(MC2_TRUTH["eta_memory"], rel=0.05)
+        # The declared member policy: no intercept and no per-expert tax, because
+        # the deployed composition is one member per local expert and only
+        # additive per-work terms survive that sum.
+        assert parameters.launch_ms == 0.0
+        assert parameters.per_expert_ms is None
+        assert parameters.expert_scaling is None
+        # No L2-residency credit either: a per-call ``min(bytes, l2_usable)``
+        # credit does not survive the per-member sum.
+        assert parameters.memory_model == "hbm"
+        assert parameters.cv_wape_pct is not None and parameters.cv_wape_pct < 1.5
+        # Every band, including the <=64 rows/expert one, is predicted inside 3 %.
+        for tokens, experts, n, k in MC2_GEOMETRY:
+            if mc2_leg_family(n) != parameters.family:
+                continue
+            truth_ms, _flops, _bytes = mc2_leg_roofline(
+                MC2_TRUTH, tokens, experts, n, k
+            )
+            predicted = mc2_leg_calibration.predict_op(
+                mc2_leg_op(tokens, experts, n, k), MACHINE
+            )
+            assert predicted == pytest.approx(truth_ms, rel=0.05)
+        # The breakdown names the few-tokens-per-expert geometry the regime is
+        # about, so a report can band the residual without re-deriving it.
+        explained = mc2_leg_calibration.predict_op_explained(
+            mc2_leg_op(2059, 64, 7168, 2048), MACHINE
+        )
+        assert explained.breakdown["tokens_per_expert"] == pytest.approx(2059 / 64)
+
+
+def test_mc2_member_price_is_additive_over_local_experts(mc2_leg_calibration):
+    """One fused call over N experts == N member prices, exactly.
+
+    The deployed MC2 decomposition keeps one compute member per local expert and
+    the composer sums their service times, so a fitted member row that carried an
+    intercept (or a super-linear ``experts ** gamma`` tax) would be charged N
+    times and stop describing the measured leg.  This is the invariant behind
+    ``FUSED_CHUNK_MEMBER_TERMS``, asserted against the fitted row.
+    """
+    for family, n, k in (("moe_gate_up", 4096, 7168), ("moe_down", 7168, 2048)):
+        for experts, rows_per_expert in ((8, 519), (32, 64), (64, 32)):
+            tokens = experts * rows_per_expert
+            whole_roofline, flops, hbm_bytes = mc2_leg_roofline(
+                MC2_TRUTH, tokens, experts, n, k
+            )
+            whole = mc2_leg_calibration.predict_op(
+                mc2_leg_op(tokens, experts, n, k), MACHINE
+            )
+            assert whole == pytest.approx(whole_roofline, rel=0.05)
+            per_member = mc2_leg_calibration.predict_op(
+                mc2_leg_op(rows_per_expert, 1, n, k), MACHINE
+            )
+            assert experts * per_member == pytest.approx(whole, rel=1e-9)
+
+
+def test_mc2_leg_recipe_is_its_own_group_and_never_the_prefill_row():
+    """One kernel, two measured protocols: the rows must not be merged.
+
+    A prefill grouped row fitted on the wide-token corpus and an MC2 leg row on
+    the fused chunk's few-rows-per-expert corpus are separate fits keyed by
+    recipe; a query naming one recipe is never answered by the other.
+    """
+    rows = mc2_leg_observations() + grouped_observations()
+    calibration = fit(rows)
+    keys = set(calibration.families)
+    assert "%s/%s" % ("moe_gate_up", physical.MC2_GROUPED_RECIPE) in keys
+    assert "%s/%s" % ("moe_gate_up", "npu_grouped_matmul_list_bf16") in keys
+    mc2_row = calibration.families[
+        "%s/%s" % ("moe_gate_up", physical.MC2_GROUPED_RECIPE)
+    ]
+    prefill_row = calibration.families[
+        "%s/%s" % ("moe_gate_up", "npu_grouped_matmul_list_bf16")
+    ]
+    assert mc2_row.samples == 11 and prefill_row.samples == len(GROUPED_SHAPES)
+    assert mc2_row.eta_compute != pytest.approx(prefill_row.eta_compute, rel=0.01)
+    # An op that names the prefill recipe is priced by the prefill row.
+    prefill_shape = (2048, 32, 2048, 1024)
+    prefill_truth, _flops, _bytes = grouped_roofline(GROUPED_TRUTH, *prefill_shape)
+    explained = calibration.predict_op_explained(
+        grouped_op(*prefill_shape), MACHINE
+    )
+    assert explained.recipe == "npu_grouped_matmul_list_bf16"
+    assert explained.duration_ms == pytest.approx(prefill_truth, rel=0.05)
+
+
+MC2_DOCUMENT = {
+    "schema_version": "mindie-sim.mc2-measurements/1",
+    "machines": {"a3": "Synthetic910_X1 (a3)", "a2": "Synthetic910_X2 (a2)"},
+    "runs": [
+        {"machine": "a3", "label": "camp-e64", "run_id": "mc2-a3-camp-e64", "ranks": 2},
+        {"machine": "a3", "label": "probe-c", "run_id": "mc2-a3-probe-c", "ranks": 2},
+        {"machine": "a2", "label": "camp-e64v2", "run_id": "mc2-a2-camp-e64v2", "ranks": 2},
+    ],
+    "rows": [
+        # Rank 1 is the slower rank on gate/up and the faster one on down, and it
+        # carries a different routed row count: the reader must pair the published
+        # (max) interval with the geometry of the rank that produced it.
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "__case__", "rank": 0, "median_ms": None, "case_status": "ok"},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_gate_up", "rank": 0, "median_ms": 1.30,
+         "rows_per_rank": 2070, "n_samples": 40},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_gate_up", "rank": 1, "median_ms": 1.366,
+         "rows_per_rank": 2026, "n_samples": 40},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_down", "rank": 0, "median_ms": 0.86,
+         "rows_per_rank": 2070, "n_samples": 40},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_down", "rank": 1, "median_ms": 0.83,
+         "rows_per_rank": 2026, "n_samples": 40},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "swiglu", "rank": 0, "median_ms": 0.091,
+         "rows_per_rank": 2070, "n_samples": 40},
+        # A repeated geometry: same family + shape, different plan -> not fitted twice.
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64-replay", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_gate_up", "rank": 1, "median_ms": 1.38,
+         "rows_per_rank": 2026, "n_samples": 40},
+        # A diagnostic probe job: not a campaign condition.
+        {"machine": "a3", "campaign": "probe-c", "plan": "a3-probe-c", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_gate_up", "rank": 1, "median_ms": 1.3576,
+         "rows_per_rank": 1019, "n_samples": 40},
+        # A different machine, and a non-grouped kind.
+        {"machine": "a2", "campaign": "camp-e64v2", "plan": "a2-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "gmm_g512_e64", "kind": "gmm",
+         "timing_key": "gmm_gate_up", "rank": 1, "median_ms": 2.5188,
+         "rows_per_rank": 2026, "n_samples": 40},
+        {"machine": "a3", "campaign": "camp-e64", "plan": "a3-camp-e64", "ranks": 2,
+         "experts": 64, "global_tokens": 512, "hidden": 7168, "top_k": 8,
+         "intermediate": 2048, "case_id": "dispatch_g512_e64", "kind": "dispatch",
+         "timing_key": "dispatch", "rank": 0, "median_ms": 0.451},
+    ],
+}
+
+
+def test_mc2_reader_extracts_the_measured_legs_with_their_geometry(tmp_path):
+    path = tmp_path / "mc2-measurements.json"
+    path.write_text(json.dumps(MC2_DOCUMENT))
+    document = physical.read_mc2_grouped_results(
+        path,
+        hardware_key=MACHINE["hardware_key"],
+        arch_family="TEST",
+        machine_keys={"a3": MACHINE["hardware_key"], "a2": "Synthetic910_X2"},
+        campaigns=("camp-e64",),
+    )
+    assert document["recipe"] == physical.MC2_GROUPED_RECIPE
+    assert document["protocol_signature"]
+    observations = {obs["family"]: obs for obs in document["observations"]}
+    assert sorted(observations) == ["moe_down", "moe_gate_up"]
+    # Every ingested row carries THIS artifact's hardware key, not the key of
+    # whichever machine happened to be scanned last.
+    assert {obs["hardware_key"] for obs in document["observations"]} == {
+        MACHINE["hardware_key"]
+    }
+    assert {obs["hardware_key"] for obs in document["legs"]} == {MACHINE["hardware_key"]}
+    gate_up = observations["moe_gate_up"]
+    # The published leg is the max over ranks, paired with THAT rank's rows.
+    assert gate_up["duration_ms"] == pytest.approx(1.366)
+    assert gate_up["shape"] == {"tokens": 2026.0, "experts": 32.0, "n": 4096.0, "k": 7168.0}
+    assert gate_up["flops"] == pytest.approx(2.0 * 2026 * 4096 * 7168)
+    assert gate_up["hbm_bytes"] == pytest.approx(
+        (32 * 4096 * 7168 + 2026 * 7168 + 2026 * 4096) * 2.0
+    )
+    assert gate_up["timing_scope"] == physical.MC2_GROUPED_SCOPE
+    assert gate_up["target_estimator"] == "max_over_ranks_per_rank_median"
+    assert gate_up["protocol_signature"] == document["protocol_signature"]
+    down = observations["moe_down"]
+    # Down's maximum is rank 0, so its geometry is rank 0's row count.
+    assert down["duration_ms"] == pytest.approx(0.86)
+    assert down["shape"]["tokens"] == pytest.approx(2070.0)
+    assert down["shape"]["n"] == 7168.0 and down["shape"]["k"] == 2048.0
+    # The separately timed activation is extracted, never ingested, and the
+    # repeated geometry is the only other leg the reader refuses to fit twice.
+    activation = [leg for leg in document["legs"] if leg["leg"] == physical.MC2_ACTIVATION_LEG]
+    assert len(activation) == 1 and activation[0]["ingested"] is False
+    assert activation[0]["duration_ms"] == pytest.approx(0.091)
+    duplicates = [
+        leg for leg in document["legs"]
+        if leg["leg"] == "gmm_gate_up" and not leg["ingested"]
+    ]
+    assert len(duplicates) == 1
+    assert "tokens=2026" in duplicates[0]["duplicate_of"]
+    assert "experts=32" in duplicates[0]["duplicate_of"]
+    # A probe job, another machine, the combined rows and the bookkeeping rows are
+    # all counted, not fitted.
+    assert document["skipped"]["campaign"] == 1
+    assert document["skipped"]["other_machine"] == 1
+    assert document["skipped"]["kind"] == 1
+    assert document["skipped"]["timing_key"] == 1
+    assert document["skipped"]["duplicate_geometry"] == 1
+    assert all("probe" not in obs["condition_key"] for obs in document["observations"])
+
+    # The reader is a declared ingestion rule, so its prerequisites are errors.
+    with pytest.raises(physical.PhysicalCalibrationError, match="mc2_machine_keys_required"):
+        physical.read_mc2_grouped_results(path, campaigns=("camp-e64",))
+    with pytest.raises(physical.PhysicalCalibrationError, match="mc2_unknown_machine_label"):
+        physical.read_mc2_grouped_results(
+            path, hardware_key=MACHINE["hardware_key"],
+            machine_keys={"a3": MACHINE["hardware_key"]}, campaigns=("camp-e64",),
+        )
+
+
+def test_mc2_reader_rows_fit_the_mc2_recipe_they_declare(tmp_path):
+    """Reader output is directly fittable and lands on the MC2 recipe row."""
+    path = tmp_path / "mc2-measurements.json"
+    path.write_text(json.dumps(MC2_DOCUMENT))
+    document = physical.read_mc2_grouped_results(
+        path,
+        hardware_key=MACHINE["hardware_key"],
+        arch_family="TEST",
+        machine_keys={"a3": MACHINE["hardware_key"], "a2": "Synthetic910_X2"},
+        campaigns=("camp-e64",),
+    )
+    # One condition is below MIN_SAMPLES_PER_FIT, so the fit declares it unmodeled
+    # instead of inventing a rate; the reader's own contract is what is asserted.
+    assert len(document["observations"]) == 2
+    assert all(
+        obs["recipe"] == physical.MC2_GROUPED_RECIPE
+        and obs["source_class"] == "measured"
+        and obs["split"] == "train"
+        for obs in document["observations"]
     )

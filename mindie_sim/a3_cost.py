@@ -14,7 +14,12 @@
   * A measured duration is dispatch gap **plus** kernel service, so
     ``estimated_ms = launch_ms + max(resource service times)``.  Launch is an
     explicit additive term (``launch_amortization`` = 1.0 for eager per-op
-    submission), never one more resource competing in a ``max``.
+    submission), never one more resource competing in a ``max``.  What the
+    dispatch gap *is* depends on how the bucket was submitted: an eager op pays
+    the per-op host submit, while a bucket ACLGraph **replays** submits all its
+    kernels once and pays the declared device dispatch per kernel
+    (``GRAPH_KERNEL_LAUNCH_US``, reported as ``graph_replay_device_launch`` with
+    the replaced host intercept alongside).  Eager and prefill are untouched.
   * The wave quantization uses the machine's own ``die.aic_count``; the literal
     24 survives only as a documented fallback for a machine that declares no
     AIC count at all.
@@ -1001,6 +1006,19 @@ PHYSICAL_TRANSFER_FALLBACK_TARGETS: dict[str, tuple[str, ...]] = {
     "moe_gate_up": ("grouped_matmul", "gemm"),
     "moe_down": ("grouped_matmul", "gemm"),
 }
+#: Declared *MC2* compute-leg measurement recipes.  The MC2 campaign measures the
+#: fused decode chunk's grouped gate/up (``split_item`` 3) and down
+#: (``split_item`` 2) calls on the layer's real routing group_list at 8..64 local
+#: experts and 32..2057 routed rows per expert; the prefill grouped corpus
+#: measures one uniform list call per sample at 32..384 experts and >=64 rows per
+#: expert.  One fitted row cannot describe both populations (fitting them jointly
+#: scores worse out-of-fold than either alone), so an MC2 chunk *member* asks for
+#: the MC2-measured row first and only then falls back to the prefill grouped row.
+#: Declared here, never fitted: it names which measured kernel prices which call.
+PHYSICAL_MC2_MEASURED_RECIPES: dict[str, tuple[str, ...]] = {
+    "moe_gate_up": ("npu_grouped_matmul_list_bf16_mc2",),
+    "moe_down": ("npu_grouped_matmul_list_bf16_mc2",),
+}
 #: Cost-model aliases that are the same physical family.  ``elementwise`` is the
 #: graph name of the measured add family and ``router_softmax`` is a softmax over
 #: the expert axis (the ``softmax`` artifact family, aliased through the declared
@@ -1039,6 +1057,7 @@ PHYSICAL_TRANSFER_ANY_RECIPE = ""
 
 def physical_transfer_target(
     family: str, timing_scope: str, *, allow_dense_gemm: bool = True,
+    mc2_measured: bool = False,
 ) -> tuple[tuple[str, str], ...] | None:
     """Ordered ``(artifact family, artifact recipe)`` candidates for a family.
 
@@ -1053,6 +1072,12 @@ def physical_transfer_target(
     ``allow_dense_gemm=False`` drops the dense-GEMM fallback target.  That is the
     MC2 rule: an MC2 chunk's compute is priced inside the fused kernel, so a second
     GEMM model may not be applied on top of it.
+
+    ``mc2_measured=True`` puts the family's declared *MC2 measured* recipe
+    (:data:`PHYSICAL_MC2_MEASURED_RECIPES`) ahead of the prefill grouped recipe,
+    because a fused chunk member launches the split-item call the MC2 campaign
+    timed.  An artifact without that row simply falls through to the prefill
+    recipe, so the ordering is a preference, never a new requirement.
     """
     declared = str(family or "")
     alias = PHYSICAL_TRANSFER_ALIASES.get(declared)
@@ -1086,6 +1111,13 @@ def physical_transfer_target(
         if not allow_dense_gemm and artifact_family == PHYSICAL_GEMM_ARTIFACT_FAMILY:
             continue
         recipes = target["batched"] if "batched" in scope else target["per_call"]
+        if mc2_measured and artifact_family == key:
+            # The MC2 measured row of *this* family first; the prefill recipe and
+            # the recipe-agnostic row stay behind it as declared fallbacks.
+            candidates.extend(
+                (artifact_family, recipe)
+                for recipe in PHYSICAL_MC2_MEASURED_RECIPES.get(key, ())
+            )
         candidates.extend((artifact_family, recipe) for recipe in recipes)
         candidates.append((artifact_family, PHYSICAL_TRANSFER_ANY_RECIPE))
     return tuple(candidates) or None
@@ -1248,6 +1280,18 @@ MC2_TOKEN_CARRIER_FAMILIES: frozenset[str] = frozenset(
 #: declared range: below 1.0 would claim an overlap the measurement does not show,
 #: above 1.2 would claim a penalty it does not show either.
 MC2_CHAIN_FACTOR_BOUNDS: tuple[float, float] = (1.0, 1.2)
+#: Device-side dispatch a *replayed* graph still pays per kernel, in microseconds.
+#: A replayed bucket submits every kernel from one host call, so the per-op host
+#: intercept (a ~20 us submit) is not paid per kernel any more; what remains is the
+#: device dispatch gap between back-to-back kernels.  Derived from the measured
+#: graph-mode decode step: 15.10 ms measured at p4096 minus the corrected physical
+#: service term (14.57 ms at p1024, `model-decode-stream/report.md`) leaves ~0.53 ms
+#: over 227 kernels per step, i.e. ~2.3 us/kernel; 2.5 us is the declared value
+#: (the 0.2 us margin carries the p128/p4096 spread).  It is a per-kernel device
+#: constant, not a per-scenario knob: nothing scales it by batch, context or
+#: measured E2E.  Eager submission and prefill keep their host-dispatch charge.
+GRAPH_KERNEL_LAUNCH_US = 2.5
+GRAPH_REPLAY_COMPOSITION = "graph_replay_device_launch"
 
 #: The comm lane an MC2 all-to-all is priced on: a two-rank point-to-point lane
 #: (the same lane the existing EP dispatch/combine path prices).  Group scaling
@@ -1785,6 +1829,7 @@ class PredictiveCostModel:
             return query, explained, None, None
         candidates = physical_transfer_target(
             op.family, self.timing_scope, allow_dense_gemm=not is_mc2_op(op),
+            mc2_measured=is_mc2_op(op),
         )
         if not candidates:
             return query, explained, None, None
@@ -2241,6 +2286,7 @@ class PredictiveCostModel:
     def mc2_chunk_estimate(
         self, ops: Sequence[OpSpec], costed: Sequence[CostedOp],
         *, layer_ops: Sequence[OpSpec] | None = None,
+        composition: str | None = None,
     ) -> dict[str, Any]:
         """The fused MC2 kernel's duration for one chunk.
 
@@ -2293,11 +2339,20 @@ class PredictiveCostModel:
         # the chunk's routed expert list decides the launch count.
         chunk_experts = max(1, mc2_chunk_expert_count(ops))
         launches = max(1, math.ceil(chunk_experts / GROUPED_LAUNCH_EXPERT_CAP))
-        launch_ms = (
+        # A replayed bucket submits the fused kernel from the graph, so the chunk
+        # pays the declared device dispatch per tensor-list launch, not the per-op
+        # host intercept (``GRAPH_KERNEL_LAUNCH_US``); the fabric's own setup
+        # latency below is a real per-transfer cost and is kept either way.
+        host_launch_ms = (
             float(getattr(die, "launch_us", 0.0) or 0.0) / 1000.0
             * max(0.0, float(self.launch_amortization))
-            * launches
         )
+        per_launch_ms = (
+            GRAPH_KERNEL_LAUNCH_US / 1000.0
+            if str(composition or "") == GRAPH_REPLAY_COMPOSITION
+            else host_launch_ms
+        )
+        launch_ms = per_launch_ms * launches
         if not measured_lane and link is not None:
             # The analytic lane has no fitted intercept, so the fabric's declared
             # setup latency is the dispatch/combine term.  A measured alpha
@@ -2373,6 +2428,13 @@ class PredictiveCostModel:
             "bounds": {
                 "launch_ms": bounds["launch_ms"],
                 "launch_count": int(launches),
+                "per_launch_ms": float(per_launch_ms),
+                "launch_composition": str(composition or "host_dispatch"),
+                "launch_source": (
+                    "device_dispatch"
+                    if str(composition or "") == GRAPH_REPLAY_COMPOSITION
+                    else "host_dispatch"
+                ),
                 "legs_ms": bounds["legs_ms"],
                 "serial_ms": bounds["serial_ms"],
                 "upper_ms": bounds["upper_ms"],
@@ -2384,6 +2446,7 @@ class PredictiveCostModel:
 
     def compose_mc2(
         self, ops: Sequence[OpSpec], costed: Sequence[CostedOp],
+        *, composition: str | None = None,
     ) -> list[CostedOp]:
         """Fold every MC2 chunk's op decomposition into one fused-kernel cost.
 
@@ -2415,6 +2478,7 @@ class PredictiveCostModel:
             chunk_costed = [costed[index] for index in indices]
             estimate = self.mc2_chunk_estimate(
                 chunk_ops, chunk_costed, layer_ops=by_layer.get((key[0], key[1])),
+                composition=composition,
             )
             geometry = estimate["geometry"]
             compute_indices = [
@@ -2923,11 +2987,29 @@ class PredictiveCostModel:
         service_ms = max(service_ms, typed_stage_ms)
         composition = str(launch_composition or self.launch_composition or "concurrent")
         launch_detail = self.grouped_launch_detail(op)
+        if composition == GRAPH_REPLAY_COMPOSITION and launch_ms > 0:
+            # One host submit per replayed bucket: the per-op host intercept the
+            # fitted row (or the analytic formula) charges is *not* paid per
+            # kernel, but the device dispatch gap between back-to-back kernels
+            # still is.  Only the launch term is re-priced -- the service term is
+            # untouched -- and the replaced intercept is reported next to the
+            # declared device constant so the substitution is auditable.
+            launches = max(1, grouped_matmul_launch_count(op))
+            launch_detail = {
+                **(launch_detail or {}),
+                "composition": GRAPH_REPLAY_COMPOSITION,
+                "launches": int(launches),
+                "per_launch_ms": GRAPH_KERNEL_LAUNCH_US / 1000.0,
+                "host_intercept_ms": launch_ms,
+                "reason": "graph_replay_device_dispatch",
+            }
+            launch_ms = launches * GRAPH_KERNEL_LAUNCH_US / 1000.0
+            calibrated = {**calibrated, "launch": launch_ms}
         service_demands = tuple(sorted(
             (key, float(work)) for key, work in calibrated.items()
             if key not in {"launch", "completion_envelope_ms"} and float(work) > 0
         ))
-        if composition == "serial" and envelope_ms <= 0 and launch_ms > 0:
+        if composition in {"serial", GRAPH_REPLAY_COMPOSITION} and envelope_ms <= 0 and launch_ms > 0:
             # A replayed graph pays each kernel's dispatch gap in sequence: the host
             # submit is amortized across the bucket, the device dispatch is not.  The
             # engine serves a task's demands concurrently, so the intercept is folded
@@ -2949,7 +3031,7 @@ class PredictiveCostModel:
                         "launches": 1, "per_launch_ms": launch_ms,
                         "reason": "single_launch",
                     }),
-                    "composition": "serial",
+                    "composition": composition,
                     "folded_into_service_ms": launch_ms,
                 }
         if envelope_ms > 0:
@@ -2983,12 +3065,20 @@ class PredictiveCostModel:
             raise A3InputError("iteration_work_empty")
         # A kernel stream pays its dispatch gaps in sequence when the kernels are
         # short and back to back (a decode step) or when the bucket is replayed; a
-        # long prefill kernel's dispatch can overlap its own service instead.
+        # long prefill kernel's dispatch can overlap its own service instead.  A
+        # replayed bucket pays the declared *device* dispatch per kernel, never the
+        # per-op host submit (``GRAPH_KERNEL_LAUNCH_US``); eager submission keeps
+        # the host intercept.
         replayed = getattr(work, "graph_bucket", None) is not None
         decode = str(getattr(work, "mode", "") or "") == "decode"
-        composition = "serial" if (replayed or decode) else self.launch_composition
+        if replayed:
+            composition = GRAPH_REPLAY_COMPOSITION
+        elif decode:
+            composition = "serial"
+        else:
+            composition = self.launch_composition
         costed = [self.cost(op, launch_composition=composition) for op in work.ops]
-        return self.compose_mc2(work.ops, costed)
+        return self.compose_mc2(work.ops, costed, composition=composition)
 
     def hardware_lower_bound_ms(self, work: IterationWork) -> float:
         """Raw resource roofline for this exact DAG; not a normative target.

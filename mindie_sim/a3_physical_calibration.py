@@ -26,6 +26,15 @@
   * The L2 bandwidth is the only fitted rate allowed above the HBM peak, and
     only when the fitted blend beats the HBM-only model on train-only CV by
     ``MIN_CV_IMPROVEMENT_PCT``; otherwise ``memory_model`` is ``"hbm"``.
+  * A blend is a claim about *residency*, and prediction tests it before
+    crediting anything: a weight-dominated GEMM whose weight cannot survive the
+    per-token stream (``weight_stream_basis``) and a whole working set at least
+    ``STREAMING_L2_RATIO`` x the declared L2 are priced with **no** L2 credit at
+    an HBM rate.  That rate is the family's own fitted streaming efficiency when
+    its corpus measured the regime, else the hardware key's declared measured
+    bound, else the declared peak -- recorded in ``streaming_rate_source`` and
+    never borrowed across parts.  The rule reads shape, bytes and declared
+    constants only; it is prediction-side, so no training row or CV moves.
   * Prediction never returns a number for an unmodeled family / recipe / dtype,
     or for a machine whose hardware key contradicts the artifact: it returns
     ``None`` and an explicit reason (``predict_op_explained``).
@@ -66,6 +75,12 @@ __all__ = [
     "Observation", "FamilyParameters", "OpPrediction", "HeldoutGuard",
     "PhysicalCalibration", "fit_calibration", "read_observations_json", "read_campaign_results",
     "read_sqlite_observations", "observation_identity", "canonical_shape",
+    "streaming_regime", "weight_stream_basis", "STREAMING_BW_BYTES_PER_S",
+    "STREAMING_WEIGHT_RESIDENT_SHARE", "STREAMING_WEIGHT_MAX_M",
+    "STREAMING_WEIGHT_DOMINANCE",
+    "MC2_GROUPED_RECIPE", "MC2_GROUPED_SCOPE", "MC2_GROUPED_PROTOCOL",
+    "MC2_GROUPED_LEGS", "MC2_ACTIVATION_LEG",
+    "read_mc2_grouped_results",
 ]
 
 SCHEMA_VERSION = "mindie-sim.physical-calibration/1"
@@ -234,9 +249,30 @@ STREAMING_L2_RATIO = 8.0
 # Measured sustained HBM rate to use when a family never measured the streaming
 # regime: A3 512 MiB copy 1.249 TB/s (read+write) and graph-mode decode
 # 1.01 TB/s effective (Qwen2.5-7B TP1, 14.21 GiB weights, 15.10 ms TPOT) ->
-# 1.01e12 B/s.  Declared per hardware key: a part without a measurement keeps
-# its fitted efficiency instead of borrowing another part's number.
-STREAMING_BW_BYTES_PER_S = {"Ascend910_9362": 1.01e12}
+# 1.01e12 B/s.  A2's own corpus has no streaming row either, so it is declared
+# from its campaign's measured decode band (`.workstreams/model-bigops/report.md`
+# section 3.2: 471-955 GB/s, i.e. 0.59-1.19x its declared 800 GB/s peak); the low
+# end 471e9 is chosen as the bound, the same conservative choice as A3's 1.01 TB/s
+# (below the measured 1.249 TB/s copy).  Declared per hardware key: a part without
+# a measurement keeps its fitted efficiency (priced at peak x eta, never at a
+# borrowed number) instead of taking another part's rate.
+STREAMING_BW_BYTES_PER_S = {"Ascend910_9362": 1.01e12, "Ascend910B4": 471e9}
+# A weight tensor survives from one use to the next only if it is small relative
+# to the stream that runs between the two uses.  A decode step streams at least
+# ``STREAMING_L2_RATIO`` resident prefixes (that is the declared meaning of the
+# constant above), so a tensor larger than one ratio-th of the resident prefix is
+# evicted before it is read again: the L2 blend must not credit it.
+STREAMING_WEIGHT_RESIDENT_SHARE = 1.0 / STREAMING_L2_RATIO
+# Largest activation row count still counted as a single weight fetch.  A GEMM
+# walks its activation in row tiles of the fitted ``block_m`` (32/64/128 in this
+# artifact); at most a couple of tiles means every weight byte is fetched exactly
+# once per call.  A wider m re-reads the weight out of L2 for the next tile, which
+# is the reuse the blend legitimately models.
+STREAMING_WEIGHT_MAX_M = 128.0
+# The op's traffic must *be* the weight fetch: at least this many times more
+# weight bytes than activation bytes.  A short-wide GEMM (k >> n) reads an
+# activation as large as its weights, so its working set is not a bare stream.
+STREAMING_WEIGHT_DOMINANCE = 4.0
 # A grouped matmul streams its weight matrices from HBM and the declared
 # ``peak_bw_bytes_per_s`` is a conservative SKU constant (1.2 TB/s on A3) while
 # the big-operator block measures >= 1.36 TB/s sustained streaming.  The memory
@@ -277,6 +313,73 @@ MIN_VARIANT_IMPROVEMENT_PCT = 1.0
 # activation read?  Physically yes, but an implementation that walks the
 # activation once (or keeps it resident) can hide it; the data decides.
 GROUPED_DEFAULT_ACTIVATION_READ = True
+# The MC2 campaign measures the fused decode chunk's grouped gate/up
+# (``split_item`` 3) and down (``split_item`` 2) calls directly, on the *real*
+# routing ``group_list`` of a 512..16384-token layer at ep 2/4/8.  That is its own
+# measurement recipe: the prefill grouped corpus feeds one list call per sample
+# over a *uniform* expert count (``split_item`` 0) and its fitted row answers the
+# wide-token/wide-expert regime.  Fitting the two populations into one row makes
+# neither regime right (the joint fit's out-of-fold WAPE is worse than either
+# population alone), so the MC2 legs are ingested under this recipe and the cost
+# model resolves an MC2 chunk's compute members to it (``a3_cost``'s declared
+# ``PHYSICAL_MC2_MEASURED_RECIPES``).  The same kernel is still one physical
+# family: nothing here turns the chain into a second model.
+MC2_GROUPED_RECIPE = "npu_grouped_matmul_list_bf16_mc2"
+# The MC2 legs are device-event medians around one native call per sample, i.e.
+# the operator scope (never a batched/amortised or block-interval scope).
+MC2_GROUPED_SCOPE = "device_event_warm_operator"
+# Declared protocol of the MC2 grouped legs: one native ``npu_grouped_matmul``
+# call inside a device-event window, warm, on preallocated buffers, bf16, ND
+# weights, 2 trials of N samples.  It is written as the measurement declares it
+# (``mc2_worker.py`` kind_gmm): the split-item and the group-list convention are
+# part of the *recipe*, not of the timing protocol.
+MC2_GROUPED_PROTOCOL = {
+    "timer": "device_event",
+    "preallocated": True,
+    "compute_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "activation_dtype": "bf16",
+    "quantization": "none",
+    "layout": "contiguous",
+    "trials": 2,
+}
+#: A fused-chunk *member* is not a native call and not an expert group.  The
+#: chunk's single launch is charged once by the composer
+#: (``a3_cost.mc2_chunk_estimate``), and the deployed MC2 decomposition is one
+#: member per local expert, so the composer sums per-member prices to get the
+#: chunk's compute.  That sum is only the measured leg's cost when every member
+#: term is *additive*: an intercept would be charged once per expert (32 x 25 us
+#: on a 0.9 ms leg) and a super-linear ``experts ** gamma`` tax would be summed as
+#: ``experts ** 1``.  A fused-chunk member row therefore declares a zero intercept
+#: and no per-expert term; what it carries is the per-work physics (cube and
+#: memory efficiency) that the deployed decomposition reproduces exactly.
+#: The L2-residency blend is excluded for the same reason: a residency credit is
+#: ``min(bytes, l2_usable)`` per call, so summing it over 32 members credits far
+#: more than the call's own working set (measured on the published A2 row: the
+#: per-member sum priced a 1.51 ms leg at 0.53 ms).  A fused-chunk member row is
+#: therefore ``hbm``-only, and the whole-call residency question stays with the
+#: families that measure a whole call.
+FUSED_CHUNK_MEMBER_TERMS: dict[str, dict[str, Any]] = {
+    MC2_GROUPED_RECIPE: {
+        "launch_bounds_ms": (0.0, 0.0),
+        "include_per_expert": False,
+        "include_per_launch": False,
+        "memory_models": ("hbm",),
+    },
+}
+# The two MC2 compute legs, as the campaign times them: ``(timing_key, family,
+# shape function)``.  ``gate_up`` produces ``2 x intermediate`` columns from
+# ``hidden``; ``down`` produces ``hidden`` from ``intermediate``.
+MC2_GROUPED_LEGS = (
+    ("gmm_gate_up", "moe_gate_up", "gate_up"),
+    ("gmm_down", "moe_down", "down"),
+)
+# A leg the campaign times but that is not part of the MC2 chunk's grouped
+# compute identity: the separately measured activation.  It is extracted (so the
+# report can state the chain's non-compute leg) and deliberately *not* ingested,
+# because it is a vector kernel of the ``swiglu`` family and pricing it here
+# would silently re-fit another family from a single campaign.
+MC2_ACTIVATION_LEG = "swiglu"
 DTYPE_BYTES = {"bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0, "float16": 2.0, "fp32": 4.0, "float32": 4.0}
 
 
@@ -988,6 +1091,76 @@ def streaming_regime(hbm_bytes: float, l2_bytes: int) -> bool:
     return l2_bytes > 0 and hbm_bytes >= STREAMING_L2_RATIO * float(l2_bytes)
 
 
+def weight_stream_basis(
+    *,
+    model_kind: str,
+    m: float,
+    k: float,
+    n: float,
+    itemsize: float,
+    l2_usable_bytes: int,
+    l2_bytes: int = 0,
+) -> dict[str, Any]:
+    """Declared test: does this op fetch its weight from HBM once and lose it?
+
+    A dense GEMM that streams its weight has three shape-visible properties, and
+    ``basis`` names the one that decided the answer:
+
+    * ``m <= STREAMING_WEIGHT_MAX_M`` -- the activation is at most a couple of row
+      tiles, so each weight byte is fetched exactly once per call;
+    * ``weight_bytes >= STREAMING_WEIGHT_DOMINANCE x activation_bytes`` -- the
+      call's traffic *is* the weight fetch, not an activation walk that could
+      legitimately stay hot;
+    * ``weight_bytes >= resident_prefix x STREAMING_WEIGHT_RESIDENT_SHARE`` -- the
+      tensor cannot survive the per-token reuse distance, so no part of it is
+      resident when the call runs (see the constant).
+
+    The inputs are the shape, the byte counts and this module's declared
+    constants -- never a model name, a family name, a recipe or a measured E2E
+    number.  ``resident_prefix`` is the family's fitted ``l2_usable_bytes`` when
+    it has one (that is the capacity the blend believes in) and the declared L2
+    otherwise.
+
+    Returns ``streamed``, the two byte counts, the residency threshold and the
+    basis string.  A non-GEMM op is never a weight stream: its family either has
+    no L2 blend (``l2_usable_bytes == 0`` in both fitted artifacts) or its memory
+    is a KV/activation walk, which the blend models.
+    """
+    weight_bytes = max(0.0, float(k)) * max(0.0, float(n)) * float(itemsize)
+    activation_bytes = max(0.0, float(m)) * max(0.0, float(k)) * float(itemsize)
+    prefix = float(l2_usable_bytes or 0) or float(l2_bytes or 0)
+    threshold = prefix * STREAMING_WEIGHT_RESIDENT_SHARE
+    basis = {
+        "weight_bytes": weight_bytes,
+        "activation_bytes": activation_bytes,
+        "resident_threshold_bytes": threshold,
+        "streamed": False,
+        "basis": "not_a_weight_stream",
+    }
+    if str(model_kind) != "gemm" or weight_bytes <= 0.0 or threshold <= 0.0:
+        return basis
+    if float(m) > STREAMING_WEIGHT_MAX_M:
+        basis["basis"] = "activation_reuse:m=%.0f>%.0f" % (m, STREAMING_WEIGHT_MAX_M)
+        return basis
+    if weight_bytes < STREAMING_WEIGHT_DOMINANCE * activation_bytes:
+        basis["basis"] = "activation_dominated:weights=%.1fMiB<%.0fxact=%.1fMiB" % (
+            weight_bytes / 2**20, STREAMING_WEIGHT_DOMINANCE, activation_bytes / 2**20,
+        )
+        return basis
+    if weight_bytes < threshold:
+        basis["basis"] = "resident:weights=%.1fMiB<threshold=%.1fMiB" % (
+            weight_bytes / 2**20, threshold / 2**20,
+        )
+        return basis
+    basis["streamed"] = True
+    basis["basis"] = "weight_stream:weights=%.1fMiB>=threshold=%.1fMiB,m=%.0f<=%.0f,act=%.2fMiB" % (
+        weight_bytes / 2**20, threshold / 2**20, m, STREAMING_WEIGHT_MAX_M,
+        activation_bytes / 2**20,
+    )
+    return basis
+
+
+
 def _short_k(obs: Observation, threshold: float = K_FILL_MAX_K) -> bool:
     """True when a GEMM's k is short enough to pay a pipeline fill (W3)."""
     if obs.model_kind != "gemm":
@@ -1376,16 +1549,23 @@ def _solve(matrix: list[list[float]], vector: list[float]) -> list[float] | None
 
 
 def _launch_bounds_for(
-    kind: str, scope: str, machine: "MachineLimits | None" = None
+    kind: str, scope: str, machine: "MachineLimits | None" = None, recipe: str = ""
 ) -> tuple[float, float]:
-    """Declared launch bounds of one (kind, timing scope) column.
+    """Declared launch bounds of one (kind, timing scope, recipe) column.
 
     The attention and grouped workers dispatch one native call per sample, so on
     a part whose per-call dispatch was measured their device-event intercept is
     bounded by that measurement plus a margin.  The completion-clock block
     interval also carries the host/allocation gap, so it keeps the wider generic
     launch bounds, and a part without a dispatch measurement does too.
+
+    A fused-chunk member recipe declares a zero intercept
+    (:data:`FUSED_CHUNK_MEMBER_TERMS`): the member is one term of a kernel whose
+    launch the composer charges once.
     """
+    declared = FUSED_CHUNK_MEMBER_TERMS.get(str(recipe or ""))
+    if declared is not None:
+        return tuple(declared["launch_bounds_ms"])
     if kind in ("attention", "grouped_gemm") and scope != ATTENTION_BLOCK_SCOPE:
         key = getattr(machine, "hardware_key", "") if machine is not None else ""
         return DISPATCH_LAUNCH_BOUNDS_BY_HARDWARE.get(key, LAUNCH_BOUNDS_MS)
@@ -1710,6 +1890,7 @@ def _cross_validate(
     folds: int,
     model_terms: Mapping[str, Any] | None = None,
     fold_assignment: Sequence[int] | None = None,
+    launch_bounds: Sequence[tuple[float, float]] | None = None,
 ) -> dict[str, Any]:
     """Train-only k-fold CV: refit on each complement, score the held-out fold."""
     if len(observations) < folds or folds < 2:
@@ -1733,7 +1914,10 @@ def _cross_validate(
     bounds = _parameter_bounds(
         max(1, len(launch_scopes)), kind, memory_model, k_fill, bool(tail.get("n")),
         model_terms=model_terms, tail=tail,
-        launch_bounds=[_launch_bounds_for(kind, scope, machine) for scope in launch_scopes],
+        launch_bounds=(
+            list(launch_bounds) if launch_bounds is not None
+            else [_launch_bounds_for(kind, scope, machine) for scope in launch_scopes]
+        ),
     )
     absolute = 0.0
     total = 0.0
@@ -2081,6 +2265,8 @@ def _fit_form(
     tail: Mapping[str, bool],
     variants: Sequence[Mapping[str, Any]] = (),
     fold_assignment: Sequence[int] | None = None,
+    launch_bounds: Sequence[tuple[float, float]] | None = None,
+    memory_models: Sequence[str] | None = None,
 ) -> dict[str, Any] | None:
     """Fit one model form: grid the tiles / resident prefix, then robust IRLS.
 
@@ -2093,15 +2279,23 @@ def _fit_form(
     tile_choices = _tile_choices(form, tail, kind)
     variant_list = [dict(item) for item in (variants or ({} ,))]
     candidates: list[dict[str, Any]] = []
+    allowed_models = (
+        {str(item) for item in memory_models} if memory_models is not None else None
+    )
     for variant_index, variant in enumerate(variant_list):
         for memory_model, l2_usable in _memory_candidates(machine):
+            if allowed_models is not None and memory_model not in allowed_models:
+                continue
             for k_fill in (False, True) if tail.get("k") else (False,):
                 if k_fill and not any(_short_k(obs) for obs in observations):
                     continue
                 bounds = _parameter_bounds(
                     n_launch, kind, memory_model, k_fill, bool(tail.get("n")),
                     model_terms=variant, tail=tail,
-                    launch_bounds=[_launch_bounds_for(kind, scope, machine) for scope in launch_scopes],
+                    launch_bounds=(
+                        list(launch_bounds) if launch_bounds is not None
+                        else [_launch_bounds_for(kind, scope, machine) for scope in launch_scopes]
+                    ),
                 )
                 for block_m, block_n in tile_choices:
                     rows = _build_rows(
@@ -2182,6 +2376,7 @@ def _fit_form(
             folds=folds,
             model_terms=candidate["variant"],
             fold_assignment=fold_assignment,
+            launch_bounds=launch_bounds,
         )
         out_of_fold = candidate["cv"].pop("out_of_fold", [])
         candidate["out_of_fold"] = out_of_fold
@@ -2287,7 +2482,8 @@ def _multi_launch_rows(observations: Sequence[Observation]) -> int:
 
 
 def _declared_variants(
-    observations: Sequence[Observation], kind: str
+    observations: Sequence[Observation], kind: str,
+    member_terms: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Physics-convention variants tried for one family, default convention first.
 
@@ -2300,8 +2496,11 @@ def _declared_variants(
     """
     if kind != "grouped_gemm":
         return [{}]
+    forced = dict(member_terms or {})
     expert_counts = {round(float(obs.shape.get("experts") or 0.0), 6) for obs in observations}
-    include_per_expert = len(expert_counts) >= 2
+    include_per_expert = len(expert_counts) >= 2 and bool(
+        forced.get("include_per_expert", True)
+    )
     if include_per_expert:
         scalings = [1.0] + [
             value for value in GROUPED_EXPERT_SCALING_CHOICES if value != 1.0
@@ -2314,7 +2513,10 @@ def _declared_variants(
     # A per-launch cost is fitted only when enough rows actually cross the
     # tensorsList cap to constrain it; otherwise it is pinned to the measured
     # dispatch (see ``_fit_scope_group``).
-    include_per_launch = _multi_launch_rows(observations) >= MIN_IDENTIFYING_ROWS
+    include_per_launch = (
+        _multi_launch_rows(observations) >= MIN_IDENTIFYING_ROWS
+        and bool(forced.get("include_per_launch", True))
+    )
     variants: list[dict[str, Any]] = []
     for activation in activations:
         for scaling in scalings:
@@ -2434,7 +2636,14 @@ def _fit_scope_group(
 ) -> dict[str, Any]:
     """Select base form, tail terms and memory model by train-only CV."""
     kind = observations[0].model_kind
-    variants = _declared_variants(observations, kind)
+    # Declared per-(kind, scope, recipe) intercept bounds: a fused-chunk member
+    # recipe gets no intercept of its own (its kernel's launch is charged once).
+    member_terms = FUSED_CHUNK_MEMBER_TERMS.get(recipe)
+    launch_bounds = [
+        _launch_bounds_for(kind, scope, machine, recipe) for scope in launch_scopes
+    ]
+    memory_models = (member_terms or {}).get("memory_models")
+    variants = _declared_variants(observations, kind, member_terms)
     # No tail term is assumed: m, n and k tails are forward-selected only if they
     # buy MIN_TAIL_IMPROVEMENT_PCT of train-only CV (padding a tile is physical,
     # but it trades off against eta, so it must be identified by the data).
@@ -2443,7 +2652,8 @@ def _fit_scope_group(
     for form in MODEL_FORMS:
         result = _fit_form(
             observations, machine, form, kind, folds, launch_scopes, base_tail, variants,
-            fold_assignment=fold_assignment,
+            fold_assignment=fold_assignment, launch_bounds=launch_bounds,
+            memory_models=memory_models,
         )
         if result is not None:
             fitted[form] = result
@@ -2523,7 +2733,8 @@ def _fit_scope_group(
             continue
         trial = _fit_form(
             observations, machine, chosen_form, kind, folds, launch_scopes, trial_tail, variants,
-            fold_assignment=fold_assignment,
+            fold_assignment=fold_assignment, launch_bounds=launch_bounds,
+            memory_models=memory_models,
         )
         if trial is None:
             continue
@@ -3198,6 +3409,7 @@ class PhysicalCalibration:
         elements = _as_float(op.get("elements"), "elements", allow_none=True)
         breakdown: dict[str, float] = {}
         additive_ms = 0.0
+        stream: dict[str, Any] | None = None
         if parameters.model_kind == "attention":
             q = _as_float(shape.get("q"), "q", allow_none=True)
             kv = _as_float(shape.get("kv"), "kv", allow_none=True)
@@ -3342,6 +3554,17 @@ class PhysicalCalibration:
                 else 0.0
             )
             breakdown["compute_ms"] = compute_ms
+            # A blend is only a claim about residency; test it on the shape before
+            # crediting anything (see ``weight_stream_basis``).  A family without a
+            # blend has no residency credit to withdraw, so its fitted efficiency
+            # stands untouched.
+            if parameters.memory_model == "l2_blend" and parameters.l2_usable_bytes > 0:
+                stream = weight_stream_basis(
+                    model_kind=parameters.model_kind, m=m, k=k, n=n,
+                    itemsize=DTYPE_BYTES.get(dtype, 2.0),
+                    l2_usable_bytes=parameters.l2_usable_bytes,
+                    l2_bytes=limits.l2_bytes,
+                )
         else:
             if elements is None:
                 # Accept the measured geometry directly (tokens x width, rows x
@@ -3357,18 +3580,12 @@ class PhysicalCalibration:
                 else 0.0
             )
             breakdown["vector_ms"] = compute_ms
-        streaming_rate: float | None = None
-        if (
-            not parameters.streaming_measured
-            and streaming_regime(hbm_bytes, limits.l2_bytes)
-        ):
-            streaming_rate = STREAMING_BW_BYTES_PER_S.get(
-                self.hardware_key or limits.hardware_key
-            )
-        memory_ms = self._memory_time(limits, parameters, hbm_bytes, streaming_rate)
-        if streaming_rate is not None:
-            breakdown["streaming_regime"] = 1.0
-            breakdown["eta_memory_effective"] = streaming_rate / limits.peak_bw_bytes_per_s
+        memory = self._memory_terms(limits, parameters, hbm_bytes, stream)
+        memory_ms = memory.pop("memory_ms")
+        breakdown.update(memory)
+        if (stream is not None and stream.get("streamed")):
+            breakdown["weight_bytes"] = stream["weight_bytes"]
+            breakdown["resident_threshold_bytes"] = stream["resident_threshold_bytes"]
         if (
             parameters.tail.get("n")
             and parameters.align_penalty
@@ -3482,19 +3699,77 @@ class PhysicalCalibration:
         )
 
     # -- helpers ----------------------------------------------------------
-    def _memory_time(
+    def _streaming_rate(
+        self, limits: MachineLimits, parameters: FamilyParameters,
+    ) -> tuple[float, str]:
+        """Effective HBM rate for a streamed working set, and where it came from.
+
+        A family that measured the streaming regime keeps its own fitted
+        efficiency (``peak x eta_memory``): that number *is* a measurement of the
+        regime.  A family that never did is priced at its hardware key's declared
+        measured streaming bound, and only a part with no declared bound at all
+        falls back to the declared SKU peak -- always without L2 credit, and
+        ``streaming_rate_source`` says which of the three was used.
+        """
+        declared = STREAMING_BW_BYTES_PER_S.get(
+            self.hardware_key or limits.hardware_key
+        )
+        if parameters.streaming_measured:
+            return (
+                limits.peak_bw_bytes_per_s * (parameters.eta_memory or ETA_BOUNDS[0]),
+                "fitted_streaming_efficiency",
+            )
+        if declared is not None and float(declared) > 0.0:
+            return float(declared), "declared_measured_bound"
+        return limits.peak_bw_bytes_per_s, "declared_peak_bound"
+
+    def _memory_terms(
         self,
         limits: MachineLimits,
         parameters: FamilyParameters,
         hbm_bytes: float,
-        streaming_rate: float | None = None,
-    ) -> float:
+        stream: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Memory time, residency credit and the declared regime behind them.
+
+        Two regimes withdraw the L2 credit and price every byte at an HBM rate:
+
+        * ``weight_stream`` -- the shape test says the op's weight is fetched once
+          and cannot survive to its next use (:func:`weight_stream_basis`);
+        * ``whole_working_set_stream`` -- the op's whole working set is at least
+          ``STREAMING_L2_RATIO`` x the declared L2, so nothing of it is resident.
+
+        Everything else keeps the fitted blend exactly as fitted: the credit is
+        ``min(bytes, l2_usable)`` and the L2 part is priced at the fitted L2
+        bandwidth.  ``l2_credit_bytes``, ``eta_memory_effective``,
+        ``memory_regime``, ``streaming_regime``, ``streaming_rate_source`` and
+        ``streaming_basis`` are reported for every predicted op, so a reader can
+        see which regime priced it and why.
+        """
+        weighted = bool(stream and stream.get("streamed"))
+        whole_set = not weighted and streaming_regime(hbm_bytes, limits.l2_bytes)
         if hbm_bytes <= 0:
-            return 0.0
-        if streaming_rate is not None:
-            # Multi-GB weight streaming: no L2 residency credit and the declared
-            # measured sustained rate, never an extrapolated warm efficiency.
-            return hbm_bytes / streaming_rate * 1000.0
+            return {
+                "memory_ms": 0.0, "l2_credit_bytes": 0.0,
+                "eta_memory_effective": parameters.eta_memory or ETA_BOUNDS[0],
+                "memory_regime": "hbm", "streaming_regime": 0.0,
+                "streaming_rate_source": None, "streaming_basis": "no_memory_traffic",
+            }
+        if weighted or whole_set:
+            rate, source = self._streaming_rate(limits, parameters)
+            return {
+                "memory_ms": hbm_bytes / rate * 1000.0,
+                "l2_credit_bytes": 0.0,
+                "eta_memory_effective": rate / limits.peak_bw_bytes_per_s,
+                "memory_regime": "weight_stream" if weighted else "whole_working_set_stream",
+                "streaming_regime": 1.0,
+                "streaming_rate_source": source,
+                "streaming_basis": str(
+                    (stream or {}).get("basis")
+                    or "whole_working_set_stream:hbm_bytes=%.1fMiB>=%.0fxL2"
+                    % (hbm_bytes / 2**20, STREAMING_L2_RATIO)
+                ),
+            }
         hbm_part, l2_part = _memory_split(
             hbm_bytes, parameters.l2_usable_bytes, limits.peak_bw_bytes_per_s
         )
@@ -3504,7 +3779,17 @@ class PhysicalCalibration:
             total += l2_part / parameters.l2_bw_bytes_per_s * 1000.0
         elif l2_part > 0:
             total += l2_part / (limits.peak_bw_bytes_per_s * eta) * 1000.0
-        return total
+        return {
+            "memory_ms": total,
+            "l2_credit_bytes": l2_part,
+            "eta_memory_effective": eta,
+            "memory_regime": "l2_blend" if l2_part > 0 else "hbm",
+            "streaming_regime": 0.0,
+            "streaming_rate_source": None,
+            "streaming_basis": str(
+                (stream or {}).get("basis") or "family_has_no_l2_blend"
+            ),
+        }
 
     def _resolve_machine(
         self, machine: Mapping[str, Any] | None
@@ -5579,6 +5864,291 @@ def read_campaign_results(
         "arch_family": arch_family,
         "protocol": document_protocol,
         "package_tree": package_tree,
+        "skipped": skipped,
+        "observations": observations,
+    }
+
+
+def _mc2_leg_shape(
+    leg: str, rows: float, local_experts: float, intermediate: float, hidden: float,
+    itemsize: float,
+) -> dict[str, Any] | None:
+    """Grouped ``(tokens, experts, n, k)`` geometry of one MC2 compute leg.
+
+    ``rows`` is the routed row count the timed rank actually fed to the grouped
+    matmul -- the campaign records it per rank next to the interval, so the two
+    are the same launch.  The weight geometry is the layer's, not the campaign's:
+    gate/up produces ``2 x intermediate`` from ``hidden`` with ``split_item`` 3,
+    down produces ``hidden`` from ``intermediate`` with ``split_item`` 2.
+    """
+    if leg == "gate_up":
+        n, k = 2.0 * intermediate, hidden
+    elif leg == "down":
+        n, k = hidden, intermediate
+    else:
+        return None
+    if not (rows > 0 and local_experts > 0 and n > 0 and k > 0):
+        return None
+    return {
+        "shape": {"tokens": float(rows), "experts": float(local_experts),
+                  "n": n, "k": k},
+        "flops": 2.0 * rows * n * k,
+        # Same declared grouped byte convention as ``read_campaign_results``:
+        # one weight read per expert, the per-expert activation read, the write.
+        "hbm_bytes": (local_experts * n * k + rows * k + rows * n) * itemsize,
+    }
+
+
+def read_mc2_grouped_results(
+    path: str | Path,
+    *,
+    hardware_key: str = "",
+    arch_family: str = "",
+    machine_keys: Mapping[str, str] | None = None,
+    campaigns: Sequence[str] = (),
+    recipe: str = MC2_GROUPED_RECIPE,
+    protocol: Mapping[str, Any] | None = None,
+    split: str = "train",
+) -> dict[str, Any]:
+    """Read the MC2 campaign collation into grouped compute-leg observations.
+
+    The document is the campaign's per-rank collation
+    (``mc2-measurements.json``: ``runs`` plus one row per (plan, case, leg,
+    rank)), not an operator-campaign ``results.json``: each leg is already a
+    device-event median of 2 trials, so the reader reduces it to one observation
+    per ``(plan, case, leg)`` with exactly the pair the campaign published.
+
+    Declared extraction rules:
+
+    * only ``kind == "gmm"`` rows of the declared ``campaigns`` are campaign
+      conditions (a probe or diagnostic job is not a condition and is counted
+      under ``skipped``);
+    * the leg value is the **max over ranks of the per-rank median** -- the
+      campaign's collective bound -- paired with the routed row count *of the
+      rank that produced that median*, so duration and geometry are the same
+      launch;
+    * ``experts`` of the observation is the rank's **local** expert count
+      (``global experts / ep``), because that is what the rank's list call
+      launches; ``ep``, the global expert count and the rank count stay in the
+      manifest;
+    * the separately timed activation (``swiglu``) is extracted into ``legs``
+      but is not ingested as a grouped observation;
+    * a repeated ``(family, geometry)`` inside one machine keeps the first
+      condition in sorted order and is counted as a duplicate instead of being
+      fitted twice.
+
+    ``machine_keys`` maps the document's machine label (``a3``/``a2``) to the
+    hardware key of the artifact being built; rows of another machine are
+    counted, not silently mixed.
+    """
+    value = json.loads(Path(path).read_text())
+    if not isinstance(value, Mapping):
+        raise PhysicalCalibrationError("mc2_document_must_be_a_mapping")
+    if not machine_keys:
+        raise PhysicalCalibrationError("mc2_machine_keys_required")
+    allowed = {str(item) for item in (campaigns or ())}
+    declared_protocol = dict(protocol or MC2_GROUPED_PROTOCOL)
+    signature = protocol_signature({"timing_scope": MC2_GROUPED_SCOPE, **declared_protocol})
+    core_signature = protocol_core_signature(declared_protocol)
+    if not signature:
+        raise PhysicalCalibrationError("mc2_protocol_signature_empty")
+    runs: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for run in value.get("runs") or ():
+        if isinstance(run, Mapping):
+            runs[(str(run.get("machine") or ""), str(run.get("label") or ""))] = run
+    cases: dict[tuple[str, str, str], dict[str, list[Mapping[str, Any]]]] = {}
+    skipped = {
+        "kind": 0, "timing_key": 0, "campaign": 0, "other_machine": 0,
+        "plan_undeclared": 0, "rank_count": 0, "duration": 0, "rows": 0,
+        "duplicate_geometry": 0,
+    }
+    for row in value.get("rows") or ():
+        if not isinstance(row, Mapping):
+            continue
+        if str(row.get("kind") or "") != "gmm":
+            skipped["kind"] += 1
+            continue
+        timing_key = str(row.get("timing_key") or "")
+        leg = dict((item[0], item) for item in MC2_GROUPED_LEGS).get(timing_key)
+        if leg is None and timing_key != MC2_ACTIVATION_LEG:
+            # ``__case__`` bookkeeping rows and any other timing key are not legs.
+            skipped["timing_key"] += 1
+            continue
+        machine = str(row.get("machine") or "")
+        key = machine_keys.get(machine)
+        if key is None:
+            raise PhysicalCalibrationError("mc2_unknown_machine_label:%s" % (machine or "?",))
+        if hardware_key and key != hardware_key:
+            skipped["other_machine"] += 1
+            continue
+        if allowed and str(row.get("campaign") or "") not in allowed:
+            skipped["campaign"] += 1
+            continue
+        plan = str(row.get("plan") or "")
+        cases.setdefault((machine, plan, str(row.get("case_id") or "")), {}).setdefault(
+            timing_key, []
+        ).append(row)
+    observations: list[dict[str, Any]] = []
+    legs: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    for (machine, plan, case_id), by_leg in sorted(cases.items()):
+        # Resolve the hardware key from the case's own machine label: the scan
+        # above only decides which cases are in the corpus.
+        machine_key = machine_keys[machine]
+        any_row = next(iter(next(iter(by_leg.values()))))
+        run = runs.get((machine, str(any_row.get("campaign") or "")))
+        if run is None:
+            skipped["plan_undeclared"] += 1
+            continue
+        ranks = int(run.get("ranks") or 0)
+        if ranks <= 0:
+            skipped["rank_count"] += 1
+            continue
+        experts = float(any_row.get("experts") or 0.0)
+        hidden = float(any_row.get("hidden") or 0.0)
+        intermediate = float(any_row.get("intermediate") or 0.0)
+        local_experts = max(1.0, experts / float(ranks))
+        for timing_key, family, leg_name in MC2_GROUPED_LEGS:
+            rank_rows = [
+                item for item in by_leg.get(timing_key) or ()
+                if item.get("median_ms") is not None
+            ]
+            if not rank_rows:
+                continue
+            best = max(rank_rows, key=lambda item: (float(item["median_ms"]), int(item.get("rank") or 0)))
+            duration = float(best["median_ms"])
+            if duration <= 0:
+                skipped["duration"] += 1
+                continue
+            rows = float(best.get("rows_per_rank") or 0.0)
+            geometry = _mc2_leg_shape(
+                leg_name, rows, local_experts, intermediate, hidden,
+                DTYPE_BYTES.get(str(best.get("dtype") or "bf16").lower(), 2.0),
+            )
+            if geometry is None:
+                skipped["rows"] += 1
+                continue
+            condition_key = "mc2:%s:%s:%s:%s" % (machine, plan, case_id, timing_key)
+            leg_record = {
+                "condition_key": condition_key,
+                "machine": machine,
+                "hardware_key": machine_key,
+                "campaign": str(best.get("campaign") or ""),
+                "plan": plan,
+                "case_id": case_id,
+                "leg": timing_key,
+                "family": family,
+                "ep": ranks,
+                "global_experts": experts,
+                "local_experts": local_experts,
+                "routed_rows": rows,
+                "tokens_per_expert": rows / local_experts if local_experts else 0.0,
+                "duration_ms": duration,
+                "per_rank_medians_ms": {
+                    int(item.get("rank") or 0): float(item["median_ms"])
+                    for item in rank_rows
+                },
+                "per_rank_rows": {
+                    int(item.get("rank") or 0): item.get("rows_per_rank")
+                    for item in rank_rows
+                },
+                "rank_of_max": int(best.get("rank") or 0),
+                "samples": int(best.get("n_samples") or 0),
+                "hidden": hidden,
+                "intermediate": intermediate,
+                "ingested": timing_key != MC2_ACTIVATION_LEG,
+            }
+            legs.append(leg_record)
+            if timing_key == MC2_ACTIVATION_LEG:
+                continue
+            identity = (family, canonical_shape(geometry["shape"]))
+            if identity in seen:
+                skipped["duplicate_geometry"] += 1
+                leg_record["ingested"] = False
+                leg_record["duplicate_of"] = identity[1]
+                continue
+            seen.add(identity)
+            observations.append(
+                {
+                    "condition_key": condition_key,
+                    "hardware_key": machine_key,
+                    "arch_family": arch_family,
+                    "family": family,
+                    "recipe": recipe,
+                    "run_id": str(run.get("run_id") or ""),
+                    "split": split,
+                    "source_class": "measured",
+                    "die": "",
+                    "package_tree": "",
+                    "shape": dict(geometry["shape"]),
+                    "elements": None,
+                    "flops": geometry["flops"],
+                    "hbm_bytes": geometry["hbm_bytes"],
+                    "duration_ms": duration,
+                    "dtype": "bf16",
+                    "timing_scope": MC2_GROUPED_SCOPE,
+                    "raw_event_count": max(1, int(best.get("n_samples") or 0)),
+                    "target_estimator": "max_over_ranks_per_rank_median",
+                    "protocol_signature": signature,
+                    "protocol_core_signature": core_signature,
+                    "protocol": dict(declared_protocol, timing_scope=MC2_GROUPED_SCOPE),
+                }
+            )
+        # The separately timed activation: recorded for the chain ledger, never
+        # ingested (it is the ``swiglu`` vector family, not a grouped compute leg).
+        activation_rows = [
+            item for item in by_leg.get(MC2_ACTIVATION_LEG) or ()
+            if item.get("median_ms") is not None
+        ]
+        if activation_rows:
+            best = max(
+                activation_rows,
+                key=lambda item: (float(item["median_ms"]), int(item.get("rank") or 0)),
+            )
+            legs.append(
+                {
+                    "condition_key": "mc2:%s:%s:%s:%s" % (machine, plan, case_id, MC2_ACTIVATION_LEG),
+                    "machine": machine,
+                    "hardware_key": machine_key,
+                    "campaign": str(best.get("campaign") or ""),
+                    "plan": plan,
+                    "case_id": case_id,
+                    "leg": MC2_ACTIVATION_LEG,
+                    "family": MC2_ACTIVATION_LEG,
+                    "ep": ranks,
+                    "global_experts": experts,
+                    "local_experts": local_experts,
+                    "routed_rows": float(best.get("rows_per_rank") or 0.0),
+                    "duration_ms": float(best["median_ms"]),
+                    "per_rank_medians_ms": {
+                        int(item.get("rank") or 0): float(item["median_ms"])
+                        for item in activation_rows
+                    },
+                    "per_rank_rows": {
+                        int(item.get("rank") or 0): item.get("rows_per_rank")
+                        for item in activation_rows
+                    },
+                    "rank_of_max": int(best.get("rank") or 0),
+                    "samples": int(best.get("n_samples") or 0),
+                    "hidden": hidden,
+                    "intermediate": intermediate,
+                    "ingested": False,
+                }
+            )
+    return {
+        "schema_version": OBSERVATION_SCHEMA,
+        "source": "mc2_grouped_results:%s" % Path(path).name,
+        "source_path": str(Path(path)),
+        "hardware_key": hardware_key,
+        "arch_family": arch_family,
+        "campaigns": sorted(allowed),
+        "recipe": recipe,
+        "protocol": declared_protocol,
+        "protocol_signature": signature,
+        "protocol_core_signature": core_signature,
+        "machines": dict(sorted((str(k), str(v)) for k, v in (value.get("machines") or {}).items())),
+        "machine_keys": dict(sorted(dict(machine_keys).items())),
+        "legs": legs,
         "skipped": skipped,
         "observations": observations,
     }

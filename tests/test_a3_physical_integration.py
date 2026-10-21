@@ -738,6 +738,20 @@ def _large_operator_artifact(
             model_kind="grouped_gemm", timing_scope=PER_CALL,
             launch_ms=0.019, quality="trusted", samples=13,
         )
+    if "moe_mc2" in include:
+        # The same physical family measured twice: the prefill grouped corpus and
+        # the MC2 campaign's own compute legs.  Only the fitted intercept differs,
+        # so a prediction difference is attributable to which row answered.
+        rows[f"moe_gate_up/npu_grouped_matmul_list_bf16"] = _family_row(
+            "moe_gate_up", recipe="npu_grouped_matmul_list_bf16",
+            model_kind="grouped_gemm", timing_scope=PER_CALL,
+            launch_ms=0.019, quality="trusted", samples=15,
+        )
+        rows[f"moe_gate_up/npu_grouped_matmul_list_bf16_mc2"] = _family_row(
+            "moe_gate_up", recipe="npu_grouped_matmul_list_bf16_mc2",
+            model_kind="grouped_gemm", timing_scope=PER_CALL,
+            launch_ms=0.011, quality="trusted", samples=14,
+        )
     if "attention_qk" in include:
         rows[f"attention_qk/{PER_CALL}"] = _family_row(
             "attention_qk", recipe="npu_fusion_attention",
@@ -873,8 +887,14 @@ def test_mc2_compute_never_takes_the_dense_gemm_transfer():
     record = cost.to_dict()["physical"]
     assert record["status"] == PHYSICAL_UNMODELED
     assert "transfer_to" not in record
+    # The MC2-measured recipe is asked first (a fused chunk member launches the
+    # split-item call the MC2 campaign timed), then the prefill grouped spelling,
+    # then the pooled grouped family, then the recipe-agnostic row of each.
     assert [row["family"] for row in record["refused_transfer"]["attempts"]] == [
-        "moe_gate_up", "moe_gate_up", "grouped_matmul", "grouped_matmul",
+        "moe_gate_up", "moe_gate_up", "moe_gate_up", "grouped_matmul", "grouped_matmul",
+    ]
+    assert [row["recipe"] for row in record["refused_transfer"]["attempts"][:2]] == [
+        "npu_grouped_matmul_list_bf16_mc2", "npu_grouped_matmul_list_bf16",
     ]
     assert "gemm" not in {
         row["family"] for row in record["refused_transfer"]["attempts"]
@@ -891,6 +911,32 @@ def test_mc2_compute_never_takes_the_dense_gemm_transfer():
     assert fitted.to_dict()["physical"]["transfer_to"] == {
         "family": "grouped_matmul", "recipe": "npu_grouped_matmul_list_bf16",
     }
+
+
+def test_mc2_compute_prefers_the_mc2_measured_recipe_row():
+    """A fused chunk member is priced by the kernel the MC2 campaign timed.
+
+    Both rows describe the same grouped family at the same geometry; the MC2 row
+    was fitted on the split-item legs of the fused chunk, the other on the prefill
+    grouped corpus.  The MC2 op must take the MC2 row, and an op that does not
+    declare the MC2 marker must keep the prefill row.
+    """
+    artifact = _large_operator_artifact(include=("moe_mc2",))
+    shape = {"tokens": 2048, "experts": 32, "n": 4096, "k": 7168}
+    mc2 = cost_model(artifact).cost(grouped_op(**shape, recipe="moe_mc2"))
+    record = mc2.to_dict()["physical"]
+    assert record["status"] == PHYSICAL_CALIBRATED
+    assert record["transfer_to"] == {
+        "family": "moe_gate_up", "recipe": "npu_grouped_matmul_list_bf16_mc2",
+    }
+    prefill = cost_model(artifact).cost(
+        grouped_op(**shape, recipe="catalog_npu_grouped_matmul")
+    )
+    prefill_record = prefill.to_dict()["physical"]
+    assert prefill_record["transfer_to"]["recipe"] == "npu_grouped_matmul_list_bf16"
+    # Identical efficiencies and geometry, different measured intercept: the whole
+    # difference between the two estimates is the two fitted launches.
+    assert mc2.estimated_ms - prefill.estimated_ms == pytest.approx(0.011 - 0.019, rel=1e-9)
 
 
 def test_attention_resolves_at_the_per_call_scope_and_refuses_another_scope():

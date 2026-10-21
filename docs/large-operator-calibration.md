@@ -107,18 +107,23 @@ artefact and is marked, not fitted.
 
 After the attention and decode fixes, the model reproduces:
 
-| metric (c=1) | model | measured | error |
+| metric (c=1), `device_event_warm_operator` | model | measured | error |
 | --- | ---: | ---: | ---: |
-| graph TPOT 128 / 1024 / 4096 | 14.97 / 15.29 / 15.58 ms | 15.71 / 15.24 / 15.10 | −4.7 % / +0.3 % / +3.2 % |
-| graph TTFT 4096 | 252.7 ms (+50–66 floor) | 342.6 ms | −7…−12 % after the floor |
+| graph TPOT 128 / 1024 / 4096 | **14.70 / 15.14 / 16.52 ms** | 15.71 / 15.24 / 15.10 | −6.4 % / −0.7 % / +9.4 % |
+| graph TTFT 4096 | 323.0 ms | 342.6 ms | −5.7 % (per-call scope; the batched scope gives 252.7 ms) |
 | graph TTFT 1024 | 75.0 ms | 101.2 ms | floor is 50–66, so operator prefill is +25…+50 % |
-| graph TTFT 128 | 16.6 ms | 50.9 ms | floor dominates; not a prefill error |
+| graph TTFT 128 | 23.6 ms | 50.9 ms | floor dominates; not a prefill error |
 
-Eager TPOT is **not** reproduced (model 12–14 ms vs measured 29–31 ms): eager is
-host-dispatch-bound (~227 kernels × ~60 µs per token) and the current artifact
-does not carry an eager-specific intercept above the measured per-call one. This
-is the main declared residual; graph mode is the deployment mode the model
-targets.
+The batched scope (`device_event_warm_operator_batched_amortized`) brackets the
+same measurements from the other side: graph TPOT 14.64 / 14.68 / 14.83 ms
+(−6.8 % / −3.7 % / −1.8 %). Its prefill is under-costed (252.7 ms at 4096), which
+is why the per-call/operator scope is the declared one.
+
+Eager TPOT is **not** reproduced (model 18.9 / 19.3 / 20.7 ms vs measured
+31.3 / 30.1 / 29.0 ms): eager is host-dispatch-bound (~227 kernels × ~60–70 µs per
+token) and the artifact carries no eager-specific intercept above the measured
+per-call one, so the model still charges ~20 µs. This is the main declared
+residual; graph mode is the deployment mode the model targets.
 
 ### The bug that dominated the pre-fix whole-network error
 
@@ -136,16 +141,44 @@ The pre-fix comparison (frozen separately) measured TTFT MAPE +76.2 %, TPOT
 −10.1 %, E2E +17.2 % across all 16 scenarios; the post-fix table is appended to
 `.workstreams/e2e-comparison/report.md`.
 
-### Decode bandwidth rule
+### Decode weight streaming and the replayed-graph launch
 
-The batched GEMM row had `eta_memory 0.979` (≈1.17 TB/s), over-optimistic for a
-14.2 GiB weight sweep. The artifact now applies a declared streaming rule:
-working set ≥8× L2 gets no L2 credit, and a family that never measured that
-regime is priced at the measured **1.01 TB/s** (`eta_memory_effective 0.842`,
-`streaming_measured: false`). Graph TPOT 12.66 → 15.58 ms at 4096, matching the
-measured 15.10 ms. The regime has 0 training rows, so this is a declared
-measured bound, not a CV-selected parameter; a separate `decode_gemv` family
-cannot reach the 6-sample minimum and is not fitted.
+A decode step streams **13.55 GiB** of weights (14.21 GiB decimal) but the L2
+blend credited **9 372 MiB of it (69 %) at 4.8 TB/s**, worth ~9.5 ms of the 15.1 ms
+the stream takes: `min(bytes, l2_usable)` credits a 25–259 MiB per-op weight
+tensor even though its next use is one token — 13.5 GiB of traffic — away, so L2
+(192 MiB) can hold at most 1.4 % of it. The `≥8× L2` cap could not fire: no
+*single* op streams 1.5 GiB.
+
+The rule is now per op, declared and shape-only
+(`a3_physical_calibration.weight_stream_basis`): a dense GEMM with
+`m ≤ 128` (one or two activation row tiles), weights ≥ 4× its activation bytes and
+weights ≥ 1/8 of the family's fitted resident prefix is a **weight stream** — no
+L2 credit, priced at the part's measured streaming bound
+(`STREAMING_BW_BYTES_PER_S`: A3 **1.01 TB/s**, A2 **471 GB/s**, the low end of its
+measured 471–955 GB/s decode band). A family that never measured the regime takes
+that bound; one that did keeps its fitted efficiency; a part with neither uses its
+declared peak, flagged. `rmsnorm`'s 0.8 MiB working set keeps its blend. Every op
+reports `memory_regime`, `l2_credit_bytes`, `eta_memory_effective`,
+`streaming_rate_source` and a `streaming_basis` string.
+
+That correction alone makes the model ~3.5 ms/step too *slow* (14.57 ms service
++ 4.75 ms launch = 19.3 ms vs 15.24 measured): the service term now implies
+**0.98–1.00 TB/s**, exactly the measured stream, and the launch term is exposed.
+A replayed bucket (`graph_bucket` set, ACLGraph) submits its 227 kernels from one
+host call, so `a3_cost.GRAPH_KERNEL_LAUNCH_US = 2.5` now charges a declared
+**device dispatch per kernel** (15.10 measured − 14.57 corrected service ≈ 0.53 ms
+/ 227 ≈ 2.3 µs, declared 2.5 µs) instead of the ~20 µs host intercept, reporting
+`launch_detail.composition = "graph_replay_device_launch"`, the replaced
+`host_intercept_ms` and the per-op value. Eager decode keeps the serial host
+intercept and prefill keeps the concurrent one; the MC2 fused chunk, launched by
+the same graph, pays the same device dispatch.
+
+The streaming regime has **0** training rows, so the rate is a declared measured
+bound and not a CV-selected parameter; a separate `decode_gemv` family cannot
+reach the 6-sample minimum and is not fitted, and the two GEMM rows are unchanged
+(samples 367/107, `eta_memory 0.7076/0.9786`, `cv_wape 8.84/11.50 %`). Evidence and
+before/after tables: `.workstreams/model-decode-stream/report.md`.
 
 ## 4. Wiring
 
@@ -162,8 +195,10 @@ cannot reach the 6-sample minimum and is not fitted.
   [1.0, 1.2] with default 1.0 and `max()` flagged as refuted by measurement;
   `ceil(E/128)` launch count; measured per-EP lane (A3 65/32 GB/s e64/e128, A2
   17.5 GB/s); dense-GEMM fallback disabled for MC2.
-* Decode iterations and replayed buckets use a **serial launch composition**, so
-  the engine cannot drop the per-kernel dispatch.
+* Eager decode iterations use a **serial** launch composition so the engine cannot
+  drop the per-kernel host dispatch; a **replayed** bucket charges the declared
+  **device dispatch per kernel** (`graph_replay_device_launch`) because its host
+  submit is amortized across the bucket.
 
 ## 5. Residual gaps (ranked)
 

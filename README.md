@@ -85,9 +85,10 @@ ACLGraph):
 
 * A3 fitted CV: attention **5.47 %**, `moe_gate_up` 10.98 %, `moe_down` 2.36 %,
   grouped matmul 1.65 %, dense GEMM 8.84 % (per-call) / 11.50 % (batched).
-* Whole-network graph mode (after the attention-byte and decode-streaming
-  fixes): TPOT **14.97 / 15.29 / 15.58 ms** for 128 / 1024 / 4096-token prompts
-  vs measured **15.71 / 15.24 / 15.10 ms**.
+* Whole-network graph mode (after the attention-byte, weight-streaming and
+  replayed-graph launch fixes): TPOT **14.70 / 15.14 / 16.52 ms** for
+  128 / 1024 / 4096-token prompts vs measured **15.71 / 15.24 / 15.10 ms**;
+  the batched scope brackets them at 14.64 / 14.68 / 14.83 ms.
 * MC2 is a **sum**, not an overlap: chain = 1.0–1.2× the measured legs.
 * The pre-fix long-prompt error was traced to materialising the attention score
   matrix to HBM (18.15 GB/layer → 0.305 GB/layer); prefill prediction dropped
