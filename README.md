@@ -49,6 +49,13 @@ flowchart TB
 
 ## 快速开始
 
+宿主机资源：大模型长 decode、校准扫参和并发预测应通过 `remote-dev` 在远端 Linux
+服务器运行。本地只运行小规模验证；macOS 的 CLI 与 Python `predict()` 都会在展开
+超预算算子图之前报 `host_capacity_requires_remote`，不要绕过此限制。
+预测默认最多为每个副本保留 4096 个算子的明细，其余步骤明确标记 `detail_omitted`；
+指标和物理校准覆盖统计仍包含全部步骤。只看指标用 `--trace-detail summary`；远端
+确需完整算子证据时用 `--trace-detail full`。`trace_capture` 表示明细是否完整。
+
 ### 方式一：直接把链接发给你的 Agent 自动安装（推荐）
 
 复制下面这句话发给你的 Claude Code、Codex、Kimi Code 或 Cursor，让它自动完成 `mindie-sim` 的安装与校验：

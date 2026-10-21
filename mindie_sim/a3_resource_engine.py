@@ -183,6 +183,28 @@ class ResourceEngine:
         """O(1) lookup in the complete persistent map, independent of deltas."""
         return self.completed_at.get(task_id)
 
+    def discard_completed_history(self, keep: Sequence[str] = ()) -> None:
+        """Release consumed history after a predictive step has copied its delta.
+
+        Keep preparation/draft witnesses explicitly named by the caller plus
+        dependencies of live tasks. Old trace cursors are invalid after this
+        operation. Standalone engine users retain history unless they opt in.
+        """
+        retained = set(keep)
+        for task in self._pending.values():
+            retained.update(task.dependencies)
+        removed = set(self.completed_at) - retained
+        for task_id in removed:
+            self.tasks.pop(task_id, None)
+            self.completed_at.pop(task_id, None)
+            self._outstanding.pop(task_id, None)
+            self._deadline_slack.pop(task_id, None)
+        self.trace = [row for row in self.trace if row.task_id not in removed]
+        kept = [(task_id, time) for task_id, time in
+                zip(self._completion_log, self._completion_times) if task_id not in removed]
+        self._completion_log = [row[0] for row in kept]
+        self._completion_times = [row[1] for row in kept]
+
     # ------------------------------------------------------------------
     # Registration
     # ------------------------------------------------------------------

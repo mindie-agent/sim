@@ -2776,7 +2776,7 @@ def test_draft_query_tokens_are_charged_to_batch_budget_and_itl_scope_is_explici
         "draft_mode": "dspark", "draft_accept_tokens": 5,
     }
     case["workload"]["requests"][0]["prompt_tokens"] = 2
-    result = predict(case)
+    result = predict(case, trace_detail="full")
     assert result["status"] == "modeled"
     q = result["requests"][0]
     assert (q["generated_tokens"], q["computed_tokens"]) == (7, 8)

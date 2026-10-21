@@ -226,6 +226,9 @@ def record_prediction_misses(
     max_requests: int = 256,
 ) -> dict[str, Any]:
     """Opt-in conversion of uncalibrated prediction ops into pending requests."""
+    if any(not row.get("detail_complete", True)
+           for row in prediction.get("trace_capture", ())):
+        raise A3InputError("record_misses_requires_full_trace:rerun_on_server_with_trace_detail_full")
     recorded = 0
     skipped = 0
     seen: set[tuple[Any, ...]] = set()

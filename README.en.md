@@ -49,6 +49,16 @@ flowchart TB
 
 ## Quick Start
 
+Run large-model/long-decode predictions, calibration sweeps and concurrent
+prediction jobs on a remote Linux server through remote-dev. macOS CLI and
+Python `predict()` refuse oversized jobs with `host_capacity_requires_remote`
+before allocating the operator graph. Do not bypass this desktop limit.
+Default traces retain at most 4096 detailed ops per replica; omitted step detail
+is explicit. Metrics and physical-coverage totals include all steps. Use
+`--trace-detail summary` for metrics, or `--trace-detail full` on a server when
+complete op evidence is needed. Check `trace_capture` before treating traces as
+a complete inventory.
+
 ### Option 1: One-Sentence Agent-Native Install (Recommended)
 
 Copy and paste this prompt into Claude Code, Codex, Kimi Code, or Cursor to let your agent install and configure `mindie-sim` automatically:
