@@ -41,6 +41,7 @@ from dataclasses import dataclass, field, fields, replace
 from typing import Any, Mapping, Sequence
 
 from .a3_cost import (
+    LARGE_OPERATOR_FAMILIES,
     PHYSICAL_CALIBRATED, PHYSICAL_LOW_CONFIDENCE, PHYSICAL_UNMODELED,
     CalibrationStore, PredictiveCostModel, communication_placement_for_machine,
     physical_calibration_provenance,
@@ -162,7 +163,87 @@ def _physical_calibration_summary(
     # counted separately so a reader can see how much of the answer is transfer.
     provenance["applied_transfer_op_count"] = sum(transfers.values())
     provenance["transfer_counts"] = dict(sorted(transfers.items()))
+    provenance.update(_wiring_summary(replica_results))
     return provenance
+
+
+def _wiring_summary(
+    replica_results: Sequence[Mapping[str, Any]],
+) -> dict[str, Any]:
+    """Large-operator wiring status of the whole prediction.
+
+    Every trace op is classified into the closed wiring vocabulary
+    (``physical_calibrated`` / ``physical_transfer`` / ``mc2_overlap_unverified``
+    / ``mc2_overlap_calibrated`` / ``unmodeled``) and the large-operator families
+    are counted separately, so "the big operators are wired" is visible without
+    walking the traces.  The MC2 path is counted on its own: a model with MoE must
+    show it.
+    """
+    wiring: dict[str, int] = {}
+    large: dict[str, int] = {}
+    by_family: dict[str, int] = {}
+    scope_aliases: dict[str, int] = {}
+    mc2_ops = 0
+    modeled_ms = 0.0
+    applied_ms = 0.0
+    large_ms = 0.0
+    large_applied_ms = 0.0
+    for result in replica_results:
+        for trace in result.get("traces", ()) or ():
+            for op in trace.get("ops", ()) or ():
+                family = str(op.get("family") or "")
+                mc2 = op.get("mc2") if isinstance(op.get("mc2"), Mapping) else None
+                record = op.get("physical")
+                if mc2 is not None:
+                    status = str(mc2.get("wiring_status") or "")
+                    mc2_ops += 1
+                elif isinstance(record, Mapping):
+                    status = str(dict(record.get("wiring") or {}).get("status") or "")
+                else:
+                    status = ""
+                if not status:
+                    status = PHYSICAL_UNMODELED
+                wiring[status] = wiring.get(status, 0) + 1
+                alias = dict(
+                    (record or {}).get("scope_alias") or {}
+                ) if isinstance(record, Mapping) else {}
+                if alias:
+                    key = f"{alias.get('from')}->{alias.get('to')}"
+                    scope_aliases[key] = scope_aliases.get(key, 0) + 1
+                estimated = float(op.get("estimated_ms") or 0.0)
+                modeled_ms += estimated
+                applied = bool(isinstance(record, Mapping) and record.get("applied"))
+                if applied:
+                    applied_ms += estimated
+                if family in LARGE_OPERATOR_FAMILIES:
+                    large[status] = large.get(status, 0) + 1
+                    by_family[family] = by_family.get(family, 0) + 1
+                    large_ms += estimated
+                    if applied:
+                        large_applied_ms += estimated
+    return {
+        "wiring_counts": dict(sorted(wiring.items())),
+        "large_operator_wiring_counts": dict(sorted(large.items())),
+        "large_operator_family_counts": dict(sorted(by_family.items())),
+        "mc2_op_count": mc2_ops,
+        # Ops the artifact answered through the declared timing-scope family (a
+        # ``device_event_warm`` case reaching a ``device_event_warm_operator``
+        # row).  Reported per pair: a scope alias is a protocol sibling, not an
+        # exact measurement, and a reader has to see how much of the prediction
+        # rests on it.
+        "scope_alias_counts": dict(sorted(scope_aliases.items())),
+        # The share the whole-network prediction rests on: how much of the modelled
+        # duration came from a fitted row rather than the analytic formula.
+        "modeled_duration_ms": modeled_ms,
+        "physical_applied_duration_ms": applied_ms,
+        "physical_applied_duration_share": (
+            applied_ms / modeled_ms if modeled_ms else 0.0
+        ),
+        "large_operator_duration_ms": large_ms,
+        "large_operator_applied_duration_share": (
+            large_applied_ms / large_ms if large_ms else 0.0
+        ),
+    }
 
 
 
@@ -276,6 +357,13 @@ class _ReplicaRunner:
                 case.runtime.curve_allow_primitive_transfer
             ),
             graph_mode=case.runtime.graph_mode,
+            # Graph replay amortizes the host submit across a bucket.  The ratio is
+            # a measured protocol property, so it is declared by the case
+            # (``runtime.metadata.launch_amortization``) instead of invented here;
+            # eager per-op submission stays 1.0.
+            launch_amortization=float(
+                dict(case.runtime.metadata).get("launch_amortization", 1.0) or 1.0
+            ),
             calibration_protocol=_calibration_protocol(case),
             physical_calibration=self.physical_calibration,
         )
@@ -527,6 +615,12 @@ class _ReplicaRunner:
                 "competition": {},
                 "analytic_ms": cost.analytic_ms if cost is not None else None,
                 "estimated_ms": cost.estimated_ms if cost is not None else None,
+                # The additive decomposition of ``estimated_ms``: the dispatch
+                # intercept and the kernel service it precedes.  A whole-network
+                # reader needs both to separate launch-bound from
+                # bandwidth-bound iterations.
+                "launch_ms": cost.launch_ms if cost is not None else None,
+                "service_ms": cost.service_ms if cost is not None else None,
                 "calibration_status": cost.calibration.status if cost is not None else "injected_backend",
                 "calibration_evidence": (
                     dict(cost.calibration.evidence)
@@ -539,6 +633,18 @@ class _ReplicaRunner:
                 "physical": (
                     dict(cost.physical)
                     if cost is not None and cost.physical else None
+                ),
+                # MC2 chunk provenance: dispatch/combine bytes and lane, the
+                # grouped-matmul compute term, both overlap bounds and whether
+                # the overlap is measured.  ``None`` for every non-MC2 op.
+                "mc2": (
+                    dict(cost.mc2) if cost is not None and cost.mc2 else None
+                ),
+                # A grouped matmul pays one dispatch intercept per tensor-list
+                # launch (128-expert cap); the count is reported, not folded in.
+                "launch_detail": (
+                    dict(cost.launch_detail)
+                    if cost is not None and cost.launch_detail else None
                 ),
             })
         return result

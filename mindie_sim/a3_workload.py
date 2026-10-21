@@ -38,6 +38,12 @@ from .a3_types import (
 
 DEFAULT_TOKEN_ALIGN = 32
 DEFAULT_HEAD_ALIGN = 16
+#: Query rows one pass of a flash-attention style kernel covers.  The fused kernel
+#: re-streams K/V once per query tile, so this tile is the multiplier of the KV
+#: read volume -- never the number of (query, key) pairs.
+ATTENTION_QUERY_TILE = 128
+#: Softmax vector work per score element, kept inside the fused attention kernel.
+ATTENTION_SOFTMAX_OPS_PER_ELEMENT = 5.0
 
 
 @dataclass(frozen=True)
@@ -163,6 +169,25 @@ def _attention_pair(
     *, prefix: str, view: RequestView, stage: int, layer: int, model: ModelSpec,
     parallel: ParallelSpec, runtime: RuntimeSpec, deps: tuple[str, ...], recipe: str,
 ) -> tuple[list[OpSpec], str]:
+    """The attention kernel for one request view.
+
+    A served attention kernel is *fused*: QK^T, the softmax and PV run on chip, so
+    the score/probability matrix is never written to HBM and K/V are streamed once
+    per **query tile**, not once per (query, key) pair.  The op therefore carries
+    ``flops = QK + PV`` and a byte model of
+
+    * Q read: ``q*heads*qk_dim*bytes``
+    * K/V read: ``ceil(q/q_tile) * kv_len * kv_heads*(qk_dim+v_dim)*bytes``
+    * O write: ``q*heads*v_dim*bytes``
+
+    The softmax stays as an on-chip vector term inside the fused kernel
+    (``ATTENTION_SOFTMAX_OPS_PER_ELEMENT`` per score), not as a separate memory
+    pass.  A caller that wants the decomposed QK / softmax / PV lowering -- only
+    useful to inspect the split, since no served kernel writes probabilities to
+    HBM -- declares ``runtime.metadata.attention_decomposition = "qk_softmax_pv"``;
+    that path charges the same tiled K/V traffic, each half reading only its own
+    operand, and no HBM probability traffic.
+    """
     dtype = model.activation_dtype
     local_heads = max(1, model.num_heads // parallel.tp)
     local_kv_heads = model.local_kv_heads(parallel.tp)
@@ -182,58 +207,115 @@ def _attention_pair(
     if model.attention == "gqa":
         qk_dim = model.head_dim
         v_dim = model.head_dim
-        kv_bytes_per_token = 2 * local_kv_heads * model.head_dim * dtype_bytes(model.kv_dtype)
     else:
         assert model.mla is not None
         qk_dim = model.mla.qk_head_dim
         v_dim = model.mla.v_head_dim
-        kv_bytes_per_token = (model.mla.kv_lora_rank + model.mla.qk_rope_head_dim) * dtype_bytes(model.kv_dtype)
     # ``pairs`` already sums over all query rows.  Do not multiply by q again.
     qk_flops = 2.0 * local_heads * local_pairs * qk_dim
     pv_flops = 2.0 * local_heads * local_pairs * v_dim
-    q_bytes = q_effective * local_heads * qk_dim * dtype_bytes(dtype)
-    kv_read = local_pairs * kv_bytes_per_token
-    out_bytes = q_effective * local_heads * v_dim * dtype_bytes(dtype)
     local_kv_len = max(1, math.ceil(view.kv_len / max(1, parallel.dcp)))
-    probability_bytes = q_effective * local_heads * local_kv_len * 2.0
-    qk_bytes = q_bytes + kv_read + probability_bytes
-    pv_bytes = probability_bytes + kv_read + out_bytes
+    # KV is re-streamed per query tile (a flash-attention style loop), not per
+    # query row: `ceil(q/q_tile)` passes over the cache, each reading K and V once.
+    kv_tiles = max(1, math.ceil(q_effective / ATTENTION_QUERY_TILE))
+    kv_bytes = dtype_bytes(model.kv_dtype)
+    activation_bytes = dtype_bytes(dtype)
+    q_read = q_effective * local_heads * qk_dim * activation_bytes
+    out_write = q_effective * local_heads * v_dim * activation_bytes
+    k_read = kv_tiles * local_kv_len * local_kv_heads * qk_dim * kv_bytes
+    v_read = kv_tiles * local_kv_len * local_kv_heads * v_dim * kv_bytes
+    softmax_elements = max(1, int(q_effective * local_heads * local_kv_len))
+    notes = (
+        "attention_pairs=context+q(q+1)/2",
+        "fused_scores_and_probabilities_stay_on_chip",
+        "kv_streamed_once_per_query_tile",
+    )
+    metadata = (
+        ("attention_query_tile", ATTENTION_QUERY_TILE),
+        ("attention_kv_tiles", kv_tiles),
+        ("attention_fused", True),
+        ("q_tile_traffic_bytes", k_read + v_read),
+        ("probability_hbm_bytes", 0.0),
+    )
+    decomposed = str(
+        dict(runtime.metadata).get("attention_decomposition", "")
+    ).strip() == "qk_softmax_pv"
+    if not decomposed:
+        return [
+            _op(
+                op_id=f"{prefix}.attn", family="attention_fused",
+                phase=view.phase, stage=stage, layer=layer,
+                requests=(view.request_id,),
+                semantic_shape=(q_effective, view.kv_len, local_heads, qk_dim),
+                local_shape=(q_effective, local_kv_len, local_heads, qk_dim),
+                padded_shape=(
+                    align_up(q_effective, DEFAULT_HEAD_ALIGN),
+                    align_up(local_kv_len, DEFAULT_HEAD_ALIGN),
+                    local_heads, qk_dim,
+                ),
+                launch_shape=(q_effective, local_kv_len, local_heads, qk_dim),
+                flops=qk_flops + pv_flops,
+                vector_ops=(
+                    float(softmax_elements) * ATTENTION_SOFTMAX_OPS_PER_ELEMENT
+                ),
+                hbm_bytes=q_read + k_read + v_read + out_write,
+                mte2_bytes=q_read + k_read + v_read,
+                mte3_bytes=out_write,
+                deps=deps, recipe=f"{recipe}:fused", notes=notes, dtype=dtype,
+                metadata=metadata + (
+                    ("attention_softmax_vector_ops",
+                     float(softmax_elements) * ATTENTION_SOFTMAX_OPS_PER_ELEMENT),
+                    ("qk_dim", qk_dim), ("v_dim", v_dim),
+                ),
+            ),
+        ], f"{prefix}.attn"
+    # Decomposed lowering (inspection / measurement of the halves only).
     op_qk = _op(
         op_id=f"{prefix}.qk", family="attention_qk", phase=view.phase, stage=stage,
         layer=layer, requests=(view.request_id,),
         semantic_shape=(q_effective, view.kv_len, local_heads, qk_dim),
-        local_shape=(q_effective, max(1, math.ceil(view.kv_len / parallel.dcp)), local_heads, qk_dim),
-        padded_shape=(align_up(q_effective, DEFAULT_HEAD_ALIGN),
-                      align_up(int(math.ceil(view.kv_len / parallel.dcp)), DEFAULT_HEAD_ALIGN),
-                      local_heads, qk_dim),
-        launch_shape=(q_effective, max(1, math.ceil(view.kv_len / parallel.dcp)), local_heads, qk_dim),
-        flops=qk_flops, hbm_bytes=qk_bytes, mte2_bytes=kv_read + q_bytes,
-        mte3_bytes=probability_bytes, deps=deps,
-        recipe=f"{recipe}:qk", notes=("attention_pairs=context+q(q+1)/2",),
-        dtype=dtype,
+        local_shape=(q_effective, local_kv_len, local_heads, qk_dim),
+        padded_shape=(
+            align_up(q_effective, DEFAULT_HEAD_ALIGN),
+            align_up(local_kv_len, DEFAULT_HEAD_ALIGN),
+            local_heads, qk_dim,
+        ),
+        launch_shape=(q_effective, local_kv_len, local_heads, qk_dim),
+        flops=qk_flops, hbm_bytes=q_read + k_read, mte2_bytes=q_read + k_read,
+        mte3_bytes=0.0, deps=deps, recipe=f"{recipe}:qk", notes=notes,
+        dtype=dtype, metadata=metadata,
     )
-    op_softmax = _vec_op(
-        op_id=f"{prefix}.softmax", deps=(op_qk.op_id,), stage=stage, layer=layer,
+    # The softmax runs on chip: its vector work is real, its memory traffic is not
+    # an HBM score-matrix pass.
+    op_softmax = _op(
+        op_id=f"{prefix}.softmax", family="attention_softmax",
+        phase=view.phase, stage=stage, layer=layer,
         requests=(view.request_id,),
-        elements=max(1, int(q_effective * local_heads * local_kv_len)),
-        ops_per_element=5.0, dtype="fp32", family="attention_softmax",
-        phase=view.phase, recipe=f"{recipe}:softmax",
-        shape=(q_effective, local_heads, local_kv_len),
+        semantic_shape=(q_effective, local_heads, local_kv_len),
+        local_shape=(q_effective, local_heads, local_kv_len),
+        padded_shape=(align_up(softmax_elements, 256),),
+        launch_shape=(align_up(softmax_elements, 256),),
+        vector_ops=float(softmax_elements) * ATTENTION_SOFTMAX_OPS_PER_ELEMENT,
+        hbm_bytes=0.0, mte2_bytes=0.0, mte3_bytes=0.0,
+        deps=(op_qk.op_id,), recipe=f"{recipe}:softmax",
+        notes=("softmax_on_chip_no_hbm_score_matrix",), dtype="fp32",
+        metadata=metadata,
     )
     op_pv = _op(
         op_id=f"{prefix}.pv", family="attention_pv", phase=view.phase, stage=stage,
         layer=layer, requests=(view.request_id,),
         semantic_shape=(q_effective, view.kv_len, local_heads, v_dim),
-        local_shape=(q_effective, max(1, math.ceil(view.kv_len / parallel.dcp)), local_heads, v_dim),
-        padded_shape=(align_up(q_effective, DEFAULT_HEAD_ALIGN),
-                      align_up(int(math.ceil(view.kv_len / parallel.dcp)), DEFAULT_HEAD_ALIGN),
-                      local_heads, v_dim),
-        launch_shape=(q_effective, max(1, math.ceil(view.kv_len / parallel.dcp)), local_heads, v_dim),
-        flops=pv_flops, hbm_bytes=pv_bytes,
-        mte2_bytes=probability_bytes + kv_read,
-        mte3_bytes=out_bytes, deps=(op_softmax.op_id,),
-        recipe=f"{recipe}:pv", notes=("attention_pv_formula=2*Q*KV*H*Vdim",),
-        dtype=dtype,
+        local_shape=(q_effective, local_kv_len, local_heads, v_dim),
+        padded_shape=(
+            align_up(q_effective, DEFAULT_HEAD_ALIGN),
+            align_up(local_kv_len, DEFAULT_HEAD_ALIGN),
+            local_heads, v_dim,
+        ),
+        launch_shape=(q_effective, local_kv_len, local_heads, v_dim),
+        flops=pv_flops, hbm_bytes=v_read + out_write, mte2_bytes=v_read,
+        mte3_bytes=out_write, deps=(op_softmax.op_id,),
+        recipe=f"{recipe}:pv", notes=notes + ("attention_pv_formula=2*Q*KV*H*Vdim",),
+        dtype=dtype, metadata=metadata,
     )
     return [op_qk, op_softmax, op_pv], op_pv.op_id
 

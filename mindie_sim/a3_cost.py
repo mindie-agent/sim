@@ -33,6 +33,25 @@
     artifact does not model falls back to the analytic/curve path with the
     artifact's own reason, and a family whose fitted parameters are labelled
     unidentified keeps the analytic path and says so.
+  * A graph family name is mapped onto a fitted family only through the declared
+    transfer table, and the mapping is physical: ``elementwise`` is the ``add``
+    kernel, ``router_softmax`` is the ``softmax`` kernel, and a projection named
+    ``linear_*_projection`` is the measured ``gemm`` kernel.  An attention
+    kernel, the grouped expert GEMM, an embedding and a sampling op are never
+    written off as a dense GEMM.
+  * MC2 is a fused kernel, so it is costed as one unit: its dispatch/combine
+    volume is ``tokens*top_k*hidden*dtype_bytes`` per replica, scaled by the EP
+    group factor ``(ep-1)/ep``; its compute is the grouped-matmul duration (the
+    fitted row when the artifact has one, else the analytic roofline), and its
+    duration is ``launch + compute + comm - overlap*min(compute, comm)`` with an
+    explicit overlap fraction -- ``0`` is the serial bound and ``1`` is
+    ``launch + max(compute, comm)``.  Both bounds are reported, and an unverified
+    overlap keeps the serial bound as the primary estimate instead of being
+    replaced by a midpoint.  The dense-GEMM transfer is never applied to MC2 on
+    top of that.
+  * A grouped matmul pays one dispatch intercept per ``tensorList`` launch: the
+    list API caps a launch at :data:`GROUPED_LAUNCH_EXPERT_CAP` experts, so a
+    256- or 384-expert layer is two or three launches, never one.
   * Revision/commit fields are excluded from the semantic calibration key.
     Changing a source revision for an identical semantic case cannot make the
     estimate unavailable.
@@ -74,6 +93,11 @@ GEMM_TRANSFER_FAMILIES = {
     "qkv_projection", "o_projection", "gate_up_projection", "down_projection",
     "mla_q_a", "mla_kv_a", "mla_q_b", "mla_kv_b", "moe_gate_up",
     "moe_down", "shared_expert_gate_up", "shared_expert_down", "logits", "gemm",
+    # Gated/linear attention blocks name their projections ``linear_*``.  They
+    # are the measured GEMM kernel when the op declares GEMM work
+    # (:data:`PHYSICAL_GEMM_SHAPED_ONLY` keeps the vector gates out).
+    "linear_q_projection", "linear_k_projection", "linear_v_projection",
+    "linear_o_projection", "linear_gate", "linear_output_gate",
 }
 VECTOR_FAMILIES = {
     "rmsnorm", "attention_softmax", "embedding", "sampling", "dequant",
@@ -482,6 +506,20 @@ class CostedOp:
     #: parameter quality/level.  ``None`` when no artifact was supplied, so the
     #: analytic/curve record is exactly what it was before.
     physical: Mapping[str, Any] | None = None
+    #: MC2 fused-kernel record for an op that belongs to an MC2 chunk: the
+    #: dispatch/combine bytes and lane, the grouped-matmul compute term, the
+    #: serial/overlapped bounds and the overlap provenance.  ``None`` for every
+    #: op that is not part of an MC2 chunk.
+    mc2: Mapping[str, Any] | None = None
+    #: Why the dispatch term is more than one launch (the grouped-matmul
+    #: tensor-list expert cap), or ``None`` for a single-launch op.
+    launch_detail: Mapping[str, Any] | None = None
+    #: The kernel's *service* work, before any launch folding.  ``demands`` is what
+    #: the engine schedules (the dispatch intercept folded into the service window
+    #: when the composition is serial); this is the same work without it, so a
+    #: consumer that re-prices a fused kernel (MC2 chunk composition) scales from
+    #: the service and not from an already-folded demand.
+    service_demands: tuple[tuple[str, float], ...] = ()
 
     def demand_map(self) -> dict[str, float]:
         return dict(self.demands)
@@ -496,6 +534,11 @@ class CostedOp:
             "curve_result": dict(self.curve_result) if self.curve_result else None,
             "coverage": self.coverage, "recipe": self.op.recipe,
             "physical": dict(self.physical) if self.physical else None,
+            "mc2": dict(self.mc2) if self.mc2 else None,
+            "launch_detail": (
+                dict(self.launch_detail) if self.launch_detail else None
+            ),
+            "service_demands": dict(self.service_demands),
         }
 
 
@@ -716,6 +759,144 @@ PHYSICAL_LOW_CONFIDENCE_ANALYTIC_FAMILIES: frozenset[str] = frozenset(
 #: (empty today).
 PHYSICAL_ANALYTIC_PREFERRED_FAMILIES: frozenset[str] = frozenset()
 
+#: Wiring status of an op whose duration came from a fitted row that belongs to a
+#: *different* artifact family (a declared transfer target).  It is a calibration
+#: status only in the loose sense: the op's own identity was not measured, and the
+#: wiring says so next to ``physical.status``.
+PHYSICAL_TRANSFER = "physical_transfer"
+#: Families whose duration dominates a large-model iteration.  Their wiring is
+#: reported separately from the launch-band tail, because a large operator that
+#: silently stays analytic changes the whole-network prediction while a small one
+#: does not.  ``moe_gate_up``/``moe_down``/``grouped_matmul``/``mc2`` are the MoE
+#: path; ``attention_*`` is the attention path; the projections are the GEMM path.
+LARGE_OPERATOR_FAMILIES: frozenset[str] = frozenset({
+    "mc2", "grouped_matmul", "moe_gate_up", "moe_down",
+    "shared_expert_gate_up", "shared_expert_down",
+    "attention_fused", "attention_qk", "attention_pv",
+    "gemm", "qkv_projection", "o_projection", "gate_up_projection",
+    "down_projection", "mla_q_a", "mla_kv_a", "mla_q_b", "mla_kv_b",
+    "linear_q_projection", "linear_k_projection", "linear_v_projection",
+    "linear_o_projection", "logits",
+})
+#: Operating-class token reported next to the wiring status, so a reader can tell
+#: which large-operator family a status belongs to without a family table.
+LARGE_OPERATOR_CLASSES: dict[str, str] = {
+    "mc2": "mc2", "moe_gate_up": "grouped_matmul", "moe_down": "grouped_matmul",
+    "grouped_matmul": "grouped_matmul", "shared_expert_gate_up": "grouped_matmul",
+    "shared_expert_down": "grouped_matmul",
+    "attention_fused": "attention", "attention_qk": "attention",
+    "attention_pv": "attention",
+}
+
+
+def operator_class(family: str) -> str:
+    """Declared operating class of a cost-model family."""
+    key = str(family or "")
+    if key in LARGE_OPERATOR_CLASSES:
+        return LARGE_OPERATOR_CLASSES[key]
+    if key in GEMM_TRANSFER_FAMILIES or key in {"logits"}:
+        return "gemm"
+    if key in {"allreduce", "ep_dispatch", "ep_combine", "pp_p2p", "kv_transfer",
+               "dcp_allgather"}:
+        return "communication"
+    return "vector"
+
+
+def physical_wiring(record: Mapping[str, Any] | None) -> dict[str, Any]:
+    """Large-operator physical/wiring status of one costed op.
+
+    The vocabulary is closed and small so a trace reader (or a test) can assert
+    it: ``physical_calibrated`` (the artifact's own row ran), ``physical_transfer``
+    (a declared sibling row ran), ``mc2_overlap_unverified`` (the op is an MC2
+    chunk member whose fused overlap has no measured verification),
+    ``mc2_overlap_calibrated`` (a fitted chain factor on a measured lane) and
+    ``unmodeled`` (everything else, including "no artifact configured" and "a
+    fitted row exists but does not replace the estimate").  The MC2 token names
+    are kept for provenance stability: ``*_unverified`` now means the fused
+    chain's factor is a declared assumption, not a measured one.  The artifact's
+    own status stays in ``physical_status`` for anyone who needs the finer label.
+    """
+    if not record:
+        return {
+            "status": PHYSICAL_UNMODELED, "physical_status": "",
+            "reason": "no_physical_record",
+        }
+    status = str(record.get("status") or "")
+    applied = bool(record.get("applied"))
+    base = {
+        "physical_status": status,
+        "artifact_family": str(dict(record.get("query") or {}).get("family") or ""),
+    }
+    # A row reached through the declared timing-scope family is a protocol sibling,
+    # not an exact measurement: name the hop on every branch that reports it.
+    scope_alias = dict(record.get("scope_alias") or {})
+    if scope_alias:
+        base = {
+            **base,
+            "scope_alias_from": str(scope_alias.get("from") or ""),
+            "scope_alias_to": str(scope_alias.get("to") or ""),
+        }
+    if applied and record.get("transfer_from"):
+        return {
+            **base,
+            "status": PHYSICAL_TRANSFER,
+            "reason": str(record.get("detail") or "declared_family_transfer"),
+            "artifact_family": str(
+                dict(record.get("transfer_to") or {}).get("family") or ""
+            ),
+            "artifact_recipe": str(
+                dict(record.get("transfer_to") or {}).get("recipe") or ""
+            ),
+        }
+    if applied and status == PHYSICAL_CALIBRATED:
+        return {
+            **base,
+            "status": PHYSICAL_CALIBRATED,
+            "reason": str(record.get("detail") or "fitted_row"),
+        }
+    attempts = [
+        dict(row) for row in
+        (record.get("refused_transfer") or {}).get("attempts", ()) or ()
+    ]
+    reason = str(record.get("reason") or record.get("detail") or status)
+    outcome = {
+        **base,
+        "status": PHYSICAL_UNMODELED,
+        "reason": reason,
+    }
+    if attempts:
+        # The artifact's own refusal per attempted target: a mapping that exists
+        # but finds no row (wrong scope / fp32 op against a bf16 fit) is a
+        # different finding from a family that was never mapped at all.
+        outcome["transfer_attempts"] = attempts
+        outcome["reason"] = reason + ";transfer_attempts=" + ",".join(
+            f"{row.get('family')}/{row.get('recipe') or '*'}:{row.get('reason')}"
+            for row in attempts
+        )
+    return outcome
+
+
+def op_family(query: Mapping[str, Any]) -> str:
+    """Cost-model family named by a physical query (``""`` when absent)."""
+    return str(query.get("family") or "")
+
+
+def physical_transfer_eligible(op: Any) -> bool:
+    """Whether a declared family transfer may price this op.
+
+    A ``linear_gate``/``linear_output_gate`` op is a matrix projection in a gated
+    attention block but a *vector* gate kernel in a linear-attention block; only
+    the GEMM-shaped op may be priced by the measured dense GEMM.  Every other
+    declared transfer target is shape-agnostic (an op with no ``m/n/k`` is refused
+    by the artifact itself, with its own reason).
+    """
+    if str(getattr(op, "family", "") or "") not in PHYSICAL_GEMM_SHAPED_ONLY:
+        return True
+    shape = tuple(getattr(op, "launch_shape", ()) or ())
+    return float(getattr(op, "flops", 0.0) or 0.0) > 0 and len(shape) >= 3
+
+
+
 # ---------------------------------------------------------------------------
 # Declared physical transfer map
 # ---------------------------------------------------------------------------
@@ -726,9 +907,9 @@ PHYSICAL_ANALYTIC_PREFERRED_FAMILIES: frozenset[str] = frozenset()
 #: physical kernel as the measured ``gemm`` family, so a cost-model family with
 #: no row of its own may be priced by a *declared* transfer target.  The transfer
 #: is always recorded on the op (``physical.transfer_from``) and counted in the
-#: provenance; it is never silent, and families with no fitted model are absent
-#: on purpose (``attention_qk``/``attention_pv``/``attention_fused`` are
-#: attention kernels, ``embedding``/``sampling``/``swiglu`` have no fit).
+#: provenance; it is never silent.  Families with no fitted model are absent on
+#: purpose (``attention_qk``/``attention_pv`` are half kernels, ``embedding``,
+#: ``sampling`` and the collectives have no fit).
 #:
 #: Recipes are selected by the declared timing scope: a ``batched`` scope lists
 #: the batched-protocol recipes first, everything else the per-call recipes first.
@@ -757,6 +938,40 @@ PHYSICAL_TRANSFER_TARGETS: dict[str, dict[str, tuple[str, ...]]] = {
     "quantize": {
         "batched": ("npu_dynamic_quant",), "per_call": ("npu_dynamic_quant",),
     },
+    # The grouped expert GEMM is its own measured kernel (``npu_grouped_matmul``
+    # list API), not a stack of dense GEMMs.  The A3 heldout corpus measures it
+    # both under the routed-family name and under the pooled ``grouped_matmul``
+    # name, so both fitted spellings are declared candidates.
+    "grouped_matmul": {
+        "batched": ("npu_grouped_matmul_list_bf16",),
+        "per_call": ("npu_grouped_matmul_list_bf16",),
+    },
+    "moe_gate_up": {
+        "batched": ("npu_grouped_matmul_list_bf16",),
+        "per_call": ("npu_grouped_matmul_list_bf16",),
+    },
+    "moe_down": {
+        "batched": ("npu_grouped_matmul_list_bf16",),
+        "per_call": ("npu_grouped_matmul_list_bf16",),
+    },
+    # A fused attention kernel is measured with ``npu_fusion_attention`` (which
+    # is a whole QK+PV call).  Only the *fused* family may claim that row: the
+    # separate QK and PV halves are never priced by a whole-kernel measurement.
+    "attention_fused": {
+        "batched": ("npu_fusion_attention",),
+        "per_call": ("npu_fusion_attention",),
+    },
+    # The halves are their own fitted attention families.  They resolve to the
+    # same-named artifact family only: a QK op is never answered by the PV or the
+    # fused row, and no attention op is ever answered by a GEMM row.
+    "attention_qk": {
+        "batched": ("npu_fusion_attention",),
+        "per_call": ("npu_fusion_attention",),
+    },
+    "attention_pv": {
+        "batched": ("npu_fusion_attention",),
+        "per_call": ("npu_fusion_attention",),
+    },
 }
 #: Artifact family each transfer target belongs to (``attention_softmax`` is the
 #: measured ``softmax`` family; every GEMM projection family is ``gemm``).
@@ -768,33 +983,112 @@ PHYSICAL_TRANSFER_ARTIFACT_FAMILY: dict[str, str] = {
     "copy": "copy",
     "swiglu": "swiglu",
     "quantize": "quantize",
+    "grouped_matmul": "grouped_matmul",
+    "moe_gate_up": "moe_gate_up",
+    "moe_down": "moe_down",
+    "attention_fused": "attention_fused",
+    "attention_qk": "attention_qk",
+    "attention_pv": "attention_pv",
 }
-#: Cost-model aliases that are the same physical family.
-PHYSICAL_TRANSFER_ALIASES: dict[str, str] = {"copy_bytes": "copy"}
+#: Ordered *further* targets of the same physical kernel, each keeping its own
+#: artifact family and recipe spelling.  A grouped expert GEMM is fitted under its
+#: routed family or under the pooled ``grouped_matmul`` family; the dense GEMM row
+#: is the last declared approximation for a *non-MC2* grouped GEMM (it is the same
+#: ``torch.mm``/``aclnn`` cube work at the same total geometry, and the existing
+#: acceptance corpus counts it as applied).  An MC2 op refuses the dense-GEMM
+#: target: its damage is priced by the fused kernel, not by a second GEMM model.
+PHYSICAL_TRANSFER_FALLBACK_TARGETS: dict[str, tuple[str, ...]] = {
+    "moe_gate_up": ("grouped_matmul", "gemm"),
+    "moe_down": ("grouped_matmul", "gemm"),
+}
+#: Cost-model aliases that are the same physical family.  ``elementwise`` is the
+#: graph name of the measured add family and ``router_softmax`` is a softmax over
+#: the expert axis (the ``softmax`` artifact family, aliased through the declared
+#: ``attention_softmax`` entry).
+PHYSICAL_TRANSFER_ALIASES: dict[str, str] = {
+    "copy_bytes": "copy",
+    "elementwise": "add",
+    "router_softmax": "attention_softmax",
+}
+#: Families that are the measured GEMM kernel only when the op actually declares
+#: GEMM work.  ``linear_gate``/``linear_output_gate`` name a matrix projection in
+#: a gated attention block but a *vector* gate kernel in a linear-attention
+#: block; a 1-D op is not a GEMM and must not be priced as one.
+PHYSICAL_GEMM_SHAPED_ONLY: frozenset[str] = frozenset(
+    {"linear_gate", "linear_output_gate"}
+)
+#: Artifact family of the dense-GEMM transfer target, named once so the MC2
+#: suppression rule cannot silently stop matching.
+PHYSICAL_GEMM_ARTIFACT_FAMILY = "gemm"
+#: Measured kernels this cost model cannot represent, mapped to the reason.  The
+#: campaign measures a fused ``npu_grouped_matmul_swiglu_quant`` kernel: pricing it
+#: as a plain grouped matmul *plus* a separate activation would double count the
+#: fused epilogue, and pricing it as a plain grouped matmul would drop the
+#: activation work.  Such an op is reported unmodeled with that reason instead of
+#: being silently priced as something it is not.
+PHYSICAL_UNEXPRESSIBLE_RECIPES: dict[str, str] = {
+    "npu_grouped_matmul_swiglu_quant":
+        "fused_grouped_matmul_swiglu_quant_epilogue_not_expressible",
+}
+#: Recipe spelling of an artifact row that declares *no* runner recipe.  Such a
+#: row is a fit keyed by family/timing scope only (the routed-expert rows of the
+#: A3 artifact are spelled that way); it is the last declared candidate for its own
+#: family and is always reported as the transfer target it is.
+PHYSICAL_TRANSFER_ANY_RECIPE = ""
 
 
 def physical_transfer_target(
-    family: str, timing_scope: str,
+    family: str, timing_scope: str, *, allow_dense_gemm: bool = True,
 ) -> tuple[tuple[str, str], ...] | None:
     """Ordered ``(artifact family, artifact recipe)`` candidates for a family.
 
-    ``None`` means "no fitted model exists for this family": attention
-    (``attention_qk``/``attention_pv``/``attention_fused`` is not a GEMM),
-    ``embedding``, ``sampling`` and the communication families stay unmodeled with
-    the artifact's own reason.  The first candidate is the recipe the declared
-    timing scope names; the rest are the other SKU's declared spelling of the same
-    physical family, tried in order.
+    ``None`` means "no fitted model exists for this family": the QK/PV attention
+    halves (a half kernel is not the measured fused call), ``embedding``,
+    ``sampling`` and the communication families stay unmodeled with the artifact's
+    own reason.  The first candidate is the artifact family and recipe the
+    declared timing scope names; the rest are the other declared spellings of the
+    same physical kernel, tried in order, ending with the recipe-agnostic row of
+    the same family.
+
+    ``allow_dense_gemm=False`` drops the dense-GEMM fallback target.  That is the
+    MC2 rule: an MC2 chunk's compute is priced inside the fused kernel, so a second
+    GEMM model may not be applied on top of it.
     """
-    key = PHYSICAL_TRANSFER_ALIASES.get(str(family or ""), str(family or ""))
-    if key in GEMM_TRANSFER_FAMILIES:
+    declared = str(family or "")
+    alias = PHYSICAL_TRANSFER_ALIASES.get(declared)
+    key = alias or declared
+    if key not in PHYSICAL_TRANSFER_TARGETS and key in GEMM_TRANSFER_FAMILIES:
+        # No entry of its own: a projection/MLP GEMM is the measured gemm kernel.
         key = "gemm"
-    target = PHYSICAL_TRANSFER_TARGETS.get(key)
-    if target is None:
-        return None
     scope = str(timing_scope or "").lower()
-    recipes = target["batched"] if "batched" in scope else target["per_call"]
-    artifact_family = PHYSICAL_TRANSFER_ARTIFACT_FAMILY.get(key, key)
-    return tuple((artifact_family, recipe) for recipe in recipes)
+    keys = (key, *PHYSICAL_TRANSFER_FALLBACK_TARGETS.get(key, ()))
+    candidates: list[tuple[str, str]] = []
+    # A graph family that resolves to the *pooled* dense-GEMM declaration may still
+    # have measured rows of its own (``qkv_projection``, ``mla_q_a``, ...), so its
+    # own name is asked first and the pooled rows follow.  A family whose artifact
+    # family is itself (``rmsnorm``, ``softmax``, ``attention_fused``) or that is a
+    # declared alias (``elementwise`` -> ``add``) needs no extra hop.
+    primary_artifact_family = PHYSICAL_TRANSFER_ARTIFACT_FAMILY.get(key, key)
+    if (
+        declared and not alias
+        and primary_artifact_family == PHYSICAL_GEMM_ARTIFACT_FAMILY
+        and declared != PHYSICAL_GEMM_ARTIFACT_FAMILY
+    ):
+        target = PHYSICAL_TRANSFER_TARGETS.get(key) or PHYSICAL_TRANSFER_TARGETS["gemm"]
+        own_recipes = target["batched"] if "batched" in scope else target["per_call"]
+        candidates.extend((declared, recipe) for recipe in own_recipes)
+        candidates.append((declared, PHYSICAL_TRANSFER_ANY_RECIPE))
+    for target_key in keys:
+        target = PHYSICAL_TRANSFER_TARGETS.get(target_key)
+        if target is None:
+            continue
+        artifact_family = PHYSICAL_TRANSFER_ARTIFACT_FAMILY.get(target_key, target_key)
+        if not allow_dense_gemm and artifact_family == PHYSICAL_GEMM_ARTIFACT_FAMILY:
+            continue
+        recipes = target["batched"] if "batched" in scope else target["per_call"]
+        candidates.extend((artifact_family, recipe) for recipe in recipes)
+        candidates.append((artifact_family, PHYSICAL_TRANSFER_ANY_RECIPE))
+    return tuple(candidates) or None
 
 
 def physical_prediction_policy(explained: Any) -> tuple[str, str]:
@@ -904,6 +1198,243 @@ from .a3_precision import (  # noqa: E402  (public aliases kept for callers)
 )
 
 
+# ---------------------------------------------------------------------------
+# MC2: dispatch/combine traffic overlapped with the grouped matmul
+# ---------------------------------------------------------------------------
+#: MC2 is a fused kernel: one launch covers dispatch, the grouped expert GEMMs
+#: and combine.  A chunk's compute and its communication therefore run inside the
+#: same kernel, so the op decomposition the graph declares (dispatch -> GEMM ->
+#: combine) is folded back into one overlap-aware estimate
+#: (:meth:`PredictiveCostModel.compose_mc2`).
+MC2_OVERLAP_UNVERIFIED = "mc2_overlap_unverified"
+MC2_OVERLAP_CALIBRATED = "mc2_overlap_calibrated"
+MC2_NO_COMMUNICATION = "mc2_no_communication"
+#: Recipes the MoE lowering emits for an MC2 layer.  ``moe_mc2_swiglu`` is
+#: deliberately absent: the activation is its own vector kernel and is not part of
+#: the fused dispatch/GMM/combine window.
+MC2_RECIPES: frozenset[str] = frozenset(
+    {"moe_mc2", "mc2", "mc2_dispatch", "mc2_combine"}
+)
+MC2_FAMILIES: frozenset[str] = frozenset({"mc2"})
+MC2_DISPATCH_FAMILIES: frozenset[str] = frozenset({"ep_dispatch"})
+MC2_COMBINE_FAMILIES: frozenset[str] = frozenset({"ep_combine"})
+#: Families whose duration is for the measured ``npu_grouped_matmul`` kernel.
+#: The list API accepts at most :data:`GROUPED_LAUNCH_EXPERT_CAP` experts per
+#: ``tensorList``, so a routed group above the cap needs ceil(experts/cap)
+#: sequential launches -- a 256-expert layer is two launches, not one.
+GROUPED_MATMUL_FAMILIES: frozenset[str] = frozenset(
+    {"moe_gate_up", "moe_down", "grouped_matmul"}
+)
+GROUPED_LAUNCH_EXPERT_CAP = 128
+#: Keys the lowering uses to declare how many experts one grouped call covers,
+#: most specific first (``group_size`` is the per-op expert count; ``local_experts``
+#: is the layer's total and only answers when nothing narrower is declared).
+GROUPED_EXPERT_METADATA_KEYS: tuple[str, ...] = (
+    "group_size", "group_experts", "experts", "num_experts_local", "local_experts",
+)
+#: Families whose duration is the fused kernel's *compute* term (the grouped
+#: matmul).  Everything else in a chunk is communication or bookkeeping.
+MC2_COMPUTE_FAMILIES: frozenset[str] = frozenset(
+    {"moe_gate_up", "moe_down", "grouped_matmul", "mc2"}
+)
+#: Families that declare the layer's batch geometry as a ``(tokens, hidden)``
+#: shape.  The MC2 barrier is the one the lowering always emits next to the
+#: chunk; a norm/allreduce/add carrier is accepted for graphs that omit it.
+MC2_TOKEN_CARRIER_FAMILIES: frozenset[str] = frozenset(
+    {"barrier", "allreduce", "dcp_allgather", "elementwise", "cache_store"}
+)
+#: Measured spread of the fused chain against the sum of its legs (A3 0.95-1.18x,
+#: A2 ~1.00x, 17 campaign jobs / 686 rows).  ``chain_factor`` is bounded by this
+#: declared range: below 1.0 would claim an overlap the measurement does not show,
+#: above 1.2 would claim a penalty it does not show either.
+MC2_CHAIN_FACTOR_BOUNDS: tuple[float, float] = (1.0, 1.2)
+
+#: The comm lane an MC2 all-to-all is priced on: a two-rank point-to-point lane
+#: (the same lane the existing EP dispatch/combine path prices).  Group scaling
+#: is the ``(ep-1)/ep`` volume factor, not a per-rank lane change.
+MC2_LANE_MODE = "p2p_only"
+MC2_LANE_TIMING_SCOPE = "communication_lane"
+MC2_LANE_RANKS = 2
+MC2_BYTES_FORMULA = "tokens*top_k*hidden*dtype_bytes"
+
+
+def is_mc2_op(op: Any) -> bool:
+    """True for an op the MoE lowering marked as part of an MC2 fused layer."""
+    family = str(getattr(op, "family", "") or "")
+    recipe = str(getattr(op, "recipe", "") or "")
+    return family in MC2_FAMILIES or recipe in MC2_RECIPES
+
+
+def _mc2_int(value: Any) -> int:
+    """Declared integer metadata, or ``0`` when the field is absent/unparsable."""
+    if value is None or isinstance(value, bool):
+        return 0
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return 0
+
+
+def grouped_expert_count(op: Any) -> int:
+    """Experts one grouped-matmul op covers, from its declared grouping."""
+    metadata = dict(getattr(op, "metadata", ()) or {})
+    for key in GROUPED_EXPERT_METADATA_KEYS:
+        declared = _mc2_int(metadata.get(key))
+        if declared > 0:
+            return declared
+    per_expert = metadata.get("expert_tokens")
+    if isinstance(per_expert, (tuple, list)) and per_expert:
+        return len(per_expert)
+    return 1
+
+
+def grouped_matmul_launch_count(op: Any) -> int:
+    """Sequential ``npu_grouped_matmul`` launches this op costs.
+
+    The list API caps one ``tensorList`` at :data:`GROUPED_LAUNCH_EXPERT_CAP`
+    experts; a wider routed group is issued as ceil(experts/cap) calls, each
+    paying the declared dispatch intercept.  A 256- or 384-expert layer must not
+    be priced as a single launch.
+    """
+    if str(getattr(op, "family", "") or "") not in GROUPED_MATMUL_FAMILIES:
+        return 1
+    experts = max(1, grouped_expert_count(op))
+    return max(1, math.ceil(experts / GROUPED_LAUNCH_EXPERT_CAP))
+
+
+def mc2_chunk_expert_count(ops: Sequence[OpSpec]) -> int:
+    """Local experts the MC2 chunk's fused grouped matmul covers.
+
+    The lowering declares the chunk's expert ids on its dispatch op; a chunk that
+    does not declare them falls back to the widest per-op grouping.  The fused
+    kernel issues one grouped matmul over that whole list, so the tensor-list cap
+    applies to the chunk's expert count, not to one expert at a time.
+    """
+    for op in ops:
+        declared = dict(getattr(op, "metadata", ()) or ()).get("experts")
+        if isinstance(declared, (tuple, list)) and declared:
+            return len(declared)
+    return max([grouped_expert_count(op) for op in ops] or [1])
+
+
+def mc2_chunk_key(op: Any) -> tuple[int, int, int] | None:
+    """``(stage, layer, chunk)`` identity of an MC2 op, else ``None``.
+
+    The chunk is the fused kernel's unit: one dispatch, one grouped GEMM per
+    local expert and one combine.  Ops of independent chunks never share a
+    kernel, and ops of different layers never do either.
+    """
+    if not is_mc2_op(op):
+        return None
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    try:
+        chunk = int(metadata.get("mc2_chunk", 0))
+    except (TypeError, ValueError):
+        chunk = 0
+    return (int(getattr(op, "stage", 0) or 0), int(getattr(op, "layer", 0) or 0), chunk)
+
+
+def mc2_comm_bytes(
+    *, tokens: float, top_k: int, hidden: float, dtype_bytes_value: float,
+    ep_size: int,
+) -> tuple[float, float]:
+    """``(payload_bytes, link_bytes)`` of one MC2 direction.
+
+    ``payload_bytes`` is the routed activation a replica exchanges in one
+    direction (``tokens*top_k*hidden*dtype_bytes``).  An all-to-all sends
+    ``(ep-1)/ep`` of it to other ranks, which is the D2D link volume; an EP group
+    of one has no traffic.
+    """
+    payload = (
+        max(0.0, float(tokens)) * max(0, int(top_k))
+        * max(0.0, float(hidden)) * max(0.0, float(dtype_bytes_value))
+    )
+    group = max(1, int(ep_size))
+    return payload, payload * (group - 1) / group
+
+
+def mc2_time_bounds(
+    *, launch_ms: float, compute_ms: float, comm_ms: float,
+    chain_factor: float = 1.0,
+) -> dict[str, float]:
+    """Bounds of one fused MC2 kernel under the *measured* chain contract.
+
+    The completed A3/A2 campaign (17 jobs, 686 rows) measured the fused chain
+    against the sum of its independently measured legs: 0.95-1.18x on A3
+    (ep2/ep4/ep8, 64/128 experts) and ~1.00x on A2.  The chain is therefore
+    ``launch + (compute + comm) * chain_factor`` -- it never collapses to
+    ``launch + max(compute, comm)``, which the campaign refutes by ~35 % at
+    ep2/e64:
+
+    * ``legs_ms`` = ``launch + compute + comm`` -- the campaign's own baseline
+      (``chain_factor = 1.0``); this is the default and the primary estimate;
+    * ``upper_ms`` = ``launch + (compute + comm) * 1.2`` -- the declared campaign
+      ceiling (:data:`MC2_CHAIN_FACTOR_BOUNDS`), reported so a reader sees the
+      measured spread rather than one number;
+    * ``max_bound_ms`` = ``launch + max(compute, comm)`` -- the full-overlap bound,
+      reported for reference only and flagged ``max_bound_refuted_by_measurement``;
+      it is never the estimate.
+    """
+    launch = max(0.0, float(launch_ms))
+    compute = max(0.0, float(compute_ms))
+    comm = max(0.0, float(comm_ms))
+    factor = min(
+        MC2_CHAIN_FACTOR_BOUNDS[1],
+        max(MC2_CHAIN_FACTOR_BOUNDS[0], float(chain_factor)),
+    )
+    return {
+        "launch_ms": launch,
+        "compute_ms": compute,
+        "comm_ms": comm,
+        "chain_factor": factor,
+        "legs_ms": launch + compute + comm,
+        "serial_ms": launch + compute + comm,
+        "upper_ms": launch + (compute + comm) * MC2_CHAIN_FACTOR_BOUNDS[1],
+        "max_bound_ms": launch + max(compute, comm),
+        "max_bound_refuted_by_measurement": True,
+        "estimated_ms": launch + (compute + comm) * factor,
+    }
+
+
+def communication_lane_curve(
+    calibration: Any, *, placement: str, hardware_key: str, dtype: str,
+    model: "PredictiveCostModel", ranks: int = MC2_LANE_RANKS,
+) -> tuple[float, float, str]:
+    """``(alpha_ms, beta_ms_per_byte, note)`` of the measured comm lane.
+
+    ``alpha``/``beta`` are the intercept and slope of the affine lane fit the
+    communication calibration already applies (``span = alpha + beta*bytes``).
+    The lane is returned only when a *measured* curve exists for this machine and
+    fabric: ``note`` names why it does not, and the caller then prices the lane
+    analytically instead of inventing a curve.
+    """
+    curve = getattr(calibration, "_curve", None)
+    if not callable(curve):
+        return 0.0, 0.0, "comm_curve_api_unavailable"
+    intercept, slope = curve(
+        placement, MC2_LANE_MODE,
+        hardware_key=hardware_key, timing_scope=MC2_LANE_TIMING_SCOPE,
+        ranks=int(ranks), dtype=dtype, algorithm=MC2_LANE_MODE,
+        execution_backend=model.communication_backend,
+        observed_execution=model.communication_observed_backend,
+        collective="send_recv", group_size=int(ranks),
+        route=model.communication_route,
+        timing_completion=model.communication_timing_completion,
+        requested_aiv_cores=model.communication_requested_aiv_cores or None,
+        observed_aiv_cores=model.communication_observed_aiv_cores or None,
+        algorithm_regime=model.communication_algorithm_regime,
+        topology_class=model.communication_topology_class,
+        in_place=(
+            model.communication_in_place if model.communication_in_place else None
+        ),
+    )
+    intercept = max(0.0, float(intercept))
+    slope = max(0.0, float(slope))
+    if intercept + slope <= 0:
+        return 0.0, 0.0, "no_measured_lane_curve_for_fabric"
+    return intercept, slope, ""
+
+
 @dataclass
 class PredictiveCostModel:
     machine: MachineSpec
@@ -953,6 +1484,33 @@ class PredictiveCostModel:
     #: op's own family/recipe.  The transfer is always recorded on the op and
     #: counted in the provenance; set ``False`` to demand an exact row.
     physical_allow_family_transfer: bool = True
+    #: Measured chain factor of the MC2 fused kernel:
+    #: ``t = launch + (compute + comm) * chain_factor``.  The completed campaign
+    #: measured the chain at 0.95-1.18x the sum of its legs on A3 and ~1.00x on A2
+    #: (17 jobs, 686 rows) -- there is no overlap to claim, and
+    #: ``launch + max(compute, comm)`` is refuted by ~35 % at ep2/e64.  The declared
+    #: default is ``1.0`` (the campaign's baseline) and the value is bounded by
+    #: :data:`MC2_CHAIN_FACTOR_BOUNDS`; ``1.2`` is reported as the upper bound on
+    #: every MC2 op.  A value is only called *verified* when it came from a fit and
+    #: the fabric lane is measured.
+    mc2_chain_factor: float = 1.0
+    #: Provenance of :attr:`mc2_chain_factor`: ``declared`` (a model assumption) or
+    #: ``fitted`` (a fitted chain factor supplied by a measurement campaign).
+    mc2_chain_factor_source: str = "declared"
+    #: Declared MC2 EP group size.  ``0`` means "read it from the op metadata, else
+    #: from the graph's declared routed volume"; it is never guessed as 2.
+    mc2_ep_size: int = 0
+    #: How the per-kernel dispatch intercept composes with the kernel's service.
+    #: ``concurrent`` is the declared default and matches the module invariant
+    #: ``estimated_ms = launch + service`` with the launch carried as its own demand
+    #: (the engine serves a task's demands concurrently, so an eager per-op submit
+    #: lets a kernel's dispatch overlap its own service).  ``serial`` folds the
+    #: intercept into the service demand so the engine cannot drop it;
+    #: ``cost_iteration`` selects it for an iteration the workload actually
+    #: *replayed* (``work.graph_bucket`` is not ``None``), because a replayed bucket
+    #: issues its kernels' device dispatch gaps in sequence even though the host
+    #: submit is amortized.
+    launch_composition: str = "concurrent"
 
     def calibration_features(self) -> dict[str, str]:
         return {
@@ -992,15 +1550,46 @@ class PredictiveCostModel:
         calibration layer will later replace it with a fitted value per
         hardware key).  A link op also pays the fabric's fixed setup latency,
         which is part of its dispatch, not of its steady-state bandwidth.
+        A grouped matmul pays one intercept *per tensor-list launch*: the list API
+        caps a launch at :data:`GROUPED_LAUNCH_EXPERT_CAP` experts, so a wider
+        routed group is several sequential calls (:meth:`grouped_launch_detail`).
         """
         die = self.machine.dies[0] if self.machine.dies else None
         dispatch = (
             float(getattr(die, "launch_us", 0.0) or 0.0) / 1000.0
             * max(0.0, float(self.launch_amortization))
         )
+        dispatch *= grouped_matmul_launch_count(op)
         if op.link_bytes > 0 and link is not None:
             dispatch += float(link.latency_us) / 1000.0
         return dispatch
+
+    def grouped_launch_detail(self, op: OpSpec) -> dict[str, Any] | None:
+        """Why a grouped matmul costs more than one launch (``None`` otherwise).
+
+        The declared per-expert tensor-list cap is a hardware contract of the
+        ``npu_grouped_matmul`` list API, so it is reported instead of being folded
+        silently into the dispatch number.
+        """
+        launches = grouped_matmul_launch_count(op)
+        if launches <= 1 and str(op.family) not in GROUPED_MATMUL_FAMILIES:
+            return None
+        die = self.machine.dies[0] if self.machine.dies else None
+        per_launch = (
+            float(getattr(die, "launch_us", 0.0) or 0.0) / 1000.0
+            * max(0.0, float(self.launch_amortization))
+        )
+        return {
+            "launches": int(launches),
+            "experts": int(grouped_expert_count(op)),
+            "expert_cap_per_launch": GROUPED_LAUNCH_EXPERT_CAP,
+            "per_launch_ms": per_launch,
+            "reason": (
+                "single_launch" if launches == 1 else
+                "npu_grouped_matmul_tensorlist_expert_cap"
+            ),
+            "source": "declared_die.launch_us",
+        }
 
     def machine_key(self) -> str:
         # A real measurement is keyed by the hardware identity, not by the
@@ -1085,6 +1674,12 @@ class PredictiveCostModel:
         else ``op.recipe``), the model's timing scope (a physical protocol
         identity, never inferred), and the shape/work vector.  An unknown family
         stays unknown -- ``attention_qk`` is never relabelled ``gemm``.
+
+        The large-operator families carry axes a dense GEMM does not: an attention
+        kernel is identified by ``(q, kv, heads, dim)`` and a grouped expert GEMM
+        by ``(tokens, experts, n, k)``.  Those axes come from the op's own launch
+        shape and its declared expert grouping, so the artifact can identify the
+        row instead of refusing a shape it could have been given.
         """
         if self.physical_calibration is None:
             return None
@@ -1094,6 +1689,34 @@ class PredictiveCostModel:
         for key in ("m", "n", "k"):
             if key in features:
                 shape[key] = float(features[key])
+        if op.family in _ATTENTION_FAMILIES and len(op.launch_shape) >= 4:
+            q_len, kv_len, heads, dim = (int(value) for value in op.launch_shape[:4])
+            shape.update({
+                "q": float(q_len), "kv": float(kv_len),
+                "heads": float(heads), "dim": float(dim),
+            })
+            # A multi-query prefill chunk is causal; a single query sees the whole
+            # context either way, so it declares the non-causal form.
+            shape["causal"] = 1.0 if q_len > 1 else 0.0
+        if op.family in {"moe_gate_up", "moe_down", "grouped_matmul"}:
+            declared = meta.get("expert_tokens")
+            if isinstance(declared, (tuple, list)):
+                tokens = float(sum(int(value) for value in declared))
+                experts = float(len(declared) or 1)
+            else:
+                tokens = float(
+                    declared if declared is not None
+                    else (op.launch_shape[0] if op.launch_shape else 0)
+                )
+                experts = 1.0
+            group = meta.get("group_size")
+            if group is not None:
+                try:
+                    experts = float(int(group))
+                except (TypeError, ValueError):
+                    experts = 1.0
+            if tokens > 0 and experts > 0:
+                shape.update({"tokens": tokens, "experts": experts})
         declared_shape = meta.get("physical_shape")
         if isinstance(declared_shape, Mapping):
             shape.update({str(key): float(value) for key, value in declared_shape.items()})
@@ -1136,16 +1759,33 @@ class PredictiveCostModel:
           refused, so a "why is this not modeled" answer names both attempts.
 
         ``(None, None, None, None)`` when no artifact is configured.
+
+        An MC2 op never takes the dense-GEMM fallback target: its duration is the
+        fused kernel (:meth:`mc2_chunk_estimate`), so a second GEMM model applied
+        on top of it would double count the same cube work.
         """
         query = self.physical_query(op)
         if query is None:
             return None, None, None, None
+        unexpressible = PHYSICAL_UNEXPRESSIBLE_RECIPES.get(str(op.recipe or ""))
+        if unexpressible:
+            # The op is a fused kernel this module cannot decompose (activation and
+            # quantisation inside the grouped matmul).  Refuse it explicitly rather
+            # than price it as a plain GEMM and a separate activation.
+            return query, self._physical_refusal(query, op, unexpressible), None, None
         explained = self._physical_ask(query, op)
         if explained.modeled:
             return query, explained, None, None
         if not self.physical_allow_family_transfer:
             return query, explained, None, None
-        candidates = physical_transfer_target(op.family, self.timing_scope)
+        if not physical_transfer_eligible(op):
+            # A ``linear_gate``/``linear_output_gate`` op that carries no GEMM
+            # work is a vector gate kernel, not a projection: transferring it onto
+            # the measured dense GEMM would price a vector op as a matmul.
+            return query, explained, None, None
+        candidates = physical_transfer_target(
+            op.family, self.timing_scope, allow_dense_gemm=not is_mc2_op(op),
+        )
         if not candidates:
             return query, explained, None, None
         origin = {
@@ -1171,9 +1811,30 @@ class PredictiveCostModel:
             })
         return query, explained, None, {**origin, "attempts": attempts}
 
+    def _physical_refusal(
+        self, query: Mapping[str, Any], op: OpSpec, reason: str,
+    ) -> Any:
+        """An unmodeled answer this module owes for an unexpressible kernel.
+
+        Shaped like ``a3_physical_calibration.OpPrediction`` so the record,
+        policy and provenance paths are identical; ``duration_ms`` is ``None``, so
+        the analytic/curve path stays primary and the reason is carried through.
+        """
+        from .a3_physical_calibration import OpPrediction
+
+        return OpPrediction(
+            duration_ms=None,
+            status="unmodeled",
+            reason=reason,
+            family=str(query.get("family") or ""),
+            recipe=str(query.get("recipe") or ""),
+            timing_scope=str(query.get("timing_scope") or ""),
+            machine_source="cost_model_declared",
+        )
+
     def _physical_record(
         self, query: Mapping[str, Any], explained: Any, status: str, detail: str,
-        *, applied: bool, superseded: str = "",
+        *, applied: bool, family: str = "", superseded: str = "",
         transfer: Mapping[str, Any] | None = None,
         refused_transfer: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
@@ -1203,6 +1864,23 @@ class PredictiveCostModel:
             record["refused_transfer"] = dict(refused_transfer)
         if superseded:
             record["superseded_calibration_status"] = superseded
+        # Timing-scope identity.  ``timing_scope`` is the scope that actually
+        # priced the op (the fitted row's own scope when the artifact answered
+        # through its declared scope *family*, e.g. a case that declares
+        # ``device_event_warm`` and gets the ``device_event_warm_operator``
+        # attention row).  The declared scope and the alias are reported next to
+        # it so a reader can tell "measured at this protocol" from "measured at a
+        # sibling protocol of the same family".
+        declared_scope = str((query or {}).get("timing_scope") or "")
+        parameters = dict(getattr(explained, "parameters", {}) or {})
+        fitted_scope = str(getattr(explained, "timing_scope", "") or "")
+        record["declared_timing_scope"] = declared_scope
+        record["fitted_timing_scope"] = fitted_scope
+        record["timing_scope"] = fitted_scope or declared_scope
+        scope_from = str(parameters.get("scope_alias_from") or "")
+        scope_to = str(parameters.get("scope_alias_to") or "")
+        if scope_from:
+            record["scope_alias"] = {"from": scope_from, "to": scope_to}
         if status == PHYSICAL_UNMODELED:
             reason = str(explained.reason or "")
             if reason == "unmodeled_recipe_or_protocol":
@@ -1220,11 +1898,20 @@ class PredictiveCostModel:
                 record["available_timing_scopes_for_family"] = sorted({
                     item.timing_scope for item in rows
                 })
+        # The coarse wiring label a trace reader (and ``predict``'s provenance)
+        # aggregates; the artifact's own status stays in ``record["status"]``.
+        record["wiring"] = physical_wiring(record)
+        record["wiring"]["operator_class"] = operator_class(family or op_family(
+            record.get("query") or {},
+        ))
+        record["wiring"]["large_operator"] = (
+            str(family or "") in LARGE_OPERATOR_FAMILIES
+        )
         return record
 
     def _apply_physical(
         self, explained: Any, baseline: Mapping[str, float],
-        capacity: Mapping[str, float],
+        capacity: Mapping[str, float], *, launch_multiplicity: int = 1,
     ) -> dict[str, float]:
         """Analytic busy-resource work re-priced to the fitted duration.
 
@@ -1235,11 +1922,22 @@ class PredictiveCostModel:
         the service part, which is what the engine schedules; the fitted
         breakdown itself is reported on ``CostedOp.physical``.  Launch is never
         added twice: the fitted intercept is the launch term, it is not an extra
-        term on top of ``explained.duration_ms``.
+        term on top of ``explained.duration_ms``.  A grouped matmul whose expert
+        count exceeds the tensor-list cap pays the fitted intercept once per
+        launch (``launch_multiplicity``), because every launch of the list API
+        repeats that intercept.
         """
         fitted_ms = float(explained.duration_ms or 0.0)
         breakdown = dict(getattr(explained, "breakdown", {}) or {})
         fitted_launch = float(breakdown.get("launch_ms") or 0.0)
+        if launch_multiplicity > 1 and fitted_launch > 0:
+            # The fit measured one tensor-list launch; the extra launches repeat
+            # exactly that intercept.  The scaled launch is carried into the
+            # fitted duration so estimated_ms stays launch + service.
+            fitted_launch *= int(launch_multiplicity)
+            fitted_ms += float(breakdown.get("launch_ms") or 0.0) * (
+                int(launch_multiplicity) - 1
+            )
         analytic_launch = float(baseline.get("launch", 0.0) or 0.0)
         analytic_service = max(
             (
@@ -1265,7 +1963,590 @@ class PredictiveCostModel:
             self.physical_calibration, timing_scope=str(self.timing_scope or ""),
         )
 
-    def cost(self, op: OpSpec) -> CostedOp:
+    # -- MC2 fused dispatch/combine + grouped matmul -----------------------
+    def capacity_map(self, link: Any = None) -> dict[str, float]:
+        """Per-resource ceilings (work per millisecond) for this machine.
+
+        One declaration shared by :meth:`cost` and :meth:`compose_mc2`, so an MC2
+        member's fused duration is re-derived with exactly the capacities that
+        priced it.
+        """
+        die = self.machine.dies[0] if self.machine.dies else None
+        if die is None:
+            raise A3InputError("machine_has_no_dies")
+        return {
+            "cube": self.machine.peak_flops_for(self.compute_dtype) / 1000.0,
+            "vector": die.vector_ops_per_s / 1000.0,
+            "hbm": die.hbm_bw_bytes_per_s / 1000.0,
+            "mte2": die.mte_bw_bytes_per_s / 1000.0,
+            "mte3": die.mte_bw_bytes_per_s / 1000.0,
+            "link": (link.capacity_bytes_per_ms if link is not None else 1.0),
+            "launch": 1.0, "cpu": 1.0, "serial": 1.0, "aicpu": 1.0,
+        }
+
+    def _resource_capacity(self, name: str) -> float:
+        return float(self.capacity_map().get(name, 1.0))
+
+    def mc2_link(self, ep_size: int) -> tuple[Any, str, str]:
+        """``(link, scope, note)`` the MC2 traffic is priced on.
+
+        The EP group decides the fabric: a group that spans nodes uses the
+        declared ``d2d_inter_node`` channel when the machine has one, otherwise
+        the ``d2d_intra_node`` fabric, otherwise the machine's single declared
+        fabric.  A machine that declares neither is an explicit error -- MC2
+        traffic is never priced on an arbitrary wire.
+        """
+        ranks_per_node = max(1, int(getattr(self.machine, "ranks_per_node", 1) or 1))
+        order: list[str] = []
+        if int(ep_size) > ranks_per_node:
+            order.append("d2d_inter_node")
+        order.extend(("d2d_intra_node", "d2d"))
+        note = ""
+        for scope in order:
+            try:
+                resolved = self.machine.link_for_scope(scope)
+            except A3InputError:
+                continue
+            if resolved is None:
+                continue
+            if scope == "d2d_intra_node" and int(ep_size) > ranks_per_node:
+                note = (
+                    "ep_group_spans_nodes_but_machine_declares_no_d2d_inter_node_"
+                    "fabric;price_on_intra_node"
+                )
+            return resolved, scope, note
+        raise A3InputError(
+            f"mc2_link_unresolved:ep={int(ep_size)}:"
+            f"links={[link.name for link in self.machine.links]}"
+        )
+
+    def mc2_geometry(
+        self, ops: Sequence[OpSpec], *, layer_ops: Sequence[OpSpec] | None = None,
+    ) -> dict[str, Any]:
+        """Declared geometry of one MC2 chunk.
+
+        Every input of :data:`MC2_BYTES_FORMULA` is reported with where it came
+        from (``*_source``): the op metadata first, then the layer's
+        ``(tokens, hidden)`` carrier op, then the graph's own declared routed
+        volume (:attr:`OpSpec.link_bytes`), then the routed row count.  The
+        chunk's payload is ``tokens*top_k*hidden*dtype_bytes / chunks``; an EP
+        group of ``ep`` sends ``(ep-1)/ep`` of it over the fabric.
+        """
+        chunk_ops = tuple(ops)
+        if not chunk_ops:
+            raise A3InputError("mc2_chunk_empty")
+        metadata: dict[str, Any] = {}
+        for op in chunk_ops:
+            for key, value in dict(op.metadata or ()).items():
+                metadata.setdefault(str(key), value)
+        dispatch = next(
+            (op for op in chunk_ops if op.family in MC2_DISPATCH_FAMILIES), None,
+        )
+        combine = next(
+            (op for op in chunk_ops if op.family in MC2_COMBINE_FAMILIES), None,
+        )
+        anchor = dispatch or combine or chunk_ops[0]
+        shape = tuple(anchor.semantic_shape or ())
+        hidden = _mc2_int(metadata.get("mc2_hidden")) or _mc2_int(
+            metadata.get("hidden")
+        )
+        hidden_source = "declared_metadata" if hidden else ""
+        if not hidden and len(shape) >= 3:
+            hidden, hidden_source = int(shape[2]), "dispatch_shape"
+        if not hidden and len(shape) == 2:
+            hidden, hidden_source = int(shape[1]), "combine_shape"
+        if not hidden:
+            # No dispatch/combine shape to read: the grouped gate/up GEMM's k is
+            # the hidden width (the down GEMM's k is the expert width, so it is
+            # only a last resort).
+            for family in ("moe_gate_up", "grouped_matmul", "moe_down", "mc2"):
+                compute_op = next(
+                    (
+                        op for op in chunk_ops
+                        if op.family == family
+                        and len(op.launch_shape or ()) >= 3
+                    ),
+                    None,
+                )
+                if compute_op is not None:
+                    hidden = int(compute_op.launch_shape[-1])
+                    hidden_source = "grouped_matmul_k"
+                    break
+        top_k = _mc2_int(metadata.get("mc2_top_k")) or _mc2_int(
+            metadata.get("top_k")
+        )
+        top_k_source = "declared_metadata" if top_k else ""
+        if not top_k:
+            if len(shape) >= 3:
+                top_k, top_k_source = int(shape[1]), "dispatch_shape"
+            else:
+                top_k, top_k_source = 1, "no_routed_dimension"
+        top_k = max(1, top_k)
+        hidden = max(0, hidden)
+        chunks = max(1, _mc2_int(metadata.get("mc2_chunks")) or 1)
+        dtype = str(anchor.dtype or self.compute_dtype or "")
+        per_element = dtype_bytes(dtype)
+        declared = max(
+            float(getattr(combine, "link_bytes", 0.0) or 0.0),
+            float(getattr(dispatch, "link_bytes", 0.0) or 0.0),
+        )
+        ep_size = self.mc2_ep_size or _mc2_int(metadata.get("mc2_ep_size")) or _mc2_int(
+            metadata.get("ep_size")
+        ) or _mc2_int(metadata.get("ep"))
+        ep_source = "declared" if ep_size else ""
+        tokens = _mc2_int(metadata.get("mc2_tokens")) or _mc2_int(
+            metadata.get("tokens")
+        )
+        tokens_source = "declared_metadata" if tokens else ""
+        if not tokens and layer_ops is not None and hidden > 0:
+            best = 0
+            for op in layer_ops:
+                if op.family not in MC2_TOKEN_CARRIER_FAMILIES:
+                    continue
+                candidate = tuple(op.semantic_shape or ())
+                if len(candidate) != 2 or int(candidate[1]) != hidden:
+                    continue
+                best = max(best, int(candidate[0]))
+            if best > 0:
+                tokens, tokens_source = best, "layer_token_carrier"
+        # A routed volume the graph already declares pins the batch geometry
+        # exactly: link = tokens*top_k*hidden*bytes*(ep-1)/ep/chunks.
+        if not tokens and declared > 0 and ep_size > 1 and hidden > 0:
+            payload_per_chunk = declared * ep_size / ((ep_size - 1) * chunks)
+            tokens = int(round(payload_per_chunk / (top_k * hidden * per_element)))
+            tokens_source = "inverted_from_declared_link_bytes"
+        if ep_size <= 1 and declared > 0 and tokens > 0 and hidden > 0:
+            payload_per_chunk = tokens * top_k * hidden * per_element / chunks
+            if payload_per_chunk > 0:
+                ratio = declared / payload_per_chunk
+                if 0.0 < ratio < 1.0:
+                    candidate = 1.0 / (1.0 - ratio)
+                    rounded = int(round(candidate))
+                    if rounded >= 2 and abs(candidate - rounded) <= 0.02:
+                        ep_size, ep_source = rounded, "inverted_from_declared_link_bytes"
+        if not tokens:
+            rows = int(shape[0]) if shape else 0
+            if rows > 0:
+                tokens = max(1, int(round(rows / top_k)))
+                tokens_source = "routed_rows_over_top_k"
+            else:
+                tokens, tokens_source = 0, "undeclared"
+        ep_size = max(1, ep_size)
+        if not ep_source:
+            ep_source = "undeclared_single_rank"
+        payload, grouped_link = mc2_comm_bytes(
+            tokens=tokens, top_k=top_k, hidden=hidden,
+            dtype_bytes_value=per_element, ep_size=ep_size,
+        )
+        payload_per_chunk = payload / chunks
+        formula_link = grouped_link / chunks
+        if formula_link > 0:
+            link_bytes, link_source = formula_link, "formula"
+        elif declared > 0:
+            link_bytes, link_source = declared, "graph_declared_routed_volume"
+        else:
+            link_bytes, link_source = 0.0, "no_routed_volume"
+        link_scope: str = ""
+        link_note = ""
+        link = None
+        if link_bytes > 0:
+            link, link_scope, link_note = self.mc2_link(ep_size)
+        return {
+            "bytes_formula": MC2_BYTES_FORMULA,
+            "tokens": float(tokens),
+            "tokens_source": tokens_source,
+            "top_k": int(top_k),
+            "top_k_source": top_k_source,
+            "hidden": float(hidden),
+            "hidden_source": hidden_source,
+            "dtype": dtype,
+            "dtype_bytes": float(per_element),
+            "ep_size": int(ep_size),
+            "ep_source": ep_source,
+            "ep_group_factor": (ep_size - 1) / ep_size,
+            "chunks": int(chunks),
+            "chunk_split": "equal_by_declared_chunk_count",
+            "payload_bytes": float(payload),
+            "payload_bytes_per_chunk": float(payload_per_chunk),
+            "link_bytes": float(link_bytes),
+            "link_bytes_source": link_source,
+            "declared_link_bytes": float(declared),
+            "declared_over_formula": (
+                float(declared / formula_link) if formula_link > 0 else None
+            ),
+            "link_scope": link_scope,
+            "link_name": str(getattr(link, "name", "") or ""),
+            "link_protocol": str(getattr(link, "protocol", "") or ""),
+            "link_note": link_note,
+        }
+
+    def mc2_lane(
+        self, *, link: Any, link_bytes: float, dtype: str, ep_size: int = 0,
+    ) -> dict[str, Any]:
+        """One MC2 direction's lane: ``alpha + beta*bytes`` when measured.
+
+        ``alpha``/``beta`` come from the communication calibration fitted for this
+        machine and fabric.  With no measured lane the wire's declared bandwidth
+        is used (``alpha = 0``) and the record says so, so a zero-``alpha`` lane is
+        never mistaken for a measurement.
+        """
+        placement = str(self.communication_placement or "").strip()
+        if not placement:
+            placement = communication_placement_for_machine(self.machine, link=link)
+        alpha = 0.0
+        beta = 0.0
+        note = "no_communication_calibration"
+        measured_ranks = MC2_LANE_RANKS
+        if self.communication_calibration is not None and placement:
+            # The campaign measures the all-to-all per EP group, so the group's own
+            # lane is asked first; the two-rank lane is the declared fallback for a
+            # machine whose calibration only carries the pair.
+            for ranks in (int(ep_size) if int(ep_size) > 1 else None, MC2_LANE_RANKS):
+                if ranks is None:
+                    continue
+                alpha, beta, note = communication_lane_curve(
+                    self.communication_calibration, placement=placement,
+                    hardware_key=str(self.machine.hardware_key or ""),
+                    dtype=dtype, model=self, ranks=int(ranks),
+                )
+                if alpha + beta > 0 and not note:
+                    measured_ranks = int(ranks)
+                    break
+        measured = alpha + beta > 0 and not note
+        if measured:
+            lane_ms = max(0.0, alpha + beta * max(0.0, float(link_bytes)))
+            source = "measured_comm_curve"
+        else:
+            capacity = float(getattr(link, "capacity_bytes_per_ms", 0.0) or 0.0)
+            lane_ms = float(link_bytes) / capacity if capacity > 0 else 0.0
+            beta = 1.0 / capacity if capacity > 0 else 0.0
+            alpha = 0.0
+            source = "analytic_link_capacity"
+            note = note or "no_measured_lane_curve_for_fabric"
+        return {
+            "placement": placement,
+            "mode": MC2_LANE_MODE,
+            "measured_ranks": int(measured_ranks),
+            "requested_ranks": int(ep_size) if int(ep_size) > 1 else int(MC2_LANE_RANKS),
+            "alpha_ms": float(alpha),
+            "beta_ms_per_byte": float(beta),
+            "link_capacity_bytes_per_ms": float(
+                getattr(link, "capacity_bytes_per_ms", 0.0) or 0.0
+            ),
+            "lane_ms": float(lane_ms),
+            "source": source,
+            "note": note,
+        }
+
+    def mc2_chunk_estimate(
+        self, ops: Sequence[OpSpec], costed: Sequence[CostedOp],
+        *, layer_ops: Sequence[OpSpec] | None = None,
+    ) -> dict[str, Any]:
+        """The fused MC2 kernel's duration for one chunk.
+
+        ``compute`` is the grouped-matmul duration (the fitted duration of each
+        expert GEMM when the artifact models it, else its analytic roofline) and
+        ``comm`` is the measured-or-analytic dispatch + combine lane time.  The
+        duration is ``launch + (compute + comm) * chain_factor``: the measured
+        campaign chain is 1.0-1.2x the sum of its legs, so the legs bound and the
+        campaign ceiling are both reported and the full-overlap
+        ``launch + max(compute, comm)`` is carried only as a refuted reference.
+        """
+        geometry = self.mc2_geometry(ops, layer_ops=layer_ops)
+        compute_members = [
+            (op, cost) for op, cost in zip(ops, costed)
+            if op.family in MC2_COMPUTE_FAMILIES
+        ]
+        compute_ms = sum(max(0.0, float(cost.service_ms)) for _, cost in compute_members)
+        fitted = sum(
+            1 for _, cost in compute_members
+            if cost.physical is not None and bool(cost.physical.get("applied"))
+        )
+        fitted_families = sorted({
+            str(dict(cost.physical.get("query") or {}).get("family") or "")
+            for _, cost in compute_members
+            if cost.physical is not None and bool(cost.physical.get("applied"))
+        })
+        if not compute_members:
+            compute_source = "no_grouped_matmul_member"
+        elif fitted == len(compute_members):
+            compute_source = "fitted_physical"
+        elif fitted == 0:
+            compute_source = "analytic_roofline"
+        else:
+            compute_source = "mixed_fitted_and_analytic"
+        link = None
+        if geometry["link_bytes"] > 0:
+            link, _, _ = self.mc2_link(geometry["ep_size"])
+        lane = self.mc2_lane(
+            link=link, link_bytes=geometry["link_bytes"],
+            dtype=str(ops[0].dtype or self.compute_dtype or ""),
+            ep_size=int(geometry["ep_size"]),
+        )
+        dispatch_ms = lane["lane_ms"]
+        combine_ms = lane["lane_ms"]
+        comm_ms = dispatch_ms + combine_ms
+        measured_lane = lane["source"] == "measured_comm_curve"
+        die = self.machine.dies[0] if self.machine.dies else None
+        # The fused kernel is one launch, except that the grouped matmul inside it
+        # is still capped at one tensor list per GROUPED_LAUNCH_EXPERT_CAP experts:
+        # the chunk's routed expert list decides the launch count.
+        chunk_experts = max(1, mc2_chunk_expert_count(ops))
+        launches = max(1, math.ceil(chunk_experts / GROUPED_LAUNCH_EXPERT_CAP))
+        launch_ms = (
+            float(getattr(die, "launch_us", 0.0) or 0.0) / 1000.0
+            * max(0.0, float(self.launch_amortization))
+            * launches
+        )
+        if not measured_lane and link is not None:
+            # The analytic lane has no fitted intercept, so the fabric's declared
+            # setup latency is the dispatch/combine term.  A measured alpha
+            # already contains it and is never added a second time.
+            launch_ms += 2.0 * float(getattr(link, "latency_us", 0.0) or 0.0) / 1000.0
+        bounds = mc2_time_bounds(
+            launch_ms=launch_ms, compute_ms=compute_ms, comm_ms=comm_ms,
+            chain_factor=self.mc2_chain_factor,
+        )
+        fitted_factor = str(self.mc2_chain_factor_source) == "fitted"
+        verified = measured_lane and fitted_factor
+        if comm_ms <= 0:
+            status = MC2_NO_COMMUNICATION
+            reason = f"mc2_no_communication:{geometry['link_bytes_source']}"
+        elif verified:
+            status = MC2_OVERLAP_CALIBRATED
+            reason = (
+                "mc2_chain_calibrated:fitted_chain_factor_on_measured_lane;"
+                f"lane={lane['placement']};chain_factor={bounds['chain_factor']}"
+            )
+        else:
+            status = MC2_OVERLAP_UNVERIFIED
+            missing = []
+            if not measured_lane:
+                missing.append(f"measured_comm_lane({lane['note']})")
+            if not fitted_factor:
+                missing.append("fitted_chain_factor")
+            reason = (
+                "chain_unverified:missing=" + "+".join(missing)
+                + ";legs_and_upper_bounds_reported"
+                + ";measured_campaign_chain_is_1.0-1.2x_the_leg_sum"
+            )
+        return {
+            "status": status,
+            "wiring_status": status,
+            "operator_class": "mc2",
+            "reason": reason,
+            "chunk": {
+                "stage": int(getattr(ops[0], "stage", 0) or 0),
+                "layer": int(getattr(ops[0], "layer", 0) or 0),
+                "chunk": int(
+                    dict(ops[0].metadata or ()).get("mc2_chunk", 0) or 0
+                ),
+                "chunks": geometry["chunks"],
+            },
+            "geometry": geometry,
+            "compute": {
+                "compute_ms": float(compute_ms),
+                "source": compute_source,
+                "grouped_matmul_members": len(compute_members),
+                "fitted_members": int(fitted),
+                "fitted_artifact_families": fitted_families,
+                # The chunk's fused duration already contains the cube work; the
+                # dense-GEMM transfer is not applied on top of it.
+                "dense_gemm_transfer": "suppressed_for_mc2",
+            },
+            "comm": {
+                "comm_ms": float(comm_ms),
+                "dispatch_ms": float(dispatch_ms),
+                "combine_ms": float(combine_ms),
+                "directions": 2,
+                "lane": lane,
+                "group_scaling": "volume_only",
+            },
+            "chain": {
+                "factor": bounds["chain_factor"],
+                "bounds": list(MC2_CHAIN_FACTOR_BOUNDS),
+                "source": str(self.mc2_chain_factor_source),
+                "verified": bool(verified),
+                "measured_lane": bool(measured_lane),
+                "max_bound_refuted_by_measurement": True,
+            },
+            "bounds": {
+                "launch_ms": bounds["launch_ms"],
+                "launch_count": int(launches),
+                "legs_ms": bounds["legs_ms"],
+                "serial_ms": bounds["serial_ms"],
+                "upper_ms": bounds["upper_ms"],
+                "max_bound_ms": bounds["max_bound_ms"],
+                "estimated_ms": bounds["estimated_ms"],
+                "primary": "legs" if bounds["chain_factor"] <= 1.0 else "chain",
+            },
+        }
+
+    def compose_mc2(
+        self, ops: Sequence[OpSpec], costed: Sequence[CostedOp],
+    ) -> list[CostedOp]:
+        """Fold every MC2 chunk's op decomposition into one fused-kernel cost.
+
+        The graph must keep its dispatch -> expert GEMM -> combine ops (they are
+        real dependencies), but MC2 runs them in one kernel: the chunk's launch is
+        charged once, the grouped-matmul service times are the compute term, the
+        dispatch/combine lane times are the communication term, and the members
+        share the fused duration in proportion to their serial share.
+
+        The communication rides on the *compute* members: their per-resource times
+        become ``compute + (1-overlap)*comm`` and ``comm + (1-overlap)*compute``,
+        whose ``max`` is exactly the fused duration.  The dispatch/combine ops
+        themselves are marked ``absorbed`` with zero marginal duration, so no byte
+        or launch of the same kernel is charged twice.
+        """
+        result = list(costed)
+        groups: dict[tuple[int, int, int], list[int]] = {}
+        for index, op in enumerate(ops):
+            key = mc2_chunk_key(op)
+            if key is not None:
+                groups.setdefault(key, []).append(index)
+        if not groups:
+            return result
+        by_layer: dict[tuple[int, int], list[OpSpec]] = {}
+        for op in ops:
+            by_layer.setdefault((op.stage, op.layer), []).append(op)
+        for key, indices in groups.items():
+            chunk_ops = [ops[index] for index in indices]
+            chunk_costed = [costed[index] for index in indices]
+            estimate = self.mc2_chunk_estimate(
+                chunk_ops, chunk_costed, layer_ops=by_layer.get((key[0], key[1])),
+            )
+            geometry = estimate["geometry"]
+            compute_indices = [
+                index for index, op in zip(indices, chunk_ops)
+                if op.family in MC2_COMPUTE_FAMILIES
+            ]
+            absorbed = [
+                index for index, op in zip(indices, chunk_ops)
+                if op.family not in MC2_COMPUTE_FAMILIES
+            ]
+            total_compute = sum(
+                max(0.0, float(costed[index].service_ms)) for index in compute_indices
+            )
+            if estimate["status"] == MC2_NO_COMMUNICATION or total_compute <= 0:
+                # No peer traffic means no fusion to model: the graph's own
+                # decomposition (one launch per op) is the estimate, and nothing is
+                # absorbed.  The record still says the chunk was seen.
+                for index in indices:
+                    current = costed[index]
+                    is_compute = index in compute_indices
+                    result[index] = replace(
+                        current, mc2={
+                            **estimate,
+                            "role": "compute" if is_compute else "no_communication",
+                            "note": "no MC2 communication to overlap",
+                            "share": 1.0 if is_compute and total_compute <= 0 else 0.0,
+                            "serial_analytic_ms": float(current.estimated_ms),
+                        },
+                    )
+                continue
+            for index in absorbed:
+                current = costed[index]
+                record = (
+                    dict(current.physical) if current.physical is not None else None
+                )
+                if record is not None and record.get("applied"):
+                    record["applied"] = False
+                    record["superseded_by"] = "mc2_fused_chunk"
+                    record["wiring"] = physical_wiring(record)
+                result[index] = replace(
+                    current, demands=(), estimated_ms=0.0, launch_ms=0.0,
+                    service_ms=0.0, physical=record,
+                    mc2={
+                        **estimate,
+                        "role": "absorbed",
+                        "note": (
+                            "dispatch/combine traffic and launch of this op are "
+                            "charged to the MC2 chunk's fused compute members"
+                        ),
+                        "share": 0.0,
+                        "serial_analytic_ms": float(current.estimated_ms),
+                    },
+                )
+            link = None
+            if geometry["link_bytes"] > 0:
+                link, _, _ = self.mc2_link(geometry["ep_size"])
+            capacity = float(getattr(link, "capacity_bytes_per_ms", 0.0) or 0.0)
+            factor = float(estimate["chain"]["factor"])
+            launch_ms = float(estimate["bounds"]["launch_ms"])
+            comm_ms = float(estimate["comm"]["comm_ms"])
+            anchor = compute_indices[0]
+            for index in compute_indices:
+                current = costed[index]
+                service = max(0.0, float(current.service_ms))
+                share = service / total_compute if total_compute > 0 else 0.0
+                comm_share = comm_ms * share
+                launch_share = launch_ms if index == anchor else 0.0
+                # The chain is the *sum* of the legs times the chain factor: the
+                # fused kernel does not overlap compute with its own dispatch.  The
+                # member's local resource carries the whole serial window (leg plus
+                # comm share) so the task's duration is the chain, while the fabric
+                # carries only the real comm share.
+                local_ms = factor * (service + comm_share)
+                link_ms = factor * comm_share
+                target = launch_share + local_ms
+                # Scale from the *service* work (never from an already-folded
+                # demand), so the chunk's own launch is charged exactly once.
+                base_demands = (
+                    current.service_demands
+                    or tuple(
+                        (name, work) for name, work in current.demands
+                        if name not in {"launch", "completion_envelope_ms"}
+                    )
+                )
+                scale = (
+                    local_ms / service if service > 0 and local_ms > 0 else 0.0
+                )
+                window = local_ms + launch_share
+                # Serial launch composition: the fused kernel's dispatch intercept
+                # is folded into the (one) member that carries it, exactly as
+                # ``cost`` folds a single op's intercept.
+                fold = window / local_ms if launch_share > 0 and local_ms > 0 else 1.0
+                demands: dict[str, float] = {
+                    name: float(work) * scale * fold
+                    for name, work in base_demands
+                    if float(work) * scale * fold > 0
+                }
+                demands["launch"] = 0.0
+                if link is not None and link_ms > 0 and capacity > 0:
+                    demands["link"] = link_ms * capacity
+                service_ms = max(
+                    (
+                        work / max(1e-9, self._resource_capacity(name))
+                        for name, work in demands.items() if name != "launch"
+                    ),
+                    default=0.0,
+                )
+                result[index] = replace(
+                    current,
+                    demands=tuple(sorted(demands.items())),
+                    estimated_ms=target,
+                    launch_ms=launch_share,
+                    service_ms=service_ms,
+                    mc2={
+                        **estimate,
+                        "role": "compute",
+                        "share": float(share),
+                        "serial_analytic_ms": float(current.estimated_ms),
+                        "member": {
+                            "compute_ms": float(service),
+                            "comm_ms": float(comm_share),
+                            "local_resource_ms": float(local_ms),
+                            "link_resource_ms": float(link_ms),
+                            "estimated_ms": float(target),
+                        },
+                    },
+                )
+        return result
+
+    def cost(
+        self, op: OpSpec, *, launch_composition: str | None = None,
+    ) -> CostedOp:
         op_metadata = dict(op.metadata)
         if (bool(op_metadata.get("witness_only"))
                 or bool(op_metadata.get("not_execution"))):
@@ -1316,15 +2597,7 @@ class PredictiveCostModel:
                 demands["launch"] = dispatch_ms * scale
             return demands
 
-        capacity = {
-            "cube": self.machine.peak_flops_for(self.compute_dtype) / 1000.0,
-            "vector": die.vector_ops_per_s / 1000.0,
-            "hbm": die.hbm_bw_bytes_per_s / 1000.0,
-            "mte2": die.mte_bw_bytes_per_s / 1000.0,
-            "mte3": die.mte_bw_bytes_per_s / 1000.0,
-            "link": (link.capacity_bytes_per_ms if link is not None else 1.0),
-            "launch": 1.0, "cpu": 1.0, "serial": 1.0, "aicpu": 1.0,
-        }
+        capacity = self.capacity_map(link)
         baseline = build(1.0)
         calibrated = build(factor)
         calibration_status = factor_status
@@ -1595,7 +2868,10 @@ class PredictiveCostModel:
                 "completion_envelope_ms"
             ):
                 superseded = str(calibration_status.status)
-                calibrated = self._apply_physical(physical_explained, baseline, capacity)
+                calibrated = self._apply_physical(
+                    physical_explained, baseline, capacity,
+                    launch_multiplicity=grouped_matmul_launch_count(op),
+                )
                 physical_parameters = dict(physical_explained.parameters or {})
                 transfer_note = ""
                 if physical_transfer is not None:
@@ -1635,7 +2911,7 @@ class PredictiveCostModel:
                 )
             physical_record = self._physical_record(
                 physical_query or {}, physical_explained, decision, detail,
-                applied=applied,
+                applied=applied, family=str(op.family or ""),
                 superseded=str(calibration_status.status)
                 if not applied else "",
                 transfer=physical_transfer, refused_transfer=physical_refused_transfer,
@@ -1645,6 +2921,37 @@ class PredictiveCostModel:
         # ops' dispatch and service; this per-op estimate is the serial bound.
         envelope_ms = float(calibrated.get("completion_envelope_ms", 0.0))
         service_ms = max(service_ms, typed_stage_ms)
+        composition = str(launch_composition or self.launch_composition or "concurrent")
+        launch_detail = self.grouped_launch_detail(op)
+        service_demands = tuple(sorted(
+            (key, float(work)) for key, work in calibrated.items()
+            if key not in {"launch", "completion_envelope_ms"} and float(work) > 0
+        ))
+        if composition == "serial" and envelope_ms <= 0 and launch_ms > 0:
+            # A replayed graph pays each kernel's dispatch gap in sequence: the host
+            # submit is amortized across the bucket, the device dispatch is not.  The
+            # engine serves a task's demands concurrently, so the intercept is folded
+            # into the busiest service demand to keep it additive; ``estimated_ms`` is
+            # unchanged and ``launch_ms`` still reports the term.
+            folded = {
+                key: float(work)
+                for key, work in calibrated.items()
+                if key not in {"launch", "completion_envelope_ms"}
+            }
+            if folded and service_ms > 0:
+                scale = (launch_ms + service_ms) / service_ms
+                calibrated = {
+                    key: value * scale for key, value in folded.items()
+                }
+                calibrated["launch"] = 0.0
+                launch_detail = {
+                    **(launch_detail or {
+                        "launches": 1, "per_launch_ms": launch_ms,
+                        "reason": "single_launch",
+                    }),
+                    "composition": "serial",
+                    "folded_into_service_ms": launch_ms,
+                }
         if envelope_ms > 0:
             # An opaque measured whole span *is* a complete duration that
             # already contains dispatch; adding the intercept on top would
@@ -1659,12 +2966,29 @@ class PredictiveCostModel:
             curve_result=curve,
             launch_ms=launch_ms, service_ms=service_ms,
             physical=physical_record,
+            launch_detail=launch_detail,
+            service_demands=service_demands,
         )
 
     def cost_iteration(self, work: IterationWork) -> list[CostedOp]:
+        """Cost every op, then fold each MC2 chunk into its fused-kernel estimate.
+
+        The MoE lowering keeps dispatch -> grouped GEMM -> combine as separate
+        dependency nodes because they are real scheduling dependencies.  MC2 runs
+        them inside one kernel, so the chunk's overlap has to be computed across
+        those nodes (:meth:`compose_mc2`); a per-op ``cost`` can only report the
+        serial decomposition.
+        """
         if not work.ops:
             raise A3InputError("iteration_work_empty")
-        return [self.cost(op) for op in work.ops]
+        # A kernel stream pays its dispatch gaps in sequence when the kernels are
+        # short and back to back (a decode step) or when the bucket is replayed; a
+        # long prefill kernel's dispatch can overlap its own service instead.
+        replayed = getattr(work, "graph_bucket", None) is not None
+        decode = str(getattr(work, "mode", "") or "") == "decode"
+        composition = "serial" if (replayed or decode) else self.launch_composition
+        costed = [self.cost(op, launch_composition=composition) for op in work.ops]
+        return self.compose_mc2(work.ops, costed)
 
     def hardware_lower_bound_ms(self, work: IterationWork) -> float:
         """Raw resource roofline for this exact DAG; not a normative target.
@@ -1708,7 +3032,20 @@ __all__ = [
     "COMM_PLACEMENT_BY_PROTOCOL", "COMM_PLACEMENT_BY_CHANNEL",
     "communication_placement_for_link", "communication_placement_for_machine",
     "PHYSICAL_CALIBRATED", "PHYSICAL_LOW_CONFIDENCE", "PHYSICAL_UNMODELED",
-    "physical_prediction_policy", "physical_calibration_provenance",
+    "PHYSICAL_TRANSFER", "physical_prediction_policy",
+    "physical_calibration_provenance", "physical_wiring",
     "PHYSICAL_TRANSFER_TARGETS", "PHYSICAL_TRANSFER_ARTIFACT_FAMILY",
+    "PHYSICAL_TRANSFER_FALLBACK_TARGETS", "PHYSICAL_TRANSFER_ALIASES",
+    "PHYSICAL_GEMM_ARTIFACT_FAMILY",
+    "PHYSICAL_GEMM_SHAPED_ONLY", "physical_transfer_eligible",
     "PHYSICAL_LOW_CONFIDENCE_ANALYTIC_FAMILIES", "physical_transfer_target",
+    "LARGE_OPERATOR_FAMILIES", "operator_class",
+    "MC2_OVERLAP_UNVERIFIED", "MC2_OVERLAP_CALIBRATED", "MC2_NO_COMMUNICATION",
+    "MC2_RECIPES", "MC2_FAMILIES", "MC2_COMPUTE_FAMILIES",
+    "MC2_BYTES_FORMULA", "MC2_LANE_RANKS", "MC2_CHAIN_FACTOR_BOUNDS",
+    "PHYSICAL_UNEXPRESSIBLE_RECIPES",
+    "is_mc2_op", "mc2_chunk_key", "mc2_comm_bytes",
+    "mc2_time_bounds", "communication_lane_curve",
+    "GROUPED_MATMUL_FAMILIES", "GROUPED_LAUNCH_EXPERT_CAP",
+    "grouped_expert_count", "grouped_matmul_launch_count",
 ]
