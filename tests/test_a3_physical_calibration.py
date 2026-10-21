@@ -1652,3 +1652,100 @@ def test_mc2_reader_rows_fit_the_mc2_recipe_they_declare(tmp_path):
         and obs["split"] == "train"
         for obs in document["observations"]
     )
+
+
+# ---------------------------------------------------------------------------
+# KV-cache broadcast limit (per-query-head re-read)
+# ---------------------------------------------------------------------------
+def _broadcast_corpus(truth_broadcast, *, mla_rows=True):
+    """Attention corpus whose truth includes a per-query-head KV re-read."""
+    rows = []
+    shapes = [
+        (1024, 1024, 32, 8, 128),
+        (4096, 4096, 32, 8, 128),
+        (16384, 16384, 32, 8, 128),
+        (1, 16384, 32, 8, 128),
+        (2048, 2048, 16, 4, 256),
+        (8192, 8192, 16, 4, 256),
+    ]
+    if mla_rows:
+        shapes += [
+            (1, 4096, 64, 1, 576),
+            (1, 16384, 64, 1, 576),
+            (1, 65536, 64, 1, 576),
+            (4096, 4096, 128, 1, 576),
+            (2048, 2048, 96, 96, 256),
+        ]
+    for index, (q, kv, heads, kv_heads, dim) in enumerate(shapes):
+        v_dim = 512 if dim == 576 else dim
+        visible = kv if not (q > 1 and kv >= q) else max(1.0, kv - (q - 1) / 2.0)
+        base_bytes = (
+            q * heads * dim + kv * kv_heads * (dim + v_dim) + q * heads * v_dim
+        ) * 2.0 + 64.0 * q * heads
+        extra = 0.0
+        if truth_broadcast:
+            effective = max(kv_heads, math.ceil(heads / truth_broadcast))
+            extra = (effective - kv_heads) * kv * (dim + v_dim) * 2.0
+        flops = 2.0 * q * kv * heads * (dim + v_dim)
+        flops_eff = 2.0 * q * visible * heads * (dim + v_dim)
+        compute_ms = flops_eff / (PEAK_FLOPS * ATTENTION_TRUTH["eta_compute"]) * 1000.0
+        memory_ms = (base_bytes + extra) / (PEAK_BW * ATTENTION_TRUTH["eta_memory"]) * 1000.0
+        rows.append(
+            {
+                "condition_key": "bcast-%03d" % index,
+                "hardware_key": MACHINE["hardware_key"],
+                "die": "phy0",
+                "arch_family": "TEST",
+                "family": "attention_fused",
+                "recipe": "npu_fusion_attention",
+                "protocol_signature": "sha256:bcast-fixture",
+                "run_id": "fixture-bcast",
+                "split": "train",
+                "shape": {"q": q, "kv": kv, "heads": heads, "kv_heads": kv_heads,
+                          "dim": dim, "v_dim": v_dim, "causal": q > 1},
+                "flops": flops,
+                "hbm_bytes": base_bytes,
+                "duration_ms": ATTENTION_TRUTH["launch_ms"] + max(compute_ms, memory_ms),
+                "dtype": "bf16",
+                "source_class": "measured",
+                "timing_scope": "device_event_warm_operator",
+                "raw_event_count": 30,
+            }
+        )
+    return rows
+
+
+def test_kv_broadcast_limit_is_selected_only_when_the_corpus_re_reads_the_cache():
+    # The truth re-reads the KV cache 16 times for the one-KV-head MLA rows; the
+    # declared base formula would price them 4x too fast.
+    calibration = fit(_broadcast_corpus(4))
+    parameters = next(iter(calibration.families.values()))
+    assert parameters.kv_broadcast == 4
+    assert parameters.train_wape_pct < 2.0
+    assert parameters.cv_wape_pct is not None and parameters.cv_wape_pct < 3.0
+    mla = calibration.predict_op_explained(
+        {"family": "attention_fused", "recipe": "npu_fusion_attention",
+         "timing_scope": "device_event_warm_operator",
+         "shape": {"q": 1, "kv": 65536, "heads": 64, "kv_heads": 1,
+                   "dim": 576, "v_dim": 512, "causal": False}},
+        MACHINE,
+    )
+    assert mla.breakdown["kv_broadcast"] == 4.0
+    assert mla.breakdown["kv_heads_effective"] == 16.0
+    assert mla.breakdown["kv_extra_mb"] == pytest.approx(
+        15.0 * 65536 * (576 + 512) * 2.0 / 1e6
+    )
+    # A GQA shape whose ratio is inside the broadcast limit pays no extra bytes.
+    gqa = calibration.predict_op_explained(
+        {"family": "attention_fused", "recipe": "npu_fusion_attention",
+         "timing_scope": "device_event_warm_operator",
+         "shape": {"q": 1024, "kv": 1024, "heads": 32, "kv_heads": 8,
+                   "dim": 128, "v_dim": 128, "causal": True}},
+        MACHINE,
+    )
+    assert gqa.breakdown["kv_heads_effective"] == 8.0
+    assert gqa.breakdown["kv_extra_mb"] == 0.0
+    # Without any re-read in the corpus the declared base formula stays: the
+    # variant can only replace it by beating it on train-only CV.
+    plain = fit(_broadcast_corpus(None, mla_rows=False))
+    assert next(iter(plain.families.values())).kv_broadcast is None
