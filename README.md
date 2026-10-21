@@ -133,6 +133,7 @@ pytest -m "not live_npu"
 | **`mindie-sim net`** | Layer 4 整网多维并行（`DP×TP×EP×PP×DCP`）步骤拆解与 `msmodeling` 对齐 | `--model-spec`、`--parallel`、`--measured-ms` | 并行步耗时分解、通信暴露占比与三值对齐报告 |
 | **`mindie-sim predict`** | **白盒物理下界 + 实测校准预测**：下降 Dense / GQA / MLA / MoE 算子图，结合物理校准（`--physical-calibration`）或校准库输出端到端指标 | `--input <case.json>`、`--calibration-db`、`--physical-calibration` | TTFT / ITL / TPOT / E2E 时延、吞吐/SLO Goodput、显存规划与逐算子耗时明细 |
 | **`mindie-sim should`** | **Go / No-Go 优化顾问（应达成本模型）**：不靠拍脑袋乘效率系数，而是枚举合法执行计划，给出乐观物理下界 $L$、可行目标上界 $U$ 与见证时间线 | `--input <case.json>`、`--constraints`、`--search-budget` | 理论乐观下界 `L`、合法计划可行目标 `U`、瓶颈证人与优化空间评估 |
+| **`mindie-sim execution-replay`** | 完整执行计划身份与严格全 kernel 证据回放，只生成对照报告 | `--input examples/execution-replay/mixed.json` | 孤立/共享跨度、回退覆盖、身份匹配与声明留出集误差；不修改成本或拟合阶段；[使用说明](docs/execution-replay.md) |
 | **`mindie-sim search`** | **候选并行与运行配置寻优**：对搜索域内所有合法候选执行完整预测仿真，自动过滤 OOM 与违反 SLO 的配置并给出独立复核的最优推荐 | `--input <case.json>`、`--search-spec`、`--calibration-db` | 候选配置排名表、OOM/SLO 淘汰原因与最优配置推荐回执 |
 | **`mindie-sim calibration`** | **实测校准数据库（`SQLiteCalibrationStore`）**：管理 `mindie-profiler` / `torch_npu` 实测样本、生成待测 Manifest、拟合通信与算子 $\alpha/\beta$ 曲线 | `--db <cal.db>` + `inventory` / `coverage` / `manifest` / `ingest` / `import-a3` / `import-comm` / `run` | 样本覆盖率报告、去重待测请求清单、拟合后的算子与通信带宽模型 |
 | **`mindie-sim models` / `model-info`** | 查看内置的真实大模型配置目录（DeepSeek V4、GLM-5.3、Kimi K3、Qwen3.8 等）及单模型层结构参数 | `mindie-sim models` 或 `mindie-sim model-info --key <model_key>` | 模型层数、注意力机制（MLA/GQA）、MoE 专家规格与参数字典 |
