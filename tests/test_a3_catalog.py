@@ -102,7 +102,7 @@ def test_body_schedules_match_independent_fixtures():
         assert model.parameter_count() > 0
         assert model.resident_weight_bytes_override > 0
         if FIXTURES.exists():
-            fixture = json.loads((FIXTURES / f"{key}.json").read_text())
+            fixture = json.loads((FIXTURES / f"{key}.json").read_text(encoding="utf-8"))
             expected = fixture["expected"]
             assert [p.index for p in model.layer_plans] == list(range(BODY_COUNTS[key]))
             kinds = {}
@@ -1400,7 +1400,7 @@ def test_public_joint_speculative_target_query_budget_b2_b6():
     case = json.loads((
         Path(__file__).resolve().parents[1]
         / "examples/model-reference/cases/deepseek-v4.1-flash.json"
-    ).read_text())
+    ).read_text(encoding="utf-8"))
     case["runtime"].update(
         tp=64, ep=64, pp=1, dp=1, max_num_seqs=2, kv_block_size=1,
         metadata={"draft_mode": "dspark", "draft_accept_tokens": 5},

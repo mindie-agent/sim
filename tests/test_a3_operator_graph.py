@@ -355,7 +355,7 @@ def test_cli_rejects_bad_device_and_existing_results_without_device_import(
     assert "npu:0" in capsys.readouterr().err
 
     existing = tmp_path / "existing.json"
-    existing.write_text("prior evidence\n")
+    existing.write_text("prior evidence\n", encoding="utf-8")
     before = existing.read_bytes()
     assert main([
         "--manifest", str(CAPABILITY), "--results", str(existing),
@@ -490,7 +490,7 @@ def test_result_book_completeness_progress_failures_and_partial_persistence(
     writer = AtomicResultWriter(tmp_path / "partial.json")
     writer.preflight()
     writer.write(book.to_dict())
-    loaded = json.loads((tmp_path / "partial.json").read_text())
+    loaded = json.loads((tmp_path / "partial.json").read_text(encoding="utf-8"))
     assert loaded["status"] == "partial"
     assert loaded["progress"]["raw_blocks"] == 75
     assert loaded["conditions"][0]["trials"][0]["samples"][0]["run_id"] == (
@@ -579,30 +579,30 @@ def test_result_book_rejects_duplicates_and_overwrites(tmp_path) -> None:
 
 def test_writer_atomicity_overwrite_guard_and_nonfinite_refusal(tmp_path) -> None:
     path = tmp_path / "results.json"
-    path.write_text('{"old": true}\n')
+    path.write_text('{"old": true}\n', encoding="utf-8")
     writer = AtomicResultWriter(path)
     with pytest.raises(OutputPathError, match="refusing to overwrite"):
         writer.preflight()
     overwriting = AtomicResultWriter(path, allow_overwrite=True)
     overwriting.preflight()
     overwriting.write({"old": False, "value": 1})
-    assert json.loads(path.read_text()) == {"old": False, "value": 1}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"old": False, "value": 1}
     with pytest.raises(ValueError):
         overwriting.write({"bad": math.nan})
-    assert json.loads(path.read_text()) == {"old": False, "value": 1}
+    assert json.loads(path.read_text(encoding="utf-8")) == {"old": False, "value": 1}
 
 
 def test_example_schemas_and_non_measured_results_example_are_aligned() -> None:
     manifest_schema = json.loads(
-        (EXAMPLES / "manifest.schema.json").read_text())
+        (EXAMPLES / "manifest.schema.json").read_text(encoding="utf-8"))
     results_schema = json.loads(
-        (EXAMPLES / "results.schema.json").read_text())
+        (EXAMPLES / "results.schema.json").read_text(encoding="utf-8"))
     assert manifest_schema["properties"]["kind"]["const"] == "a3_operator_graph_manifest"
     assert results_schema["properties"]["kind"]["const"] == "a3_operator_graph_timing_results"
     assert "kind" in manifest_schema["required"]
     assert "kind" in results_schema["required"]
     for name in ("full-matrix.manifest.json", "capability.manifest.json"):
-        document = json.loads((EXAMPLES / name).read_text())
+        document = json.loads((EXAMPLES / name).read_text(encoding="utf-8"))
         assert document["kind"] == "a3_operator_graph_manifest"
 
     assert "calibrated_conditions" not in results_schema["properties"][
@@ -610,7 +610,7 @@ def test_example_schemas_and_non_measured_results_example_are_aligned() -> None:
     assert "complete_conditions" in results_schema["properties"]["progress"][
         "required"]
 
-    example = json.loads((EXAMPLES / "results.example.json").read_text())
+    example = json.loads((EXAMPLES / "results.example.json").read_text(encoding="utf-8"))
     assert example["kind"] == "a3_operator_graph_timing_results"
     assert example["status"] == "failed"
     assert example["cleanup_ok"] is True
@@ -1144,7 +1144,7 @@ def test_optional_debug_dump_path_is_sanitized_and_optional(tmp_path) -> None:
 
     class WritingGraph:
         def debug_dump(self, path):
-            Path(path).write_text("{}\n")
+            Path(path).write_text("{}\n", encoding="utf-8")
 
     runner._debug_dump(WritingGraph(), condition, metadata)
     assert metadata["debug_dump"]["status"] == "ok"
@@ -1219,7 +1219,7 @@ def test_run_manifest_setup_failure_persists_truthful_partial_evidence(
     code = run_manifest(
         plan, manifest_path=str(CAPABILITY), manifest_sha256="0" * 64,
         run_id="setup-failure-test", device="npu:0", results_path=results)
-    document = json.loads(results.read_text())
+    document = json.loads(results.read_text(encoding="utf-8"))
     assert code == 1
     assert document["status"] == "failed"
     assert document["setup"]["status"] == "failed"

@@ -258,7 +258,7 @@ def test_cli_mixed_vector_cube_dag_and_default_import(tmp_path):
         str(root/"examples/operator-plans/mixed.json"), "--output", str(result_path),
     ], cwd=root, text=True, capture_output=True, timeout=30)
     assert run.returncode == 0, run.stdout[-2000:]+run.stderr[-2000:]
-    result = json.loads(result_path.read_text())
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["status"] == "modeled"
     assert [op["operator_estimation"]["status"] for op in result["operators"]] == ["analytic_plan"]*3
     trace = {event["task_id"]: event for event in result["execution"]["trace"]}

@@ -605,7 +605,7 @@ def test_linearity_split_adapter_keeps_repeats_as_one_independent_measurement(tm
     assert group["fit"]["segments"][0]["slope_ms_per_unit"] == pytest.approx(0.0)
     assert (tmp_path / "out" / "adapted-manifest.json").exists()
     assert (tmp_path / "out" / "adapted-results.json").exists()
-    calibration = json.loads((tmp_path / "out" / "calibration-groups.json").read_text())
+    calibration = json.loads((tmp_path / "out" / "calibration-groups.json").read_text(encoding="utf-8"))
     assert len(calibration["groups"]) == 1
     assert all(case["kind"] == "add" for case in calibration["groups"][0]["cases"])
     assert "analytic_ms" not in calibration["groups"][0]["cases"][0]
@@ -801,8 +801,8 @@ def test_linearity_adapter_preserves_protocol_and_source_evidence(tmp_path):
     input_path = tmp_path / "train.json"
     input_path.write_text(json.dumps(payload), encoding="utf-8")
     analysis = analyze_linearity_files(input_path, output_dir=tmp_path / "out")
-    manifest = json.loads((tmp_path / "out" / "adapted-manifest.json").read_text())
-    results = json.loads((tmp_path / "out" / "adapted-results.json").read_text())
+    manifest = json.loads((tmp_path / "out" / "adapted-manifest.json").read_text(encoding="utf-8"))
+    results = json.loads((tmp_path / "out" / "adapted-results.json").read_text(encoding="utf-8"))
     request = manifest["requests"][0]
     result = results["results"][0]
     assert request["protocol"]["warmup"] == 10
@@ -1687,7 +1687,7 @@ def test_attention_campaign_adapter_dry_run_and_three_clocks():
         attention_manifest_from_campaign, attention_results_to_campaign,
         campaign_requests_from_attention, dry_run_campaign_attention,
     )
-    template = json.loads(Path("examples/operator-attention/capability.manifest.json").read_text())
+    template = json.loads(Path("examples/operator-attention/capability.manifest.json").read_text(encoding="utf-8"))
     for case in template["cases"]:
         source = case.setdefault("source", {})
         if case["operator"] == "fusion_attention":

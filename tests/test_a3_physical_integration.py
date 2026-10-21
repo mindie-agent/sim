@@ -1101,7 +1101,7 @@ def test_predict_reports_the_analytic_path_wiring_when_no_artifact_is_supplied()
 # 4. Public predict(): provenance, scope reporting, hardware-key refusal
 # ---------------------------------------------------------------------------
 def _example_payload() -> dict:
-    return json.loads(EXAMPLE_CASE.read_text())
+    return json.loads(EXAMPLE_CASE.read_text(encoding="utf-8"))
 
 
 def example_artifact(*, timing_scope: str = PER_CALL, hardware_key: str | None = None) -> PhysicalCalibration:
@@ -1198,7 +1198,7 @@ def test_predict_cli_refuses_an_unknown_timing_scope(tmp_path: Path, capsys):
         "--output", str(output),
     ])
     assert code == 1
-    payload = json.loads(output.read_text())
+    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["status"] == "error"
     assert payload["reason"].startswith("timing_scope_unknown:not_a_scope")
 
@@ -1216,7 +1216,7 @@ def test_production_loop_case_reaches_the_published_artifact_through_the_transfe
     """
     artifact = PhysicalCalibration.load(PUBLISHED_A3_ARTIFACT)
     payload = predict(
-        json.loads(PRODUCTION_CASE.read_text()), physical_calibration=artifact,
+        json.loads(PRODUCTION_CASE.read_text(encoding="utf-8")), physical_calibration=artifact,
     )
     provenance = payload["physical_calibration"]
     assert provenance["applied_op_count"] > 0
@@ -1266,7 +1266,7 @@ def test_predict_cli_with_physical_calibration_emits_analytic_and_physical_field
         "--output", str(output),
     ])
     assert code == 0
-    payload = json.loads(output.read_text())
+    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["status"] == "modeled"
     assert payload["command"] == "predict"
     # Existing public fields survive the integration.
@@ -1299,7 +1299,7 @@ def test_predict_cli_refuses_a_foreign_artifact_and_reports_the_reason(
         "--output", str(output),
     ])
     assert code == 1
-    payload = json.loads(output.read_text())
+    payload = json.loads(output.read_text(encoding="utf-8"))
     assert payload["status"] == "error"
     assert "physical_calibration_hardware_key_conflict" in payload["reason"]
 
@@ -1328,7 +1328,7 @@ def test_hardware_cli_without_a_sustained_band_reports_it_unmeasured(
         "hardware", "--sku-profile", str(sku), "--workload", str(workload),
         "--output", str(unmeasured),
     ]) == 0
-    thermal = json.loads(unmeasured.read_text())["thermal"]
+    thermal = json.loads(unmeasured.read_text(encoding="utf-8"))["thermal"]
     # No fabricated 1250-1300 MHz band: an omitted clock band stays unmeasured.
     assert thermal["sustained_mhz_range"] == []
     assert thermal["sustained_reference_us"] is None
@@ -1338,7 +1338,7 @@ def test_hardware_cli_without_a_sustained_band_reports_it_unmeasured(
         "hardware", "--sku-profile", str(sku), "--workload", str(workload),
         "--sustained-mhz", "1650:1650", "--output", str(declared),
     ]) == 0
-    declared_thermal = json.loads(declared.read_text())["thermal"]
+    declared_thermal = json.loads(declared.read_text(encoding="utf-8"))["thermal"]
     assert declared_thermal["sustained_mhz_range"] == [1650.0, 1650.0]
     assert declared_thermal["sustained_reference_us"] is not None
 

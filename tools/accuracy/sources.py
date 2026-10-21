@@ -401,7 +401,7 @@ def _device_name(environment: Mapping[str, Any]) -> str | None:
 
 
 def _load_json(path: Path) -> Any:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _record_id(prefix: str, value: Any) -> str:
@@ -947,7 +947,7 @@ def read_derived_merge(path: Path, source: Mapping[str, Any]) -> list[dict[str, 
 
 def read_jsonl_mirror(path: Path, source: Mapping[str, Any]) -> list[dict[str, Any]]:
     count = 0
-    with path.open() as handle:
+    with path.open(encoding="utf-8") as handle:
         for line in handle:
             if line.strip():
                 count += 1
@@ -980,7 +980,7 @@ def discover_round2_sources(root: Path, arch_family: str) -> list[dict[str, Any]
         return entries
     for path in sorted(root.glob("runs/*/results.json")) + sorted(root.glob("*/results.json")):
         try:
-            document = json.loads(path.read_text())
+            document = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
         if not isinstance(document, dict) or not isinstance(document.get("results"), list):

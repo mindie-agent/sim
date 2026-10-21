@@ -799,7 +799,7 @@ class HeldoutGuard:
         used: list[str] = []
         for raw_path in paths:
             path = Path(raw_path)
-            value = json.loads(path.read_text())
+            value = json.loads(path.read_text(encoding="utf-8"))
             found_keys, found_ids = _extract_heldout(value)
             if not found_ids and not found_keys:
                 continue
@@ -3336,7 +3336,7 @@ class PhysicalCalibration:
 
     @classmethod
     def load(cls, path: str | Path) -> "PhysicalCalibration":
-        return cls.from_mapping(json.loads(Path(path).read_text()))
+        return cls.from_mapping(json.loads(Path(path).read_text(encoding="utf-8")))
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -5227,7 +5227,7 @@ def fit_calibration(
 # ---------------------------------------------------------------------------
 def read_observations_json(path: str | Path) -> dict[str, Any]:
     """Read an observation document and validate its declared schema."""
-    value = json.loads(Path(path).read_text())
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
     if isinstance(value, Mapping):
         declared = str(value.get("schema_version") or "")
         if declared and declared != OBSERVATION_SCHEMA:
@@ -5466,7 +5466,7 @@ def _read_git_head(repository: str | Path | None) -> str | None:
     entry = root / ".git"
     try:
         if entry.is_file():
-            text = entry.read_text().strip()
+            text = entry.read_text(encoding="utf-8").strip()
             if not text.startswith("gitdir:"):
                 return None
             git_dir = Path(text[len("gitdir:"):].strip())
@@ -5476,22 +5476,22 @@ def _read_git_head(repository: str | Path | None) -> str | None:
             git_dir = entry
         else:
             return None
-        head = (git_dir / "HEAD").read_text().strip()
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
         if not head.startswith("ref:"):
             return head or None
         ref = head[len("ref:"):].strip()
         search = [git_dir]
         common = git_dir / "commondir"
         if common.is_file():
-            shared = Path(common.read_text().strip())
+            shared = Path(common.read_text(encoding="utf-8").strip())
             search.append(shared if shared.is_absolute() else (git_dir / shared).resolve())
         for directory in search:
             ref_file = directory / ref
             if ref_file.is_file():
-                return ref_file.read_text().strip() or None
+                return ref_file.read_text(encoding="utf-8").strip() or None
             packed = directory / "packed-refs"
             if packed.is_file():
-                for line in packed.read_text().splitlines():
+                for line in packed.read_text(encoding="utf-8").splitlines():
                     if line and not line.startswith(("#", "^")):
                         sha, _, name = line.partition(" ")
                         if name.strip() == ref:
@@ -5539,7 +5539,7 @@ def _command_fit(args: Any) -> dict[str, Any]:
     rows, sources = _load_observations(args)
     if not rows:
         raise PhysicalCalibrationError("no_observations_loaded")
-    machine = json.loads(Path(args.machine).read_text())
+    machine = json.loads(Path(args.machine).read_text(encoding="utf-8"))
     guard = HeldoutGuard.from_files(args.heldout_guard) if args.heldout_guard else None
     calibration = fit_calibration(
         {"schema_version": OBSERVATION_SCHEMA, "observations": rows},
@@ -5559,7 +5559,7 @@ def _command_fit(args: Any) -> dict[str, Any]:
         output = Path(args.output)
         if output.parent and not output.parent.exists():
             output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n")
+        output.write_text(json.dumps(payload, indent=2, sort_keys=True, allow_nan=False) + "\n", encoding="utf-8")
     return {
         "status": "fitted",
         "output": str(args.output) if args.output else None,
@@ -5572,10 +5572,10 @@ def _command_fit(args: Any) -> dict[str, Any]:
 
 def _command_predict(args: Any) -> dict[str, Any]:
     calibration = PhysicalCalibration.load(args.artifact)
-    op = json.loads(Path(args.op).read_text())
+    op = json.loads(Path(args.op).read_text(encoding="utf-8"))
     if "op" in op and isinstance(op["op"], Mapping):
         op = op["op"]
-    machine = json.loads(Path(args.machine).read_text()) if args.machine else None
+    machine = json.loads(Path(args.machine).read_text(encoding="utf-8")) if args.machine else None
     prediction = calibration.predict_op_explained(op, machine, compute_dtype=args.compute_dtype)
     return prediction.to_dict()
 
@@ -5722,7 +5722,7 @@ def read_attention_results(
     (K and V, on their own head count) and the O write, plus the measured
     workspace (two fp32 row-statistic buffers per query-head, 64 bytes).
     """
-    value = json.loads(Path(path).read_text())
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
     results = value.get("cases") or value.get("results") or []
     document_protocol = value.get("protocol") if isinstance(value.get("protocol"), Mapping) else {}
     document_environment = value.get("environment") if isinstance(value.get("environment"), Mapping) else {}
@@ -5999,7 +5999,7 @@ def read_campaign_results(
     a GEMM touches ``m*k + k*n + m*n`` elements, and each vector family reads /
     writes ``_VECTOR_BYTES_PER_ELEMENT`` tensors per element.
     """
-    value = json.loads(Path(path).read_text())
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
     results = value.get("results") or value.get("cases") or []
     document_protocol = value.get("protocol") or {}
     document_environment = value.get("environment") if isinstance(value.get("environment"), Mapping) else {}
@@ -6317,7 +6317,7 @@ def read_mc2_grouped_results(
     hardware key of the artifact being built; rows of another machine are
     counted, not silently mixed.
     """
-    value = json.loads(Path(path).read_text())
+    value = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(value, Mapping):
         raise PhysicalCalibrationError("mc2_document_must_be_a_mapping")
     if not machine_keys:

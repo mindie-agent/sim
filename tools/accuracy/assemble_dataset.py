@@ -335,7 +335,7 @@ def discover_round2_dirs(roots: Sequence[tuple[str, str, Path]]) -> dict[str, An
                 classification = "unclassified"
                 if path.suffix == ".json":
                     try:
-                        document = json.loads(path.read_text())
+                        document = json.loads(path.read_text(encoding="utf-8"))
                     except (json.JSONDecodeError, OSError):
                         classification = "unreadable_json"
                     else:
@@ -811,7 +811,7 @@ def build_outside_store_table(dataset: Mapping[str, Any], manifest: Mapping[str,
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=False, allow_nan=False) + "\n")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=False, allow_nan=False) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
@@ -819,10 +819,10 @@ def write_csv(path: Path, rows: Sequence[Mapping[str, Any]]) -> None:
     import csv
     path.parent.mkdir(parents=True, exist_ok=True)
     if not rows:
-        path.write_text("")
+        path.write_text("", encoding="utf-8")
         return
     fieldnames = list(rows[0].keys())
-    with path.open("w", newline="") as handle:
+    with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         for row in rows:
@@ -1075,7 +1075,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         write_csv(out / "train-outside-store.csv", derived["rows"])
         manifest["outside_store_table"] = derived["summary"]
         write_json(out / "dataset-manifest.json", manifest)
-    (out / "dataset-report.md").write_text(render_report(manifest, derived))
+    (out / "dataset-report.md").write_text(render_report(manifest, derived), encoding="utf-8")
     print(json.dumps({
         "status": "assembled",
         "observations": manifest["counts"]["observations"],

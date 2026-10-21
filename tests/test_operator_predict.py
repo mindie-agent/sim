@@ -7,11 +7,11 @@ import sys
 
 def test_predict_opt_in_selects_plans_and_preserves_explicit_fallback(tmp_path):
     root = Path(__file__).resolve().parents[1]
-    mixed = json.loads((root / "examples/operator-plans/mixed.json").read_text())
+    mixed = json.loads((root / "examples/operator-plans/mixed.json").read_text(encoding="utf-8"))
     # Reuse the one declared profile source instead of duplicating rates here.
     config = dict(mixed["estimators"], strict=False)
     config_path = tmp_path / "estimators.json"
-    config_path.write_text(json.dumps(config))
+    config_path.write_text(json.dumps(config), encoding="utf-8")
     case = {
         "name": "synthetic-small-dense-operator-integration",
         "machine": mixed["machine"],
@@ -34,13 +34,13 @@ def test_predict_opt_in_selects_plans_and_preserves_explicit_fallback(tmp_path):
     }
     case_path = tmp_path / "case.json"
     result_path = tmp_path / "result.json"
-    case_path.write_text(json.dumps(case))
+    case_path.write_text(json.dumps(case), encoding="utf-8")
     run = subprocess.run([
         sys.executable, "-m", "mindie_sim", "predict", "--input", str(case_path),
         "--operator-config", str(config_path), "--output", str(result_path),
     ], cwd=root, text=True, capture_output=True, timeout=30)
     assert run.returncode == 0, run.stdout[-2000:] + run.stderr[-2000:]
-    result = json.loads(result_path.read_text())
+    result = json.loads(result_path.read_text(encoding="utf-8"))
     assert result["status"] == "modeled"
     assert result["command"] == "predict"
     assert len(result["requests"]) == 1

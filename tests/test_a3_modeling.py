@@ -782,7 +782,7 @@ def test_real_a3_training_import_raw_repeats_calibration_and_cv():
     )
 
     store = SQLiteCalibrationStore(":memory:")
-    environment = json.loads(REAL_TRAINING.read_text())["environment"]
+    environment = json.loads(REAL_TRAINING.read_text(encoding="utf-8"))["environment"]
     first = import_a3_measurements(store, REAL_TRAINING)
     second = import_a3_measurements(store, REAL_TRAINING)
     assert first["measurements"] >= 330
@@ -827,7 +827,7 @@ def test_real_a3_training_import_raw_repeats_calibration_and_cv():
 def test_native_scheduler_capture_chunking_and_phase_fields():
     from mindie_sim.a3_framework import TokenLinearCostBackend
 
-    capture = json.loads(NATIVE_CAPTURE.read_text())
+    capture = json.loads(NATIVE_CAPTURE.read_text(encoding="utf-8"))
     backend = TokenLinearCostBackend()
     for native_case in capture["cases"]:
         requests = [
@@ -1771,7 +1771,7 @@ def test_public_miss_manifest_worker_ingest_repredict_roundtrip(tmp_path):
         manifest_path, results_path, FakeWorker(), run_id="leased-1",
     )
     assert run["failed"] == 0
-    ingest = store.ingest_results(json.loads(results_path.read_text()))
+    ingest = store.ingest_results(json.loads(results_path.read_text(encoding="utf-8")))
     assert ingest["completed"]
     refreshed = predict(payload, calibration=store.as_calibration_store())
     statuses = {
@@ -2391,7 +2391,8 @@ def test_public_media_state_tower_once_and_already_encoded():
 def _draft_case(trace, *, output=12):
     import json as _json
     case = json.load(open(
-        "examples/model-reference/cases/deepseek-v4.1-flash.json"
+        "examples/model-reference/cases/deepseek-v4.1-flash.json",
+        encoding="utf-8",
     ))
     case["machine"]["num_devices"] = 64
     case["runtime"].update(
@@ -2464,7 +2465,7 @@ def test_should_budget_is_caller_controlled_and_counts_attempts():
     import json as _json
     from mindie_sim.a3_should import should_cost
 
-    case = json.load(open("examples/model-reference/cases/qwen3.8-27b.json"))
+    case = json.load(open("examples/model-reference/cases/qwen3.8-27b.json", encoding="utf-8"))
     full = should_cost(case, constraints={
         "tp": [8], "dp": [1], "pp": [1], "ep": [1],
         "fusion": [False, True], "graph_padding": False,
@@ -2538,7 +2539,7 @@ def test_should_budget_keeps_topology_diversity():
     import json as _json
     from mindie_sim.a3_should import should_cost
 
-    case = _json.load(open("examples/model-reference/cases/qwen3.8-27b.json"))
+    case = _json.load(open("examples/model-reference/cases/qwen3.8-27b.json", encoding="utf-8"))
     result = should_cost(case, constraints={"search_budget": 2})
     assert result["status"] == "modeled"
     devices = [item["plan"]["devices"] for item in result["plans"]]
@@ -2554,7 +2555,7 @@ def test_comm_identity_parser_keeps_requested_and_observed_and_rejects_name_only
         identity_fixture, load_identity, parse_profile_identity,
     )
 
-    payload = _json.load(open("examples/a3_comm_identity_raw.json"))
+    payload = _json.load(open("examples/a3_comm_identity_raw.json", encoding="utf-8"))
     records = parse_profile_identity(payload)
     assert len(load_identity(payload)) == 36
     fixture = identity_fixture(payload)

@@ -114,12 +114,12 @@ def utc_now() -> str:
 def write_json(path: Path, value: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_name(path.name + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n")
+    temporary.write_text(json.dumps(value, indent=2, allow_nan=False) + "\n", encoding="utf-8")
     os.replace(temporary, path)
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text())
+    return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
 def protocol_block(protocol_identity: Mapping[str, Any], hardware_key: str) -> dict[str, Any]:
@@ -821,7 +821,7 @@ def generate(*, declarations: Path, dataset: Path, out: Path, receipt: Path | No
     write_json(out / "dryruns.json", index["dryruns"])
     runbook = render_runbook(index, collisions, dryruns,
                             "A2 + A3", data_root="/Volumes/data/mindie-sim-data")
-    (out / "heldout-runbook.md").write_text(runbook)
+    (out / "heldout-runbook.md").write_text(runbook, encoding="utf-8")
     return index
 
 

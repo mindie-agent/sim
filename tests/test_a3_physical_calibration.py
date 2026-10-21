@@ -1567,7 +1567,7 @@ MC2_DOCUMENT = {
 
 def test_mc2_reader_extracts_the_measured_legs_with_their_geometry(tmp_path):
     path = tmp_path / "mc2-measurements.json"
-    path.write_text(json.dumps(MC2_DOCUMENT))
+    path.write_text(json.dumps(MC2_DOCUMENT), encoding="utf-8")
     document = physical.read_mc2_grouped_results(
         path,
         hardware_key=MACHINE["hardware_key"],
@@ -1635,7 +1635,7 @@ def test_mc2_reader_extracts_the_measured_legs_with_their_geometry(tmp_path):
 def test_mc2_reader_rows_fit_the_mc2_recipe_they_declare(tmp_path):
     """Reader output is directly fittable and lands on the MC2 recipe row."""
     path = tmp_path / "mc2-measurements.json"
-    path.write_text(json.dumps(MC2_DOCUMENT))
+    path.write_text(json.dumps(MC2_DOCUMENT), encoding="utf-8")
     document = physical.read_mc2_grouped_results(
         path,
         hardware_key=MACHINE["hardware_key"],

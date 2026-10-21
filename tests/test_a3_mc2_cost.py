@@ -727,7 +727,7 @@ MOE_CASE = ROOT / "examples" / "a3_mla_moe_predict.json"
 
 
 def test_predict_shows_the_mc2_path_for_a_moe_model():
-    payload = json.loads(MOE_CASE.read_text())
+    payload = json.loads(MOE_CASE.read_text(encoding="utf-8"))
     base = payload["runtime"]
     without_mc2 = predict({**payload, "runtime": {**base, "moe_recipe": "alltoall"}})
     with_mc2 = predict({**payload, "runtime": {**base, "moe_recipe": "mc2"}})
@@ -762,7 +762,7 @@ def test_predict_shows_the_mc2_path_for_a_moe_model():
 def test_predict_models_an_explicit_alltoall_moe_without_mc2_markers():
     # ``moe_recipe: alltoall`` must not produce MC2 records: the fused-kernel
     # estimate is tied to the declared recipe, never inferred from the family.
-    payload = json.loads(MOE_CASE.read_text())
+    payload = json.loads(MOE_CASE.read_text(encoding="utf-8"))
     payload = {
         **payload,
         "runtime": {**payload["runtime"], "moe_recipe": "alltoall"},
