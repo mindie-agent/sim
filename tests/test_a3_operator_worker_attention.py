@@ -182,7 +182,7 @@ def test_valid_manifest_without_source_contract_keeps_empty_or_supplied_provenan
     doc = _doc()
     del doc["source_contract"]
     path = tmp_path / "no-provenance.manifest.json"
-    path.write_text(json.dumps(doc))
+    path.write_text(json.dumps(doc), encoding="utf-8")
     plan = dry_run_payload(path)["plan"]
     assert plan["source_contract"] == {}
     result = new_results(plan, "no-provenance", "npu:0", str(path), "0" * 64)
@@ -190,7 +190,7 @@ def test_valid_manifest_without_source_contract_keeps_empty_or_supplied_provenan
     assert result["progress"]["requested_cases"] == 4
 
     doc["source_contract"] = {"attribution": "optional only", "note": {"k": 1}}
-    path.write_text(json.dumps(doc))
+    path.write_text(json.dumps(doc), encoding="utf-8")
     plan = dry_run_payload(path)["plan"]
     assert plan["source_contract"] == doc["source_contract"]
     result = new_results(plan, "partial-provenance", "npu:0", str(path), "0" * 64)
@@ -224,7 +224,7 @@ def test_manifest_declared_heldout_is_preserved_not_relabelled(tmp_path):
     heldout_id = doc["cases"][1]["case_id"]
     doc["cases"][1]["split"] = "heldout"
     path = tmp_path / "heldout.manifest.json"
-    path.write_text(json.dumps(doc))
+    path.write_text(json.dumps(doc), encoding="utf-8")
     plan = dry_run_payload(path)["plan"]
     splits = {case["case_id"]: case["split"] for case in plan["cases"]}
     assert splits[heldout_id] == "heldout"

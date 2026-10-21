@@ -1,0 +1,135 @@
+{
+  "schema": "mindie-sim.benchmark-fixture/1",
+  "note": "Deterministic public fixture: Qwen2.5-7B-Instruct architecture on one A3 910C die, with a declared synthetic physical-calibration artifact. No value here is a measured NPU outcome; the fixture exists to exercise the whole-network prediction path.",
+  "case": {
+    "name": "qwen2.5-7b-instruct-a3-tp1-graph",
+    "machine": {
+      "name": "a3-ascend910-9362-one-die",
+      "hardware_key": "Ascend910_9362",
+      "arch_family": "A3",
+      "dies_per_package": 2,
+      "num_devices": 1,
+      "device": {
+        "hbm_gib": 64,
+        "cube_flops_per_s": 2.70336e14,
+        "vector_ops_per_s": 1.6896e13,
+        "hbm_bw_bytes_per_s": 1.2e12,
+        "mte_bw_bytes_per_s": 2.4e12,
+        "launch_us": 20.0,
+        "l2_bytes": 201326592,
+        "aic_count": 20,
+        "aiv_count": 40
+      },
+      "compute_peaks": {"bf16": 2.70336e14, "fp16": 2.70336e14},
+      "links": [
+        {
+          "name": "d2d",
+          "channel": "d2d_intra_node",
+          "capacity_gbps": 196,
+          "latency_us": 2.5,
+          "members": [0]
+        }
+      ]
+    },
+    "model": {
+      "name": "Qwen2.5-7B-Instruct",
+      "architecture": "gqa",
+      "layers": 28,
+      "hidden_size": 3584,
+      "num_heads": 28,
+      "num_kv_heads": 4,
+      "head_dim": 128,
+      "intermediate_size": 18944,
+      "vocab_size": 152064,
+      "activation_dtype": "bf16",
+      "weight_dtype": "bf16",
+      "kv_dtype": "bf16",
+      "compute_dtype": "bf16"
+    },
+    "workload": {
+      "requests": [
+        {"id": "qwen25-7b-one", "prompt_tokens": 128, "output_tokens": 4}
+      ]
+    },
+    "runtime": {
+      "max_num_batched_tokens": 8192,
+      "max_num_seqs": 16,
+      "max_model_len": 8192,
+      "enable_chunked_prefill": true,
+      "kv_block_size": 128,
+      "gpu_memory_utilization": 0.9,
+      "tp": 1,
+      "ep": 1,
+      "dp": 1,
+      "pp": 1,
+      "graph_buckets": [1, 2, 4, 8, 16],
+      "graph_mode": "force",
+      "moe_recipe": "auto"
+    },
+    "slo": {"ttft_ms": 60000, "tpot_ms": 6000, "e2e_ms": 180000}
+  },
+  "physical_calibration": {
+    "schema_version": "mindie-sim.physical-calibration/1",
+    "hardware_key": "Ascend910_9362",
+    "arch_family": "A3",
+    "machine": {
+      "hardware_key": "Ascend910_9362",
+      "arch_family": "A3",
+      "aic_count": 20,
+      "aiv_count": 40,
+      "clock_mhz": 1650.0,
+      "ops_per_cycle": 8192.0,
+      "peak_bw_bytes_per_s": 1.2e12,
+      "l2_bytes": 67108864,
+      "vec_elements_per_cycle_per_aiv": 128.0
+    },
+    "fit_config": {"fit_policy": "qwen2.5-7b-instruct-public-benchmark-fixture"},
+    "families": {
+      "gemm/device_event_warm": {
+        "family": "gemm",
+        "recipe": "torch_npu_managed_runner",
+        "protocol_signature": "",
+        "timing_scope": "device_event_warm",
+        "model_kind": "gemm",
+        "model_form": "wave_max",
+        "fit_level": "family_protocol",
+        "block_m": 32,
+        "block_n": 256,
+        "launch_ms": 0.0177,
+        "eta_compute": 0.837,
+        "eta_memory": 0.814,
+        "vec_ops_per_s": null,
+        "memory_model": "hbm",
+        "l2_usable_bytes": 0,
+        "l2_bw_bytes_per_s": null,
+        "compute_dtype": "bf16",
+        "samples": 367,
+        "raw_event_count": 2202,
+        "train_wape_pct": 16.6,
+        "cv_wape_pct": 17.65,
+        "median_ape_pct": 20.3,
+        "p90_ape_pct": 51.8,
+        "max_ape_pct": 85.2,
+        "binding_share": {"compute": 0.5, "memory": 0.5},
+        "binding_counts": {"compute": 180, "memory": 187},
+        "identified": {"launch": true, "tile_geometry": true, "eta_compute": true},
+        "pinned_parameters": [],
+        "intervals": {},
+        "breakdown": {},
+        "model_selection": {},
+        "memory_model_selection": {},
+        "quality": "trusted",
+        "warnings": []
+      }
+    },
+    "provenance": {
+      "generator": "benchmarks/fixtures/qwen2.5-7b-instruct.json",
+      "condition_count": 367,
+      "raw_event_count": 2202,
+      "fitted_utc": "2026-10-21T00:00:00+00:00",
+      "training_hash": "sha256:qwen2.5-7b-instruct-public-benchmark-fixture",
+      "heldout_guard": {"status": "clean"}
+    },
+    "unmodeled": []
+  }
+}

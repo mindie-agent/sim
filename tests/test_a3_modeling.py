@@ -595,13 +595,15 @@ def test_budget_b_minus_one_two_b_and_prefix_cached_first_token():
 
 def test_calibration_changes_prediction_and_revision_is_metadata():
     base = predict(case())
+    # A served attention kernel is the fused one (QK+softmax+PV on chip); its
+    # launch shape still declares (q, kv, heads, dim), which is the physical key.
     qk = next(
         op for op in base["traces"][0]["ops"]
-        if op["family"] == "attention_qk"
+        if op["family"] == "attention_fused"
     )
     shape = qk["launch_shape"]
     observation = {
-        "op_family": "attention_qk", "phase": qk["phase"], "recipe": qk["recipe"],
+        "op_family": "attention_fused", "phase": qk["phase"], "recipe": qk["recipe"],
         "shape": {"q": shape[0], "kv": shape[1], "heads": shape[2], "dim": shape[3]},
         "duration_ms": float(qk["analytic_ms"]) * 8.0,
         "analytic_ms": float(qk["analytic_ms"]),
@@ -780,7 +782,7 @@ def test_real_a3_training_import_raw_repeats_calibration_and_cv():
     )
 
     store = SQLiteCalibrationStore(":memory:")
-    environment = json.loads(REAL_TRAINING.read_text())["environment"]
+    environment = json.loads(REAL_TRAINING.read_text(encoding="utf-8"))["environment"]
     first = import_a3_measurements(store, REAL_TRAINING)
     second = import_a3_measurements(store, REAL_TRAINING)
     assert first["measurements"] >= 330
@@ -825,7 +827,7 @@ def test_real_a3_training_import_raw_repeats_calibration_and_cv():
 def test_native_scheduler_capture_chunking_and_phase_fields():
     from mindie_sim.a3_framework import TokenLinearCostBackend
 
-    capture = json.loads(NATIVE_CAPTURE.read_text())
+    capture = json.loads(NATIVE_CAPTURE.read_text(encoding="utf-8"))
     backend = TokenLinearCostBackend()
     for native_case in capture["cases"]:
         requests = [
@@ -1514,7 +1516,7 @@ def test_mla_attention_waits_for_both_q_and_kv_producers():
         RuntimeSpec.from_mapping({"max_num_batched_tokens": 16, "max_model_len": 128}),
         MachineSpec.from_mapping(machine()),
     )
-    qk = next(op for op in work.ops if op.family == "attention_qk")
+    qk = next(op for op in work.ops if op.family == "attention_fused")
     assert any("mla_qkv_barrier" in dep for dep in qk.deps)
     barrier = next(op for op in work.ops if op.family == "barrier")
     assert any(".q_b" in dep for dep in barrier.deps)
@@ -1595,7 +1597,13 @@ def test_should_placement_is_automatic_unless_caller_pins_core_base():
     }
     payload = case(
         machine=machine_payload,
-        runtime={"fusion": True, "fusion_worker_count": 2},
+        # This test exercises the fusion *placement* planner, which composes a
+        # kernel out of separate ops: declare the decomposed attention lowering so
+        # there is a group to place (the served default is one fused kernel).
+        runtime={
+            "fusion": True, "fusion_worker_count": 2,
+            "metadata": {"attention_decomposition": "qk_softmax_pv"},
+        },
     )
     base_constraints = {
         "tp": [1], "dp": [1], "pp": [1], "fusion": [True],
@@ -1616,11 +1624,18 @@ def test_should_placement_is_automatic_unless_caller_pins_core_base():
 
 
 def test_should_fused_candidate_is_real_and_selected_by_completion():
-    unfused = should_cost(case(), constraints={
+    # The fusion rules need the decomposed graph to have groups to fuse: the
+    # served default already emits the fused attention kernel, so this test
+    # declares the decomposed lowering explicitly.
+    payload = case(runtime={
+        **case()["runtime"],
+        "metadata": {"attention_decomposition": "qk_softmax_pv"},
+    })
+    unfused = should_cost(payload, constraints={
         "tp": [1], "dp": [1], "pp": [1], "fusion": [False],
         "graph_padding": False,
     })
-    fused = should_cost(case(), constraints={
+    fused = should_cost(payload, constraints={
         "tp": [1], "dp": [1], "pp": [1], "fusion": [True],
         "graph_padding": False,
     })
@@ -1756,7 +1771,7 @@ def test_public_miss_manifest_worker_ingest_repredict_roundtrip(tmp_path):
         manifest_path, results_path, FakeWorker(), run_id="leased-1",
     )
     assert run["failed"] == 0
-    ingest = store.ingest_results(json.loads(results_path.read_text()))
+    ingest = store.ingest_results(json.loads(results_path.read_text(encoding="utf-8")))
     assert ingest["completed"]
     refreshed = predict(payload, calibration=store.as_calibration_store())
     statuses = {
@@ -2376,7 +2391,8 @@ def test_public_media_state_tower_once_and_already_encoded():
 def _draft_case(trace, *, output=12):
     import json as _json
     case = json.load(open(
-        "examples/model-reference/cases/deepseek-v4.1-flash.json"
+        "examples/model-reference/cases/deepseek-v4.1-flash.json",
+        encoding="utf-8",
     ))
     case["machine"]["num_devices"] = 64
     case["runtime"].update(
@@ -2449,7 +2465,7 @@ def test_should_budget_is_caller_controlled_and_counts_attempts():
     import json as _json
     from mindie_sim.a3_should import should_cost
 
-    case = json.load(open("examples/model-reference/cases/qwen3.8-27b.json"))
+    case = json.load(open("examples/model-reference/cases/qwen3.8-27b.json", encoding="utf-8"))
     full = should_cost(case, constraints={
         "tp": [8], "dp": [1], "pp": [1], "ep": [1],
         "fusion": [False, True], "graph_padding": False,
@@ -2523,7 +2539,7 @@ def test_should_budget_keeps_topology_diversity():
     import json as _json
     from mindie_sim.a3_should import should_cost
 
-    case = _json.load(open("examples/model-reference/cases/qwen3.8-27b.json"))
+    case = _json.load(open("examples/model-reference/cases/qwen3.8-27b.json", encoding="utf-8"))
     result = should_cost(case, constraints={"search_budget": 2})
     assert result["status"] == "modeled"
     devices = [item["plan"]["devices"] for item in result["plans"]]
@@ -2539,7 +2555,7 @@ def test_comm_identity_parser_keeps_requested_and_observed_and_rejects_name_only
         identity_fixture, load_identity, parse_profile_identity,
     )
 
-    payload = _json.load(open("examples/a3_comm_identity_raw.json"))
+    payload = _json.load(open("examples/a3_comm_identity_raw.json", encoding="utf-8"))
     records = parse_profile_identity(payload)
     assert len(load_identity(payload)) == 36
     fixture = identity_fixture(payload)

@@ -10,7 +10,15 @@ def isolated_runtime(tmp_path, monkeypatch):
         monkeypatch.setenv(key, '')
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_ROOT', str(tmp_path.resolve() / 'isolated-diagnostics'))
     monkeypatch.setenv('MINDIE_DIAGNOSTICS_CONFIG', str(tmp_path.resolve() / 'reporting.json'))
-    from mindie_diagnostics import reporter
+    # mindie-sim is a standalone package and its test extra does not install
+    # the optional diagnostics sibling. Keep its transport guard when present,
+    # without making every offline simulation test depend on that package.
+    try:
+        from mindie_diagnostics import reporter
+    except ModuleNotFoundError as exc:
+        if exc.name != 'mindie_diagnostics':
+            raise
+        return
     def unexpected_network(*args, **kwargs):
         pytest.fail('unit tests must explicitly mock the HTTPS transport')
     monkeypatch.setattr(reporter.GitHub, 'request', unexpected_network)

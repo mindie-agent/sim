@@ -137,6 +137,7 @@ pytest -m "not live_npu"
 | **`mindie-sim calibration`** | **实测校准数据库（`SQLiteCalibrationStore`）**：管理 `mindie-profiler` / `torch_npu` 实测样本、生成待测 Manifest、拟合通信与算子 $\alpha/\beta$ 曲线 | `--db <cal.db>` + `inventory` / `coverage` / `manifest` / `ingest` / `import-a3` / `import-comm` / `run` | 样本覆盖率报告、去重待测请求清单、拟合后的算子与通信带宽模型 |
 | **`mindie-sim models` / `model-info`** | 查看内置的真实大模型配置目录（DeepSeek V4、GLM-5.3、Kimi K3、Qwen3.8 等）及单模型层结构参数 | `mindie-sim models` 或 `mindie-sim model-info --key <model_key>` | 模型层数、注意力机制（MLA/GQA）、MoE 专家规格与参数字典 |
 | **`mindie-sim pipeline-microbatches`** | 有限微批次（Microbatch）PP 流水气泡与时间线仿真（非简单除以 PP） | `--stages 3,5 --microbatches 8 --transfer-ms 0.2` | 精确的 Stage 气泡率、总跨度与微批次时间线 |
+| **`mindie-sim operator-plan`** | 可选 Vector 指令流与 BF16 Cube 有限流水，接入既有资源 DAG | `--input examples/operator-plans/mixed.json` | 细化阶段、容量、来源、回退及资源时间线；[使用说明](docs/operator-execution-plans.md) |
 
 ---
 
@@ -264,6 +265,65 @@ sim/
 | 精度评测工具与 Schema 说明 | [tools/accuracy/README.md](./tools/accuracy/README.md) · [tools/accuracy/schema.md](./tools/accuracy/schema.md) |
 | MindIE Agent 仿真系统总体架构（主仓库） | [mindie-agent/docs/simulation-system.md](https://github.com/mindie-agent/mindie-agent/blob/main/docs/simulation-system.md) |
 | 关联剖析组件：`mindie-profiler`（实测 Profiling 原地解析与对比） | [mindie-agent/profiler](https://github.com/mindie-agent/profiler) |
+
+---
+
+## A2 predictive support and fitted physical calibration (v0.8, measured round)
+
+The predictive path now targets **A2 (`Ascend910B4`) and A3 (`Ascend910_9362`)**
+through the same machine-physics layer, with no per-SKU fudge factors:
+
+* **A2 first-class**: profile-derived `MachineSpec` (clock precedence
+  override > live `npu-smi` > CANN `.ini`), evidence-corrected AIC/L2 catalog,
+  HCCS mesh + no-SIO link model, mesh vs switched semantics, and per-op fabric
+  scope instead of `links[0]`.
+* **Physical calibration** (`mindie_sim/a3_physical_calibration.py`): a versioned,
+  provenance-bearing artifact fitted only on train measurements
+  (`launch + max(compute, memory)` with fitted tiles, wave quantization,
+  L2 blend and shape-tail terms). `predict --physical-calibration PATH
+  --timing-scope SCOPE` uses it; unmodeled families fall back with the artifact's
+  own reason. Timing scopes (batched amortized vs per-call) are never mixed.
+* **Structural fixes**: additive launch (no max-composed 20 µs floor), AIC count
+  from the machine, invented efficiency floors removed, correct PV contraction
+  axis, exact `machine_key` calibration joins.
+
+Measured on real A2/A3 hardware in this round (train-only fits; blinded test set 2
+frozen before any outcome): A2 344 train conditions / 66 heldout, A3 212 train /
+80 heldout. Fitted CV: **A2 GEMM 9.71 %**, A2 add/rmsnorm/swiglu/softmax 2.4–4.0 %,
+**A3 GEMM 16.05 % (per-call) / 16.10 % (batched)**, A3 rmsnorm 6.13 %, softmax 6.98 %.
+Frozen held-out test set 2: **A2 22.80 % WAPE (coverage 0.9545)**,
+**A3 45.72 % WAPE (coverage 0.9125)**, combined 29.67 % over 136/146 conditions.
+Both verdicts are **rejected** against the predeclared gates; the fitted layer is
+strongest where it applies (A2 GEMM 4.78 %, A3 GEMM 16.87 %), and the remaining
+error is concentrated in unmodeled batched families and protocol/declaration
+mismatches. A5 is deliberately deferred.
+
+Full method, tables, gates, limitations and evidence paths:
+[`docs/a2-a3-measured-accuracy.md`](docs/a2-a3-measured-accuracy.md).
+
+## Large-operator calibration and whole-network validation
+
+The model now carries measured **fused attention** (GQA and absorbed MLA,
+prefill/decode), **grouped matmul / MoE** and **MC2** (dispatch + combine +
+grouped matmul) physics, fitted train-only with 5-fold CV, and it is validated
+against a real serving benchmark on A3 (Qwen2.5-7B, TP1, vLLM-Ascend, eager and
+ACLGraph):
+
+* A3 fitted CV: attention **4.19 %**, `moe_gate_up` **3.44 / 5.59 %**
+  (narrow / wide), `moe_down` 2.36 %, grouped matmul 1.65 %, dense GEMM
+  8.84 % (per-call) / 11.50 % (batched).
+* Whole-network graph mode (after the attention-byte, weight-streaming and
+  replayed-graph launch fixes): TPOT **14.64 / 14.69 / 14.84 ms** for
+  128 / 1024 / 4096-token prompts vs measured **15.71 / 15.24 / 15.10 ms**;
+  the batched scope brackets them at 14.67 / 14.66 / 14.68 ms.
+* MC2 is a **sum**, not an overlap: chain = 1.0–1.2× the measured legs.
+* The pre-fix long-prompt error was traced to materialising the attention score
+  matrix to HBM (18.15 GB/layer → 0.305 GB/layer); prefill prediction dropped
+  1147.6 → 225.3 ms analytic (323.1 ms fitted) for a measured 342.6 ms TTFT.
+
+Method, contracts (128-expert GMM cap, A2 silent mask, absorbed-MLA support),
+measured campaigns and residual gaps:
+[`docs/large-operator-calibration.md`](docs/large-operator-calibration.md).
 
 ---
 

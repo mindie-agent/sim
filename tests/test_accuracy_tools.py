@@ -72,7 +72,7 @@ def row(condition_id, prediction, observed, *, region="exact", status="ok", vari
 
 def write_json(path: Path, value) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return path
 
 
@@ -415,10 +415,10 @@ def test_assemble_relabels_a_train_row_that_hits_a_declared_heldout_key(tmp_path
     # Give the train case the heldout geometry under a different protocol: it must be
     # relabelled (never trained on) and listed as a relabel, not silently dropped.
     path = data / "nine-model-linearity-20261021/train-results.json"
-    document = json.loads(path.read_text())
+    document = json.loads(path.read_text(encoding="utf-8"))
     document["cases"][0]["request"]["shape"] = {"m": 1, "n": 7168, "k": 1536}
     document["cases"][0]["production_result"]["protocol"]["iterations"] = 4
-    path.write_text(json.dumps(document))
+    path.write_text(json.dumps(document), encoding="utf-8")
     result = assemble_dataset.assemble(
         data_root=data, a2_root=tmp_path / "no-a2", a3_round2_root=tmp_path / "no-a3",
         declarations_dir=declarations, round1_evidence=tmp_path / "no-round1",
@@ -596,7 +596,7 @@ def test_score_verifies_hashes_and_refuses_a_tampered_or_incomplete_freeze(tmp_p
                 round1_evidence=tmp_path / "no-round1", out=tmp_path / "out",
                 bootstrap_b=32, allow_dirty=True)
     # A tampered prediction file (one value changed, so the hash must differ).
-    tampered_document = json.loads(corpus["predictions"].read_text())
+    tampered_document = json.loads(corpus["predictions"].read_text(encoding="utf-8"))
     tampered_document["predictions"][0]["variants"]["curve"]["prediction_ms"] = 0.031
     tampered = write_json(tmp_path / "tampered.json", tampered_document)
     with pytest.raises(score_frozen.IntegrityError):
@@ -610,10 +610,10 @@ def test_score_verifies_hashes_and_refuses_a_tampered_or_incomplete_freeze(tmp_p
     # An incomplete freeze.
     incomplete_root = tmp_path / "incomplete"
     incomplete = build_frozen_corpus(incomplete_root)
-    document = json.loads(incomplete["predictions"].read_text())
+    document = json.loads(incomplete["predictions"].read_text(encoding="utf-8"))
     document["completed_entries"] = 0
     write_json(incomplete["predictions"], document)
-    receipt = json.loads(incomplete["receipt"].read_text())
+    receipt = json.loads(incomplete["receipt"].read_text(encoding="utf-8"))
     receipt["predictions_sha256"] = metrics.sha256_file(incomplete["predictions"])
     write_json(incomplete["receipt"], receipt)
     with pytest.raises(score_frozen.IntegrityError):
@@ -683,7 +683,7 @@ def test_cli_exit_codes_are_0_for_scoring_and_2_when_enforced_threshold_fails(tm
     assert score_frozen.main([*common, "--out", str(tmp_path / "out3"), "--enforce",
                               "--max-wape", "500"]) == 0
     # Integrity failure path returns 3 rather than raising through the CLI.
-    tampered_document = json.loads(corpus["predictions"].read_text())
+    tampered_document = json.loads(corpus["predictions"].read_text(encoding="utf-8"))
     tampered_document["predictions"][0]["variants"]["curve"]["prediction_ms"] = 0.031
     tampered = write_json(tmp_path / "tampered.json", tampered_document)
     assert score_frozen.main(["--dataset", str(corpus["dataset"]),
@@ -752,7 +752,7 @@ def test_heldout_manifests_are_deterministic_heldout_only_and_collision_checked(
     assert campaign["cases"] == 1 and campaign["split_counts"] == {"heldout": 1}
     attention = next(entry for name, entry in by_name.items() if "attention" in name)
     assert attention["cases"] == 2
-    manifest = json.loads((tmp_path / "out1" / attention["path"]).read_text())
+    manifest = json.loads((tmp_path / "out1" / attention["path"]).read_text(encoding="utf-8"))
     assert manifest["kind"] == "a3_attention_rope_manifest"
     assert {case["split"] for case in manifest["cases"]} == {"heldout"}
     fusion = next(case for case in manifest["cases"]
@@ -800,7 +800,7 @@ def test_guard_passes_on_a_current_receipt_and_fails_when_the_dataset_changed(tm
     corpus = build_frozen_corpus(tmp_path / "guard")
     passing = heldout_manifests.guard(corpus["receipt"], corpus["dataset"])
     assert passing["guard"] == "pass" and passing["reasons"] == []
-    document = json.loads((corpus["dataset"] / "observations.json").read_text())
+    document = json.loads((corpus["dataset"] / "observations.json").read_text(encoding="utf-8"))
     document["observations"][0]["duration_ms"] += 0.005
     write_json(corpus["dataset"] / "observations.json", document)
     failing = heldout_manifests.guard(corpus["receipt"], corpus["dataset"])
@@ -808,7 +808,7 @@ def test_guard_passes_on_a_current_receipt_and_fails_when_the_dataset_changed(tm
     assert "training_dataset_hash_changed_since_freeze" in failing["reasons"]
     # A receipt that claims it read outcomes is refused even when the hash matches.
     write_json(corpus["dataset"] / "observations.json", document)
-    claims = json.loads(Path(corpus["receipt"]).read_text())
+    claims = json.loads(Path(corpus["receipt"]).read_text(encoding="utf-8"))
     claims["evaluation_outcomes_read"] = True
     write_json(Path(corpus["receipt"]), claims)
     refused = heldout_manifests.guard(corpus["receipt"], corpus["dataset"])
