@@ -1749,3 +1749,89 @@ def test_kv_broadcast_limit_is_selected_only_when_the_corpus_re_reads_the_cache(
     # variant can only replace it by beating it on train-only CV.
     plain = fit(_broadcast_corpus(None, mla_rows=False))
     assert next(iter(plain.families.values())).kv_broadcast is None
+
+
+# ---------------------------------------------------------------------------
+# Grouped weight-width classes (two model configurations in one family)
+# ---------------------------------------------------------------------------
+def _two_width_corpus(*, wide=True):
+    """Grouped corpus whose two weight widths have opposite overlap behaviour.
+
+    The narrow class is memory-bound (its measured time is the weight stream), the
+    wide class is compute-bound (its measured time is the cube work and the stream
+    overlaps).  One additive row cannot satisfy both; a per-class row can.
+    """
+    rows = []
+    shapes = [(64, 32, 4096, 7168), (256, 32, 4096, 7168), (1024, 32, 4096, 7168),
+              (2048, 64, 4096, 7168), (512, 64, 4096, 7168), (4096, 128, 4096, 7168)]
+    if wide:
+        shapes += [(256, 32, 14336, 7168), (1024, 32, 14336, 7168),
+                   (64, 64, 14336, 7168), (1024, 64, 14336, 7168),
+                   (256, 128, 14336, 7168), (1024, 128, 14336, 7168)]
+    for index, (tpe, experts, n, k) in enumerate(shapes):
+        tokens = tpe * experts
+        rows_count = math.ceil(tpe / 64)
+        tiles = experts * rows_count * math.ceil(n / 128)
+        wave_eff = tiles / (math.ceil(tiles / AIC) * AIC)
+        flops_eff = 2.0 * experts * rows_count * 64 * n * k
+        weights = experts * n * k * 2.0
+        moves = weights + tokens * k * 2.0 + tokens * n * 2.0
+        compute_ms = flops_eff / (PEAK_FLOPS * 0.9 * wave_eff) * 1000.0
+        memory_ms = moves / PEAK_BW * 1000.0
+        # narrow: stream dominates and compute hides under it (max);
+        # wide: the two are serialized in the measured kernel (sum).
+        duration = 0.020 + (max(compute_ms, memory_ms) if n <= 8192 else compute_ms + memory_ms)
+        rows.append(
+            {
+                "condition_key": "width-%03d" % index,
+                "hardware_key": MACHINE["hardware_key"],
+                "die": "phy0",
+                "arch_family": "TEST",
+                "family": "moe_gate_up",
+                "recipe": "npu_grouped_matmul_list_bf16",
+                "protocol_signature": "sha256:width-fixture",
+                "run_id": "fixture-width",
+                "split": "train",
+                "shape": {"tokens": tokens, "experts": experts, "n": n, "k": k},
+                "flops": 2.0 * tokens * n * k,
+                "hbm_bytes": moves,
+                "duration_ms": duration,
+                "dtype": "bf16",
+                "source_class": "measured",
+                "timing_scope": "device_event_warm_operator",
+                "raw_event_count": 30,
+            }
+        )
+    return rows
+
+
+def test_grouped_weight_width_split_is_adopted_only_when_it_pays():
+    calibration = fit(_two_width_corpus())
+    records = [
+        item for item in calibration.families.values() if item.family == "moe_gate_up"
+    ]
+    assert {item.corpus_class for item in records} == {"narrow", "wide"}
+    for item in records:
+        comparison = item.model_selection["shape_split"]
+        assert comparison["adopted"] is True
+        assert comparison["axis"] == "weight_width_class"
+        assert comparison["cv_improvement_pct"] >= physical.MIN_CV_IMPROVEMENT_PCT
+    # The narrow class is fitted as a max-composed kernel, the wide one additive.
+    narrow = next(item for item in records if item.corpus_class == "narrow")
+    wide = next(item for item in records if item.corpus_class == "wide")
+    assert narrow.model_form == "wave_max"
+    assert wide.model_form == "flat_additive"
+    # A query is routed by the declared weight width alone.
+    small = calibration.predict_op_explained(grouped_op(2048, 32, 4096, 7168), MACHINE)
+    large = calibration.predict_op_explained(grouped_op(2048, 32, 14336, 7168), MACHINE)
+    assert small.parameters["corpus_class"] == "narrow"
+    assert large.parameters["corpus_class"] == "wide"
+    assert small.status == large.status == "predicted"
+    # With a single weight width the split is refused and the pooled row stays.
+    single = fit(_two_width_corpus(wide=False))
+    single_records = [
+        item for item in single.families.values() if item.family == "moe_gate_up"
+    ]
+    assert len(single_records) == 1
+    assert single_records[0].corpus_class == ""
+    assert single_records[0].model_selection["shape_split"]["adopted"] is False
