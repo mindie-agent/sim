@@ -88,7 +88,7 @@ def _operator(raw: Mapping[str, Any]) -> OpSpec:
     return OpSpec(**data)
 
 
-def operator_plan_report(payload: Mapping[str, Any]) -> dict[str, Any]:
+def operator_plan_report(payload: Mapping[str, Any], *, include_task_ids: bool = False) -> dict[str, Any]:
     allowed = {"machine", "operators", "estimators", "context", "name", "source"}
     if not isinstance(payload, Mapping) or set(payload)-allowed:
         raise A3InputError("operator_report_input_invalid")
@@ -117,7 +117,7 @@ def operator_plan_report(payload: Mapping[str, Any]) -> dict[str, Any]:
     engine = ResourceEngine(resources)
     ids = add_costed_ops(engine, costs, stage_map, prefix="operators", start_ms=0.0)
     execution = engine.run(until=tuple(ids.values()))
-    return {
+    report = {
         "status": "modeled", "command": "operator-plan",
         "name": payload.get("name", "operator-dag"), "source": payload.get("source", "declared"),
         "input_sha256": hashlib.sha256(json.dumps(
@@ -130,3 +130,6 @@ def operator_plan_report(payload: Mapping[str, Any]) -> dict[str, Any]:
         "operators": [cost.to_dict() for cost in costs],
         "execution": execution,
     }
+    if include_task_ids:
+        report["task_ids"] = dict(ids)
+    return report

@@ -562,6 +562,11 @@ def _model_info(args: argparse.Namespace) -> dict[str, Any]:
     return model.to_dict()
 
 
+def _execution_replay(args: argparse.Namespace) -> dict[str, Any]:
+    from .execution_replay import execution_replay_report
+    return execution_replay_report(_load_json(args.input))
+
+
 def _pipeline_microbatches(args: argparse.Namespace) -> dict[str, Any]:
     stages = [float(item) for item in args.stages.replace(":", ",").split(",") if item.strip()]
     payload = simulate_microbatch_pipeline(stages, args.microbatches, transfer_ms=args.transfer_ms)
@@ -788,6 +793,10 @@ def build_parser() -> argparse.ArgumentParser:
     model_info.add_argument("--output", default=None)
     model_info.set_defaults(handler=_model_info)
 
+    replay_parser = subparsers.add_parser("execution-replay", help="Strict plan identities and report-only whole-kernel evidence replay")
+    replay_parser.add_argument("--input", required=True)
+    replay_parser.add_argument("--output", default=None)
+    replay_parser.set_defaults(handler=_execution_replay)
     pm = subparsers.add_parser("pipeline-microbatches", help="Finite PP microbatch timeline (not total/PP)")
     pm.add_argument("--stages", required=True, help="comma-separated stage durations in ms, e.g. 3,5")
     pm.add_argument("--microbatches", type=int, required=True)
