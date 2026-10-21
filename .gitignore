@@ -18,3 +18,7 @@ dist/
 /examples/operator-campaign/results/dry-run-sample.json
 /examples/operator-campaign/analysis-dry-run/
 /examples/operator-attention/integration.patch
+
+# Local accuracy-round working notes and harness state (not component source)
+.workstreams/
+state/

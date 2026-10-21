@@ -13,6 +13,23 @@
     Passing a family name without an exact SKU, ``.ini``, ``sku_profile`` or
     disambiguating ``npu-smi`` snapshot yields ``status="ambiguous_sku"`` and
     ``unmodeled_reason="ambiguous_soc_sku_requires_exact_soc_or_ini_or_probe"``.
+  * Architecture inference requires *positive* evidence: an ``910_93`` /
+    ``910C`` token, a dual-die package or an A5 arch id.  ``NpuArch=2201`` is
+    shared by A2 (910B4, CANN 9.1) and A3, so it never selects A3 by itself.
+  * Clock precedence is single-sourced in
+    :meth:`ClockAndTopologySpec.effective_clock_mhz`: explicit caller override >
+    verified ``npu-smi`` runtime clock (``Aicore Freq(MHZ)``, the rated maximum)
+    > ``.ini``/catalog ``configured_clock_mhz``.  ``configured_clock_mhz`` keeps
+    the declared value forever; every disagreement is recorded in
+    ``discrepancies`` instead of overwriting a tier.
+  * ``sustained_clock_mhz_range`` is empty unless a caller supplies a measured
+    band; no family-level clock constant is substituted for a measurement.
+  * A vector peak is *declared* (``ops_per_cycle_per_aiv``) or undeclared.  The
+    accessor returns ``None`` when undeclared; ``simd_width_bytes`` is a SIMD
+    width (bytes/cycle), never an ops/cycle count.
+  * ``hbm_peak_bw_gbps`` is the declared registry peak, ``sustained_hbm_bw_gbps``
+    a measured sustained figure, and ``hbm_peak_bw_verified`` states whether the
+    peak itself has board evidence.  None of them is silently promoted.
   * ``platform_config_hbm_mib`` and ``verified_runtime_hbm_mib`` remain distinct;
     runtime probe overrides populate ``verified_runtime_hbm_mib`` and record a
     structured entry in ``discrepancies`` whenever they diverge from static data.
@@ -42,11 +59,12 @@ from .comm import (
 )
 from .hardware_common import (
     A5_CANN_SIM_LINK_CEILINGS_BPC,
-    SUSTAINED_MHZ_RANGE,
+    UNMEASURED_MHZ_RANGE,
     HardwareError,
     _finite,
     _float_value,
     _int_value,
+    parse_mhz_range,
 )
 
 if TYPE_CHECKING:
@@ -82,9 +100,10 @@ _FAMILY_DEFAULT_OPS_PER_CYCLE: dict[str, dict[str, int]] = {
     "A5": {"fp8_e4m3": 16384, "fp8_e5m2": 16384, "int8": 16384, "bf16": 8192, "fp16": 8192, "fp32": 4096},
 }
 
-# Dtype spelling aliases only.  They all resolve inside the one canonical
-# ``ops_per_cycle_per_aic`` map; there is no alternate capability source.
-_CUBE_DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
+# Dtype spelling aliases only.  They resolve inside the canonical capability
+# maps (``CubeSpec.ops_per_cycle_per_aic`` / ``VectorSpec.ops_per_cycle_per_aiv``);
+# there is no alternate capability source and no cross-architecture fallback.
+_DTYPE_ALIASES: dict[str, tuple[str, ...]] = {
     "fp8": ("fp8", "fp8_e4m3", "fp8_e5m2"),
     "fp8_e4m3": ("fp8_e4m3", "fp8"),
     "fp8_e5m2": ("fp8_e5m2", "fp8"),
@@ -134,6 +153,10 @@ BUILTIN_SKU_CATALOG: dict[str, dict[str, Any]] = {
         "arch_family": "A2", "short_soc_version": "Ascend910B", "dies_per_package": 1,
         "aic_count_per_die": 20, "aiv_count_per_die": 40, "configured_clock_mhz": 1500.0,
         "platform_config_hbm_mib": 32768.0, "l2_capacity_mib": 96.0, "hbm_peak_bw_gbps": 800.0,
+        # The registry peak has no local source: only npu-smi "HBM Clock Speed
+        # 1600 MHz" exists, and 1600 MT/s x 4096 bit / 8 = 819.2 GB/s rests on an
+        # assumed bus width (.workstreams/a2-recon/a2-hardware-evidence.md §7.1).
+        "hbm_peak_bw_verified": False,
     },
     "Ascend910B4-1": {
         "arch_family": "A2", "short_soc_version": "Ascend910B", "dies_per_package": 1,
@@ -170,10 +193,32 @@ BUILTIN_SKU_CATALOG: dict[str, dict[str, Any]] = {
         "platform_config_hbm_mib": 65536.0, "l2_capacity_mib": 192.0, "hbm_peak_bw_gbps": 1400.0,
         "intra_package_die_bw_gbps": 448.0,
     },
+    # Ascend910_9362 is the standing A3 host (mindie-qwen35hist, 2026-10-21).
+    # Board evidence for the per-die core counts, both live captures:
+    #   * npu-smi info -t common -> "Chip Count: 2" and "Aicore Count: 20" on
+    #     each of the two chips (/Volumes/data/mindie-sim-data/a3/2026-10-20/
+    #     production-loop-v3-30-20261021/live-environment.json, clock_common_*)
+    #   * torch_npu device properties -> cube_core_num=20, vector_core_num=40
+    #     (/Volumes/data/mindie-sim-data/a3/2026-10-20/graph-replay-20261021/
+    #     capability-results.json)
+    # The previous 16/32 was the "2x AIC" convention applied to an assumed
+    # 16-AIC die; both sources say 20 AIC / 40 AIV per die (a3-dual-die).
+    # L2 is 168 MiB, not 192: the live CANN platform config declares
+    # l2_size=176160768 and torch_npu on the A3 host reports
+    # L2_cache_size=176160768 (176160768 / 1024^2 = 168.0 MiB,
+    # /Volumes/data/mindie-sim-data/a3/2026-10-20/graph-replay-20261021/
+    # capability-results.json).  The A2 96 MiB entry stays as-is (its own
+    # .ini l2_size=100663296 agrees with the same kind of capture).
+    # The 1200 GB/s HBM peak stays UNCHANGED and unverified: live memory-bound
+    # GEMMs imply 1.45-1.64 TB/s while the streamed weights fit in L2 (168 MiB)
+    # and 0.69-1.09 TB/s once they exceed it
+    # (.workstreams/residual-analysis/decomposition.md §3.7), so the campaign
+    # must decide whether 1200 is an HBM peak or an L2-resident rate.
     "Ascend910_9362": {
         "arch_family": "A3", "short_soc_version": "Ascend910_93", "npu_arch": "2201", "dies_per_package": 2,
-        "aic_count_per_die": 16, "aiv_count_per_die": 32, "configured_clock_mhz": 1650.0,
-        "platform_config_hbm_mib": 65536.0, "l2_capacity_mib": 192.0, "hbm_peak_bw_gbps": 1200.0,
+        "aic_count_per_die": 20, "aiv_count_per_die": 40, "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0, "l2_capacity_mib": 168.0, "hbm_peak_bw_gbps": 1200.0,
+        "hbm_peak_bw_verified": False,
         "intra_package_die_bw_gbps": 448.0,
     },
     "Ascend950DT_9581": {
@@ -214,7 +259,7 @@ class CubeSpec:
         if self.aic_count_per_die is None or int(self.aic_count_per_die) <= 0:
             return None
         key = str(dtype).strip().lower()
-        for candidate in _CUBE_DTYPE_ALIASES.get(key, (key,)):
+        for candidate in _DTYPE_ALIASES.get(key, (key,)):
             raw = self.ops_per_cycle_per_aic.get(candidate)
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
                 continue
@@ -241,6 +286,31 @@ class VectorSpec:
     simd_width_bytes: int
     physical_ub_kib: float
     allocatable_ub_kib: float
+    #: Declared per-AIV vector ops/cycle, keyed by dtype.  Empty means the
+    #: capability is undeclared: the 128 B/clk ``vec_calc_size`` in the A2
+    #: ``.ini`` is a SIMD width, and no board source in this tree states an A2/A3
+    #: AIV ops/cycle count (see ``.workstreams/code-audit/a2-blockers.md`` B8).
+    ops_per_cycle_per_aiv: Mapping[str, int] = field(default_factory=dict)
+
+    def ops_per_cycle_per_die(self, dtype: str) -> float | None:
+        """Total per-die AIV ops/cycle for ``dtype``, or ``None`` if undeclared.
+
+        Mirrors :meth:`CubeSpec.ops_per_cycle_per_die`: the stored map is
+        per-AIV, this accessor is the single unit-explicit normalization.  A
+        dtype nobody declared returns ``None``; ``simd_width_bytes`` is
+        deliberately not consulted, because bytes/cycle is not ops/cycle.
+        """
+        if self.aiv_count_per_die is None or int(self.aiv_count_per_die) <= 0:
+            return None
+        key = str(dtype).strip().lower()
+        for candidate in _DTYPE_ALIASES.get(key, (key,)):
+            raw = self.ops_per_cycle_per_aiv.get(candidate)
+            if isinstance(raw, bool) or not isinstance(raw, (int, float)):
+                continue
+            if not _finite(raw) or float(raw) <= 0:
+                continue
+            return float(raw) * float(self.aiv_count_per_die)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -249,6 +319,7 @@ class VectorSpec:
             "simd_width_bytes": self.simd_width_bytes,
             "physical_ub_kib": self.physical_ub_kib,
             "allocatable_ub_kib": self.allocatable_ub_kib,
+            "ops_per_cycle_per_aiv": dict(sorted(self.ops_per_cycle_per_aiv.items())),
         }
 
 
@@ -264,6 +335,10 @@ class MemoryHierarchySpec:
     intra_node_hccs_bw_gbps: float | None = None
     inter_node_roce_bw_gbps: float | None = None
     transfer_channels: Mapping[str, TransferChannelSpec] = field(default_factory=dict)
+    #: ``True``/``False`` only when an authority states it; ``None`` = undeclared.
+    #: A registry peak that no measurement confirms stays ``False`` and is never
+    #: promoted to ``sustained_hbm_bw_gbps``.
+    hbm_peak_bw_verified: bool | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -271,6 +346,7 @@ class MemoryHierarchySpec:
             "verified_runtime_hbm_mib": self.verified_runtime_hbm_mib,
             "hbm_peak_bw_gbps": self.hbm_peak_bw_gbps,
             "sustained_hbm_bw_gbps": self.sustained_hbm_bw_gbps,
+            "hbm_peak_bw_verified": self.hbm_peak_bw_verified,
             "l2_capacity_mib": self.l2_capacity_mib,
             "link_ceilings_bpc": dict(sorted(self.link_ceilings_bpc.items())),
             "intra_package_die_bw_gbps": self.intra_package_die_bw_gbps,
@@ -288,8 +364,43 @@ class ClockAndTopologySpec:
     npu_arch: str | None
     dies_per_package: int
     configured_clock_mhz: float | None
-    sustained_clock_mhz_range: tuple[float, float]
+    sustained_clock_mhz_range: tuple[float, ...]
     runtime_clock_mhz: float | None = None
+    #: Explicit caller override; highest precedence, never written into
+    #: ``configured_clock_mhz``.
+    clock_override_mhz: float | None = None
+    #: DVFS observation (``Aicore curFreq``).  Reported, never a peak.
+    runtime_current_clock_mhz: float | None = None
+    #: Provenance of ``sustained_clock_mhz_range``; ``None`` when unmeasured.
+    sustained_clock_source: str | None = None
+
+    def clock_source(self) -> str | None:
+        """Which tier ``effective_clock_mhz`` resolves to, or ``None``."""
+        for value, source in (
+            (self.clock_override_mhz, "caller_override"),
+            (self.runtime_clock_mhz, "npu_smi_runtime"),
+            (self.configured_clock_mhz, "platform_config"),
+        ):
+            if value is not None and _finite(value) and float(value) > 0:
+                return source
+        return None
+
+    def effective_clock_mhz(self) -> float | None:
+        """Clock the model must use, by documented precedence.
+
+        1. explicit caller override (``clock_override_mhz``),
+        2. verified ``npu-smi`` runtime clock (``Aicore Freq(MHZ)`` — the rated
+           maximum the part reaches under load, not the DVFS ``Aicore curFreq``),
+        3. the ``.ini`` / catalog declared clock (``configured_clock_mhz``).
+
+        ``configured_clock_mhz`` is never overwritten by this resolution: all
+        three values stay readable and every disagreement is a
+        ``discrepancies`` entry.  Returns ``None`` when no tier is usable.
+        """
+        for value in (self.clock_override_mhz, self.runtime_clock_mhz, self.configured_clock_mhz):
+            if value is not None and _finite(value) and float(value) > 0:
+                return float(value)
+        return None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -300,7 +411,14 @@ class ClockAndTopologySpec:
             "dies_per_package": self.dies_per_package,
             "configured_clock_mhz": self.configured_clock_mhz,
             "sustained_clock_mhz_range": list(self.sustained_clock_mhz_range),
+            "sustained_clock_source": self.sustained_clock_source,
             "runtime_clock_mhz": self.runtime_clock_mhz,
+            "runtime_current_clock_mhz": self.runtime_current_clock_mhz,
+            "clock_override_mhz": self.clock_override_mhz,
+            # Derived, not stored: the precedence result, so reports do not
+            # re-implement the ordering.
+            "effective_clock_mhz": self.effective_clock_mhz(),
+            "effective_clock_source": self.clock_source(),
         }
 
 
@@ -327,14 +445,59 @@ class DeviceCapabilityProfile:
             "resolution_sources": list(self.resolution_sources),
         }
 
+    def effective_clock_mhz(self) -> float | None:
+        """:meth:`ClockAndTopologySpec.effective_clock_mhz` for the profile."""
+        return self.clock_and_topology_spec.effective_clock_mhz()
+
+    def _peak_clock(self, clock_mhz: float | None) -> float | None:
+        value = self.effective_clock_mhz() if clock_mhz is None else clock_mhz
+        if value is None or not _finite(value) or float(value) <= 0:
+            return None
+        return float(value)
+
+    def peak_cube_ops_per_s(self, dtype: str = "bf16", *, clock_mhz: float | None = None) -> float | None:
+        """Per-die Cube ops/s from the declared capability, or ``None``.
+
+        ``clock_mhz`` defaults to :meth:`effective_clock_mhz`; the result is
+        ``ops_per_cycle_per_die(dtype) x clock`` and never a registry literal.
+        """
+        clock = self._peak_clock(clock_mhz)
+        ops = self.cube_spec.ops_per_cycle_per_die(dtype)
+        if clock is None or ops is None:
+            return None
+        return ops * clock * 1e6
+
+    def peak_vector_ops_per_s(self, dtype: str = "bf16", *, clock_mhz: float | None = None) -> float | None:
+        """Per-die AIV ops/s from the declared capability, or ``None``.
+
+        Returns ``None`` when ``ops_per_cycle_per_aiv`` does not declare the
+        dtype: a vector peak may not be synthesized from ``simd_width_bytes``
+        (bytes/cycle is not ops/cycle), so an undeclared capability stays
+        unmodeled instead of borrowing 128 or 256.
+        """
+        clock = self._peak_clock(clock_mhz)
+        ops = self.vector_spec.ops_per_cycle_per_die(dtype)
+        if clock is None or ops is None:
+            return None
+        return ops * clock * 1e6
+
 
 def infer_arch_family(soc_or_family: str | None, *, npu_arch: str | None = None, dual_die: bool = False) -> str:
+    """Infer ``A2``/``A3``/``A5`` from *positive* board evidence only.
+
+    ``NpuArch`` values are not a family discriminator on their own: CANN 9.1
+    tags an A2 ``Ascend910B4`` with ``NpuArch=2201``, the same id A3 parts use
+    (``.workstreams/a2-recon/a2-hardware-evidence.md`` §7.5).  A3 therefore
+    requires an ``910_93``/``910C`` SKU token or a dual-die package; an A2
+    ``910B`` token wins over the shared arch id.  The final ``"A5"`` is the
+    legacy catch-all for a caller-supplied non-Ascend token.
+    """
     token = (soc_or_family or "").strip().upper()
     if token in _AMBIGUOUS_FAMILY_TOKENS:
         return _AMBIGUOUS_FAMILY_TOKENS[token]
     if npu_arch == "3510" or "950" in token:
         return "A5"
-    if npu_arch == "2201" or "910_93" in token or "910C" in token or dual_die:
+    if "910_93" in token or "910C" in token or dual_die:
         return "A3"
     if "910B" in token or "910" in token:
         return "A2"
@@ -387,14 +550,36 @@ def resolve_device_capability_profile(
     verified_runtime_hbm_mib: float | None = None,
     simulator_ub_kib: float | None = None,
     allocatable_ub_kib: float | None = None,
-    sustained_mhz_range: Sequence[float] = SUSTAINED_MHZ_RANGE,
+    sustained_mhz_range: Sequence[float] | None = None,
+    clock_override_mhz: float | None = None,
     cannsim_links: Mapping[str, Any] | None = None,
 ) -> DeviceCapabilityProfile:
+    """Resolve a device profile from the strongest evidence the caller supplies.
+
+    Tiers: custom ``sku_profile`` < CANN ``.ini`` < exact SKU catalog < npu-smi
+    snapshot < explicit caller arguments.  Two clocks are kept apart:
+    ``configured_clock_mhz`` is the declared ``.ini``/catalog value and
+    ``runtime_clock_mhz`` the verified npu-smi rated clock; which one a model
+    should use is decided only by ``ClockAndTopologySpec.effective_clock_mhz``
+    (override > runtime > configured).  ``sustained_mhz_range`` is a measured
+    band and stays empty unless the caller passes one.
+    """
     custom = load_sku_profile(sku_profile) if sku_profile is not None else {}
     cube_override = dict(custom.get("cube_spec") or {}) if isinstance(custom.get("cube_spec"), Mapping) else {}
     vec_override = dict(custom.get("vector_spec") or {}) if isinstance(custom.get("vector_spec"), Mapping) else {}
     mem_override = dict(custom.get("memory_hierarchy_spec") or {}) if isinstance(custom.get("memory_hierarchy_spec"), Mapping) else {}
     clk_override = dict(custom.get("clock_and_topology_spec") or {}) if isinstance(custom.get("clock_and_topology_spec"), Mapping) else {}
+
+    # The sustained band is a measurement.  ``None``/empty stays unmeasured and
+    # nothing (least of all a family constant) is substituted for it.
+    sustained = parse_mhz_range(sustained_mhz_range, reason="sku_invalid_sustained_mhz_range")
+    sustained_range: tuple[float, ...] = sustained or UNMEASURED_MHZ_RANGE
+    sustained_source = "caller_supplied" if sustained else None
+    # Explicit caller override: highest clock precedence, never stored into
+    # ``configured_clock_mhz``.
+    override_f = _float_value(float(clock_override_mhz), "sku_invalid_clock_override") if clock_override_mhz is not None else None
+    if override_f is not None and override_f <= 0:
+        raise HardwareError("sku_invalid_clock_override")
 
     sources: list[str] = []
     if config is not None:
@@ -430,7 +615,6 @@ def resolve_device_capability_profile(
         )
     )
     common_buf = _FAMILY_COMMON_BUFFERS.get(family, _FAMILY_COMMON_BUFFERS["A5"])
-    low_mhz, high_mhz = sorted(float(v) for v in sustained_mhz_range)[:2]
 
     # Check if we only have an ambiguous family token and no exact SKU / INI / probe disambiguation.
     has_exact_sku = bool(config is not None or catalog_entry or custom.get("soc_version") or clk_override.get("soc_version") or snap_soc)
@@ -471,7 +655,9 @@ def resolve_device_capability_profile(
                 npu_arch=None,
                 dies_per_package=2 if (snapshot and snapshot.dual_die) or family == "A3" else 1,
                 configured_clock_mhz=None,
-                sustained_clock_mhz_range=(low_mhz, high_mhz),
+                sustained_clock_mhz_range=sustained_range,
+                sustained_clock_source=sustained_source,
+                clock_override_mhz=override_f,
             ),
             discrepancies=(),
             resolution_sources=tuple(sources or ["ambiguous_family_only"]),
@@ -493,6 +679,7 @@ def resolve_device_capability_profile(
     )
     runtime_aic = None
     runtime_clock = None
+    runtime_current_clock = None
     if snapshot is not None and snapshot.chips:
         counts = sorted({chip.aicore_count for chip in snapshot.chips if chip.aicore_count})
         if counts:
@@ -504,9 +691,10 @@ def resolve_device_capability_profile(
                     "runtime_value": runtime_aic,
                     "authority": "npu_smi_runtime",
                 })
-        clocks = sorted({chip.aicore_freq_mhz for chip in snapshot.chips if chip.aicore_freq_mhz})
-        if clocks:
-            runtime_clock = float(clocks[0])
+        # "Aicore Freq(MHZ)" is the rated maximum the part reaches under load;
+        # "Aicore curFreq(MHZ)" is the instantaneous DVFS point and never a peak.
+        runtime_clock = snapshot.rated_aicore_freq_mhz
+        runtime_current_clock = snapshot.observed_aicore_freq_mhz
 
     resolved_aic = _int_value(int(runtime_aic if runtime_aic is not None else static_aic), "sku_invalid_aic") if (runtime_aic or static_aic) else None
     resolved_aiv = (
@@ -543,11 +731,26 @@ def resolve_device_capability_profile(
     )
     cfg_clock_f = _float_value(float(cfg_clock), "sku_invalid_clock") if cfg_clock is not None else None
     if cfg_clock_f is not None and runtime_clock is not None and abs(cfg_clock_f - runtime_clock) > 0.5:
+        # Both numbers are real and answer different questions: the .ini value is
+        # the declared configuration, npu-smi's "Aicore Freq" the rated maximum
+        # reached under load.  They stay separate and the disagreement is logged.
         discrepancies.append({
             "field": "configured_clock_mhz",
             "platform_config_clock_mhz": cfg_clock_f,
             "runtime_aicore_freq_mhz": runtime_clock,
+            "observed_current_freq_mhz": runtime_current_clock,
+            "caller_override_clock_mhz": override_f,
             "authority": "npu_smi_runtime",
+        })
+    if override_f is not None and any(
+        other is not None and abs(override_f - other) > 0.5 for other in (cfg_clock_f, runtime_clock)
+    ):
+        discrepancies.append({
+            "field": "effective_clock_mhz",
+            "caller_override_clock_mhz": override_f,
+            "platform_config_clock_mhz": cfg_clock_f,
+            "runtime_aicore_freq_mhz": runtime_clock,
+            "authority": "caller_override",
         })
 
     base_alloc_ub = (
@@ -598,6 +801,21 @@ def resolve_device_capability_profile(
     ops_map = dict(_FAMILY_DEFAULT_OPS_PER_CYCLE.get(family, _FAMILY_DEFAULT_OPS_PER_CYCLE["A5"]))
     if isinstance(cube_override.get("ops_per_cycle_per_aic"), Mapping):
         ops_map.update({str(k): int(v) for k, v in cube_override["ops_per_cycle_per_aic"].items()})
+    # Declared AIV capability: catalog first, caller profile last.  Undeclared
+    # stays empty -> ``VectorSpec.ops_per_cycle_per_die`` returns ``None``; the
+    # SIMD width is never converted into an ops/cycle count.
+    vec_ops_map: dict[str, int] = {}
+    for source_map in (catalog_entry.get("ops_per_cycle_per_aiv"), vec_override.get("ops_per_cycle_per_aiv")):
+        if isinstance(source_map, Mapping):
+            vec_ops_map.update({str(k): int(v) for k, v in source_map.items()})
+    # HBM peak bandwidth evidence tier: the declared registry peak and a measured
+    # sustained figure stay separate, and the peak is only "verified" when an
+    # authority says so (use ``is None`` because ``False`` is a real value).
+    bw_verified: bool | None = None
+    for candidate in (mem_override.get("hbm_peak_bw_verified"), custom.get("hbm_peak_bw_verified"), catalog_entry.get("hbm_peak_bw_verified")):
+        if candidate is not None:
+            bw_verified = bool(candidate)
+            break
     intra_pkg_bw = (
         float(mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
         if (mem_override.get("intra_package_die_bw_gbps") or catalog_entry.get("intra_package_die_bw_gbps"))
@@ -643,6 +861,7 @@ def resolve_device_capability_profile(
             simd_width_bytes=int(vec_override.get("simd_width_bytes", 256 if family == "A5" else 128)),
             physical_ub_kib=phys_ub_f,
             allocatable_ub_kib=alloc_ub_f,
+            ops_per_cycle_per_aiv=vec_ops_map,
         ),
         memory_hierarchy_spec=MemoryHierarchySpec(
             platform_config_hbm_mib=plat_hbm_f,
@@ -657,6 +876,7 @@ def resolve_device_capability_profile(
             intra_node_hccs_bw_gbps=intra_node_bw or channels["d2d_intra_node"].effective_uni_bw_gbps,
             inter_node_roce_bw_gbps=inter_node_bw or channels["d2d_inter_node"].effective_uni_bw_gbps,
             transfer_channels=channels,
+            hbm_peak_bw_verified=bw_verified,
         ),
         clock_and_topology_spec=ClockAndTopologySpec(
             arch_family=family,
@@ -674,8 +894,11 @@ def resolve_device_capability_profile(
             ) if (clk_override.get("npu_arch") or (config and config.npu_arch) or catalog_entry.get("npu_arch")) else None,
             dies_per_package=dies,
             configured_clock_mhz=cfg_clock_f,
-            sustained_clock_mhz_range=(low_mhz, high_mhz),
+            sustained_clock_mhz_range=sustained_range,
+            sustained_clock_source=sustained_source,
             runtime_clock_mhz=runtime_clock,
+            runtime_current_clock_mhz=runtime_current_clock,
+            clock_override_mhz=override_f,
         ),
         discrepancies=tuple(discrepancies),
         resolution_sources=tuple(sources),

@@ -1,11 +1,19 @@
 """Shared constants and validation primitives for the Layer 1 hardware package.
 
 [Role]
-  Provide the error type, unit constants, alignment helper and A5 simulator
-  reference constants used by ``hardware``, ``buffers`` and ``thermal``.
+  Provide the error type, unit constants, alignment helper, clock-band parsing
+  and A5 simulator reference constants used by ``hardware``, ``buffers``,
+  ``thermal`` and ``sku_profile``.
 
 [Invariants]
   * Constants here are references or units, never verified board measurements.
+  * Clock bands are evidence, not family constants.  ``UNMEASURED_MHZ_RANGE`` is
+    the only default for a device whose sustained clock has not been soaked; a
+    populated band exists only when a caller supplies a measured one.
+  * ``LEGACY_REFERENCE_MHZ_RANGE`` is the A5 cannsim frequency ladder used to
+    index reference-time tables.  It is *not* a device sustained-clock claim and
+    must never be copied into a SKU profile (the A2 910B4 only ever showed
+    800 MHz idle / 1650 MHz loaded).
   * Alignment is a pure integer ceiling operation; no silent clamping.
   * ``HardwareError.reason`` is stable and caller-safe.
 
@@ -24,7 +32,19 @@ MIB = 1024 * 1024
 KIB = 1024
 DEFAULT_ALIGNMENT_BYTES = 32
 PING_PONG_ALIGNMENT_BYTES = 256
-SUSTAINED_MHZ_RANGE = (1250.0, 1300.0)
+
+#: The evidence-free default: no sustained clock band has been measured.
+UNMEASURED_MHZ_RANGE: tuple[float, ...] = ()
+#: A5 cannsim reference ladder for frequency-indexed reference times.  Evidence:
+#: ``.workstreams/a2-recon/a2-hardware-evidence.md`` §4.2/§7.6 observed exactly
+#: two A2 DVFS states (800 idle / 1650 loaded), never 1250-1300, and no soak
+#: exists.  ``thermal``/``hardware`` still index their reference tables by this
+#: ladder; the SKU-profile layer defaults to ``UNMEASURED_MHZ_RANGE`` instead.
+LEGACY_REFERENCE_MHZ_RANGE: tuple[float, float] = (1250.0, 1300.0)
+#: Deprecated alias for :data:`LEGACY_REFERENCE_MHZ_RANGE`, kept only for
+#: existing ``thermal``/``hardware`` default arguments in this tree.  New code
+#: must treat a missing band as ``UNMEASURED_MHZ_RANGE``.
+SUSTAINED_MHZ_RANGE = LEGACY_REFERENCE_MHZ_RANGE
 SHORT_BURST_MHZ_RANGE = (1640.0, 1650.0)
 A5_REFERENCE_PEAKS = {
     "fp8_flops_per_s": 864e12,
@@ -110,6 +130,34 @@ def _canonical_link_key(key: str) -> str:
     return _LINK_ALIASES.get(normalized, normalized.lower())
 
 
+def parse_mhz_range(raw: Any, *, reason: str = "mhz_range_invalid") -> tuple[float, float] | None:
+    """Normalize a caller-supplied measured MHz band.
+
+    Backward-compatible spellings: a 2-element sequence of finite positive MHz
+    values, the CLI string ``"1250:1300"``, or ``None`` / ``()`` / ``""`` for
+    "not measured".  Returns ``None`` for the unmeasured case; no substitute
+    band is ever invented.  A malformed or non-positive band raises
+    ``HardwareError(reason)``.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        parts = [part for part in raw.strip().split(":") if part.strip()]
+        if not parts:
+            return None
+        raw = parts
+    try:
+        values = [float(value) for value in raw]
+    except (TypeError, ValueError) as exc:
+        raise HardwareError(reason) from exc
+    if not values:
+        return None
+    if len(values) != 2 or any(not _finite(value) or value <= 0 for value in values):
+        raise HardwareError(reason)
+    low, high = sorted(values)
+    return (low, high)
+
+
 def default_link_ceilings() -> dict[str, Any]:
     return {
         "ceilings_bpc": dict(A5_CANN_SIM_LINK_CEILINGS_BPC),
@@ -124,6 +172,8 @@ __all__ = [
     "KIB",
     "DEFAULT_ALIGNMENT_BYTES",
     "PING_PONG_ALIGNMENT_BYTES",
+    "UNMEASURED_MHZ_RANGE",
+    "LEGACY_REFERENCE_MHZ_RANGE",
     "SUSTAINED_MHZ_RANGE",
     "SHORT_BURST_MHZ_RANGE",
     "A5_REFERENCE_PEAKS",
@@ -136,5 +186,6 @@ __all__ = [
     "_mib",
     "_kib",
     "_canonical_link_key",
+    "parse_mhz_range",
     "default_link_ceilings",
 ]

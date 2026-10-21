@@ -1104,14 +1104,25 @@ def test_fa_and_rope_are_not_advertised_executable_without_builders():
 def _gap_curve_artifact():
     from mindie_sim.a3_operator_curves_adapter import adapt_linearity_split_results
     from mindie_sim.a3_operator_curve_forecast import export_curve_artifact
+    # Six train points split 3+3 under the three-point segment minimum, so the
+    # unresolved gap sits between x=16 and x=129 and the heldout x=32 falls in
+    # it.  (The fixture previously relied on 2-point segments ending at x=8.)
     cases = []
-    for x, y, split in [(1, 1, "train"), (8, 1, "train"), (127, 3, "train"),
+    for x, y, split in [(1, 1, "train"), (8, 1, "train"), (16, 3, "train"),
                         (129, 5, "train"), (512, 10, "train"), (513, 10, "train"),
                         (32, 1, "heldout")]:
         cases.append({
             "request": {"case_id": f"x{x}", "op_family": "gemm",
                         "shape": {"m": x, "n": 128, "k": 128}, "dtype": "bf16",
-                        "layout": "contiguous", "features": {}, "sweeps": [{"axis": "m"}]},
+                        "layout": "contiguous",
+                        # Complete precision attestation: the curve must be able to
+                        # reject a contradicted dtype (see the identity test).
+                        "features": {"weight_dtype": "bf16",
+                                     "activation_dtype": "bf16",
+                                     "compute_dtype": "bf16",
+                                     "accumulation_dtype": "backend_default",
+                                     "quantization": "none"},
+                        "sweeps": [{"axis": "m"}]},
             "campaign_split": split,
             "production_result": {
                 "status": "completed", "source_class": "measured", "run_id": "synthetic",
@@ -1839,7 +1850,12 @@ def test_generic_scope_is_part_of_grouping_export_and_query():
             cases.append({
                 "request": {"case_id": f"scope{scope_index}-{x}", "op_family": "gemm",
                             "shape": {"m": x, "n": 128, "k": 128}, "dtype": "bf16",
-                            "layout": "contiguous", "features": {},
+                            "layout": "contiguous",
+                            "features": {"weight_dtype": "bf16",
+                                         "activation_dtype": "bf16",
+                                         "compute_dtype": "bf16",
+                                         "accumulation_dtype": "backend_default",
+                                         "quantization": "none"},
                             "coverage_scope": scope, "sweeps": [{"axis": "m"}]},
                 "campaign_split": "train",
                 "production_result": {
@@ -1860,10 +1876,35 @@ def test_generic_scope_is_part_of_grouping_export_and_query():
     assert {curve["physical"]["coverage_scope"] for curve in artifact["curves"]} == set(scopes)
     for curve in artifact["curves"]:
         query = _curve_query(curve, {"m": 12, "n": 128, "k": 128})
-        assert query_curve_artifact(artifact, query)["status"] == "ok"
+        exact = query_curve_artifact(artifact, query)
+        assert exact["status"] == "ok"
+        assert exact["match_scope"] == "exact_physical_candidate"
+        # The same physical cell carries two declared probe series; resolution
+        # is deterministic and reported, so both series' own queries agree.
+        assert exact["curve_selection"]["candidates"]
+        # A declared-probe description is not a physical fact.  A fresh heldout
+        # condition can only carry a heldout label, so a scope that names no
+        # training series is still answered from the physically identical cell,
+        # labelled and with both scope labels reported (round-2 policy).
         crossed = copy.deepcopy(query)
         crossed["coverage_scope"] = "unrelated_scope_not_in_artifact"
-        assert query_curve_artifact(artifact, crossed)["status"] == "unsupported"
+        answer = query_curve_artifact(artifact, crossed)
+        assert answer["status"] == "ok"
+        assert answer["match_scope"] == "physical_cell_scope_agnostic"
+        assert answer["scope_agnostic"] is True
+        assert answer["declared_coverage_scope"] == "unrelated_scope_not_in_artifact"
+        assert answer["measured_coverage_scopes"] == sorted(scopes)
+        assert answer["production_match"] is False
+        # Physical mismatches still refuse.
+        other_dtype = copy.deepcopy(crossed)
+        other_dtype["precision"] = {**crossed["precision"], "output_dtype": "fp32"}
+        assert query_curve_artifact(artifact, other_dtype)["status"] == "unsupported"
+        other_protocol = copy.deepcopy(crossed)
+        other_protocol["protocol"] = {**crossed["protocol"], "warmup": 11}
+        assert query_curve_artifact(artifact, other_protocol)["status"] == "unsupported"
+        other_shape = copy.deepcopy(crossed)
+        other_shape["shape"] = {"m": 12, "n": 256, "k": 128}
+        assert query_curve_artifact(artifact, other_shape)["status"] == "unsupported"
     reversed_manifest, reversed_results = adapt_linearity_split_results(
         {"cases": list(reversed(cases))})
     reversed_artifact = export_curve_artifact(reversed_manifest, reversed_results)

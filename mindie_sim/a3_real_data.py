@@ -14,8 +14,19 @@
     requested and is never used by ``as_calibration_store`` by default.
   * Measured samples are labelled by the JSON's real run protocol, not
     synthesized; logical bytes are not presented as measured HBM traffic.
-  * The analytic baseline uses the same machine fixture and cost formulas as
-    predictive modeling.
+  * The measurement machine is derived, never typed in: ``device_name`` resolves
+    the declared SKU capability profile, the runtime ``npu-smi`` clock/package
+    capture overrides it, and the result is a ``MachineSpec`` whose links come
+    from the declared transfer channels.  Configured-vs-runtime clock
+    disagreements stay in the machine metadata.
+  * Hardware identity is mandatory.  A run without ``device_name`` produces an
+    explicit ``machine_identity_missing`` gap and no row; it never becomes an
+    ``unspecified:*`` key that would match every machine.
+  * Communication baselines use the machine's own channels and package/rank
+    geometry.  A placement the machine does not have (SIO on single-die A2) is
+    a gap, not a fabricated baseline.
+  * The analytic baseline uses the same machine and cost formulas as predictive
+    modeling.
   * CV summaries are measured slowdowns under the declared stream overlap, not
     a universal contention discount.
 
@@ -29,7 +40,6 @@ from __future__ import annotations
 
 import json
 import math
-import re
 import statistics
 from dataclasses import dataclass
 from pathlib import Path
@@ -37,42 +47,114 @@ from typing import Any, Mapping, Sequence
 
 from .a3_calibration_store import SQLiteCalibrationStore
 from .a3_cost import CalibrationStore, PredictiveCostModel
-from .a3_resources import ResourceEngine, ResourceSpec
 from .a3_types import A3InputError, MachineSpec
 from .a3_workload import OpSpec, dtype_bytes
+from .hardware import resolve_device_capability_profile
+from .hardware_common import HardwareError
+from .hardware_probe import NpuSmiSnapshot, parse_npu_smi_common
+
+
+def _capture_text(value: Any) -> str:
+    """Read a capture that may be a raw string or ``{returncode, stdout}``."""
+    if isinstance(value, Mapping):
+        return str(value.get("stdout") or value.get("text") or "")
+    return str(value or "")
+
+
+def _clock_snapshot(environment: Mapping[str, Any]) -> NpuSmiSnapshot | None:
+    """Build an npu-smi snapshot from the environment's clock capture."""
+    common = _capture_text(
+        environment.get("clock_common_before")
+        or environment.get("npu_smi_common_before")
+    )
+    if not common.strip():
+        return None
+    try:
+        chips = parse_npu_smi_common(common)
+    except HardwareError as exc:
+        raise A3InputError("machine_clock_capture_invalid") from exc
+    if not chips:
+        return None
+    return NpuSmiSnapshot(
+        devices=(), chips=chips, board={},
+        source="measurement_environment.clock_common_before",
+    )
 
 
 def machine_from_environment(environment: Mapping[str, Any]) -> MachineSpec:
-    """Build a one-die fixture from the measurement environment."""
-    device_name = str(environment.get("device_name", "Ascend910_9362"))
-    common = str(environment.get("clock_common_before", ""))
-    aic_match = re.search(r"Aicore Count\s*:\s*(\d+)", common)
-    freq_match = re.search(r"Aicore Freq\(MHZ\)\s*:\s*(\d+)", common)
-    aic = int(aic_match.group(1)) if aic_match else 20
-    freq_mhz = float(freq_match.group(1)) if freq_match else 1650.0
-    # Ascend910_9362 published HBM peak in the SKU catalog; this is a declared
-    # hardware fixture, not inferred from the measured durations.
-    hbm_bw = 1200e9
-    cube = float(aic) * 8192.0 * freq_mhz * 1e6
-    vector = float(aic * 2) * 256.0 * freq_mhz * 1e6
-    return MachineSpec.from_mapping({
-        "name": f"real-measurement-{device_name}",
-        "hardware_key": device_name,
-        "arch_family": "A3",
-        "dies_per_package": 2,
-        "num_devices": 1,
-        "device": {
-            "hbm_gib": 64.0,
-            "cube_flops_per_s": cube,
-            "vector_ops_per_s": vector,
-            "hbm_bw_bytes_per_s": hbm_bw,
-            "mte_bw_bytes_per_s": 2.0 * hbm_bw,
-            "launch_us": 20.0,
-            "l2_bytes": 201326592,
-        },
-        "compute_peaks": {"bf16": cube},
-        "links": [{"name": "d2d", "capacity_gbps": 196, "members": [0]}],
-    })
+    """Derive the measurement machine from the declared SKU + clock snapshot.
+
+    No A3 literal survives here: architecture, dies per package, HBM, L2, AIC
+    and AIV counts come from ``resolve_device_capability_profile`` (platform
+    config / SKU catalog, overridden by the runtime ``npu-smi`` capture), and
+    the peaks are scaled to the *runtime* clock when the capture provides it.
+    The configured-vs-runtime clock difference stays visible in the machine
+    metadata instead of being silently resolved either way.
+    """
+    device_name = str(
+        environment.get("device_name") or environment.get("soc") or ""
+    ).strip()
+    if not device_name:
+        raise A3InputError("machine_identity_missing")
+    snapshot = _clock_snapshot(environment)
+    try:
+        profile = resolve_device_capability_profile(
+            soc=device_name, snapshot=snapshot,
+        )
+    except HardwareError as exc:
+        raise A3InputError(f"machine_sku_unresolved:{device_name}") from exc
+    topology = profile.clock_and_topology_spec
+    runtime_clock = topology.runtime_clock_mhz
+    configured_clock = topology.configured_clock_mhz
+    effective_clock = getattr(profile, "effective_clock_mhz", None)
+    model_clock = effective_clock() if callable(effective_clock) else None
+    if model_clock is None:
+        model_clock = (
+            runtime_clock if (runtime_clock and runtime_clock > 0)
+            else configured_clock
+        )
+    if model_clock is None or float(model_clock) <= 0:
+        raise A3InputError("machine_clock_undeclared")
+    clock_mhz = float(model_clock)
+    clock_source = (
+        "npu_smi_runtime_aicore_freq"
+        if runtime_clock is not None and abs(float(runtime_clock) - clock_mhz) < 1e-9
+        else "configured_platform_ini_or_sku_catalog"
+    )
+    visible = str(environment.get("visible_devices") or "")
+    devices = len([item for item in visible.replace(";", ",").split(",") if item.strip()])
+    if devices <= 0:
+        try:
+            devices = int(environment.get("device_count") or 0)
+        except (TypeError, ValueError):
+            devices = 0
+    if devices <= 0:
+        devices = max(1, int(topology.dies_per_package or 1))
+    vector_ops_per_s, vector_source = _measurement_vector_ops_per_s(
+        profile, clock_mhz,
+    )
+    metadata = {
+        "profile_status": profile.status,
+        "profile_sources": list(profile.resolution_sources),
+        "configured_clock_mhz": configured_clock,
+        "runtime_clock_mhz": runtime_clock,
+        "model_clock_mhz": clock_mhz,
+        "clock_source": clock_source,
+        "vector_capability_source": vector_source,
+        "discrepancies": [dict(item) for item in profile.discrepancies],
+        "source": "measurement_environment",
+    }
+    return MachineSpec.from_profile(
+        profile,
+        name=f"measurement-machine-{device_name}",
+        sku=device_name,
+        hardware_key=device_name,
+        num_devices=devices,
+        ranks_per_node=devices,
+        clock_mhz=clock_mhz,
+        vector_ops_per_s=vector_ops_per_s,
+        metadata=metadata,
+    )
 
 
 def _baseline_op(
@@ -309,15 +391,70 @@ __all__ = [
 ]
 
 
-def _comm_baselines(placement: str, payload_bytes: int) -> tuple[float, float]:
-    from .comm import default_transfer_channels, solve_collective_bound, solve_transfer_bound
+_PLACEMENT_CHANNEL = {
+    "sio": "d2d_intra_package",
+    "intra_package": "d2d_intra_package",
+    "hccssw": "d2d_intra_node",
+    "hccs_sw": "d2d_intra_node",
+    "hccs": "d2d_intra_node",
+    "intra_node": "d2d_intra_node",
+    "inter_node": "d2d_inter_node",
+    "roce": "d2d_inter_node",
+}
 
-    channels = default_transfer_channels("A3", dies_per_package=2)
+
+#: B8: neither A2 nor A3 publishes an ``ops_per_cycle_per_aiv`` declaration, so
+#: a profile-derived vector peak can only be a nominal.  The measurement
+#: campaign this importer serves declared the AIV engine at 2 element-ops per
+#: byte of SIMD width (256 element-ops/clk/AIV for 16-bit), and every A3
+#: fixture in this tree asserts that value.  It stays one named, documented
+#: nominal here -- never scattered through the formulas -- until a measured
+#: effective vector rate (or a declared capability) replaces it.
+_MEASUREMENT_VECTOR_OPS_PER_SIMD_BYTE = 2.0
+
+
+def _measurement_vector_ops_per_s(profile: Any, clock_mhz: float) -> tuple[float, str]:
+    """Effective per-die AIV ops/s for a measurement machine + its provenance."""
+    declared = getattr(profile, "peak_vector_ops_per_s", None)
+    if callable(declared):
+        value = declared("bf16")
+        if value is not None:
+            return float(value), "profile_declared_ops_per_cycle_per_aiv"
+    aiv = float(profile.vector_spec.aiv_count_per_die or 0)
+    simd = float(profile.vector_spec.simd_width_bytes or 0)
+    if aiv <= 0 or simd <= 0:
+        raise A3InputError("machine_sku_vector_capability_missing")
+    return (
+        aiv * simd * _MEASUREMENT_VECTOR_OPS_PER_SIMD_BYTE * clock_mhz * 1e6,
+        "legacy_measurement_nominal_2_element_ops_per_simd_byte_unverified",
+    )
+
+
+def _comm_baselines(
+    placement: str, payload_bytes: int, machine: MachineSpec,
+) -> tuple[float, float]:
+    """Analytic all-reduce / transfer baselines on *this machine's* fabric.
+
+    The channels and the rank/package geometry come from the machine the
+    measurement was taken on, not from an A3 literal.  A placement the machine
+    does not have (SIO on a single-die A2 part) is an explicit error so the
+    importer records a gap instead of storing a fabricated A3 baseline.
+    """
+    from .comm import solve_collective_bound, solve_transfer_bound
+
+    channels = {item.channel: item for item in machine.transfer_channels}
+    channel = _PLACEMENT_CHANNEL.get(str(placement).strip().lower())
+    if channel is None:
+        raise A3InputError(f"communication_placement_unmapped:{placement}")
+    if channel not in channels:
+        raise A3InputError(f"communication_link_missing:{placement}")
+    if channels[channel].effective_uni_bw_gbps is None:
+        raise A3InputError(f"communication_fabric_unavailable:{placement}")
     collective = solve_collective_bound(
         "all_reduce", float(payload_bytes), channels,
-        total_ranks=2, ranks_per_node=2, dies_per_package=2,
+        total_ranks=2, ranks_per_node=machine.ranks_per_node,
+        dies_per_package=machine.dies_per_package,
     )
-    channel = "d2d_intra_package" if "sio" in placement.lower() else "d2d_intra_node"
     transfer = solve_transfer_bound(channel, float(payload_bytes), channels)
     return (
         float(collective.get("lower_bound_us", 0.0) or 0.0) / 1000.0,
@@ -342,6 +479,7 @@ def import_communication_measurements(
         raise A3InputError("communication_measurements_invalid")
     pending: list[dict[str, Any]] = []
     condition_keys: set[tuple[str, str]] = set()
+    gaps: list[dict[str, Any]] = []
     skipped = 0
     for run in runs:
         if not isinstance(run, Mapping) or run.get("status") != "completed":
@@ -359,6 +497,15 @@ def import_communication_measurements(
             rank = int(rank_block.get("rank", 0) or 0)
             rank_environment = dict(rank_block.get("environment") or {})
             rank_protocol = dict(rank_block.get("protocol") or {})
+            rank_machine: MachineSpec | None = None
+            machine_error = ""
+            try:
+                rank_machine = machine_from_environment({
+                    **rank_environment,
+                    "visible_devices": run.get("visible_devices", ""),
+                })
+            except A3InputError as exc:
+                machine_error = str(exc)
             for case in rank_block.get("cases", ()):
                 split = str(case.get("split", "train")).strip().lower()
                 split = {"holdout": "heldout", "held_out": "heldout", "validation": "heldout"}.get(split, split)
@@ -366,15 +513,32 @@ def import_communication_measurements(
                     skipped += 1
                     continue
                 case_id = str(case.get("case_id", "comm-case"))
+                if rank_machine is None:
+                    # No hardware identity means no residual can ever be
+                    # attributed.  Record the gap instead of writing an
+                    # ``unspecified:*`` key that would match every machine.
+                    gaps.append({
+                        "case_id": case_id,
+                        "reason": f"machine_identity_missing:{machine_error}",
+                    })
+                    skipped += 1
+                    continue
                 placement = "sio" if "sio" in case_id.lower() else "hccssw"
                 payload = int(case.get("tensor_payload_bytes", 0))
                 if payload <= 0:
                     skipped += 1
                     continue
-                condition_keys.add((run_id, case_id))
                 repetitions = max(1, int(case.get("repetitions_per_lane", 1)))
                 delay = float(case.get("requested_transfer_delay_ms", 0.0))
-                c_base, p_base = _comm_baselines(placement, payload)
+                try:
+                    c_base, p_base = _comm_baselines(
+                        placement, payload, rank_machine,
+                    )
+                except A3InputError as exc:
+                    gaps.append({"case_id": case_id, "reason": str(exc)})
+                    skipped += 1
+                    continue
+                condition_keys.add((run_id, case_id))
                 mode = str(case.get("mode", "unknown"))
                 features = {"placement": placement, "mode": mode}
                 competition = {
@@ -406,6 +570,7 @@ def import_communication_measurements(
                             "case": dict(case), "run_protocol": run_protocol,
                             "rank_protocol": rank_protocol,
                             "rank_environment": rank_environment,
+                            "machine": rank_machine,
                             "visible_devices": run.get("visible_devices", ""),
                         })
     # Rank rows from one collective trial are correlated.  Store one critical-
@@ -441,16 +606,22 @@ def import_communication_measurements(
             "rank_count": len(ranks),
             "rank_samples_correlated": True,
         }
-        try:
-            from .a3_types import machine_from_environment as _machine_from_env
-            _env_machine = _machine_from_env(best["rank_environment"])
-        except Exception:
-            _env_machine = None
+        # The machine was derived (profile + clock snapshot) when the run's rank
+        # block was read.  The old code imported a non-existent symbol here and
+        # swallowed the ImportError, degrading the key to ``unspecified``.
+        env_machine: MachineSpec = best["machine"]
         _device_name = str(
             best["rank_environment"].get("device_name", "")
-            or (_env_machine.hardware_key if _env_machine is not None else "")
-            or "unspecified"
-        )
+            or env_machine.hardware_key
+            or ""
+        ).strip()
+        if not _device_name:
+            gaps.append({
+                "case_id": case_id,
+                "reason": "machine_identity_missing:hardware_key_empty",
+            })
+            skipped += 1
+            continue
         _dtype_decl = str(
             best["rank_protocol"].get("dtype", "bf16")
         ).lower()
@@ -544,6 +715,7 @@ def import_communication_measurements(
         "measurements": imported,
         "conditions": conditions,
         "skipped": skipped,
+        "gaps": gaps,
         "include_heldout": include_heldout,
         "inventory": store.inventory(),
     }
@@ -609,8 +781,12 @@ def import_linearity_calibration_cases(
             or ""
         )
         machine = None
+        machine_error = ""
         if device_name:
-            machine = machine_from_environment(environment)
+            try:
+                machine = machine_from_environment(environment)
+            except A3InputError as exc:
+                machine_error = str(exc)
         shape_raw = case.get("shape_mkn")
         elements = 0
         m = k = n = 0
@@ -649,7 +825,11 @@ def import_linearity_calibration_cases(
         case_id = str(case.get("case_id") or "linearity-case")
         if machine is None:
             gaps.append({
-                "case_id": case_id, "reason": "machine_identity_missing",
+                "case_id": case_id,
+                "reason": (
+                    f"machine_identity_missing:{machine_error}"
+                    if machine_error else "machine_identity_missing"
+                ),
             })
             skipped += 1
             continue

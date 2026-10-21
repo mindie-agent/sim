@@ -16,6 +16,14 @@
     completed trials, not event iterations.
   * Pending/failed/unmeasured cases remain in coverage with reasons; they are
     never removed from the denominator or replaced by zero.
+  * Segments carry at least three points whenever the curve can be split; the
+    segment count is chosen by BIC on a robust (Huber) loss and every candidate
+    is reported.  Residuals and outliers stay visible; no point is dropped.
+  * A measured negative slope is reported as measured and projected onto a
+    constant level; segment knots are isotonically projected before publication,
+    so a published curve never decreases with the work axis.  Every projection
+    reports the measured slope and its size, and a weak fit is labelled weak
+    rather than presented as ``ok``.
   * Affine intercept is labelled constant cost, not proven launch latency;
     plateau is labelled a hint, not proven hardware saturation.
   * No source SHA/version is an admission gate; manifest/results paths are
@@ -36,14 +44,21 @@ import math
 import statistics
 import sys
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Mapping, Sequence
 
 from .a3_operator_campaign import load_manifest
 from .a3_operator_curve_axis import fixed_shape as _axis_fixed_shape
 from .a3_operator_curve_protocol import protocol_signature
-from .a3_operator_curve_query import _predict, _predict_query
+from .a3_operator_curve_query import (
+    MAX_RELATIVE_DROP, MAX_RELATIVE_RESIDUAL_FOR_STRONG_FIT,
+    MIN_R2_FOR_STRONG_FIT, PROJECTION_CONSTANT_LEVEL,
+    _predict, _predict_query, robust_affine,
+)
 
-DEFAULT_MIN_SEGMENT_POINTS = 2
+# A segment is only published as a fitted trend when at least three independent
+# points support it; curves with 2-5 points fit one segment because a 2-point
+# segment has r2 == 1 by construction and cannot be validated.
+DEFAULT_MIN_SEGMENT_POINTS = 3
 DEFAULT_MAX_SEGMENTS = 3
 DEFAULT_JUMP_THRESHOLD = 0.15
 
@@ -186,7 +201,6 @@ def _result_points(manifest: Mapping[str, Any], results: Mapping[str, Any]) -> t
                     "x": float(request.get("point", {}).get("value", 0.0)),
                     "shape": request.get("point", {}).get("shape"),
                     "split": str(request.get("split", "train")),
-                    "run_id": run_id,
                     "hardware_key": str(request.get("hardware_key") or ""),
                     "source_class": source_class,
                     "source": result.get("source") or request.get("source"),
@@ -299,108 +313,302 @@ def _merge_same_x(points: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, A
     return list(merged.values()), overlap
 
 
-def _linear_fit(xs: Sequence[float], ys: Sequence[float]) -> dict[str, float] | None:
-    n = len(xs)
-    if n < 2:
-        return None
-    mean_x = sum(xs) / n
-    mean_y = sum(ys) / n
-    sxx = sum((x - mean_x) ** 2 for x in xs)
-    if sxx <= 1e-15:
-        return None
-    sxy = sum((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys))
-    slope = sxy / sxx
-    intercept = mean_y - slope * mean_x
-    sse = sum((y - (intercept + slope * x)) ** 2 for x, y in zip(xs, ys))
-    sst = sum((y - mean_y) ** 2 for y in ys)
-    return {
-        "slope_ms_per_unit": slope, "intercept_ms": intercept, "sse": sse,
-        "r2": 1.0 - sse / sst if sst > 1e-15 else 1.0,
-        "n": float(n), "x_min": min(xs), "x_max": max(xs),
-    }
+def _effective_segment_min(n: int, min_points: int) -> int:
+    """Minimum support per segment, honest about small curves.
+
+    Three points per segment whenever the curve can be split at all
+    (``n >= 2 * min_points``); otherwise the whole curve is one segment, because
+    a two-point segment is not evidence of a regime.
+    """
+    if n >= 2 * max(2, int(min_points)):
+        return max(2, int(min_points))
+    return max(2, n)
 
 
-def _segment_cost(xs: Sequence[float], ys: Sequence[float], start: int, end: int) -> float:
-    fit = _linear_fit(xs[start:end], ys[start:end])
-    if fit is None:
-        return float("inf")
-    return float(fit["sse"])
+def _huber_loss(fit: Mapping[str, Any]) -> float:
+    """Bounded Huber loss of a fitted segment (reported, never a silent drop)."""
+    delta = float(fit.get("huber_delta_ms") or 0.0)
+    total = 0.0
+    for item in fit.get("residuals") or ():
+        residual = abs(float(item["residual_ms"]))
+        if delta <= 0:
+            total += 0.0
+        elif residual <= delta:
+            total += 0.5 * residual * residual
+        else:
+            total += delta * (residual - 0.5 * delta)
+    return total
 
 
 def _fit_piecewise(points: Sequence[Mapping[str, Any]], *, max_segments: int,
                    min_points: int) -> dict[str, Any] | None:
-    ordered = sorted(points, key=lambda item: float(item["x"]))
+    """Robust piecewise-affine fit with a documented segment-count criterion.
+
+    * Segment model: Huber-loss affine fit (IRLS, MAD scale), not OLS, so one
+      gross repeat cannot tilt a segment.
+    * Segment count: dynamic program over minimum robust loss, selected by BIC
+      on that robust loss (``criterion="bic_on_robust_huber_loss"``); every
+      candidate count is reported so the choice is auditable.
+    * A measured negative slope is reported as measured and then projected onto
+      a constant level, so a published curve never decreases with the probed
+      work axis.  The projection is labelled, never silent.
+    * Residuals, outliers and raw slopes are kept for every segment.
+    """
+    ordered = sorted(points, key=lambda item: (float(item["x"]), float(item["median_ms"])))
     xs = [float(item["x"]) for item in ordered]
     ys = [float(item["median_ms"]) for item in ordered]
     n = len(xs)
     if n < 2 or len(set(xs)) < 2:
         return None
-    segment_limit = max(1, min(int(max_segments), n // max(2, min_points)))
-    cost = [[float("inf")] * (n + 1) for _ in range(n + 1)]
+    segment_min = _effective_segment_min(n, min_points)
+    segment_limit = max(1, min(int(max_segments), n // segment_min))
+    fits: dict[tuple[int, int], dict[str, Any]] = {}
+    loss: dict[tuple[int, int], float] = {}
     for start in range(n):
-        for end in range(start + max(2, min_points), n + 1):
-            cost[start][end] = _segment_cost(xs, ys, start, end)
+        for end in range(start + segment_min, n + 1):
+            fit = robust_affine(xs[start:end], ys[start:end])
+            if fit is None:
+                continue
+            fits[(start, end)] = fit
+            loss[(start, end)] = _huber_loss(fit)
+    if not fits:
+        return None
+    mean_y = sum(ys) / n
+    loss_floor = max(1e-18, 1e-12 * n * mean_y * mean_y)
+
+    def _bic(segments: int, total_loss: float) -> float:
+        return n * math.log(max(loss_floor, total_loss) / n) + (2 * segments) * math.log(max(2, n))
+
     dp = [[float("inf")] * (n + 1) for _ in range(segment_limit + 1)]
     back = [[-1] * (n + 1) for _ in range(segment_limit + 1)]
     dp[0][0] = 0.0
     for segments in range(1, segment_limit + 1):
         for end in range(1, n + 1):
             for start in range(0, end):
-                if start < 0 or dp[segments - 1][start] == float("inf"):
+                if dp[segments - 1][start] == float("inf"):
                     continue
-                candidate = dp[segments - 1][start] + cost[start][end]
+                if (start, end) not in loss:
+                    continue
+                candidate = dp[segments - 1][start] + loss[(start, end)]
                 if candidate < dp[segments][end]:
                     dp[segments][end] = candidate
                     back[segments][end] = start
+    candidates = []
     best_segments = None
     best_bic = float("inf")
     for segments in range(1, segment_limit + 1):
-        sse = dp[segments][n]
-        if sse == float("inf"):
+        total = dp[segments][n]
+        if total == float("inf"):
             continue
-        bic = n * math.log(max(1e-15, sse) / n) + (2 * segments) * math.log(max(2, n))
+        bic = _bic(segments, total)
+        candidates.append({"segments": segments, "robust_loss": total, "bic": bic})
         if bic < best_bic:
             best_bic, best_segments = bic, segments
     if not best_segments:
-        fit = _linear_fit(xs, ys)
-        if fit is None:
-            return None
-        return {
-            "kind": "linear", "segments": [{
-                "x_min": fit["x_min"], "x_max": fit["x_max"],
-                "slope_ms_per_unit": fit["slope_ms_per_unit"],
-                "intercept_ms": fit["intercept_ms"], "sse": fit["sse"],
-                "n": int(fit["n"]), "r2": fit["r2"],
-            }], "bic": None, "train_points": n,
-        }
-    # Reconstruct segments from the best DP state.
+        return None
     bounds = [n]
     cursor = n
     for segments in range(best_segments, 0, -1):
         cursor = back[segments][cursor]
         bounds.append(cursor)
     bounds.reverse()
-    segment_items = []
+    segment_items: list[dict[str, Any]] = []
+    previous_published_end: float | None = None
+    monotone_breaks = 0
     for left, right in zip(bounds[:-1], bounds[1:]):
-        fit = _linear_fit(xs[left:right], ys[left:right])
+        fit = fits.get((left, right))
         if fit is None:
             continue
-        segment_items.append({
-            "x_min": fit["x_min"], "x_max": fit["x_max"],
-            "slope_ms_per_unit": fit["slope_ms_per_unit"],
-            "intercept_ms": fit["intercept_ms"], "sse": fit["sse"],
-            "n": int(fit["n"]), "r2": fit["r2"],
-        })
+        start_x, end_x = float(fit["x_min"]), float(fit["x_max"])
+        slope = float(fit["slope_ms_per_unit"])
+        intercept = float(fit["intercept_ms"])
+        sxx = sum((x - sum(xs[left:right]) / (right - left)) ** 2 for x in xs[left:right])
+        scale = float(fit["residual_scale_ms"])
+        standard_error = (scale / math.sqrt(sxx)) if sxx > 0 and scale > 0 else 0.0
+        drop = float(fit["relative_drop_fraction"])
+        projected = bool(
+            slope < 0 and (drop > MAX_RELATIVE_DROP or abs(slope) > 2.0 * standard_error)
+        )
+        level = float(fit["level_ms"])
+        if projected and previous_published_end is not None:
+            # Keep the published curve non-decreasing across the segment join.
+            level = max(level, previous_published_end)
+        if projected:
+            published_end = level
+            uncertainty = max(scale, 0.5 * (
+                max(ys[left:right]) - min(ys[left:right])))
+            start_value = published_end = level
+        else:
+            start_value = intercept + slope * start_x
+            published_end = intercept + slope * end_x
+            uncertainty = scale
+            if previous_published_end is not None and start_value < previous_published_end:
+                monotone_breaks += 1
+        item = {
+            "x_min": start_x, "x_max": end_x,
+            "slope_ms_per_unit": 0.0 if projected else slope,
+            "intercept_ms": level if projected else intercept,
+            "n": right - left, "r2": float(fit["r2"]),
+            "sse": float(fit["sse"]),
+            "slope_raw_ms_per_unit": float(fit.get("slope_raw_ms_per_unit") or slope),
+            "intercept_raw_ms": float(fit.get("intercept_raw_ms") or intercept),
+            "slope_fitted_ms_per_unit": slope,
+            "huber_delta_ms": float(fit.get("huber_delta_ms") or 0.0),
+            "huber_iterations": int(fit.get("iterations") or 0),
+            "residual_scale_ms": scale,
+            "residual_median_abs_ms": float(fit.get("residual_median_abs_ms") or 0.0),
+            "residual_p90_abs_ms": float(fit.get("residual_p90_abs_ms") or 0.0),
+            "residual_max_abs_ms": float(fit.get("residual_max_abs_ms") or 0.0),
+            "relative_residual": float(fit.get("relative_residual") or 0.0),
+            "relative_drop_fraction": drop,
+            "standard_error_ms_per_unit": standard_error,
+            "measured_negative_slope": bool(slope < 0),
+            "negative_slope_significant": bool(slope < 0 and abs(slope) > 2.0 * standard_error),
+            "projection": PROJECTION_CONSTANT_LEVEL if projected else "none",
+            "level_ms": level if projected else None,
+            "published_start_ms": start_value,
+            "published_end_ms": published_end,
+            "uncertainty_ms": uncertainty,
+            "outliers": list(fit.get("outliers") or ()),
+            "outlier_count": len(fit.get("outliers") or ()),
+            "publishable": True,
+        }
+        segment_items.append(item)
+        previous_published_end = published_end
     if not segment_items:
         return None
+    # Monotone publication by isotonic regression on the segment knots.
+    #
+    # Two independently fitted segments can meet with the later one below the
+    # earlier one (measurement noise, or a real transient drop the layer must not
+    # claim as a trend).  The published knot values are projected onto the
+    # non-decreasing cone with pool-adjacent-violators, which is the least-squares
+    # monotone fit of those knots: it neither over-corrects a join upward (a rigid
+    # shift) nor publishes a decreasing cost.  Each segment is then re-expressed
+    # through its two projected knots; the change is reported and widens the
+    # segment's uncertainty instead of being hidden.
+    knots = []
+    for index, item in enumerate(segment_items):
+        weight = max(1.0, float(item["n"]))
+        knots.append({"index": index, "edge": "start", "x": float(item["x_min"]),
+                      "y": float(item["published_start_ms"]), "weight": weight})
+        knots.append({"index": index, "edge": "end", "x": float(item["x_max"]),
+                      "y": float(item["published_end_ms"]), "weight": weight})
+    tolerance = max(1e-12, 1e-9 * max(knot["y"] for knot in knots))
+    blocks: list[dict[str, Any]] = []
+    for knot in knots:
+        blocks.append({"weight": knot["weight"],
+                       "weighted": knot["weight"] * knot["y"],
+                       "knots": [knot]})
+        while len(blocks) > 1:
+            left, right = blocks[-2], blocks[-1]
+            left_level = left["weighted"] / left["weight"]
+            right_level = right["weighted"] / right["weight"]
+            if left_level <= right_level + tolerance:
+                break
+            blocks.pop()
+            blocks.pop()
+            blocks.append({"weight": left["weight"] + right["weight"],
+                           "weighted": left["weighted"] + right["weighted"],
+                           "knots": left["knots"] + right["knots"]})
+    projected: dict[tuple[int, str], float] = {}
+    for block in blocks:
+        level = block["weighted"] / block["weight"]
+        for knot in block["knots"]:
+            projected[(knot["index"], knot["edge"])] = level
+    for index, item in enumerate(segment_items):
+        start_value = projected[(index, "start")]
+        end_value = projected[(index, "end")]
+        original_start = float(item["published_start_ms"])
+        original_end = float(item["published_end_ms"])
+        change = max(abs(start_value - original_start), abs(end_value - original_end))
+        span = float(item["x_max"]) - float(item["x_min"])
+        if change > tolerance:
+            item["monotone_projection_ms"] = change
+            item["uncertainty_ms"] = max(float(item["uncertainty_ms"] or 0.0), change)
+        item["published_start_ms"] = start_value
+        item["published_end_ms"] = end_value
+        if span <= 0:
+            continue
+        if abs(end_value - start_value) <= tolerance:
+            if item["projection"] == PROJECTION_CONSTANT_LEVEL:
+                # Already projected from a measured negative slope.
+                item["monotone_source"] = "negative_slope"
+                item["level_ms"] = start_value
+            elif change > tolerance:
+                # PAVA pooled the knots into one level: publish it, but label why.
+                item["projection"] = PROJECTION_CONSTANT_LEVEL
+                item["monotone_source"] = "isotonic_pooling"
+                item["level_ms"] = start_value
+            else:
+                # A genuinely horizontal measured line is not a projection.
+                item["projection"] = "none"
+                item["level_ms"] = None
+            item["slope_ms_per_unit"] = 0.0
+            item["intercept_ms"] = start_value
+        else:
+            slope = (end_value - start_value) / span
+            item["slope_ms_per_unit"] = slope
+            item["intercept_ms"] = start_value - slope * float(item["x_min"])
+            if change > tolerance:
+                item["monotone_tilt"] = True
+                item["monotone_source"] = "isotonic_tilt"
     brackets = []
     for left, right in zip(segment_items[:-1], segment_items[1:]):
-        brackets.append([left["x_max"], right["x_min"]])
+        brackets.append([float(left["x_max"]), float(right["x_min"])])
+    published = []
+    for x, y in zip(xs, ys):
+        predicted = _predict({"segments": segment_items}, x)
+        published.append(abs(predicted - y) if predicted is not None else None)
+    scored = [value for value in published if value is not None]
+    sse_published = sum(value * value for value in scored) if len(scored) == n else None
+    sst = sum((y - mean_y) ** 2 for y in ys)
+    relative_residual = (sum(scored) / len(scored)) / mean_y if scored and mean_y > 0 else 0.0
+    quality_status = (
+        "weak" if relative_residual > MAX_RELATIVE_RESIDUAL_FOR_STRONG_FIT else "strong"
+    )
+    projected_segments = [
+        index for index, item in enumerate(segment_items)
+        if item["projection"] == PROJECTION_CONSTANT_LEVEL
+    ]
     return {
         "kind": "piecewise" if len(segment_items) > 1 else "linear",
-        "segments": segment_items, "transition_brackets": brackets,
-        "bic": best_bic, "train_points": n,
+        "segments": segment_items,
+        "transition_brackets": brackets,
+        "bracket_support": {f"{lo},{hi}": [] for lo, hi in brackets},
+        "bic": best_bic,
+        "robust_loss": dp[best_segments][n],
+        "train_points": n,
+        "selection": {
+            "criterion": "bic_on_robust_huber_loss",
+            "max_segments": segment_limit,
+            "min_segment_points_requested": int(min_points),
+            "min_segment_points_effective": segment_min,
+            "chosen_segments": best_segments,
+            "candidates": candidates,
+        },
+        "robust": {
+            "loss": "huber",
+            "delta_sigma": 1.345,
+            "outlier_sigma": 3.0,
+            "note": "IRLS with a MAD scale per segment; raw OLS slope retained for audit",
+        },
+        "fit_quality": {
+            "status": quality_status,
+            "published_r2": (
+                None if sse_published is None
+                else 1.0 - sse_published / sst if sst > 0 else 1.0
+            ),
+            "published_relative_residual": relative_residual,
+            "projected_segments": projected_segments,
+            "monotone_breaks": monotone_breaks,
+            "outlier_count": sum(item["outlier_count"] for item in segment_items),
+            "min_segment_points_effective": segment_min,
+            "r2_floor_for_strong_fit": MIN_R2_FOR_STRONG_FIT,
+            "relative_residual_floor_for_strong_fit": MAX_RELATIVE_RESIDUAL_FOR_STRONG_FIT,
+        },
     }
+
 
 
 def _secants(points: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
@@ -546,7 +754,16 @@ def _fit_summary(group: Mapping[str, Any], points: Sequence[Mapping[str, Any]],
                 residuals.append(abs(predicted - float(point["median_ms"])))
         summary["train_residuals_ms"] = {
             "median_abs": _median(residuals), "max_abs": max(residuals) if residuals else 0.0,
+            "count": len(residuals),
         }
+        summary["fit_quality"] = dict(fit.get("fit_quality") or {})
+        summary["fit_selection"] = dict(fit.get("selection") or {})
+        summary["transition_brackets"] = list(fit.get("transition_brackets") or ())
+        summary["outliers"] = [
+            {"segment": index, "x": item["x"], "residual_ms": item["residual_ms"]}
+            for index, segment in enumerate(fit["segments"])
+            for item in segment.get("outliers") or ()
+        ]
     return summary
 
 
@@ -560,6 +777,9 @@ def _point_summary(point: Mapping[str, Any]) -> dict[str, Any]:
         "analytic_ms": point["analytic_ms"], "rate": point["rate"],
         "work_unit": point["work_unit"], "traffic_bytes": point["traffic_bytes"],
         "extrapolation": point["extrapolation"],
+        # Every raw trial median is retained: fitting may not discard evidence.
+        "trial_medians_ms": list(point.get("trial_medians_ms") or ()),
+        "raw_samples_ms": list(point.get("raw_samples_ms") or ()),
     }
 
 
@@ -644,6 +864,18 @@ def analyze(manifest: Mapping[str, Any], results: Mapping[str, Any], *,
             "train_only": True, "heldout_evaluation_only": True,
             "no_pooling": "groups keep condition, axis, protocol and observed API separate",
             "max_segments": max_segments, "min_segment_points": min_segment_points,
+            "min_segment_points_effective": (
+                "3 points per segment whenever n >= 2*min_segment_points; a curve with "
+                "fewer points fits one segment because a 2-point segment has r2 == 1 by "
+                "construction and cannot be validated"
+            ),
+            "segment_model": "Huber-loss affine (IRLS, MAD scale) per segment",
+            "segment_count_criterion": "bic_on_robust_huber_loss; all candidate counts reported",
+            "monotone_policy": (
+                "a measured negative slope is reported as measured and projected onto a "
+                "constant level; a published curve never decreases with the work axis"
+            ),
+            "outliers": "reported per segment; never silently dropped",
             "jump_threshold": jump_threshold,
             "root_owns_acceptance": True,
             "observed_context_use": "used only to keep measured backend/protocol groups separate; it never selects a train regime from heldout outcomes",
@@ -663,6 +895,14 @@ def analyze(manifest: Mapping[str, Any], results: Mapping[str, Any], *,
             },
             "split_overlap_groups": len(overlaps),
             "independent_condition_axis_groups": len(analyses),
+            "weak_fit_groups": sum(
+                1 for group in analyses
+                if (group.get("fit_quality") or {}).get("status") == "weak"),
+            "projected_segments": sum(
+                len((group.get("fit_quality") or {}).get("projected_segments") or ())
+                for group in analyses),
+            "outliers_reported": sum(
+                len(group.get("outliers") or ()) for group in analyses),
             "raw_measured_samples": sum(
                 sum(point["raw_sample_count"] for point in group["train_points"] + group["heldout_points"])
                 for group in analyses

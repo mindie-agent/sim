@@ -344,7 +344,10 @@ def test_generic_hardware_report_without_workload_does_not_inject_golden_thermal
     assert thermal["clock_table"] == []
     assert thermal["gap_sensitivity"] == []
     assert thermal["workload_origin"] is None
-    assert thermal["sustained_mhz_range"] == [1250.0, 1300.0]
+    # No measured sustained band exists (A2 evidence: 800 MHz idle / 1650 MHz
+    # loaded only), so the default range is empty rather than the legacy
+    # cannsim 1250-1300 reference ladder.
+    assert thermal["sustained_mhz_range"] == []
     assert thermal["short_burst_mhz_range"] == [1640.0, 1650.0]
 
 
