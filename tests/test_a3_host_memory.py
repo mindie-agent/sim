@@ -131,3 +131,34 @@ def test_trace_reduction_preserves_framework_stream_backlog_and_client_times(mon
             assert step["framework"] == full_step["framework"]
             if step.get("detail_omitted"):
                 assert step["events"] == []
+
+
+def test_estimate_prediction_resources_and_cross_platform_spec_admission():
+    from mindie_sim.a3_host_budget import (
+        _linux_memory_bytes,
+        check_prediction_host,
+        estimate_prediction_resources,
+    )
+    from mindie_sim.a3_types import CaseSpec
+
+    large_spec = CaseSpec.from_mapping(
+        case(
+            dense_model(layers=61),
+            runtime={"max_model_len": 2048},
+            workload={"requests": [{"prompt_tokens": 1024, "output_tokens": 128}]},
+        )
+    )
+    bounded_est = estimate_prediction_resources(large_spec, trace_detail="bounded")
+    full_est = estimate_prediction_resources(large_spec, trace_detail="full")
+    assert int(full_est["expected_memory_mb"]) > int(bounded_est["expected_memory_mb"])
+    assert full_est["tier"] == "heavy"
+
+    # Low-spec 16 GiB host (Windows laptop, MacBook, or small Linux VM) is rejected before DAG build:
+    with pytest.raises(A3InputError, match="host_capacity_requires_remote"):
+        check_prediction_host(large_spec, trace_detail="bounded", host_capacity_bytes=16 * 1024**3)
+
+    # High-spec 512 GiB host (whether a local workstation or a remote server) is admitted:
+    admitted = check_prediction_host(large_spec, trace_detail="bounded", host_capacity_bytes=512 * 1024**3)
+    assert int(admitted["host_limit"]) >= int(admitted["layer_iterations"])
+    assert _linux_memory_bytes("MemTotal: 32768000 kB\nMemAvailable: 16384000 kB\n") == 16384000 * 1024
+
