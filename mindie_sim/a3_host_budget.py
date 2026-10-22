@@ -144,7 +144,7 @@ def check_prediction_host(
         return estimate
     layer_iterations = int(estimate["layer_iterations"])
     work_per_16gib = 512 if trace_detail == "full" else 4096
-    limit = max(128, int(capacity / (16 * 1024**3) * work_per_16gib))
+    limit = max(384, int(capacity / (16 * 1024**3) * work_per_16gib))
     if layer_iterations > limit:
         raise A3InputError(
             "host_capacity_requires_remote:"
