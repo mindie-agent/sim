@@ -29,7 +29,8 @@
 
 [Timeouts & Locks]
   Deterministic virtual time only.  Iteration guard prevents infinite loops;
-  no wall-clock sleeps, threads, locks or device calls.
+  host admission reads OS memory capacity before allocation. No wall-clock
+  sleeps, subprocesses, threads, locks or device calls.
 
 [Side-Effect Policy]
   No filesystem, network, provider import or device mutation.
@@ -55,6 +56,8 @@ from .a3_async import (
     add_prepare_tasks, prepare_residency_report, prepare_summary,
 )
 from .a3_predict_global import predict_global_replicas
+from .a3_host_budget import check_prediction_host
+from .a3_trace import PredictionTraces, merge_coverage
 from .a3_request import (
     runtime_with_draft_next_counts,
     RequestState, TokenLinearCostBackend, _backend_duration, with_media_runtime,
@@ -90,6 +93,7 @@ class _PredictiveCase(CaseSpec):
     timing_scope: str = ""
     op_estimator: Any = None
     framework_profile: Any = None
+    trace_detail: str = "bounded"
 
 
 def _predictive_case(
@@ -140,6 +144,9 @@ def _physical_calibration_summary(
     provenance = physical_calibration_provenance(
         physical_calibration, timing_scope=timing_scope,
     )
+    if replica_results and all("physical_totals" in row for row in replica_results):
+        provenance.update(merge_coverage(row["physical_totals"] for row in replica_results))
+        return provenance
     counts: dict[str, int] = {}
     reasons: dict[str, int] = {}
     transfers: dict[str, int] = {}
@@ -315,7 +322,13 @@ class _ReplicaRunner:
         self.now = 0.0
         self.iteration = 0
         self.allocated_blocks = sum(state.kv_blocks for state in self.states)
-        self.traces: list[dict[str, Any]] = []
+        self.traces = PredictionTraces(
+            getattr(case, "trace_detail", "bounded"),
+            lambda step, scope=getattr(case, "timing_scope", DEFAULT_TIMING_SCOPE): _physical_calibration_summary(
+                None, timing_scope=scope,
+                replica_results=({"traces": (step,)},),
+            ),
+        )
         self._last_draft_next: tuple[str, ...] = ()
         # A collective runs on a physical fabric.  It is derived from the
         # machine's declared transfer channels for this replica's rank group --
@@ -939,6 +952,8 @@ class _ReplicaRunner:
             })
             self.now = end
             self.iteration += 1
+            self.engine.discard_completed_history((*self._prepare_ids, *self._last_draft_next))
+            self.backend_engine.discard_completed_history()
             for state in self.states:
                 if not state.finished and not state.started and state.request.arrival_ms <= self.now:
                     # Waiting requests become visible only on the next scheduling
@@ -958,6 +973,8 @@ class _ReplicaRunner:
             "unserved": len(unserved),
             "requests": [state.to_dict() for state in self.states],
             "traces": self.traces,
+            "physical_totals": self.traces.coverage,
+            "trace_capture": self.traces.report(),
             "prepare": prepare_summary(
                 drain, token_end, prep_task_ids=tuple(self._prepare_ids),
                 residency=prepare_residency_report(self.engine),
@@ -1047,6 +1064,7 @@ def predict(
     timing_scope: str | None = None,
     op_estimator: Any = None,
     framework_profile: Any = None,
+    trace_detail: str = "bounded",
 ) -> dict[str, Any]:
     """Run the predictive path for one declared case.
 
@@ -1061,6 +1079,9 @@ def predict(
     ``framework_profile`` optionally declares CPU and stream lifecycle work.
     Engine commit gates scheduling; ordered stream completion is reported in
     separate client timestamps and metrics. Zero profiles retain old output.
+    ``trace_detail`` bounds retained diagnostic detail by default; metrics and
+    physical-coverage counts include every step. Server investigations may
+    request ``full``. Large desktop jobs raise before any graph is allocated.
     """
     if isinstance(case, Mapping):
         case = CaseSpec.from_mapping(case)
@@ -1075,7 +1096,10 @@ def predict(
         raise A3InputError("framework_profile_invalid")
     if framework_profile is not None and framework_profile.is_zero:
         framework_profile = None
+    if trace_detail not in {"bounded", "summary", "full"}:
+        raise A3InputError(f"trace_detail_invalid:{trace_detail}")
     case = with_media_runtime(case)
+    check_prediction_host(case, trace_detail)
     if physical_calibration is None:
         physical_calibration = getattr(case, "physical_calibration", None)
     _refuse_foreign_physical_calibration(case, physical_calibration)
@@ -1093,6 +1117,7 @@ def predict(
         op_estimator=op_estimator if op_estimator is not None else getattr(case, "op_estimator", None),
         framework_profile=framework_profile,
     )
+    case = replace(case, trace_detail=trace_detail)
     memory = memory_plan(case.model, case.runtime, case.machine)
     if memory.status != "fits":
         return {
@@ -1231,6 +1256,7 @@ def predict(
         },
         "requests": merged["requests"],
         "traces": merged["traces"],
+        "trace_capture": [result["trace_capture"] for result in replica_results],
         "timing_scope": effective_scope,
         "physical_calibration": _physical_calibration_summary(
             physical_calibration, timing_scope=effective_scope,

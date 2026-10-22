@@ -1412,7 +1412,7 @@ def test_public_joint_speculative_target_query_budget_b2_b6():
                 6: ([2, 6], [0, 5])}
     for budget, (queries, drafts) in expected.items():
         case["runtime"]["max_num_batched_tokens"] = budget
-        result = predict(case)
+        result = predict(case, trace_detail="full")
         assert result["status"] == "modeled"
         request = result["requests"][0]
         assert (request["generated_tokens"], request["computed_tokens"]) == (7, 8)

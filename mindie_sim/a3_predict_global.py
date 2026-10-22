@@ -382,6 +382,17 @@ def predict_global_replicas(
                 info["engine_commit_ms"] = end
                 runners[index].traces[-1]["framework"] = info
             del pending[index]
+        # Delta output alone does not release WorkTask/service/trace objects.
+        # Future forwards may reference preparation and draft-next witnesses;
+        # live DP steps still need their gates until their completion is read.
+        keep = [task for ids in prepare_ids.values() for task in ids]
+        keep.extend(task for ids in last_draft_next.values() for task in ids)
+        keep.extend(step["gate"] for step in pending.values())
+        # Framework scheduling depends on the previous output commit. Stream
+        # completion witnesses are consumed after drain to compute client times.
+        keep.extend(last_output.values())
+        keep.extend(task for records in stream_records.values() for task, _ in records)
+        engine.discard_completed_history(keep)
     drain = engine.run(start_ms=max(
         (runner.now for runner in runners.values()), default=0.0,
     ))
@@ -396,8 +407,9 @@ def predict_global_replicas(
                 info["client_stream_end_ms"] = {
                     rid: float(engine.completed_at[task]) for rid, task in tasks.items()
                 }
-                seen = {event["task_id"] for event in trace["events"]}
-                trace["events"].extend(final_events[task] for task in tasks.values() if task not in seen)
+                if not trace.get("detail_omitted"):
+                    seen = {event["task_id"] for event in trace["events"]}
+                    trace["events"].extend(final_events[task] for task in tasks.values() if task not in seen)
     token_end = max(
         (state.finish_ms or runner.now
          for runner in runners.values() for state in runner.states),
@@ -422,6 +434,8 @@ def predict_global_replicas(
                 for state in runner.states
             ],
             "traces": runner.traces,
+            "physical_totals": runner.traces.coverage,
+            "trace_capture": runner.traces.report(),
             "prepare": prepare_summary(
                 drain,
                 max(

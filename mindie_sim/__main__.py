@@ -357,6 +357,7 @@ def _predict(args: argparse.Namespace) -> dict[str, Any]:
         physical_calibration=physical_calibration, timing_scope=timing_scope,
         op_estimator=estimator,
         framework_profile=_load_json(args.framework_config) if args.framework_config else None,
+        trace_detail="full" if args.record_misses else getattr(args, "trace_detail", "bounded"),
     )
     if args.record_misses:
         if not args.calibration_db:
@@ -659,6 +660,10 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument("--operator-config", default=None, help="optional per-op Vector/Cube profiles JSON")
     predict_parser.add_argument("--framework-config", default=None, help="explicit host lifecycle costs and resource scopes JSON")
     predict_parser.add_argument("--input", required=True, help="case JSON: machine/model/workload/runtime")
+    predict_parser.add_argument(
+        "--trace-detail", choices=("bounded", "summary", "full"), default="bounded",
+        help="bounded: retain at most 4096 detailed ops per replica; summary: metrics/steps only; full: all detail (server jobs)",
+    )
     predict_parser.add_argument("--calibration", default=None, help="optional calibration observations JSON")
     predict_parser.add_argument("--calibration-db", default=None, help="optional SQLite calibration store")
     predict_parser.add_argument("--curve-artifact", default=None, help="optional public train-only piecewise curve artifact")
