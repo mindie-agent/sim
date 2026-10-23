@@ -29,7 +29,11 @@ class ProfiledKernelProvider:
     def __init__(self, config: Mapping[str, Any]):
         self.db = Path(config["db"]).resolve()
         self.environment_key = str(config["environment_key"])
-        self.bindings = tuple(config.get("bindings", ()))
+        self.bindings: dict[tuple[Any, ...], list[Mapping[str, Any]]] = {}
+        for binding in config.get("bindings", ()):
+            key = (binding["family"], binding["recipe"], binding["phase"],
+                   tuple(binding["launch_shape"]), binding["dtype"], binding["layout"])
+            self.bindings.setdefault(key, []).append(binding)
         self._cache: dict[str, dict[str, Any]] = {}
 
     def lookup(self, variant_id: str) -> dict[str, Any]:
@@ -55,12 +59,9 @@ class ProfiledKernelProvider:
         # Bindings are exact lowering contracts reviewed against the actual
         # profile; an equal first-input shape alone does not identify a kernel.
         selected = dict(op.metadata).get("profile_variant")
-        matches = [b for b in self.bindings if (
-            b["family"] == op.family and b["recipe"] == op.recipe
-            and b["phase"] == op.phase and tuple(b["launch_shape"]) == op.launch_shape
-            and b["dtype"] == op.dtype and b["layout"] == op.layout
-            and (selected is None or selected == b["variant_id"])
-        )]
+        key = (op.family, op.recipe, op.phase, op.launch_shape, op.dtype, op.layout)
+        matches = [b for b in self.bindings.get(key, ())
+                   if selected is None or selected == b["variant_id"]]
         if len(matches) != 1:
             return KernelEstimate(unsupported_reason="profile_exact_binding_missing_or_ambiguous")
         if context.timing_scope != "profiled_device_kernel":
