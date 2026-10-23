@@ -47,6 +47,17 @@ flowchart TB
 
 ---
 
+已有 profiling 可先通过 `mindie-profiler kernels --manifest ... --output-dir ...`
+建立去重的 kernel/shape 清单，再由 `operator-plan` 或
+`predict --operator-config ... --timing-scope profiled_device_kernel` 的
+`profiled_kernels` provider 读取精确绑定的观测耗时。保持原始 SKU、环境、
+cell、完整 I/O 和计时范围，已有校准仍优先，通信继续使用原拓扑模型。
+该入口不自动建立语义 lowering 绑定，也不证明整网精度提升；使用方式见
+[profiler kernel 清单文档](https://github.com/mindie-agent/profiler/blob/main/examples/kernel-inventory/README.md)。
+
+开发期 CAModel trace 可由 `mindie-profiler camodel` 导出微阶段时长，再输入
+`mindie-sim pipeline --durations`。输出保留 simulated 来源，不能混作真机实测。
+
 ## 快速开始
 
 宿主机资源：大模型长 decode、校准扫参和并发预测应通过 `remote-dev` 在远端 Linux

@@ -318,9 +318,10 @@ def _timing_scope_from_args(args: argparse.Namespace) -> str | None:
         return None
     from .a3_physical_calibration import ACCEPTED_TIMING_SCOPES
 
-    if scope not in ACCEPTED_TIMING_SCOPES:
+    accepted_scopes = (*ACCEPTED_TIMING_SCOPES, "profiled_device_kernel")
+    if scope not in accepted_scopes:
         raise A3InputError(
-            f"timing_scope_unknown:{scope}:expected_one_of:{','.join(ACCEPTED_TIMING_SCOPES)}"
+            f"timing_scope_unknown:{scope}:expected_one_of:{','.join(accepted_scopes)}"
         )
     return scope
 

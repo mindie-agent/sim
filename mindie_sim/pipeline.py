@@ -636,6 +636,7 @@ def solve_periodic_pipeline(
                 "reasons": list(calibration.reasons),
                 "uncalibrated_stages": list(calibration.uncalibrated_stages),
                 "provenance": calibration.provenance,
+                "evidence": dict(calibration.evidence),
                 "note": "No numeric period is inferred from missing or raw percentage durations.",
             },
             "self_check": self_check,
@@ -663,6 +664,7 @@ def solve_periodic_pipeline(
             "status": calibration.status,
             "provenance": calibration.provenance,
             "extra_keys": list(calibration.extra_keys),
+            "evidence": dict(calibration.evidence),
         },
         "self_check": self_check,
     }

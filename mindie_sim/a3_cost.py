@@ -2658,6 +2658,8 @@ class PredictiveCostModel:
         )
         estimate = self.op_estimator.estimate(op, self.machine, context)
         if estimate.plan is None:
+            if metadata.get("profile_variant"):
+                raise A3InputError(f"profile_variant_unavailable:{op.op_id}:{estimate.unsupported_reason}")
             if getattr(self.op_estimator, "strict", False):
                 raise A3InputError(f"operator_estimator_unsupported:{op.op_id}:{estimate.unsupported_reason}")
             return replace(baseline, operator_estimation={
@@ -2665,19 +2667,26 @@ class PredictiveCostModel:
                 "baseline_ms": baseline.estimated_ms,
             })
         plan = estimate.plan
+        observed_plan = plan.provenance.get("source_class") in {"observed", "measured"}
         isolated = evaluate_kernel_plan(plan, self.machine, context, baseline.launch_ms, stage=op.stage)
         elapsed = float(isolated["elapsed_ms"])
         launch = 0.0 if plan.includes_dispatch else baseline.launch_ms
         return replace(
             baseline, execution_plan=plan,
+            calibration=(CalibrationResult(
+                "profiled_kernel_observed", 1.0,
+                int(plan.provenance.get("captured_calls") or 0), True, False, False,
+                "profiled_kernel_exact_variant", exact_matches=1,
+                evidence=dict(plan.provenance),
+            ) if observed_plan else baseline.calibration),
             demands=tuple(sorted(plan.resource_totals().items())),
             estimated_ms=elapsed, launch_ms=launch, service_ms=max(0.0, elapsed-launch),
             operator_estimation={
-                "status": "analytic_plan", "backend": plan.backend,
+                "status": "observed_plan" if observed_plan else "analytic_plan", "backend": plan.backend,
                 "version": plan.version, "baseline_ms": baseline.estimated_ms,
                 "isolated_plan_ms": elapsed, "timing_scope": self.timing_scope,
                 "provenance": dict(plan.provenance),
-                "not_npu_measured": True,
+                "not_npu_measured": not observed_plan,
             },
         )
 

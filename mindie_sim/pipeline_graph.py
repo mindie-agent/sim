@@ -147,6 +147,7 @@ class DurationCalibration:
     provenance: str | None = None
     extra_keys: tuple[str, ...] = ()
     node_durations_ns: Mapping[str, float] = field(default_factory=dict)
+    evidence: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def calibrated(self) -> bool:
@@ -337,12 +338,14 @@ def _is_percentage_unit(unit: Any) -> bool:
 
 def normalize_stage_durations(graph: PipelineGraph, durations: Any) -> DurationCalibration:
     values, unit, provenance, extra = _duration_payload(durations)
+    evidence = dict(durations.get("evidence", {})) if isinstance(durations, Mapping) else {}
     if values is None:
         return DurationCalibration(
             status="uncalibrated",
             durations_ns={},
             uncalibrated_stages=tuple(stage.name for stage in graph.stages),
             reasons=(provenance or "missing_durations",),
+            evidence=evidence,
         )
     expanded = expand_pipeline_graph(graph)
     reasons: list[str] = []
@@ -390,6 +393,7 @@ def normalize_stage_durations(graph: PipelineGraph, durations: Any) -> DurationC
             provenance=provenance,
             extra_keys=unknown,
             node_durations_ns=parsed_nodes,
+            evidence=evidence,
         )
     return DurationCalibration(
         status="calibrated",
@@ -399,4 +403,5 @@ def normalize_stage_durations(graph: PipelineGraph, durations: Any) -> DurationC
         provenance=provenance,
         extra_keys=unknown,
         node_durations_ns=parsed_nodes,
+        evidence=evidence,
     )
