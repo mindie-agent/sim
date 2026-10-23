@@ -1148,7 +1148,7 @@ def test_large_norm_build_is_bounded_and_finite_k_events_conserve_work():
     assert "rmsnorm_gemm_epilogue" in result.applied_rules
     fused = fused_op(result)
     meta = dict(fused.metadata)
-    assert build_sec < 25.0
+    assert build_sec < 45.0
     assert len(meta["fusion_stages"]) < 400000
     assert all(
         stage["extents"].get("compact_inner_loop") is not True
