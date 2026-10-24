@@ -1,4 +1,8 @@
-"""Optional per-operator plans for the existing resource service engine.
+"""[Role] Optional per-operator plans for the existing resource service engine.
+
+[Invariants] One plan replaces parent device work and preserves physical units.
+[Timeouts & Locks] Pure bounded plan evaluation; no I/O, subprocesses or locks.
+[Side-Effect Policy] No filesystem, device, network or global-state writes.
 
 Demands retain their physical units (FLOPs, operations or bytes). A stage's
 minimum duration is an opaque concurrent completion floor, never an additional
@@ -18,6 +22,11 @@ RESOURCE_UNITS = {
     "cube": "flops", "vector": "ops", "hbm": "bytes",
     "mte1": "bytes", "mte2": "bytes", "mte3": "bytes",
 }
+
+#: Backend name of the captured-kernel provider (``profiled_kernel.py``).  It
+#: lives with the plan contract so the cost model can recognise an observed
+#: plan without importing the provider, which stays opt-in.
+PROFILED_KERNEL_BACKEND = "profiled_kernel"
 
 
 def _nonnegative(value: Any, label: str) -> float:

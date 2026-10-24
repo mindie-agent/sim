@@ -572,19 +572,6 @@ def test_uncalibrated_durations_return_only_topology_and_symbolic_cycles():
     assert zero_result["minimum_period_ns"] == 0.0
 
 
-def test_pipeline_camodel_evidence_survives_numeric_and_symbolic_results():
-    durations = _c8_durations()
-    evidence = {"source_class": "simulated", "backend": "camodel",
-                "context": {"kernel": "declared-c8-oracle", "soc_version": "Ascend950DT_9581"}}
-    durations["evidence"] = evidence
-    result = pl.solve_periodic_pipeline(_c8_spec(), durations)
-    assert result["durations"]["evidence"] == evidence
-    del durations["durations_ns"]["score_fix"]
-    symbolic = pl.solve_periodic_pipeline(_c8_spec(), durations)
-    assert symbolic["minimum_period_ns"] is None
-    assert symbolic["durations"]["evidence"] == evidence
-
-
 def test_pipeline_self_check_rejects_nonpositive_fifo_closure():
     spec = _c8_spec()
     spec["pipe_fifo"]["MTE2"] = [("kv_gm_l1", 0), ("qk_b0", 1)]

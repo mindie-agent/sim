@@ -49,9 +49,12 @@ flowchart TB
 
 已有 profiling 可先通过 `mindie-profiler kernels --manifest ... --output-dir ...`
 建立去重的 kernel/shape 清单，再由 `operator-plan` 或
-`predict --operator-config ... --timing-scope profiled_device_kernel` 的
-`profiled_kernels` provider 读取精确绑定的观测耗时。保持原始 SKU、环境、
-cell、完整 I/O 和计时范围，已有校准仍优先，通信继续使用原拓扑模型。
+`predict --operator-config ...` 的 `profiled_kernels` provider 读取精确绑定的
+观测耗时。捕获计时范围由每条 binding 自己声明（`timing_scope:
+profiled_device_kernel`），不改变本次运行自身的测量协议，因此同一次运行里
+其余算子的实测校准照常生效。保持原始 SKU、环境、cell 与完整 I/O；已有校准
+仍优先，通信继续使用原拓扑模型。观测只给出耗时下限，占用沿用算子自己声明的
+工作量（declared-work proxy，非实测占用），未声明工作量的算子直接报错。
 该入口不自动建立语义 lowering 绑定，也不证明整网精度提升；使用方式见
 [profiler kernel 清单文档](https://github.com/mindie-agent/profiler/blob/main/examples/kernel-inventory/README.md)。
 

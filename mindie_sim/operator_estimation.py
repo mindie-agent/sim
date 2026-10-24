@@ -90,8 +90,9 @@ def _operator(raw: Mapping[str, Any]) -> OpSpec:
     if not any(amounts) and not (
         declared_metadata.get("witness_only") or declared_metadata.get("not_execution")
         or declared_metadata.get("serial_ms", 0) > 0
-        or declared_metadata.get("profile_variant")
     ):
+        # A captured kernel is no exemption: the capture records duration, not
+        # occupancy, so an operator bound to one still declares its own work.
         raise A3InputError("operator_baseline_work_required")
     if isinstance(data["stage"], bool) or not isinstance(data["stage"], int) or data["stage"] < 0:
         raise A3InputError("operator_stage_invalid")
