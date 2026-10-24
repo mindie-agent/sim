@@ -20,7 +20,7 @@ The input contains `machine`, a topologically ordered `operators` list, and an
 `estimators` object. Operators use the existing `OpSpec` fields. `context` can
 declare compute, activation and weight dtype plus timing scope. The estimator
 configuration accepts `vector_profile`, `gemm_profile`, `cannbot_repo`,
-`cannbot_revision` and `strict`. Profiles are explicit; passing
+`cannbot_revision`, `profiled_kernels` and `strict`. Profiles are explicit; passing
 `vector_profile: true` selects the built-in, assumed RegBase scenario.
 
 Declare finite, nonnegative baseline work (`flops`, `vector_ops` and/or

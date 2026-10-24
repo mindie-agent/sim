@@ -47,19 +47,9 @@ flowchart TB
 
 ---
 
-已有 profiling 可先通过 `mindie-profiler kernels --manifest ... --output-dir ...`
-建立去重的 kernel/shape 清单，再由 `operator-plan` 或
-`predict --operator-config ...` 的 `profiled_kernels` provider 读取精确绑定的
-观测耗时。捕获计时范围由每条 binding 自己声明（`timing_scope:
-profiled_device_kernel`），不改变本次运行自身的测量协议，因此同一次运行里
-其余算子的实测校准照常生效。保持原始 SKU、环境、cell 与完整 I/O；已有校准
-仍优先，通信继续使用原拓扑模型。观测只给出耗时下限，占用沿用算子自己声明的
-工作量（declared-work proxy，非实测占用），未声明工作量的算子直接报错。
-该入口不自动建立语义 lowering 绑定，也不证明整网精度提升；使用方式见
-[profiler kernel 清单文档](https://github.com/mindie-agent/profiler/blob/main/examples/kernel-inventory/README.md)。
-
-开发期 CAModel trace 可由 `mindie-profiler camodel` 导出微阶段时长，再输入
-`mindie-sim pipeline --durations`。输出保留 simulated 来源，不能混作真机实测。
+> **实测 Kernel 耗时绑定与 CAModel 微阶段导入说明**：
+> - **精确复用已采集的 Kernel 耗时（`profiled_kernels`）**：若已有 [`mindie-profiler`](https://github.com/mindie-agent/profiler) 采集数据，可先通过 `mindie-profiler kernels --manifest ... --output-dir ...` 生成去重的 Kernel / Shape 清单库，再由 `mindie-sim operator-plan` 或 `mindie-sim predict --operator-config ...` 中的 `profiled_kernels` Provider 读取精确绑定的实测完成时间。捕获计时范围由每条 binding 显式声明（`timing_scope: profiled_device_kernel`），不会改动本次运行自身的测量协议（`--timing-scope`），因此同一次运行中其余算子的实测校准仍照常生效（已有专有校准与既有通信拓扑模型优先，且保留原始 SKU、环境、cell 与完整 I/O 校验）。**注意证据边界**：采集数据仅提供该算子的**实测完成时间下限（completion floor）**，共享资源占用仍沿用算子显式声明的工作量契约（`occupancy_basis: declared_work_proxy`、`resource_occupancy: not_captured`，**并非实测硬件 occupancy**；未声明工作量的算子直接报错拒绝）；该入口不会自动推导语义 lowering 绑定，也**不构成整网预测精度提升的独立验收结论**（`independent_accuracy_acceptance: False`）。详见 [`docs/operator-execution-plans.md`](./docs/operator-execution-plans.md) 与 [`profiler` Kernel 清单文档](https://github.com/mindie-agent/profiler/blob/main/examples/kernel-inventory/README.md)。
+> - **CAModel 仿真微阶段导入**：开发期 CAModel trace 可由 `mindie-profiler camodel` 导出微阶段时长，再输入 `mindie-sim pipeline --durations`；其输出保留 `simulated` 来源标记，不得混作真机实测结果。
 
 ## 快速开始
 
