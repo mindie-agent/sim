@@ -124,7 +124,7 @@ from .a3_real_data import (
     import_communication_measurements, machine_from_environment,
 )
 
-__version__ = "0.7.0"
+__version__ = "0.7.1"
 
 
 def net_report(*args, **kwargs):
