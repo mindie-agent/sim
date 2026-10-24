@@ -234,7 +234,9 @@ def record_prediction_misses(
     seen: set[tuple[Any, ...]] = set()
     for trace in prediction.get("traces", ()):
         for op in trace.get("ops", ()):
-            if op.get("calibration_status") in {"calibrated_exact", "calibrated_interpolated"}:
+            if op.get("calibration_status") in {
+                "calibrated_exact", "calibrated_interpolated", "profiled_kernel_observed",
+            }:
                 skipped += 1
                 continue
             if recorded >= max_requests:

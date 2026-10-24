@@ -1,4 +1,10 @@
-"""Explicit configuration and a small, model-independent operator DAG report."""
+"""Explicit configuration and a finite, model-independent operator DAG report.
+
+[Role] Assemble opt-in estimators and execute declared operator DAGs.
+[Invariants] Observations keep exact conditions; existing calibration wins.
+[Timeouts & Locks] Pure orchestration and bounded provider lookups; no devices.
+[Side-Effect Policy] Read only explicitly selected inputs; no writes.
+"""
 from __future__ import annotations
 
 from dataclasses import fields
@@ -16,12 +22,15 @@ from .operator_plan import CompositeEstimator, EstimateContext
 
 def create_operator_estimator(config: Mapping[str, Any]) -> CompositeEstimator:
     """Providers are optional, statically selected and constructed only on opt-in."""
-    allowed = {"vector_profile", "gemm_profile", "cannbot_repo", "cannbot_revision", "strict"}
+    allowed = {"vector_profile", "gemm_profile", "cannbot_repo", "cannbot_revision", "strict", "profiled_kernels"}
     if not isinstance(config, Mapping) or set(config)-allowed:
         raise A3InputError("operator_estimator_config_invalid")
     if not isinstance(config.get("strict", False), bool):
         raise A3InputError("operator_estimator_strict_invalid")
     providers = []
+    if config.get("profiled_kernels"):
+        from .profiled_kernel import ProfiledKernelProvider
+        providers.append(ProfiledKernelProvider(config["profiled_kernels"]))
     if config.get("cannbot_repo"):
         from .operator_vector import CannbotVectorProvider, CANNBOT_REVISION
         providers.append(CannbotVectorProvider(
@@ -82,6 +91,8 @@ def _operator(raw: Mapping[str, Any]) -> OpSpec:
         declared_metadata.get("witness_only") or declared_metadata.get("not_execution")
         or declared_metadata.get("serial_ms", 0) > 0
     ):
+        # A captured kernel is no exemption: the capture records duration, not
+        # occupancy, so an operator bound to one still declares its own work.
         raise A3InputError("operator_baseline_work_required")
     if isinstance(data["stage"], bool) or not isinstance(data["stage"], int) or data["stage"] < 0:
         raise A3InputError("operator_stage_invalid")
@@ -124,7 +135,7 @@ def operator_plan_report(payload: Mapping[str, Any], *, include_task_ids: bool =
             payload, sort_keys=True, separators=(",", ":"), allow_nan=False,
         ).encode()).hexdigest(),
         "effective_input": dict(payload),
-        "scope": "declared finite operator DAG; analytic, not NPU measurement",
+        "scope": "declared finite operator DAG; observed kernel costs and/or analytic plans; not independent accuracy acceptance",
         "timing_scope": context.timing_scope,
         "elapsed_ms": max(execution["completed_at_ms"][key] for key in ids.values()),
         "operators": [cost.to_dict() for cost in costs],

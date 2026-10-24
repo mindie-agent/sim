@@ -1,5 +1,8 @@
 """Predictive analytic cost model and measurement calibration for A3/A2.
 
+[Timeouts & Locks] Pure default computation; opt-in evaluators have bounded reads.
+[Side-Effect Policy] No filesystem/network/global writes; calibration is read-only.
+
 [Role]
   Convert explicit op work into resource demands: Cube/Vector compute, shared
   HBM, local MTE2/MTE3, launch, and D2D link bytes.  Apply shape/tiling
@@ -88,7 +91,9 @@ from .a3_curve_binding import build_curve_base_query, query_curve_for_op
 from .a3_operator_curve_protocol import canonical_protocol, protocol_equal
 from .a3_types import A3InputError, MachineSpec, dtype_bytes
 from .a3_workload import IterationWork, OpSpec
-from .operator_plan import EstimateContext, KernelPlan, evaluate_kernel_plan
+from .operator_plan import (
+    PROFILED_KERNEL_BACKEND, EstimateContext, KernelPlan, evaluate_kernel_plan,
+)
 
 COMPUTE_FAMILIES = {
     "attention_qk", "attention_pv", "qkv_projection", "o_projection",
@@ -113,6 +118,18 @@ COMM_FAMILIES = {
     "allreduce", "ep_dispatch", "ep_combine", "pp_p2p", "dcp_allgather",
     "moe_comm_fused", "kv_transfer", "engram_rh2d",
 }
+#: Precedence reasons that contradict an explicit ``metadata.profile_variant``.
+#: Declaring a captured kernel for an operator the same caller declared as
+#: non-executing, already stage-planned, or explicitly serial is one
+#: self-contradictory declaration, so it is refused.  The two remaining reasons
+#: are *not* contradictions: a dedicated measured calibration and the existing
+#: communication topology model legitimately own the price, and the superseded
+#: request is reported on the preserved record instead of raising.
+PROFILE_VARIANT_CONTRADICTIONS = frozenset({
+    "non_executable_witness",
+    "existing_stage_plan_precedence",
+    "explicit_serial_cost_precedence",
+})
 _TILE_M = 64
 _TILE_N = 128
 #: Declared k-block width.  The tile model has no k dimension (a known
@@ -2647,10 +2664,19 @@ class PredictiveCostModel:
         elif op.link_bytes > 0 or op.family in COMM_FAMILIES:
             reason = "communication_owned_by_existing_model"
         if reason:
-            return replace(baseline, operator_estimation={
+            preserved = {
                 "status": "preserved", "reason": reason,
                 "baseline_ms": baseline.estimated_ms,
-            })
+            }
+            if metadata.get("profile_variant"):
+                if reason in PROFILE_VARIANT_CONTRADICTIONS:
+                    raise A3InputError(
+                        f"profile_variant_contradicts_declaration:{op.op_id}:{reason}"
+                    )
+                preserved["superseded_profile_variant"] = str(
+                    metadata["profile_variant"]
+                )
+            return replace(baseline, operator_estimation=preserved)
         context = EstimateContext(
             compute_dtype=self.compute_dtype, weight_dtype=self.weight_dtype,
             activation_dtype=self.activation_dtype, timing_scope=self.timing_scope,
@@ -2658,6 +2684,8 @@ class PredictiveCostModel:
         )
         estimate = self.op_estimator.estimate(op, self.machine, context)
         if estimate.plan is None:
+            if metadata.get("profile_variant"):
+                raise A3InputError(f"profile_variant_unavailable:{op.op_id}:{estimate.unsupported_reason}")
             if getattr(self.op_estimator, "strict", False):
                 raise A3InputError(f"operator_estimator_unsupported:{op.op_id}:{estimate.unsupported_reason}")
             return replace(baseline, operator_estimation={
@@ -2665,19 +2693,33 @@ class PredictiveCostModel:
                 "baseline_ms": baseline.estimated_ms,
             })
         plan = estimate.plan
+        if metadata.get("profile_variant") and plan.backend != PROFILED_KERNEL_BACKEND:
+            # The composite tried the next provider and priced the operator
+            # analytically.  An explicitly bound capture is not interchangeable
+            # with a model, so the substitution is refused, not reported.
+            raise A3InputError(
+                f"profile_variant_unavailable:{op.op_id}:analytic_backend_substituted:{plan.backend}"
+            )
+        observed_plan = plan.provenance.get("source_class") in {"observed", "measured"}
         isolated = evaluate_kernel_plan(plan, self.machine, context, baseline.launch_ms, stage=op.stage)
         elapsed = float(isolated["elapsed_ms"])
         launch = 0.0 if plan.includes_dispatch else baseline.launch_ms
         return replace(
             baseline, execution_plan=plan,
+            calibration=(CalibrationResult(
+                "profiled_kernel_observed", 1.0,
+                int(plan.provenance.get("captured_calls") or 0), True, False, False,
+                "profiled_kernel_exact_variant", exact_matches=1,
+                evidence=dict(plan.provenance),
+            ) if observed_plan else baseline.calibration),
             demands=tuple(sorted(plan.resource_totals().items())),
             estimated_ms=elapsed, launch_ms=launch, service_ms=max(0.0, elapsed-launch),
             operator_estimation={
-                "status": "analytic_plan", "backend": plan.backend,
+                "status": "observed_plan" if observed_plan else "analytic_plan", "backend": plan.backend,
                 "version": plan.version, "baseline_ms": baseline.estimated_ms,
                 "isolated_plan_ms": elapsed, "timing_scope": self.timing_scope,
                 "provenance": dict(plan.provenance),
-                "not_npu_measured": True,
+                "not_npu_measured": not observed_plan,
             },
         )
 

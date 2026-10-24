@@ -20,7 +20,7 @@ The input contains `machine`, a topologically ordered `operators` list, and an
 `estimators` object. Operators use the existing `OpSpec` fields. `context` can
 declare compute, activation and weight dtype plus timing scope. The estimator
 configuration accepts `vector_profile`, `gemm_profile`, `cannbot_repo`,
-`cannbot_revision` and `strict`. Profiles are explicit; passing
+`cannbot_revision`, `profiled_kernels` and `strict`. Profiles are explicit; passing
 `vector_profile: true` selects the built-in, assumed RegBase scenario.
 
 Declare finite, nonnegative baseline work (`flops`, `vector_ops` and/or
@@ -138,6 +138,116 @@ This first implementation does not establish coverage for INT8, packed W4A8,
 ragged grouped GEMM, automatic tile search or arbitrary layouts. Those require
 their own dtype, metadata and work-conservation contracts rather than a
 throughput multiplier applied to BF16.
+
+## Captured kernel costs
+
+A captured-kernel binding reuses one exact variant of an existing profiler
+inventory (`mindie-profiler kernels`) as the completion floor of one operator.
+The `profiled_kernels` configuration holds the inventory `db`, the
+`environment_key` the caller accepts, and `bindings`. A binding names the
+lowering it stands for (`family`, `recipe`, `phase`, `launch_shape`, `dtype`,
+`layout`), the `variant_id` it resolves, and its own `timing_scope`, which must
+be `profiled_device_kernel`. The captured scope belongs to the binding because
+one run mixes captured kernels with operators priced by the run's own
+measurement protocol; a run-wide captured scope would exclude every observation
+that declares a real protocol, so `--timing-scope` still names only the run's
+measurement protocols. An operator opts in with `metadata.profile_variant`; a
+binding alone resolves only when the lowering key matches exactly and
+unambiguously.
+
+The provider reads the inventory with `mode=ro` and no `immutable` flag. That
+inventory is incremental, and `immutable=1` returns the pre-WAL snapshot — a
+superseded median, or no row for a freshly ingested variant — without reporting
+anything. Hardware key, environment key, variant eligibility and the lowering
+key must all match. Any mismatch is an unsupported reason, and an operator that
+explicitly named a variant turns that reason into an error rather than a
+different price.
+
+### What a capture prices
+
+The captured median is the stage's `minimum_duration_ms`: a concurrent
+completion floor under the same rule as every other plan here. It is not a
+second service interval added to the analytic cost, and the existing device
+launch term is still charged once.
+
+A capture records duration, not occupancy. The stage therefore charges the
+operator's own declared work (`flops`, `vector_ops`, `hbm_bytes`, `mte2_bytes`,
+`mte3_bytes`) as its shared-resource demand, recorded as `occupancy_basis:
+declared_work_proxy` beside `resource_occupancy: not_captured`. This is a
+declared-work proxy, never a measured occupancy; the capture cannot confirm it
+and this repo does not report it as measured. Its purpose is that a captured
+kernel is not a free task every concurrent operator overlaps at no cost. An
+operator bound to a capture still declares its own work, and a captured
+operator with no declared work has no occupancy to schedule and is refused like
+any other operator without baseline work.
+
+Status versus target: the proxy is only as informative as the declaration. When
+a captured duration is dominated by something the declared work does not
+express — launch behaviour, low block occupancy, intra-kernel synchronisation —
+the floor dominates and concurrent operators still overlap it almost freely.
+Charging whole-Die exclusivity instead would invent an occupancy the capture
+never measured, so the gap stays visible rather than filled. Closing it needs
+per-kernel occupancy in the capture itself (block dim and active-core
+residency), not different arithmetic in this layer.
+
+### Precedence and evidence
+
+A dedicated measured calibration and the existing communication topology model
+keep precedence over a captured binding, as they do over an analytic plan. The
+operator's record then reports `superseded_profile_variant`, so an explicit
+request is visible as superseded instead of disappearing. Declaring a capture
+for an operator the same caller declared non-executing, already stage-planned
+or explicitly serial is one self-contradictory declaration and is refused.
+
+The calibration record keeps this repo's existing vocabulary.
+`observations_used` is the number of captured calls the inventory aggregated —
+the same quantity a measured served row reports as its sample count — and
+`inside_envelope` is `True` because an exact variant match lies on the measured
+support rather than outside it; neither field has meant runtime variance. The
+provenance carries what those fields do not: `captured_calls`,
+`captured_min_ns`, `captured_max_ns`, `captured_median_ns`,
+`aggregated_observation_rows`, and `independent_trials`, which stays `None`
+because a capture does not record whether repeated calls are independent
+trials. `independent_accuracy_acceptance` stays `False`.
+
+### Held-out evidence: an unclosed boundary
+
+Reusing a known captured kernel and fitting an independent whole-model
+benchmark are different purposes, and this layer does not classify splits.
+`a3_calibration_store` owns the train/held-out rule for fits
+(`calibration.heldout_fit_forbidden`) and `HeldoutGuard` excludes declared
+held-out conditions from `fit_calibration`. Neither reaches a captured replay,
+and their identities do not map today: a guard identity is
+`family|canonical_shape` over a physical operator shape, while an inventory
+variant is a digest of the kernel signature, capture context and capture group.
+No declared correspondence exists between a kernel-level variant and an
+operator-level condition key, so binding the guard here would either block
+legitimate replay or match nothing while appearing to protect.
+
+The boundary is therefore a configuration requirement rather than an automatic
+check: an evaluation that publishes held-out accuracy must bind the captures it
+replays to the declared held-out conditions it evaluates against, and state
+which captures were replayed. Closing it in code needs a declared
+variant-to-condition mapping in the evaluation configuration, not a second
+split classifier in `profiler`.
+
+### Validation
+
+The CPU-side checks cover this layer's resource and precedence behaviour: the
+captured median stays the completion floor and the launch term is charged once;
+the plan's resource totals equal the operator's declared work and the shared
+stage services it; a concurrent analytic operator is delayed by a captured
+kernel's declared work; an explicit variant that cannot be applied is an error
+instead of another price or a zero-cost plan; a captured binding and an exact
+existing calibration both resolve in one run; and one real twice-captured
+variant keeps its call count with its observed minimum and maximum. They run
+against the committed A3 capture excerpt.
+
+None of that is accuracy evidence. Whether replaying captured kernels improves a
+whole-model prediction can only be answered on matching hardware, kernel
+implementation, tiling and timing scope, by comparing error and configuration
+ranking against frozen held-out device measurements before and after — and only
+once an evaluation configuration binds the held-out boundary above.
 
 ## Coverage and fallback
 
