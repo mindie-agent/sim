@@ -34,6 +34,8 @@ class Selection:
 
 
 IMPLEMENTATIONS = {
+    "vllm_ascend_group_list_prefix": Implementation(
+        "mindie_sim.prediction.moe_group_list", blocks=("group_list_prefix",)),
     "vllm_ascend_cann_keypool_caller": Implementation(
         "mindie_sim.prediction.index_pool_native", blocks=("pool_key_indexer",),
         options=("score_mode", "tail_capacity", "block_table_columns")),

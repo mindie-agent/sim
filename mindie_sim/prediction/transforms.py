@@ -240,6 +240,8 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
     ops = lower_shared_experts(ops, bindings)
     from .family_grouped_quant import lower as lower_grouped_int8
     ops = lower_grouped_int8(ops, bindings)
+    from .moe_group_list import lower as lower_group_list
+    ops = lower_group_list(ops, bindings)
     wrapper = select(bindings, "matrix_wrapper")
     if wrapper:
         ops = wrapper.module.apply_matrix_wrapper(
