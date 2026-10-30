@@ -60,6 +60,10 @@ def test_shared_operand_bytes_and_late_sum_match_both_native_row_counts(capture)
     assert reduced.link_bytes == 2 * 3 / 4 * m * 2048 * 2
     joined = ops[reduced.deps[0]]
     assert joined.recipe == 'expert_add'
+    assert joined.local_shape == (m, 2048)
+    assert joined.hbm_bytes == 3 * m * 2048 * 2
+    assert joined.mte2_bytes == 2 * m * 2048 * 2
+    assert joined.mte3_bytes == m * 2048 * 2
     assert {ops[dep].recipe for dep in joined.deps} == {'route_unpack', 'shared_gate_apply'}
     native_reduce, = [row for row in rows if row['Type'] == 'hcom_allReduce_']
     native_join, = [row for row in rows if row['Type'] == 'ForeachAddList']

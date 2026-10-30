@@ -637,6 +637,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             op_id=prefix + ".join", deps=(last, shared_last), stage=stage, layer=plan.index,
             requests=requests, elements=tokens * hidden, ops_per_element=1,
             dtype=model.activation_dtype, family="elementwise", phase=mode, recipe="expert_add",
+            shape=(tokens, hidden),
+            read_bytes_override=2 * tokens * hidden * dtype_bytes(model.activation_dtype),
+            write_bytes_override=tokens * hidden * dtype_bytes(model.activation_dtype),
+            metadata=(("input_tensor_count", 2),),
         )
         ops.append(join)
         last = join.op_id
