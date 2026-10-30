@@ -148,15 +148,17 @@ def attention_contract(op):
 def _paged_mla_attention_contract(op, view):
     """Native BNSD query/NBSD output; cache capacity and index values excluded."""
     geometry = op["metadata"].get("paged_mla_geometry", {})
-    batch = len(geometry.get("contexts", ()))
+    active = len(geometry.get("contexts", ()))
+    batch = geometry.get("native_query_capacity", active)
     heads, page = geometry.get("heads", 0), geometry.get("page_size", 0)
     key_tile = 512 if op.get("recipe") == "ascend_paged_mla_decode_arch22" else 128
     if (not view or view.get("kind") != "paged_latent"
             or op.get("source_boundary") != "kernel"
             or op["metadata"].get("implementation_binding", {}).get("implementation")
             != op.get("recipe")
-            or batch < 1 or not 1 <= heads <= 64 or page < 1 or key_tile % page
-            or tuple(op["local_shape"]) != (batch, heads, 1, 512)
+            or active < 1 or batch < active or not 1 <= heads <= 64 or page < 1 or key_tile % page
+            or tuple(op["local_shape"]) != (active, heads, 1, 512)
+            or tuple(op["padded_shape"]) != (batch, heads, 1, 512)
             or tuple(view.get("query_shape", ())) != (batch, heads, 1, 512)
             or tuple(view.get("query_rope_shape", ())) != (batch, heads, 1, 64)
             or tuple(view.get("output_shape", ())) != (heads, batch, 1, 512)

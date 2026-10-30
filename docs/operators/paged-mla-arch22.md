@@ -87,3 +87,14 @@ spans. Two TP8 points remain outside 15%; no all-domain pass is claimed.
 All controls completed in 0.72–44.24 seconds below 42 MB peak RSS, with no
 live tasks/programs and released buffers to floating-point precision
 (maximum residual 2.33e−10 bytes).
+
+`native_query_capacity` optionally declares native query/output storage rows
+separately from valid `contexts`. Its default is the active sequence count;
+it must not be smaller. The source caller appends zero KV lengths to inactive
+query rows. Native tensor contracts and padded/launch shapes retain capacity,
+while semantic/local shapes and all QK/PV work retain only active sequences.
+This option declares existing caller storage; it does not add caller padding
+copies, infer capacity from sequence-parallel right padding, or assign 128K KV
+to inactive rows. Twelve unmodified C++ host oracle controls for 6→8/12→16,
+8/16 heads and 4K/32K/128K verify identical active owner/FD work. Only the final
+exclusive host endpoint advances across zero-work storage rows.

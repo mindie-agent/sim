@@ -65,7 +65,7 @@ IMPLEMENTATIONS = {
         options=("kv_splits", "dispatch")),
     "ascend_paged_mla_decode_arch22": Implementation(
         "mindie_sim.prediction.family_paged_mla_arch22", blocks=("paged_mla_attention",),
-        options=("dispatch", "retained_kv_rows")),
+        options=("dispatch", "retained_kv_rows", "native_query_capacity")),
     "vllm_ascend_mla_head_padding": Implementation(
         "mindie_sim.prediction.mla_head_padding", blocks=("mla_head_padding",)),
     "cannbot_mixed_quant_sparse_flash_mla": Implementation(

@@ -17,7 +17,8 @@ int main(int argc, char **argv) {
     b.isS1G = false; // BNSD caller; q1 makes the single M group identical.
     b.actualLenKvDims = b.bSize;
     for (int i = 3; i < argc; ++i) {
-        auto length = std::stoul(argv[i]) + 1;
+        // A context of -1 declares an inactive query row with zero valid KV.
+        auto length = std::stoll(argv[i]) + 1;
         b.actualSeqS2Size.push_back(length);
         b.s2Size = std::max(b.s2Size, static_cast<uint32_t>(length));
     }
@@ -31,7 +32,7 @@ int main(int argc, char **argv) {
               << ",\"key_tile\":512,\"contexts\":[";
     for (unsigned i = 0; i < b.bSize; ++i) {
         if (i) std::cout << ",";
-        std::cout << b.actualSeqS2Size[i] - 1;
+        std::cout << static_cast<int64_t>(b.actualSeqS2Size[i]) - 1;
     }
     std::cout << "],\"ends\":[";
     for (unsigned i = 0; i < r.usedCoreNum; ++i) {
