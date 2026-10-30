@@ -114,6 +114,8 @@ class StagedGQADecode:
     ``kv_mapping='fai_flash_decode'`` instead uses the pinned FAI host budget
     across query boundaries and a global producer/merge barrier. Device stages
     remain analytical; selecting host ownership does not select a native kernel.
+    ``fai_host`` also selects the regular speculative-query host path when the
+    source occupancy threshold disables flash splitting.
     """
 
     key_tile: int = 128
@@ -130,9 +132,9 @@ class StagedGQADecode:
         _positive_int(self.slots, "slots")
         if self.target_cores is not None:
             _positive_int(self.target_cores, "target_cores")
-        if self.kv_mapping not in {"uniform", "fai_flash_decode"}:
+        if self.kv_mapping not in {"uniform", "fai_flash_decode", "fai_host"}:
             raise ModelingError("attention_decode_unknown_kv_mapping")
-        if self.kv_mapping == "fai_flash_decode" and self.kv_splits != 1:
+        if self.kv_mapping in {"fai_flash_decode", "fai_host"} and self.kv_splits != 1:
             raise ModelingError("fai_decode_mapping_owns_splits:remove_kv_splits")
 
     def spec(self, op: OpSpec) -> "_Spec":
@@ -300,9 +302,10 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                     request_index, kv_head, query_tile, row_start, row_end,
                     token_first, token_last, horizon, contributions,
                 ))
-    if recipe.kv_mapping == "fai_flash_decode":
-        from .fai_decode_mapping import partitions
-        mapping = partitions(requests, heads, kv_heads, recipe.target_cores,
+    if recipe.kv_mapping in {"fai_flash_decode", "fai_host"}:
+        from .fai_decode_mapping import partitions, host_partitions
+        mapper = host_partitions if recipe.kv_mapping == "fai_host" else partitions
+        mapping = mapper(requests, heads, kv_heads, recipe.target_cores,
                              key_tile=recipe.key_tile, query_tile=recipe.query_tile)
         outputs = [replace(output, contributions=tuple(
             _Contribution(index, start, end - start, owner)
@@ -741,7 +744,7 @@ class _GQADecodeProgram:
         merge_events = []
         merge_ready = (engine.submit(name + ":all_producers", after=tuple(producer_events),
                                      owner=owner)
-                       if self.recipe.kv_mapping == "fai_flash_decode" else ready)
+                       if self.recipe.kv_mapping in {"fai_flash_decode", "fai_host"} else ready)
         for core in range(min(len(merges), cores)):
             stream = _MergeStream(
                 self.context, self.recipe, self.spec,

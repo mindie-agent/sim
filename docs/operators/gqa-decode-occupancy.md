@@ -99,3 +99,20 @@ They establish a scheduling correction, not native timing accuracy: the
 analytical device pipeline still does not reconstruct the FAI GM score/P/PV
 scratch path, and the captured operator's API layout and binary tiling key
 must agree before this host mapping can be called the observed dispatch.
+
+## Regular high-batch speculative queries
+
+`kv_mapping: fai_host` selects the same pinned host's flash-decode partition
+when its occupancy condition holds. Otherwise, for the supported small-query
+single-head-group tile, it uses `FillSplitCoreTilingData` and the regular
+kernel's `taskIdx = coreIdx; taskIdx += coreNum` ownership. Each request/KV-head
+pair reads its complete KV range and does not create split outputs or a merge.
+The source references are `fused_infer_attention_score_tiling.cpp:1558-1573`,
+`flash_attention_infer_tiling.h:373-399` and
+`arch22/flash_attention_regular.h:306-335` at the same retained revision.
+
+This is source-based dispatch, independent of measurements. The explicit
+`fai_flash_decode` selector still rejects inputs outside that branch. The
+separate high-batch one-token specialized decoder is not selected by this
+regular speculative path. Device tile stages remain the declared analytical
+program; the 512-row host partition is distinct from its 128-row device tile.

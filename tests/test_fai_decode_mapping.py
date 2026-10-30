@@ -99,3 +99,32 @@ def test_ragged_query_work_uses_selected_owners_even_with_extra_physical_cores()
               if resource == 'mte1@r0:s0' for unit in units}
     assert max(owners) < 8
     assert engine.summary()['live_tasks'] == 0
+
+
+@pytest.mark.parametrize('batch,kv_heads', [(8,2),(9,2),(16,1),(17,1),(48,1),(64,2)])
+def test_source_dispatch_switches_to_regular_query_tasks_at_occupancy_boundary(batch, kv_heads):
+    from mindie_sim.prediction.fai_decode_mapping import host_partitions, uses_flash_decode
+    requests = [(4,126000)] * batch
+    mapping = host_partitions(requests, kv_heads*6, kv_heads, 20,
+                              key_tile=128, query_tile=64)
+    if uses_flash_decode(requests, kv_heads,20):
+        assert mapping == partitions(requests,kv_heads*6,kv_heads,20,key_tile=128,query_tile=64)
+    else:
+        # Independent source task ordinal: one whole query/head task per
+        # iteration, striding by launch grid rather than repartitioning KV.
+        for ordinal, ((b,h), spans) in enumerate(mapping.items()):
+            assert ordinal == b*kv_heads+h
+            assert spans == ((ordinal%20,0,(126004+127)//128),)
+    assert sum(end-start for spans in mapping.values() for _,start,end in spans) == batch*kv_heads*((126004+127)//128)
+
+
+def test_regular_host_branch_executes_without_split_workspace_or_merge():
+    op=make_op([(4,1020)]*4,heads=4,kv_heads=1,dim=8)
+    recipe=StagedGQADecode(target_cores=4,kv_mapping='fai_host')
+    spec=recipe.spec(op)
+    assert all(len(out.contributions)==1 for out in spec.outputs)
+    engine,end,before,_,_=run(op,recipe,units=4,ready=2)
+    assert end.done and not before
+    assert not any('merge_load' in event['task'] for event in engine.trace)
+    assert engine.serviced['memory@r0:s0']==pytest.approx(recipe.work(op).resources['hbm'])
+    assert engine.summary()['live_tasks']==0

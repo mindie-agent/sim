@@ -17,6 +17,41 @@ SOURCE_PATH = ("attention/fused_infer_attention_score/op_host/"
 HOST_KV_TILE = 512
 
 
+def uses_flash_decode(requests, kv_heads, cores):
+    """Pinned host selector for the supported paged, small-query domain."""
+    longest = max(context + q for q, context in requests)
+    tasks = len(requests) * kv_heads
+    return longest >= 1024 and (
+        (5 * tasks <= 4 * cores and longest >= cores * HOST_KV_TILE)
+        or 5 * tasks <= 2 * cores)
+
+
+def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
+    """Select flash splitting or regular round-robin query/head tasks.
+
+    The ordinary speculative q>1 branch uses FillSplitCoreTilingData and
+    flash_attention_regular.h's taskIdx = coreIdx; taskIdx += coreNum loop.
+    It has no split-KV merge. The separate q=1 high-batch specialized decoder
+    packs several KV heads in one task and is outside this ordinary branch.
+    """
+    group = query_heads // kv_heads
+    if (cores is None or not 1 <= cores <= 26 or not requests
+            or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile
+            or any(not 0 < q <= 16 or q * group > min(128, query_tile)
+                   or min(max(1, (128 // q) // 2 * 2), group) != group
+                   for q, _ in requests)):
+        raise ModelingError("fai_host_mapping_requires_supported_single_query_head_tile")
+    if uses_flash_decode(requests, kv_heads, cores):
+        return partitions(requests, query_heads, kv_heads, cores,
+                          key_tile=key_tile, query_tile=query_tile)
+    if all(q == 1 for q, _ in requests) and len(requests) >= cores:
+        raise ModelingError("fai_host_single_token_specialized_decoder_not_selected")
+    return {(batch, head): (((batch * kv_heads + head) % cores, 0,
+                            (context + query + key_tile - 1) // key_tile),)
+            for batch, (query, context) in enumerate(requests)
+            for head in range(kv_heads)}
+
+
 def partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
     """Return {(request, KV head): ((owner, micro_start, micro_end), ...)}.
 
@@ -34,11 +69,7 @@ def partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
            or min(max(1, (128 // q) // 2 * 2), group) != group
            for q, _ in lengths):
         raise ModelingError("fai_decode_mapping_requires_one_query_head_group_tile")
-    longest = max(k for _, k in lengths)
-    tasks = len(requests) * kv_heads
-    if not (longest >= 1024 and (
-            (5 * tasks <= 4 * cores and longest >= cores * HOST_KV_TILE)
-            or 5 * tasks <= 2 * cores)):
+    if not uses_flash_decode(requests, kv_heads, cores):
         raise ModelingError("fai_decode_mapping_outside_flash_decode_host_domain")
 
     total = sum(q * k for q, k in lengths) * query_heads
