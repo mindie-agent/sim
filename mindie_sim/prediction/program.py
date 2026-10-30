@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 import json
 import math
+from types import MappingProxyType
 from typing import Callable, Mapping, Protocol, Sequence
 
 from mindie_sim.schema.common import ModelingError
@@ -39,12 +40,27 @@ class Stage:
     previous: tuple[str, ...] = ()
     coupled: bool = False
 
-    def submit(self, engine, name, predecessors, scoped, owner):
-        event = engine.submit(
-            name, self.work, after=predecessors, latency=self.latency, caps=self.caps,
-            acquire=scoped(self.acquire), free=() if self.program else scoped(self.free), owner=owner,
+    def __post_init__(self):
+        # A frozen Stage is a reusable physical template, not an alias to a
+        # caller's mutable work or placement dictionary.
+        object.__setattr__(self, "work", MappingProxyType(dict(self.work)))
+        object.__setattr__(self, "caps", MappingProxyType(dict(self.caps)))
+        object.__setattr__(self, "placement", MappingProxyType(
+            {key: tuple(units) for key, units in self.placement.items()}))
+        for name in ("after", "acquire", "free", "previous"):
+            object.__setattr__(self, name, tuple(getattr(self, name)))
+
+    def prepare(self, engine, name, scoped):
+        return engine._prepare(
+            name, self.work, latency=self.latency, caps=self.caps,
+            acquire=scoped(self.acquire), free=() if self.program else scoped(self.free),
             placement=self.placement, coupled=self.coupled,
         )
+
+    def submit(self, engine, name, predecessors, scoped, owner, prepared=None):
+        if prepared is None:
+            prepared = self.prepare(engine, name, scoped)
+        event = engine._submit_prepared(prepared, name, after=predecessors, owner=owner)
         if self.program is not None:
             event = self.program.start(engine, name + ":program", event, owner=owner)
             if self.free:
@@ -105,6 +121,8 @@ class PipelineProgram:
         ready = engine.submit(name + ":setup", after=(ready,), latency=self.setup_ms, owner=owner)
         observation = engine.submit(name + ":span", after=(ready,), latency=self.minimum_ms, owner=owner)
         stage_tail: dict[str, Event] = {}
+        prepared_slots: list[dict[str, tuple[Stage, object]]] = [
+            {} for _ in range(min(self.slots, self.count))]
         next_tile, finished = 0, 0
         scoped = lambda items: scope_allocations(name, items)
 
@@ -113,6 +131,7 @@ class PipelineProgram:
             finished += 1
             if finished == self.count:
                 stage_tail.clear()
+                prepared_slots.clear()
                 engine.resolve(complete)
             else:
                 issue()
@@ -125,14 +144,25 @@ class PipelineProgram:
             next_tile += 1
             local: dict[str, Event] = {}
             previous = dict(stage_tail)
-            for stage in self.tile(index):
+            slot = prepared_slots[index % self.slots]
+            stages = self.tile(index)
+            current = {}
+            for stage in stages:
                 deps = [local[key] for key in stage.after]
                 deps.extend(previous[key] for key in stage.previous if key in previous)
                 if stage.name in stage_tail:
                     deps.append(stage_tail[stage.name])
-                event = stage.submit(engine, f"{name}:tile{index}:{stage.name}",
-                                     tuple(deps) or (ready,), scoped, owner)
+                task_name = f"{name}:tile{index}:{stage.name}"
+                cached = slot.get(stage.name)
+                prepared = (cached[1] if cached is not None and cached[0] is stage
+                            else stage.prepare(engine, task_name, scoped))
+                current[stage.name] = (stage, prepared)
+                event = stage.submit(engine, task_name, tuple(deps) or (ready,),
+                                     scoped, owner, prepared)
                 local[stage.name] = stage_tail[stage.name] = event
+            # At most one stage set per live slot: unique/generated tail stages
+            # replace the previous set instead of growing an execution history.
+            prepared_slots[index % self.slots] = current
             engine.submit(f"{name}:tile{index}:retire", after=tuple(local.values()),
                           on_complete=retire, owner=owner)
 

@@ -79,6 +79,19 @@ class _Task:
     service: dict[str, float] = field(default_factory=dict)
 
 
+@dataclass(frozen=True)
+class _PreparedTask:
+    """Validated static service; each submission owns its remaining work."""
+
+    demand: dict[str, float]
+    latency: float
+    caps: dict[str, float]
+    acquire: tuple[Allocation, ...]
+    free: tuple[Allocation, ...]
+    placement: dict[str, tuple[int, ...]]
+    coupled: bool
+
+
 def _fair_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, float]:
     """Max-min allocation redistributes unused service from capped producers."""
     result: dict[int, float] = {}
@@ -144,6 +157,20 @@ class Engine:
         placement: Mapping[str, Sequence[int]] | None = None,
         coupled: bool = False,
     ) -> Event:
+        prepared = self._prepare(
+            name, work, latency=latency, caps=caps, acquire=acquire, free=free,
+            placement=placement, coupled=coupled,
+        )
+        return self._submit_prepared(
+            prepared, name, after=after, release=release, owner=owner,
+            metadata=metadata, on_complete=on_complete,
+        )
+
+    def _prepare(
+        self, name, work=None, *, latency=0.0, caps=None, acquire=(), free=(),
+        placement=None, coupled=False,
+    ) -> _PreparedTask:
+        """Validate a template against this engine's physical resource binding."""
         demands = {key: float(value) for key, value in (work or {}).items() if value}
         for key, value in demands.items():
             if key not in self.resources:
@@ -172,6 +199,15 @@ class Engine:
                 unit < 0 or unit >= self.pool_units[allocation.pool] for unit in allocation.units
             ):
                 raise ExecutionError(f"buffer_unit_out_of_range:{allocation.pool}")
+        return _PreparedTask(demands, latency, limits, tuple(acquire), tuple(free),
+                             placement, coupled)
+
+    def _submit_prepared(
+        self, prepared, name, *, after=(), release=None, owner="", metadata=None,
+        on_complete=None,
+    ) -> Event:
+        # Dependencies and allocations remain live invocation state. Only static
+        # work, supply and placement validation can be shared by repeated tiles.
         dependencies = tuple(dict.fromkeys(after))
         pending = tuple(event for event in dependencies if not event.done)
         if any(event.sequence not in self._tasks and event.sequence not in self._promises
@@ -184,9 +220,10 @@ class Engine:
             max((event.time for event in dependencies if event.done), default=self.now),
         )
         task = _Task(
-            event, dict(demands), demands, len(pending), release, latency, limits,
-            tuple(acquire), tuple(free), owner, dict(metadata or {}), placement,
-            coupled=coupled, callback=on_complete,
+            event, dict(prepared.demand), prepared.demand, len(pending), release,
+            prepared.latency, prepared.caps, prepared.acquire, prepared.free,
+            owner, dict(metadata or {}), prepared.placement,
+            coupled=prepared.coupled, callback=on_complete,
         )
         self._tasks[event.sequence] = task
         for predecessor in pending:
@@ -253,9 +290,9 @@ class Engine:
             self.trace.append({
                 "task": task.event.name, "owner": task.owner,
                 "start_ms": task.start, "end_ms": self.now,
-                "demand": task.demand, "serviced": task.service,
+                "demand": dict(task.demand), "serviced": task.service,
                 "metadata": task.metadata,
-                "placement": task.placement,
+                "placement": dict(task.placement),
                 "coupled": task.coupled,
             })
         self._wake(task.event)

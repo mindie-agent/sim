@@ -1,0 +1,189 @@
+{
+  "schema": "mindie-prepared-stage-cpu-control/1",
+  "purpose": "CPU execution optimization with the same finite tasks, physical service and contention",
+  "implementation": [
+    "Stage snapshots work/caps/placement and dependency/allocation sequences at construction",
+    "Pipeline keeps at most one prepared stage set per live slot; the next stage set replaces it and completion clears it",
+    "static work/supply/placement/allocation descriptors are validated once per reused Stage in that Engine binding",
+    "each task keeps independent dependencies, remaining work, service, event, allocation state and trace snapshots"
+  ],
+  "source_files": [
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
+      "sha256": "f033f1d19ee5176116a83991c645902d4acd806cc6ab848156c087cbf190482a",
+      "bytes": 17963
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
+      "sha256": "44218db471f47c870d8920fa0d81a941ea9eac56e6dcf233125d3156e67a62e7",
+      "bytes": 21997
+    }
+  ],
+  "driver": {
+    "path": "/tmp/qwen35-coupled-body-control.py",
+    "sha256": "0512ee7811f6a52ae0a07c27d54ebe5790b4024a50dd48f4580cd97eb9466b83",
+    "bytes": 2590
+  },
+  "targeted_tests": {
+    "passed": 81,
+    "seconds": 0.96,
+    "files": [
+      "test_prepared_pipeline.py",
+      "test_prediction_engine.py",
+      "test_coupled_engine.py",
+      "test_steady_pipeline.py",
+      "test_matrix_program.py",
+      "test_attention_decode.py",
+      "test_attention_decode_templates.py",
+      "test_mc2_phase_templates.py",
+      "test_transaction_program.py",
+      "test_paged_mla_arch22_pipeline.py"
+    ]
+  },
+  "first_attention_control": {
+    "geometry": {
+      "sequences": 48,
+      "query_tokens": 4,
+      "context_tokens": 126000,
+      "tp": 4
+    },
+    "case_sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408",
+    "virtual_duration_ms": 7.332702225451278,
+    "exact_entire_engine_execution_equal": true,
+    "engine_execution_sha256": "2aee30cf3edae7767cdadca87627a343adf0f5683564d0a2cc5c66fe52afe6f0",
+    "profiled_before_wall_seconds": 28.151103292009793,
+    "profiled_after_wall_seconds": 15.606742625008337,
+    "profiled_after_peak_rss_bytes": 47153152,
+    "before": {
+      "path": "/tmp/qwen35-attention-template-b48.json",
+      "sha256": "0cced1470fd895c9afe9b3eb5c9f0d098a98d2c450b353fbc0f68a0d481f8458",
+      "bytes": 11815
+    },
+    "after": {
+      "path": "/tmp/qwen35-attention-prepared-b48.json",
+      "sha256": "f4baa2d473cd46155b9df40a67ceb4e831fe57b2de57a426cc89d72ad0e13f8f",
+      "bytes": 11815
+    },
+    "after_profile": {
+      "path": "/tmp/qwen35-attention-prepared-b48.profile.txt",
+      "sha256": "bc6e5de7ae722511a504930cc530ed5aef5bc3d3f34ffb83fc74841df00a893b",
+      "bytes": 3466
+    }
+  },
+  "full_body_controls": [
+    {
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 48
+      },
+      "input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+        "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408"
+      },
+      "source_git_revision_at_start": "9f2f3359aba71a6f28709258a26c67813511a86c",
+      "source_revision_note": "shared checkout; prepared Stage patch was uncommitted; root-owned source-contract changes may already be present",
+      "budget_seconds": 90,
+      "previous_status": "failed",
+      "previous_error": "body_prediction_90s_budget_exhausted",
+      "previous_wall_seconds": 90.01983920799103,
+      "status": "completed",
+      "wall_seconds": 58.34557512507308,
+      "peak_rss_bytes": 70582272,
+      "body_forward_ms": 99.29468573132972,
+      "execution_sha256": "8237bf0b13392102b423c5ef0e5e03a0a902e6feac6d2f0b35f7ab1ecc2afbc6",
+      "source_work": {
+        "flops": 1232924835840.0,
+        "vector_ops": 12165054720.0,
+        "hbm_bytes": 77553615360.0,
+        "link_bytes": 94371840.0
+      },
+      "execution": {
+        "completed_tasks": 7686875,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "peak_live_tasks": 3708,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        }
+      },
+      "record": {
+        "path": "/tmp/qwen35-prepared-body-b48.json",
+        "sha256": "82e3f6a29bb5a70a18a1255aa14f40450a136a5e7f0de039b85fa0a04fd2b841",
+        "bytes": 20509
+      },
+      "previous_record": {
+        "path": "/tmp/qwen35-template-body-b48.json",
+        "sha256": "1087a3b2c0a4f353d967e493f3ea2b215847e76da9ce51fd2c7089eeb31092f8",
+        "bytes": 9730
+      }
+    },
+    {
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 64
+      },
+      "input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+        "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408"
+      },
+      "source_git_revision_at_start": "a72e432ad43833e791b8cac69dac6f398fc6d622",
+      "source_revision_note": "shared checkout; prepared Stage patch was uncommitted; root-owned source-contract changes may already be present",
+      "budget_seconds": 90,
+      "previous_status": "failed",
+      "previous_error": "body_prediction_90s_budget_exhausted",
+      "previous_wall_seconds": 90.02907479205169,
+      "status": "completed",
+      "wall_seconds": 79.20903470902704,
+      "peak_rss_bytes": 68681728,
+      "body_forward_ms": 126.56472190031421,
+      "execution_sha256": "fa4d1ca98419f0bf20030e9dc1b3e0be9ca2b2c09cf15788aa5d90a546ee9f5e",
+      "source_work": {
+        "flops": 1643899781120.0,
+        "vector_ops": 16217404160.0,
+        "hbm_bytes": 100408506880.0,
+        "link_bytes": 125829120.0
+      },
+      "execution": {
+        "completed_tasks": 10212395,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "peak_live_tasks": 3716,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        }
+      },
+      "record": {
+        "path": "/tmp/qwen35-prepared-body-b64.json",
+        "sha256": "331f625ff356bbe32f65e0c0eb2418d5ba1cb03a76e7f136e3915e8a46817e58",
+        "bytes": 22553
+      },
+      "previous_record": {
+        "path": "/tmp/qwen35-template-body-b64.json",
+        "sha256": "3fc7f93b4bd293d15792144edcfa4d05115cf2eb76e66abdcc130d7b19bcaba8",
+        "bytes": 11746
+      }
+    }
+  ],
+  "limits": [
+    "CPU wall times are local process measurements, not NPU timing accuracy acceptance",
+    "The first attention control compares entire Engine execution; tests compare complete traces for reused/fresh stages under contention and nested allocation lifetimes",
+    "Previous full B48/B64 runs exhausted 90 seconds, so no successful full-body before/after equality is claimed",
+    "B48 was measured before final tuple freezing and trace-copy-only cleanup; B64 used final production code",
+    "Only the two stated canonical full-body geometries were rerun; the other reported 17 timeout entries and the 280-case profiler sweep remain unverified",
+    "macOS ru_maxrss values are bytes; no timeout budget was raised"
+  ]
+}
