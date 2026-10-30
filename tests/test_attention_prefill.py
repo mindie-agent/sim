@@ -7,8 +7,10 @@ observable; they establish no measured hardware accuracy.
 from __future__ import annotations
 
 import math
-import resource
-import sys
+try:
+    import resource
+except ImportError:
+    resource = None
 import time
 
 import pytest
@@ -278,16 +280,17 @@ def test_bounded_real_q8192_h6_kv2_d256_run():
     started = time.perf_counter()
     engine, end, _, _, _ = run(op, recipe, trace_limit=1000, raw_case=raw)
     elapsed = time.perf_counter() - started
-    peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-    if sys.platform != "darwin":
-        peak *= 1024  # Linux reports KiB; macOS reports bytes.
     assert end.done
     # This is the complete large-geometry execution control. Its 90 s budget
     # follows the local end-to-end tier; CPU throughput varies by runner.
     # The live task bound, rather than host speed, guards against expansion.
     assert elapsed < 90.0
     assert engine.peak_tasks < 4096
-    assert peak < 512 * 1024 * 1024
+    if resource is not None:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        if peak < (1 << 20):
+            peak *= 1024  # Linux reports KiB; macOS reports bytes.
+        assert peak < 512 * 1024 * 1024
     assert engine.summary()["live_tasks"] == 0
     assert engine.summary()["live_programs"] == 0
     assert not any(engine.allocated.values())

@@ -458,17 +458,33 @@ class RecurrentScan:
         heads = metadata["heads"]
         cap = {matrix: min(1, heads / context.core_count) * context.rates[matrix]}
 
+        tile_cache = {}
+        chunk_vec_total = float(metadata.get("chunk_vector_ops", 0.0))
+
         def tile(index):
-            fraction = min(chunk, tokens - index * chunk) / tokens
+            valid = min(chunk, tokens - index * chunk)
+            if valid in tile_cache:
+                return tile_cache[valid]
+            fraction = valid / tokens
             # State moves once per chunk; token operands scale with real tail
             # rows. Aggregate traffic is conserved, including the last tile.
-            work = {key: amount * (1 / count if key not in {matrix, vector} else fraction)
-                    for key, amount in context.work.items()}
+            work = {}
+            for key, amount in context.work.items():
+                if key == matrix:
+                    work[key] = amount * fraction
+                elif key == vector and 0.0 < chunk_vec_total <= amount:
+                    work[key] = chunk_vec_total * (1 / count) + (amount - chunk_vec_total) * fraction
+                elif key == vector:
+                    work[key] = amount * fraction
+                else:
+                    work[key] = amount * (1 / count)
             first = {matrix: work.get(matrix, 0) / 2}
             last = dict(work)
             last[matrix] = work.get(matrix, 0) / 2
             vwork = {vector: last.pop(vector, 0)}
-            return (Stage("c1", first, caps=cap), Stage("delta", vwork, after=("c1",)),
-                    Stage("c2_update", last, after=("delta",), caps=cap))
+            res = (Stage("c1", first, caps=cap), Stage("delta", vwork, after=("c1",)),
+                   Stage("c2_update", last, after=("delta",), caps=cap))
+            tile_cache[valid] = res
+            return res
 
         return PipelineProgram(count, 1, tile, context.minimum_ms, context.setup_ms)

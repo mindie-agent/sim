@@ -138,9 +138,9 @@ def conv_plan(op, geometry, *, compact=True):
             # time-dilated serial run, not overlapping sequences. Work and each
             # owner's fixed buffers remain exact; external contention can be
             # rephased by compaction. compact=False is the detailed oracle.
-            pending = runs(owner)
+            pending = tuple(runs(owner))
             tiles = PipelineProgram(run_counts[owner], 1,
-                                    lambda index: task(*next(pending), owner))
+                                    lambda index, pending=pending: task(*pending[index], owner))
             pool = context.pool_names.get("ub")
             if pool is None:
                 return tiles

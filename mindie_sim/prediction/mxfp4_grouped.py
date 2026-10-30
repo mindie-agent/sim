@@ -87,10 +87,10 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
                             for pool, size in pools.items() if pool != "ub") if counts[owner] else ()
         allocations += tuple(context.allocate(f"ub{owner}_{sub}", "ub", UB_BYTES,
                                                (2 * owner + sub,)) for sub in (0, 1))
-        schedule = iter(tile_runs(config, owner, cores, compact))
+        schedule = tuple(tile_runs(config, owner, cores, compact))
 
-        def tile(_):
-            m, n, repeat = next(schedule)
+        def tile(index):
+            m, n, repeat = schedule[index]
             arguments = dict(k=config.k, m=m, n=n, repeat=repeat,
                              owner=owner, cores=cores, aivs=aivs, directional=directional)
             if compact_panels:

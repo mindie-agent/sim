@@ -33,7 +33,7 @@ class RoutingPolicy:
             raise ValueError("routing_support_must_cover_top_k")
         # Weighted sampling without replacement: saturate certain selections,
         # then redistribute remaining probability mass. Sum inclusions = top-k.
-        remaining, available = float(layer.top_k), sum(probabilities)
+        remaining, available = float(layer.top_k), math.fsum(probabilities)
         inclusions = [0.0] * layer.num_experts
         for index in sorted(range(layer.num_experts), key=lambda i: probabilities[i], reverse=True):
             probability = probabilities[index]
@@ -46,9 +46,9 @@ class RoutingPolicy:
             rows.append(tokens * inclusion)
             active.append(-math.expm1(tokens * math.log1p(-inclusion))
                           if 0 < inclusion < 1 else float(tokens > 0 and inclusion > 0))
-        rank_rows = [sum(rows[index::parallel.ep]) for index in range(parallel.ep)]
+        rank_rows = [math.fsum(rows[index::parallel.ep]) for index in range(parallel.ep)]
         slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
-        return rank_rows[slowest], sum(active[slowest::parallel.ep])
+        return rank_rows[slowest], math.fsum(active[slowest::parallel.ep])
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):

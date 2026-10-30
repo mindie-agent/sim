@@ -438,10 +438,10 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 from .program import PipelineProgram
                 # Bounded verification control; input phases are regenerated
                 # lazily, so even this path retains no full task history.
-                iterator = iter(tile_keys(owner))
-                count = sum(1 for _ in tile_keys(owner))
+                keys_seq = tuple(tile_keys(owner))
+                count = len(keys_seq)
                 program = PipelineProgram(
-                    count, slots, lambda _: stage_list(next(iterator)))
+                    count, slots, lambda idx, keys_seq=keys_seq: stage_list(keys_seq[idx]))
                 return KernelProgram((
                     Stage("reserve", acquire=buffers),
                     Stage("tiles", after=("reserve",), program=program),

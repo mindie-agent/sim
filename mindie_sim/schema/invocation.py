@@ -9,8 +9,14 @@
 from collections.abc import Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+import json
 import math
 from numbers import Real
+
+
+class _FrozenProvenance(dict):
+    """Immutable-by-convention provenance dict that caches its canonical JSON signature."""
+    __slots__ = ("_sig",)
 
 
 def _declared_ms(name: str, value: object) -> float:
@@ -33,7 +39,16 @@ class InvocationTiming:
         object.__setattr__(self, "minimum_ms", _declared_ms("minimum_ms", self.minimum_ms))
         if not isinstance(self.provenance, Mapping):
             raise TypeError("invocation_provenance_requires_mapping")
-        object.__setattr__(self, "provenance", deepcopy(dict(self.provenance)))
+        if isinstance(self.provenance, _FrozenProvenance):
+            object.__setattr__(self, "provenance", self.provenance)
+        else:
+            fp = _FrozenProvenance(deepcopy(dict(self.provenance)))
+            fp._sig = json.dumps(fp, sort_keys=True, separators=(",", ":"))
+            object.__setattr__(self, "provenance", fp)
+
+    @property
+    def _cache_sig(self) -> tuple[float, float, str]:
+        return (self.startup_ms, self.minimum_ms, getattr(self.provenance, "_sig", ""))
 
     @classmethod
     def from_mapping(cls, data: Mapping) -> "InvocationTiming":

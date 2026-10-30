@@ -242,10 +242,13 @@ class SteadyMatmul(MappedMatmul):
             source = None if owner_tiles is None else iter(owner_tiles[core][1])
             if self.compact_output_tiles and tiles > 1:
                 owners.append(owner_run(core, tiles, source))
+            elif source is None:
+                owners.append(PipelineProgram(tiles, 1, lambda index, core=core: build(core, index, None)))
             else:
+                seq = tuple(owner_tiles[core][1])
                 owners.append(PipelineProgram(
-                    tiles, 1, lambda index, core=core, source=source:
-                    build(core, index, next(source) if source is not None else None)))
+                    tiles, 1, lambda index, core=core, seq=seq:
+                    build(core, index, seq[index])))
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
             Stage("owners", after=("setup",), program=ParallelProgram(tuple(owners))),

@@ -8,6 +8,7 @@
 [Side-Effect Policy] Returns timing plus provenance, without changing work.
 """
 from dataclasses import replace
+from copy import deepcopy
 import hashlib
 import json
 
@@ -70,6 +71,9 @@ class InvocationPolicy:
         return timing, record
 
 
+_HW_INV_CACHE = {}
+
+
 def hardware_invocation(context, devices, *, explicit_class=None):
     """An enclosing physical kernel pays its declared execution classes once."""
     work = context.native_work
@@ -80,11 +84,24 @@ def hardware_invocation(context, devices, *, explicit_class=None):
         return None
     else:
         classes = tuple(role for role in ("cube", "vector") if work.get(role, 0))
+    cache_key = (
+        tuple(
+            (device.rank, tuple((role, timing._cache_sig)
+                                for role, timing in device.kernel_invocations))
+            for device in devices
+        ),
+        classes,
+    )
+    if cache_key in _HW_INV_CACHE:
+        return _HW_INV_CACHE[cache_key]
     selected = [
         {"rank": device.rank, "class": role, **timing.to_dict()}
         for device in devices for role, timing in device.kernel_invocations if role in classes
     ]
     if not selected:
+        if len(_HW_INV_CACHE) >= 1024:
+            _HW_INV_CACHE.pop(next(iter(_HW_INV_CACHE)))
+        _HW_INV_CACHE[cache_key] = None
         return None
     # A representative TP/PCP shard conservatively uses its slowest member.
     # Mixed cube/vector is one invocation, not two stacked dispatch delays.
@@ -94,11 +111,15 @@ def hardware_invocation(context, devices, *, explicit_class=None):
         provenance={"basis": "hardware_execution_class", "declarations": selected},
     )
     payload = json.dumps(timing.to_dict(), sort_keys=True, separators=(",", ":"))
-    return timing, {
+    res = timing, {
         "id": hashlib.sha256(payload.encode()).hexdigest(),
         "match": {"execution_classes": classes}, "source": "device.kernel_invocations",
         **timing.to_dict(),
     }
+    if len(_HW_INV_CACHE) >= 1024:
+        _HW_INV_CACHE.pop(next(iter(_HW_INV_CACHE)))
+    _HW_INV_CACHE[cache_key] = res
+    return res
 
 
 def lower_invocation(recipe, context):
@@ -106,5 +127,6 @@ def lower_invocation(recipe, context):
     if timing is None:
         return recipe.lower(context)
     body = recipe.lower(replace(context, minimum_ms=0, invocation_timing=None))
-    timing = replace(timing, minimum_ms=max(timing.minimum_ms, context.minimum_ms))
+    if context.minimum_ms > timing.minimum_ms:
+        timing = replace(timing, minimum_ms=context.minimum_ms)
     return InvocationProgram(body, timing)
