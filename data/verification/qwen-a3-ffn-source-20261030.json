@@ -1,0 +1,5245 @@
+{
+  "schema": "mindie-qwen-a3-ffn-source-audit/1",
+  "input": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+    "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+    "size_bytes": 5852
+  },
+  "control_input": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+    "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
+    "size_bytes": 4234
+  },
+  "source_contract": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/tests/fixtures/verification/qwen35-a3-ffn-contract.json",
+    "sha256": "c42b158e6f7bda51edd3fe607355a1a37633e920c35fd1be51cb75ebfb579f1a",
+    "size_bytes": 24111
+  },
+  "producer": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/qwen-a3-ffn-source-20261030.producer.py",
+    "sha256": "d8d5facdd9a9759b2cc83a9765bed8d8011acdb21f76ed12eba6ef38ffd0bfa3",
+    "size_bytes": 8277
+  },
+  "scenarios": [
+    {
+      "scenario": "retained_q2_b1",
+      "before": {
+        "full_model_layers": 40,
+        "selected_layer": 0,
+        "query_tokens": 2,
+        "sequence_slots": 1,
+        "layer_graph_duration_ms": 0.1990691305936921,
+        "isolated_operator_sum_ms": 0.1990691305937018,
+        "shared_resident_weight_bytes": 804864.0,
+        "operators": [
+          {
+            "op_id": "s0.l0.norm1",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 20480.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 20480.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 20480.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_qkvz",
+            "recipe": "linear_qkvz",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              3072,
+              2048
+            ],
+            "flops": 25165824.0,
+            "hbm_bytes": 12603392.0,
+            "mte2_bytes": 12591104.0,
+            "mte3_bytes": 12288.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 20.49939393939404,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12603392.00000001,
+              "mte1@r0:s0": 12779520.000000011,
+              "mte2_aic@r0:s0": 12779519.999999998,
+              "mte3@r0:s0": 12287.999999999996,
+              "matrix@r0:s0": 9.309090909090912e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_beta_alpha",
+            "recipe": "linear_beta_alpha",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              16,
+              2048
+            ],
+            "flops": 131072.0,
+            "hbm_bytes": 73792.0,
+            "mte2_bytes": 73728.0,
+            "mte3_bytes": 64.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 73792.0,
+              "mte1@r0:s0": 73728.0,
+              "mte2_aic@r0:s0": 73728.0,
+              "mte3@r0:s0": 64.0,
+              "matrix@r0:s0": 4.848484848484849e-07
+            }
+          },
+          {
+            "op_id": "s0.l0.beta_contiguous",
+            "recipe": "beta_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 64.0,
+            "mte2_bytes": 32.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 64.0,
+              "mte3@r0:s0": 32.0
+            }
+          },
+          {
+            "op_id": "s0.l0.alpha_contiguous",
+            "recipe": "alpha_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 64.0,
+            "mte2_bytes": 32.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 64.0,
+              "mte3@r0:s0": 32.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_zero",
+            "recipe": "core_output_zero",
+            "family": "tensor_fill",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096,
+            "mte2_bytes": 0,
+            "mte3_bytes": 4096,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.convolution_input_contiguous",
+            "recipe": "convolution_input_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.short_convolution",
+            "recipe": "ascend_causal_conv1d_update",
+            "family": "short_convolution",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 77824,
+            "mte2_bytes": 0,
+            "mte3_bytes": 24576,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 77824.0,
+              "mte2_aiv@r0:s0": 53248.0,
+              "mte3@r0:s0": 24575.999999999993,
+              "vector@r0:s0": 79872.0
+            }
+          },
+          {
+            "op_id": "s0.l0.q_flat",
+            "recipe": "q_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.k_flat",
+            "recipe": "k_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.v_flat",
+            "recipe": "v_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.qkv_concatenate",
+            "recipe": "qkv_concatenate",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.delta_gates",
+            "recipe": "ascend_gdn_decode_gating",
+            "family": "gdn_gating",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 2720,
+            "mte2_bytes": 0,
+            "mte3_bytes": 96,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 2719.999999999999,
+              "mte2_aiv@r0:s0": 2623.9999999999995,
+              "mte3@r0:s0": 96.0,
+              "vector@r0:s0": 266880.00000000023
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_q_l2norm",
+            "recipe": "decode_q_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              2,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0,
+              "vector@r0:s0": 5120.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_k_l2norm",
+            "recipe": "decode_k_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              2,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0,
+              "vector@r0:s0": 5120.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_recurrent_scan",
+            "recipe": "decode_recurrent_scan",
+            "family": "recurrent_vector",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 1589344.0,
+            "mte2_bytes": 536672.0,
+            "mte3_bytes": 1052672.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 6.86083333333265,
+            "program": "RecurrentVector",
+            "serviced": {
+              "memory@r0:s0": 1589344.0,
+              "mte2_aiv@r0:s0": 536672.0,
+              "mte3@r0:s0": 1052672.0,
+              "vector@r0:s0": 1835008.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_copy",
+            "recipe": "core_output_copy",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.z_norm_materialize",
+            "recipe": "z_norm_materialize",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output_norm_gate",
+            "recipe": "linear_output_norm_gate",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12544.0,
+            "mte2_bytes": 8448.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12544.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 18432.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output",
+            "recipe": "linear_output",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048,
+              1024
+            ],
+            "flops": 8388608.0,
+            "hbm_bytes": 4206592.0,
+            "mte2_bytes": 4198400.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.211675151515216,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4206592.0,
+              "mte1@r0:s0": 4259840.0,
+              "mte2_aic@r0:s0": 4259840.000000002,
+              "mte3@r0:s0": 8192.0,
+              "matrix@r0:s0": 3.1030303030303025e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_reduce",
+            "recipe": "linear_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              12288.0
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 12288.0,
+            "elapsed_us": 15.062693877550437,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 12288.0,
+              "link:d2d_intra_package:0:rx:port1": 12288.0,
+              "link:d2d_intra_package:2:tx:port2": 12288.0,
+              "link:d2d_intra_package:2:rx:port3": 12288.0,
+              "link:d2d_intra_node:0:rx:port0": 12288.0,
+              "link:d2d_intra_node:0:tx:port1": 12288.0,
+              "link:d2d_intra_node:0:rx:port2": 12288.0,
+              "link:d2d_intra_node:0:tx:port3": 12288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.attention.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 24576.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 24576.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.norm2",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 20480.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 20480.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 20480.0
+            }
+          },
+          {
+            "op_id": "s0.l0.router",
+            "recipe": "router",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              256,
+              2048
+            ],
+            "flops": 2097152.0,
+            "hbm_bytes": 1057792.0,
+            "mte2_bytes": 1056768.0,
+            "mte3_bytes": 1024.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 10.24969696969702,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1057792.0,
+              "mte1@r0:s0": 1064960.0,
+              "mte2_aic@r0:s0": 1064960.0,
+              "mte3@r0:s0": 1023.9999999999999,
+              "matrix@r0:s0": 7.757575757575758e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.topk",
+            "recipe": "router_topk",
+            "family": "topk",
+            "dtype": "fp32",
+            "local_shape": [
+              2,
+              256
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 1120.0,
+            "mte2_bytes": 1024.0,
+            "mte3_bytes": 96.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 1120.0,
+              "mte3@r0:s0": 96.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.pack",
+            "recipe": "route_pack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 73856.0,
+            "mte2_bytes": 8256.0,
+            "mte3_bytes": 65600.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 73856.0,
+              "mte3@r0:s0": 65600.0,
+              "vector@r0:s0": 16.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98368.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 32832.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98367.99999999999,
+              "mte3@r0:s0": 32832.0,
+              "vector@r0:s0": 131104.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up",
+            "recipe": "balanced_grouped_gate_up",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216,
+            "hbm_bytes": 8462400.0,
+            "mte2_bytes": 8454208.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 10.16994424242501,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 8462400.000000006,
+              "mte1@r0:s0": 8454143.999999994,
+              "mte2_aic@r0:s0": 8421376.000000006,
+              "mte2_aiv@r0:s0": 32832.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 16384.0,
+              "matrix@r0:s0": 3.103030303030303e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_act",
+            "recipe": "grouped_swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12288.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12288.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 6208.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 2112.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 6208.0,
+              "mte3@r0:s0": 2112.0,
+              "vector@r0:s0": 8224.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down",
+            "recipe": "balanced_grouped_down",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              2048,
+              128
+            ],
+            "flops": 8388608,
+            "hbm_bytes": 4524096.0,
+            "mte2_bytes": 4458560.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.305117878787513,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4524096.0,
+              "mte1@r0:s0": 4227072.000000005,
+              "mte2_aic@r0:s0": 4227072.000000001,
+              "mte2_aiv@r0:s0": 263168.0,
+              "mte3@r0:s0": 65536.00000000003,
+              "vector@r0:s0": 131071.99999999978,
+              "matrix@r0:s0": 1.5515151515151496e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_reduce",
+            "recipe": "expert_tensor_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 98304.0,
+            "elapsed_us": 15.501551020407511,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 98304.0,
+              "link:d2d_intra_package:0:rx:port1": 98304.0,
+              "link:d2d_intra_package:2:tx:port2": 98304.0,
+              "link:d2d_intra_package:2:rx:port3": 98304.0,
+              "link:d2d_intra_node:0:rx:port0": 98304.0,
+              "link:d2d_intra_node:0:tx:port1": 98304.0,
+              "link:d2d_intra_node:0:rx:port2": 98304.0,
+              "link:d2d_intra_node:0:tx:port3": 98304.0
+            }
+          },
+          {
+            "op_id": "s0.l0.unpack",
+            "recipe": "route_unpack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 73792.0,
+            "mte2_bytes": 65600.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 73792.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12296.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 4104.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12295.999999999998,
+              "mte3@r0:s0": 4104.0,
+              "vector@r0:s0": 16388.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up",
+            "recipe": "dense_gate_up",
+            "family": "gate_up_projection",
+            "dtype": "int8",
+            "local_shape": [
+              2,
+              256,
+              2048
+            ],
+            "flops": 2097152.0,
+            "hbm_bytes": 531464.0,
+            "mte2_bytes": 530440.0,
+            "mte3_bytes": 1024.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.145530303030554,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 531464.0,
+              "mte1@r0:s0": 532480.0,
+              "mte2_aic@r0:s0": 532480.0,
+              "mte2_aiv@r0:s0": 2064.0,
+              "mte3@r0:s0": 1023.9999999999999,
+              "vector@r0:s0": 2048.0,
+              "matrix@r0:s0": 3.878787878787879e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.swiglu",
+            "recipe": "swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 1536.0,
+            "mte2_bytes": 1024.0,
+            "mte3_bytes": 512.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 1536.0,
+              "mte3@r0:s0": 512.0,
+              "vector@r0:s0": 1024.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 776.0,
+            "mte2_bytes": 512.0,
+            "mte3_bytes": 264.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 776.0,
+              "mte3@r0:s0": 264.0,
+              "vector@r0:s0": 1028.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down",
+            "recipe": "dense_down",
+            "family": "down_projection",
+            "dtype": "int8",
+            "local_shape": [
+              2,
+              2048,
+              128
+            ],
+            "flops": 1048576.0,
+            "hbm_bytes": 286984.0,
+            "mte2_bytes": 278792.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 286984.0,
+              "mte1@r0:s0": 266240.0,
+              "mte2_aic@r0:s0": 266240.0,
+              "mte2_aiv@r0:s0": 16512.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 16384.0,
+              "matrix@r0:s0": 1.9393939393939395e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.tp",
+            "recipe": "ring_allreduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 12288.0,
+            "elapsed_us": 15.062693877550437,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 12288.0,
+              "link:d2d_intra_package:0:rx:port1": 12288.0,
+              "link:d2d_intra_package:2:tx:port2": 12288.0,
+              "link:d2d_intra_package:2:rx:port3": 12288.0,
+              "link:d2d_intra_node:0:rx:port0": 12288.0,
+              "link:d2d_intra_node:0:tx:port1": 12288.0,
+              "link:d2d_intra_node:0:rx:port2": 12288.0,
+              "link:d2d_intra_node:0:tx:port3": 12288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate",
+            "recipe": "shared_gate",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1,
+              2048
+            ],
+            "flops": 8192.0,
+            "hbm_bytes": 12292.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 4.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12292.0,
+              "mte1@r0:s0": 12288.0,
+              "mte2_aic@r0:s0": 12288.0,
+              "mte3@r0:s0": 4.0,
+              "matrix@r0:s0": 3.0303030303030305e-08
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate_apply",
+            "recipe": "shared_gate_apply",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.join",
+            "recipe": "expert_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.ffn.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 24576.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 24576.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          }
+        ],
+        "body_declaration": {
+          "profile": "decode_resource_pipelines",
+          "selections": [
+            {
+              "family": "gqa_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry"
+            },
+            {
+              "family": "gdn_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry",
+              "caller": "non_interleaved_qkvz_ba",
+              "recurrence": "analytical; no reviewed source recurrence for this hardware/domain",
+              "gating_store": "DMA resource estimate; no compatible physical store queue declared"
+            },
+            {
+              "family": "grouped_gemm",
+              "selection": "default_installed",
+              "reason": "preserve_existing_grouped_mapping_domain",
+              "program": {
+                "kind": "steady_matmul"
+              },
+              "priority": "family_default; named_and_source_recipes_override"
+            },
+            {
+              "family": "matmul",
+              "selection": "default_installed",
+              "reason": "compact_finite_k_pipeline_preserving_128_output_grid",
+              "program": {
+                "kind": "steady_matmul",
+                "candidates": [
+                  [
+                    128,
+                    128,
+                    128
+                  ],
+                  [
+                    128,
+                    128,
+                    64
+                  ]
+                ]
+              },
+              "priority": "program_default; named_source_and_family_recipes_override",
+              "contention": "coupled_fluid_approximation_with_finite_owner_buffers"
+            }
+          ],
+          "basis": "analytic resource programs; no measured dispatch or latency fit",
+          "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+          "gqa_tiles": {
+            "kind": "staged_gqa_decode",
+            "query_tile": 64,
+            "key_tile": 64,
+            "slots": 2
+          },
+          "selection_boundary": "family default; per-operator recipes retain priority",
+          "indexed_scratch": "offchip; no inferred cache hit rate",
+          "indexed_operand_service": "directional_mte1",
+          "sharedkv": "SCFA source currently requires explicit prefill declarations"
+        },
+        "physical_work": {
+          "flops": 64102400.0,
+          "vector_ops": 2675416.0,
+          "hbm_bytes": 33922308.0,
+          "link_bytes": 122880.0
+        },
+        "runtime_seconds": 0.15105816698633134
+      },
+      "corrected": {
+        "full_model_layers": 40,
+        "selected_layer": 0,
+        "query_tokens": 2,
+        "sequence_slots": 1,
+        "layer_graph_duration_ms": 0.1836717462399506,
+        "isolated_operator_sum_ms": 0.18367174623995997,
+        "shared_resident_weight_bytes": 1572864.0,
+        "operators": [
+          {
+            "op_id": "s0.l0.norm1",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 20480.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 20480.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 20480.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_qkvz",
+            "recipe": "linear_qkvz",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              3072,
+              2048
+            ],
+            "flops": 25165824.0,
+            "hbm_bytes": 12603392.0,
+            "mte2_bytes": 12591104.0,
+            "mte3_bytes": 12288.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 20.49939393939404,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12603392.00000001,
+              "mte1@r0:s0": 12779520.000000011,
+              "mte2_aic@r0:s0": 12779519.999999998,
+              "mte3@r0:s0": 12287.999999999996,
+              "matrix@r0:s0": 9.309090909090912e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_beta_alpha",
+            "recipe": "linear_beta_alpha",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              16,
+              2048
+            ],
+            "flops": 131072.0,
+            "hbm_bytes": 73792.0,
+            "mte2_bytes": 73728.0,
+            "mte3_bytes": 64.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 73792.0,
+              "mte1@r0:s0": 73728.0,
+              "mte2_aic@r0:s0": 73728.0,
+              "mte3@r0:s0": 64.0,
+              "matrix@r0:s0": 4.848484848484849e-07
+            }
+          },
+          {
+            "op_id": "s0.l0.beta_contiguous",
+            "recipe": "beta_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 64.0,
+            "mte2_bytes": 32.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 64.0,
+              "mte3@r0:s0": 32.0
+            }
+          },
+          {
+            "op_id": "s0.l0.alpha_contiguous",
+            "recipe": "alpha_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 64.0,
+            "mte2_bytes": 32.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 64.0,
+              "mte3@r0:s0": 32.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_zero",
+            "recipe": "core_output_zero",
+            "family": "tensor_fill",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096,
+            "mte2_bytes": 0,
+            "mte3_bytes": 4096,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.convolution_input_contiguous",
+            "recipe": "convolution_input_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.short_convolution",
+            "recipe": "ascend_causal_conv1d_update",
+            "family": "short_convolution",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 77824,
+            "mte2_bytes": 0,
+            "mte3_bytes": 24576,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 77824.0,
+              "mte2_aiv@r0:s0": 53248.0,
+              "mte3@r0:s0": 24575.999999999993,
+              "vector@r0:s0": 79872.0
+            }
+          },
+          {
+            "op_id": "s0.l0.q_flat",
+            "recipe": "q_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.k_flat",
+            "recipe": "k_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0
+            }
+          },
+          {
+            "op_id": "s0.l0.v_flat",
+            "recipe": "v_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.qkv_concatenate",
+            "recipe": "qkv_concatenate",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.delta_gates",
+            "recipe": "ascend_gdn_decode_gating",
+            "family": "gdn_gating",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 2720,
+            "mte2_bytes": 0,
+            "mte3_bytes": 96,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 2719.999999999999,
+              "mte2_aiv@r0:s0": 2623.9999999999995,
+              "mte3@r0:s0": 96.0,
+              "vector@r0:s0": 266880.00000000023
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_q_l2norm",
+            "recipe": "decode_q_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              2,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0,
+              "vector@r0:s0": 5120.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_k_l2norm",
+            "recipe": "decode_k_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              2,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 4096.0,
+            "mte2_bytes": 2048.0,
+            "mte3_bytes": 2048.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 4096.0,
+              "mte3@r0:s0": 2048.0,
+              "vector@r0:s0": 5120.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_recurrent_scan",
+            "recipe": "decode_recurrent_scan",
+            "family": "recurrent_vector",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 1589344.0,
+            "mte2_bytes": 536672.0,
+            "mte3_bytes": 1052672.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 6.86083333333265,
+            "program": "RecurrentVector",
+            "serviced": {
+              "memory@r0:s0": 1589344.0,
+              "mte2_aiv@r0:s0": 536672.0,
+              "mte3@r0:s0": 1052672.0,
+              "vector@r0:s0": 1835008.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_copy",
+            "recipe": "core_output_copy",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.z_norm_materialize",
+            "recipe": "z_norm_materialize",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 8192.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8192.0,
+              "mte3@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output_norm_gate",
+            "recipe": "linear_output_norm_gate",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12544.0,
+            "mte2_bytes": 8448.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12544.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 18432.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output",
+            "recipe": "linear_output",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048,
+              1024
+            ],
+            "flops": 8388608.0,
+            "hbm_bytes": 4206592.0,
+            "mte2_bytes": 4198400.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.211675151515216,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4206592.0,
+              "mte1@r0:s0": 4259840.0,
+              "mte2_aic@r0:s0": 4259840.000000002,
+              "mte3@r0:s0": 8192.0,
+              "matrix@r0:s0": 3.1030303030303025e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_reduce",
+            "recipe": "linear_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              12288.0
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 12288.0,
+            "elapsed_us": 15.062693877550437,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 12288.0,
+              "link:d2d_intra_package:0:rx:port1": 12288.0,
+              "link:d2d_intra_package:2:tx:port2": 12288.0,
+              "link:d2d_intra_package:2:rx:port3": 12288.0,
+              "link:d2d_intra_node:0:rx:port0": 12288.0,
+              "link:d2d_intra_node:0:tx:port1": 12288.0,
+              "link:d2d_intra_node:0:rx:port2": 12288.0,
+              "link:d2d_intra_node:0:tx:port3": 12288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.attention.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 24576.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 24576.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.norm2",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 20480.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 20480.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 20480.0
+            }
+          },
+          {
+            "op_id": "s0.l0.router",
+            "recipe": "router",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              256,
+              2048
+            ],
+            "flops": 2097152.0,
+            "hbm_bytes": 1057792.0,
+            "mte2_bytes": 1056768.0,
+            "mte3_bytes": 1024.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 10.24969696969702,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1057792.0,
+              "mte1@r0:s0": 1064960.0,
+              "mte2_aic@r0:s0": 1064960.0,
+              "mte3@r0:s0": 1023.9999999999999,
+              "matrix@r0:s0": 7.757575757575758e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.topk",
+            "recipe": "router_topk",
+            "family": "topk",
+            "dtype": "fp32",
+            "local_shape": [
+              2,
+              256
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 1120.0,
+            "mte2_bytes": 1024.0,
+            "mte3_bytes": 96.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 1120.0,
+              "mte3@r0:s0": 96.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.pack",
+            "recipe": "route_pack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 73856.0,
+            "mte2_bytes": 8256.0,
+            "mte3_bytes": 65600.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 73856.0,
+              "mte3@r0:s0": 65600.0,
+              "vector@r0:s0": 16.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98368.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 32832.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98367.99999999999,
+              "mte3@r0:s0": 32832.0,
+              "vector@r0:s0": 131104.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up",
+            "recipe": "balanced_grouped_gate_up",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216,
+            "hbm_bytes": 8462400.0,
+            "mte2_bytes": 8454208.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 10.16994424242501,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 8462400.000000006,
+              "mte1@r0:s0": 8454143.999999994,
+              "mte2_aic@r0:s0": 8421376.000000006,
+              "mte2_aiv@r0:s0": 32832.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 16384.0,
+              "matrix@r0:s0": 3.103030303030303e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_act",
+            "recipe": "grouped_swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12288.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12288.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 6208.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 2112.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 6208.0,
+              "mte3@r0:s0": 2112.0,
+              "vector@r0:s0": 8224.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down",
+            "recipe": "balanced_grouped_down",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              2048,
+              128
+            ],
+            "flops": 8388608,
+            "hbm_bytes": 4524096.0,
+            "mte2_bytes": 4458560.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.305117878787513,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4524096.0,
+              "mte1@r0:s0": 4227072.000000005,
+              "mte2_aic@r0:s0": 4227072.000000001,
+              "mte2_aiv@r0:s0": 263168.0,
+              "mte3@r0:s0": 65536.00000000003,
+              "vector@r0:s0": 131071.99999999978,
+              "matrix@r0:s0": 1.5515151515151496e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.unpack",
+            "recipe": "route_unpack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              8,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 73792.0,
+            "mte2_bytes": 65600.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 73792.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up",
+            "recipe": "dense_gate_up",
+            "family": "gate_up_projection",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              256,
+              2048
+            ],
+            "flops": 2097152.0,
+            "hbm_bytes": 1057792.0,
+            "mte2_bytes": 1056768.0,
+            "mte3_bytes": 1024.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 10.24969696969702,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1057792.0,
+              "mte1@r0:s0": 1064960.0,
+              "mte2_aic@r0:s0": 1064960.0,
+              "mte3@r0:s0": 1023.9999999999999,
+              "matrix@r0:s0": 7.757575757575758e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.swiglu",
+            "recipe": "swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 1536.0,
+            "mte2_bytes": 1024.0,
+            "mte3_bytes": 512.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 1536.0,
+              "mte3@r0:s0": 512.0,
+              "vector@r0:s0": 1024.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down",
+            "recipe": "dense_down",
+            "family": "down_projection",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              2048,
+              128
+            ],
+            "flops": 1048576.0,
+            "hbm_bytes": 532992.0,
+            "mte2_bytes": 524800.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 532992.0,
+              "mte1@r0:s0": 532480.0,
+              "mte2_aic@r0:s0": 532480.0,
+              "mte3@r0:s0": 8192.0,
+              "matrix@r0:s0": 3.878787878787879e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate",
+            "recipe": "shared_gate",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              2,
+              1,
+              2048
+            ],
+            "flops": 8192.0,
+            "hbm_bytes": 12292.0,
+            "mte2_bytes": 12288.0,
+            "mte3_bytes": 4.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12292.0,
+              "mte1@r0:s0": 12288.0,
+              "mte2_aic@r0:s0": 12288.0,
+              "mte3@r0:s0": 4.0,
+              "matrix@r0:s0": 3.0303030303030305e-08
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate_apply",
+            "recipe": "shared_gate_apply",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.join",
+            "recipe": "expert_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 16384.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 16384.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          },
+          {
+            "op_id": "s0.l0.moe_output_reduce",
+            "recipe": "moe_output_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              2,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 12288.0,
+            "elapsed_us": 15.062693877550437,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 12288.0,
+              "link:d2d_intra_package:0:rx:port1": 12288.0,
+              "link:d2d_intra_package:2:tx:port2": 12288.0,
+              "link:d2d_intra_package:2:rx:port3": 12288.0,
+              "link:d2d_intra_node:0:rx:port0": 12288.0,
+              "link:d2d_intra_node:0:tx:port1": 12288.0,
+              "link:d2d_intra_node:0:rx:port2": 12288.0,
+              "link:d2d_intra_node:0:tx:port3": 12288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.ffn.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              4096
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 24576.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 24576.0,
+              "mte3@r0:s0": 8192.0,
+              "vector@r0:s0": 4096.0
+            }
+          }
+        ],
+        "body_declaration": {
+          "profile": "decode_resource_pipelines",
+          "selections": [
+            {
+              "family": "gqa_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry"
+            },
+            {
+              "family": "gdn_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry",
+              "caller": "non_interleaved_qkvz_ba",
+              "recurrence": "analytical; no reviewed source recurrence for this hardware/domain",
+              "gating_store": "DMA resource estimate; no compatible physical store queue declared"
+            },
+            {
+              "family": "grouped_gemm",
+              "selection": "default_installed",
+              "reason": "preserve_existing_grouped_mapping_domain",
+              "program": {
+                "kind": "steady_matmul"
+              },
+              "priority": "family_default; named_and_source_recipes_override"
+            },
+            {
+              "family": "matmul",
+              "selection": "default_installed",
+              "reason": "compact_finite_k_pipeline_preserving_128_output_grid",
+              "program": {
+                "kind": "steady_matmul",
+                "candidates": [
+                  [
+                    128,
+                    128,
+                    128
+                  ],
+                  [
+                    128,
+                    128,
+                    64
+                  ]
+                ]
+              },
+              "priority": "program_default; named_source_and_family_recipes_override",
+              "contention": "coupled_fluid_approximation_with_finite_owner_buffers"
+            }
+          ],
+          "basis": "analytic resource programs; no measured dispatch or latency fit",
+          "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+          "gqa_tiles": {
+            "kind": "staged_gqa_decode",
+            "query_tile": 64,
+            "key_tile": 64,
+            "slots": 2
+          },
+          "selection_boundary": "family default; per-operator recipes retain priority",
+          "indexed_scratch": "offchip; no inferred cache hit rate",
+          "indexed_operand_service": "directional_mte1",
+          "sharedkv": "SCFA source currently requires explicit prefill declarations"
+        },
+        "physical_work": {
+          "flops": 64102400.0,
+          "vector_ops": 2639568.0,
+          "hbm_bytes": 34681572.0,
+          "link_bytes": 24576.0
+        },
+        "runtime_seconds": 0.10080191609449685
+      },
+      "accuracy": "not scored; this probe does not bind whole-layer measured boundaries"
+    },
+    {
+      "scenario": "transfer_q4_b4",
+      "before": {
+        "full_model_layers": 40,
+        "selected_layer": 0,
+        "query_tokens": 4,
+        "sequence_slots": 4,
+        "layer_graph_duration_ms": 0.3117185465677181,
+        "isolated_operator_sum_ms": 0.31171854656772524,
+        "shared_resident_weight_bytes": 804864.0,
+        "operators": [
+          {
+            "op_id": "s0.l0.norm1",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 135168.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 135168.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 163840.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_qkvz",
+            "recipe": "linear_qkvz",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              3072,
+              2048
+            ],
+            "flops": 201326592.0,
+            "hbm_bytes": 12746752.0,
+            "mte2_bytes": 12648448.0,
+            "mte3_bytes": 98304.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 22.80727272727301,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12746751.999999994,
+              "mte1@r0:s0": 14155775.999999985,
+              "mte2_aic@r0:s0": 14155775.99999999,
+              "mte3@r0:s0": 98304.00000000004,
+              "matrix@r0:s0": 0.0007447272727272735
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_beta_alpha",
+            "recipe": "linear_beta_alpha",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              16,
+              2048
+            ],
+            "flops": 1048576.0,
+            "hbm_bytes": 131584.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 512.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 131584.0,
+              "mte1@r0:s0": 131072.0,
+              "mte2_aic@r0:s0": 131072.0,
+              "mte3@r0:s0": 512.0,
+              "matrix@r0:s0": 3.878787878787879e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.beta_contiguous",
+            "recipe": "beta_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 512.0,
+            "mte2_bytes": 256.0,
+            "mte3_bytes": 256.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 512.0,
+              "mte3@r0:s0": 256.0
+            }
+          },
+          {
+            "op_id": "s0.l0.alpha_contiguous",
+            "recipe": "alpha_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 512.0,
+            "mte2_bytes": 256.0,
+            "mte3_bytes": 256.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 512.0,
+              "mte3@r0:s0": 256.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_zero",
+            "recipe": "core_output_zero",
+            "family": "tensor_fill",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768,
+            "mte2_bytes": 0,
+            "mte3_bytes": 32768,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.convolution_input_contiguous",
+            "recipe": "convolution_input_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.short_convolution",
+            "recipe": "ascend_causal_conv1d_update",
+            "family": "short_convolution",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 442368,
+            "mte2_bytes": 0,
+            "mte3_bytes": 163840,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 442368.0,
+              "mte2_aiv@r0:s0": 278528.0,
+              "mte3@r0:s0": 163840.0,
+              "vector@r0:s0": 598016.0000000006
+            }
+          },
+          {
+            "op_id": "s0.l0.q_flat",
+            "recipe": "q_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.k_flat",
+            "recipe": "k_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.v_flat",
+            "recipe": "v_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.qkv_concatenate",
+            "recipe": "qkv_concatenate",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.delta_gates",
+            "recipe": "ascend_gdn_decode_gating",
+            "family": "gdn_gating",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 3840,
+            "mte2_bytes": 0,
+            "mte3_bytes": 768,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 3839.999999999999,
+              "mte2_aiv@r0:s0": 3071.9999999999995,
+              "mte3@r0:s0": 768.0,
+              "vector@r0:s0": 266880.0000000003
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_q_l2norm",
+            "recipe": "decode_q_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              16,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0,
+              "vector@r0:s0": 40960.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_k_l2norm",
+            "recipe": "decode_k_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              16,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0,
+              "vector@r0:s0": 40960.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_recurrent_scan",
+            "recipe": "decode_recurrent_scan",
+            "family": "recurrent_vector",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 10617600.0,
+            "mte2_bytes": 2196224.0,
+            "mte3_bytes": 8421376.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 17.53648484848469,
+            "program": "RecurrentVector",
+            "serviced": {
+              "memory@r0:s0": 10617600.0,
+              "mte2_aiv@r0:s0": 2196224.0,
+              "mte3@r0:s0": 8421376.0,
+              "vector@r0:s0": 14680064.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_copy",
+            "recipe": "core_output_copy",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.z_norm_materialize",
+            "recipe": "z_norm_materialize",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output_norm_gate",
+            "recipe": "linear_output_norm_gate",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98560.0,
+            "mte2_bytes": 65792.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98560.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 147456.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output",
+            "recipe": "linear_output",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048,
+              1024
+            ],
+            "flops": 67108864.0,
+            "hbm_bytes": 4292608.0,
+            "mte2_bytes": 4227072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.853401212120524,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4292608.0,
+              "mte1@r0:s0": 4718592.000000005,
+              "mte2_aic@r0:s0": 4718592.0,
+              "mte3@r0:s0": 65536.0,
+              "matrix@r0:s0": 0.0002482424242424243
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_reduce",
+            "recipe": "linear_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              98304.0
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 98304.0,
+            "elapsed_us": 15.501551020407511,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 98304.0,
+              "link:d2d_intra_package:0:rx:port1": 98304.0,
+              "link:d2d_intra_package:2:tx:port2": 98304.0,
+              "link:d2d_intra_package:2:rx:port3": 98304.0,
+              "link:d2d_intra_node:0:rx:port0": 98304.0,
+              "link:d2d_intra_node:0:tx:port1": 98304.0,
+              "link:d2d_intra_node:0:rx:port2": 98304.0,
+              "link:d2d_intra_node:0:tx:port3": 98304.0
+            }
+          },
+          {
+            "op_id": "s0.l0.attention.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 196608.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 196608.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.norm2",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 135168.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 135168.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 163840.0
+            }
+          },
+          {
+            "op_id": "s0.l0.router",
+            "recipe": "router",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216.0,
+            "hbm_bytes": 1122304.0,
+            "mte2_bytes": 1114112.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 11.40363636363606,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1122304.0,
+              "mte1@r0:s0": 1179648.0,
+              "mte2_aic@r0:s0": 1179648.0,
+              "mte3@r0:s0": 8191.999999999999,
+              "matrix@r0:s0": 6.206060606060606e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.topk",
+            "recipe": "router_topk",
+            "family": "topk",
+            "dtype": "fp32",
+            "local_shape": [
+              16,
+              256
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 8960.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8960.0,
+              "mte3@r0:s0": 768.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.pack",
+            "recipe": "route_pack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 590848.0,
+            "mte2_bytes": 66048.0,
+            "mte3_bytes": 524800.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 590848.0,
+              "mte3@r0:s0": 524800.0,
+              "vector@r0:s0": 128.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 786944.0,
+            "mte2_bytes": 524288.0,
+            "mte3_bytes": 262656.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 786943.9999999999,
+              "mte3@r0:s0": 262656.0,
+              "vector@r0:s0": 1048832.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up",
+            "recipe": "balanced_grouped_gate_up",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              128,
+              256,
+              2048
+            ],
+            "flops": 134217728,
+            "hbm_bytes": 67699200.0,
+            "mte2_bytes": 67633664.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 66.28693606060487,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 67699199.99999996,
+              "mte1@r0:s0": 67633152.00000004,
+              "mte2_aic@r0:s0": 67633152.0000001,
+              "mte2_aiv@r0:s0": 263168.00000000006,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 131072.00000000012,
+              "matrix@r0:s0": 0.0002482424242424243
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_act",
+            "recipe": "grouped_swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98304.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98304.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 49664.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 16896.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 49664.0,
+              "mte3@r0:s0": 16896.0,
+              "vector@r0:s0": 65792.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down",
+            "recipe": "balanced_grouped_down",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              128,
+              2048,
+              128
+            ],
+            "flops": 67108864,
+            "hbm_bytes": 36192768.0,
+            "mte2_bytes": 35668480.0,
+            "mte3_bytes": 524288.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 42.015911212121004,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 36192767.99999998,
+              "mte1@r0:s0": 33816575.999999955,
+              "mte2_aic@r0:s0": 33816576.000000015,
+              "mte2_aiv@r0:s0": 2105344.0,
+              "mte3@r0:s0": 524288.0,
+              "vector@r0:s0": 1048576.000000001,
+              "matrix@r0:s0": 0.00012412121212121205
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_reduce",
+            "recipe": "expert_tensor_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              128,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 786432.0,
+            "elapsed_us": 19.012408163264993,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 786432.0,
+              "link:d2d_intra_package:0:rx:port1": 786432.0,
+              "link:d2d_intra_package:2:tx:port2": 786432.0,
+              "link:d2d_intra_package:2:rx:port3": 786432.0,
+              "link:d2d_intra_node:0:rx:port0": 786432.0,
+              "link:d2d_intra_node:0:tx:port1": 786432.0,
+              "link:d2d_intra_node:0:rx:port2": 786432.0,
+              "link:d2d_intra_node:0:tx:port3": 786432.0
+            }
+          },
+          {
+            "op_id": "s0.l0.unpack",
+            "recipe": "route_unpack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 590336.0,
+            "mte2_bytes": 524800.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 590336.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 524288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98368.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 32832.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98367.99999999999,
+              "mte3@r0:s0": 32832.0,
+              "vector@r0:s0": 131104.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up",
+            "recipe": "dense_gate_up",
+            "family": "gate_up_projection",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216.0,
+            "hbm_bytes": 567360.0,
+            "mte2_bytes": 559168.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.79939393939366,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 567360.0,
+              "mte1@r0:s0": 589824.0,
+              "mte2_aic@r0:s0": 589824.0,
+              "mte2_aiv@r0:s0": 2176.0,
+              "mte3@r0:s0": 8191.999999999999,
+              "vector@r0:s0": 16384.0,
+              "matrix@r0:s0": 3.103030303030303e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.swiglu",
+            "recipe": "swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12288.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12288.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 6208.0,
+            "mte2_bytes": 4096.0,
+            "mte3_bytes": 2112.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 6208.0,
+              "mte3@r0:s0": 2112.0,
+              "vector@r0:s0": 8224.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down",
+            "recipe": "dense_down",
+            "family": "down_projection",
+            "dtype": "int8",
+            "local_shape": [
+              16,
+              2048,
+              128
+            ],
+            "flops": 8388608.0,
+            "hbm_bytes": 346176.0,
+            "mte2_bytes": 280640.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 346176.0,
+              "mte1@r0:s0": 294912.0,
+              "mte2_aic@r0:s0": 294912.0000000001,
+              "mte2_aiv@r0:s0": 17408.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 131072.0,
+              "matrix@r0:s0": 1.5515151515151516e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.tp",
+            "recipe": "ring_allreduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 98304.0,
+            "elapsed_us": 15.501551020407511,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 98304.0,
+              "link:d2d_intra_package:0:rx:port1": 98304.0,
+              "link:d2d_intra_package:2:tx:port2": 98304.0,
+              "link:d2d_intra_package:2:rx:port3": 98304.0,
+              "link:d2d_intra_node:0:rx:port0": 98304.0,
+              "link:d2d_intra_node:0:tx:port1": 98304.0,
+              "link:d2d_intra_node:0:rx:port2": 98304.0,
+              "link:d2d_intra_node:0:tx:port3": 98304.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate",
+            "recipe": "shared_gate",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1,
+              2048
+            ],
+            "flops": 65536.0,
+            "hbm_bytes": 69664.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 69664.0,
+              "mte1@r0:s0": 69632.0,
+              "mte2_aic@r0:s0": 69632.0,
+              "mte3@r0:s0": 32.0,
+              "matrix@r0:s0": 2.4242424242424244e-07
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate_apply",
+            "recipe": "shared_gate_apply",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.join",
+            "recipe": "expert_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.ffn.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 196608.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 196608.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          }
+        ],
+        "body_declaration": {
+          "profile": "decode_resource_pipelines",
+          "selections": [
+            {
+              "family": "gqa_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry"
+            },
+            {
+              "family": "gdn_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry",
+              "caller": "non_interleaved_qkvz_ba",
+              "recurrence": "analytical; no reviewed source recurrence for this hardware/domain",
+              "gating_store": "DMA resource estimate; no compatible physical store queue declared"
+            },
+            {
+              "family": "grouped_gemm",
+              "selection": "default_installed",
+              "reason": "preserve_existing_grouped_mapping_domain",
+              "program": {
+                "kind": "steady_matmul"
+              },
+              "priority": "family_default; named_and_source_recipes_override"
+            },
+            {
+              "family": "matmul",
+              "selection": "default_installed",
+              "reason": "compact_finite_k_pipeline_preserving_128_output_grid",
+              "program": {
+                "kind": "steady_matmul",
+                "candidates": [
+                  [
+                    128,
+                    128,
+                    128
+                  ],
+                  [
+                    128,
+                    128,
+                    64
+                  ]
+                ]
+              },
+              "priority": "program_default; named_source_and_family_recipes_override",
+              "contention": "coupled_fluid_approximation_with_finite_owner_buffers"
+            }
+          ],
+          "basis": "analytic resource programs; no measured dispatch or latency fit",
+          "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+          "gqa_tiles": {
+            "kind": "staged_gqa_decode",
+            "query_tile": 64,
+            "key_tile": 64,
+            "slots": 2
+          },
+          "selection_boundary": "family default; per-operator recipes retain priority",
+          "indexed_scratch": "offchip; no inferred cache hit rate",
+          "indexed_operand_service": "directional_mte1",
+          "sharedkv": "SCFA source currently requires explicit prefill declarations"
+        },
+        "physical_work": {
+          "flops": 512819200.0,
+          "vector_ops": 19494208.0,
+          "hbm_bytes": 138122016.0,
+          "link_bytes": 983040.0
+        },
+        "runtime_seconds": 0.11852245801128447
+      },
+      "corrected": {
+        "full_model_layers": 40,
+        "selected_layer": 0,
+        "query_tokens": 4,
+        "sequence_slots": 4,
+        "layer_graph_duration_ms": 0.29331038082869515,
+        "isolated_operator_sum_ms": 0.29331038082870187,
+        "shared_resident_weight_bytes": 1572864.0,
+        "operators": [
+          {
+            "op_id": "s0.l0.norm1",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 135168.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 135168.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 163840.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_qkvz",
+            "recipe": "linear_qkvz",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              3072,
+              2048
+            ],
+            "flops": 201326592.0,
+            "hbm_bytes": 12746752.0,
+            "mte2_bytes": 12648448.0,
+            "mte3_bytes": 98304.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 22.80727272727301,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 12746751.999999994,
+              "mte1@r0:s0": 14155775.999999985,
+              "mte2_aic@r0:s0": 14155775.99999999,
+              "mte3@r0:s0": 98304.00000000004,
+              "matrix@r0:s0": 0.0007447272727272735
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_beta_alpha",
+            "recipe": "linear_beta_alpha",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              16,
+              2048
+            ],
+            "flops": 1048576.0,
+            "hbm_bytes": 131584.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 512.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 131584.0,
+              "mte1@r0:s0": 131072.0,
+              "mte2_aic@r0:s0": 131072.0,
+              "mte3@r0:s0": 512.0,
+              "matrix@r0:s0": 3.878787878787879e-06
+            }
+          },
+          {
+            "op_id": "s0.l0.beta_contiguous",
+            "recipe": "beta_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 512.0,
+            "mte2_bytes": 256.0,
+            "mte3_bytes": 256.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 512.0,
+              "mte3@r0:s0": 256.0
+            }
+          },
+          {
+            "op_id": "s0.l0.alpha_contiguous",
+            "recipe": "alpha_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 512.0,
+            "mte2_bytes": 256.0,
+            "mte3_bytes": 256.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 512.0,
+              "mte3@r0:s0": 256.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_zero",
+            "recipe": "core_output_zero",
+            "family": "tensor_fill",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768,
+            "mte2_bytes": 0,
+            "mte3_bytes": 32768,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.convolution_input_contiguous",
+            "recipe": "convolution_input_contiguous",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.short_convolution",
+            "recipe": "ascend_causal_conv1d_update",
+            "family": "short_convolution",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0,
+            "hbm_bytes": 442368,
+            "mte2_bytes": 0,
+            "mte3_bytes": 163840,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 442368.0,
+              "mte2_aiv@r0:s0": 278528.0,
+              "mte3@r0:s0": 163840.0,
+              "vector@r0:s0": 598016.0000000006
+            }
+          },
+          {
+            "op_id": "s0.l0.q_flat",
+            "recipe": "q_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.k_flat",
+            "recipe": "k_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              512
+            ],
+            "flops": 0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0
+            }
+          },
+          {
+            "op_id": "s0.l0.v_flat",
+            "recipe": "v_flat",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.qkv_concatenate",
+            "recipe": "qkv_concatenate",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.delta_gates",
+            "recipe": "ascend_gdn_decode_gating",
+            "family": "gdn_gating",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0,
+            "hbm_bytes": 3840,
+            "mte2_bytes": 0,
+            "mte3_bytes": 768,
+            "link_bytes": 0,
+            "elapsed_us": 2.500000000000391,
+            "program": "OperatorPlan",
+            "serviced": {
+              "memory@r0:s0": 3839.999999999999,
+              "mte2_aiv@r0:s0": 3071.9999999999995,
+              "mte3@r0:s0": 768.0,
+              "vector@r0:s0": 266880.0000000003
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_q_l2norm",
+            "recipe": "decode_q_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              16,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0,
+              "vector@r0:s0": 40960.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_k_l2norm",
+            "recipe": "decode_k_l2norm",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              1,
+              16,
+              4,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 32768.0,
+            "mte2_bytes": 16384.0,
+            "mte3_bytes": 16384.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 32768.0,
+              "mte3@r0:s0": 16384.0,
+              "vector@r0:s0": 40960.0
+            }
+          },
+          {
+            "op_id": "s0.l0.decode_recurrent_scan",
+            "recipe": "decode_recurrent_scan",
+            "family": "recurrent_vector",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 10617600.0,
+            "mte2_bytes": 2196224.0,
+            "mte3_bytes": 8421376.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 17.53648484848469,
+            "program": "RecurrentVector",
+            "serviced": {
+              "memory@r0:s0": 10617600.0,
+              "mte2_aiv@r0:s0": 2196224.0,
+              "mte3@r0:s0": 8421376.0,
+              "vector@r0:s0": 14680064.0
+            }
+          },
+          {
+            "op_id": "s0.l0.core_output_copy",
+            "recipe": "core_output_copy",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              128
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.z_norm_materialize",
+            "recipe": "z_norm_materialize",
+            "family": "tensor_copy",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1024
+            ],
+            "flops": 0,
+            "hbm_bytes": 65536.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 65536.0,
+              "mte3@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output_norm_gate",
+            "recipe": "linear_output_norm_gate",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98560.0,
+            "mte2_bytes": 65792.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98560.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 147456.0
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_output",
+            "recipe": "linear_output",
+            "family": "gemm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048,
+              1024
+            ],
+            "flops": 67108864.0,
+            "hbm_bytes": 4292608.0,
+            "mte2_bytes": 4227072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 5.853401212120524,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 4292608.0,
+              "mte1@r0:s0": 4718592.000000005,
+              "mte2_aic@r0:s0": 4718592.0,
+              "mte3@r0:s0": 65536.0,
+              "matrix@r0:s0": 0.0002482424242424243
+            }
+          },
+          {
+            "op_id": "s0.l0.linear_reduce",
+            "recipe": "linear_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              98304.0
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 98304.0,
+            "elapsed_us": 15.501551020407511,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 98304.0,
+              "link:d2d_intra_package:0:rx:port1": 98304.0,
+              "link:d2d_intra_package:2:tx:port2": 98304.0,
+              "link:d2d_intra_package:2:rx:port3": 98304.0,
+              "link:d2d_intra_node:0:rx:port0": 98304.0,
+              "link:d2d_intra_node:0:tx:port1": 98304.0,
+              "link:d2d_intra_node:0:rx:port2": 98304.0,
+              "link:d2d_intra_node:0:tx:port3": 98304.0
+            }
+          },
+          {
+            "op_id": "s0.l0.attention.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 196608.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 196608.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.norm2",
+            "recipe": "rmsnorm",
+            "family": "rmsnorm",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 135168.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 135168.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 163840.0
+            }
+          },
+          {
+            "op_id": "s0.l0.router",
+            "recipe": "router",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216.0,
+            "hbm_bytes": 1122304.0,
+            "mte2_bytes": 1114112.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 11.40363636363606,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1122304.0,
+              "mte1@r0:s0": 1179648.0,
+              "mte2_aic@r0:s0": 1179648.0,
+              "mte3@r0:s0": 8191.999999999999,
+              "matrix@r0:s0": 6.206060606060606e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.topk",
+            "recipe": "router_topk",
+            "family": "topk",
+            "dtype": "fp32",
+            "local_shape": [
+              16,
+              256
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 8960.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 8960.0,
+              "mte3@r0:s0": 768.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.pack",
+            "recipe": "route_pack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 590848.0,
+            "mte2_bytes": 66048.0,
+            "mte3_bytes": 524800.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 590848.0,
+              "mte3@r0:s0": 524800.0,
+              "vector@r0:s0": 128.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 786944.0,
+            "mte2_bytes": 524288.0,
+            "mte3_bytes": 262656.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 786943.9999999999,
+              "mte3@r0:s0": 262656.0,
+              "vector@r0:s0": 1048832.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_up",
+            "recipe": "balanced_grouped_gate_up",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              128,
+              256,
+              2048
+            ],
+            "flops": 134217728,
+            "hbm_bytes": 67699200.0,
+            "mte2_bytes": 67633664.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 66.28693606060487,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 67699199.99999996,
+              "mte1@r0:s0": 67633152.00000004,
+              "mte2_aic@r0:s0": 67633152.0000001,
+              "mte2_aiv@r0:s0": 263168.00000000006,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 131072.00000000012,
+              "matrix@r0:s0": 0.0002482424242424243
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_act",
+            "recipe": "grouped_swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 98304.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 32768.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 98304.0,
+              "mte3@r0:s0": 32768.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down.quantize",
+            "recipe": "dynamic_quantize",
+            "family": "quantize",
+            "dtype": "bf16",
+            "local_shape": [
+              128,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 49664.0,
+            "mte2_bytes": 32768.0,
+            "mte3_bytes": 16896.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 49664.0,
+              "mte3@r0:s0": 16896.0,
+              "vector@r0:s0": 65792.0
+            }
+          },
+          {
+            "op_id": "s0.l0.expert_down",
+            "recipe": "balanced_grouped_down",
+            "family": "grouped_gemm",
+            "dtype": "int8",
+            "local_shape": [
+              128,
+              2048,
+              128
+            ],
+            "flops": 67108864,
+            "hbm_bytes": 36192768.0,
+            "mte2_bytes": 35668480.0,
+            "mte3_bytes": 524288.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 42.015911212121004,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 36192767.99999998,
+              "mte1@r0:s0": 33816575.999999955,
+              "mte2_aic@r0:s0": 33816576.000000015,
+              "mte2_aiv@r0:s0": 2105344.0,
+              "mte3@r0:s0": 524288.0,
+              "vector@r0:s0": 1048576.000000001,
+              "matrix@r0:s0": 0.00012412121212121205
+            }
+          },
+          {
+            "op_id": "s0.l0.unpack",
+            "recipe": "route_unpack",
+            "family": "routing",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              8,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 590336.0,
+            "mte2_bytes": 524800.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 590336.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 524288.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.gate_up",
+            "recipe": "dense_gate_up",
+            "family": "gate_up_projection",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              256,
+              2048
+            ],
+            "flops": 16777216.0,
+            "hbm_bytes": 1122304.0,
+            "mte2_bytes": 1114112.0,
+            "mte3_bytes": 8192.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 11.40363636363606,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 1122304.0,
+              "mte1@r0:s0": 1179648.0,
+              "mte2_aic@r0:s0": 1179648.0,
+              "mte3@r0:s0": 8191.999999999999,
+              "matrix@r0:s0": 6.206060606060606e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.swiglu",
+            "recipe": "swiglu",
+            "family": "swiglu",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              128
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 12288.0,
+            "mte2_bytes": 8192.0,
+            "mte3_bytes": 4096.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 12288.0,
+              "mte3@r0:s0": 4096.0,
+              "vector@r0:s0": 8192.0
+            }
+          },
+          {
+            "op_id": "s0.l0.shared.down",
+            "recipe": "dense_down",
+            "family": "down_projection",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              2048,
+              128
+            ],
+            "flops": 8388608.0,
+            "hbm_bytes": 593920.0,
+            "mte2_bytes": 528384.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 593920.0,
+              "mte1@r0:s0": 589824.0,
+              "mte2_aic@r0:s0": 589824.0000000002,
+              "mte3@r0:s0": 65536.0,
+              "matrix@r0:s0": 3.103030303030303e-05
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate",
+            "recipe": "shared_gate",
+            "family": "router",
+            "dtype": "bf16",
+            "local_shape": [
+              16,
+              1,
+              2048
+            ],
+            "flops": 65536.0,
+            "hbm_bytes": 69664.0,
+            "mte2_bytes": 69632.0,
+            "mte3_bytes": 32.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 4.999999999999893,
+            "program": "SteadyMatmul",
+            "serviced": {
+              "memory@r0:s0": 69664.0,
+              "mte1@r0:s0": 69632.0,
+              "mte2_aic@r0:s0": 69632.0,
+              "mte3@r0:s0": 32.0,
+              "matrix@r0:s0": 2.4242424242424244e-07
+            }
+          },
+          {
+            "op_id": "s0.l0.shared_gate_apply",
+            "recipe": "shared_gate_apply",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 65536.0
+            }
+          },
+          {
+            "op_id": "s0.l0.join",
+            "recipe": "expert_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 131072.0,
+            "mte2_bytes": 65536.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 131072.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          },
+          {
+            "op_id": "s0.l0.moe_output_reduce",
+            "recipe": "moe_output_reduce",
+            "family": "allreduce",
+            "dtype": "",
+            "local_shape": [
+              16,
+              2048
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 0.0,
+            "mte2_bytes": 0.0,
+            "mte3_bytes": 0.0,
+            "link_bytes": 98304.0,
+            "elapsed_us": 15.501551020407511,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "link:d2d_intra_package:0:tx:port0": 98304.0,
+              "link:d2d_intra_package:0:rx:port1": 98304.0,
+              "link:d2d_intra_package:2:tx:port2": 98304.0,
+              "link:d2d_intra_package:2:rx:port3": 98304.0,
+              "link:d2d_intra_node:0:rx:port0": 98304.0,
+              "link:d2d_intra_node:0:tx:port1": 98304.0,
+              "link:d2d_intra_node:0:rx:port2": 98304.0,
+              "link:d2d_intra_node:0:tx:port3": 98304.0
+            }
+          },
+          {
+            "op_id": "s0.l0.ffn.residual",
+            "recipe": "residual_add",
+            "family": "elementwise",
+            "dtype": "bf16",
+            "local_shape": [
+              32768
+            ],
+            "flops": 0.0,
+            "hbm_bytes": 196608.0,
+            "mte2_bytes": 131072.0,
+            "mte3_bytes": 65536.0,
+            "link_bytes": 0.0,
+            "elapsed_us": 2.500000000000391,
+            "program": "ResourceEnvelope",
+            "serviced": {
+              "memory@r0:s0": 196608.0,
+              "mte3@r0:s0": 65536.0,
+              "vector@r0:s0": 32768.0
+            }
+          }
+        ],
+        "body_declaration": {
+          "profile": "decode_resource_pipelines",
+          "selections": [
+            {
+              "family": "gqa_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry"
+            },
+            {
+              "family": "gdn_decode",
+              "selection": "default_installed",
+              "reason": "supported_tensor_and_resource_geometry",
+              "caller": "non_interleaved_qkvz_ba",
+              "recurrence": "analytical; no reviewed source recurrence for this hardware/domain",
+              "gating_store": "DMA resource estimate; no compatible physical store queue declared"
+            },
+            {
+              "family": "grouped_gemm",
+              "selection": "default_installed",
+              "reason": "preserve_existing_grouped_mapping_domain",
+              "program": {
+                "kind": "steady_matmul"
+              },
+              "priority": "family_default; named_and_source_recipes_override"
+            },
+            {
+              "family": "matmul",
+              "selection": "default_installed",
+              "reason": "compact_finite_k_pipeline_preserving_128_output_grid",
+              "program": {
+                "kind": "steady_matmul",
+                "candidates": [
+                  [
+                    128,
+                    128,
+                    128
+                  ],
+                  [
+                    128,
+                    128,
+                    64
+                  ]
+                ]
+              },
+              "priority": "program_default; named_source_and_family_recipes_override",
+              "contention": "coupled_fluid_approximation_with_finite_owner_buffers"
+            }
+          ],
+          "basis": "analytic resource programs; no measured dispatch or latency fit",
+          "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+          "gqa_tiles": {
+            "kind": "staged_gqa_decode",
+            "query_tile": 64,
+            "key_tile": 64,
+            "slots": 2
+          },
+          "selection_boundary": "family default; per-operator recipes retain priority",
+          "indexed_scratch": "offchip; no inferred cache hit rate",
+          "indexed_operand_service": "directional_mte1",
+          "sharedkv": "SCFA source currently requires explicit prefill declarations"
+        },
+        "physical_work": {
+          "flops": 512819200.0,
+          "vector_ops": 19207424.0,
+          "hbm_bytes": 138820128.0,
+          "link_bytes": 196608.0
+        },
+        "runtime_seconds": 0.11476362496614456
+      },
+      "accuracy": "not scored; this probe does not bind whole-layer measured boundaries"
+    }
+  ],
+  "qwen36_q4_b1_control": {
+    "full_model_layers": 64,
+    "selected_layer": 0,
+    "query_tokens": 4,
+    "sequence_slots": 1,
+    "layer_graph_duration_ms": 0.22146633392702553,
+    "isolated_operator_sum_ms": 0.2214663339270313,
+    "shared_resident_weight_bytes": 0,
+    "operators": [
+      {
+        "op_id": "s0.l0.norm1",
+        "recipe": "rmsnorm",
+        "family": "rmsnorm",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          5120
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 92160.0,
+        "mte2_bytes": 51200.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 92160.0,
+          "mte3@r0:s0": 40960.0,
+          "vector@r0:s0": 102400.0
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_qkvz.quantize",
+        "recipe": "dynamic_quantize",
+        "family": "quantize",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          5120
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 61456.0,
+        "mte2_bytes": 40960.0,
+        "mte3_bytes": 20496.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 61456.0,
+          "mte3@r0:s0": 20496.0,
+          "vector@r0:s0": 81928.0
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_qkvz",
+        "recipe": "linear_qkvz",
+        "family": "gemm",
+        "dtype": "int8",
+        "local_shape": [
+          4,
+          4096,
+          5120
+        ],
+        "flops": 167772160.0,
+        "hbm_bytes": 21057552.0,
+        "mte2_bytes": 21024784.0,
+        "mte3_bytes": 32768.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 25.84327030302891,
+        "program": "SteadyMatmul",
+        "serviced": {
+          "memory@r0:s0": 21057551.999999978,
+          "mte1@r0:s0": 21626879.999999996,
+          "mte2_aic@r0:s0": 21626880.000000026,
+          "mte2_aiv@r0:s0": 33279.999999999985,
+          "mte3@r0:s0": 32767.99999999998,
+          "vector@r0:s0": 65535.9999999999,
+          "matrix@r0:s0": 0.00031030303030303054
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_beta_alpha",
+        "recipe": "linear_beta_alpha",
+        "family": "gemm",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          24,
+          5120
+        ],
+        "flops": 983040.0,
+        "hbm_bytes": 286912.0,
+        "mte2_bytes": 286720.0,
+        "mte3_bytes": 192.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 5.466969696970025,
+        "program": "SteadyMatmul",
+        "serviced": {
+          "memory@r0:s0": 286912.0,
+          "mte1@r0:s0": 286720.0,
+          "mte2_aic@r0:s0": 286720.0,
+          "mte3@r0:s0": 192.0,
+          "matrix@r0:s0": 3.6363636363636366e-06
+        }
+      },
+      {
+        "op_id": "s0.l0.beta_contiguous",
+        "recipe": "beta_contiguous",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12
+        ],
+        "flops": 0,
+        "hbm_bytes": 192.0,
+        "mte2_bytes": 96.0,
+        "mte3_bytes": 96.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 192.0,
+          "mte3@r0:s0": 96.0
+        }
+      },
+      {
+        "op_id": "s0.l0.alpha_contiguous",
+        "recipe": "alpha_contiguous",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12
+        ],
+        "flops": 0,
+        "hbm_bytes": 192.0,
+        "mte2_bytes": 96.0,
+        "mte3_bytes": 96.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 192.0,
+          "mte3@r0:s0": 96.0
+        }
+      },
+      {
+        "op_id": "s0.l0.core_output_zero",
+        "recipe": "core_output_zero",
+        "family": "tensor_fill",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12,
+          128
+        ],
+        "flops": 0,
+        "hbm_bytes": 12288,
+        "mte2_bytes": 0,
+        "mte3_bytes": 12288,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 12288.0,
+          "mte3@r0:s0": 12288.0,
+          "vector@r0:s0": 6144.0
+        }
+      },
+      {
+        "op_id": "s0.l0.convolution_input_contiguous",
+        "recipe": "convolution_input_contiguous",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          2560
+        ],
+        "flops": 0,
+        "hbm_bytes": 40960.0,
+        "mte2_bytes": 20480.0,
+        "mte3_bytes": 20480.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 40960.0,
+          "mte3@r0:s0": 20480.0
+        }
+      },
+      {
+        "op_id": "s0.l0.short_convolution",
+        "recipe": "ascend_causal_conv1d_update",
+        "family": "short_convolution",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          2560
+        ],
+        "flops": 0,
+        "hbm_bytes": 138240,
+        "mte2_bytes": 0,
+        "mte3_bytes": 51200,
+        "link_bytes": 0,
+        "elapsed_us": 2.500000000000391,
+        "program": "OperatorPlan",
+        "serviced": {
+          "memory@r0:s0": 138240.0,
+          "mte2_aiv@r0:s0": 87040.00000000003,
+          "mte3@r0:s0": 51200.0,
+          "vector@r0:s0": 186880.0
+        }
+      },
+      {
+        "op_id": "s0.l0.q_flat",
+        "recipe": "q_flat",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          512
+        ],
+        "flops": 0,
+        "hbm_bytes": 8192.0,
+        "mte2_bytes": 4096.0,
+        "mte3_bytes": 4096.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 8192.0,
+          "mte3@r0:s0": 4096.0
+        }
+      },
+      {
+        "op_id": "s0.l0.k_flat",
+        "recipe": "k_flat",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          512
+        ],
+        "flops": 0,
+        "hbm_bytes": 8192.0,
+        "mte2_bytes": 4096.0,
+        "mte3_bytes": 4096.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 8192.0,
+          "mte3@r0:s0": 4096.0
+        }
+      },
+      {
+        "op_id": "s0.l0.v_flat",
+        "recipe": "v_flat",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          1536
+        ],
+        "flops": 0,
+        "hbm_bytes": 24576.0,
+        "mte2_bytes": 12288.0,
+        "mte3_bytes": 12288.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 24576.0,
+          "mte3@r0:s0": 12288.0
+        }
+      },
+      {
+        "op_id": "s0.l0.qkv_concatenate",
+        "recipe": "qkv_concatenate",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          10240
+        ],
+        "flops": 0,
+        "hbm_bytes": 40960.0,
+        "mte2_bytes": 20480.0,
+        "mte3_bytes": 20480.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 40960.0,
+          "mte3@r0:s0": 20480.0
+        }
+      },
+      {
+        "op_id": "s0.l0.delta_gates",
+        "recipe": "ascend_gdn_decode_gating",
+        "family": "gdn_gating",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12
+        ],
+        "flops": 0,
+        "hbm_bytes": 4320,
+        "mte2_bytes": 0,
+        "mte3_bytes": 288,
+        "link_bytes": 0,
+        "elapsed_us": 2.500000000000391,
+        "program": "OperatorPlan",
+        "serviced": {
+          "memory@r0:s0": 4319.999999999999,
+          "mte2_aiv@r0:s0": 4032.0,
+          "mte3@r0:s0": 288.0,
+          "vector@r0:s0": 533760.0000000002
+        }
+      },
+      {
+        "op_id": "s0.l0.decode_q_l2norm",
+        "recipe": "decode_q_l2norm",
+        "family": "elementwise",
+        "dtype": "bf16",
+        "local_shape": [
+          1,
+          4,
+          4,
+          128
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 8192.0,
+        "mte2_bytes": 4096.0,
+        "mte3_bytes": 4096.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 8192.0,
+          "mte3@r0:s0": 4096.0,
+          "vector@r0:s0": 10240.0
+        }
+      },
+      {
+        "op_id": "s0.l0.decode_k_l2norm",
+        "recipe": "decode_k_l2norm",
+        "family": "elementwise",
+        "dtype": "bf16",
+        "local_shape": [
+          1,
+          4,
+          4,
+          128
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 8192.0,
+        "mte2_bytes": 4096.0,
+        "mte3_bytes": 4096.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 8192.0,
+          "mte3@r0:s0": 4096.0,
+          "vector@r0:s0": 10240.0
+        }
+      },
+      {
+        "op_id": "s0.l0.decode_recurrent_scan",
+        "recipe": "decode_recurrent_scan",
+        "family": "recurrent_vector",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12,
+          128,
+          128
+        ],
+        "flops": 0,
+        "hbm_bytes": 3981600.0,
+        "mte2_bytes": 823584.0,
+        "mte3_bytes": 3158016.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 12.620013333332736,
+        "program": "RecurrentVector",
+        "serviced": {
+          "memory@r0:s0": 3981600.0,
+          "mte2_aiv@r0:s0": 823584.0,
+          "mte3@r0:s0": 3158016.0,
+          "vector@r0:s0": 5505024.0
+        }
+      },
+      {
+        "op_id": "s0.l0.core_output_copy",
+        "recipe": "core_output_copy",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          12,
+          128
+        ],
+        "flops": 0,
+        "hbm_bytes": 24576.0,
+        "mte2_bytes": 12288.0,
+        "mte3_bytes": 12288.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 24576.0,
+          "mte3@r0:s0": 12288.0
+        }
+      },
+      {
+        "op_id": "s0.l0.z_norm_materialize",
+        "recipe": "z_norm_materialize",
+        "family": "tensor_copy",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          1536
+        ],
+        "flops": 0,
+        "hbm_bytes": 24576.0,
+        "mte2_bytes": 12288.0,
+        "mte3_bytes": 12288.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 24576.0,
+          "mte3@r0:s0": 12288.0
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_output_norm_gate",
+        "recipe": "linear_output_norm_gate",
+        "family": "elementwise",
+        "dtype": "bf16",
+        "local_shape": [
+          48,
+          128
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 37120.0,
+        "mte2_bytes": 24832.0,
+        "mte3_bytes": 12288.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 37120.0,
+          "mte3@r0:s0": 12288.0,
+          "vector@r0:s0": 55296.0
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_output",
+        "recipe": "linear_output",
+        "family": "gemm",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          5120,
+          1536
+        ],
+        "flops": 62914560.0,
+        "hbm_bytes": 15781888.0,
+        "mte2_bytes": 15740928.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 15.72130909090852,
+        "program": "SteadyMatmul",
+        "serviced": {
+          "memory@r0:s0": 15781888.000000007,
+          "mte1@r0:s0": 16220160.000000006,
+          "mte2_aic@r0:s0": 16220159.999999989,
+          "mte3@r0:s0": 40960.000000000015,
+          "matrix@r0:s0": 0.0002327272727272725
+        }
+      },
+      {
+        "op_id": "s0.l0.linear_reduce",
+        "recipe": "linear_reduce",
+        "family": "allreduce",
+        "dtype": "",
+        "local_shape": [
+          61440.0
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 0.0,
+        "mte2_bytes": 0.0,
+        "mte3_bytes": 0.0,
+        "link_bytes": 61440.0,
+        "elapsed_us": 15.313469387754353,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "link:d2d_intra_package:0:tx:port0": 61440.0,
+          "link:d2d_intra_package:0:rx:port1": 61440.0,
+          "link:d2d_intra_package:2:tx:port2": 61440.0,
+          "link:d2d_intra_package:2:rx:port3": 61440.0,
+          "link:d2d_intra_node:0:rx:port0": 61440.0,
+          "link:d2d_intra_node:0:tx:port1": 61440.0,
+          "link:d2d_intra_node:0:rx:port2": 61440.0,
+          "link:d2d_intra_node:0:tx:port3": 61440.0
+        }
+      },
+      {
+        "op_id": "s0.l0.attention.residual",
+        "recipe": "residual_add",
+        "family": "elementwise",
+        "dtype": "bf16",
+        "local_shape": [
+          20480
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 122880.0,
+        "mte2_bytes": 81920.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 122880.0,
+          "mte3@r0:s0": 40960.0,
+          "vector@r0:s0": 20480.0
+        }
+      },
+      {
+        "op_id": "s0.l0.norm2",
+        "recipe": "rmsnorm",
+        "family": "rmsnorm",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          5120
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 92160.0,
+        "mte2_bytes": 51200.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 92160.0,
+          "mte3@r0:s0": 40960.0,
+          "vector@r0:s0": 102400.0
+        }
+      },
+      {
+        "op_id": "s0.l0.gate_up.quantize",
+        "recipe": "dynamic_quantize",
+        "family": "quantize",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          5120
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 61456.0,
+        "mte2_bytes": 40960.0,
+        "mte3_bytes": 20496.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 61456.0,
+          "mte3@r0:s0": 20496.0,
+          "vector@r0:s0": 81928.0
+        }
+      },
+      {
+        "op_id": "s0.l0.gate_up",
+        "recipe": "dense_gate_up",
+        "family": "gate_up_projection",
+        "dtype": "int8",
+        "local_shape": [
+          4,
+          8704,
+          5120
+        ],
+        "flops": 356515840.0,
+        "hbm_bytes": 44724240.0,
+        "mte2_bytes": 44654608.0,
+        "mte3_bytes": 69632.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 51.67773575757639,
+        "program": "SteadyMatmul",
+        "serviced": {
+          "memory@r0:s0": 44724240.000000045,
+          "mte1@r0:s0": 45957120.0,
+          "mte2_aic@r0:s0": 45957119.99999998,
+          "mte2_aiv@r0:s0": 70720.00000000003,
+          "mte3@r0:s0": 69631.99999999999,
+          "vector@r0:s0": 139264.0,
+          "matrix@r0:s0": 0.0006593939393939386
+        }
+      },
+      {
+        "op_id": "s0.l0.swiglu",
+        "recipe": "swiglu",
+        "family": "swiglu",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          4352
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 104448.0,
+        "mte2_bytes": 69632.0,
+        "mte3_bytes": 34816.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 104448.0,
+          "mte3@r0:s0": 34816.0,
+          "vector@r0:s0": 69632.0
+        }
+      },
+      {
+        "op_id": "s0.l0.down.quantize",
+        "recipe": "dynamic_quantize",
+        "family": "quantize",
+        "dtype": "bf16",
+        "local_shape": [
+          4,
+          4352
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 52240.0,
+        "mte2_bytes": 34816.0,
+        "mte3_bytes": 17424.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 52240.0,
+          "mte3@r0:s0": 17424.0,
+          "vector@r0:s0": 69640.0
+        }
+      },
+      {
+        "op_id": "s0.l0.down",
+        "recipe": "dense_down",
+        "family": "down_projection",
+        "dtype": "int8",
+        "local_shape": [
+          4,
+          5120,
+          4352
+        ],
+        "flops": 178257920.0,
+        "hbm_bytes": 22381584.0,
+        "mte2_bytes": 22340624.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 22.010096969697024,
+        "program": "SteadyMatmul",
+        "serviced": {
+          "memory@r0:s0": 22381583.999999993,
+          "mte1@r0:s0": 22978560.0,
+          "mte2_aic@r0:s0": 22978559.999999993,
+          "mte2_aiv@r0:s0": 41600.00000000001,
+          "mte3@r0:s0": 40959.99999999999,
+          "vector@r0:s0": 81919.99999999997,
+          "matrix@r0:s0": 0.00032969696969696957
+        }
+      },
+      {
+        "op_id": "s0.l0.tp",
+        "recipe": "ring_allreduce",
+        "family": "allreduce",
+        "dtype": "",
+        "local_shape": [
+          4,
+          5120
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 0.0,
+        "mte2_bytes": 0.0,
+        "mte3_bytes": 0.0,
+        "link_bytes": 61440.0,
+        "elapsed_us": 15.313469387754353,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "link:d2d_intra_package:0:tx:port0": 61440.0,
+          "link:d2d_intra_package:0:rx:port1": 61440.0,
+          "link:d2d_intra_package:2:tx:port2": 61440.0,
+          "link:d2d_intra_package:2:rx:port3": 61440.0,
+          "link:d2d_intra_node:0:rx:port0": 61440.0,
+          "link:d2d_intra_node:0:tx:port1": 61440.0,
+          "link:d2d_intra_node:0:rx:port2": 61440.0,
+          "link:d2d_intra_node:0:tx:port3": 61440.0
+        }
+      },
+      {
+        "op_id": "s0.l0.ffn.residual",
+        "recipe": "residual_add",
+        "family": "elementwise",
+        "dtype": "bf16",
+        "local_shape": [
+          20480
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 122880.0,
+        "mte2_bytes": 81920.0,
+        "mte3_bytes": 40960.0,
+        "link_bytes": 0.0,
+        "elapsed_us": 2.500000000000391,
+        "program": "ResourceEnvelope",
+        "serviced": {
+          "memory@r0:s0": 122880.0,
+          "mte3@r0:s0": 40960.0,
+          "vector@r0:s0": 20480.0
+        }
+      }
+    ],
+    "body_declaration": {
+      "profile": "decode_resource_pipelines",
+      "selections": [
+        {
+          "family": "gqa_decode",
+          "selection": "default_installed",
+          "reason": "supported_tensor_and_resource_geometry"
+        },
+        {
+          "family": "gdn_decode",
+          "selection": "default_installed",
+          "reason": "supported_tensor_and_resource_geometry",
+          "caller": "non_interleaved_qkvz_ba",
+          "recurrence": "analytical; no reviewed source recurrence for this hardware/domain",
+          "gating_store": "DMA resource estimate; no compatible physical store queue declared"
+        },
+        {
+          "family": "grouped_gemm",
+          "selection": "default_installed",
+          "reason": "preserve_existing_grouped_mapping_domain",
+          "program": {
+            "kind": "steady_matmul"
+          },
+          "priority": "family_default; named_and_source_recipes_override"
+        },
+        {
+          "family": "matmul",
+          "selection": "default_installed",
+          "reason": "compact_finite_k_pipeline_preserving_128_output_grid",
+          "program": {
+            "kind": "steady_matmul",
+            "candidates": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                128,
+                128,
+                64
+              ]
+            ]
+          },
+          "priority": "program_default; named_source_and_family_recipes_override",
+          "contention": "coupled_fluid_approximation_with_finite_owner_buffers"
+        }
+      ],
+      "basis": "analytic resource programs; no measured dispatch or latency fit",
+      "gqa_kv_splits": "default 1; explicit flash_attention_decode recipe may override",
+      "gqa_tiles": {
+        "kind": "staged_gqa_decode",
+        "query_tile": 64,
+        "key_tile": 64,
+        "slots": 2
+      },
+      "selection_boundary": "family default; per-operator recipes retain priority",
+      "indexed_scratch": "offchip; no inferred cache hit rate",
+      "indexed_operand_service": "directional_mte1",
+      "sharedkv": "SCFA source currently requires explicit prefill declarations"
+    },
+    "physical_work": {
+      "flops": 766443520.0,
+      "vector_ops": 7143192.0,
+      "hbm_bytes": 109304224.0,
+      "link_bytes": 122880.0
+    },
+    "runtime_seconds": 0.11077387491241097
+  },
+  "retained_comparisons": {
+    "qwen35": {
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_126976_c1/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023194711307_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "sha256": "c27f9a5425221c103ba212d68bb18c50302626f6e41dc021241fba5127b0831b",
+        "size_bytes": 49138968
+      },
+      "components": [
+        {
+          "component": "qkvz",
+          "csv_lines": [
+            33904
+          ],
+          "operator_ids": [
+            "linear_qkvz"
+          ],
+          "native_duration_sum_us": 16.96,
+          "isolated_sim_duration_sum_us": 20.49939393939404,
+          "relative_error_percent": 20.869068038879934,
+          "native_types": [
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "beta_alpha",
+          "csv_lines": [
+            33906
+          ],
+          "operator_ids": [
+            "linear_beta_alpha"
+          ],
+          "native_duration_sum_us": 7.08,
+          "isolated_sim_duration_sum_us": 4.999999999999893,
+          "relative_error_percent": -29.37853107344783,
+          "native_types": [
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "convolution",
+          "csv_lines": [
+            33911
+          ],
+          "operator_ids": [
+            "short_convolution"
+          ],
+          "native_duration_sum_us": 9.64,
+          "isolated_sim_duration_sum_us": 2.500000000000391,
+          "relative_error_percent": -74.06639004148971,
+          "native_types": [
+            "CausalConv1d"
+          ]
+        },
+        {
+          "component": "gating",
+          "csv_lines": [
+            33915
+          ],
+          "operator_ids": [
+            "delta_gates"
+          ],
+          "native_duration_sum_us": 9.78,
+          "isolated_sim_duration_sum_us": 2.500000000000391,
+          "relative_error_percent": -74.43762781185694,
+          "native_types": [
+            "fused_gdn_gating_kernel"
+          ]
+        },
+        {
+          "component": "recurrence",
+          "csv_lines": [
+            33918
+          ],
+          "operator_ids": [
+            "decode_recurrent_scan"
+          ],
+          "native_duration_sum_us": 17.32,
+          "isolated_sim_duration_sum_us": 6.86083333333265,
+          "relative_error_percent": -60.38779830639347,
+          "native_types": [
+            "RecurrentGatedDeltaRule"
+          ]
+        },
+        {
+          "component": "output_projection",
+          "csv_lines": [
+            33921
+          ],
+          "operator_ids": [
+            "linear_output"
+          ],
+          "native_duration_sum_us": 11.021,
+          "isolated_sim_duration_sum_us": 5.211675151515216,
+          "relative_error_percent": -52.71141319739392,
+          "native_types": [
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "shared_ffn",
+          "csv_lines": [
+            33934,
+            33935,
+            33936
+          ],
+          "operator_ids": [
+            "shared.gate_up",
+            "shared.swiglu",
+            "shared.down"
+          ],
+          "native_duration_sum_us": 19.34,
+          "isolated_sim_duration_sum_us": 17.749696969697304,
+          "relative_error_percent": -8.222869856787462,
+          "native_types": [
+            "MatMulV2",
+            "SwiGlu",
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "routed_up_act_down",
+          "csv_lines": [
+            33930,
+            33931
+          ],
+          "operator_ids": [
+            "expert_up.quantize",
+            "expert_up",
+            "expert_act",
+            "expert_down.quantize",
+            "expert_down"
+          ],
+          "native_duration_sum_us": 96.542,
+          "isolated_sim_duration_sum_us": 22.975062121213696,
+          "relative_error_percent": -76.20200314763139,
+          "native_types": [
+            "GroupedMatmulSwigluQuant",
+            "GroupedMatmul"
+          ]
+        }
+      ],
+      "boundary": "component elapsed sums, not an additive layer critical path or score",
+      "interpretation": "tensor geometry is retained; compiled dispatch and scalar arguments remain conditional"
+    },
+    "qwen36": {
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen36-rows/prof/p_126976_c1/rank0_430_20261023224849770_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "sha256": "1e5144631139710a62211a286d2068adffdfbe345ba51fa328e2aa86b8583e6a",
+        "size_bytes": 23388404
+      },
+      "components": [
+        {
+          "component": "qkvz",
+          "csv_lines": [
+            45705
+          ],
+          "operator_ids": [
+            "linear_qkvz"
+          ],
+          "native_duration_sum_us": 26.26,
+          "isolated_sim_duration_sum_us": 25.84327030302891,
+          "relative_error_percent": -1.5869371552593048,
+          "native_types": [
+            "QuantBatchMatmulV3"
+          ]
+        },
+        {
+          "component": "beta_alpha",
+          "csv_lines": [
+            45706
+          ],
+          "operator_ids": [
+            "linear_beta_alpha"
+          ],
+          "native_duration_sum_us": 12.359,
+          "isolated_sim_duration_sum_us": 5.466969696970025,
+          "relative_error_percent": -55.765274723116555,
+          "native_types": [
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "convolution",
+          "csv_lines": [
+            45711
+          ],
+          "operator_ids": [
+            "short_convolution"
+          ],
+          "native_duration_sum_us": 10.1,
+          "isolated_sim_duration_sum_us": 2.500000000000391,
+          "relative_error_percent": -75.24752475247138,
+          "native_types": [
+            "CausalConv1d"
+          ]
+        },
+        {
+          "component": "gating",
+          "csv_lines": [
+            45715
+          ],
+          "operator_ids": [
+            "delta_gates"
+          ],
+          "native_duration_sum_us": 11.64,
+          "isolated_sim_duration_sum_us": 2.500000000000391,
+          "relative_error_percent": -78.5223367697561,
+          "native_types": [
+            "fused_gdn_gating_kernel"
+          ]
+        },
+        {
+          "component": "recurrence",
+          "csv_lines": [
+            45718
+          ],
+          "operator_ids": [
+            "decode_recurrent_scan"
+          ],
+          "native_duration_sum_us": 27.339,
+          "isolated_sim_duration_sum_us": 12.620013333332736,
+          "relative_error_percent": -53.83878951924819,
+          "native_types": [
+            "RecurrentGatedDeltaRule"
+          ]
+        },
+        {
+          "component": "output_projection",
+          "csv_lines": [
+            45721
+          ],
+          "operator_ids": [
+            "linear_output"
+          ],
+          "native_duration_sum_us": 19.6,
+          "isolated_sim_duration_sum_us": 15.72130909090852,
+          "relative_error_percent": -19.789239332099395,
+          "native_types": [
+            "MatMulV2"
+          ]
+        },
+        {
+          "component": "dense_ffn",
+          "csv_lines": [
+            45725,
+            45726,
+            45728,
+            45729,
+            45730
+          ],
+          "operator_ids": [
+            "gate_up.quantize",
+            "gate_up",
+            "swiglu",
+            "down.quantize",
+            "down"
+          ],
+          "native_duration_sum_us": 86.858,
+          "isolated_sim_duration_sum_us": 81.18783272727458,
+          "relative_error_percent": -6.528088688117872,
+          "native_types": [
+            "DynamicQuant",
+            "QuantBatchMatmulV3",
+            "SwiGlu",
+            "DynamicQuant",
+            "QuantBatchMatmulV3"
+          ]
+        }
+      ],
+      "boundary": "component elapsed sums, not an additive layer critical path or score",
+      "interpretation": "tensor geometry is retained; compiled dispatch and scalar arguments remain conditional"
+    }
+  },
+  "corrections": [
+    "shared expert gate/up/down operands and resident weights use retained BF16",
+    "one token-row TP sum follows routed/shared join"
+  ],
+  "no_new_parameters": true,
+  "unresolved": [
+    "A3 GDN recurrence remains an analytical vector mechanism, without an arch22 source recurrence binding.",
+    "GroupedMatmulSwigluQuant and GroupedMatmul remain an analytical decomposition; no arch35 substitution.",
+    "Native scalar group_list, dispatch and per-call compiled identities are unobserved.",
+    "Finite launch, vector/copy service and routing Cumsum residuals are not fitted from body differences."
+  ]
+}

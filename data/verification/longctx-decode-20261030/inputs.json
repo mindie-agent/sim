@@ -214,8 +214,8 @@
       "id": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "source": {
         "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-35b-a3-tp4-c144.json",
@@ -235,7 +235,22 @@
         "pp": 1,
         "pcp": 1
       },
-      "source_domain_changes": [],
+      "source_domain_changes": [
+        {
+          "selector": "model.quant.category_overrides.shared_expert",
+          "previous": "int8 preset inheritance",
+          "selected": "bf16 activation and weight",
+          "reason": "retained MatMulV2 operands at low rows33934/33936 and high rows182/184",
+          "parameter_changes": "representation correction; no service/rate change"
+        },
+        {
+          "selector": "runtime.moe_recipe",
+          "previous": "alltoall",
+          "selected": "tp_join_reduce",
+          "reason": "retained FFN sum follows routed unpermute and shared join at low row33942 and high row189",
+          "parameter_changes": "reduction boundary and payload correction; no service/rate change"
+        }
+      ],
       "runtime_changes": {
         "max_model_len": 129000,
         "max_num_seqs": 64
@@ -4827,8 +4842,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -4860,8 +4875,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -4893,8 +4908,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -4926,8 +4941,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -4959,8 +4974,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -4992,8 +5007,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -5025,8 +5040,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -5058,8 +5073,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -5091,8 +5106,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -5124,8 +5139,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -5157,8 +5172,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -5190,8 +5205,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -5223,8 +5238,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -5256,8 +5271,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -5289,8 +5304,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -5322,8 +5337,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -5355,8 +5370,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -5388,8 +5403,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,
@@ -5421,8 +5436,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 126000,
       "query_tokens_per_sequence": 1,
@@ -5454,8 +5469,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 127500,
       "query_tokens_per_sequence": 1,
@@ -5487,8 +5502,8 @@
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
         "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
-        "sha256": "11a17b4aeaa5bdae7fd51efeea9a362c37e7c8290fbe210c30ec19d0b49bc9cf",
-        "size_bytes": 4414
+        "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
+        "size_bytes": 5852
       },
       "context_tokens": 128999,
       "query_tokens_per_sequence": 1,

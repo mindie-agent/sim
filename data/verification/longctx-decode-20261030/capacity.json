@@ -8200,10 +8200,10 @@
             "stage": 0,
             "sequences": 1,
             "cache_bytes": 1307156480.0,
-            "cache_capacity_bytes": 51550248102.4,
-            "headroom_bytes": 50243091622.4,
-            "resident_bytes": 11604437440.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519528102.4,
+            "headroom_bytes": 50212371622.4,
+            "resident_bytes": 11635157440.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 83968.0,
             "reserved_bytes": 0
           }
@@ -8246,10 +8246,10 @@
             "stage": 0,
             "sequences": 1,
             "cache_bytes": 1322885120.0,
-            "cache_capacity_bytes": 51550248102.4,
-            "headroom_bytes": 50227362982.4,
-            "resident_bytes": 11620166080.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519528102.4,
+            "headroom_bytes": 50196642982.4,
+            "resident_bytes": 11650886080.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 83968.0,
             "reserved_bytes": 0
           }
@@ -8292,10 +8292,10 @@
             "stage": 0,
             "sequences": 1,
             "cache_bytes": 1337303040.0,
-            "cache_capacity_bytes": 51550248102.4,
-            "headroom_bytes": 50212945062.4,
-            "resident_bytes": 11634584000.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519528102.4,
+            "headroom_bytes": 50182225062.4,
+            "resident_bytes": 11665304000.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 83968.0,
             "reserved_bytes": 0
           }
@@ -8338,10 +8338,10 @@
             "stage": 0,
             "sequences": 2,
             "cache_bytes": 2614312960.0,
-            "cache_capacity_bytes": 51550164134.4,
-            "headroom_bytes": 48935851174.4,
-            "resident_bytes": 12911677888.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519444134.4,
+            "headroom_bytes": 48905131174.4,
+            "resident_bytes": 12942397888.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 167936.0,
             "reserved_bytes": 0
           }
@@ -8384,10 +8384,10 @@
             "stage": 0,
             "sequences": 2,
             "cache_bytes": 2645770240.0,
-            "cache_capacity_bytes": 51550164134.4,
-            "headroom_bytes": 48904393894.4,
-            "resident_bytes": 12943135168.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519444134.4,
+            "headroom_bytes": 48873673894.4,
+            "resident_bytes": 12973855168.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 167936.0,
             "reserved_bytes": 0
           }
@@ -8430,10 +8430,10 @@
             "stage": 0,
             "sequences": 2,
             "cache_bytes": 2674606080.0,
-            "cache_capacity_bytes": 51550164134.4,
-            "headroom_bytes": 48875558054.4,
-            "resident_bytes": 12971971008.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519444134.4,
+            "headroom_bytes": 48844838054.4,
+            "resident_bytes": 13002691008.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 167936.0,
             "reserved_bytes": 0
           }
@@ -8476,10 +8476,10 @@
             "stage": 0,
             "sequences": 4,
             "cache_bytes": 5228625920.0,
-            "cache_capacity_bytes": 51549996198.4,
-            "headroom_bytes": 46321370278.4,
-            "resident_bytes": 15526158784.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519276198.4,
+            "headroom_bytes": 46290650278.4,
+            "resident_bytes": 15556878784.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 335872.0,
             "reserved_bytes": 0
           }
@@ -8522,10 +8522,10 @@
             "stage": 0,
             "sequences": 4,
             "cache_bytes": 5291540480.0,
-            "cache_capacity_bytes": 51549996198.4,
-            "headroom_bytes": 46258455718.4,
-            "resident_bytes": 15589073344.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519276198.4,
+            "headroom_bytes": 46227735718.4,
+            "resident_bytes": 15619793344.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 335872.0,
             "reserved_bytes": 0
           }
@@ -8568,10 +8568,10 @@
             "stage": 0,
             "sequences": 4,
             "cache_bytes": 5349212160.0,
-            "cache_capacity_bytes": 51549996198.4,
-            "headroom_bytes": 46200784038.4,
-            "resident_bytes": 15646745024.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51519276198.4,
+            "headroom_bytes": 46170064038.4,
+            "resident_bytes": 15677465024.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 335872.0,
             "reserved_bytes": 0
           }
@@ -8614,10 +8614,10 @@
             "stage": 0,
             "sequences": 8,
             "cache_bytes": 10457251840.0,
-            "cache_capacity_bytes": 51549660326.4,
-            "headroom_bytes": 41092408486.4,
-            "resident_bytes": 20755120576.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518940326.4,
+            "headroom_bytes": 41061688486.4,
+            "resident_bytes": 20785840576.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 671744.0,
             "reserved_bytes": 0
           }
@@ -8660,10 +8660,10 @@
             "stage": 0,
             "sequences": 8,
             "cache_bytes": 10583080960.0,
-            "cache_capacity_bytes": 51549660326.4,
-            "headroom_bytes": 40966579366.4,
-            "resident_bytes": 20880949696.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518940326.4,
+            "headroom_bytes": 40935859366.4,
+            "resident_bytes": 20911669696.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 671744.0,
             "reserved_bytes": 0
           }
@@ -8706,10 +8706,10 @@
             "stage": 0,
             "sequences": 8,
             "cache_bytes": 10698424320.0,
-            "cache_capacity_bytes": 51549660326.4,
-            "headroom_bytes": 40851236006.4,
-            "resident_bytes": 20996293056.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518940326.4,
+            "headroom_bytes": 40820516006.4,
+            "resident_bytes": 21027013056.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 671744.0,
             "reserved_bytes": 0
           }
@@ -8752,10 +8752,10 @@
             "stage": 0,
             "sequences": 16,
             "cache_bytes": 20914503680.0,
-            "cache_capacity_bytes": 51548988582.4,
-            "headroom_bytes": 30634484902.4,
-            "resident_bytes": 31213044160.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518268582.4,
+            "headroom_bytes": 30603764902.4,
+            "resident_bytes": 31243764160.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 1343488.0,
             "reserved_bytes": 0
           }
@@ -8798,10 +8798,10 @@
             "stage": 0,
             "sequences": 16,
             "cache_bytes": 21166161920.0,
-            "cache_capacity_bytes": 51548988582.4,
-            "headroom_bytes": 30382826662.4,
-            "resident_bytes": 31464702400.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518268582.4,
+            "headroom_bytes": 30352106662.4,
+            "resident_bytes": 31495422400.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 1343488.0,
             "reserved_bytes": 0
           }
@@ -8844,10 +8844,10 @@
             "stage": 0,
             "sequences": 16,
             "cache_bytes": 21396848640.0,
-            "cache_capacity_bytes": 51548988582.4,
-            "headroom_bytes": 30152139942.4,
-            "resident_bytes": 31695389120.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51518268582.4,
+            "headroom_bytes": 30121419942.4,
+            "resident_bytes": 31726109120.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 1343488.0,
             "reserved_bytes": 0
           }
@@ -8890,10 +8890,10 @@
             "stage": 0,
             "sequences": 32,
             "cache_bytes": 41829007360.0,
-            "cache_capacity_bytes": 51547645094.4,
-            "headroom_bytes": 9718637734.400002,
-            "resident_bytes": 52128891328.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51516925094.4,
+            "headroom_bytes": 9687917734.400002,
+            "resident_bytes": 52159611328.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 2686976.0,
             "reserved_bytes": 0
           }
@@ -8936,10 +8936,10 @@
             "stage": 0,
             "sequences": 32,
             "cache_bytes": 42332323840.0,
-            "cache_capacity_bytes": 51547645094.4,
-            "headroom_bytes": 9215321254.400002,
-            "resident_bytes": 52632207808.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51516925094.4,
+            "headroom_bytes": 9184601254.400002,
+            "resident_bytes": 52662927808.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 2686976.0,
             "reserved_bytes": 0
           }
@@ -8982,10 +8982,10 @@
             "stage": 0,
             "sequences": 32,
             "cache_bytes": 42793697280.0,
-            "cache_capacity_bytes": 51547645094.4,
-            "headroom_bytes": 8753947814.400002,
-            "resident_bytes": 53093581248.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51516925094.4,
+            "headroom_bytes": 8723227814.400002,
+            "resident_bytes": 53124301248.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 2686976.0,
             "reserved_bytes": 0
           }
@@ -9028,10 +9028,10 @@
             "stage": 0,
             "sequences": 64,
             "cache_bytes": 83658014720.0,
-            "cache_capacity_bytes": 51544958118.4,
-            "headroom_bytes": -32113056601.6,
-            "resident_bytes": 93960585664.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51514238118.4,
+            "headroom_bytes": -32143776601.6,
+            "resident_bytes": 93991305664.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 5373952.0,
             "reserved_bytes": 0
           }
@@ -9042,7 +9042,7 @@
             "replica": 0,
             "stage": 0,
             "required": 83658014720.0,
-            "available": 51544958118.4
+            "available": 51514238118.4
           }
         ],
         "assumptions": [
@@ -9082,10 +9082,10 @@
             "stage": 0,
             "sequences": 64,
             "cache_bytes": 84664647680.0,
-            "cache_capacity_bytes": 51544958118.4,
-            "headroom_bytes": -33119689561.6,
-            "resident_bytes": 94967218624.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51514238118.4,
+            "headroom_bytes": -33150409561.6,
+            "resident_bytes": 94997938624.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 5373952.0,
             "reserved_bytes": 0
           }
@@ -9096,7 +9096,7 @@
             "replica": 0,
             "stage": 0,
             "required": 84664647680.0,
-            "available": 51544958118.4
+            "available": 51514238118.4
           }
         ],
         "assumptions": [
@@ -9136,10 +9136,10 @@
             "stage": 0,
             "sequences": 64,
             "cache_bytes": 85587394560.0,
-            "cache_capacity_bytes": 51544958118.4,
-            "headroom_bytes": -34042436441.6,
-            "resident_bytes": 95889965504.0,
-            "weights_bytes": 10297196992.0,
+            "cache_capacity_bytes": 51514238118.4,
+            "headroom_bytes": -34073156441.6,
+            "resident_bytes": 95920685504.0,
+            "weights_bytes": 10327916992.0,
             "workspace_bytes": 5373952.0,
             "reserved_bytes": 0
           }
@@ -9150,7 +9150,7 @@
             "replica": 0,
             "stage": 0,
             "required": 85587394560.0,
-            "available": 51544958118.4
+            "available": 51514238118.4
           }
         ],
         "assumptions": [
