@@ -32,6 +32,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from functools import lru_cache
 import math
 from typing import Callable, Mapping
 
@@ -507,8 +508,14 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
         valid = max(0, end - start)
         pairs, active_rows = _tile_counts(
             output, context_len, spec.group, start, end)
+        return template(valid, pairs, active_rows, index % recipe.slots)
+
+    @lru_cache(maxsize=2 * recipe.slots)
+    def template(valid: int, pairs: int, active_rows: int, slot: int):
+        # Full tiles repeat immutable work and slot-local buffer descriptors.
+        # Retain at most a full/tail pair per live slot, within this producer;
+        # every tile still submits its original finite stages and dependencies.
         k_bytes = valid * dim * spec.kv_bytes
-        slot = index % recipe.slots
         suffix = f"s{slot}"
         k_l1 = _allocation(context, core, "l1", f"k_l1_{suffix}", k_bytes)
         k_l0b = _allocation(context, core, "l0b", f"k_l0b_{suffix}", k_bytes)

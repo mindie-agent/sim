@@ -1,0 +1,202 @@
+{
+  "schema": "mindie-gqa-tile-template-control/1",
+  "implementation": "allocation-local immutable Stage templates keyed by valid rows, causal pairs, active rows and buffer slot",
+  "scope": "preserves every finite task and dependency; no new timing or contention approximation",
+  "reference_revision": "21422237",
+  "runtime_file": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
+    "sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+    "bytes": 32018
+  },
+  "reference_file": {
+    "path": "/tmp/attention-decode-before-templates.py",
+    "sha256": "6713a0d58ef2c225bd6ea4327c0706e3aaacef1fe5be878d87b793ffa7ed7832",
+    "bytes": 31599
+  },
+  "retention_bound": "2 * recipe.slots per live producer; no cross-producer or cross-call cache",
+  "targeted_tests": {
+    "passed": 35,
+    "seconds": 1.79,
+    "controls": "ragged causal tails, one/two slots, split merges, physical owner contention, exact full Engine summaries and traces with cache disabled"
+  },
+  "single_attention": {
+    "geometry": {
+      "batch_slots": 48,
+      "tokens_per_sequence": 4,
+      "context_tokens": 126000
+    },
+    "case": {
+      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+      "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408",
+      "bytes": 151098
+    },
+    "selected_recipe": {
+      "operator": "flash_attention_decode",
+      "program": "StagedGQADecode",
+      "query_tile": 64,
+      "key_tile": 64,
+      "slots": 2,
+      "kv_splits": 1,
+      "kv_mapping": "uniform"
+    },
+    "duration_ms": 7.332702225451278,
+    "duration_exactly_equal": true,
+    "execution_exactly_equal": true,
+    "execution_sha256": "2aee30cf3edae7767cdadca87627a343adf0f5683564d0a2cc5c66fe52afe6f0",
+    "completed_tasks": 756670,
+    "peak_live_tasks": 428,
+    "peak_rss_bytes": 45727744,
+    "profile": {
+      "before": {
+        "identity": {
+          "path": "/tmp/qwen35-attention-cpu-b48.pstats",
+          "sha256": "fc7ead97daeccb8632fa7c9212ec3b6c010e9279c146a284cda30e01b147583a",
+          "bytes": 95527
+        },
+        "function_calls": 122754398,
+        "functions": [
+          {
+            "module": "attention_decode.py",
+            "function": "tile",
+            "calls": 48,
+            "self_cpu_seconds": 4.4667000000000004e-05,
+            "cumulative_seconds": 0.00013645900000000002
+          },
+          {
+            "module": "engine.py",
+            "function": "_settle",
+            "calls": 65000,
+            "self_cpu_seconds": 1.5240053070000001,
+            "cumulative_seconds": 24.815306293000003
+          },
+          {
+            "module": "engine.py",
+            "function": "advance",
+            "calls": 1,
+            "self_cpu_seconds": 2.198162387,
+            "cumulative_seconds": 31.328036958000002
+          },
+          {
+            "module": "attention_decode.py",
+            "function": "tile",
+            "calls": 94512,
+            "self_cpu_seconds": 1.300422847,
+            "cumulative_seconds": 8.22428385
+          },
+          {
+            "module": "engine.py",
+            "function": "submit",
+            "calls": 756670,
+            "self_cpu_seconds": 4.649524964,
+            "cumulative_seconds": 8.706049512
+          },
+          {
+            "module": "engine.py",
+            "function": "_rates",
+            "calls": 64999,
+            "self_cpu_seconds": 1.2858459290000002,
+            "cumulative_seconds": 3.361749903
+          }
+        ]
+      },
+      "after": {
+        "identity": {
+          "path": "/tmp/qwen35-attention-template-b48.pstats",
+          "sha256": "8fa4e6c4483eca7aca9813e0f1985c5b9dd39a8d02cfa7e74c073bd2dcad49de",
+          "bytes": 95698
+        },
+        "function_calls": 98031038,
+        "functions": [
+          {
+            "module": "attention_decode.py",
+            "function": "tile",
+            "calls": 94512,
+            "self_cpu_seconds": 0.132230848,
+            "cumulative_seconds": 0.617727963
+          },
+          {
+            "module": "attention_decode.py",
+            "function": "tile",
+            "calls": 48,
+            "self_cpu_seconds": 4.3332000000000005e-05,
+            "cumulative_seconds": 0.000130333
+          },
+          {
+            "module": "attention_decode.py",
+            "function": "template",
+            "calls": 144,
+            "self_cpu_seconds": 0.002699758,
+            "cumulative_seconds": 0.015777371000000002
+          },
+          {
+            "module": "engine.py",
+            "function": "advance",
+            "calls": 1,
+            "self_cpu_seconds": 2.7146061,
+            "cumulative_seconds": 28.006215917000002
+          },
+          {
+            "module": "engine.py",
+            "function": "_settle",
+            "calls": 65000,
+            "self_cpu_seconds": 1.818064431,
+            "cumulative_seconds": 19.856870592
+          },
+          {
+            "module": "engine.py",
+            "function": "submit",
+            "calls": 756670,
+            "self_cpu_seconds": 5.507161283,
+            "cumulative_seconds": 9.970363021
+          },
+          {
+            "module": "engine.py",
+            "function": "_rates",
+            "calls": 64999,
+            "self_cpu_seconds": 1.64052354,
+            "cumulative_seconds": 4.246687122
+          }
+        ]
+      }
+    }
+  },
+  "unchanged_canonical_body_budget": {
+    "budget_seconds": 90,
+    "input_or_recipe_changed": false,
+    "completed": false,
+    "cases": [
+      {
+        "sequences": 48,
+        "status": "failed",
+        "error_type": "TimeoutError",
+        "error": "body_prediction_90s_budget_exhausted",
+        "wall_seconds": 90.01983920799103,
+        "peak_rss_bytes": 66863104,
+        "identity": {
+          "path": "/tmp/qwen35-template-body-b48.json",
+          "sha256": "1087a3b2c0a4f353d967e493f3ea2b215847e76da9ce51fd2c7089eeb31092f8",
+          "bytes": 9730
+        }
+      },
+      {
+        "sequences": 64,
+        "status": "failed",
+        "error_type": "TimeoutError",
+        "error": "body_prediction_90s_budget_exhausted",
+        "wall_seconds": 90.02907479205169,
+        "peak_rss_bytes": 67190784,
+        "identity": {
+          "path": "/tmp/qwen35-template-body-b64.json",
+          "sha256": "3fc7f93b4bd293d15792144edcfa4d05115cf2eb76e66abdcc130d7b19bcaba8",
+          "bytes": 11746
+        }
+      }
+    ]
+  },
+  "limitations": [
+    "Single-operator equivalence and CPU construction improvement do not establish full Body CPU acceptance.",
+    "Both unchanged canonical full Body probes still exhaust the original 90-second budget.",
+    "Profiling controls run locally; wall time is affected by profiler overhead and concurrent work.",
+    "No device timing measurement or accuracy comparison is used."
+  ]
+}
