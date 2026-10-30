@@ -28,6 +28,9 @@ def source_case(tp, retained):
     raw['machine']['num_devices'] = tp
     raw['runtime'].update(tp=tp,ep=tp,dp=1,pp=1,max_model_len=131072)
     raw['runtime'].pop('metadata',None)
+    # Retain the independently audited full KDA QKV/BFG caller groups in body
+    # controls; the high-concurrency template predates this explicit selector.
+    raw['runtime']['kernels']['lowerings']['kda_input_projection'] = 'vllm_ascend_kda_mixed_projection'
     raw['runtime']['kernels']['lowerings']['paged_mla_attention'] = {
         'implementation':IMPLEMENTATION,'options':{'retained_kv_rows':retained}}
     # Independent platform declaration, not native-op calibration. Modes share

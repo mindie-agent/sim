@@ -1,0 +1,4227 @@
+{
+  "schema": "kimi-body-family-activity/1",
+  "boundary": "all native event types within same-device body; union clips event ends at retained body end",
+  "status": "diagnosis_only_no_parameters",
+  "limitations": [
+    "Activity is elapsed event coverage, not independently identified pipe busy time.",
+    "Family candidate simulation roles indicate caller ownership, not same ABI or additive time equivalence; candidates can overlap across family rows.",
+    "No HCOM AIV child rows are inferred when absent from the capture.",
+    "Unknown group_list and active-mask values stay unknown."
+  ],
+  "cases": [
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "3554dcb2b430dd5eb499e180639b45c5cd18099a6c20d05e1b4fe2e66c6ba5f4",
+        "size_bytes": 20706836
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1-extraction.json",
+        "sha256": "e1c431b5b8e1d8d5e564402408f8cbc90dd430ceb09c12b00e859dec67545b24",
+        "size_bytes": 438083
+      },
+      "native_forwards": 242,
+      "body_span_us": {
+        "mean": 3396.537305785124,
+        "median": 3322.897,
+        "min": 3040.361,
+        "max": 6307.826
+      },
+      "body_activity_union_us": {
+        "mean": 3256.0671239669423,
+        "median": 3183.1455,
+        "min": 2898.738,
+        "max": 6168.384
+      },
+      "body_gap_us": {
+        "mean": 140.4701818181818,
+        "median": 140.13250000000016,
+        "min": 136.48199999999997,
+        "max": 189.163
+      },
+      "extraction_activity_agreement_max_us": 9.094947017729282e-13,
+      "sim_body_us": 2656.722010201465,
+      "native_minus_sim_body_median_us": 666.1749897985351,
+      "all_native_families": [
+        {
+          "native_type": "hcom_allGather_",
+          "native_calls": 2178,
+          "cores": {
+            "COMMUNICATION": 2178
+          },
+          "task_types": {
+            "COMMUNICATION": 2178
+          },
+          "first_csv_line": 76,
+          "last_csv_line": 63874,
+          "sum_elapsed_us": {
+            "mean": 666.5327975206611,
+            "median": 625.7425000000001,
+            "min": 384.25,
+            "max": 2822.096
+          },
+          "union_activity_us": {
+            "mean": 666.5327975206611,
+            "median": 625.7425000000001,
+            "min": 384.25,
+            "max": 2822.096
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 20.470487006072794,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ring_allgather"
+            ],
+            "calls": 9,
+            "sum_elapsed_us": 162.10799999999637,
+            "union_elapsed_us": 162.10799999999654,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 666.5327975206611,
+            "median": 625.7425000000001,
+            "min": 384.25,
+            "max": 2822.096
+          },
+          "cumulative_mean_activity_coverage_pct": 20.470487006072794
+        },
+        {
+          "native_type": "QuantBatchMatmulV3",
+          "native_calls": 4598,
+          "cores": {
+            "MIX_AIC": 3872,
+            "AI_CORE": 726
+          },
+          "task_types": {
+            "MIX_AIC": 3872,
+            "AI_CORE": 726
+          },
+          "first_csv_line": 84,
+          "last_csv_line": 63871,
+          "sum_elapsed_us": {
+            "mean": 493.78598347107436,
+            "median": 493.6465,
+            "min": 489.508,
+            "max": 499.171
+          },
+          "union_activity_us": {
+            "mean": 493.78598347107436,
+            "median": 493.6465,
+            "min": 489.508,
+            "max": 499.171
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 15.16510454703045,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dense_down",
+              "dense_gate_up",
+              "kv_a",
+              "linear_qkv",
+              "q_a",
+              "q_b"
+            ],
+            "calls": 14,
+            "sum_elapsed_us": 325.98661848489206,
+            "union_elapsed_us": 325.98661848489064,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 1160.3187809917356,
+            "median": 1119.2130000000002,
+            "min": 875.617,
+            "max": 3315.947
+          },
+          "cumulative_mean_activity_coverage_pct": 35.63559155310325
+        },
+        {
+          "native_type": "hcom_reduceScatter_",
+          "native_calls": 1936,
+          "cores": {
+            "COMMUNICATION": 1936
+          },
+          "task_types": {
+            "COMMUNICATION": 1936
+          },
+          "first_csv_line": 93,
+          "last_csv_line": 63868,
+          "sum_elapsed_us": {
+            "mean": 284.20004132231406,
+            "median": 205.2735,
+            "min": 183.982,
+            "max": 3074.064
+          },
+          "union_activity_us": {
+            "mean": 284.20004132231406,
+            "median": 205.2735,
+            "min": 183.982,
+            "max": 3074.064
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 8.728322559151254,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ring_reduce_scatter"
+            ],
+            "calls": 8,
+            "sum_elapsed_us": 144.0959999999958,
+            "union_elapsed_us": 144.095999999995,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 1444.5188223140497,
+            "median": 1371.367,
+            "min": 1082.964,
+            "max": 4360.249
+          },
+          "cumulative_mean_activity_coverage_pct": 44.363914112254506
+        },
+        {
+          "native_type": "MatMulV2",
+          "native_calls": 1936,
+          "cores": {
+            "AI_CORE": 1936
+          },
+          "task_types": {
+            "AI_CORE": 1936
+          },
+          "first_csv_line": 80,
+          "last_csv_line": 63847,
+          "sum_elapsed_us": {
+            "mean": 281.4169132231405,
+            "median": 281.395,
+            "min": 275.226,
+            "max": 286.787
+          },
+          "union_activity_us": {
+            "mean": 281.4169132231405,
+            "median": 281.395,
+            "min": 275.226,
+            "max": 286.787
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 8.64284741403868,
+          "simulation_role_candidates": {
+            "recipes": [
+              "linear_bfg",
+              "linear_output",
+              "output",
+              "output_gate",
+              "q_absorb",
+              "v_expand"
+            ],
+            "calls": 10,
+            "sum_elapsed_us": 347.48005818182116,
+            "union_elapsed_us": 347.48005818182264,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 1725.93573553719,
+            "median": 1653.2705,
+            "min": 1365.785,
+            "max": 4641.576
+          },
+          "cumulative_mean_activity_coverage_pct": 53.00676152629318
+        },
+        {
+          "native_type": "GroupedMatmul",
+          "native_calls": 1452,
+          "cores": {
+            "MIX_AIC": 1452
+          },
+          "task_types": {
+            "MIX_AIC": 1452
+          },
+          "first_csv_line": 143,
+          "last_csv_line": 63859,
+          "sum_elapsed_us": {
+            "mean": 271.19764462809917,
+            "median": 271.0055,
+            "min": 267.066,
+            "max": 276.605
+          },
+          "union_activity_us": {
+            "mean": 271.19764462809917,
+            "median": 271.0055,
+            "min": 267.066,
+            "max": 276.605
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 8.32899428368334,
+          "simulation_role_candidates": {
+            "recipes": [
+              "balanced_grouped_down",
+              "balanced_grouped_gate_up"
+            ],
+            "calls": 6,
+            "sum_elapsed_us": 793.977191772191,
+            "union_elapsed_us": 793.97719177219,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 1997.1333801652893,
+            "median": 1924.038,
+            "min": 1639.136,
+            "max": 4911.302
+          },
+          "cumulative_mean_activity_coverage_pct": 61.335755809976526
+        },
+        {
+          "native_type": "FusedInferAttentionScore",
+          "native_calls": 242,
+          "cores": {
+            "MIX_AIC": 242
+          },
+          "task_types": {
+            "MIX_AIC": 242
+          },
+          "first_csv_line": 219,
+          "last_csv_line": 63841,
+          "sum_elapsed_us": {
+            "mean": 238.1205743801653,
+            "median": 238.225,
+            "min": 235.165,
+            "max": 241.805
+          },
+          "union_activity_us": {
+            "mean": 238.1205743801653,
+            "median": 238.225,
+            "min": 235.165,
+            "max": 241.805
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 7.313134690235055,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ascend_paged_mla_decode_arch22"
+            ],
+            "calls": 1,
+            "sum_elapsed_us": 232.52398845087896,
+            "union_elapsed_us": 232.5239884508792,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2235.2539545454547,
+            "median": 2161.3125,
+            "min": 1877.821,
+            "max": 5149.207
+          },
+          "cumulative_mean_activity_coverage_pct": 68.64889050021158
+        },
+        {
+          "native_type": "MoeDistributeDispatchV2",
+          "native_calls": 726,
+          "cores": {
+            "MIX_AIV": 726
+          },
+          "task_types": {
+            "MIX_AIV": 726
+          },
+          "first_csv_line": 142,
+          "last_csv_line": 63856,
+          "sum_elapsed_us": {
+            "mean": 167.43238016528926,
+            "median": 167.2635,
+            "min": 159.503,
+            "max": 176.585
+          },
+          "union_activity_us": {
+            "mean": 167.43238016528926,
+            "median": 167.2635,
+            "min": 159.503,
+            "max": 176.585
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 5.142166109932724,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize",
+              "expert_dispatch",
+              "route_pack"
+            ],
+            "calls": 9,
+            "sum_elapsed_us": 23.81657142856941,
+            "union_elapsed_us": 23.81657142856875,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2402.6863347107437,
+            "median": 2328.7235,
+            "min": 2042.904,
+            "max": 5319.552
+          },
+          "cumulative_mean_activity_coverage_pct": 73.7910566101443
+        },
+        {
+          "native_type": "PadV3",
+          "native_calls": 2178,
+          "cores": {
+            "MIX_AIV": 2178
+          },
+          "task_types": {
+            "MIX_AIV": 2178
+          },
+          "first_csv_line": 92,
+          "last_csv_line": 63867,
+          "sum_elapsed_us": {
+            "mean": 131.94339669421487,
+            "median": 131.92149999999998,
+            "min": 130.863,
+            "max": 133.243
+          },
+          "union_activity_us": {
+            "mean": 131.94339669421487,
+            "median": 131.92149999999998,
+            "min": 130.863,
+            "max": 133.243
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 4.052232084621927,
+          "simulation_role_candidates": {
+            "recipes": [
+              "paged_mla_query_pad_nope",
+              "paged_mla_query_pad_rope",
+              "sequence_parallel_reduce_scatter_pad",
+              "sequence_parallel_right_pad"
+            ],
+            "calls": 7,
+            "sum_elapsed_us": 12.52688000000024,
+            "union_elapsed_us": 12.526879999998528,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2534.629731404959,
+            "median": 2460.5159999999996,
+            "min": 2174.724,
+            "max": 5451.634
+          },
+          "cumulative_mean_activity_coverage_pct": 77.84328869476623
+        },
+        {
+          "native_type": "AttnResFwd",
+          "native_calls": 2178,
+          "cores": {
+            "AI_VECTOR_CORE": 2178
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 2178
+          },
+          "first_csv_line": 75,
+          "last_csv_line": 63873,
+          "sum_elapsed_us": {
+            "mean": 88.27919421487603,
+            "median": 88.25200000000001,
+            "min": 87.062,
+            "max": 89.581
+          },
+          "union_activity_us": {
+            "mean": 88.27919421487603,
+            "median": 88.25200000000001,
+            "min": 87.062,
+            "max": 89.581
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 2.711221570497706,
+          "simulation_role_candidates": {
+            "recipes": [
+              "attention_residual_mix",
+              "attention_residual_output_cast",
+              "attention_residual_softmax",
+              "residual_values_fp32"
+            ],
+            "calls": 32,
+            "sum_elapsed_us": 79.9999999999983,
+            "union_elapsed_us": 79.99999999999818,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2622.908925619835,
+            "median": 2548.8285,
+            "min": 2262.965,
+            "max": 5540.235
+          },
+          "cumulative_mean_activity_coverage_pct": 80.55451026526394
+        },
+        {
+          "native_type": "MoeDistributeCombineV2",
+          "native_calls": 726,
+          "cores": {
+            "MIX_AIV": 726
+          },
+          "task_types": {
+            "MIX_AIV": 726
+          },
+          "first_csv_line": 147,
+          "last_csv_line": 63860,
+          "sum_elapsed_us": {
+            "mean": 81.59763636363637,
+            "median": 81.6315,
+            "min": 69.702,
+            "max": 93.243
+          },
+          "union_activity_us": {
+            "mean": 81.59763636363637,
+            "median": 81.6315,
+            "min": 69.702,
+            "max": 93.243
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 2.506018250146639,
+          "simulation_role_candidates": {
+            "recipes": [
+              "expert_combine",
+              "route_unpack"
+            ],
+            "calls": 6,
+            "sum_elapsed_us": 16.316571428570015,
+            "union_elapsed_us": 16.31657142857057,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2704.506561983471,
+            "median": 2631.545,
+            "min": 2347.606,
+            "max": 5616.276
+          },
+          "cumulative_mean_activity_coverage_pct": 83.06052851541057
+        },
+        {
+          "native_type": "MemSet",
+          "native_calls": 2178,
+          "cores": {
+            "AI_VECTOR_CORE": 2178
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 2178
+          },
+          "first_csv_line": 91,
+          "last_csv_line": 63866,
+          "sum_elapsed_us": {
+            "mean": 72.44043801652893,
+            "median": 72.4425,
+            "min": 71.802,
+            "max": 73.362
+          },
+          "union_activity_us": {
+            "mean": 72.44043801652893,
+            "median": 72.4425,
+            "min": 71.802,
+            "max": 73.362
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 2.2247833124604957,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2776.947,
+            "median": 2703.976,
+            "min": 2420.326,
+            "max": 5688.876
+          },
+          "cumulative_mean_activity_coverage_pct": 85.28531182787107
+        },
+        {
+          "native_type": "MatMulV3",
+          "native_calls": 726,
+          "cores": {
+            "AI_CORE": 726
+          },
+          "task_types": {
+            "AI_CORE": 726
+          },
+          "first_csv_line": 137,
+          "last_csv_line": 63852,
+          "sum_elapsed_us": {
+            "mean": 65.7022479338843,
+            "median": 65.6515,
+            "min": 64.143,
+            "max": 67.881
+          },
+          "union_activity_us": {
+            "mean": 65.7022479338843,
+            "median": 65.6515,
+            "min": 64.143,
+            "max": 67.881
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 2.0178407088192247,
+          "simulation_role_candidates": {
+            "recipes": [
+              "router"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 105.55720727273598,
+            "union_elapsed_us": 105.55720727273729,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2842.6492479338845,
+            "median": 2770.2969999999996,
+            "min": 2485.588,
+            "max": 5755.098
+          },
+          "cumulative_mean_activity_coverage_pct": 87.3031525366903
+        },
+        {
+          "native_type": "DequantSituQuant",
+          "native_calls": 1452,
+          "cores": {
+            "AI_VECTOR_CORE": 1452
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1452
+          },
+          "first_csv_line": 144,
+          "last_csv_line": 63864,
+          "sum_elapsed_us": {
+            "mean": 61.76471487603306,
+            "median": 61.7415,
+            "min": 61.061,
+            "max": 62.962
+          },
+          "union_activity_us": {
+            "mean": 61.76471487603306,
+            "median": 61.7415,
+            "min": 61.061,
+            "max": 62.962
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.896911596858718,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize",
+              "grouped_situ",
+              "situ"
+            ],
+            "calls": 12,
+            "sum_elapsed_us": 29.999999999995808,
+            "union_elapsed_us": 29.999999999996362,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2904.4139628099174,
+            "median": 2831.5875,
+            "min": 2547.529,
+            "max": 5816.478
+          },
+          "cumulative_mean_activity_coverage_pct": 89.200064133549
+        },
+        {
+          "native_type": "ForeachAddList",
+          "native_calls": 726,
+          "cores": {
+            "AI_VECTOR_CORE": 726
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 726
+          },
+          "first_csv_line": 160,
+          "last_csv_line": 63872,
+          "sum_elapsed_us": {
+            "mean": 51.76929338842975,
+            "median": 51.811,
+            "min": 50.201,
+            "max": 52.821
+          },
+          "union_activity_us": {
+            "mean": 51.76929338842975,
+            "median": 51.811,
+            "min": 50.201,
+            "max": 52.821
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.5899332359388838,
+          "simulation_role_candidates": {
+            "recipes": [
+              "expert_add",
+              "residual_add"
+            ],
+            "calls": 11,
+            "sum_elapsed_us": 27.499999999997193,
+            "union_elapsed_us": 27.49999999999909,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2956.183256198347,
+            "median": 2883.1775,
+            "min": 2598.99,
+            "max": 5867.839
+          },
+          "cumulative_mean_activity_coverage_pct": 90.78999736948789
+        },
+        {
+          "native_type": "DynamicQuant",
+          "native_calls": 3872,
+          "cores": {
+            "AI_VECTOR_CORE": 3872
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 3872
+          },
+          "first_csv_line": 82,
+          "last_csv_line": 63870,
+          "sum_elapsed_us": {
+            "mean": 51.57789256198347,
+            "median": 51.561,
+            "min": 50.54,
+            "max": 52.862
+          },
+          "union_activity_us": {
+            "mean": 51.57789256198347,
+            "median": 51.561,
+            "min": 50.54,
+            "max": 52.862
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.5840549533618007,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize"
+            ],
+            "calls": 25,
+            "sum_elapsed_us": 62.49999999999467,
+            "union_elapsed_us": 62.49999999999727,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3007.7611487603303,
+            "median": 2934.3085,
+            "min": 2649.61,
+            "max": 5918.719
+          },
+          "cumulative_mean_activity_coverage_pct": 92.37405232284969
+        },
+        {
+          "native_type": "RecurrentKda",
+          "native_calls": 726,
+          "cores": {
+            "AI_VECTOR_CORE": 726
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 726
+          },
+          "first_csv_line": 86,
+          "last_csv_line": 63789,
+          "sum_elapsed_us": {
+            "mean": 51.30005785123967,
+            "median": 51.282,
+            "min": 50.022,
+            "max": 52.902
+          },
+          "union_activity_us": {
+            "mean": 51.30005785123967,
+            "median": 51.282,
+            "min": 50.022,
+            "max": 52.902
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.5755221221833908,
+          "simulation_role_candidates": {
+            "recipes": [
+              "vllm_ascend_recurrent_kda_arch22"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 12.401823181825478,
+            "union_elapsed_us": 12.40182318182542,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3059.0612066115705,
+            "median": 2985.7895,
+            "min": 2701.371,
+            "max": 5969.779
+          },
+          "cumulative_mean_activity_coverage_pct": 93.94957444503311
+        },
+        {
+          "native_type": "CausalConv1d",
+          "native_calls": 726,
+          "cores": {
+            "MIX_AIV": 726
+          },
+          "task_types": {
+            "MIX_AIV": 726
+          },
+          "first_csv_line": 85,
+          "last_csv_line": 63788,
+          "sum_elapsed_us": {
+            "mean": 32.37817768595041,
+            "median": 32.342,
+            "min": 31.341,
+            "max": 33.721
+          },
+          "union_activity_us": {
+            "mean": 32.37817768595041,
+            "median": 32.342,
+            "min": 31.341,
+            "max": 33.721
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.9943952766705659,
+          "simulation_role_candidates": {
+            "recipes": [
+              "short_convolution"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 7.500000000000284,
+            "union_elapsed_us": 7.4999999999990905,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3091.4393842975205,
+            "median": 3018.12,
+            "min": 2734.552,
+            "max": 6003.22
+          },
+          "cumulative_mean_activity_coverage_pct": 94.94396972170365
+        },
+        {
+          "native_type": "RmsNorm",
+          "native_calls": 1210,
+          "cores": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "first_csv_line": 157,
+          "last_csv_line": 63869,
+          "sum_elapsed_us": {
+            "mean": 22.419512396694216,
+            "median": 22.4005,
+            "min": 21.78,
+            "max": 23.122
+          },
+          "union_activity_us": {
+            "mean": 22.419512396694216,
+            "median": 22.4005,
+            "min": 21.78,
+            "max": 23.122
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.6885457683495174,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3113.8588966942148,
+            "median": 3040.4605,
+            "min": 2756.912,
+            "max": 6025.801
+          },
+          "cumulative_mean_activity_coverage_pct": 95.63251549005317
+        },
+        {
+          "native_type": "Mul",
+          "native_calls": 1210,
+          "cores": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "first_csv_line": 105,
+          "last_csv_line": 63846,
+          "sum_elapsed_us": {
+            "mean": 21.58590909090909,
+            "median": 21.58,
+            "min": 21.201,
+            "max": 22.26
+          },
+          "union_activity_us": {
+            "mean": 21.58590909090909,
+            "median": 21.58,
+            "min": 21.201,
+            "max": 22.26
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.6629442290062643,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3135.444805785124,
+            "median": 3062.1305,
+            "min": 2778.412,
+            "max": 6047.281
+          },
+          "cumulative_mean_activity_coverage_pct": 96.29545971905944
+        },
+        {
+          "native_type": "Cast",
+          "native_calls": 1452,
+          "cores": {
+            "AI_VECTOR_CORE": 1452
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1452
+          },
+          "first_csv_line": 81,
+          "last_csv_line": 63784,
+          "sum_elapsed_us": {
+            "mean": 20.005652892561983,
+            "median": 19.9805,
+            "min": 19.64,
+            "max": 20.78
+          },
+          "union_activity_us": {
+            "mean": 20.005652892561983,
+            "median": 19.9805,
+            "min": 19.64,
+            "max": 20.78
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.6144115625045418,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3153.0657603305785,
+            "median": 3079.851,
+            "min": 2796.093,
+            "max": 6065.262
+          },
+          "cumulative_mean_activity_coverage_pct": 96.83663267018665
+        },
+        {
+          "native_type": "MoeGatingTopK",
+          "native_calls": 726,
+          "cores": {
+            "AI_VECTOR_CORE": 726
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 726
+          },
+          "first_csv_line": 141,
+          "last_csv_line": 63855,
+          "sum_elapsed_us": {
+            "mean": 16.06590909090909,
+            "median": 16.06,
+            "min": 15.641,
+            "max": 16.74
+          },
+          "union_activity_us": {
+            "mean": 16.06590909090909,
+            "median": 16.06,
+            "min": 15.641,
+            "max": 16.74
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.4934145544068398,
+          "simulation_role_candidates": {
+            "recipes": [
+              "router_topk"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 7.499999999999396,
+            "union_elapsed_us": 7.499999999998181,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3169.1316694214875,
+            "median": 3096.1710000000003,
+            "min": 2812.154,
+            "max": 6081.442
+          },
+          "cumulative_mean_activity_coverage_pct": 97.33004722459347
+        },
+        {
+          "native_type": "TransposeBatchMatMul",
+          "native_calls": 242,
+          "cores": {
+            "AI_CORE": 242
+          },
+          "task_types": {
+            "AI_CORE": 242
+          },
+          "first_csv_line": 220,
+          "last_csv_line": 63844,
+          "sum_elapsed_us": {
+            "mean": 13.180165289256198,
+            "median": 13.18,
+            "min": 12.74,
+            "max": 13.921
+          },
+          "union_activity_us": {
+            "mean": 13.180165289256198,
+            "median": 13.18,
+            "min": 12.74,
+            "max": 13.921
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.40478788635040475,
+          "simulation_role_candidates": {
+            "recipes": [
+              "v_expand"
+            ],
+            "calls": 1,
+            "sum_elapsed_us": 5.000000000000782,
+            "union_elapsed_us": 5.0,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3182.311834710744,
+            "median": 3109.482,
+            "min": 2825.054,
+            "max": 6094.542
+          },
+          "cumulative_mean_activity_coverage_pct": 97.73483511094389
+        },
+        {
+          "native_type": "Sigmoid",
+          "native_calls": 1210,
+          "cores": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1210
+          },
+          "first_csv_line": 83,
+          "last_csv_line": 63845,
+          "sum_elapsed_us": {
+            "mean": 11.804144628099174,
+            "median": 11.78,
+            "min": 11.52,
+            "max": 12.522
+          },
+          "union_activity_us": {
+            "mean": 11.804144628099174,
+            "median": 11.78,
+            "min": 11.52,
+            "max": 12.522
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.36252768074749975,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3190.1058223140494,
+            "median": 3117.2325,
+            "min": 2833.015,
+            "max": 6102.342
+          },
+          "cumulative_mean_activity_coverage_pct": 97.97420325989685
+        },
+        {
+          "native_type": "Tanh",
+          "native_calls": 484,
+          "cores": {
+            "AI_VECTOR_CORE": 484
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 484
+          },
+          "first_csv_line": 104,
+          "last_csv_line": 63731,
+          "sum_elapsed_us": {
+            "mean": 11.507822314049587,
+            "median": 11.5,
+            "min": 11.18,
+            "max": 11.86
+          },
+          "union_activity_us": {
+            "mean": 11.507822314049587,
+            "median": 11.5,
+            "min": 11.18,
+            "max": 11.86
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.3534270601900043,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3201.6136446280993,
+            "median": 3128.6025,
+            "min": 2844.555,
+            "max": 6113.982
+          },
+          "cumulative_mean_activity_coverage_pct": 98.32763032008685
+        },
+        {
+          "native_type": "RealDiv",
+          "native_calls": 484,
+          "cores": {
+            "AI_VECTOR_CORE": 484
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 484
+          },
+          "first_csv_line": 103,
+          "last_csv_line": 63730,
+          "sum_elapsed_us": {
+            "mean": 10.568078512396694,
+            "median": 10.56,
+            "min": 10.42,
+            "max": 10.84
+          },
+          "union_activity_us": {
+            "mean": 10.568078512396694,
+            "median": 10.56,
+            "min": 10.42,
+            "max": 10.84
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.3245657448093809,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3212.1817231404957,
+            "median": 3139.193,
+            "min": 2855.116,
+            "max": 6124.523
+          },
+          "cumulative_mean_activity_coverage_pct": 98.65219606489623
+        },
+        {
+          "native_type": "Slice",
+          "native_calls": 968,
+          "cores": {
+            "AI_VECTOR_CORE": 968
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 968
+          },
+          "first_csv_line": 99,
+          "last_csv_line": 63836,
+          "sum_elapsed_us": {
+            "mean": 9.336438016528925,
+            "median": 9.32,
+            "min": 8.98,
+            "max": 10.08
+          },
+          "union_activity_us": {
+            "mean": 9.336438016528925,
+            "median": 9.32,
+            "min": 8.98,
+            "max": 10.08
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.2867397280543199,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3221.5181611570247,
+            "median": 3148.733,
+            "min": 2864.437,
+            "max": 6133.963
+          },
+          "cumulative_mean_activity_coverage_pct": 98.93893579295055
+        },
+        {
+          "native_type": "Index",
+          "native_calls": 242,
+          "cores": {
+            "AI_VECTOR_CORE": 242
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 242
+          },
+          "first_csv_line": 253,
+          "last_csv_line": 63877,
+          "sum_elapsed_us": {
+            "mean": 8.286165289256198,
+            "median": 8.22,
+            "min": 7.88,
+            "max": 13.78
+          },
+          "union_activity_us": {
+            "mean": 8.286165289256198,
+            "median": 8.22,
+            "min": 7.88,
+            "max": 13.78
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.25448385963127723,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3229.804326446281,
+            "median": 3157.034,
+            "min": 2872.557,
+            "max": 6142.083
+          },
+          "cumulative_mean_activity_coverage_pct": 99.19341965258184
+        },
+        {
+          "native_type": "BatchMatMulV2",
+          "native_calls": 242,
+          "cores": {
+            "AI_CORE": 242
+          },
+          "task_types": {
+            "AI_CORE": 242
+          },
+          "first_csv_line": 211,
+          "last_csv_line": 63832,
+          "sum_elapsed_us": {
+            "mean": 7.825173553719008,
+            "median": 7.801,
+            "min": 7.34,
+            "max": 8.461
+          },
+          "union_activity_us": {
+            "mean": 7.825173553719008,
+            "median": 7.801,
+            "min": 7.34,
+            "max": 8.461
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.24032592866775476,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3237.6295,
+            "median": 3164.8445,
+            "min": 2880.637,
+            "max": 6149.903
+          },
+          "cumulative_mean_activity_coverage_pct": 99.4337455812496
+        },
+        {
+          "native_type": "layer_norm_gated_fwd_kernel",
+          "native_calls": 726,
+          "cores": {
+            "AI_VECTOR_CORE": 726
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 726
+          },
+          "first_csv_line": 88,
+          "last_csv_line": 63791,
+          "sum_elapsed_us": {
+            "mean": 7.24844214876033,
+            "median": 7.24,
+            "min": 6.88,
+            "max": 7.84
+          },
+          "union_activity_us": {
+            "mean": 7.24844214876033,
+            "median": 7.24,
+            "min": 6.88,
+            "max": 7.84
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.22261341283190084,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3244.87794214876,
+            "median": 3172.205,
+            "min": 2888.037,
+            "max": 6157.083
+          },
+          "cumulative_mean_activity_coverage_pct": 99.65635899408149
+        },
+        {
+          "native_type": "ZerosLike",
+          "native_calls": 968,
+          "cores": {
+            "AI_VECTOR_CORE": 968
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 968
+          },
+          "first_csv_line": 87,
+          "last_csv_line": 63824,
+          "sum_elapsed_us": {
+            "mean": 5.818342975206612,
+            "median": 5.8,
+            "min": 5.6,
+            "max": 6.42
+          },
+          "union_activity_us": {
+            "mean": 5.818342975206612,
+            "median": 5.8,
+            "min": 5.6,
+            "max": 6.42
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.17869235349540305,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3250.696285123967,
+            "median": 3178.0254999999997,
+            "min": 2893.758,
+            "max": 6162.744
+          },
+          "cumulative_mean_activity_coverage_pct": 99.8350513475769
+        },
+        {
+          "native_type": "IndexCheck",
+          "native_calls": 242,
+          "cores": {
+            "AI_VECTOR_CORE": 242
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 242
+          },
+          "first_csv_line": 251,
+          "last_csv_line": 63875,
+          "sum_elapsed_us": {
+            "mean": 2.826995867768595,
+            "median": 2.78,
+            "min": 2.5,
+            "max": 3.66
+          },
+          "union_activity_us": {
+            "mean": 2.826995867768595,
+            "median": 2.78,
+            "min": 2.5,
+            "max": 3.66
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.08682240752839274,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3253.5232809917356,
+            "median": 3180.6955,
+            "min": 2896.358,
+            "max": 6165.684
+          },
+          "cumulative_mean_activity_coverage_pct": 99.92187375510528
+        },
+        {
+          "native_type": "ScatterPaKvCache",
+          "native_calls": 242,
+          "cores": {
+            "AI_VECTOR_CORE": 242
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 242
+          },
+          "first_csv_line": 213,
+          "last_csv_line": 63835,
+          "sum_elapsed_us": {
+            "mean": 2.5438429752066116,
+            "median": 2.52,
+            "min": 2.24,
+            "max": 3.02
+          },
+          "union_activity_us": {
+            "mean": 2.5438429752066116,
+            "median": 2.52,
+            "min": 2.24,
+            "max": 3.02
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.07812624489471177,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3256.0671239669423,
+            "median": 3183.1455,
+            "min": 2898.738,
+            "max": 6168.384
+          },
+          "cumulative_mean_activity_coverage_pct": 100.0
+        }
+      ],
+      "sim_roles": [
+        {
+          "recipe": "balanced_grouped_gate_up",
+          "calls": 3,
+          "sum_elapsed_us": 526.794062775978,
+          "union_elapsed_us": 526.794062775979
+        },
+        {
+          "recipe": "balanced_grouped_down",
+          "calls": 3,
+          "sum_elapsed_us": 267.183128996213,
+          "union_elapsed_us": 267.18312899621105
+        },
+        {
+          "recipe": "ascend_paged_mla_decode_arch22",
+          "calls": 1,
+          "sum_elapsed_us": 232.52398845087896,
+          "union_elapsed_us": 232.5239884508792
+        },
+        {
+          "recipe": "linear_bfg",
+          "calls": 3,
+          "sum_elapsed_us": 210.29899636363325,
+          "union_elapsed_us": 210.2989963636328
+        },
+        {
+          "recipe": "latent_projection",
+          "calls": 6,
+          "sum_elapsed_us": 184.9311000000009,
+          "union_elapsed_us": 184.93109999999888
+        },
+        {
+          "recipe": "ring_allgather",
+          "calls": 9,
+          "sum_elapsed_us": 162.10799999999637,
+          "union_elapsed_us": 162.10799999999654
+        },
+        {
+          "recipe": "ring_reduce_scatter",
+          "calls": 8,
+          "sum_elapsed_us": 144.0959999999958,
+          "union_elapsed_us": 144.095999999995
+        },
+        {
+          "recipe": "dense_gate_up",
+          "calls": 4,
+          "sum_elapsed_us": 128.16146181818232,
+          "union_elapsed_us": 128.16146181818112
+        },
+        {
+          "recipe": "router",
+          "calls": 3,
+          "sum_elapsed_us": 105.55720727273598,
+          "union_elapsed_us": 105.55720727273729
+        },
+        {
+          "recipe": "linear_qkv",
+          "calls": 3,
+          "sum_elapsed_us": 105.28611909094643,
+          "union_elapsed_us": 105.28611909094707
+        },
+        {
+          "recipe": "linear_output",
+          "calls": 3,
+          "sum_elapsed_us": 68.99569454545684,
+          "union_elapsed_us": 68.99569454545599
+        },
+        {
+          "recipe": "dynamic_quantize",
+          "calls": 25,
+          "sum_elapsed_us": 62.49999999999467,
+          "union_elapsed_us": 62.49999999999727
+        },
+        {
+          "recipe": "dense_down",
+          "calls": 4,
+          "sum_elapsed_us": 52.32134787879161,
+          "union_elapsed_us": 52.32134787879204
+        },
+        {
+          "recipe": "attention_residual_scores",
+          "calls": 8,
+          "sum_elapsed_us": 40.0000000000027,
+          "union_elapsed_us": 40.00000000000182
+        },
+        {
+          "recipe": "rmsnorm",
+          "calls": 16,
+          "sum_elapsed_us": 39.99999999999915,
+          "union_elapsed_us": 39.99999999999909
+        },
+        {
+          "recipe": "output_gate",
+          "calls": 1,
+          "sum_elapsed_us": 35.18680242424388,
+          "union_elapsed_us": 35.18680242424489
+        },
+        {
+          "recipe": "output",
+          "calls": 1,
+          "sum_elapsed_us": 22.998564848485614,
+          "union_elapsed_us": 22.99856484848715
+        },
+        {
+          "recipe": "attention_residual_softmax",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 20.00000000000091
+        },
+        {
+          "recipe": "attention_residual_output_cast",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 20.0
+        },
+        {
+          "recipe": "residual_add",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999998685,
+          "union_elapsed_us": 20.0
+        },
+        {
+          "recipe": "residual_values_fp32",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 19.99999999999909
+        },
+        {
+          "recipe": "attention_residual_mix",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 19.99999999999818
+        },
+        {
+          "recipe": "q_a",
+          "calls": 1,
+          "sum_elapsed_us": 17.609773030304865,
+          "union_elapsed_us": 17.609773030304495
+        },
+        {
+          "recipe": "kv_a",
+          "calls": 1,
+          "sum_elapsed_us": 17.607916666666057,
+          "union_elapsed_us": 17.607916666665915
+        },
+        {
+          "recipe": "vllm_ascend_recurrent_kda_arch22",
+          "calls": 3,
+          "sum_elapsed_us": 12.401823181825478,
+          "union_elapsed_us": 12.40182318182542
+        },
+        {
+          "recipe": "situ",
+          "calls": 4,
+          "sum_elapsed_us": 9.999999999998899,
+          "union_elapsed_us": 10.0
+        },
+        {
+          "recipe": "sequence_parallel_reduce_scatter_pad",
+          "calls": 4,
+          "sum_elapsed_us": 9.999999999999787,
+          "union_elapsed_us": 9.99999999999909
+        },
+        {
+          "recipe": "expert_combine",
+          "calls": 3,
+          "sum_elapsed_us": 8.816571428570619,
+          "union_elapsed_us": 8.816571428572388
+        },
+        {
+          "recipe": "expert_dispatch",
+          "calls": 3,
+          "sum_elapsed_us": 8.816571428570619,
+          "union_elapsed_us": 8.816571428572388
+        },
+        {
+          "recipe": "linear_output_norm_gate",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.500000000001819
+        },
+        {
+          "recipe": "latent_norm",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.5000000000009095
+        },
+        {
+          "recipe": "linear_beta_cast",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.5000000000009095
+        },
+        {
+          "recipe": "linear_beta_sigmoid",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "expert_add",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999998508,
+          "union_elapsed_us": 7.4999999999990905
+        },
+        {
+          "recipe": "short_convolution",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.4999999999990905
+        },
+        {
+          "recipe": "grouped_situ",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.499999999998181
+        },
+        {
+          "recipe": "route_pack",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.499999999998181
+        },
+        {
+          "recipe": "route_unpack",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.499999999998181
+        },
+        {
+          "recipe": "router_topk",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.499999999998181
+        },
+        {
+          "recipe": "q_absorb",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.000000000001819
+        },
+        {
+          "recipe": "q_b",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.0
+        },
+        {
+          "recipe": "v_expand",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.0
+        },
+        {
+          "recipe": "kv_norm",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "kv_store",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "q_norm",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "sequence_parallel_right_pad",
+          "calls": 1,
+          "sum_elapsed_us": 2.500000000000391,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "gated_output",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.499999999998181
+        },
+        {
+          "recipe": "rotary",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.499999999998181
+        },
+        {
+          "recipe": "paged_mla_query_pad_nope",
+          "calls": 1,
+          "sum_elapsed_us": 0.023893333333191435,
+          "union_elapsed_us": 0.023893333333035116
+        },
+        {
+          "recipe": "paged_mla_query_pad_rope",
+          "calls": 1,
+          "sum_elapsed_us": 0.002986666666870974,
+          "union_elapsed_us": 0.002986666666402016
+        },
+        {
+          "recipe": "sequence_parallel_attention_view",
+          "calls": 4,
+          "sum_elapsed_us": 0.0,
+          "union_elapsed_us": 0.0
+        },
+        {
+          "recipe": "sequence_parallel_output_view",
+          "calls": 1,
+          "sum_elapsed_us": 0.0,
+          "union_elapsed_us": 0.0
+        }
+      ],
+      "routed_sim_geometry": [
+        {
+          "op_id": "s0.l1.expert_up",
+          "shape": [
+            16,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l1.expert_down",
+          "shape": [
+            16,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l2.expert_up",
+          "shape": [
+            16,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l2.expert_down",
+          "shape": [
+            16,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l3.expert_up",
+          "shape": [
+            16,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l3.expert_down",
+          "shape": [
+            16,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 16,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 16,
+          "global_declared_tokens": 8,
+          "row_classes": [
+            [
+              0,
+              96
+            ],
+            [
+              1,
+              16
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        }
+      ],
+      "hcom_and_controller_overlap": {
+        "hcom_envelope_union_us": {
+          "mean": 950.7328388429752,
+          "median": 877.9504999999999,
+          "min": 591.597,
+          "max": 3866.561
+        },
+        "controller_union_us": {
+          "mean": 2565.575181818182,
+          "median": 2469.4700000000003,
+          "min": 2359.169,
+          "max": 5901.539
+        },
+        "intersection_union_us": {
+          "mean": 734.1911074380165,
+          "median": 673.915,
+          "min": 438.726,
+          "max": 3674.776
+        },
+        "controller_types": {
+          "reduce_scatterAicpuKernel": 1936,
+          "allgatherAicpuKernel": 2178
+        },
+        "controller_examples": [
+          {
+            "line": 77,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 324.386
+          },
+          {
+            "line": 78,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 234.545
+          },
+          {
+            "line": 79,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 257.365
+          },
+          {
+            "line": 90,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 270.525
+          },
+          {
+            "line": 96,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 205.064
+          },
+          {
+            "line": 113,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 143.943
+          }
+        ],
+        "separately_exported_hcom_aiv_rows": 0,
+        "inclusion": "HCOM envelope contributes once to global union. AI_CPU controllers are diagnostic only; no independently exported transport AIV child rows in these selected bodies."
+      }
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p4k/kernel_details.csv",
+        "sha256": "8e1b18f02318ab650d5b7444163dc7a0dd0dc2980bc6f70307c80990e130bfd3",
+        "size_bytes": 16801673
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p4k-extraction.json",
+        "sha256": "51ff6770f41a45dcf33dacfa61ba5b242535dafe8f6037ce32bb5ba8e0d64b40",
+        "size_bytes": 378567
+      },
+      "native_forwards": 200,
+      "body_span_us": {
+        "mean": 5640.848565,
+        "median": 5581.5015,
+        "min": 5415.988,
+        "max": 7383.027
+      },
+      "body_activity_union_us": {
+        "mean": 5516.144205,
+        "median": 5456.9275,
+        "min": 5292.046,
+        "max": 7255.185
+      },
+      "body_gap_us": {
+        "mean": 124.70436000000001,
+        "median": 124.54099999999971,
+        "min": 121.1840000000002,
+        "max": 137.86099999999988
+      },
+      "extraction_activity_agreement_max_us": 9.094947017729282e-13,
+      "sim_body_us": 4345.201184545006,
+      "native_minus_sim_body_median_us": 1236.3003154549942,
+      "all_native_families": [
+        {
+          "native_type": "GroupedMatmul",
+          "native_calls": 1200,
+          "cores": {
+            "MIX_AIC": 1200
+          },
+          "task_types": {
+            "MIX_AIC": 1200
+          },
+          "first_csv_line": 132,
+          "last_csv_line": 50972,
+          "sum_elapsed_us": {
+            "mean": 2118.143925,
+            "median": 2117.4629999999997,
+            "min": 2089.722,
+            "max": 2166.003
+          },
+          "union_activity_us": {
+            "mean": 2118.143925,
+            "median": 2117.4629999999997,
+            "min": 2089.722,
+            "max": 2166.003
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 38.39899477392289,
+          "simulation_role_candidates": {
+            "recipes": [
+              "balanced_grouped_down",
+              "balanced_grouped_gate_up"
+            ],
+            "calls": 6,
+            "sum_elapsed_us": 2338.713843647197,
+            "union_elapsed_us": 2338.713843647196,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2118.143925,
+            "median": 2117.4629999999997,
+            "min": 2089.722,
+            "max": 2166.003
+          },
+          "cumulative_mean_activity_coverage_pct": 38.39899477392289
+        },
+        {
+          "native_type": "QuantBatchMatmulV3",
+          "native_calls": 3800,
+          "cores": {
+            "MIX_AIC": 3200,
+            "AI_CORE": 600
+          },
+          "task_types": {
+            "MIX_AIC": 3200,
+            "AI_CORE": 600
+          },
+          "first_csv_line": 75,
+          "last_csv_line": 50982,
+          "sum_elapsed_us": {
+            "mean": 504.57667,
+            "median": 504.3515,
+            "min": 500.609,
+            "max": 510.328
+          },
+          "union_activity_us": {
+            "mean": 504.57667,
+            "median": 504.3515,
+            "min": 500.609,
+            "max": 510.328
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 9.147271196112612,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dense_down",
+              "dense_gate_up",
+              "kv_a",
+              "linear_qkv",
+              "q_a",
+              "q_b"
+            ],
+            "calls": 14,
+            "sum_elapsed_us": 362.7764654545711,
+            "union_elapsed_us": 362.77646545457355,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 2622.720595,
+            "median": 2622.0125,
+            "min": 2593.53,
+            "max": 2669.434
+          },
+          "cumulative_mean_activity_coverage_pct": 47.54626597003549
+        },
+        {
+          "native_type": "hcom_allGather_",
+          "native_calls": 1800,
+          "cores": {
+            "COMMUNICATION": 1800
+          },
+          "task_types": {
+            "COMMUNICATION": 1800
+          },
+          "first_csv_line": 68,
+          "last_csv_line": 50985,
+          "sum_elapsed_us": {
+            "mean": 490.119925,
+            "median": 436.83799999999997,
+            "min": 322.126,
+            "max": 1629.733
+          },
+          "union_activity_us": {
+            "mean": 490.119925,
+            "median": 436.83799999999997,
+            "min": 322.126,
+            "max": 1629.733
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 8.885190574889984,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ring_allgather"
+            ],
+            "calls": 9,
+            "sum_elapsed_us": 171.32399999999848,
+            "union_elapsed_us": 171.3239999999978,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3112.84052,
+            "median": 3057.999,
+            "min": 2935.618,
+            "max": 4261.966
+          },
+          "cumulative_mean_activity_coverage_pct": 56.43145654492549
+        },
+        {
+          "native_type": "DequantSituQuant",
+          "native_calls": 1200,
+          "cores": {
+            "AI_VECTOR_CORE": 1200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1200
+          },
+          "first_csv_line": 136,
+          "last_csv_line": 50977,
+          "sum_elapsed_us": {
+            "mean": 381.28403,
+            "median": 381.3075,
+            "min": 379.61,
+            "max": 382.907
+          },
+          "union_activity_us": {
+            "mean": 381.28403,
+            "median": 381.3075,
+            "min": 379.61,
+            "max": 382.907
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 6.912147613080757,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize",
+              "grouped_situ",
+              "situ"
+            ],
+            "calls": 12,
+            "sum_elapsed_us": 29.99999999999403,
+            "union_elapsed_us": 29.999999999990905,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3494.12455,
+            "median": 3439.0875,
+            "min": 3316.786,
+            "max": 4643.493
+          },
+          "cumulative_mean_activity_coverage_pct": 63.343604158006244
+        },
+        {
+          "native_type": "MatMulV2",
+          "native_calls": 1600,
+          "cores": {
+            "AI_CORE": 1600
+          },
+          "task_types": {
+            "AI_CORE": 1600
+          },
+          "first_csv_line": 70,
+          "last_csv_line": 50962,
+          "sum_elapsed_us": {
+            "mean": 376.065875,
+            "median": 376.0975,
+            "min": 370.647,
+            "max": 380.888
+          },
+          "union_activity_us": {
+            "mean": 376.065875,
+            "median": 376.0975,
+            "min": 370.647,
+            "max": 380.888
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 6.817549741704043,
+          "simulation_role_candidates": {
+            "recipes": [
+              "linear_bfg",
+              "linear_output",
+              "output",
+              "output_gate",
+              "q_absorb",
+              "v_expand"
+            ],
+            "calls": 10,
+            "sum_elapsed_us": 390.8886690909128,
+            "union_elapsed_us": 390.888669090913,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 3870.190425,
+            "median": 3816.527,
+            "min": 3690.993,
+            "max": 5019.499
+          },
+          "cumulative_mean_activity_coverage_pct": 70.16115389971029
+        },
+        {
+          "native_type": "RecurrentKda",
+          "native_calls": 600,
+          "cores": {
+            "AI_VECTOR_CORE": 600
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 600
+          },
+          "first_csv_line": 79,
+          "last_csv_line": 50910,
+          "sum_elapsed_us": {
+            "mean": 245.07798,
+            "median": 245.084,
+            "min": 242.064,
+            "max": 247.905
+          },
+          "union_activity_us": {
+            "mean": 245.07798,
+            "median": 245.084,
+            "min": 242.064,
+            "max": 247.905
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 4.442921919587488,
+          "simulation_role_candidates": {
+            "recipes": [
+              "vllm_ascend_recurrent_kda_arch22"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 125.66617272728031,
+            "union_elapsed_us": 125.66617272728035,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4115.268405,
+            "median": 4061.4425,
+            "min": 3935.938,
+            "max": 5265.824
+          },
+          "cumulative_mean_activity_coverage_pct": 74.60407581929778
+        },
+        {
+          "native_type": "hcom_reduceScatter_",
+          "native_calls": 1600,
+          "cores": {
+            "COMMUNICATION": 1600
+          },
+          "task_types": {
+            "COMMUNICATION": 1600
+          },
+          "first_csv_line": 83,
+          "last_csv_line": 50979,
+          "sum_elapsed_us": {
+            "mean": 227.0898,
+            "median": 196.4145,
+            "min": 177.623,
+            "max": 833.258
+          },
+          "union_activity_us": {
+            "mean": 227.0898,
+            "median": 196.4145,
+            "min": 177.623,
+            "max": 833.258
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 4.1168213077924785,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ring_reduce_scatter"
+            ],
+            "calls": 8,
+            "sum_elapsed_us": 152.28799999999865,
+            "union_elapsed_us": 152.28799999999956,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4342.358205,
+            "median": 4284.2385,
+            "min": 4133.76,
+            "max": 6099.082
+          },
+          "cumulative_mean_activity_coverage_pct": 78.72089712709025
+        },
+        {
+          "native_type": "MoeDistributeDispatchV2",
+          "native_calls": 600,
+          "cores": {
+            "MIX_AIV": 600
+          },
+          "task_types": {
+            "MIX_AIV": 600
+          },
+          "first_csv_line": 131,
+          "last_csv_line": 50969,
+          "sum_elapsed_us": {
+            "mean": 175.809495,
+            "median": 175.8435,
+            "min": 169.724,
+            "max": 181.605
+          },
+          "union_activity_us": {
+            "mean": 175.809495,
+            "median": 175.8435,
+            "min": 169.724,
+            "max": 181.605
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 3.1871809087340566,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize",
+              "expert_dispatch",
+              "route_pack"
+            ],
+            "calls": 9,
+            "sum_elapsed_us": 26.449714285711856,
+            "union_elapsed_us": 26.449714285711707,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4518.1677,
+            "median": 4461.101500000001,
+            "min": 4309.083,
+            "max": 6274.865
+          },
+          "cumulative_mean_activity_coverage_pct": 81.9080780358243
+        },
+        {
+          "native_type": "FusedInferAttentionScore",
+          "native_calls": 200,
+          "cores": {
+            "MIX_AIC": 200
+          },
+          "task_types": {
+            "MIX_AIC": 200
+          },
+          "first_csv_line": 213,
+          "last_csv_line": 50958,
+          "sum_elapsed_us": {
+            "mean": 167.336005,
+            "median": 167.2835,
+            "min": 158.804,
+            "max": 176.944
+          },
+          "union_activity_us": {
+            "mean": 167.336005,
+            "median": 167.2835,
+            "min": 158.804,
+            "max": 176.944
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 3.033568354654717,
+          "simulation_role_candidates": {
+            "recipes": [
+              "ascend_paged_mla_decode_arch22"
+            ],
+            "calls": 1,
+            "sum_elapsed_us": 168.05065050817268,
+            "union_elapsed_us": 168.0506505081721,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4685.503705,
+            "median": 4627.4645,
+            "min": 4478.186,
+            "max": 6444.388
+          },
+          "cumulative_mean_activity_coverage_pct": 84.94164639047902
+        },
+        {
+          "native_type": "MoeDistributeCombineV2",
+          "native_calls": 600,
+          "cores": {
+            "MIX_AIV": 600
+          },
+          "task_types": {
+            "MIX_AIV": 600
+          },
+          "first_csv_line": 140,
+          "last_csv_line": 50973,
+          "sum_elapsed_us": {
+            "mean": 106.548165,
+            "median": 108.6325,
+            "min": 63.521,
+            "max": 141.383
+          },
+          "union_activity_us": {
+            "mean": 106.548165,
+            "median": 108.6325,
+            "min": 63.521,
+            "max": 141.383
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.9315696080501579,
+          "simulation_role_candidates": {
+            "recipes": [
+              "expert_combine",
+              "route_unpack"
+            ],
+            "calls": 6,
+            "sum_elapsed_us": 18.949714285710684,
+            "union_elapsed_us": 18.949714285714435,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4792.05187,
+            "median": 4732.3925,
+            "min": 4571.572,
+            "max": 6530.81
+          },
+          "cumulative_mean_activity_coverage_pct": 86.87321599852919
+        },
+        {
+          "native_type": "AttnResFwd",
+          "native_calls": 1800,
+          "cores": {
+            "AI_VECTOR_CORE": 1800
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1800
+          },
+          "first_csv_line": 67,
+          "last_csv_line": 50984,
+          "sum_elapsed_us": {
+            "mean": 91.852435,
+            "median": 91.8335,
+            "min": 90.442,
+            "max": 93.263
+          },
+          "union_activity_us": {
+            "mean": 91.852435,
+            "median": 91.8335,
+            "min": 90.442,
+            "max": 93.263
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.6651565221362812,
+          "simulation_role_candidates": {
+            "recipes": [
+              "attention_residual_mix",
+              "attention_residual_output_cast",
+              "attention_residual_softmax",
+              "residual_values_fp32"
+            ],
+            "calls": 32,
+            "sum_elapsed_us": 79.9999999999983,
+            "union_elapsed_us": 79.99999999999545,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4883.904305,
+            "median": 4824.5435,
+            "min": 4663.252,
+            "max": 6622.072
+          },
+          "cumulative_mean_activity_coverage_pct": 88.53837252066546
+        },
+        {
+          "native_type": "MatMulV3",
+          "native_calls": 600,
+          "cores": {
+            "AI_CORE": 600
+          },
+          "task_types": {
+            "AI_CORE": 600
+          },
+          "first_csv_line": 126,
+          "last_csv_line": 50965,
+          "sum_elapsed_us": {
+            "mean": 83.9382,
+            "median": 83.902,
+            "min": 82.361,
+            "max": 86.2
+          },
+          "union_activity_us": {
+            "mean": 83.9382,
+            "median": 83.902,
+            "min": 82.361,
+            "max": 86.2
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.5216824811054772,
+          "simulation_role_candidates": {
+            "recipes": [
+              "router"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 107.21707636364198,
+            "union_elapsed_us": 107.21707636364135,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 4967.842505,
+            "median": 4908.546,
+            "min": 4746.394,
+            "max": 6705.673
+          },
+          "cumulative_mean_activity_coverage_pct": 90.06005500177093
+        },
+        {
+          "native_type": "DynamicQuant",
+          "native_calls": 3200,
+          "cores": {
+            "AI_VECTOR_CORE": 3200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 3200
+          },
+          "first_csv_line": 72,
+          "last_csv_line": 50981,
+          "sum_elapsed_us": {
+            "mean": 83.39678,
+            "median": 83.38,
+            "min": 82.521,
+            "max": 84.56
+          },
+          "union_activity_us": {
+            "mean": 83.39678,
+            "median": 83.38,
+            "min": 82.521,
+            "max": 84.56
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.511867291729006,
+          "simulation_role_candidates": {
+            "recipes": [
+              "dynamic_quantize"
+            ],
+            "calls": 25,
+            "sum_elapsed_us": 62.499999999992895,
+            "union_elapsed_us": 62.499999999989086,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5051.239285,
+            "median": 4992.127,
+            "min": 4829.535,
+            "max": 6788.875
+          },
+          "cumulative_mean_activity_coverage_pct": 91.57192229349994
+        },
+        {
+          "native_type": "CausalConv1d",
+          "native_calls": 600,
+          "cores": {
+            "MIX_AIV": 600
+          },
+          "task_types": {
+            "MIX_AIV": 600
+          },
+          "first_csv_line": 77,
+          "last_csv_line": 50908,
+          "sum_elapsed_us": {
+            "mean": 58.308835,
+            "median": 58.311499999999995,
+            "min": 57.162,
+            "max": 59.461
+          },
+          "union_activity_us": {
+            "mean": 58.308835,
+            "median": 58.311499999999995,
+            "min": 57.162,
+            "max": 59.461
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 1.057057843903847,
+          "simulation_role_candidates": {
+            "recipes": [
+              "short_convolution"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 7.500000000000284,
+            "union_elapsed_us": 7.5000000000009095,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5109.54812,
+            "median": 5050.6195,
+            "min": 4887.136,
+            "max": 6847.916
+          },
+          "cumulative_mean_activity_coverage_pct": 92.6289801374038
+        },
+        {
+          "native_type": "ForeachAddList",
+          "native_calls": 600,
+          "cores": {
+            "AI_VECTOR_CORE": 600
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 600
+          },
+          "first_csv_line": 151,
+          "last_csv_line": 50983,
+          "sum_elapsed_us": {
+            "mean": 54.448785,
+            "median": 54.531,
+            "min": 53.161,
+            "max": 55.502
+          },
+          "union_activity_us": {
+            "mean": 54.448785,
+            "median": 54.531,
+            "min": 53.161,
+            "max": 55.502
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.9870805217645684,
+          "simulation_role_candidates": {
+            "recipes": [
+              "expert_add",
+              "residual_add"
+            ],
+            "calls": 11,
+            "sum_elapsed_us": 27.499999999997193,
+            "union_elapsed_us": 27.50000000000182,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5163.996905,
+            "median": 5105.171,
+            "min": 4941.618,
+            "max": 6902.778
+          },
+          "cumulative_mean_activity_coverage_pct": 93.61606065916837
+        },
+        {
+          "native_type": "RmsNorm",
+          "native_calls": 1000,
+          "cores": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "first_csv_line": 148,
+          "last_csv_line": 50980,
+          "sum_elapsed_us": {
+            "mean": 32.66534,
+            "median": 32.67,
+            "min": 31.5,
+            "max": 33.841
+          },
+          "union_activity_us": {
+            "mean": 32.66534,
+            "median": 32.67,
+            "min": 31.5,
+            "max": 33.841
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.5921770495120695,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5196.662245,
+            "median": 5137.471,
+            "min": 4975.059,
+            "max": 6936.238
+          },
+          "cumulative_mean_activity_coverage_pct": 94.20823770868044
+        },
+        {
+          "native_type": "Slice",
+          "native_calls": 2000,
+          "cores": {
+            "AI_VECTOR_CORE": 2000
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 2000
+          },
+          "first_csv_line": 71,
+          "last_csv_line": 50953,
+          "sum_elapsed_us": {
+            "mean": 32.208095,
+            "median": 32.2,
+            "min": 31.622,
+            "max": 33.16
+          },
+          "union_activity_us": {
+            "mean": 32.208095,
+            "median": 32.2,
+            "min": 31.622,
+            "max": 33.16
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.5838878354703927,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5216.712035,
+            "median": 5157.642,
+            "min": 4995.039,
+            "max": 6956.158
+          },
+          "cumulative_mean_activity_coverage_pct": 94.57171243404794
+        },
+        {
+          "native_type": "Mul",
+          "native_calls": 1000,
+          "cores": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "first_csv_line": 96,
+          "last_csv_line": 50961,
+          "sum_elapsed_us": {
+            "mean": 30.937325,
+            "median": 30.92,
+            "min": 30.32,
+            "max": 31.701
+          },
+          "union_activity_us": {
+            "mean": 30.937325,
+            "median": 30.92,
+            "min": 30.32,
+            "max": 31.701
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.5608505479598861,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5247.64936,
+            "median": 5188.3925,
+            "min": 5026.059,
+            "max": 6987.198
+          },
+          "cumulative_mean_activity_coverage_pct": 95.13256298200783
+        },
+        {
+          "native_type": "PadV3",
+          "native_calls": 400,
+          "cores": {
+            "MIX_AIV": 400
+          },
+          "task_types": {
+            "MIX_AIV": 400
+          },
+          "first_csv_line": 210,
+          "last_csv_line": 50957,
+          "sum_elapsed_us": {
+            "mean": 30.450975,
+            "median": 30.461,
+            "min": 29.341,
+            "max": 31.441
+          },
+          "union_activity_us": {
+            "mean": 30.450975,
+            "median": 30.461,
+            "min": 29.341,
+            "max": 31.441
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.5520337008666002,
+          "simulation_role_candidates": {
+            "recipes": [
+              "paged_mla_query_pad_nope",
+              "paged_mla_query_pad_rope"
+            ],
+            "calls": 2,
+            "sum_elapsed_us": 0.6451199999997215,
+            "union_elapsed_us": 0.6451199999992241,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5278.100335,
+            "median": 5218.8925,
+            "min": 5056.32,
+            "max": 7017.699
+          },
+          "cumulative_mean_activity_coverage_pct": 95.68459668287444
+        },
+        {
+          "native_type": "ZerosLike",
+          "native_calls": 800,
+          "cores": {
+            "AI_VECTOR_CORE": 800
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 800
+          },
+          "first_csv_line": 80,
+          "last_csv_line": 50937,
+          "sum_elapsed_us": {
+            "mean": 27.14707,
+            "median": 27.16,
+            "min": 26.7,
+            "max": 27.78
+          },
+          "union_activity_us": {
+            "mean": 27.14707,
+            "median": 27.16,
+            "min": 26.7,
+            "max": 27.78
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.4921385118139782,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5305.247405,
+            "median": 5246.163500000001,
+            "min": 5083.501,
+            "max": 7044.919
+          },
+          "cumulative_mean_activity_coverage_pct": 96.1767351946884
+        },
+        {
+          "native_type": "Transpose",
+          "native_calls": 200,
+          "cores": {
+            "AI_VECTOR_CORE": 200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 200
+          },
+          "first_csv_line": 207,
+          "last_csv_line": 50952,
+          "sum_elapsed_us": {
+            "mean": 25.4972,
+            "median": 25.560499999999998,
+            "min": 22.48,
+            "max": 27.601
+          },
+          "union_activity_us": {
+            "mean": 25.4972,
+            "median": 25.560499999999998,
+            "min": 22.48,
+            "max": 27.601
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.4622286701078004,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5330.744605,
+            "median": 5272.763999999999,
+            "min": 5107.402,
+            "max": 7070.82
+          },
+          "cumulative_mean_activity_coverage_pct": 96.63896386479622
+        },
+        {
+          "native_type": "Cast",
+          "native_calls": 1200,
+          "cores": {
+            "AI_VECTOR_CORE": 1200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1200
+          },
+          "first_csv_line": 73,
+          "last_csv_line": 50904,
+          "sum_elapsed_us": {
+            "mean": 24.01647,
+            "median": 24.001,
+            "min": 23.54,
+            "max": 24.741
+          },
+          "union_activity_us": {
+            "mean": 24.01647,
+            "median": 24.001,
+            "min": 23.54,
+            "max": 24.741
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.4353851006692456,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5350.75429,
+            "median": 5292.5645,
+            "min": 5127.323,
+            "max": 7090.801
+          },
+          "cumulative_mean_activity_coverage_pct": 97.00171154245595
+        },
+        {
+          "native_type": "Sigmoid",
+          "native_calls": 1000,
+          "cores": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 1000
+          },
+          "first_csv_line": 74,
+          "last_csv_line": 50960,
+          "sum_elapsed_us": {
+            "mean": 19.1999,
+            "median": 19.18,
+            "min": 18.761,
+            "max": 20.18
+          },
+          "union_activity_us": {
+            "mean": 19.1999,
+            "median": 19.18,
+            "min": 18.761,
+            "max": 20.18
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.34806740517400964,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5368.468345,
+            "median": 5310.165,
+            "min": 5144.704,
+            "max": 7108.401
+          },
+          "cumulative_mean_activity_coverage_pct": 97.32284265037629
+        },
+        {
+          "native_type": "AsStrided",
+          "native_calls": 800,
+          "cores": {
+            "AI_VECTOR_CORE": 800
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 800
+          },
+          "first_csv_line": 78,
+          "last_csv_line": 50946,
+          "sum_elapsed_us": {
+            "mean": 19.09837,
+            "median": 19.0805,
+            "min": 18.64,
+            "max": 19.821
+          },
+          "union_activity_us": {
+            "mean": 19.09837,
+            "median": 19.0805,
+            "min": 18.64,
+            "max": 19.821
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.346226807897601,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5387.566715,
+            "median": 5329.145,
+            "min": 5163.844,
+            "max": 7127.461
+          },
+          "cumulative_mean_activity_coverage_pct": 97.66906945827388
+        },
+        {
+          "native_type": "Index",
+          "native_calls": 200,
+          "cores": {
+            "AI_VECTOR_CORE": 200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 200
+          },
+          "first_csv_line": 243,
+          "last_csv_line": 50988,
+          "sum_elapsed_us": {
+            "mean": 18.856145,
+            "median": 18.52,
+            "min": 17.5,
+            "max": 24.76
+          },
+          "union_activity_us": {
+            "mean": 18.856145,
+            "median": 18.52,
+            "min": 17.5,
+            "max": 24.76
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.3418356065258088,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5406.42286,
+            "median": 5347.7555,
+            "min": 5181.964,
+            "max": 7145.921
+          },
+          "cumulative_mean_activity_coverage_pct": 98.0109050647997
+        },
+        {
+          "native_type": "layer_norm_gated_fwd_kernel",
+          "native_calls": 600,
+          "cores": {
+            "AI_VECTOR_CORE": 600
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 600
+          },
+          "first_csv_line": 81,
+          "last_csv_line": 50912,
+          "sum_elapsed_us": {
+            "mean": 17.68152,
+            "median": 17.671,
+            "min": 17.18,
+            "max": 18.341
+          },
+          "union_activity_us": {
+            "mean": 17.68152,
+            "median": 17.671,
+            "min": 17.18,
+            "max": 18.341
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.32054129375321505,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5424.10438,
+            "median": 5365.406,
+            "min": 5199.324,
+            "max": 7163.722
+          },
+          "cumulative_mean_activity_coverage_pct": 98.33144635855291
+        },
+        {
+          "native_type": "MoeGatingTopK",
+          "native_calls": 600,
+          "cores": {
+            "AI_VECTOR_CORE": 600
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 600
+          },
+          "first_csv_line": 130,
+          "last_csv_line": 50968,
+          "sum_elapsed_us": {
+            "mean": 17.10231,
+            "median": 17.0905,
+            "min": 16.6,
+            "max": 17.9
+          },
+          "union_activity_us": {
+            "mean": 17.10231,
+            "median": 17.0905,
+            "min": 16.6,
+            "max": 17.9
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.3100410243897893,
+          "simulation_role_candidates": {
+            "recipes": [
+              "router_topk"
+            ],
+            "calls": 3,
+            "sum_elapsed_us": 7.499999999999396,
+            "union_elapsed_us": 7.5000000000009095,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5441.20669,
+            "median": 5382.666,
+            "min": 5216.284,
+            "max": 7180.603
+          },
+          "cumulative_mean_activity_coverage_pct": 98.64148738294271
+        },
+        {
+          "native_type": "MemSet",
+          "native_calls": 400,
+          "cores": {
+            "AI_VECTOR_CORE": 400
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 400
+          },
+          "first_csv_line": 209,
+          "last_csv_line": 50956,
+          "sum_elapsed_us": {
+            "mean": 14.42534,
+            "median": 14.430499999999999,
+            "min": 14.0,
+            "max": 14.861
+          },
+          "union_activity_us": {
+            "mean": 14.42534,
+            "median": 14.430499999999999,
+            "min": 14.0,
+            "max": 14.861
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.26151129237927534,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5455.63203,
+            "median": 5397.036,
+            "min": 5230.764,
+            "max": 7194.843
+          },
+          "cumulative_mean_activity_coverage_pct": 98.90299867532198
+        },
+        {
+          "native_type": "Tanh",
+          "native_calls": 400,
+          "cores": {
+            "AI_VECTOR_CORE": 400
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 400
+          },
+          "first_csv_line": 95,
+          "last_csv_line": 50846,
+          "sum_elapsed_us": {
+            "mean": 13.421495,
+            "median": 13.401,
+            "min": 13.1,
+            "max": 14.14
+          },
+          "union_activity_us": {
+            "mean": 13.421495,
+            "median": 13.401,
+            "min": 13.1,
+            "max": 14.14
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.24331298278667826,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5469.053525,
+            "median": 5410.326,
+            "min": 5244.165,
+            "max": 7208.183
+          },
+          "cumulative_mean_activity_coverage_pct": 99.14631165810867
+        },
+        {
+          "native_type": "TransposeBatchMatMul",
+          "native_calls": 200,
+          "cores": {
+            "AI_CORE": 200
+          },
+          "task_types": {
+            "AI_CORE": 200
+          },
+          "first_csv_line": 214,
+          "last_csv_line": 50959,
+          "sum_elapsed_us": {
+            "mean": 13.12829,
+            "median": 13.08,
+            "min": 12.52,
+            "max": 14.12
+          },
+          "union_activity_us": {
+            "mean": 13.12829,
+            "median": 13.08,
+            "min": 12.52,
+            "max": 14.12
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.23799758512658392,
+          "simulation_role_candidates": {
+            "recipes": [
+              "v_expand"
+            ],
+            "calls": 1,
+            "sum_elapsed_us": 5.000000000000782,
+            "union_elapsed_us": 5.000000000001819,
+            "pairing": "caller_role_only_not_native_ABI_or_valid_routing_equivalence"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5482.181815,
+            "median": 5423.2365,
+            "min": 5257.865,
+            "max": 7221.624
+          },
+          "cumulative_mean_activity_coverage_pct": 99.38430924323524
+        },
+        {
+          "native_type": "RealDiv",
+          "native_calls": 400,
+          "cores": {
+            "AI_VECTOR_CORE": 400
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 400
+          },
+          "first_csv_line": 94,
+          "last_csv_line": 50845,
+          "sum_elapsed_us": {
+            "mean": 10.915515000000001,
+            "median": 10.901,
+            "min": 10.7,
+            "max": 11.321
+          },
+          "union_activity_us": {
+            "mean": 10.915515000000001,
+            "median": 10.901,
+            "min": 10.7,
+            "max": 11.321
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.19788306096323313,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5493.09733,
+            "median": 5434.097,
+            "min": 5268.865,
+            "max": 7232.525
+          },
+          "cumulative_mean_activity_coverage_pct": 99.58219230419849
+        },
+        {
+          "native_type": "BatchMatMulV2",
+          "native_calls": 200,
+          "cores": {
+            "AI_CORE": 200
+          },
+          "task_types": {
+            "AI_CORE": 200
+          },
+          "first_csv_line": 202,
+          "last_csv_line": 50947,
+          "sum_elapsed_us": {
+            "mean": 8.450385,
+            "median": 8.48,
+            "min": 7.98,
+            "max": 9.04
+          },
+          "union_activity_us": {
+            "mean": 8.450385,
+            "median": 8.48,
+            "min": 7.98,
+            "max": 9.04
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.15319369265836663,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5501.547715,
+            "median": 5442.4375,
+            "min": 5277.365,
+            "max": 7240.905
+          },
+          "cumulative_mean_activity_coverage_pct": 99.73538599685683
+        },
+        {
+          "native_type": "IndexCheck",
+          "native_calls": 200,
+          "cores": {
+            "AI_VECTOR_CORE": 200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 200
+          },
+          "first_csv_line": 241,
+          "last_csv_line": 50986,
+          "sum_elapsed_us": {
+            "mean": 8.00927,
+            "median": 7.98,
+            "min": 7.64,
+            "max": 9.36
+          },
+          "union_activity_us": {
+            "mean": 8.00927,
+            "median": 7.98,
+            "min": 7.64,
+            "max": 9.36
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.14519689301704908,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5509.556985,
+            "median": 5450.3375,
+            "min": 5285.566,
+            "max": 7248.925
+          },
+          "cumulative_mean_activity_coverage_pct": 99.8805828898739
+        },
+        {
+          "native_type": "ScatterPaKvCache",
+          "native_calls": 200,
+          "cores": {
+            "AI_VECTOR_CORE": 200
+          },
+          "task_types": {
+            "AI_VECTOR_CORE": 200
+          },
+          "first_csv_line": 206,
+          "last_csv_line": 50951,
+          "sum_elapsed_us": {
+            "mean": 6.58722,
+            "median": 6.560499999999999,
+            "min": 6.22,
+            "max": 7.04
+          },
+          "union_activity_us": {
+            "mean": 6.58722,
+            "median": 6.560499999999999,
+            "min": 6.22,
+            "max": 7.04
+          },
+          "within_family_overlap_us": {
+            "mean": 0.0,
+            "median": 0.0,
+            "min": 0.0,
+            "max": 0.0
+          },
+          "mean_share_of_body_activity_pct": 0.11941711012611209,
+          "simulation_role_candidates": {
+            "recipes": [],
+            "calls": 0,
+            "sum_elapsed_us": 0,
+            "union_elapsed_us": 0,
+            "pairing": "unmatched_no_declared_role"
+          },
+          "cumulative_family_union_us": {
+            "mean": 5516.144205,
+            "median": 5456.9275,
+            "min": 5292.046,
+            "max": 7255.185
+          },
+          "cumulative_mean_activity_coverage_pct": 100.00000000000001
+        }
+      ],
+      "sim_roles": [
+        {
+          "recipe": "balanced_grouped_gate_up",
+          "calls": 3,
+          "sum_elapsed_us": 1554.8433226623447,
+          "union_elapsed_us": 1554.8433226623456
+        },
+        {
+          "recipe": "balanced_grouped_down",
+          "calls": 3,
+          "sum_elapsed_us": 783.8705209848521,
+          "union_elapsed_us": 783.8705209848504
+        },
+        {
+          "recipe": "linear_bfg",
+          "calls": 3,
+          "sum_elapsed_us": 229.7213672727274,
+          "union_elapsed_us": 229.72136727272755
+        },
+        {
+          "recipe": "latent_projection",
+          "calls": 6,
+          "sum_elapsed_us": 187.23175818182725,
+          "union_elapsed_us": 187.23175818182972
+        },
+        {
+          "recipe": "ring_allgather",
+          "calls": 9,
+          "sum_elapsed_us": 171.32399999999848,
+          "union_elapsed_us": 171.3239999999978
+        },
+        {
+          "recipe": "ascend_paged_mla_decode_arch22",
+          "calls": 1,
+          "sum_elapsed_us": 168.05065050817268,
+          "union_elapsed_us": 168.0506505081721
+        },
+        {
+          "recipe": "ring_reduce_scatter",
+          "calls": 8,
+          "sum_elapsed_us": 152.28799999999865,
+          "union_elapsed_us": 152.28799999999956
+        },
+        {
+          "recipe": "dense_gate_up",
+          "calls": 4,
+          "sum_elapsed_us": 139.98259151515134,
+          "union_elapsed_us": 139.98259151515504
+        },
+        {
+          "recipe": "vllm_ascend_recurrent_kda_arch22",
+          "calls": 3,
+          "sum_elapsed_us": 125.66617272728031,
+          "union_elapsed_us": 125.66617272728035
+        },
+        {
+          "recipe": "linear_qkv",
+          "calls": 3,
+          "sum_elapsed_us": 116.01990545455898,
+          "union_elapsed_us": 116.0199054545592
+        },
+        {
+          "recipe": "router",
+          "calls": 3,
+          "sum_elapsed_us": 107.21707636364198,
+          "union_elapsed_us": 107.21707636364135
+        },
+        {
+          "recipe": "linear_output",
+          "calls": 3,
+          "sum_elapsed_us": 82.19485090909195,
+          "union_elapsed_us": 82.19485090909166
+        },
+        {
+          "recipe": "dynamic_quantize",
+          "calls": 25,
+          "sum_elapsed_us": 62.499999999992895,
+          "union_elapsed_us": 62.499999999989086
+        },
+        {
+          "recipe": "dense_down",
+          "calls": 4,
+          "sum_elapsed_us": 59.916770909099526,
+          "union_elapsed_us": 59.91677090909889
+        },
+        {
+          "recipe": "output_gate",
+          "calls": 1,
+          "sum_elapsed_us": 41.574167272726115,
+          "union_elapsed_us": 41.57416727272539
+        },
+        {
+          "recipe": "attention_residual_scores",
+          "calls": 8,
+          "sum_elapsed_us": 40.0000000000027,
+          "union_elapsed_us": 40.00000000000637
+        },
+        {
+          "recipe": "rmsnorm",
+          "calls": 16,
+          "sum_elapsed_us": 39.99999999999915,
+          "union_elapsed_us": 39.99999999999727
+        },
+        {
+          "recipe": "output",
+          "calls": 1,
+          "sum_elapsed_us": 27.39828363636576,
+          "union_elapsed_us": 27.398283636364795
+        },
+        {
+          "recipe": "q_a",
+          "calls": 1,
+          "sum_elapsed_us": 20.944773333333444,
+          "union_elapsed_us": 20.944773333334524
+        },
+        {
+          "recipe": "kv_a",
+          "calls": 1,
+          "sum_elapsed_us": 20.912424242427008,
+          "union_elapsed_us": 20.912424242425914
+        },
+        {
+          "recipe": "attention_residual_output_cast",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 20.00000000000182
+        },
+        {
+          "recipe": "residual_add",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999998685,
+          "union_elapsed_us": 20.00000000000182
+        },
+        {
+          "recipe": "attention_residual_mix",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 19.99999999999818
+        },
+        {
+          "recipe": "attention_residual_softmax",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 19.99999999999818
+        },
+        {
+          "recipe": "residual_values_fp32",
+          "calls": 8,
+          "sum_elapsed_us": 19.999999999999574,
+          "union_elapsed_us": 19.99999999999727
+        },
+        {
+          "recipe": "expert_combine",
+          "calls": 3,
+          "sum_elapsed_us": 11.449714285712176,
+          "union_elapsed_us": 11.449714285714435
+        },
+        {
+          "recipe": "expert_dispatch",
+          "calls": 3,
+          "sum_elapsed_us": 11.449714285713064,
+          "union_elapsed_us": 11.449714285710797
+        },
+        {
+          "recipe": "situ",
+          "calls": 4,
+          "sum_elapsed_us": 9.999999999998899,
+          "union_elapsed_us": 10.0
+        },
+        {
+          "recipe": "linear_beta_cast",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.500000000001819
+        },
+        {
+          "recipe": "router_topk",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.5000000000009095
+        },
+        {
+          "recipe": "short_convolution",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.5000000000009095
+        },
+        {
+          "recipe": "expert_add",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999998508,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "linear_beta_sigmoid",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "linear_output_norm_gate",
+          "calls": 3,
+          "sum_elapsed_us": 7.500000000000284,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "route_pack",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999999396,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "route_unpack",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999998508,
+          "union_elapsed_us": 7.5
+        },
+        {
+          "recipe": "grouped_situ",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999998508,
+          "union_elapsed_us": 7.499999999996362
+        },
+        {
+          "recipe": "latent_norm",
+          "calls": 3,
+          "sum_elapsed_us": 7.499999999998508,
+          "union_elapsed_us": 7.499999999994543
+        },
+        {
+          "recipe": "q_absorb",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.000000000001819
+        },
+        {
+          "recipe": "v_expand",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.000000000001819
+        },
+        {
+          "recipe": "q_b",
+          "calls": 1,
+          "sum_elapsed_us": 5.000000000000782,
+          "union_elapsed_us": 5.0
+        },
+        {
+          "recipe": "gated_output",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "kv_norm",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "kv_store",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "q_norm",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.5
+        },
+        {
+          "recipe": "rotary",
+          "calls": 1,
+          "sum_elapsed_us": 2.4999999999995026,
+          "union_elapsed_us": 2.499999999998181
+        },
+        {
+          "recipe": "paged_mla_query_pad_nope",
+          "calls": 1,
+          "sum_elapsed_us": 0.5734400000001472,
+          "union_elapsed_us": 0.5734400000001187
+        },
+        {
+          "recipe": "paged_mla_query_pad_rope",
+          "calls": 1,
+          "sum_elapsed_us": 0.0716799999995743,
+          "union_elapsed_us": 0.07167999999910535
+        },
+        {
+          "recipe": "kda_beta_contiguous",
+          "calls": 3,
+          "sum_elapsed_us": 0.05471999999961952,
+          "union_elapsed_us": 0.05471999999917898
+        },
+        {
+          "recipe": "sequence_parallel_view",
+          "calls": 1,
+          "sum_elapsed_us": 0,
+          "union_elapsed_us": 0
+        }
+      ],
+      "routed_sim_geometry": [
+        {
+          "op_id": "s0.l1.expert_up",
+          "shape": [
+            48,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l1.expert_down",
+          "shape": [
+            48,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l2.expert_up",
+          "shape": [
+            48,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l2.expert_down",
+          "shape": [
+            48,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l3.expert_up",
+          "shape": [
+            48,
+            6144,
+            3584
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        },
+        {
+          "op_id": "s0.l3.expert_down",
+          "shape": [
+            48,
+            3584,
+            3072
+          ],
+          "weight_bank_experts": 112,
+          "active_expert_matrices": 48,
+          "routing_basis": "forced_balanced_integer_counts",
+          "valid_received_assignment_rows": 48,
+          "global_declared_tokens": 24,
+          "row_classes": [
+            [
+              0,
+              64
+            ],
+            [
+              1,
+              48
+            ]
+          ],
+          "capture_group_list_values": "unobserved"
+        }
+      ],
+      "hcom_and_controller_overlap": {
+        "hcom_envelope_union_us": {
+          "mean": 717.209725,
+          "median": 656.923,
+          "min": 509.671,
+          "max": 2462.991
+        },
+        "controller_union_us": {
+          "mean": 2724.266855,
+          "median": 2637.1935000000003,
+          "min": 2492.39,
+          "max": 3789.975
+        },
+        "intersection_union_us": {
+          "mean": 513.19194,
+          "median": 457.2985,
+          "min": 322.106,
+          "max": 2155.363
+        },
+        "controller_types": {
+          "allgatherAicpuKernel": 2000,
+          "reduce_scatterAicpuKernel": 1600
+        },
+        "controller_examples": [
+          {
+            "line": 69,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 167.683
+          },
+          {
+            "line": 76,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 181.864
+          },
+          {
+            "line": 84,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 156.703
+          },
+          {
+            "line": 91,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 255.925
+          },
+          {
+            "line": 109,
+            "type": "allgatherAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 180.324
+          },
+          {
+            "line": 110,
+            "type": "reduce_scatterAicpuKernel",
+            "core": "AI_CPU",
+            "task_type": "AI_CPU",
+            "duration_us": 190.164
+          }
+        ],
+        "separately_exported_hcom_aiv_rows": 0,
+        "inclusion": "HCOM envelope contributes once to global union. AI_CPU controllers are diagnostic only; no independently exported transport AIV child rows in these selected bodies."
+      }
+    }
+  ],
+  "wall_seconds": 4.907078290940262,
+  "maxrss_bytes": 56328192
+}

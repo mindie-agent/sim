@@ -79,12 +79,14 @@ TP label and Body totals never set retention, rates, ownership or work.
 
 The eight retained full-body controls are in
 `data/verification/kimi-mla-body-domain-20261030.json`. At TP8, B1@128K,
-B24@4K/32K and B64@128K have body errors −17.07%, −19.43%, −11.32% and
-−10.70%; TP16 gives −4.52%, −3.79%, +6.30% and −7.55%. Each uses the
+B24@4K/32K and B64@128K have body errors −20.05%, −22.15%, −13.71% and
+−11.75%; TP16 gives −10.94%, −9.84%, +0.87% and −9.48%. Each uses the
 prompt lower bound because per-call context values are not captured. The
 artifact retains native body/activity/gap statistics and all four layer
 spans. Two TP8 points remain outside 15%; no all-domain pass is claimed.
-All controls completed in 0.72–44.24 seconds below 42 MB peak RSS, with no
+The corrected input explicitly selects the existing mixed KDA QKV/BFG
+projection; previous controls used the older template without that selector.
+All controls completed in 0.44–38.49 seconds below 45 MB peak RSS, with no
 live tasks/programs and released buffers to floating-point precision
 (maximum residual 2.33e−10 bytes).
 
@@ -98,3 +100,22 @@ copies, infer capacity from sequence-parallel right padding, or assign 128K KV
 to inactive rows. Twelve unmodified C++ host oracle controls for 6→8/12→16,
 8/16 heads and 4K/32K/128K verify identical active owner/FD work. Only the final
 exclusive host endpoint advances across zero-work storage rows.
+
+`data/verification/kimi-body-activity-20261030.json` accounts for every native
+family in the two failed TP8 controls, including unmatched events. Per-forward
+interval unions reproduce the retained profiler activity. AllGather and
+ReduceScatter envelopes contribute once; overlapping AI_CPU controllers remain
+separate diagnostics. No independent HCOM AIV child rows exist in these body
+windows. The top ten native families cover 83.06%/86.87% of mean activity.
+B1 is led by HCOM, while B24@4K is led by routed GMM and includes substantial
+DequantSituQuant service. The current balanced GMM model is already higher
+than those native GMM totals; its excess offsets other missing service.
+
+`data/verification/kimi-body-primitive-residual-20261030.json` separately keeps
+all exact declared-contract matches, call-count differences and unmatched
+native signatures. It does not turn active-parameter matches into binary,
+layout, routing-value or critical-path equivalence. The existing 4K-trained,
+16K-validated Qwen A3 response selectors do not match the Kimi fixed dimensions
+and kernel families. Neither body residuals nor unmatched activity become
+parameters. The adjacent producers read the ordinary body-control JSONs from
+`--controls-dir` and stream the original source captures.
