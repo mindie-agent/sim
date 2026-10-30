@@ -1,0 +1,120 @@
+{
+  "schema": "mindie-fai-host-mapping-control/1",
+  "boundary": "one_isolated_gqa_operator",
+  "case": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a3-qwen36-tp4-source-model.json",
+  "case_sha256": "e77b14955f72c696d5d62e7ebf12b77484275dfd133d5319b2755d1afe63500d",
+  "host_schedule": "ops-transformer a3925fd49 FAInfer flash decode; 512-row macro partitions",
+  "device_program": "staged_gqa_decode analytical128-row pipeline, not full native instruction reconstruction",
+  "rows": [
+    {
+      "batch": 1,
+      "query": 4,
+      "context": 126976,
+      "mapping": "uniform",
+      "duration_us": 144.77453212121227,
+      "wall_seconds": 0.1351029999786988,
+      "serviced": {
+        "memory@r0:s0": 131276287.99999402,
+        "mte1@r0:s0": 136368248.0,
+        "mte2_aic@r0:s0": 130273280.0,
+        "mte2_aiv@r0:s0": 495360.0,
+        "mte3@r0:s0": 507648.0,
+        "vector@r0:s0": 40252812.0,
+        "matrix@r0:s0": 0.011543500000000087
+      },
+      "live_tasks": 0
+    },
+    {
+      "batch": 1,
+      "query": 4,
+      "context": 126976,
+      "mapping": "fai_flash_decode",
+      "duration_us": 150.32867515151426,
+      "wall_seconds": 0.11824820807669312,
+      "serviced": {
+        "memory@r0:s0": 131276288.00000113,
+        "mte1@r0:s0": 136368248.0,
+        "mte2_aic@r0:s0": 130273280.0,
+        "mte2_aiv@r0:s0": 495360.0,
+        "mte3@r0:s0": 507648.0,
+        "vector@r0:s0": 40252812.0,
+        "matrix@r0:s0": 0.011543500000000075
+      },
+      "live_tasks": 0
+    },
+    {
+      "batch": 4,
+      "query": 4,
+      "context": 126976,
+      "mapping": "uniform",
+      "duration_us": 543.2901042424156,
+      "wall_seconds": 0.43386745802126825,
+      "serviced": {
+        "memory@r0:s0": 521395712.0001022,
+        "mte1@r0:s0": 544735712.0,
+        "mte2_aic@r0:s0": 520355840.0,
+        "mte2_aiv@r0:s0": 495360.0,
+        "mte3@r0:s0": 544512.0,
+        "vector@r0:s0": 159892368.0,
+        "matrix@r0:s0": 0.046173999999999014
+      },
+      "live_tasks": 0
+    },
+    {
+      "batch": 4,
+      "query": 4,
+      "context": 126976,
+      "mapping": "fai_flash_decode",
+      "duration_us": 547.1225766666762,
+      "wall_seconds": 0.4684502499876544,
+      "serviced": {
+        "memory@r0:s0": 521581184.00006187,
+        "mte1@r0:s0": 544772575.9999956,
+        "mte2_aic@r0:s0": 520392704.0000341,
+        "mte2_aiv@r0:s0": 569664.0,
+        "mte3@r0:s0": 618816.0000000001,
+        "vector@r0:s0": 159948311.99999905,
+        "matrix@r0:s0": 0.04617399999999735
+      },
+      "live_tasks": 0
+    },
+    {
+      "batch": 12,
+      "query": 4,
+      "context": 126976,
+      "mapping": "uniform",
+      "duration_us": 2701.2331424240947,
+      "wall_seconds": 1.36276516597718,
+      "serviced": {
+        "memory@r0:s0": 1561961472.0006106,
+        "mte1@r0:s0": 1633764768.0004692,
+        "mte2_aic@r0:s0": 1560625151.9999964,
+        "mte2_aiv@r0:s0": 594432.0000000001,
+        "mte3@r0:s0": 741888.0000000003,
+        "vector@r0:s0": 479005775.9998827,
+        "matrix@r0:s0": 0.13852200000002723
+      },
+      "live_tasks": 0
+    },
+    {
+      "batch": 12,
+      "query": 4,
+      "context": 126976,
+      "mapping": "fai_flash_decode",
+      "duration_us": 1621.1495748486482,
+      "wall_seconds": 2.431662666029297,
+      "serviced": {
+        "memory@r0:s0": 1562394240.0011728,
+        "mte1@r0:s0": 1633850784.0002182,
+        "mte2_aic@r0:s0": 1560711167.998606,
+        "mte2_aiv@r0:s0": 767808.0000000008,
+        "mte3@r0:s0": 915264.0000000013,
+        "vector@r0:s0": 479136311.99950564,
+        "matrix@r0:s0": 0.1385220000000098
+      },
+      "live_tasks": 0
+    }
+  ],
+  "accuracy_verdict": null,
+  "measurement_input": false
+}

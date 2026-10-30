@@ -31,7 +31,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import math
 from typing import Callable, Mapping
 
@@ -111,6 +111,9 @@ class StagedGQADecode:
     Optional ``target_cores`` increases partitions to fill the declared owner
     budget after batch/head/query parallelism. It is an analytic mapping;
     captured dispatch should continue to declare its explicit split count.
+    ``kv_mapping='fai_flash_decode'`` instead uses the pinned FAI host budget
+    across query boundaries and a global producer/merge barrier. Device stages
+    remain analytical; selecting host ownership does not select a native kernel.
     """
 
     key_tile: int = 128
@@ -118,6 +121,7 @@ class StagedGQADecode:
     kv_splits: int = 1
     slots: int = 2
     target_cores: int | None = None
+    kv_mapping: str = "uniform"
 
     def __post_init__(self):
         _positive_int(self.key_tile, "key_tile")
@@ -126,6 +130,10 @@ class StagedGQADecode:
         _positive_int(self.slots, "slots")
         if self.target_cores is not None:
             _positive_int(self.target_cores, "target_cores")
+        if self.kv_mapping not in {"uniform", "fai_flash_decode"}:
+            raise ModelingError("attention_decode_unknown_kv_mapping")
+        if self.kv_mapping == "fai_flash_decode" and self.kv_splits != 1:
+            raise ModelingError("fai_decode_mapping_owns_splits:remove_kv_splits")
 
     def spec(self, op: OpSpec) -> "_Spec":
         return _spec(op, self)
@@ -161,6 +169,7 @@ class _Contribution:
     split: int
     tile_start: int
     tile_count: int
+    owner: int | None = None
 
 
 @dataclass(frozen=True)
@@ -291,6 +300,15 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                     request_index, kv_head, query_tile, row_start, row_end,
                     token_first, token_last, horizon, contributions,
                 ))
+    if recipe.kv_mapping == "fai_flash_decode":
+        from .fai_decode_mapping import partitions
+        mapping = partitions(requests, heads, kv_heads, recipe.target_cores,
+                             key_tile=recipe.key_tile, query_tile=recipe.query_tile)
+        outputs = [replace(output, contributions=tuple(
+            _Contribution(index, start, end - start, owner)
+            for index, (owner, start, end) in enumerate(
+                mapping[output.request, output.kv_head]))) for output in outputs]
+        splits = max(len(output.contributions) for output in outputs)
     return _Spec(
         requests, heads, kv_heads, dim, query_dtype, kv_dtype,
         recipe.key_tile, recipe.query_tile, splits, recipe.slots,
@@ -692,13 +710,20 @@ class _GQADecodeProgram:
             for contribution in output.contributions
         )
         cores = self.context.core_count
-        total = len(tasks)
+        streams = [[] for _ in range(cores)]
+        for index, (output_index, contribution) in enumerate(tasks):
+            core = index % cores if contribution.owner is None else contribution.owner
+            if core >= cores:
+                raise ModelingError("attention_decode_mapping_exceeds_hardware_cores")
+            streams[core].append((output_index, contribution))
         producer_events = []
-        for core in range(min(total, cores)):
-            count = (total - core + cores - 1) // cores
+        for core, stream in enumerate(streams):
+            if not stream:
+                continue
+            count = len(stream)
 
-            def tile(index: int, core: int = core):
-                output_index, contribution = tasks[core + index * cores]
+            def tile(index: int, core: int = core, stream=tuple(stream)):
+                output_index, contribution = stream[index]
                 callback = ((lambda index=output_index: signal(index))
                             if output_index in barriers else None)
                 return (Stage("task", program=_ProducerTaskProgram(
@@ -714,13 +739,16 @@ class _GQADecodeProgram:
         merges = tuple((index, output) for index, output in enumerate(outputs)
                        if len(output.contributions) > 1)
         merge_events = []
+        merge_ready = (engine.submit(name + ":all_producers", after=tuple(producer_events),
+                                     owner=owner)
+                       if self.recipe.kv_mapping == "fai_flash_decode" else ready)
         for core in range(min(len(merges), cores)):
             stream = _MergeStream(
                 self.context, self.recipe, self.spec,
                 merges[core::cores], barriers, core,
             )
             merge_events.append(stream.start(
-                engine, f"{name}:owner{core}:merge", ready,
+                engine, f"{name}:owner{core}:merge", merge_ready,
                 owner=f"{owner}:gqa_merge{core}" if owner else f"gqa_merge{core}",
             ))
         return engine.submit(

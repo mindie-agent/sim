@@ -48,3 +48,54 @@ path, so the newer FIA `split_core.cpp` schedule is not automatically the
 captured one. Tests verify causal arithmetic, nonempty partitions, physical
 traffic, delayed-input ordering and actual resource cleanup, independently of
 these dispatch uncertainties.
+
+## FAI host ownership
+
+`kv_mapping="fai_flash_decode"` selects the host partition from
+`FAInferTiling::splitBN2S1GS2` and `fillCoreInfoForFlashDecode` in
+ops-transformer revision `a3925fd49cd256ad478d2faf983bf2961b8ae2c8`,
+`attention/fused_infer_attention_score/op_host/flash_attention_infer_tiling.h`.
+This is the legacy paged TND route's small-query flash-decode mapping, separate
+from the newer FIA `SplitCore` helper. The source branch requires positive
+q <= 16, q × query-head group <= 128 and enough KV work relative to the query
+and owner counts. Other branches raise a visible domain error when this mapping
+is explicitly selected. Existing defaults are unchanged.
+
+```json
+{"recipes": {"flash_attention_decode": {
+  "kind": "staged_gqa_decode", "target_cores": 20,
+  "kv_mapping": "fai_flash_decode", "query_tile": 128,
+  "key_tile": 128, "slots": 2
+}}}
+```
+
+Each owner gets `ceil(sum(q * heads * KV) / cores)` scheduling work and
+consumes whole 512-row host blocks across request and head boundaries. Excess
+work from the last block stays on that owner; it is not a credit against the
+next owner's budget. The device program can retain smaller operand tiles that
+divide 512. All split producers finish before the merge stage, preserving the
+source's global synchronization boundary.
+
+The original C++ host, compiled locally with only field-accessor ABI stubs,
+matched 192 independently enumerated schedules. The retained fixture includes
+equal and ragged cases, query boundaries and tail blocks; no NPU runtime or
+observed duration was involved. Common-engine tests independently check work,
+owner placement, input readiness, global merge ordering and resource release.
+
+Independent review additionally matched 873 valid schedules spanning ragged
+query and KV lengths. Three source cases emitted an invalid terminal owner
+starting at `batch` after the final request had completed. The simulator stops
+after the last real block; it does not reproduce that host bookkeeping defect.
+The tests retain those counterexamples. This is a source-compatible partition
+with bounded completion, not byte-identical behavior for malformed source
+terminal records.
+
+For twelve q4 requests at K126976, the uniform two-way split gives four of
+twenty owners two halves. The FAI budget crosses query boundaries instead.
+The same analytical device pipeline changes from 2701 to 1621 us, including
+the extra partial-output traffic. At B1/B4 it changes 145/543 to 150/547 us.
+These controls are retained in `data/verification/fai-host-mapping-control.json`.
+They establish a scheduling correction, not native timing accuracy: the
+analytical device pipeline still does not reconstruct the FAI GM score/P/PV
+scratch path, and the captured operator's API layout and binary tiling key
+must agree before this host mapping can be called the observed dispatch.
