@@ -23,7 +23,7 @@ from .response_functions import ResponseFunction, nonnegative as _nonnegative
 ROOTS = {"hardware", "runtime", "revision", "format", "kernel", "implementation",
          "dtype", "layout", "replay_scope", "recipe", "family", "phase",
          "local_shape", "semantic_shape", "padded_shape", "launch_shape",
-         "metadata", "work", "resource_units", "core_count"}
+         "metadata", "work", "resource_units", "core_count", "physical_rates"}
 REDUCERS = {"sum": sum, "max": max, "min": min, "len": len,
             "product": math.prod, "positive_count": lambda x: sum(v > 0 for v in x)}
 MISSING = object()
@@ -97,14 +97,26 @@ def coordinates(axes, declarations):
     return result
 
 
-def _axes(context):
+def _axes(context, *, physical_rates=False):
     op = context.op
-    return {**context.service_identity,
+    axes = {**context.service_identity,
             "hardware": context.service_identity.get("hardware", {}).get("key"),
             **{key: getattr(op, key) for key in ("recipe", "family", "phase", "local_shape",
                                                 "semantic_shape", "padded_shape", "launch_shape")},
             "metadata": dict(op.metadata), "work": context.native_work,
             "resource_units": context.resource_units, "core_count": context.core_count}
+    if physical_rates:
+        # A joint native duration cannot identify responses to individual pipe
+        # changes. Explicit rate guards keep it in its declared hardware domain.
+        # Resource rates are per second; compute peaks and mode rates already
+        # use their respective native work units per second.
+        axes["physical_rates"] = {
+            "resources": {role: context.rates[name] * 1000
+                          for role, name in context.resource_names.items()},
+            "compute_peaks": context.compute_peaks,
+            "service_modes": context.service_modes,
+        }
+    return axes
 
 
 def _rate(context, declaration):
@@ -128,6 +140,7 @@ class RegimePolicy:
     def __init__(self, declarations=()):
         self.rules = []
         self.responses = {}
+        self.physical_rates = False
         ids = set()
         for declaration in declarations:
             raw = deepcopy(declaration)
@@ -144,9 +157,9 @@ class RegimePolicy:
                         or _nonnegative(execution["reference_rate"]) == 0):
                     raise ModelingError("joint_native_service_requires_queue_and_native_boundary")
             for path in raw.get("match", {}):
-                _path(path)
+                self.physical_rates |= _path(path)[0] == "physical_rates"
             for coord in raw.get("coordinates", {}).values():
-                _path(coord["path"])
+                self.physical_rates |= _path(coord["path"])[0] == "physical_rates"
                 if set(coord) - {"path", "reduce", "scale"} or coord.get("reduce", "sum") not in REDUCERS:
                     raise ModelingError("service_regime_coordinate_unknown_reducer")
                 _nonnegative(coord.get("scale", 1))
@@ -188,7 +201,7 @@ class RegimePolicy:
     def resolve(self, context, record):
         if context.service_boundary != "device_kernel" or context.op.family in {"barrier", "token_commit"}:
             return None
-        axes, matches = _axes(context), []
+        axes, matches = _axes(context, physical_rates=self.physical_rates), []
         for raw, key in self.rules:
             selectors = raw.get("match", {})
             mismatches = [path for path, value in selectors.items()
