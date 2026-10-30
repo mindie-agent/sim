@@ -1,0 +1,3131 @@
+{
+  "schema": "kimi-hccl-source-conditional-response/1",
+  "training_identity": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/train-native.json",
+    "sha256": "48ae50a53055e7c7de8ef282317a75047ce3f3c075714bc3491351a132ae3cf8",
+    "size_bytes": 585748
+  },
+  "assignment_identity": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/inputs.json",
+    "sha256": "57c6e44e39f337bc8ff54108361dc3dd3bb2941bcad0931e2ffc6320c63b697f",
+    "size_bytes": 55926
+  },
+  "physical_domains": {
+    "8": {
+      "canonical_input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+        "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
+        "size_bytes": 17742
+      },
+      "resolved_machine": {
+        "name": "Ascend910_9362",
+        "architecture": "A3",
+        "hardware_key": "",
+        "sku": "Ascend910_9362",
+        "devices": [
+          {
+            "rank": 0,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 0,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 1,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 0,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 2,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 1,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 3,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 1,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 4,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 2,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 5,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 2,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 6,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 3,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 7,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 3,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          }
+        ],
+        "links": [
+          {
+            "name": "d2d_intra_package:0",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              0,
+              1
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:2",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              2,
+              3
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:4",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              4,
+              5
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:6",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              6,
+              7
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_node:0",
+            "capacity_bytes_per_ms": 196000000.0,
+            "members": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7
+            ],
+            "latency_us": 2.5,
+            "channel": "d2d_intra_node",
+            "semantics": "per_port"
+          }
+        ],
+        "ranks_per_node": 8,
+        "dies_per_package": 2,
+        "assumptions": {
+          "accuracy": "nominal analytical resource profile; no accuracy claim",
+          "clock_provenance": "configured 1650 MHz is retained; the read-only CANN 9.2.0 platform ini cube_freq 1500 MHz is not substituted.",
+          "fixpipe": "128 B/cycle*20*1.65 GHz=4.224e12 B/s. Generic use for GM destinations is an explicit analytical assumption; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+          "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+          "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+          "memory_path": "one shared HBM at 1.2e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+          "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e12 B/s and L1->L0B 128 B/cycle*20=4.224e12 B/s. No independent mte1_a/mte1_b resources.",
+          "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping of the platform memory-path ddr_read_rate scalar, not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+          "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.65 GHz=4.224e12 B/s. No additional AIC MTE3 pipe is fabricated.",
+          "pipeline_provenance": "asc-devkit pinned revision 56500ea0dc219380f50f4a17ce73ef5264f830fc: npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994 (AIC:AIV 1:2, independent cores, GM communication, PIPE_MTE1 256/128 B/cycle); cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728 (table 3 direction rates, table 7 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 64 B/cycle). The read-only sim-runner CANN 9.2.0 ini SHA ffd0e8d061db7fa8b3877bcbaf8151edac77abcf3a50df95b42b21e2332a9ca3 confirms 20 AIC/40 AIV, 64 GiB, ddr_read 32, ub_to_ddr 64, cube_freq 1500 and has only AICoreMemoryRates, with no AIV-specific rates; the retained CANN 9.1beta1 ini SHA 5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c is preserved in data/verification/a3-9362-platform-metadata-20261029.json.",
+          "pipeline_rates": "nominal analytical supply from the configured 1.65 GHz clock and pinned public instruction tables; these are not measured peaks, do not replace the configured clock with the platform ini 1500 MHz, and are not fitted from observed model gaps",
+          "profile": "registered SKU geometry and nominal rates",
+          "source_discrepancy": "the read-only CANN 9.2.0 ini reports only AICoreMemoryRates l1_to_l0_a/l1_to_l0_b at 512/256 B/cycle, while the pinned public instruction table documents 256/128 B/cycle. The profile chooses the documented instruction 256/128 and preserves this discrepancy; no measurement is implied.",
+          "transfer_bandwidth_precedence": "explicit machine.links > explicit transfer_channels channel bandwidth > convenience bytes_per_s > same-layer Gb/s > profile effective; within a channel explicit effective > explicit calibrated > explicit derived > explicit uni_peak, and null preserves unknown/disabled semantics",
+          "transfer_bandwidth_units": "inter_node_bw_gbps/intra_node_bw_gbps are decimal Gb/s and divided by 8; inter_node_bw_bytes_per_s/intra_node_bw_bytes_per_s are B/s and win over same-layer Gb/s; transfer_channels.*_bw_gbps and Link.capacity_gbps keep the historical GB/s meaning",
+          "transfer_channel_scope": "Only d2d_intra_package, d2d_intra_node and d2d_inter_node generate device graph links. Other registered channels remain metadata; they do not override host/offload services or the P/D connector. Generated links retain per_port capacity unless semantics is explicitly declared.",
+          "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden"
+        }
+      },
+      "resolved_machine_sha256": "962541d08046f20b148bd273a2751af13179a9458a09bcef461f183581da0a4b",
+      "runtime_declaration": {
+        "runtime": "",
+        "revision": "",
+        "format": ""
+      },
+      "identity_strength": "source-conditional; empty software identity fields are unknown, not captured versions",
+      "guard_policy": "same resolved physical rates, service modes, compute supply, rank count and topology; do not transfer to changed link resources"
+    },
+    "16": {
+      "canonical_input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+        "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
+        "size_bytes": 15110
+      },
+      "resolved_machine": {
+        "name": "Ascend910_9362",
+        "architecture": "A3",
+        "hardware_key": "",
+        "sku": "Ascend910_9362",
+        "devices": [
+          {
+            "rank": 0,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 0,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 1,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 0,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 2,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 1,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 3,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 1,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 4,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 2,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 5,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 2,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 6,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 3,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 7,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 3,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 8,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 4,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 9,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 4,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 10,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 5,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 11,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 5,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 12,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 6,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 13,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 6,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 14,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 7,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          },
+          {
+            "rank": 15,
+            "memory_bytes": 68719476736,
+            "compute_peaks": {
+              "bf16": 270336000000000.0,
+              "fp16": 270336000000000.0,
+              "fp32": 67584000000000.0,
+              "hf32": 135168000000000.0,
+              "int4": 1081344000000000.0,
+              "int8": 540672000000000.0
+            },
+            "rates": {
+              "fixpipe": 4224000000000.0,
+              "hbm": 1200000000000.0,
+              "l2": 3630000000000.0,
+              "mte1": 4224000000000.0,
+              "mte2_aic": 1056000000000.0,
+              "mte2_aiv": 2112000000000.0,
+              "mte3": 4224000000000.0,
+              "vector": 2112000000000.0
+            },
+            "buffers": {
+              "l0a": 65536,
+              "l0b": 65536,
+              "l0c": 131072,
+              "l1": 524288,
+              "l2": 176160768,
+              "ub": 196608
+            },
+            "compute_units": 20,
+            "launch_us": 0.0,
+            "node": 0,
+            "package": 7,
+            "resource_units": {
+              "fixpipe": 20,
+              "l2": 1,
+              "mte1": 20,
+              "mte2_aic": 20,
+              "mte2_aiv": 40,
+              "mte3": 40,
+              "vector": 40
+            },
+            "buffer_units": {
+              "l0a": 20,
+              "l0b": 20,
+              "l0c": 20,
+              "l1": 20,
+              "l2": 1,
+              "ub": 40
+            },
+            "service_modes": {
+              "l2_read": {
+                "resource": "l2",
+                "rate": 3630000000000.0
+              },
+              "l2_write": {
+                "resource": "l2",
+                "rate": 2838000000000.0
+              },
+              "mte1_l0a": {
+                "resource": "mte1",
+                "rate": 8448000000000.0
+              },
+              "mte1_l0b": {
+                "resource": "mte1",
+                "rate": 4224000000000.0
+              },
+              "mte2_aic_cached": {
+                "resource": "mte2_aic",
+                "rate": 3630000000000.0
+              }
+            },
+            "kernel_invocations": {
+              "cube": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.005,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    5,
+                    5
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "reported approximate value"
+                }
+              },
+              "vector": {
+                "startup_ms": 0.0,
+                "minimum_ms": 0.0025,
+                "provenance": {
+                  "basis": "user_reported_experience",
+                  "reported_us": [
+                    2,
+                    3
+                  ],
+                  "declared_on": "2026-10-29",
+                  "boundary": "device_kernel_completion",
+                  "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+                  "selection": "midpoint of reported range"
+                }
+              }
+            }
+          }
+        ],
+        "links": [
+          {
+            "name": "d2d_intra_package:0",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              0,
+              1
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:2",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              2,
+              3
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:4",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              4,
+              5
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:6",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              6,
+              7
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:8",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              8,
+              9
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:10",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              10,
+              11
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:12",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              12,
+              13
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_package:14",
+            "capacity_bytes_per_ms": 448000000.0,
+            "members": [
+              14,
+              15
+            ],
+            "latency_us": 0.8,
+            "channel": "d2d_intra_package",
+            "semantics": "per_port"
+          },
+          {
+            "name": "d2d_intra_node:0",
+            "capacity_bytes_per_ms": 196000000.0,
+            "members": [
+              0,
+              1,
+              2,
+              3,
+              4,
+              5,
+              6,
+              7,
+              8,
+              9,
+              10,
+              11,
+              12,
+              13,
+              14,
+              15
+            ],
+            "latency_us": 2.5,
+            "channel": "d2d_intra_node",
+            "semantics": "per_port"
+          }
+        ],
+        "ranks_per_node": 16,
+        "dies_per_package": 2,
+        "assumptions": {
+          "accuracy": "nominal analytical resource profile; no accuracy claim",
+          "clock_provenance": "configured 1650 MHz is retained; the read-only CANN 9.2.0 platform ini cube_freq 1500 MHz is not substituted.",
+          "fixpipe": "128 B/cycle*20*1.65 GHz=4.224e12 B/s. Generic use for GM destinations is an explicit analytical assumption; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+          "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+          "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+          "memory_path": "one shared HBM at 1.2e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+          "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e12 B/s and L1->L0B 128 B/cycle*20=4.224e12 B/s. No independent mte1_a/mte1_b resources.",
+          "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping of the platform memory-path ddr_read_rate scalar, not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+          "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.65 GHz=4.224e12 B/s. No additional AIC MTE3 pipe is fabricated.",
+          "pipeline_provenance": "asc-devkit pinned revision 56500ea0dc219380f50f4a17ce73ef5264f830fc: npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994 (AIC:AIV 1:2, independent cores, GM communication, PIPE_MTE1 256/128 B/cycle); cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728 (table 3 direction rates, table 7 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 64 B/cycle). The read-only sim-runner CANN 9.2.0 ini SHA ffd0e8d061db7fa8b3877bcbaf8151edac77abcf3a50df95b42b21e2332a9ca3 confirms 20 AIC/40 AIV, 64 GiB, ddr_read 32, ub_to_ddr 64, cube_freq 1500 and has only AICoreMemoryRates, with no AIV-specific rates; the retained CANN 9.1beta1 ini SHA 5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c is preserved in data/verification/a3-9362-platform-metadata-20261029.json.",
+          "pipeline_rates": "nominal analytical supply from the configured 1.65 GHz clock and pinned public instruction tables; these are not measured peaks, do not replace the configured clock with the platform ini 1500 MHz, and are not fitted from observed model gaps",
+          "profile": "registered SKU geometry and nominal rates",
+          "source_discrepancy": "the read-only CANN 9.2.0 ini reports only AICoreMemoryRates l1_to_l0_a/l1_to_l0_b at 512/256 B/cycle, while the pinned public instruction table documents 256/128 B/cycle. The profile chooses the documented instruction 256/128 and preserves this discrepancy; no measurement is implied.",
+          "transfer_bandwidth_precedence": "explicit machine.links > explicit transfer_channels channel bandwidth > convenience bytes_per_s > same-layer Gb/s > profile effective; within a channel explicit effective > explicit calibrated > explicit derived > explicit uni_peak, and null preserves unknown/disabled semantics",
+          "transfer_bandwidth_units": "inter_node_bw_gbps/intra_node_bw_gbps are decimal Gb/s and divided by 8; inter_node_bw_bytes_per_s/intra_node_bw_bytes_per_s are B/s and win over same-layer Gb/s; transfer_channels.*_bw_gbps and Link.capacity_gbps keep the historical GB/s meaning",
+          "transfer_channel_scope": "Only d2d_intra_package, d2d_intra_node and d2d_inter_node generate device graph links. Other registered channels remain metadata; they do not override host/offload services or the P/D connector. Generated links retain per_port capacity unless semantics is explicitly declared.",
+          "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden"
+        }
+      },
+      "resolved_machine_sha256": "6968e6b1fa85cacb1c8df353fcd40b24009132ed55231745199934f8b639c919",
+      "runtime_declaration": {
+        "runtime": "",
+        "revision": "",
+        "format": ""
+      },
+      "identity_strength": "source-conditional; empty software identity fields are unknown, not captured versions",
+      "guard_policy": "same resolved physical rates, service modes, compute supply, rank count and topology; do not transfer to changed link resources"
+    }
+  },
+  "rules": [
+    {
+      "tp": 8,
+      "collective": "allgather",
+      "physical_domain": "8",
+      "response": {
+        "kind": "continuous_piecewise_linear",
+        "coordinate": "declared_input_bytes",
+        "points": [
+          [
+            14336,
+            70.632805
+          ],
+          [
+            43008,
+            54.457769444444445
+          ],
+          [
+            86016,
+            51.68156114605171
+          ]
+        ]
+      },
+      "domain": {
+        "min": 14336,
+        "max": 86016
+      },
+      "extrapolation_allowed": false,
+      "training": [
+        {
+          "payload_bytes": 14336,
+          "mean_us": 70.632805,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c2-p4k",
+          "source_sha256": "1e816d73ff9a5743ee0b87648c591a5a46b7d944ee1b0424a2f4cf54fb9e2315",
+          "ordinal_means_us": [
+            207.149005,
+            113.43245,
+            115.847325,
+            27.6786,
+            48.205215,
+            26.88027,
+            35.19207,
+            29.652075,
+            31.658235
+          ]
+        },
+        {
+          "payload_bytes": 43008,
+          "mean_us": 54.457769444444445,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c24-p4k",
+          "source_sha256": "8e1b18f02318ab650d5b7444163dc7a0dd0dc2980bc6f70307c80990e130bfd3",
+          "ordinal_means_us": [
+            136.328075,
+            63.13549,
+            118.565695,
+            27.13356,
+            30.12087,
+            28.40521,
+            24.445035,
+            27.921435,
+            34.064555
+          ]
+        },
+        {
+          "payload_bytes": 86016,
+          "mean_us": 51.68156114605171,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c48-p4k",
+          "source_sha256": "f864b8937e07ebf3b4e9879250f691c398cffd4d0c90b029046793fefdf86eea",
+          "ordinal_means_us": [
+            147.76345283018867,
+            51.46293710691824,
+            82.27895597484277,
+            32.38596226415094,
+            32.97811320754717,
+            28.01540251572327,
+            29.95151572327044,
+            27.879283018867923,
+            32.41842767295598
+          ]
+        }
+      ],
+      "monotone_training_means": false,
+      "evaluation_relation": "retrospective_training",
+      "parameter_meaning": "inclusive native collective envelope, including observed peer/control boundary",
+      "pure_link_bandwidth_or_RTT": false
+    },
+    {
+      "tp": 8,
+      "collective": "reduce_scatter",
+      "physical_domain": "8",
+      "response": {
+        "kind": "continuous_piecewise_linear",
+        "coordinate": "declared_input_bytes",
+        "points": [
+          [
+            114688,
+            29.457825625
+          ],
+          [
+            344064,
+            28.386225
+          ],
+          [
+            688128,
+            31.654279874213838
+          ]
+        ]
+      },
+      "domain": {
+        "min": 114688,
+        "max": 688128
+      },
+      "extrapolation_allowed": false,
+      "training": [
+        {
+          "payload_bytes": 114688,
+          "mean_us": 29.457825625,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c2-p4k",
+          "source_sha256": "1e816d73ff9a5743ee0b87648c591a5a46b7d944ee1b0424a2f4cf54fb9e2315",
+          "ordinal_means_us": [
+            25.94708,
+            33.056035,
+            46.174205,
+            23.62906,
+            39.00934,
+            22.444045,
+            24.38131,
+            21.02153
+          ]
+        },
+        {
+          "payload_bytes": 344064,
+          "mean_us": 28.386225,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c24-p4k",
+          "source_sha256": "8e1b18f02318ab650d5b7444163dc7a0dd0dc2980bc6f70307c80990e130bfd3",
+          "ordinal_means_us": [
+            22.38553,
+            44.264435,
+            37.102065,
+            21.582985,
+            32.76691,
+            20.454845,
+            27.408595,
+            21.124435
+          ]
+        },
+        {
+          "payload_bytes": 688128,
+          "mean_us": 31.654279874213838,
+          "case_id": "a3-kimi4-tp8-longctx-decode-c48-p4k",
+          "source_sha256": "f864b8937e07ebf3b4e9879250f691c398cffd4d0c90b029046793fefdf86eea",
+          "ordinal_means_us": [
+            41.12479245283019,
+            47.31159748427673,
+            33.47918238993711,
+            24.037044025157233,
+            28.778,
+            24.455345911949685,
+            30.959459119496856,
+            23.088817610062893
+          ]
+        }
+      ],
+      "monotone_training_means": false,
+      "evaluation_relation": "retrospective_training",
+      "parameter_meaning": "inclusive native collective envelope, including observed peer/control boundary",
+      "pure_link_bandwidth_or_RTT": false
+    },
+    {
+      "tp": 16,
+      "collective": "allgather",
+      "physical_domain": "16",
+      "response": {
+        "kind": "continuous_piecewise_linear",
+        "coordinate": "declared_input_bytes",
+        "points": [
+          [
+            14336,
+            156.81227611841234
+          ],
+          [
+            43008,
+            116.12927260981913
+          ]
+        ]
+      },
+      "domain": {
+        "min": 14336,
+        "max": 43008
+      },
+      "extrapolation_allowed": false,
+      "training": [
+        {
+          "payload_bytes": 14336,
+          "mean_us": 147.1145390946502,
+          "case_id": "a3-kimi4-tp16-128k-decode-c12-p4k",
+          "source_sha256": "b98be4ef1438ff886f5c6e9f31418da690c5dd0c8ccd5c02f0354838f463439f",
+          "ordinal_means_us": [
+            258.5065,
+            287.8748827160494,
+            294.2006975308642,
+            50.54941975308642,
+            139.3999012345679,
+            44.426314814814816,
+            133.438487654321,
+            57.49794444444444,
+            58.1367037037037
+          ]
+        },
+        {
+          "payload_bytes": 14336,
+          "mean_us": 166.51001314217444,
+          "case_id": "a3-kimi4-tp16-128k-decode-c2-p4k",
+          "source_sha256": "45912269b0152dfd7a6832d22ce130b42bd21964ed145d6001076797454ad25b",
+          "ordinal_means_us": [
+            210.79547849462367,
+            297.831,
+            286.6868064516129,
+            54.36055376344086,
+            222.7525053763441,
+            48.821145161290325,
+            229.13087634408603,
+            39.86732258064516,
+            108.34443010752688
+          ]
+        },
+        {
+          "payload_bytes": 43008,
+          "mean_us": 116.12927260981913,
+          "case_id": "a3-kimi4-tp16-128k-decode-c48-p4k",
+          "source_sha256": "6543b4af2e998914518e479b450679041fed3f985c14f1e0565da9e238ee76cb",
+          "ordinal_means_us": [
+            240.43072674418605,
+            249.5572093023256,
+            282.7072034883721,
+            43.29033139534884,
+            48.64180813953488,
+            43.97098255813953,
+            48.71112790697674,
+            44.57743023255814,
+            43.276633720930235
+          ]
+        }
+      ],
+      "monotone_training_means": false,
+      "evaluation_relation": "retrospective_training",
+      "parameter_meaning": "inclusive native collective envelope, including observed peer/control boundary",
+      "pure_link_bandwidth_or_RTT": false
+    },
+    {
+      "tp": 16,
+      "collective": "reduce_scatter",
+      "physical_domain": "16",
+      "response": {
+        "kind": "continuous_piecewise_linear",
+        "coordinate": "declared_input_bytes",
+        "points": [
+          [
+            229376,
+            61.98428979988053
+          ],
+          [
+            688128,
+            38.60906976744186
+          ]
+        ]
+      },
+      "domain": {
+        "min": 229376,
+        "max": 688128
+      },
+      "extrapolation_allowed": false,
+      "training": [
+        {
+          "payload_bytes": 229376,
+          "mean_us": 65.96989814814815,
+          "case_id": "a3-kimi4-tp16-128k-decode-c12-p4k",
+          "source_sha256": "b98be4ef1438ff886f5c6e9f31418da690c5dd0c8ccd5c02f0354838f463439f",
+          "ordinal_means_us": [
+            57.34954938271605,
+            47.284901234567904,
+            39.39671604938272,
+            39.97887654320988,
+            55.365919753086416,
+            34.27283333333333,
+            218.00806172839506,
+            36.10232716049383
+          ]
+        },
+        {
+          "payload_bytes": 229376,
+          "mean_us": 57.9986814516129,
+          "case_id": "a3-kimi4-tp16-128k-decode-c2-p4k",
+          "source_sha256": "45912269b0152dfd7a6832d22ce130b42bd21964ed145d6001076797454ad25b",
+          "ordinal_means_us": [
+            69.82346774193549,
+            59.797854838709675,
+            65.87798387096774,
+            74.96351612903226,
+            53.859258064516126,
+            71.86308064516129,
+            35.33290860215054,
+            32.47138172043011
+          ]
+        },
+        {
+          "payload_bytes": 688128,
+          "mean_us": 38.60906976744186,
+          "case_id": "a3-kimi4-tp16-128k-decode-c48-p4k",
+          "source_sha256": "6543b4af2e998914518e479b450679041fed3f985c14f1e0565da9e238ee76cb",
+          "ordinal_means_us": [
+            73.4851976744186,
+            52.727331395348834,
+            36.23702325581395,
+            27.14902906976744,
+            31.248587209302325,
+            25.0215,
+            33.68214534883721,
+            29.321744186046512
+          ]
+        }
+      ],
+      "monotone_training_means": false,
+      "evaluation_relation": "retrospective_training",
+      "parameter_meaning": "inclusive native collective envelope, including observed peer/control boundary",
+      "pure_link_bandwidth_or_RTT": false
+    }
+  ],
+  "runtime_admission": "candidate_only; use existing single native-group inclusive response after physical/topology guard verification",
+  "heldout_used_for_fit": false
+}

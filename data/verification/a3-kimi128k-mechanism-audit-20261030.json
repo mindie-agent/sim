@@ -1,0 +1,747 @@
+{
+  "schema": "a3-kimi128k-mechanism-audit/1",
+  "fit": "none",
+  "runtime_scope": "canonical long-context source cases, not old eager/direct-peer controls",
+  "bindings": {
+    "present": [
+      "mixed INT8 QKV / BF16 BFG projection",
+      "arch22 KDA (use_beta_sigmoid=false)",
+      "arch22 MLA retained-KV512 with declared L2 mapping"
+    ],
+    "absent": [
+      "Kimi native measured service regimes",
+      "AttnRes prefix source caller",
+      "DequantSituQuant native caller",
+      "TP HCCL source executor"
+    ]
+  },
+  "query_capacity": {
+    "commit": "537cc9ad",
+    "fixed_storage_buckets": {
+      "B6": 8,
+      "B12": 16
+    },
+    "effect": "ABI/storage only; no work or timing calibration; inactive KV length zero"
+  },
+  "canonical_isolated_roles": {
+    "schema": "a3-kimi-canonical-isolated-role-control/1",
+    "geometry": {
+      "B": 1,
+      "q": 1,
+      "context": 126000
+    },
+    "rows": [
+      {
+        "tp": 8,
+        "case": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+          "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce"
+        },
+        "groups": {
+          "residual_values_fp32": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                1,
+                7168
+              ]
+            ]
+          },
+          "attention_residual_scores": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.04000000000000001,
+            "program": "SteadyMatmul",
+            "caller_shapes": [
+              [
+                1,
+                1,
+                7168
+              ]
+            ]
+          },
+          "attention_residual_softmax": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                1
+              ]
+            ]
+          },
+          "attention_residual_mix": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                7168
+              ]
+            ]
+          },
+          "attention_residual_output_cast": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                7168
+              ]
+            ]
+          },
+          "ring_allgather": {
+            "calls": 9,
+            "elapsed_sum_ms": 0.162108,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                8,
+                7168
+              ]
+            ]
+          },
+          "short_convolution": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.0075,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                4608
+              ]
+            ]
+          },
+          "vllm_ascend_recurrent_kda_arch22": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.012401823181818181,
+            "program": "OperatorPlan",
+            "caller_shapes": [
+              [
+                1,
+                12,
+                128,
+                128
+              ]
+            ]
+          },
+          "ring_reduce_scatter": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.144096,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                7168
+              ]
+            ]
+          },
+          "situ": {
+            "calls": 4,
+            "elapsed_sum_ms": 0.01,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                8,
+                768
+              ],
+              [
+                8,
+                4224
+              ]
+            ]
+          },
+          "grouped_situ": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.0075,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                16,
+                3072
+              ]
+            ]
+          }
+        }
+      },
+      {
+        "tp": 16,
+        "case": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+          "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7"
+        },
+        "groups": {
+          "residual_values_fp32": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                1,
+                7168
+              ]
+            ]
+          },
+          "attention_residual_scores": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.04000000000000001,
+            "program": "SteadyMatmul",
+            "caller_shapes": [
+              [
+                1,
+                1,
+                7168
+              ]
+            ]
+          },
+          "attention_residual_softmax": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                1
+              ]
+            ]
+          },
+          "attention_residual_mix": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                7168
+              ]
+            ]
+          },
+          "attention_residual_output_cast": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.02,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                7168
+              ]
+            ]
+          },
+          "ring_allgather": {
+            "calls": 9,
+            "elapsed_sum_ms": 0.34737428571428575,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                16,
+                7168
+              ]
+            ]
+          },
+          "short_convolution": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.0075,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                2304
+              ]
+            ]
+          },
+          "vllm_ascend_recurrent_kda_arch22": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.012347670454545455,
+            "program": "OperatorPlan",
+            "caller_shapes": [
+              [
+                1,
+                6,
+                128,
+                128
+              ]
+            ]
+          },
+          "ring_reduce_scatter": {
+            "calls": 8,
+            "elapsed_sum_ms": 0.30877714285714286,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                1,
+                7168
+              ]
+            ]
+          },
+          "situ": {
+            "calls": 4,
+            "elapsed_sum_ms": 0.01,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                16,
+                384
+              ],
+              [
+                16,
+                2112
+              ]
+            ]
+          },
+          "grouped_situ": {
+            "calls": 3,
+            "elapsed_sum_ms": 0.0075,
+            "program": "ResourceEnvelope",
+            "caller_shapes": [
+              [
+                16,
+                3072
+              ]
+            ]
+          }
+        }
+      }
+    ],
+    "wall_seconds": 0.18144591595046222,
+    "limits": [
+      "Isolated native or analytical operator sums are not additive Body critical-path attribution.",
+      "Caller shapes are model declarations, not observed HCOM arguments.",
+      "Public operator_costs consolidates repeated signatures; every sum multiplies by the returned occurrences."
+    ]
+  },
+  "native_communication_comparison": [
+    {
+      "tp": 8,
+      "family": "hcom_allGather_",
+      "calls": 9,
+      "native_sum_mean_ms": 0.6665327975206611,
+      "current_isolated_operator_sum_ms": 0.162108,
+      "candidate_difference_ms": 0.504424797520661,
+      "comparison_limit": "caller-role alignment only; not observed payload/algorithm equivalence or additive critical-path attribution"
+    },
+    {
+      "tp": 8,
+      "family": "hcom_reduceScatter_",
+      "calls": 8,
+      "native_sum_mean_ms": 0.2842000413223141,
+      "current_isolated_operator_sum_ms": 0.144096,
+      "candidate_difference_ms": 0.14010404132231408,
+      "comparison_limit": "caller-role alignment only; not observed payload/algorithm equivalence or additive critical-path attribution"
+    },
+    {
+      "tp": 16,
+      "family": "hcom_allGather_",
+      "calls": 9,
+      "native_sum_mean_ms": 1.4799091228070176,
+      "current_isolated_operator_sum_ms": 0.34737428571428575,
+      "candidate_difference_ms": 1.1325348370927317,
+      "comparison_limit": "caller-role alignment only; not observed payload/algorithm equivalence or additive critical-path attribution"
+    },
+    {
+      "tp": 16,
+      "family": "hcom_reduceScatter_",
+      "calls": 8,
+      "native_sum_mean_ms": 0.43285922368421054,
+      "current_isolated_operator_sum_ms": 0.30877714285714286,
+      "candidate_difference_ms": 0.12408208082706768,
+      "comparison_limit": "caller-role alignment only; not observed payload/algorithm equivalence or additive critical-path attribution"
+    }
+  ],
+  "conditional_source_controls": [
+    {
+      "schema": "a3-kimi-hccl-source-body-control/1",
+      "status": "completed",
+      "runtime": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+      "runtime_revision": "c4e918181756049a9f39e58cf4c60aca2d8705ad",
+      "canonical_input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+        "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
+        "bytes": 17742
+      },
+      "conditional_input": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp8-longctx-source-mesh.json",
+        "sha256": "340ca138bcb01e020d6874b7613513891275ca123d22472d1a89db6037c0c953",
+        "bytes": 18982
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 1
+      },
+      "topology": {
+        "tp": 8,
+        "ranks_per_node": 8
+      },
+      "limit_seconds": 90,
+      "fit": "none",
+      "caller_declared_collectives": [
+        {
+          "collective": "allgather",
+          "ranks": 8,
+          "input_payload_bytes": 14336,
+          "dtype_bytes": 2,
+          "calls": 9
+        },
+        {
+          "collective": "reduce_scatter",
+          "ranks": 8,
+          "input_payload_bytes": 114688,
+          "dtype_bytes": 2,
+          "calls": 8
+        }
+      ],
+      "unpriced_source_work": {
+        "hccl_copy": 372736,
+        "hccl_control": 440,
+        "hccl_reduce": 802816
+      },
+      "body_forward_ms": 2.493106848295818,
+      "execution": {
+        "time_ms": 2.493106848295818,
+        "serviced": {
+          "scheduler@r0": 0.0,
+          "fixpipe@r0:s0": 16158720.0,
+          "memory@r0:s0": 1720307524.0000021,
+          "l2@r0:s0": 314686032.37209326,
+          "mte1@r0:s0": 2616670464.0000315,
+          "mte2_aic@r0:s0": 1705517904.4363327,
+          "mte2_aiv@r0:s0": 12494492.000000028,
+          "mte3@r0:s0": 19498163.999999985,
+          "vector@r0:s0": 31983838.000000026,
+          "matrix@r0:s0": 0.02830784848484818,
+          "host@r0:s0": 0.0,
+          "link:d2d_intra_package:0:tx:port0": 329728.0,
+          "link:d2d_intra_package:0:rx:port0": 329728.0,
+          "link:d2d_intra_package:0:tx:port1": 329728.0,
+          "link:d2d_intra_package:0:rx:port1": 329728.0,
+          "link:d2d_intra_package:2:tx:port2": 329728.0,
+          "link:d2d_intra_package:2:rx:port2": 329728.0,
+          "link:d2d_intra_package:2:tx:port3": 329728.0,
+          "link:d2d_intra_package:2:rx:port3": 329728.0,
+          "link:d2d_intra_package:4:tx:port4": 329728.0,
+          "link:d2d_intra_package:4:rx:port4": 329728.0,
+          "link:d2d_intra_package:4:tx:port5": 329728.0,
+          "link:d2d_intra_package:4:rx:port5": 329728.0,
+          "link:d2d_intra_package:6:tx:port6": 329728.0,
+          "link:d2d_intra_package:6:rx:port6": 329728.0,
+          "link:d2d_intra_package:6:tx:port7": 329728.0,
+          "link:d2d_intra_package:6:rx:port7": 329728.0,
+          "link:d2d_intra_node:0:tx:port0": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port0": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port1": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port1": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port2": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port2": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port3": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port3": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port4": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port4": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port5": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port5": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port6": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port6": 1978367.999999992,
+          "link:d2d_intra_node:0:tx:port7": 1978367.999999992,
+          "link:d2d_intra_node:0:rx:port7": 1978367.999999992
+        },
+        "completed_tasks": 17704,
+        "peak_live_tasks": 1118,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "l2@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 10632667136.0,
+          "vector_ops": 31983838.0,
+          "hbm_bytes": 1720307524.0,
+          "link_bytes": 2308096.0
+        }
+      },
+      "result_sha256": "376d12b942f5d5614fae2d8392893696ee1404a9ed85506d3096558fbe02dc50",
+      "result_keys": [
+        "schema",
+        "model_coverage",
+        "unmodeled_features",
+        "degraded_submodules",
+        "prediction_scope",
+        "boundary",
+        "input_ready_ms",
+        "complete_ms",
+        "duration_ms",
+        "replicas",
+        "replay_scope",
+        "replay_scope_by_replica",
+        "operator_occurrences",
+        "timeline",
+        "resources",
+        "execution",
+        "parameters",
+        "events",
+        "status",
+        "scope",
+        "body_forward_ms",
+        "metric_boundary",
+        "geometry",
+        "routing",
+        "default_mechanisms",
+        "capacity",
+        "boundary_details"
+      ],
+      "wall_seconds": 0.5729721670504659,
+      "cpu_seconds": 0.549687,
+      "peak_rss_bytes": 47644672,
+      "observed_body_ms": 3.396537305785124,
+      "canonical_body_ms": 2.746722010200631,
+      "conditional_relative_error": -0.265985730806061
+    },
+    {
+      "schema": "a3-kimi-hccl-source-body-control/1",
+      "status": "completed",
+      "runtime": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+      "runtime_revision": "c4e918181756049a9f39e58cf4c60aca2d8705ad",
+      "canonical_input": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+        "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
+        "bytes": 15110
+      },
+      "conditional_input": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp16-longctx-source-mesh.json",
+        "sha256": "6b2d11012b0ad85cd267a81579076606e76e2605279dbdcc42ad4f85d3014a21",
+        "bytes": 16351
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 1
+      },
+      "topology": {
+        "tp": 16,
+        "ranks_per_node": 16
+      },
+      "limit_seconds": 90,
+      "fit": "none",
+      "caller_declared_collectives": [
+        {
+          "collective": "allgather",
+          "ranks": 16,
+          "input_payload_bytes": 14336,
+          "dtype_bytes": 2,
+          "calls": 9
+        },
+        {
+          "collective": "reduce_scatter",
+          "ranks": 16,
+          "input_payload_bytes": 229376,
+          "dtype_bytes": 2,
+          "calls": 8
+        }
+      ],
+      "unpriced_source_work": {
+        "hccl_copy": 372736,
+        "hccl_control": 984,
+        "hccl_reduce": 1720320
+      },
+      "body_forward_ms": 2.3669917104794083,
+      "execution": {
+        "time_ms": 2.3669917104794083,
+        "serviced": {
+          "scheduler@r0": 0.0,
+          "fixpipe@r0:s0": 16158720.00000001,
+          "memory@r0:s0": 1470499772.0000196,
+          "l2@r0:s0": 314686032.3720849,
+          "mte1@r0:s0": 2370865919.999982,
+          "mte2_aic@r0:s0": 1456378432.4363935,
+          "mte2_aiv@r0:s0": 6511424.000000013,
+          "mte3@r0:s0": 17165567.99999997,
+          "vector@r0:s0": 22392054.000000034,
+          "matrix@r0:s0": 0.027663257575758184,
+          "host@r0:s0": 0.0,
+          "link:d2d_intra_package:0:tx:port0": 286720.0,
+          "link:d2d_intra_package:0:rx:port0": 286720.0,
+          "link:d2d_intra_package:0:tx:port1": 286720.0,
+          "link:d2d_intra_package:0:rx:port1": 286720.0,
+          "link:d2d_intra_package:2:tx:port2": 286720.0,
+          "link:d2d_intra_package:2:rx:port2": 286720.0,
+          "link:d2d_intra_package:2:tx:port3": 286720.0,
+          "link:d2d_intra_package:2:rx:port3": 286720.0,
+          "link:d2d_intra_package:4:tx:port4": 286720.0,
+          "link:d2d_intra_package:4:rx:port4": 286720.0,
+          "link:d2d_intra_package:4:tx:port5": 286720.0,
+          "link:d2d_intra_package:4:rx:port5": 286720.0,
+          "link:d2d_intra_package:6:tx:port6": 286720.0,
+          "link:d2d_intra_package:6:rx:port6": 286720.0,
+          "link:d2d_intra_package:6:tx:port7": 286720.0,
+          "link:d2d_intra_package:6:rx:port7": 286720.0,
+          "link:d2d_intra_package:8:tx:port8": 286720.0,
+          "link:d2d_intra_package:8:rx:port8": 286720.0,
+          "link:d2d_intra_package:8:tx:port9": 286720.0,
+          "link:d2d_intra_package:8:rx:port9": 286720.0,
+          "link:d2d_intra_package:10:tx:port10": 286720.0,
+          "link:d2d_intra_package:10:rx:port10": 286720.0,
+          "link:d2d_intra_package:10:tx:port11": 286720.0,
+          "link:d2d_intra_package:10:rx:port11": 286720.0,
+          "link:d2d_intra_package:12:tx:port12": 286720.0,
+          "link:d2d_intra_package:12:rx:port12": 286720.0,
+          "link:d2d_intra_package:12:tx:port13": 286720.0,
+          "link:d2d_intra_package:12:rx:port13": 286720.0,
+          "link:d2d_intra_package:14:tx:port14": 286720.0,
+          "link:d2d_intra_package:14:rx:port14": 286720.0,
+          "link:d2d_intra_package:14:tx:port15": 286720.0,
+          "link:d2d_intra_package:14:rx:port15": 286720.0,
+          "link:d2d_intra_node:0:tx:port0": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port0": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port1": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port1": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port2": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port2": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port3": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port3": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port4": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port4": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port5": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port5": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port6": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port6": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port7": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port7": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port8": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port8": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port9": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port9": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port10": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port10": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port11": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port11": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port12": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port12": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port13": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port13": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port14": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port14": 4014080.0000000116,
+          "link:d2d_intra_node:0:tx:port15": 4014080.0000000116,
+          "link:d2d_intra_node:0:rx:port15": 4014080.0000000116
+        },
+        "completed_tasks": 29307,
+        "peak_live_tasks": 1731,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "l2@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 10407096320.0,
+          "vector_ops": 22392054.0,
+          "hbm_bytes": 1470499772.0,
+          "link_bytes": 4300800.0
+        }
+      },
+      "result_sha256": "f10c70b13c5705087569b7dbcdaec7ab57c828494c20bf7b435edf85fc814357",
+      "result_keys": [
+        "schema",
+        "model_coverage",
+        "unmodeled_features",
+        "degraded_submodules",
+        "prediction_scope",
+        "boundary",
+        "input_ready_ms",
+        "complete_ms",
+        "duration_ms",
+        "replicas",
+        "replay_scope",
+        "replay_scope_by_replica",
+        "operator_occurrences",
+        "timeline",
+        "resources",
+        "execution",
+        "parameters",
+        "events",
+        "status",
+        "scope",
+        "body_forward_ms",
+        "metric_boundary",
+        "geometry",
+        "routing",
+        "default_mechanisms",
+        "capacity",
+        "boundary_details"
+      ],
+      "wall_seconds": 0.7273772499756888,
+      "cpu_seconds": 0.6768559999999999,
+      "peak_rss_bytes": 48414720,
+      "observed_body_ms": 4.09264002631579,
+      "canonical_body_ms": 2.958313112384263,
+      "conditional_relative_error": -0.4216467377390669
+    }
+  ],
+  "existing_parameter_transfer": {
+    "packet": {
+      "path": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/network-joint-service-regimes.json",
+      "sha256": "2a45c2ad359b6df67a793673211a06e2e06ab0c05499899d0467e1014512551b",
+      "bytes": 26616
+    },
+    "A3_scope": {
+      "ranks": 8,
+      "AG_payload_bytes": 57344,
+      "RS_payload_bytes": 458752,
+      "parameters": null,
+      "extrapolation_allowed": false
+    },
+    "B1_or_TP16_transfer": "not supported; physical payload/rank domain differs",
+    "A5_frozen_parameters": "different hardware/domain; not reused",
+    "Qwen_A3_short_context_parameters": "different GDN vs KDA, widths, expert formats and matrix geometry; no compatible match"
+  },
+  "typed_contracts": {
+    "HCCL": "AICPU_TS/mesh/separate is explicit source-compatible hypothesis only; native HCOM shapes/dtypes are N/A. Payload derives from canonical SP caller, not capture arguments. Original ranks_per_node retained.",
+    "AttnRes": "Existing vllm_ascend_attn_res_prefix can represent source state/prefix ownership, but canonical uses eight generic 5-node points; nine native calls include initial bank point. Generic score compute is part of role total, so no assumed positive timing gain.",
+    "DequantSituQuant": "Grouped BF16 [128,6144] + INT64[112] -> INT8[128,3072]+FP32[128]; shared INT32[1,1536]+FP32[1536]+FP32[1] -> INT8[1,768]+FP32[1]. Existing SwiGLU INT32 and arch35 MX Situ profiles are different ABIs; do not substitute.",
+    "RecurrentKDA": "Existing source mechanism selected; TP8 heads12, TP16 heads6, FP32 state and beta, BF16 QKV/gate. Qwen GDN service rules do not match."
+  },
+  "evidence": [
+    {
+      "path": "/tmp/a3-kimi-tp16-b1-native-ledger-20261030.json",
+      "sha256": "ffe6817cd97d30135ab259bb1d0375904f806b1db0d6cf36cf55a760ac881afe",
+      "bytes": 19485
+    },
+    {
+      "path": "/tmp/a3-kimi-tp16-b1-native-ledger-20261030.py",
+      "sha256": "8e5cecd3ef84814213512213b752ba06e824a7d78f894355841ceac1f7eb2af2",
+      "bytes": 4218
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/verification/kimi-body-activity-20261030.json",
+      "sha256": "1c3a99570f8d018f4748e6e7df5ab50e83173e2556e34a4c200d6160fd34724e",
+      "bytes": 125178
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/verification/kimi-body-primitive-residual-20261030.json",
+      "sha256": "02b107c449256d8d5051b00dd04cf83d35535b7a47b7f76f1bd6ee460057aaef",
+      "bytes": 395889
+    },
+    {
+      "path": "/tmp/a3-kimi-hccl-source-body-control.py",
+      "sha256": "1b5f1ae6fba256544bf8294b39794ff059093a3a0b81642a591212e53222ff36",
+      "bytes": 4783
+    }
+  ],
+  "conclusion": "Untuned source DAG lowers both Body predictions further. Missing AICPU copy/reduce/control and peer readiness remain unpriced; no whole-Body residual or HCOM envelope fit is installed.",
+  "limitations": [
+    "Native family sums may overlap and cannot be added as critical-path attribution.",
+    "TP8 cached native evidence is reusable, but its historical simulation configuration is not used as current canonical prediction.",
+    "Only one TP16 B1 source was streamed; no 46-source raw sweep.",
+    "Exactly two authorized conditional complete Body controls ran; no full matrix rerun."
+  ]
+}
