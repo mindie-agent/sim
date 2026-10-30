@@ -163,10 +163,15 @@ def _indexer_terms(plan, model):
                          "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights")])
     if plan.index_kpool > 1:
         # process_weights_after_loading retains the BF16 parameter objects
-        # and registers FP32 execution copies; these add no checkpoint terms.
-        copies = [replace(term, name=term.name + "_prepared_fp32", source_owned=False,
-                          runtime_dtype="fp32") for term in terms
-                  if term.name in {"indexer_wk", "indexer_weights", "indexer_pool_gate"}]
+        # and registers FP32 execution copies. Explicit alternative formats
+        # retain the same source parameters and their own prepared bytes.
+        quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
+        roles = {"indexer_wk": "indexer.pool_projection", "indexer_weights": "indexer.weights",
+                 "indexer_pool_gate": "indexer.pool_gate"}
+        copies = [replace(term, name=term.name + "_prepared_" + quant.format_for(roles[term.name]),
+                          category=roles[term.name], source_owned=False, runtime_quant=quant)
+                  for term in terms if term.name in roles
+                  and quant.format_for(roles[term.name]) != "bf16"]
         terms.extend(copies)
     return terms
 

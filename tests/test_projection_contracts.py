@@ -135,16 +135,38 @@ def test_mla_ordinary_frontend_preserves_packing_precision_and_branch_dependenci
     assert by_recipe["q_b"].deps == (by_recipe["q_norm"].op_id,)
 
 
-def test_observed_fp32_index_weight_contract_has_input_cast_and_matching_capacity():
+def test_fp32_index_weight_contract_shares_joint_projection_and_prepared_capacity():
     c = case({"indexer.weights": FP32})
     by_recipe = {op.recipe: op for op in target_graphs(
         c, phase="decode", tokens=6, sequences=4, context=2048, scope="body")[0] if op.layer == 3}
-    cast, matrix = by_recipe["index_weights_input_cast"], by_recipe["index_weights"]
-    assert matrix.local_shape == (24, 32, 4096) and matrix.dtype == "fp32"
+    cast, matrix = by_recipe["index_pool_hidden_fp32"], by_recipe["index_k_weights"]
+    assert matrix.local_shape == (24, 160, 4096) and matrix.dtype == "fp32"
     assert matrix.deps == (cast.op_id,)
     assert cast.mte2_bytes == 24 * 4096 * 2 and cast.mte3_bytes == 24 * 4096 * 4
+    weights = by_recipe["index_weights_cast"]
+    assert weights.deps == (matrix.op_id,)
+    assert dict(weights.metadata)["input_column_slice"] == (128, 160)
+    assert weights.mte2_bytes == 24 * 32 * 4
     terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
-    assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == 32 * 4096 * 4
+    assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == 32 * 4096 * 2
+    assert sum(term_bytes(terms[name], c.model.quant, c.runtime.parallel)
+               for name in ("indexer_wk_prepared_fp32", "indexer_weights_prepared_fp32")) == dict(matrix.metadata)["packed_weight_bytes"]
+
+
+def test_explicit_index_weight_precision_splits_joint_pool_projection():
+    c = case({"indexer.weights": BF16})
+    by_recipe = {op.recipe: op for op in target_graphs(
+        c, phase="decode", tokens=6, sequences=4, context=2048, scope="body")[0] if op.layer == 3}
+    key, weights = by_recipe["index_k"], by_recipe["index_weights"]
+    assert "index_k_weights" not in by_recipe
+    assert key.dtype == "fp32" and key.local_shape == (24, 128, 4096)
+    assert weights.dtype == "bf16" and weights.local_shape == (24, 32, 4096)
+    assert key.deps == (by_recipe["index_pool_hidden_fp32"].op_id,)
+    assert weights.deps != key.deps
+    assert by_recipe["index_weights_scale"].deps == (weights.op_id,)
+    terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[3], c.model)}
+    assert "indexer_weights_prepared_fp32" not in terms
+    assert term_bytes(terms["indexer_weights"], c.model.quant, c.runtime.parallel) == dict(weights.metadata)["packed_weight_bytes"]
 
 
 def test_explicit_mla_source_caller_keeps_its_own_projection_boundaries():

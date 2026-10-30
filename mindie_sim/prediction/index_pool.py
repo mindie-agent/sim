@@ -61,10 +61,16 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens):
             read_bytes_override=count * model.hidden_size * dtype_bytes(model.activation_dtype),
             write_bytes_override=count * model.hidden_size * 4,
             metadata=(("input_format", model.activation_dtype), ("output_format", "fp32")))
-    key = b.matrix("index_k_weights", (hidden,), count, width + plan.index_heads, model.hidden_size,
+    fused_weights = (b.quant.for_category("indexer.pool_projection")
+                     == b.quant.for_category("indexer.weights"))
+    key = b.matrix("index_k_weights" if fused_weights else "index_k", (hidden,),
+                   count, width + (plan.index_heads if fused_weights else 0), model.hidden_size,
                    category="indexer.pool_projection", metadata=(
-                       ("key_slice", (0, width)), ("weights_slice", (width, width + plan.index_heads)),
-                       ("slice_layout", "views_of_fused_projection; no_copy"), ("native_source", SOURCE)))
+                       ("key_slice", (0, width)),
+                       ("weights_slice", (width, width + plan.index_heads) if fused_weights else None),
+                       ("projection_packing", "source_joint_key_weights" if fused_weights
+                        else "separate_explicit_operand_formats"),
+                       ("slice_layout", "views_of_projection; no_copy"), ("native_source", SOURCE)))
     normalized = index_layer_norm(b, source=key, rows=count, width=width,
                                   input_dtype="fp32", output_dtype="fp32")
     gates = b.matrix("index_pool_gate", (hidden,), count, width, model.hidden_size,
@@ -107,7 +113,7 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens):
             "scope": "analytical_projection_norm_gate_pool_cache_phases",
             "native_dispatch_and_fusion_not_selected": True}},
         source=SOURCE, coverage={"kind": "analytic_phase_decomposition"})
-    return stored, key
+    return stored, key if fused_weights else None
 
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
