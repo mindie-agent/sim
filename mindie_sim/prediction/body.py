@@ -33,6 +33,9 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
     padded = {r: cohort_padded_tokens((tuple(
         RequestView(f"geometry{r}:{i}", tokens, context, False, phase)
         for i in range(count)),), case.runtime) for r, count in counts.items()}
+    from .decode_probe import probe_capacity
+    capacity = probe_capacity(case, context=context, tokens=tokens,
+                              sequences=sequences, phase=phase)
     return {
         **result, "schema": "mindie-sim.body-forward/1", "status": "modeled",
         "scope": "body", "body_forward_ms": result["duration_ms"],
@@ -47,6 +50,7 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                      "padded_query_tokens": sum(padded.values())},
         "routing": case.runtime.routing or {"policy": "probability_moments"},
         "default_mechanisms": default_selection,
+        "capacity": capacity,
         "boundary_details": {
             "start": "input hidden states and KV cache ready",
             "end": "target transformer body output ready on all cohort participants",

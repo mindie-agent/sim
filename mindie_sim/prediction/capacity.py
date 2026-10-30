@@ -35,7 +35,8 @@ class MemoryPolicy:
 
 
 class Memory:
-    def __init__(self, case: CaseSpec, policy: MemoryPolicy | None = None):
+    def __init__(self, case: CaseSpec, policy: MemoryPolicy | None = None, *,
+                 workspace_tokens: int | None = None):
         self.case = case
         self.policy = policy or MemoryPolicy(**case.runtime.memory)
         p = case.runtime.parallel
@@ -65,7 +66,8 @@ class Memory:
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
         )
         width = p.tp * p.pcp
-        self.workspace = self._workspace() if self.policy.derive_workspace else [0.0] * p.pp
+        self.workspace = (self._workspace(workspace_tokens) if self.policy.derive_workspace
+                          else [0.0] * p.pp)
         self.capacity = [
             [
                 min(d.hbm_bytes * case.runtime.gpu_memory_utilization
@@ -80,12 +82,15 @@ class Memory:
         self.live = [[0.0] * p.pp for _ in range(p.dp)]
         self.owners: dict[tuple[int, str], tuple[float, ...]] = {}
 
-    def _workspace(self):
+    def _workspace(self, tokens=None):
         """Resident simultaneous tensors for one layer, not lifetime traffic."""
         model, runtime = self.case.model, self.case.runtime
         p = runtime.parallel
-        tokens = min(runtime.max_num_batched_tokens, sum(
-            max(1, min(r.prompt_tokens, runtime.max_num_batched_tokens)) for r in self.case.workload.requests))
+        if tokens is None:
+            tokens = min(runtime.max_num_batched_tokens, sum(
+                max(1, min(r.prompt_tokens, runtime.max_num_batched_tokens)) for r in self.case.workload.requests))
+        elif type(tokens) is not int or tokens < 0:
+            raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             residual = model.hidden_size * (2 + max(1, layer.hc_mult))
