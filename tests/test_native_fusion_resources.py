@@ -46,6 +46,24 @@ def _external(ops):
     return {dep: 0 for op in ops for dep in op.deps if dep not in ids}
 
 
+def test_receive_only_kimi_rank_preserves_expert_fusion_without_local_situ():
+    raw = json.loads((ROOT / 'examples/cases/kimi-k3-a5-sp-right-pad-conditional.json').read_text())
+    raw['model']['layers'] = 2
+    graphs = target_graphs(raw, phase='prefill', tokens=64, scope='body',
+                          sequences=[1, 0, 0, 0])
+    for replica, ops in graphs.items():
+        roles = {dict(op.metadata).get('fusion_role') for op in ops}
+        assert 'grouped_gate_up_situ_quant' in roles
+        assert ('situ_quant' in roles) == (replica == 0)
+        assert any(op.family == 'alltoall' and op.link_bytes > 0 for op in ops)
+    result = graph_costs(raw, graphs, external_inputs={'analysis_input': 0}, isolated=False)
+    assert result['duration_ms'] > 0
+    assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
+    # The idle source has real expert compute and return traffic; exempting a
+    # nonexistent local activation does not disable its physical participant.
+    assert result['execution']['serviced']['matrix@r1:s0'] > 0
+
+
 def test_hc_fusion_runs_one_launch_with_source_gram_and_external_outputs():
     from mindie_sim.prediction.family_hc import pre_phase_work
     from mindie_sim.prediction.mechanism import Geometry

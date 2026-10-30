@@ -419,9 +419,11 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None):
         matched_roles.add(declaration["role"])
         replacements[members[0].op_id] = fused
     # A receive-only EP rank still executes expert kernels and transport but
-    # has no local residual stream. The composing frontend, not an empty role
-    # search, establishes that HC has no call on this rank.
-    required_roles = roles - {"hc_pre", "hc_post"} if local_tokens == 0 else roles
+    # has no local residual, dense or shared-expert activation stream. The
+    # frontend establishes those calls are absent; routed expert fusion stays
+    # required because received rows do not depend on local query ownership.
+    local_roles = {"hc_pre", "hc_post", "situ_quant"}
+    required_roles = roles - local_roles if local_tokens == 0 else roles
     if required_roles - matched_roles:
         raise ModelingError("native_fusion_selected_roles_unmatched:" +
                             ",".join(sorted(required_roles - matched_roles)))
