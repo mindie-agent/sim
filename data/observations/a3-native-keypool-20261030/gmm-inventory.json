@@ -1,0 +1,3438 @@
+{
+  "scope": "same_native_ABI_operator_calibration_inventory",
+  "routing_distribution": "unknown; no independence_or_forceEPLB_claim",
+  "model_reference": {
+    "experts": 288,
+    "local_expert_banks": 18,
+    "topk": 8,
+    "tp": 16,
+    "ep": 16,
+    "q": 6,
+    "capacity_is_valid_rows": false
+  },
+  "sources": [
+    {
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+        "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+        "size_bytes": 31548884
+      },
+      "groups": [
+        {
+          "batch": 1,
+          "query_rows": 6,
+          "expected_local_rows": 3.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              128,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              128
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              128
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 336,
+          "sum_us": 12831.194000000001,
+          "min_us": 11.92,
+          "max_us": 99.602,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 851.974999999999,
+            "aic_mac_time(us)": 1075.9289999999999,
+            "aic_mte1_time(us)": 3421.0469999999996,
+            "aic_mte2_time(us)": 6298.163999999995,
+            "aic_scalar_time(us)": 4951.665999999997,
+            "aicore_time(us)": 11421.800000000005,
+            "aiv_mte2_time(us)": 97.665,
+            "aiv_mte3_time(us)": 7.754999999999998,
+            "aiv_scalar_time(us)": 1388.284999999999,
+            "aiv_time(us)": 11847.836,
+            "aiv_vec_time(us)": 31.71699999999996
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 336,
+            "aic_mac_time(us)": 336,
+            "aic_mte1_time(us)": 336,
+            "aic_mte2_time(us)": 336,
+            "aic_scalar_time(us)": 336,
+            "aicore_time(us)": 336,
+            "aiv_mte2_time(us)": 336,
+            "aiv_mte3_time(us)": 336,
+            "aiv_scalar_time(us)": 336,
+            "aiv_time(us)": 336,
+            "aiv_vec_time(us)": 336
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 228,
+            "csv_line": 230,
+            "task_id": "147",
+            "stream_id": "280",
+            "device_id": "0"
+          },
+          "mean_us": 38.188077380952386,
+          "forward_count": 8,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 2.535639880952378,
+            "aic_mac_time(us)": 3.2021696428571422,
+            "aic_mte1_time(us)": 10.181687499999999,
+            "aic_mte2_time(us)": 18.7445357142857,
+            "aic_scalar_time(us)": 14.737101190476183,
+            "aicore_time(us)": 33.9934523809524,
+            "aiv_mte2_time(us)": 0.29066964285714286,
+            "aiv_mte3_time(us)": 0.02308035714285714,
+            "aiv_scalar_time(us)": 4.131800595238092,
+            "aiv_time(us)": 35.26141666666666,
+            "aiv_vec_time(us)": 0.0943958333333332
+          }
+        },
+        {
+          "batch": 1,
+          "query_rows": 6,
+          "expected_local_rows": 3.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              128
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 336,
+          "sum_us": 8203.744999999992,
+          "min_us": 6.901,
+          "max_us": 56.841,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 800.6289999999996,
+            "aic_mac_time(us)": 537.3090000000001,
+            "aic_mte1_time(us)": 1712.2310000000016,
+            "aic_mte2_time(us)": 2536.259000000002,
+            "aic_scalar_time(us)": 2218.0300000000007,
+            "aicore_time(us)": 4634.133,
+            "aiv_mte2_time(us)": 256.44400000000013,
+            "aiv_mte3_time(us)": 69.71799999999998,
+            "aiv_scalar_time(us)": 1212.4749999999992,
+            "aiv_time(us)": 4576.558999999998,
+            "aiv_vec_time(us)": 74.36799999999998
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 336,
+            "aic_mac_time(us)": 336,
+            "aic_mte1_time(us)": 336,
+            "aic_mte2_time(us)": 336,
+            "aic_scalar_time(us)": 336,
+            "aicore_time(us)": 336,
+            "aiv_mte2_time(us)": 336,
+            "aiv_mte3_time(us)": 336,
+            "aiv_scalar_time(us)": 336,
+            "aiv_time(us)": 336,
+            "aiv_vec_time(us)": 336
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 229,
+            "csv_line": 231,
+            "task_id": "149",
+            "stream_id": "280",
+            "device_id": "0"
+          },
+          "mean_us": 24.415907738095214,
+          "forward_count": 8,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 2.3828244047619034,
+            "aic_mac_time(us)": 1.5991339285714288,
+            "aic_mte1_time(us)": 5.0959255952381,
+            "aic_mte2_time(us)": 7.548389880952387,
+            "aic_scalar_time(us)": 6.601279761904764,
+            "aicore_time(us)": 13.7920625,
+            "aiv_mte2_time(us)": 0.7632261904761909,
+            "aiv_mte3_time(us)": 0.20749404761904755,
+            "aiv_scalar_time(us)": 3.6085565476190453,
+            "aiv_time(us)": 13.620711309523804,
+            "aiv_vec_time(us)": 0.22133333333333327
+          }
+        },
+        {
+          "batch": 9,
+          "query_rows": 54,
+          "expected_local_rows": 27.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              512,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              512
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              512,
+              2048
+            ],
+            [
+              512
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 252,
+          "sum_us": 21355.113999999994,
+          "min_us": 14.82,
+          "max_us": 172.283,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 2126.223,
+            "aic_mac_time(us)": 2517.776,
+            "aic_mte1_time(us)": 7687.9119999999975,
+            "aic_mte2_time(us)": 14897.899000000003,
+            "aic_scalar_time(us)": 8739.385999999999,
+            "aicore_time(us)": 19633.069999999985,
+            "aiv_mte2_time(us)": 340.33099999999996,
+            "aiv_mte3_time(us)": 71.84199999999997,
+            "aiv_scalar_time(us)": 1215.5059999999996,
+            "aiv_time(us)": 20340.498000000014,
+            "aiv_vec_time(us)": 164.06300000000013
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 252,
+            "aic_mac_time(us)": 252,
+            "aic_mte1_time(us)": 252,
+            "aic_mte2_time(us)": 252,
+            "aic_scalar_time(us)": 252,
+            "aicore_time(us)": 252,
+            "aiv_mte2_time(us)": 252,
+            "aiv_mte3_time(us)": 252,
+            "aiv_scalar_time(us)": 252,
+            "aiv_time(us)": 252,
+            "aiv_vec_time(us)": 252
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 7809,
+            "csv_line": 7811,
+            "task_id": "147",
+            "stream_id": "204",
+            "device_id": "0"
+          },
+          "mean_us": 84.74251587301585,
+          "forward_count": 6,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.437392857142857,
+            "aic_mac_time(us)": 9.991174603174603,
+            "aic_mte1_time(us)": 30.507587301587293,
+            "aic_mte2_time(us)": 59.11864682539684,
+            "aic_scalar_time(us)": 34.68010317460317,
+            "aicore_time(us)": 77.90900793650788,
+            "aiv_mte2_time(us)": 1.3505198412698411,
+            "aiv_mte3_time(us)": 0.28508730158730144,
+            "aiv_scalar_time(us)": 4.823436507936506,
+            "aiv_time(us)": 80.71626190476196,
+            "aiv_vec_time(us)": 0.6510436507936513
+          }
+        },
+        {
+          "batch": 9,
+          "query_rows": 54,
+          "expected_local_rows": 27.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              512,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              512
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              512,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 252,
+          "sum_us": 11115.811,
+          "min_us": 7.06,
+          "max_us": 85.542,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 2167.809000000001,
+            "aic_mac_time(us)": 1257.7549999999997,
+            "aic_mte1_time(us)": 3845.9310000000005,
+            "aic_mte2_time(us)": 6914.135999999993,
+            "aic_scalar_time(us)": 4222.530000000001,
+            "aicore_time(us)": 8714.259000000004,
+            "aiv_mte2_time(us)": 716.8099999999996,
+            "aiv_mte3_time(us)": 184.84599999999995,
+            "aiv_scalar_time(us)": 1487.0149999999999,
+            "aiv_time(us)": 8695.617000000002,
+            "aiv_vec_time(us)": 226.4489999999999
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 252,
+            "aic_mac_time(us)": 252,
+            "aic_mte1_time(us)": 252,
+            "aic_mte2_time(us)": 252,
+            "aic_scalar_time(us)": 252,
+            "aicore_time(us)": 252,
+            "aiv_mte2_time(us)": 252,
+            "aiv_mte3_time(us)": 252,
+            "aiv_scalar_time(us)": 252,
+            "aiv_time(us)": 252,
+            "aiv_vec_time(us)": 252
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 7810,
+            "csv_line": 7812,
+            "task_id": "149",
+            "stream_id": "204",
+            "device_id": "0"
+          },
+          "mean_us": 44.11036111111111,
+          "forward_count": 6,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.602416666666672,
+            "aic_mac_time(us)": 4.991091269841268,
+            "aic_mte1_time(us)": 15.261630952380955,
+            "aic_mte2_time(us)": 27.437047619047593,
+            "aic_scalar_time(us)": 16.75607142857143,
+            "aicore_time(us)": 34.58039285714287,
+            "aiv_mte2_time(us)": 2.8444841269841254,
+            "aiv_mte3_time(us)": 0.7335158730158728,
+            "aiv_scalar_time(us)": 5.900853174603174,
+            "aiv_time(us)": 34.506416666666674,
+            "aiv_vec_time(us)": 0.8986071428571425
+          }
+        },
+        {
+          "batch": 10,
+          "query_rows": 60,
+          "expected_local_rows": 30.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              512,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              512
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              512,
+              2048
+            ],
+            [
+              512
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 714,
+          "sum_us": 59569.59200000007,
+          "min_us": 16.24,
+          "max_us": 182.283,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 5871.200000000007,
+            "aic_mac_time(us)": 7060.546000000007,
+            "aic_mte1_time(us)": 21339.173,
+            "aic_mte2_time(us)": 41235.92599999998,
+            "aic_scalar_time(us)": 24367.389000000006,
+            "aicore_time(us)": 54621.46300000006,
+            "aiv_mte2_time(us)": 970.3400000000014,
+            "aiv_mte3_time(us)": 255.32900000000006,
+            "aiv_scalar_time(us)": 3305.826000000003,
+            "aiv_time(us)": 56713.43799999998,
+            "aiv_vec_time(us)": 491.59399999999994
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 714,
+            "aic_mac_time(us)": 714,
+            "aic_mte1_time(us)": 714,
+            "aic_mte2_time(us)": 714,
+            "aic_scalar_time(us)": 714,
+            "aicore_time(us)": 714,
+            "aiv_mte2_time(us)": 714,
+            "aiv_mte3_time(us)": 714,
+            "aiv_scalar_time(us)": 714,
+            "aiv_time(us)": 714,
+            "aiv_vec_time(us)": 714
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 10378,
+            "csv_line": 10380,
+            "task_id": "147",
+            "stream_id": "207",
+            "device_id": "0"
+          },
+          "mean_us": 83.43080112044828,
+          "forward_count": 17,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.22296918767508,
+            "aic_mac_time(us)": 9.888719887955192,
+            "aic_mte1_time(us)": 29.886796918767505,
+            "aic_mte2_time(us)": 57.75339775910361,
+            "aic_scalar_time(us)": 34.12799579831934,
+            "aicore_time(us)": 76.50064845938384,
+            "aiv_mte2_time(us)": 1.3590196078431391,
+            "aiv_mte3_time(us)": 0.35760364145658274,
+            "aiv_scalar_time(us)": 4.630008403361349,
+            "aiv_time(us)": 79.43058543417364,
+            "aiv_vec_time(us)": 0.6885070028011203
+          }
+        },
+        {
+          "batch": 10,
+          "query_rows": 60,
+          "expected_local_rows": 30.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              512,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              512
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              512,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 714,
+          "sum_us": 31112.460999999996,
+          "min_us": 7.241,
+          "max_us": 84.001,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 6005.805000000011,
+            "aic_mac_time(us)": 3527.176999999997,
+            "aic_mte1_time(us)": 10674.231000000005,
+            "aic_mte2_time(us)": 19222.216999999993,
+            "aic_scalar_time(us)": 11783.035999999991,
+            "aicore_time(us)": 24162.710999999996,
+            "aiv_mte2_time(us)": 2031.068999999999,
+            "aiv_mte3_time(us)": 512.7730000000004,
+            "aiv_scalar_time(us)": 4277.009000000001,
+            "aiv_time(us)": 24196.375999999986,
+            "aiv_vec_time(us)": 654.1730000000008
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 714,
+            "aic_mac_time(us)": 714,
+            "aic_mte1_time(us)": 714,
+            "aic_mte2_time(us)": 714,
+            "aic_scalar_time(us)": 714,
+            "aicore_time(us)": 714,
+            "aiv_mte2_time(us)": 714,
+            "aiv_mte3_time(us)": 714,
+            "aiv_scalar_time(us)": 714,
+            "aiv_time(us)": 714,
+            "aiv_vec_time(us)": 714
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 10379,
+            "csv_line": 10381,
+            "task_id": "149",
+            "stream_id": "207",
+            "device_id": "0"
+          },
+          "mean_us": 43.57487535014005,
+          "forward_count": 17,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.41149159663867,
+            "aic_mac_time(us)": 4.940023809523805,
+            "aic_mte1_time(us)": 14.949903361344544,
+            "aic_mte2_time(us)": 26.9218725490196,
+            "aic_scalar_time(us)": 16.502851540616234,
+            "aicore_time(us)": 33.8413319327731,
+            "aiv_mte2_time(us)": 2.844634453781511,
+            "aiv_mte3_time(us)": 0.7181694677871153,
+            "aiv_scalar_time(us)": 5.990208683473391,
+            "aiv_time(us)": 33.888481792717066,
+            "aiv_vec_time(us)": 0.9162086834733905
+          }
+        },
+        {
+          "batch": 3,
+          "query_rows": 18,
+          "expected_local_rows": 9.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              256,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              256
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              256
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 2473.232,
+          "min_us": 13.701,
+          "max_us": 101.402,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 209.41799999999998,
+            "aic_mac_time(us)": 251.79300000000006,
+            "aic_mte1_time(us)": 803.837,
+            "aic_mte2_time(us)": 1604.9570000000003,
+            "aic_scalar_time(us)": 1017.5540000000002,
+            "aicore_time(us)": 2319.1260000000007,
+            "aiv_mte2_time(us)": 24.285000000000004,
+            "aiv_mte3_time(us)": 4.033999999999999,
+            "aiv_scalar_time(us)": 201.50299999999993,
+            "aiv_time(us)": 2339.1400000000003,
+            "aiv_vec_time(us)": 10.534
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 51161,
+            "csv_line": 51163,
+            "task_id": "147",
+            "stream_id": "186",
+            "device_id": "0"
+          },
+          "mean_us": 58.88647619047619,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 4.986142857142856,
+            "aic_mac_time(us)": 5.99507142857143,
+            "aic_mte1_time(us)": 19.13897619047619,
+            "aic_mte2_time(us)": 38.213261904761914,
+            "aic_scalar_time(us)": 24.227476190476196,
+            "aicore_time(us)": 55.21728571428573,
+            "aiv_mte2_time(us)": 0.5782142857142858,
+            "aiv_mte3_time(us)": 0.09604761904761902,
+            "aiv_scalar_time(us)": 4.797690476190475,
+            "aiv_time(us)": 55.693809523809534,
+            "aiv_vec_time(us)": 0.2508095238095238
+          }
+        },
+        {
+          "batch": 3,
+          "query_rows": 18,
+          "expected_local_rows": 9.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              256
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1380.151,
+          "min_us": 7.6,
+          "max_us": 56.341,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 217.10400000000004,
+            "aic_mac_time(us)": 125.81400000000001,
+            "aic_mte1_time(us)": 402.33700000000005,
+            "aic_mte2_time(us)": 687.67,
+            "aic_scalar_time(us)": 491.81300000000005,
+            "aicore_time(us)": 986.9460000000001,
+            "aiv_mte2_time(us)": 66.72900000000001,
+            "aiv_mte3_time(us)": 18.431000000000004,
+            "aiv_scalar_time(us)": 221.81899999999996,
+            "aiv_time(us)": 980.9310000000002,
+            "aiv_vec_time(us)": 19.269
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 51162,
+            "csv_line": 51164,
+            "task_id": "149",
+            "stream_id": "186",
+            "device_id": "0"
+          },
+          "mean_us": 32.8607380952381,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 5.169142857142858,
+            "aic_mac_time(us)": 2.9955714285714286,
+            "aic_mte1_time(us)": 9.579452380952382,
+            "aic_mte2_time(us)": 16.37309523809524,
+            "aic_scalar_time(us)": 11.709833333333334,
+            "aicore_time(us)": 23.49871428571429,
+            "aiv_mte2_time(us)": 1.5887857142857147,
+            "aiv_mte3_time(us)": 0.43883333333333346,
+            "aiv_scalar_time(us)": 5.281404761904761,
+            "aiv_time(us)": 23.355500000000003,
+            "aiv_vec_time(us)": 0.45878571428571424
+          }
+        },
+        {
+          "batch": 5,
+          "query_rows": 30,
+          "expected_local_rows": 15.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              256,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              256
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              256
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 84,
+          "sum_us": 5787.457,
+          "min_us": 12.96,
+          "max_us": 127.022,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 537.5259999999998,
+            "aic_mac_time(us)": 635.466,
+            "aic_mte1_time(us)": 2015.5320000000004,
+            "aic_mte2_time(us)": 3974.2429999999995,
+            "aic_scalar_time(us)": 2425.0660000000003,
+            "aicore_time(us)": 5393.771000000001,
+            "aiv_mte2_time(us)": 66.00200000000002,
+            "aiv_mte3_time(us)": 15.213000000000003,
+            "aiv_scalar_time(us)": 402.5569999999999,
+            "aiv_time(us)": 5482.742999999998,
+            "aiv_vec_time(us)": 30.979999999999997
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 84,
+            "aic_mac_time(us)": 84,
+            "aic_mte1_time(us)": 84,
+            "aic_mte2_time(us)": 84,
+            "aic_scalar_time(us)": 84,
+            "aicore_time(us)": 84,
+            "aiv_mte2_time(us)": 84,
+            "aiv_mte3_time(us)": 84,
+            "aiv_scalar_time(us)": 84,
+            "aiv_time(us)": 84,
+            "aiv_vec_time(us)": 84
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 53718,
+            "csv_line": 53720,
+            "task_id": "147",
+            "stream_id": "192",
+            "device_id": "0"
+          },
+          "mean_us": 68.89829761904763,
+          "forward_count": 2,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.399119047619045,
+            "aic_mac_time(us)": 7.565071428571429,
+            "aic_mte1_time(us)": 23.994428571428575,
+            "aic_mte2_time(us)": 47.312416666666664,
+            "aic_scalar_time(us)": 28.869833333333336,
+            "aicore_time(us)": 64.21155952380953,
+            "aiv_mte2_time(us)": 0.7857380952380956,
+            "aiv_mte3_time(us)": 0.18110714285714288,
+            "aiv_scalar_time(us)": 4.792345238095237,
+            "aiv_time(us)": 65.27074999999998,
+            "aiv_vec_time(us)": 0.36880952380952375
+          }
+        },
+        {
+          "batch": 5,
+          "query_rows": 30,
+          "expected_local_rows": 15.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              256
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 84,
+          "sum_us": 3170.196,
+          "min_us": 7.66,
+          "max_us": 62.242,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 556.396,
+            "aic_mac_time(us)": 317.39500000000004,
+            "aic_mte1_time(us)": 1008.487,
+            "aic_mte2_time(us)": 1788.6430000000005,
+            "aic_scalar_time(us)": 1188.782,
+            "aicore_time(us)": 2416.9519999999998,
+            "aiv_mte2_time(us)": 182.06200000000004,
+            "aiv_mte3_time(us)": 45.02900000000002,
+            "aiv_scalar_time(us)": 483.43899999999985,
+            "aiv_time(us)": 2405.558,
+            "aiv_vec_time(us)": 51.09899999999999
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 84,
+            "aic_mac_time(us)": 84,
+            "aic_mte1_time(us)": 84,
+            "aic_mte2_time(us)": 84,
+            "aic_scalar_time(us)": 84,
+            "aicore_time(us)": 84,
+            "aiv_mte2_time(us)": 84,
+            "aiv_mte3_time(us)": 84,
+            "aiv_scalar_time(us)": 84,
+            "aiv_time(us)": 84,
+            "aiv_vec_time(us)": 84
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 53719,
+            "csv_line": 53721,
+            "task_id": "149",
+            "stream_id": "192",
+            "device_id": "0"
+          },
+          "mean_us": 37.74042857142857,
+          "forward_count": 2,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.6237619047619045,
+            "aic_mac_time(us)": 3.7785119047619053,
+            "aic_mte1_time(us)": 12.005797619047618,
+            "aic_mte2_time(us)": 21.293369047619052,
+            "aic_scalar_time(us)": 14.152166666666666,
+            "aicore_time(us)": 28.773238095238092,
+            "aiv_mte2_time(us)": 2.1674047619047623,
+            "aiv_mte3_time(us)": 0.536059523809524,
+            "aiv_scalar_time(us)": 5.755226190476189,
+            "aiv_time(us)": 28.637595238095237,
+            "aiv_vec_time(us)": 0.6083214285714285
+          }
+        },
+        {
+          "batch": 6,
+          "query_rows": 36,
+          "expected_local_rows": 18.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              384,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              384
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              384
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 3415.8869999999997,
+          "min_us": 18.021,
+          "max_us": 127.523,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 336.25000000000006,
+            "aic_mac_time(us)": 385.3,
+            "aic_mte1_time(us)": 1211.925,
+            "aic_mte2_time(us)": 2345.3740000000007,
+            "aic_scalar_time(us)": 1381.964,
+            "aicore_time(us)": 3118.334999999999,
+            "aiv_mte2_time(us)": 59.602000000000004,
+            "aiv_mte3_time(us)": 11.731,
+            "aiv_scalar_time(us)": 182.634,
+            "aiv_time(us)": 3235.312,
+            "aiv_vec_time(us)": 19.036999999999995
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 56271,
+            "csv_line": 56273,
+            "task_id": "147",
+            "stream_id": "195",
+            "device_id": "0"
+          },
+          "mean_us": 81.33064285714285,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.005952380952383,
+            "aic_mac_time(us)": 9.173809523809524,
+            "aic_mte1_time(us)": 28.85535714285714,
+            "aic_mte2_time(us)": 55.84223809523811,
+            "aic_scalar_time(us)": 32.90390476190476,
+            "aicore_time(us)": 74.24607142857141,
+            "aiv_mte2_time(us)": 1.4190952380952382,
+            "aiv_mte3_time(us)": 0.2793095238095238,
+            "aiv_scalar_time(us)": 4.348428571428571,
+            "aiv_time(us)": 77.0312380952381,
+            "aiv_vec_time(us)": 0.45326190476190464
+          }
+        },
+        {
+          "batch": 6,
+          "query_rows": 36,
+          "expected_local_rows": 18.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              384
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1824.4359999999997,
+          "min_us": 6.92,
+          "max_us": 61.501,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 343.79200000000003,
+            "aic_mac_time(us)": 192.423,
+            "aic_mte1_time(us)": 606.2080000000003,
+            "aic_mte2_time(us)": 1097.602,
+            "aic_scalar_time(us)": 683.1309999999999,
+            "aicore_time(us)": 1396.2879999999998,
+            "aiv_mte2_time(us)": 110.44200000000002,
+            "aiv_mte3_time(us)": 27.909999999999993,
+            "aiv_scalar_time(us)": 251.52,
+            "aiv_time(us)": 1390.863,
+            "aiv_vec_time(us)": 31.037999999999997
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 56272,
+            "csv_line": 56274,
+            "task_id": "149",
+            "stream_id": "195",
+            "device_id": "0"
+          },
+          "mean_us": 43.43895238095237,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.18552380952381,
+            "aic_mac_time(us)": 4.5815,
+            "aic_mte1_time(us)": 14.433523809523816,
+            "aic_mte2_time(us)": 26.133380952380953,
+            "aic_scalar_time(us)": 16.265023809523807,
+            "aicore_time(us)": 33.24495238095238,
+            "aiv_mte2_time(us)": 2.629571428571429,
+            "aiv_mte3_time(us)": 0.6645238095238094,
+            "aiv_scalar_time(us)": 5.988571428571428,
+            "aiv_time(us)": 33.115785714285714,
+            "aiv_vec_time(us)": 0.7389999999999999
+          }
+        },
+        {
+          "batch": 7,
+          "query_rows": 42,
+          "expected_local_rows": 21.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              384,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              384
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              384
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 3605.135,
+          "min_us": 40.561,
+          "max_us": 135.403,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 353.5810000000001,
+            "aic_mac_time(us)": 412.635,
+            "aic_mte1_time(us)": 1287.371,
+            "aic_mte2_time(us)": 2496.513999999999,
+            "aic_scalar_time(us)": 1478.1839999999993,
+            "aicore_time(us)": 3295.595999999999,
+            "aiv_mte2_time(us)": 54.946000000000005,
+            "aiv_mte3_time(us)": 12.222999999999997,
+            "aiv_scalar_time(us)": 224.86600000000004,
+            "aiv_time(us)": 3426.732000000001,
+            "aiv_vec_time(us)": 21.48
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 84430,
+            "csv_line": 84432,
+            "task_id": "147",
+            "stream_id": "198",
+            "device_id": "0"
+          },
+          "mean_us": 85.83654761904762,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.41859523809524,
+            "aic_mac_time(us)": 9.824642857142857,
+            "aic_mte1_time(us)": 30.651690476190478,
+            "aic_mte2_time(us)": 59.440809523809506,
+            "aic_scalar_time(us)": 35.194857142857124,
+            "aicore_time(us)": 78.46657142857141,
+            "aiv_mte2_time(us)": 1.3082380952380954,
+            "aiv_mte3_time(us)": 0.29102380952380946,
+            "aiv_scalar_time(us)": 5.353952380952382,
+            "aiv_time(us)": 81.58885714285717,
+            "aiv_vec_time(us)": 0.5114285714285715
+          }
+        },
+        {
+          "batch": 7,
+          "query_rows": 42,
+          "expected_local_rows": 21.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              384
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1843.7539999999997,
+          "min_us": 24.541,
+          "max_us": 66.301,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 361.86199999999997,
+            "aic_mac_time(us)": 206.105,
+            "aic_mte1_time(us)": 644.0500000000001,
+            "aic_mte2_time(us)": 1155.2,
+            "aic_scalar_time(us)": 718.8170000000001,
+            "aicore_time(us)": 1471.6899999999998,
+            "aiv_mte2_time(us)": 116.11699999999996,
+            "aiv_mte3_time(us)": 29.078000000000003,
+            "aiv_scalar_time(us)": 265.98999999999995,
+            "aiv_time(us)": 1466.185,
+            "aiv_vec_time(us)": 33.73799999999999
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 84431,
+            "csv_line": 84433,
+            "task_id": "149",
+            "stream_id": "198",
+            "device_id": "0"
+          },
+          "mean_us": 43.89890476190475,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.615761904761904,
+            "aic_mac_time(us)": 4.907261904761905,
+            "aic_mte1_time(us)": 15.33452380952381,
+            "aic_mte2_time(us)": 27.504761904761907,
+            "aic_scalar_time(us)": 17.11469047619048,
+            "aicore_time(us)": 35.04023809523809,
+            "aiv_mte2_time(us)": 2.7646904761904754,
+            "aiv_mte3_time(us)": 0.6923333333333334,
+            "aiv_scalar_time(us)": 6.333095238095237,
+            "aiv_time(us)": 34.909166666666664,
+            "aiv_vec_time(us)": 0.8032857142857142
+          }
+        },
+        {
+          "batch": 4,
+          "query_rows": 24,
+          "expected_local_rows": 12.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              256,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              256
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              256
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 2704.9939999999997,
+          "min_us": 12.841,
+          "max_us": 112.502,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 239.90799999999996,
+            "aic_mac_time(us)": 286.97099999999995,
+            "aic_mte1_time(us)": 911.149,
+            "aic_mte2_time(us)": 1794.949,
+            "aic_scalar_time(us)": 1139.7310000000002,
+            "aicore_time(us)": 2535.597,
+            "aiv_mte2_time(us)": 26.080999999999996,
+            "aiv_mte3_time(us)": 6.211,
+            "aiv_scalar_time(us)": 220.63799999999992,
+            "aiv_time(us)": 2565.368,
+            "aiv_vec_time(us)": 12.372999999999998
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 89515,
+            "csv_line": 89517,
+            "task_id": "147",
+            "stream_id": "189",
+            "device_id": "0"
+          },
+          "mean_us": 64.40461904761904,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 5.7120952380952374,
+            "aic_mac_time(us)": 6.832642857142856,
+            "aic_mte1_time(us)": 21.69402380952381,
+            "aic_mte2_time(us)": 42.73688095238096,
+            "aic_scalar_time(us)": 27.136452380952385,
+            "aicore_time(us)": 60.37135714285715,
+            "aiv_mte2_time(us)": 0.6209761904761903,
+            "aiv_mte3_time(us)": 0.1478809523809524,
+            "aiv_scalar_time(us)": 5.253285714285712,
+            "aiv_time(us)": 61.080190476190474,
+            "aiv_vec_time(us)": 0.294595238095238
+          }
+        },
+        {
+          "batch": 4,
+          "query_rows": 24,
+          "expected_local_rows": 12.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              256
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1497.6309999999999,
+          "min_us": 8.4,
+          "max_us": 62.382,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 247.13500000000002,
+            "aic_mac_time(us)": 143.28300000000002,
+            "aic_mte1_time(us)": 455.915,
+            "aic_mte2_time(us)": 788.362,
+            "aic_scalar_time(us)": 549.164,
+            "aicore_time(us)": 1099.461,
+            "aiv_mte2_time(us)": 77.509,
+            "aiv_mte3_time(us)": 19.796,
+            "aiv_scalar_time(us)": 252.80399999999997,
+            "aiv_time(us)": 1097.6119999999999,
+            "aiv_vec_time(us)": 22.094
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 89516,
+            "csv_line": 89518,
+            "task_id": "149",
+            "stream_id": "189",
+            "device_id": "0"
+          },
+          "mean_us": 35.65788095238095,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 5.884166666666667,
+            "aic_mac_time(us)": 3.4115,
+            "aic_mte1_time(us)": 10.855119047619048,
+            "aic_mte2_time(us)": 18.77052380952381,
+            "aic_scalar_time(us)": 13.075333333333333,
+            "aicore_time(us)": 26.177642857142857,
+            "aiv_mte2_time(us)": 1.845452380952381,
+            "aiv_mte3_time(us)": 0.4713333333333333,
+            "aiv_scalar_time(us)": 6.019142857142857,
+            "aiv_time(us)": 26.133619047619042,
+            "aiv_vec_time(us)": 0.5260476190476191
+          }
+        }
+      ],
+      "forward_ids": {
+        "1": [
+          "auto:0",
+          "auto:1",
+          "auto:2",
+          "auto:16",
+          "auto:17",
+          "auto:18",
+          "auto:19",
+          "auto:36"
+        ],
+        "9": [
+          "auto:3",
+          "auto:14",
+          "auto:15",
+          "auto:23",
+          "auto:31",
+          "auto:32"
+        ],
+        "10": [
+          "auto:4",
+          "auto:5",
+          "auto:6",
+          "auto:7",
+          "auto:8",
+          "auto:9",
+          "auto:10",
+          "auto:11",
+          "auto:12",
+          "auto:13",
+          "auto:24",
+          "auto:25",
+          "auto:26",
+          "auto:27",
+          "auto:28",
+          "auto:29",
+          "auto:30"
+        ],
+        "3": [
+          "auto:20"
+        ],
+        "5": [
+          "auto:21",
+          "auto:34"
+        ],
+        "6": [
+          "auto:22"
+        ],
+        "7": [
+          "auto:33"
+        ],
+        "4": [
+          "auto:35"
+        ]
+      },
+      "scan_counts": {
+        "scanned_events": 94348,
+        "positive_events": 94348,
+        "vocabulary_head_occurrences": 222,
+        "complete_body_segment_events": 78178,
+        "auxiliary_candidate_segment_events": 16155,
+        "trailing_segment_events": 15
+      }
+    },
+    {
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+        "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+        "size_bytes": 86903800
+      },
+      "groups": [
+        {
+          "batch": 1,
+          "query_rows": 6,
+          "expected_local_rows": 3.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              128,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              128
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              128
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 2856,
+          "sum_us": 112491.11399999983,
+          "min_us": 11.7,
+          "max_us": 121.382,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 7510.073000000046,
+            "aic_mac_time(us)": 9509.570000000009,
+            "aic_mte1_time(us)": 30186.675000000123,
+            "aic_mte2_time(us)": 55830.756999999685,
+            "aic_scalar_time(us)": 43056.72599999997,
+            "aicore_time(us)": 99267.75100000028,
+            "aiv_mte2_time(us)": 732.955999999996,
+            "aiv_mte3_time(us)": 63.745000000000104,
+            "aiv_scalar_time(us)": 11744.264000000006,
+            "aiv_time(us)": 102975.46899999988,
+            "aiv_vec_time(us)": 253.06199999999666
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 2824,
+            "aic_mac_time(us)": 2824,
+            "aic_mte1_time(us)": 2824,
+            "aic_mte2_time(us)": 2824,
+            "aic_scalar_time(us)": 2824,
+            "aicore_time(us)": 2824,
+            "aiv_mte2_time(us)": 2824,
+            "aiv_mte3_time(us)": 2824,
+            "aiv_scalar_time(us)": 2824,
+            "aiv_time(us)": 2824,
+            "aiv_vec_time(us)": 2824
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 3109,
+            "csv_line": 3111,
+            "task_id": "147",
+            "stream_id": "280",
+            "device_id": "0"
+          },
+          "mean_us": 39.387644957983134,
+          "forward_count": 68,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 2.6593742917847187,
+            "aic_mac_time(us)": 3.367411473087822,
+            "aic_mte1_time(us)": 10.689332507082197,
+            "aic_mte2_time(us)": 19.770098087818585,
+            "aic_scalar_time(us)": 15.246716005665713,
+            "aicore_time(us)": 35.15146990084996,
+            "aiv_mte2_time(us)": 0.25954532577903544,
+            "aiv_mte3_time(us)": 0.022572592067988704,
+            "aiv_scalar_time(us)": 4.158733711048161,
+            "aiv_time(us)": 36.46440120396596,
+            "aiv_vec_time(us)": 0.08961118980169853
+          }
+        },
+        {
+          "batch": 1,
+          "query_rows": 6,
+          "expected_local_rows": 3.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              128
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 2856,
+          "sum_us": 70814.58200000004,
+          "min_us": 6.48,
+          "max_us": 63.141,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 7111.284000000065,
+            "aic_mac_time(us)": 4748.6939999999995,
+            "aic_mte1_time(us)": 15109.997999999956,
+            "aic_mte2_time(us)": 22594.259999999977,
+            "aic_scalar_time(us)": 19419.157999999952,
+            "aicore_time(us)": 40395.927,
+            "aiv_mte2_time(us)": 2246.345000000002,
+            "aiv_mte3_time(us)": 609.294999999997,
+            "aiv_scalar_time(us)": 10475.89899999999,
+            "aiv_time(us)": 39946.632,
+            "aiv_vec_time(us)": 638.1660000000055
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 2824,
+            "aic_mac_time(us)": 2824,
+            "aic_mte1_time(us)": 2824,
+            "aic_mte2_time(us)": 2824,
+            "aic_scalar_time(us)": 2824,
+            "aicore_time(us)": 2824,
+            "aiv_mte2_time(us)": 2824,
+            "aiv_mte3_time(us)": 2824,
+            "aiv_scalar_time(us)": 2824,
+            "aiv_time(us)": 2824,
+            "aiv_vec_time(us)": 2824
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 3110,
+            "csv_line": 3112,
+            "task_id": "149",
+            "stream_id": "280",
+            "device_id": "0"
+          },
+          "mean_us": 24.795021708683485,
+          "forward_count": 68,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 2.518160056657247,
+            "aic_mac_time(us)": 1.6815488668555238,
+            "aic_mte1_time(us)": 5.350565864022648,
+            "aic_mte2_time(us)": 8.000800283286111,
+            "aic_scalar_time(us)": 6.876472379603382,
+            "aicore_time(us)": 14.304506728045327,
+            "aiv_mte2_time(us)": 0.7954479461756381,
+            "aiv_mte3_time(us)": 0.21575601983002726,
+            "aiv_scalar_time(us)": 3.7095959631728013,
+            "aiv_time(us)": 14.14540793201133,
+            "aiv_vec_time(us)": 0.2259794617563759
+          }
+        },
+        {
+          "batch": 4,
+          "query_rows": 24,
+          "expected_local_rows": 12.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              256,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              256
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              256
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 546,
+          "sum_us": 40694.861000000004,
+          "min_us": 13.141,
+          "max_us": 179.163,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 3895.2910000000024,
+            "aic_mac_time(us)": 4561.227000000003,
+            "aic_mte1_time(us)": 14481.400000000012,
+            "aic_mte2_time(us)": 28605.724000000017,
+            "aic_scalar_time(us)": 17412.346999999998,
+            "aicore_time(us)": 38537.39,
+            "aiv_mte2_time(us)": 342.06600000000003,
+            "aiv_mte3_time(us)": 72.51199999999999,
+            "aiv_scalar_time(us)": 2832.7379999999957,
+            "aiv_time(us)": 38859.64400000002,
+            "aiv_vec_time(us)": 153.8040000000001
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 546,
+            "aic_mac_time(us)": 546,
+            "aic_mte1_time(us)": 546,
+            "aic_mte2_time(us)": 546,
+            "aic_scalar_time(us)": 546,
+            "aicore_time(us)": 546,
+            "aiv_mte2_time(us)": 546,
+            "aiv_mte3_time(us)": 546,
+            "aiv_scalar_time(us)": 546,
+            "aiv_time(us)": 546,
+            "aiv_vec_time(us)": 546
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 179017,
+            "csv_line": 179019,
+            "task_id": "147",
+            "stream_id": "189",
+            "device_id": "0"
+          },
+          "mean_us": 74.53271245421246,
+          "forward_count": 13,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.134232600732605,
+            "aic_mac_time(us)": 8.353895604395609,
+            "aic_mte1_time(us)": 26.522710622710644,
+            "aic_mte2_time(us)": 52.391435897435926,
+            "aic_scalar_time(us)": 31.890745421245416,
+            "aicore_time(us)": 70.58130036630037,
+            "aiv_mte2_time(us)": 0.6264945054945056,
+            "aiv_mte3_time(us)": 0.1328058608058608,
+            "aiv_scalar_time(us)": 5.1881648351648275,
+            "aiv_time(us)": 71.17150915750919,
+            "aiv_vec_time(us)": 0.28169230769230785
+          }
+        },
+        {
+          "batch": 4,
+          "query_rows": 24,
+          "expected_local_rows": 12.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              256
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 546,
+          "sum_us": 22170.265000000003,
+          "min_us": 8.26,
+          "max_us": 95.362,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 4007.6939999999986,
+            "aic_mac_time(us)": 2278.4119999999994,
+            "aic_mte1_time(us)": 7245.539000000004,
+            "aic_mte2_time(us)": 12886.290000000017,
+            "aic_scalar_time(us)": 8412.563000000006,
+            "aicore_time(us)": 17036.966999999993,
+            "aiv_mte2_time(us)": 1296.2680000000005,
+            "aiv_mte3_time(us)": 313.00099999999986,
+            "aiv_scalar_time(us)": 3556.797000000006,
+            "aiv_time(us)": 17013.412,
+            "aiv_vec_time(us)": 324.88900000000035
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 546,
+            "aic_mac_time(us)": 546,
+            "aic_mte1_time(us)": 546,
+            "aic_mte2_time(us)": 546,
+            "aic_scalar_time(us)": 546,
+            "aicore_time(us)": 546,
+            "aiv_mte2_time(us)": 546,
+            "aiv_mte3_time(us)": 546,
+            "aiv_scalar_time(us)": 546,
+            "aiv_time(us)": 546,
+            "aiv_vec_time(us)": 546
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 179018,
+            "csv_line": 179020,
+            "task_id": "149",
+            "stream_id": "189",
+            "device_id": "0"
+          },
+          "mean_us": 40.60488095238096,
+          "forward_count": 13,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.340098901098899,
+            "aic_mac_time(us)": 4.17291575091575,
+            "aic_mte1_time(us)": 13.270217948717956,
+            "aic_mte2_time(us)": 23.601263736263768,
+            "aic_scalar_time(us)": 15.407624542124552,
+            "aicore_time(us)": 31.20323626373625,
+            "aiv_mte2_time(us)": 2.374117216117217,
+            "aiv_mte3_time(us)": 0.5732619047619045,
+            "aiv_scalar_time(us)": 6.514280219780231,
+            "aiv_time(us)": 31.160095238095238,
+            "aiv_vec_time(us)": 0.5950347985347991
+          }
+        },
+        {
+          "batch": 3,
+          "query_rows": 18,
+          "expected_local_rows": 9.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              256,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              256
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              256
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 3040.6420000000003,
+          "min_us": 13.52,
+          "max_us": 151.403,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 286.979,
+            "aic_mac_time(us)": 338.8319999999999,
+            "aic_mte1_time(us)": 1077.1050000000002,
+            "aic_mte2_time(us)": 2137.91,
+            "aic_scalar_time(us)": 1284.532,
+            "aicore_time(us)": 2885.429,
+            "aiv_mte2_time(us)": 24.784999999999993,
+            "aiv_mte3_time(us)": 3.524999999999999,
+            "aiv_scalar_time(us)": 196.57800000000003,
+            "aiv_time(us)": 2906.4300000000003,
+            "aiv_vec_time(us)": 9.708000000000002
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 212050,
+            "csv_line": 212052,
+            "task_id": "147",
+            "stream_id": "186",
+            "device_id": "0"
+          },
+          "mean_us": 72.3962380952381,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.832833333333333,
+            "aic_mac_time(us)": 8.067428571428568,
+            "aic_mte1_time(us)": 25.645357142857147,
+            "aic_mte2_time(us)": 50.90261904761904,
+            "aic_scalar_time(us)": 30.584095238095237,
+            "aicore_time(us)": 68.70069047619047,
+            "aiv_mte2_time(us)": 0.5901190476190474,
+            "aiv_mte3_time(us)": 0.08392857142857141,
+            "aiv_scalar_time(us)": 4.680428571428572,
+            "aiv_time(us)": 69.2007142857143,
+            "aiv_vec_time(us)": 0.23114285714285718
+          }
+        },
+        {
+          "batch": 3,
+          "query_rows": 18,
+          "expected_local_rows": 9.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              256,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              256
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              256,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1693.3440000000003,
+          "min_us": 8.041,
+          "max_us": 76.321,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 296.052,
+            "aic_mac_time(us)": 169.144,
+            "aic_mte1_time(us)": 538.8779999999999,
+            "aic_mte2_time(us)": 955.1700000000002,
+            "aic_scalar_time(us)": 620.068,
+            "aicore_time(us)": 1268.2899999999995,
+            "aiv_mte2_time(us)": 92.64899999999999,
+            "aiv_mte3_time(us)": 23.595000000000006,
+            "aiv_scalar_time(us)": 248.594,
+            "aiv_time(us)": 1261.462,
+            "aiv_vec_time(us)": 23.132
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 212051,
+            "csv_line": 212053,
+            "task_id": "149",
+            "stream_id": "186",
+            "device_id": "0"
+          },
+          "mean_us": 40.317714285714295,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.048857142857143,
+            "aic_mac_time(us)": 4.027238095238095,
+            "aic_mte1_time(us)": 12.83042857142857,
+            "aic_mte2_time(us)": 22.742142857142863,
+            "aic_scalar_time(us)": 14.763523809523809,
+            "aicore_time(us)": 30.19738095238094,
+            "aiv_mte2_time(us)": 2.2059285714285712,
+            "aiv_mte3_time(us)": 0.5617857142857144,
+            "aiv_scalar_time(us)": 5.918904761904762,
+            "aiv_time(us)": 30.034809523809525,
+            "aiv_vec_time(us)": 0.5507619047619048
+          }
+        },
+        {
+          "batch": 2,
+          "query_rows": 12,
+          "expected_local_rows": 6.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              128,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              128
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              128
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 126,
+          "sum_us": 6516.832999999999,
+          "min_us": 14.041,
+          "max_us": 107.702,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 520.26,
+            "aic_mac_time(us)": 633.021,
+            "aic_mte1_time(us)": 2015.4089999999999,
+            "aic_mte2_time(us)": 3808.245,
+            "aic_scalar_time(us)": 2591.8959999999993,
+            "aicore_time(us)": 5916.648999999995,
+            "aiv_mte2_time(us)": 61.999,
+            "aiv_mte3_time(us)": 7.193000000000001,
+            "aiv_scalar_time(us)": 546.705,
+            "aiv_time(us)": 6074.0340000000015,
+            "aiv_vec_time(us)": 20.608
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 126,
+            "aic_mac_time(us)": 126,
+            "aic_mte1_time(us)": 126,
+            "aic_mte2_time(us)": 126,
+            "aic_scalar_time(us)": 126,
+            "aicore_time(us)": 126,
+            "aiv_mte2_time(us)": 126,
+            "aiv_mte3_time(us)": 126,
+            "aiv_scalar_time(us)": 126,
+            "aiv_time(us)": 126,
+            "aiv_vec_time(us)": 126
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 214591,
+            "csv_line": 214593,
+            "task_id": "147",
+            "stream_id": "283",
+            "device_id": "0"
+          },
+          "mean_us": 51.720896825396814,
+          "forward_count": 3,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 4.129047619047619,
+            "aic_mac_time(us)": 5.02397619047619,
+            "aic_mte1_time(us)": 15.995309523809523,
+            "aic_mte2_time(us)": 30.224166666666665,
+            "aic_scalar_time(us)": 20.570603174603168,
+            "aicore_time(us)": 46.957531746031705,
+            "aiv_mte2_time(us)": 0.4920555555555556,
+            "aiv_mte3_time(us)": 0.057087301587301596,
+            "aiv_scalar_time(us)": 4.338928571428572,
+            "aiv_time(us)": 48.20661904761906,
+            "aiv_vec_time(us)": 0.16355555555555557
+          }
+        },
+        {
+          "batch": 2,
+          "query_rows": 12,
+          "expected_local_rows": 6.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              128,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              128
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              128,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 126,
+          "sum_us": 3715.013,
+          "min_us": 7.88,
+          "max_us": 57.581,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 503.2049999999998,
+            "aic_mac_time(us)": 316.044,
+            "aic_mte1_time(us)": 1008.4700000000001,
+            "aic_mte2_time(us)": 1637.5670000000005,
+            "aic_scalar_time(us)": 1186.885,
+            "aicore_time(us)": 2475.714,
+            "aiv_mte2_time(us)": 162.40699999999998,
+            "aiv_mte3_time(us)": 42.60199999999998,
+            "aiv_scalar_time(us)": 563.2730000000001,
+            "aiv_time(us)": 2476.935,
+            "aiv_vec_time(us)": 44.81
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 126,
+            "aic_mac_time(us)": 126,
+            "aic_mte1_time(us)": 126,
+            "aic_mte2_time(us)": 126,
+            "aic_scalar_time(us)": 126,
+            "aicore_time(us)": 126,
+            "aiv_mte2_time(us)": 126,
+            "aiv_mte3_time(us)": 126,
+            "aiv_scalar_time(us)": 126,
+            "aiv_time(us)": 126,
+            "aiv_vec_time(us)": 126
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 214592,
+            "csv_line": 214594,
+            "task_id": "149",
+            "stream_id": "283",
+            "device_id": "0"
+          },
+          "mean_us": 29.48423015873016,
+          "forward_count": 3,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 3.9936904761904746,
+            "aic_mac_time(us)": 2.508285714285714,
+            "aic_mte1_time(us)": 8.00373015873016,
+            "aic_mte2_time(us)": 12.996563492063496,
+            "aic_scalar_time(us)": 9.419722222222223,
+            "aicore_time(us)": 19.64852380952381,
+            "aiv_mte2_time(us)": 1.2889444444444442,
+            "aiv_mte3_time(us)": 0.338111111111111,
+            "aiv_scalar_time(us)": 4.470420634920636,
+            "aiv_time(us)": 19.658214285714287,
+            "aiv_vec_time(us)": 0.35563492063492064
+          }
+        },
+        {
+          "batch": 8,
+          "query_rows": 48,
+          "expected_local_rows": 24.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              384,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              384
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              384
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 504,
+          "sum_us": 34787.742999999966,
+          "min_us": 15.62,
+          "max_us": 164.483,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 3138.772,
+            "aic_mac_time(us)": 3847.8959999999993,
+            "aic_mte1_time(us)": 11602.400000000007,
+            "aic_mte2_time(us)": 22226.610000000004,
+            "aic_scalar_time(us)": 13940.852,
+            "aicore_time(us)": 31399.93400000001,
+            "aiv_mte2_time(us)": 782.7929999999988,
+            "aiv_mte3_time(us)": 161.22199999999995,
+            "aiv_scalar_time(us)": 2414.4049999999984,
+            "aiv_time(us)": 32663.98000000001,
+            "aiv_vec_time(us)": 280.3649999999996
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 504,
+            "aic_mac_time(us)": 504,
+            "aic_mte1_time(us)": 504,
+            "aic_mte2_time(us)": 504,
+            "aic_scalar_time(us)": 504,
+            "aicore_time(us)": 504,
+            "aiv_mte2_time(us)": 504,
+            "aiv_mte3_time(us)": 504,
+            "aiv_scalar_time(us)": 504,
+            "aiv_time(us)": 504,
+            "aiv_vec_time(us)": 504
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 227277,
+            "csv_line": 227279,
+            "task_id": "140",
+            "stream_id": "201",
+            "device_id": "0"
+          },
+          "mean_us": 69.02329960317454,
+          "forward_count": 12,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.227722222222222,
+            "aic_mac_time(us)": 7.634714285714284,
+            "aic_mte1_time(us)": 23.020634920634933,
+            "aic_mte2_time(us)": 44.100416666666675,
+            "aic_scalar_time(us)": 27.660420634920637,
+            "aicore_time(us)": 62.30145634920637,
+            "aiv_mte2_time(us)": 1.5531607142857118,
+            "aiv_mte3_time(us)": 0.3198849206349205,
+            "aiv_scalar_time(us)": 4.790486111111108,
+            "aiv_time(us)": 64.80948412698415,
+            "aiv_vec_time(us)": 0.5562797619047611
+          }
+        },
+        {
+          "batch": 8,
+          "query_rows": 48,
+          "expected_local_rows": 24.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              384
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 504,
+          "sum_us": 18282.974000000027,
+          "min_us": 6.72,
+          "max_us": 85.242,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 3144.7759999999985,
+            "aic_mac_time(us)": 1922.2759999999992,
+            "aic_mte1_time(us)": 5806.395999999999,
+            "aic_mte2_time(us)": 9948.074000000002,
+            "aic_scalar_time(us)": 6598.973999999996,
+            "aicore_time(us)": 13302.032000000014,
+            "aiv_mte2_time(us)": 1043.179,
+            "aiv_mte3_time(us)": 273.24399999999997,
+            "aiv_scalar_time(us)": 2637.067000000002,
+            "aiv_time(us)": 13205.242999999993,
+            "aiv_vec_time(us)": 360.7980000000005
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 504,
+            "aic_mac_time(us)": 504,
+            "aic_mte1_time(us)": 504,
+            "aic_mte2_time(us)": 504,
+            "aic_scalar_time(us)": 504,
+            "aicore_time(us)": 504,
+            "aiv_mte2_time(us)": 504,
+            "aiv_mte3_time(us)": 504,
+            "aiv_scalar_time(us)": 504,
+            "aiv_time(us)": 504,
+            "aiv_vec_time(us)": 504
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 227278,
+            "csv_line": 227280,
+            "task_id": "142",
+            "stream_id": "201",
+            "device_id": "0"
+          },
+          "mean_us": 36.27574206349212,
+          "forward_count": 12,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.239634920634917,
+            "aic_mac_time(us)": 3.814039682539681,
+            "aic_mte1_time(us)": 11.520626984126983,
+            "aic_mte2_time(us)": 19.73824206349207,
+            "aic_scalar_time(us)": 13.093202380952372,
+            "aicore_time(us)": 26.392920634920664,
+            "aiv_mte2_time(us)": 2.0697996031746033,
+            "aiv_mte3_time(us)": 0.5421507936507935,
+            "aiv_scalar_time(us)": 5.232275793650797,
+            "aiv_time(us)": 26.200878968253953,
+            "aiv_vec_time(us)": 0.7158690476190487
+          }
+        },
+        {
+          "batch": 7,
+          "query_rows": 42,
+          "expected_local_rows": 21.0,
+          "native": "GroupedMatmulSwigluQuant",
+          "input_shapes": [
+            [
+              384,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              384
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              384
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 3356.1659999999993,
+          "min_us": 32.261,
+          "max_us": 128.143,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 319.58099999999996,
+            "aic_mac_time(us)": 374.57099999999997,
+            "aic_mte1_time(us)": 1169.38,
+            "aic_mte2_time(us)": 2249.001,
+            "aic_scalar_time(us)": 1364.4400000000005,
+            "aicore_time(us)": 3052.8079999999995,
+            "aiv_mte2_time(us)": 56.15800000000001,
+            "aiv_mte3_time(us)": 11.309000000000001,
+            "aiv_scalar_time(us)": 226.115,
+            "aiv_time(us)": 3178.702,
+            "aiv_vec_time(us)": 21.272000000000002
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 255592,
+            "csv_line": 255594,
+            "task_id": "147",
+            "stream_id": "198",
+            "device_id": "0"
+          },
+          "mean_us": 79.90871428571427,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.609071428571427,
+            "aic_mac_time(us)": 8.918357142857142,
+            "aic_mte1_time(us)": 27.842380952380957,
+            "aic_mte2_time(us)": 53.54764285714286,
+            "aic_scalar_time(us)": 32.48666666666668,
+            "aicore_time(us)": 72.68590476190475,
+            "aiv_mte2_time(us)": 1.3370952380952383,
+            "aiv_mte3_time(us)": 0.2692619047619048,
+            "aiv_scalar_time(us)": 5.383690476190476,
+            "aiv_time(us)": 75.68338095238096,
+            "aiv_vec_time(us)": 0.5064761904761905
+          }
+        },
+        {
+          "batch": 7,
+          "query_rows": 42,
+          "expected_local_rows": 21.0,
+          "native": "GroupedMatmul",
+          "input_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              384
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20,
+          "count": 42,
+          "sum_us": 1739.195,
+          "min_us": 24.981,
+          "max_us": 62.441,
+          "pmu_sums": {
+            "aic_fixpipe_time(us)": 326.40200000000004,
+            "aic_mac_time(us)": 186.99799999999996,
+            "aic_mte1_time(us)": 585.0240000000001,
+            "aic_mte2_time(us)": 1037.766,
+            "aic_scalar_time(us)": 663.8210000000001,
+            "aicore_time(us)": 1354.121,
+            "aiv_mte2_time(us)": 102.88799999999996,
+            "aiv_mte3_time(us)": 27.02,
+            "aiv_scalar_time(us)": 256.942,
+            "aiv_time(us)": 1348.53,
+            "aiv_vec_time(us)": 31.875999999999994
+          },
+          "pmu_counts": {
+            "aic_fixpipe_time(us)": 42,
+            "aic_mac_time(us)": 42,
+            "aic_mte1_time(us)": 42,
+            "aic_mte2_time(us)": 42,
+            "aic_scalar_time(us)": 42,
+            "aicore_time(us)": 42,
+            "aiv_mte2_time(us)": 42,
+            "aiv_mte3_time(us)": 42,
+            "aiv_scalar_time(us)": 42,
+            "aiv_time(us)": 42,
+            "aiv_vec_time(us)": 42
+          },
+          "first_locator": {
+            "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 255593,
+            "csv_line": 255595,
+            "task_id": "149",
+            "stream_id": "198",
+            "device_id": "0"
+          },
+          "mean_us": 41.40940476190476,
+          "forward_count": 1,
+          "calls_per_forward": 42.0,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.771476190476191,
+            "aic_mac_time(us)": 4.452333333333333,
+            "aic_mte1_time(us)": 13.92914285714286,
+            "aic_mte2_time(us)": 24.708714285714287,
+            "aic_scalar_time(us)": 15.805261904761908,
+            "aicore_time(us)": 32.24097619047619,
+            "aiv_mte2_time(us)": 2.449714285714285,
+            "aiv_mte3_time(us)": 0.6433333333333333,
+            "aiv_scalar_time(us)": 6.117666666666667,
+            "aiv_time(us)": 32.10785714285714,
+            "aiv_vec_time(us)": 0.7589523809523808
+          }
+        }
+      ],
+      "forward_ids": {
+        "1": [
+          "auto:0",
+          "auto:1",
+          "auto:2",
+          "auto:3",
+          "auto:4",
+          "auto:5",
+          "auto:6",
+          "auto:7",
+          "auto:8",
+          "auto:9",
+          "auto:10",
+          "auto:11",
+          "auto:12",
+          "auto:13",
+          "auto:14",
+          "auto:15",
+          "auto:16",
+          "auto:17",
+          "auto:18",
+          "auto:19",
+          "auto:20",
+          "auto:21",
+          "auto:22",
+          "auto:23",
+          "auto:24",
+          "auto:25",
+          "auto:26",
+          "auto:27",
+          "auto:28",
+          "auto:29",
+          "auto:30",
+          "auto:31",
+          "auto:32",
+          "auto:33",
+          "auto:34",
+          "auto:35",
+          "auto:36",
+          "auto:37",
+          "auto:38",
+          "auto:39",
+          "auto:40",
+          "auto:41",
+          "auto:42",
+          "auto:43",
+          "auto:44",
+          "auto:45",
+          "auto:46",
+          "auto:47",
+          "auto:48",
+          "auto:49",
+          "auto:50",
+          "auto:51",
+          "auto:52",
+          "auto:53",
+          "auto:54",
+          "auto:55",
+          "auto:56",
+          "auto:57",
+          "auto:58",
+          "auto:59",
+          "auto:60",
+          "auto:61",
+          "auto:62",
+          "auto:63",
+          "auto:64",
+          "auto:82",
+          "auto:83",
+          "auto:97"
+        ],
+        "4": [
+          "auto:65",
+          "auto:66",
+          "auto:67",
+          "auto:68",
+          "auto:69",
+          "auto:70",
+          "auto:71",
+          "auto:72",
+          "auto:73",
+          "auto:74",
+          "auto:75",
+          "auto:76",
+          "auto:77"
+        ],
+        "3": [
+          "auto:78"
+        ],
+        "2": [
+          "auto:79",
+          "auto:80",
+          "auto:81"
+        ],
+        "8": [
+          "auto:84",
+          "auto:85",
+          "auto:86",
+          "auto:87",
+          "auto:88",
+          "auto:89",
+          "auto:90",
+          "auto:91",
+          "auto:92",
+          "auto:93",
+          "auto:94",
+          "auto:95"
+        ],
+        "7": [
+          "auto:96"
+        ]
+      },
+      "scan_counts": {
+        "scanned_events": 260424,
+        "positive_events": 260424,
+        "vocabulary_head_occurrences": 618,
+        "rejected_segment_events": 13539,
+        "auxiliary_candidate_segment_events": 43307,
+        "complete_body_segment_events": 203563,
+        "trailing_segment_events": 15
+      }
+    }
+  ],
+  "elapsed_seconds": 17.744524207897484
+}

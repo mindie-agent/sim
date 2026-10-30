@@ -1,0 +1,1421 @@
+{
+  "scope": "full_45_layer_q6_B7_B8; not_serving_or_independent_routing_validation",
+  "case": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool-gmm-service.json",
+    "sha256": "96884fb14a384fb0ba5ec01a1e4da48396845e78e298755d863dde9cb30a313d",
+    "size_bytes": 29469
+  },
+  "parameters": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/gmm-parameters.json",
+    "sha256": "0ce5d716d23d810c6c79c007a52417bfa2198f166e4196b0cab740f8df9d5660",
+    "size_bytes": 14617
+  },
+  "primitive_validation": [
+    {
+      "native": "GroupedMatmulSwigluQuant",
+      "fixed_us": 54.29521428571421,
+      "us_per_expected_local_row": 1.5019682539682577,
+      "training": [
+        {
+          "batch": 6,
+          "expected_local_rows": 18.0,
+          "count": 42,
+          "mean_us": 81.33064285714285,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.005952380952383,
+            "aic_mac_time(us)": 9.173809523809524,
+            "aic_mte1_time(us)": 28.85535714285714,
+            "aic_mte2_time(us)": 55.84223809523811,
+            "aic_scalar_time(us)": 32.90390476190476,
+            "aicore_time(us)": 74.24607142857141,
+            "aiv_mte2_time(us)": 1.4190952380952382,
+            "aiv_mte3_time(us)": 0.2793095238095238,
+            "aiv_scalar_time(us)": 4.348428571428571,
+            "aiv_time(us)": 77.0312380952381,
+            "aiv_vec_time(us)": 0.45326190476190464
+          }
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 85.83654761904762,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.41859523809524,
+            "aic_mac_time(us)": 9.824642857142857,
+            "aic_mte1_time(us)": 30.651690476190478,
+            "aic_mte2_time(us)": 59.440809523809506,
+            "aic_scalar_time(us)": 35.194857142857124,
+            "aicore_time(us)": 78.46657142857141,
+            "aiv_mte2_time(us)": 1.3082380952380954,
+            "aiv_mte3_time(us)": 0.29102380952380946,
+            "aiv_scalar_time(us)": 5.353952380952382,
+            "aiv_time(us)": 81.58885714285717,
+            "aiv_vec_time(us)": 0.5114285714285715
+          }
+        }
+      ],
+      "validation": [
+        {
+          "batch": 8,
+          "expected_local_rows": 24.0,
+          "count": 504,
+          "mean_us": 69.02329960317454,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.227722222222222,
+            "aic_mac_time(us)": 7.634714285714284,
+            "aic_mte1_time(us)": 23.020634920634933,
+            "aic_mte2_time(us)": 44.100416666666675,
+            "aic_scalar_time(us)": 27.660420634920637,
+            "aicore_time(us)": 62.30145634920637,
+            "aiv_mte2_time(us)": 1.5531607142857118,
+            "aiv_mte3_time(us)": 0.3198849206349205,
+            "aiv_scalar_time(us)": 4.790486111111108,
+            "aiv_time(us)": 64.80948412698415,
+            "aiv_vec_time(us)": 0.5562797619047611
+          },
+          "prediction_us": 90.3424523809524,
+          "relative_error": 0.3088689312209778,
+          "passed_15percent": false
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 79.90871428571427,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.609071428571427,
+            "aic_mac_time(us)": 8.918357142857142,
+            "aic_mte1_time(us)": 27.842380952380957,
+            "aic_mte2_time(us)": 53.54764285714286,
+            "aic_scalar_time(us)": 32.48666666666668,
+            "aicore_time(us)": 72.68590476190475,
+            "aiv_mte2_time(us)": 1.3370952380952383,
+            "aiv_mte3_time(us)": 0.2692619047619048,
+            "aiv_scalar_time(us)": 5.383690476190476,
+            "aiv_time(us)": 75.68338095238096,
+            "aiv_vec_time(us)": 0.5064761904761905
+          },
+          "prediction_us": 85.83654761904762,
+          "relative_error": 0.07418256427125502,
+          "passed_15percent": true
+        }
+      ]
+    },
+    {
+      "native": "GroupedMatmul",
+      "fixed_us": 40.67923809523809,
+      "us_per_expected_local_row": 0.15331746031746007,
+      "training": [
+        {
+          "batch": 6,
+          "expected_local_rows": 18.0,
+          "count": 42,
+          "mean_us": 43.43895238095237,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.18552380952381,
+            "aic_mac_time(us)": 4.5815,
+            "aic_mte1_time(us)": 14.433523809523816,
+            "aic_mte2_time(us)": 26.133380952380953,
+            "aic_scalar_time(us)": 16.265023809523807,
+            "aicore_time(us)": 33.24495238095238,
+            "aiv_mte2_time(us)": 2.629571428571429,
+            "aiv_mte3_time(us)": 0.6645238095238094,
+            "aiv_scalar_time(us)": 5.988571428571428,
+            "aiv_time(us)": 33.115785714285714,
+            "aiv_vec_time(us)": 0.7389999999999999
+          }
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 43.89890476190475,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.615761904761904,
+            "aic_mac_time(us)": 4.907261904761905,
+            "aic_mte1_time(us)": 15.33452380952381,
+            "aic_mte2_time(us)": 27.504761904761907,
+            "aic_scalar_time(us)": 17.11469047619048,
+            "aicore_time(us)": 35.04023809523809,
+            "aiv_mte2_time(us)": 2.7646904761904754,
+            "aiv_mte3_time(us)": 0.6923333333333334,
+            "aiv_scalar_time(us)": 6.333095238095237,
+            "aiv_time(us)": 34.909166666666664,
+            "aiv_vec_time(us)": 0.8032857142857142
+          }
+        }
+      ],
+      "validation": [
+        {
+          "batch": 8,
+          "expected_local_rows": 24.0,
+          "count": 504,
+          "mean_us": 36.27574206349212,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.239634920634917,
+            "aic_mac_time(us)": 3.814039682539681,
+            "aic_mte1_time(us)": 11.520626984126983,
+            "aic_mte2_time(us)": 19.73824206349207,
+            "aic_scalar_time(us)": 13.093202380952372,
+            "aicore_time(us)": 26.392920634920664,
+            "aiv_mte2_time(us)": 2.0697996031746033,
+            "aiv_mte3_time(us)": 0.5421507936507935,
+            "aiv_scalar_time(us)": 5.232275793650797,
+            "aiv_time(us)": 26.200878968253953,
+            "aiv_vec_time(us)": 0.7158690476190487
+          },
+          "prediction_us": 44.35885714285713,
+          "relative_error": 0.22282425167808917,
+          "passed_15percent": false
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 41.40940476190476,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.771476190476191,
+            "aic_mac_time(us)": 4.452333333333333,
+            "aic_mte1_time(us)": 13.92914285714286,
+            "aic_mte2_time(us)": 24.708714285714287,
+            "aic_scalar_time(us)": 15.805261904761908,
+            "aicore_time(us)": 32.24097619047619,
+            "aiv_mte2_time(us)": 2.449714285714285,
+            "aiv_mte3_time(us)": 0.6433333333333333,
+            "aiv_scalar_time(us)": 6.117666666666667,
+            "aiv_time(us)": 32.10785714285714,
+            "aiv_vec_time(us)": 0.7589523809523808
+          },
+          "prediction_us": 43.89890476190475,
+          "relative_error": 0.060119193074956945,
+          "passed_15percent": true
+        }
+      ]
+    }
+  ],
+  "rows": [
+    {
+      "batch": 7,
+      "body_before_ms": 37.3637778329394,
+      "body_after_ms": 29.842786040330683,
+      "observed_mean_ms": 35.747814,
+      "relative_error": -0.16518570784969722,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.2960217048701308,
+          "observed_ms": {
+            "count": 1,
+            "mean": 3.54015,
+            "p50": 3.54015,
+            "p90": 3.54015,
+            "min": 3.54015,
+            "max": 3.54015
+          },
+          "relative_error": -0.9163815926245693
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.29602170487013524,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.335427,
+            "p50": 0.335427,
+            "p90": 0.335427,
+            "min": 0.335427,
+            "max": 0.335427
+          },
+          "relative_error": -0.11747800603369662
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.296021704870141,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.338907,
+            "p50": 0.338907,
+            "p90": 0.338907,
+            "min": 0.338907,
+            "max": 0.338907
+          },
+          "relative_error": -0.12654000988430159
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.0122936425362192,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.033161,
+            "p50": 1.033161,
+            "p90": 1.033161,
+            "min": 1.033161,
+            "max": 1.033161
+          },
+          "relative_error": -0.020197585336439117
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.5748222857359486,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.603372,
+            "p50": 0.603372,
+            "p90": 0.603372,
+            "min": 0.603372,
+            "max": 0.603372
+          },
+          "relative_error": -0.047316935926843495
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.5748222857359768,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.591911,
+            "p50": 0.591911,
+            "p90": 0.591911,
+            "min": 0.591911,
+            "max": 0.591911
+          },
+          "relative_error": -0.028870411707204502
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.5748222857359768,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.634433,
+            "p50": 0.634433,
+            "p90": 0.634433,
+            "min": 0.634433,
+            "max": 0.634433
+          },
+          "relative_error": -0.09395903785588577
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.0122936425362257,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.00328,
+            "p50": 1.00328,
+            "p90": 1.00328,
+            "min": 1.00328,
+            "max": 1.00328
+          },
+          "relative_error": 0.008984174444049309
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.5748222857360386,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.612712,
+            "p50": 0.612712,
+            "p90": 0.612712,
+            "min": 0.612712,
+            "max": 0.612712
+          },
+          "relative_error": -0.061839353993330404
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.5748222857360386,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.619092,
+            "p50": 0.619092,
+            "p90": 0.619092,
+            "min": 0.619092,
+            "max": 0.619092
+          },
+          "relative_error": -0.07150748881258584
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.5748222857360386,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.602232,
+            "p50": 0.602232,
+            "p90": 0.602232,
+            "min": 0.602232,
+            "max": 0.602232
+          },
+          "relative_error": -0.0455135467128307
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.01229364253623,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.040881,
+            "p50": 1.040881,
+            "p90": 1.040881,
+            "min": 1.040881,
+            "max": 1.040881
+          },
+          "relative_error": -0.02746457804856639
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.5748222857360386,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.600472,
+            "p50": 0.600472,
+            "p90": 0.600472,
+            "min": 0.600472,
+            "max": 0.600472
+          },
+          "relative_error": -0.042715920582410916
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.574822285736138,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.567051,
+            "p50": 0.567051,
+            "p90": 0.567051,
+            "min": 0.567051,
+            "max": 0.567051
+          },
+          "relative_error": 0.013704738614583212
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.612572,
+            "p50": 0.612572,
+            "p90": 0.612572,
+            "min": 0.612572,
+            "max": 0.612572
+          },
+          "relative_error": -0.06162494247837602
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.0122936425362212,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.051861,
+            "p50": 1.051861,
+            "p90": 1.051861,
+            "min": 1.051861,
+            "max": 1.051861
+          },
+          "relative_error": -0.03761652676901106
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.609293,
+            "p50": 0.609293,
+            "p90": 0.609293,
+            "min": 0.609293,
+            "max": 0.609293
+          },
+          "relative_error": -0.0565749389273531
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640832,
+            "p50": 0.640832,
+            "p90": 0.640832,
+            "min": 0.640832,
+            "max": 0.640832
+          },
+          "relative_error": -0.10300627038578558
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.621513,
+            "p50": 0.621513,
+            "p90": 0.621513,
+            "min": 0.621513,
+            "max": 0.621513
+          },
+          "relative_error": -0.07512427618386697
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.0122936425362212,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.094422,
+            "p50": 1.094422,
+            "p90": 1.094422,
+            "min": 1.094422,
+            "max": 1.094422
+          },
+          "relative_error": -0.07504267774567652
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.638113,
+            "p50": 0.638113,
+            "p90": 0.638113,
+            "min": 0.638113,
+            "max": 0.638113
+          },
+          "relative_error": -0.09918417939121094
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.684873,
+            "p50": 0.684873,
+            "p90": 0.684873,
+            "min": 0.684873,
+            "max": 0.684873
+          },
+          "relative_error": -0.16068776877444968
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.5748222857361363,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.649893,
+            "p50": 0.649893,
+            "p90": 0.649893,
+            "min": 0.649893,
+            "max": 0.649893
+          },
+          "relative_error": -0.11551242168151343
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.0122936425362212,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.060341,
+            "p50": 1.060341,
+            "p90": 1.060341,
+            "min": 1.060341,
+            "max": 1.060341
+          },
+          "relative_error": -0.04531311857579656
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.5748222857361522,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.678874,
+            "p50": 0.678874,
+            "p90": 0.678874,
+            "min": 0.678874,
+            "max": 0.678874
+          },
+          "relative_error": -0.1532710256451827
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.627493,
+            "p50": 0.627493,
+            "p90": 0.627493,
+            "min": 0.627493,
+            "max": 0.627493
+          },
+          "relative_error": -0.08393832961278369
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.635092,
+            "p50": 0.635092,
+            "p90": 0.635092,
+            "min": 0.635092,
+            "max": 0.635092
+          },
+          "relative_error": -0.09489918667486685
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.012293642536271,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.134803,
+            "p50": 1.134803,
+            "p90": 1.134803,
+            "min": 1.134803,
+            "max": 1.134803
+          },
+          "relative_error": -0.10795649770376803
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.656973,
+            "p50": 0.656973,
+            "p90": 0.656973,
+            "min": 0.656973,
+            "max": 0.656973
+          },
+          "relative_error": -0.12504427771569693
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.648333,
+            "p50": 0.648333,
+            "p90": 0.648333,
+            "min": 0.648333,
+            "max": 0.648333
+          },
+          "relative_error": -0.11338419340634298
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.666253,
+            "p50": 0.666253,
+            "p90": 0.666253,
+            "min": 0.666253,
+            "max": 0.666253
+          },
+          "relative_error": -0.13723122336967264
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.012293642536271,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.111702,
+            "p50": 1.111702,
+            "p90": 1.111702,
+            "min": 1.111702,
+            "max": 1.111702
+          },
+          "relative_error": -0.08941996817827891
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.674553,
+            "p50": 0.674553,
+            "p90": 0.674553,
+            "min": 0.674553,
+            "max": 0.674553
+          },
+          "relative_error": -0.1478471139609705
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640793,
+            "p50": 0.640793,
+            "p90": 0.640793,
+            "min": 0.640793,
+            "max": 0.640793
+          },
+          "relative_error": -0.10295167747418354
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.645833,
+            "p50": 0.645833,
+            "p90": 0.645833,
+            "min": 0.645833,
+            "max": 0.645833
+          },
+          "relative_error": -0.10995213044814145
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.012293642536271,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.091062,
+            "p50": 1.091062,
+            "p90": 1.091062,
+            "min": 1.091062,
+            "max": 1.091062
+          },
+          "relative_error": -0.0721942084535333
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.647973,
+            "p50": 0.647973,
+            "p90": 0.647973,
+            "min": 0.647973,
+            "max": 0.647973
+          },
+          "relative_error": -0.11289160854497726
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.657053,
+            "p50": 0.657053,
+            "p90": 0.657053,
+            "min": 0.657053,
+            "max": 0.657053
+          },
+          "relative_error": -0.12515080863144146
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640753,
+            "p50": 0.640753,
+            "p90": 0.640753,
+            "min": 0.640753,
+            "max": 0.640753
+          },
+          "relative_error": -0.1028956778410941
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.012293642536271,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.091482,
+            "p50": 1.091482,
+            "p90": 1.091482,
+            "min": 1.091482,
+            "max": 1.091482
+          },
+          "relative_error": -0.07255122618946452
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.656473,
+            "p50": 0.656473,
+            "p90": 0.656473,
+            "min": 0.656473,
+            "max": 0.656473
+          },
+          "relative_error": -0.12437787123570121
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.635572,
+            "p50": 0.635572,
+            "p90": 0.635572,
+            "min": 0.635572,
+            "max": 0.635572
+          },
+          "relative_error": -0.09558274163071145
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.685114,
+            "p50": 0.685114,
+            "p90": 0.685114,
+            "min": 0.685114,
+            "max": 0.685114
+          },
+          "relative_error": -0.1609830105117025
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.012293642536271,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.045501,
+            "p50": 1.045501,
+            "p90": 1.045501,
+            "min": 1.045501,
+            "max": 1.045501
+          },
+          "relative_error": -0.031762147968991905
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.5748222857362855,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.638333,
+            "p50": 0.638333,
+            "p90": 0.638333,
+            "min": 0.638333,
+            "max": 0.638333
+          },
+          "relative_error": -0.09949464349127268
+        }
+      ],
+      "native_services": [
+        {
+          "recipe": "declared_native_fusion",
+          "duration_us": 85.83654761904774,
+          "program": "JointNativeService",
+          "reference_hbm_bytes": 210371557.27580464
+        },
+        {
+          "recipe": "grouped_down",
+          "duration_us": 43.89890476190477,
+          "program": "JointNativeService",
+          "reference_hbm_bytes": 105368853.87891187
+        }
+      ],
+      "passed_15percent": false
+    },
+    {
+      "batch": 8,
+      "body_before_ms": 39.34393955403932,
+      "body_after_ms": 30.88966335661793,
+      "observed_mean_ms": 31.580006,
+      "relative_error": -0.02186011754975825,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.30130638879097105,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.1925803333333334,
+            "p50": 0.7846550000000001,
+            "p90": 0.849697,
+            "min": 0.743275,
+            "max": 5.701734
+          },
+          "relative_error": -0.7473491886715911
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.30130638879097105,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.34451516666666665,
+            "p50": 0.344307,
+            "p90": 0.347407,
+            "min": 0.340767,
+            "max": 0.354927
+          },
+          "relative_error": -0.12541908762322207
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.30130638879096894,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.33867525,
+            "p50": 0.33742700000000003,
+            "p90": 0.341267,
+            "min": 0.336367,
+            "max": 0.349727
+          },
+          "relative_error": -0.11033832914873776
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.0698524080260223,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0206353333333333,
+            "p50": 1.0200200000000001,
+            "p90": 1.034021,
+            "min": 0.99564,
+            "max": 1.038341
+          },
+          "relative_error": 0.04822199769622815
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.5876570226437801,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5685645833333334,
+            "p50": 0.5691415,
+            "p90": 0.591111,
+            "min": 0.543651,
+            "max": 0.591931
+          },
+          "relative_error": 0.0335800714116119
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.5876570226437798,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5630531666666667,
+            "p50": 0.5647614999999999,
+            "p90": 0.582792,
+            "min": 0.532551,
+            "max": 0.583472
+          },
+          "relative_error": 0.04369721623762546
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.5876570226437798,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5532475833333333,
+            "p50": 0.5578810000000001,
+            "p90": 0.572731,
+            "min": 0.53059,
+            "max": 0.572972
+          },
+          "relative_error": 0.06219537210289938
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.069852408026028,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0165253333333333,
+            "p50": 1.01594,
+            "p90": 1.036681,
+            "min": 0.987279,
+            "max": 1.052421
+          },
+          "relative_error": 0.05246015317476416
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.5876570226438096,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57836325,
+            "p50": 0.5763015,
+            "p90": 0.583872,
+            "min": 0.566611,
+            "max": 0.615233
+          },
+          "relative_error": 0.016069092639979354
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.5876570226438096,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5712298333333333,
+            "p50": 0.571311,
+            "p90": 0.595592,
+            "min": 0.542511,
+            "max": 0.600312
+          },
+          "relative_error": 0.02875758294103381
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.5876570226438096,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5738013333333334,
+            "p50": 0.5726720000000001,
+            "p90": 0.595812,
+            "min": 0.551011,
+            "max": 0.597292
+          },
+          "relative_error": 0.024147189115064638
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.069852408026036,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0075385,
+            "p50": 1.00433,
+            "p90": 1.02852,
+            "min": 0.98218,
+            "max": 1.038501
+          },
+          "relative_error": 0.0618476693704868
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.5876570226438007,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5777431666666667,
+            "p50": 0.5801315,
+            "p90": 0.588852,
+            "min": 0.555631,
+            "max": 0.590392
+          },
+          "relative_error": 0.017159624811025953
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5487228333333334,
+            "p50": 0.541621,
+            "p90": 0.574112,
+            "min": 0.52317,
+            "max": 0.582972
+          },
+          "relative_error": 0.0709541993613132
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5707264166666667,
+            "p50": 0.5692010000000001,
+            "p90": 0.591832,
+            "min": 0.541771,
+            "max": 0.592332
+          },
+          "relative_error": 0.02966501196140192
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.069852408026005,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0191736666666666,
+            "p50": 1.026951,
+            "p90": 1.03886,
+            "min": 0.99192,
+            "max": 1.039361
+          },
+          "relative_error": 0.04972532456130807
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5628345833333334,
+            "p50": 0.567352,
+            "p90": 0.581811,
+            "min": 0.53507,
+            "max": 0.586832
+          },
+          "relative_error": 0.04410254814732517
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57525825,
+            "p50": 0.5765215,
+            "p90": 0.596292,
+            "min": 0.536791,
+            "max": 0.605392
+          },
+          "relative_error": 0.02155340256966576
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5812599166666667,
+            "p50": 0.5794414999999999,
+            "p90": 0.596812,
+            "min": 0.565511,
+            "max": 0.615352
+          },
+          "relative_error": 0.011005585958498543
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.069852408026005,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0359923333333334,
+            "p50": 1.040691,
+            "p90": 1.056101,
+            "min": 0.99998,
+            "max": 1.067421
+          },
+          "relative_error": 0.032683711648449965
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57781825,
+            "p50": 0.577341,
+            "p90": 0.596112,
+            "min": 0.548951,
+            "max": 0.603152
+          },
+          "relative_error": 0.01702745222009061
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5930970833333333,
+            "p50": 0.583692,
+            "p90": 0.626933,
+            "min": 0.561692,
+            "max": 0.637393
+          },
+          "relative_error": -0.009172293781968377
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.5876570226437714,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5812496666666667,
+            "p50": 0.584571,
+            "p90": 0.602192,
+            "min": 0.54291,
+            "max": 0.603932
+          },
+          "relative_error": 0.011023414454324643
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.0698524080260174,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.06893975,
+            "p50": 1.0652915,
+            "p90": 1.102022,
+            "min": 1.027521,
+            "max": 1.134842
+          },
+          "relative_error": 0.0008537974436981788
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5920237500000001,
+            "p50": 0.589302,
+            "p90": 0.623353,
+            "min": 0.562991,
+            "max": 0.630553
+          },
+          "relative_error": -0.007375932732658574
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5854483333333333,
+            "p50": 0.586882,
+            "p90": 0.615593,
+            "min": 0.540211,
+            "max": 0.621212
+          },
+          "relative_error": 0.0037726459958558056
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5972484166666666,
+            "p50": 0.5977015,
+            "p90": 0.628973,
+            "min": 0.562271,
+            "max": 0.637653
+          },
+          "relative_error": -0.016059304227768134
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.069852408026069,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0450674166666667,
+            "p50": 1.0454905,
+            "p90": 1.064341,
+            "min": 0.99732,
+            "max": 1.089522
+          },
+          "relative_error": 0.023716165066610007
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6085855,
+            "p50": 0.6163225,
+            "p90": 0.634192,
+            "min": 0.554351,
+            "max": 0.665253
+          },
+          "relative_error": -0.03438872164410134
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5968586666666666,
+            "p50": 0.5913619999999999,
+            "p90": 0.641492,
+            "min": 0.569371,
+            "max": 0.642213
+          },
+          "relative_error": -0.015416788825723504
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6051221666666666,
+            "p50": 0.605792,
+            "p90": 0.643113,
+            "min": 0.544151,
+            "max": 0.664874
+          },
+          "relative_error": -0.02886217855645601
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.069852408026069,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0620561666666666,
+            "p50": 1.054311,
+            "p90": 1.116062,
+            "min": 0.9944,
+            "max": 1.133143
+          },
+          "relative_error": 0.007340705326227104
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.60183375,
+            "p50": 0.599942,
+            "p90": 0.646613,
+            "min": 0.542791,
+            "max": 0.649293
+          },
+          "relative_error": -0.023555886249543412
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6020184166666667,
+            "p50": 0.5919215,
+            "p90": 0.641813,
+            "min": 0.562931,
+            "max": 0.659473
+          },
+          "relative_error": -0.02385540645470763
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6179458333333333,
+            "p50": 0.6156625,
+            "p90": 0.653753,
+            "min": 0.573611,
+            "max": 0.690974
+          },
+          "relative_error": -0.04901531664366943
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.069852408026069,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.04461925,
+            "p50": 1.047291,
+            "p90": 1.070922,
+            "min": 1.018301,
+            "max": 1.072022
+          },
+          "relative_error": 0.02415536380941563
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6196275,
+            "p50": 0.6138425000000001,
+            "p90": 0.658934,
+            "min": 0.575131,
+            "max": 0.662473
+          },
+          "relative_error": -0.05159628543945549
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.608337,
+            "p50": 0.607822,
+            "p90": 0.635412,
+            "min": 0.553891,
+            "max": 0.662713
+          },
+          "relative_error": -0.03399427842813485
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6101688333333334,
+            "p50": 0.607362,
+            "p90": 0.656393,
+            "min": 0.561691,
+            "max": 0.662293
+          },
+          "relative_error": -0.036894396205863655
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.069852408026069,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0661894166666666,
+            "p50": 1.064331,
+            "p90": 1.098262,
+            "min": 1.02738,
+            "max": 1.106442
+          },
+          "relative_error": 0.0034355915582564567
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6308311666666667,
+            "p50": 0.6304525000000001,
+            "p90": 0.671174,
+            "min": 0.552431,
+            "max": 0.688934
+          },
+          "relative_error": -0.0684400934895728
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6031303333333333,
+            "p50": 0.6004615,
+            "p90": 0.645733,
+            "min": 0.566691,
+            "max": 0.659213
+          },
+          "relative_error": -0.02565500329580983
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.600042,
+            "p50": 0.604302,
+            "p90": 0.626593,
+            "min": 0.559491,
+            "max": 0.651533
+          },
+          "relative_error": -0.0206401841140057
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.069852408026069,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0285556666666666,
+            "p50": 1.03223,
+            "p90": 1.045841,
+            "min": 0.98916,
+            "max": 1.058381
+          },
+          "relative_error": 0.0401502249199952
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.5876570226438638,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.58150825,
+            "p50": 0.5802615,
+            "p90": 0.600272,
+            "min": 0.549291,
+            "max": 0.623192
+          },
+          "relative_error": 0.010573835614307914
+        }
+      ],
+      "native_services": [
+        {
+          "recipe": "declared_native_fusion",
+          "duration_us": 90.34245238095254,
+          "program": "JointNativeService",
+          "reference_hbm_bytes": 224852276.68815067
+        },
+        {
+          "recipe": "grouped_down",
+          "duration_us": 44.35885714285715,
+          "program": "JointNativeService",
+          "reference_hbm_bytes": 112620189.45195852
+        }
+      ],
+      "passed_15percent": true
+    }
+  ]
+}

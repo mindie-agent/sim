@@ -144,3 +144,50 @@ charging 224.31/112.37 MB of gate-up/down weight reads per layer. The resulting
 Expert grouping and weight reuse therefore dominate the next source-model
 investigation. Capacity 384 is not evidence of 384 valid rows, and observed
 kernel duration sums are diagnostic rather than additive Body wall time.
+
+## Independent short-context GMM service check
+
+`gmm_service.py` keeps the probability-moment reference and every routing
+parameter unchanged. It selects complete native gate-up/down calls from the
+independent 4K static-on capture only when their recorded ABI matches the 131K
+population: q6, TP16/EP16, 384-row capacity, 18 banks, identical shapes, dtypes,
+formats and block count. Short-context B6/B7 each contain one complete Forward
+and 42 calls of each kernel. The actual count-list values remain unavailable.
+The recorded up weights are INT8 `[18,128,256,16,32]` in NZ, which contains the
+full 8-bit `[18,4096,4096]` payload; down weights are INT8
+`[18,2048,4096]`. Up weight/input scales are FP32; down weight scale/output are
+BF16 and its per-token scale is FP32. This is not an implicit INT4 path.
+
+Short-context affine responses in expected local rows `r` are:
+
+```
+gate-up us = 54.29521429 + 1.501968254 * r
+down us    = 40.67923810 + 0.153317460 * r
+```
+
+The explicit `glm53flash-a3-native-keypool-gmm-service.json` case replaces only
+those native boundaries with `joint_native` service for `r` in 18–24. Its
+original logical reference bytes, FLOPs, expert probabilities and active-bank
+moments remain available but are not executed at the replaced boundary. No
+whole-step or layer timing entered either coefficient assignment.
+
+| 131K validation | Gate-up prediction / native us | Down prediction / native us | Full Body prediction / native ms |
+| --- | ---: | ---: | ---: |
+| B7, one Forward | 85.837 / 79.909 | 43.899 / 41.409 | 29.843 / 35.748 |
+| B8, 12 Forwards | 90.342 / 69.023 | 44.359 / 36.276 | 30.890 / 31.580 |
+
+B7 native primitive errors are +7.4%/+6.0%, but its Body remains -16.5%.
+B8 Body is -2.2%, while its two primitives **fail** at +30.9%/+22.3%. The
+short-context conditional response therefore does not demonstrate independent
+routing generalization. B8 mean AIC MTE2 times are 44.10/19.74 us versus
+short-context B7 59.44/27.50 us, supporting a changed observed memory-service
+population without identifying its exact transferred bytes or expert counts.
+
+The current expected grouped-matrix implementation also passes a byte-accounting
+check: B8 down services 112.620 MB of HBM, exactly its declared payload, while
+113.510 MB of MTE2 and 119.276 MB of MTE1 are separate private-buffer transfers.
+The bank set is not reread once per aggregate M tile. The model's 24 local rows
+equal `48 query rows * topk8 / EP16`; it does not apply a second TP division.
+The model has router groups 1/1, and the delivered artifacts do not establish
+force-EPLB. Neither an unobserved routing correlation nor capacity 384 is used
+to lower the active-expert count.

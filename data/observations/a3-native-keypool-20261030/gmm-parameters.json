@@ -1,0 +1,459 @@
+{
+  "scope": "conditional_native_GMM_service; no_routing_or_Body_fit",
+  "new_parameters": 4,
+  "rules": [
+    {
+      "id": "a3-q6-cap384-shortctx-GroupedMatmulSwigluQuant",
+      "match": {
+        "hardware": "Ascend910_9362",
+        "recipe": "declared_native_fusion",
+        "metadata.fusion_role": "grouped_gate_up_activation_quant",
+        "metadata.fusion_tensor_view.input_width": 4096,
+        "metadata.fusion_tensor_view.intermediate_width": 2048,
+        "metadata.fusion_tensor_view.local_experts": 18,
+        "metadata.fusion_tensor_view.routing_basis": "probability_moments",
+        "metadata.fusion_tensor_view.input_dtype": "int8",
+        "metadata.fusion_tensor_view.output_dtype": "int8",
+        "metadata.fusion_tensor_view.weight_dtype": "int8",
+        "metadata.fusion_tensor_view.input_scale_dtype": "fp32",
+        "metadata.fusion_tensor_view.output_scale_dtype": "fp32"
+      },
+      "coordinates": {
+        "expected_local_rows": {
+          "path": "metadata.fusion_phases.0.metadata.expected_rows"
+        }
+      },
+      "domain": {
+        "expected_local_rows": {
+          "min": 18,
+          "max": 24.000000001
+        }
+      },
+      "response": {
+        "fixed_us": 54.29521428571421,
+        "terms": [
+          {
+            "coordinate": "expected_local_rows",
+            "us_per_unit": 1.5019682539682577
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "observed_a3_local_native",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "GroupedMatmulSwigluQuant"
+      },
+      "provenance": {
+        "basis": "independent_short_context_complete_native_call_affine",
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+          "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+          "size_bytes": 31548884
+        },
+        "training_batches": [
+          6,
+          7
+        ],
+        "training_query_rows": [
+          36,
+          42
+        ],
+        "training_expected_local_rows": [
+          18,
+          21
+        ],
+        "same_native_ABI": {
+          "input_shapes": [
+            [
+              384,
+              4096
+            ],
+            [
+              18,
+              128,
+              256,
+              16,
+              32
+            ],
+            [
+              18,
+              4096
+            ],
+            [
+              384
+            ],
+            [
+              18
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "FLOAT",
+            "FLOAT",
+            "INT64"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              384
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "FLOAT"
+          ],
+          "block_num": 20
+        },
+        "caller_domain": {
+          "q": 6,
+          "tp": 16,
+          "ep": 16,
+          "input_capacity": 384,
+          "local_expert_banks": 18,
+          "actual_group_list": "unobserved"
+        },
+        "conditional_transfer": "routing_distribution_not_observed; not_independent_routing_generalization",
+        "reference_work": "original_probability_moments_unchanged_and_unexecuted_at_native_boundary",
+        "source_schedule": "not_reconstructed",
+        "binary_identity": "not_established",
+        "body_timing_used": false,
+        "validation_history": "previously_inspected_long_context",
+        "extrapolation": "expected_rows24_from18_21; tested_and_not_assumed_accurate"
+      }
+    },
+    {
+      "id": "a3-q6-cap384-shortctx-GroupedMatmul",
+      "match": {
+        "hardware": "Ascend910_9362",
+        "recipe": "grouped_down",
+        "dtype": "int8",
+        "local_shape.1": 4096,
+        "local_shape.2": 2048,
+        "metadata.matrix_weight_bank_groups": 18,
+        "metadata.routing_basis": "probability_moments",
+        "metadata.activation_format": "int8",
+        "metadata.weight_format": "int8",
+        "metadata.output_format": "bf16"
+      },
+      "coordinates": {
+        "expected_local_rows": {
+          "path": "metadata.expected_rows"
+        }
+      },
+      "domain": {
+        "expected_local_rows": {
+          "min": 18,
+          "max": 24.000000001
+        }
+      },
+      "response": {
+        "fixed_us": 40.67923809523809,
+        "terms": [
+          {
+            "coordinate": "expected_local_rows",
+            "us_per_unit": 0.15331746031746007
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "observed_a3_local_native",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "GroupedMatmul"
+      },
+      "provenance": {
+        "basis": "independent_short_context_complete_native_call_affine",
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+          "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+          "size_bytes": 31548884
+        },
+        "training_batches": [
+          6,
+          7
+        ],
+        "training_query_rows": [
+          36,
+          42
+        ],
+        "training_expected_local_rows": [
+          18,
+          21
+        ],
+        "same_native_ABI": {
+          "input_shapes": [
+            [
+              384,
+              2048
+            ],
+            [
+              18,
+              2048,
+              4096
+            ],
+            [],
+            [
+              18,
+              4096
+            ],
+            [],
+            [],
+            [],
+            [
+              18
+            ],
+            [
+              384
+            ]
+          ],
+          "input_dtypes": [
+            "INT8",
+            "INT8",
+            "INT32",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT16",
+            "FLOAT16",
+            "INT64",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "FRACTAL_NZ",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_shapes": [
+            [
+              384,
+              4096
+            ]
+          ],
+          "output_dtypes": [
+            "DT_BF16"
+          ],
+          "block_num": 20
+        },
+        "caller_domain": {
+          "q": 6,
+          "tp": 16,
+          "ep": 16,
+          "input_capacity": 384,
+          "local_expert_banks": 18,
+          "actual_group_list": "unobserved"
+        },
+        "conditional_transfer": "routing_distribution_not_observed; not_independent_routing_generalization",
+        "reference_work": "original_probability_moments_unchanged_and_unexecuted_at_native_boundary",
+        "source_schedule": "not_reconstructed",
+        "binary_identity": "not_established",
+        "body_timing_used": false,
+        "validation_history": "previously_inspected_long_context",
+        "extrapolation": "expected_rows24_from18_21; tested_and_not_assumed_accurate"
+      }
+    }
+  ],
+  "assignments": [
+    {
+      "native": "GroupedMatmulSwigluQuant",
+      "fixed_us": 54.29521428571421,
+      "us_per_expected_local_row": 1.5019682539682577,
+      "training": [
+        {
+          "batch": 6,
+          "expected_local_rows": 18.0,
+          "count": 42,
+          "mean_us": 81.33064285714285,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.005952380952383,
+            "aic_mac_time(us)": 9.173809523809524,
+            "aic_mte1_time(us)": 28.85535714285714,
+            "aic_mte2_time(us)": 55.84223809523811,
+            "aic_scalar_time(us)": 32.90390476190476,
+            "aicore_time(us)": 74.24607142857141,
+            "aiv_mte2_time(us)": 1.4190952380952382,
+            "aiv_mte3_time(us)": 0.2793095238095238,
+            "aiv_scalar_time(us)": 4.348428571428571,
+            "aiv_time(us)": 77.0312380952381,
+            "aiv_vec_time(us)": 0.45326190476190464
+          }
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 85.83654761904762,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.41859523809524,
+            "aic_mac_time(us)": 9.824642857142857,
+            "aic_mte1_time(us)": 30.651690476190478,
+            "aic_mte2_time(us)": 59.440809523809506,
+            "aic_scalar_time(us)": 35.194857142857124,
+            "aicore_time(us)": 78.46657142857141,
+            "aiv_mte2_time(us)": 1.3082380952380954,
+            "aiv_mte3_time(us)": 0.29102380952380946,
+            "aiv_scalar_time(us)": 5.353952380952382,
+            "aiv_time(us)": 81.58885714285717,
+            "aiv_vec_time(us)": 0.5114285714285715
+          }
+        }
+      ],
+      "validation": [
+        {
+          "batch": 8,
+          "expected_local_rows": 24.0,
+          "count": 504,
+          "mean_us": 69.02329960317454,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.227722222222222,
+            "aic_mac_time(us)": 7.634714285714284,
+            "aic_mte1_time(us)": 23.020634920634933,
+            "aic_mte2_time(us)": 44.100416666666675,
+            "aic_scalar_time(us)": 27.660420634920637,
+            "aicore_time(us)": 62.30145634920637,
+            "aiv_mte2_time(us)": 1.5531607142857118,
+            "aiv_mte3_time(us)": 0.3198849206349205,
+            "aiv_scalar_time(us)": 4.790486111111108,
+            "aiv_time(us)": 64.80948412698415,
+            "aiv_vec_time(us)": 0.5562797619047611
+          },
+          "prediction_us": 90.3424523809524,
+          "relative_error": 0.3088689312209778,
+          "passed_15percent": false
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 79.90871428571427,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.609071428571427,
+            "aic_mac_time(us)": 8.918357142857142,
+            "aic_mte1_time(us)": 27.842380952380957,
+            "aic_mte2_time(us)": 53.54764285714286,
+            "aic_scalar_time(us)": 32.48666666666668,
+            "aicore_time(us)": 72.68590476190475,
+            "aiv_mte2_time(us)": 1.3370952380952383,
+            "aiv_mte3_time(us)": 0.2692619047619048,
+            "aiv_scalar_time(us)": 5.383690476190476,
+            "aiv_time(us)": 75.68338095238096,
+            "aiv_vec_time(us)": 0.5064761904761905
+          },
+          "prediction_us": 85.83654761904762,
+          "relative_error": 0.07418256427125502,
+          "passed_15percent": true
+        }
+      ]
+    },
+    {
+      "native": "GroupedMatmul",
+      "fixed_us": 40.67923809523809,
+      "us_per_expected_local_row": 0.15331746031746007,
+      "training": [
+        {
+          "batch": 6,
+          "expected_local_rows": 18.0,
+          "count": 42,
+          "mean_us": 43.43895238095237,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.18552380952381,
+            "aic_mac_time(us)": 4.5815,
+            "aic_mte1_time(us)": 14.433523809523816,
+            "aic_mte2_time(us)": 26.133380952380953,
+            "aic_scalar_time(us)": 16.265023809523807,
+            "aicore_time(us)": 33.24495238095238,
+            "aiv_mte2_time(us)": 2.629571428571429,
+            "aiv_mte3_time(us)": 0.6645238095238094,
+            "aiv_scalar_time(us)": 5.988571428571428,
+            "aiv_time(us)": 33.115785714285714,
+            "aiv_vec_time(us)": 0.7389999999999999
+          }
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 43.89890476190475,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 8.615761904761904,
+            "aic_mac_time(us)": 4.907261904761905,
+            "aic_mte1_time(us)": 15.33452380952381,
+            "aic_mte2_time(us)": 27.504761904761907,
+            "aic_scalar_time(us)": 17.11469047619048,
+            "aicore_time(us)": 35.04023809523809,
+            "aiv_mte2_time(us)": 2.7646904761904754,
+            "aiv_mte3_time(us)": 0.6923333333333334,
+            "aiv_scalar_time(us)": 6.333095238095237,
+            "aiv_time(us)": 34.909166666666664,
+            "aiv_vec_time(us)": 0.8032857142857142
+          }
+        }
+      ],
+      "validation": [
+        {
+          "batch": 8,
+          "expected_local_rows": 24.0,
+          "count": 504,
+          "mean_us": 36.27574206349212,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 6.239634920634917,
+            "aic_mac_time(us)": 3.814039682539681,
+            "aic_mte1_time(us)": 11.520626984126983,
+            "aic_mte2_time(us)": 19.73824206349207,
+            "aic_scalar_time(us)": 13.093202380952372,
+            "aicore_time(us)": 26.392920634920664,
+            "aiv_mte2_time(us)": 2.0697996031746033,
+            "aiv_mte3_time(us)": 0.5421507936507935,
+            "aiv_scalar_time(us)": 5.232275793650797,
+            "aiv_time(us)": 26.200878968253953,
+            "aiv_vec_time(us)": 0.7158690476190487
+          },
+          "prediction_us": 44.35885714285713,
+          "relative_error": 0.22282425167808917,
+          "passed_15percent": false
+        },
+        {
+          "batch": 7,
+          "expected_local_rows": 21.0,
+          "count": 42,
+          "mean_us": 41.40940476190476,
+          "pmu_means_us": {
+            "aic_fixpipe_time(us)": 7.771476190476191,
+            "aic_mac_time(us)": 4.452333333333333,
+            "aic_mte1_time(us)": 13.92914285714286,
+            "aic_mte2_time(us)": 24.708714285714287,
+            "aic_scalar_time(us)": 15.805261904761908,
+            "aicore_time(us)": 32.24097619047619,
+            "aiv_mte2_time(us)": 2.449714285714285,
+            "aiv_mte3_time(us)": 0.6433333333333333,
+            "aiv_scalar_time(us)": 6.117666666666667,
+            "aiv_time(us)": 32.10785714285714,
+            "aiv_vec_time(us)": 0.7589523809523808
+          },
+          "prediction_us": 43.89890476190475,
+          "relative_error": 0.060119193074956945,
+          "passed_15percent": true
+        }
+      ]
+    }
+  ],
+  "reference_routing_changed": false,
+  "B8_operator_transfer": "failed_15percent_for_both_kernels",
+  "recorded_tensor_ABI_compatible": true
+}

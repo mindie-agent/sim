@@ -1,0 +1,924 @@
+{
+  "name": "glm53flash-a3-tp16-q6-native-keypool-operator-service:shortctx-native-gmm-service",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 16,
+    "ranks_per_node": 16,
+    "device": {
+      "rates": {
+        "observed_a3_local_native": 1000000000.0
+      },
+      "work_units": {
+        "observed_a3_local_native": "busy_ns"
+      },
+      "resource_units": {
+        "observed_a3_local_native": 1
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "int8",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "graph_mode": "NpuGraphEx",
+    "metadata": {
+      "input_boundary": "full_45_layer_target_body_only",
+      "context_basis": "131201_initial_prompt_scenario; actual_per_call_context_unobserved",
+      "calibration_origin": "explicit_operator_calibration_not_pristine_holdout",
+      "native_keypool_parameters": "data/observations/a3-native-keypool-20261030/parameters.json",
+      "base_declaration": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-glm53flash-heldout-tp16.json",
+        "sha256": "18c65290b6794a859e873324526b06def428284e322c9c0f00fc886cf2fa38d6",
+        "size_bytes": 18735
+      },
+      "retained_base_parameters": "unchanged",
+      "capture_rows": {
+        "observed_long_context": [
+          6,
+          12,
+          18,
+          24,
+          42,
+          48
+        ],
+        "B5_B6": "prediction_only_short_capture_bucket_geometry"
+      },
+      "tail_capacity": {
+        "value": 9,
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+          "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+          "size_bytes": 86903800
+        },
+        "line": 248,
+        "input_shapes": "\"9,128;9,128;6,128\"",
+        "output_shapes": "\"7646,9,256;38230,32,1,128\""
+      },
+      "limitations": [
+        "CANN source binary and internal score reuse are unbound",
+        "Sparse attention valid indices and native owner schedule remain unbound",
+        "No Body or per-layer timing entered parameter assignment"
+      ],
+      "native_gmm_service": {
+        "parameters": "data/observations/a3-native-keypool-20261030/gmm-parameters.json",
+        "scope": "q6_TP16_EP16_MC2_capacity384_scenario",
+        "actual_routing": "unknown",
+        "reference_routing": "unchanged_probability_moments",
+        "native_operator_B8_validation": "fails_15percent; do_not_infer_validity_from_Body_error"
+      }
+    },
+    "kernels": {
+      "programs": {
+        "indexed_attention": {
+          "kind": "indexed_attention_packed_int8",
+          "scratch_policy": "offchip",
+          "operand_modes": true
+        }
+      },
+      "lowerings": {
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch22",
+          "options": {
+            "safe_gate": true,
+            "use_beta_sigmoid": true,
+            "state_selection": {
+              "kind": "symbolic_valid_selection",
+              "index_layout": "speculative",
+              "index_row_stride": 6,
+              "validity": {
+                "prefix": true,
+                "state_indices": true,
+                "accepted_tokens": true,
+                "independent_sequences": true
+              }
+            }
+          }
+        },
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "hc_pre",
+              "hc_post",
+              "grouped_gate_up_activation_quant"
+            ],
+            "traffic_profile": {
+              "hc_pre": "hc_pre_m_k_split_175ef4d4",
+              "hc_post": "hc_post_d_split_175ef4d4",
+              "grouped_gate_up_activation_quant": "grouped_swiglu_quant_int8_split_workspace_ae923905"
+            }
+          }
+        },
+        "pool_key_indexer": {
+          "implementation": "vllm_ascend_cann_keypool_caller",
+          "options": {
+            "tail_capacity": 9,
+            "block_table_columns": 8195,
+            "score_mode": "linear_weighted_query"
+          }
+        }
+      },
+      "service_regimes": [
+        {
+          "id": "joint-expert_down",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "grouped_down",
+            "family": "grouped_gemm",
+            "phase": "decode",
+            "dtype": "int8",
+            "local_shape.0": 48,
+            "local_shape.1": 4096,
+            "local_shape.2": 2048,
+            "metadata.weight_dtype": "int8",
+            "metadata.expected_active_experts": 16.795616799494926,
+            "metadata.expected_rows": 48.0
+          },
+          "response": {
+            "fixed_us": 71.92663127413127
+          },
+          "execution": {
+            "kind": "joint_native",
+            "native_kernel": "GroupedMatmul",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0
+          },
+          "provenance": {
+            "evidence_identity": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8.json",
+              "sha256": "6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8",
+              "size_bytes": 30725
+            },
+            "json_pointer": "/runtime/kernels/service_regimes/0/provenance",
+            "calibration_origin": "observed",
+            "evaluation_relation": "in_sample",
+            "expected_rule_hits": 42
+          }
+        },
+        {
+          "id": "joint-grouped_gate_up_activation_quant",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "declared_native_fusion",
+            "family": "native_fusion",
+            "phase": "decode",
+            "dtype": "bf16",
+            "local_shape.0": 48,
+            "local_shape.1": 2048,
+            "metadata.fusion_role": "grouped_gate_up_activation_quant"
+          },
+          "response": {
+            "fixed_us": 142.41549034749036
+          },
+          "execution": {
+            "kind": "joint_native",
+            "native_kernel": "GroupedMatmulSwigluQuant",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0
+          },
+          "provenance": {
+            "evidence_identity": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8.json",
+              "sha256": "6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8",
+              "size_bytes": 30725
+            },
+            "json_pointer": "/runtime/kernels/service_regimes/1/provenance",
+            "calibration_origin": "observed",
+            "evaluation_relation": "in_sample",
+            "expected_rule_hits": 42
+          }
+        },
+        {
+          "id": "joint-indexed_attention_batch",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "latent_attention_batch",
+            "family": "attention",
+            "phase": "decode",
+            "dtype": "bf16",
+            "local_shape.0": 16,
+            "local_shape.1": 96,
+            "local_shape.2": 4102,
+            "local_shape.3": 4,
+            "local_shape.4": 512,
+            "local_shape.5": 512,
+            "metadata.indexed_attention_geometry": {
+              "topk": 2048,
+              "compression_ratio": 1,
+              "window": 0,
+              "heads": 4,
+              "latent": 512,
+              "rope": 0,
+              "cp": 1,
+              "query_dtype": "bf16",
+              "cache_dtype": "int8",
+              "sequences": [
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ],
+                [
+                  6,
+                  4096
+                ]
+              ]
+            }
+          },
+          "response": {
+            "fixed_us": 377.57967813267817
+          },
+          "execution": {
+            "kind": "joint_native",
+            "native_kernel": "KvQuantSparseFlashAttentionVllm",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0
+          },
+          "provenance": {
+            "evidence_identity": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8.json",
+              "sha256": "6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8",
+              "size_bytes": 30725
+            },
+            "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+            "calibration_origin": "observed",
+            "evaluation_relation": "in_sample",
+            "expected_rule_hits": 11
+          }
+        },
+        {
+          "id": "joint-hc_pre",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "declared_native_fusion",
+            "family": "native_fusion",
+            "phase": "decode",
+            "dtype": "bf16",
+            "local_shape.0": 393216,
+            "metadata.fusion_role": "hc_pre"
+          },
+          "response": {
+            "fixed_us": 34.70325885885886
+          },
+          "execution": {
+            "kind": "joint_native",
+            "native_kernel": "HcPre",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0
+          },
+          "provenance": {
+            "evidence_identity": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8.json",
+              "sha256": "6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8",
+              "size_bytes": 30725
+            },
+            "json_pointer": "/runtime/kernels/service_regimes/3/provenance",
+            "calibration_origin": "observed",
+            "evaluation_relation": "in_sample",
+            "expected_rule_hits": 90
+          }
+        },
+        {
+          "id": "joint-hc_post",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "declared_native_fusion",
+            "family": "native_fusion",
+            "phase": "decode",
+            "dtype": "bf16",
+            "local_shape.0": 1572864,
+            "metadata.fusion_role": "hc_post"
+          },
+          "response": {
+            "fixed_us": 20.144186486486486
+          },
+          "execution": {
+            "kind": "joint_native",
+            "native_kernel": "HcPost",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0
+          },
+          "provenance": {
+            "evidence_identity": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8.json",
+              "sha256": "6c6862fea646e904ff4d49a13ba1282ffabb755b9bee61b85e720057a5d2a8a8",
+              "size_bytes": 30725
+            },
+            "json_pointer": "/runtime/kernels/service_regimes/4/provenance",
+            "calibration_origin": "observed",
+            "evaluation_relation": "in_sample",
+            "expected_rule_hits": 90
+          }
+        },
+        {
+          "id": "a3-native-cann_key_pool-operator-calibration",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "cann_key_pool",
+            "dtype": "bf16",
+            "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+            "metadata.pool_size": 4,
+            "local_shape.1": 128,
+            "local_shape.2": 4096,
+            "metadata.tail_capacity": 9
+          },
+          "coordinates": {
+            "rows": {
+              "path": "metadata.padded_query_rows"
+            },
+            "query_min": {
+              "path": "metadata.query_lengths",
+              "reduce": "min"
+            },
+            "query_max": {
+              "path": "metadata.query_lengths",
+              "reduce": "max"
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 6,
+              "max": 60
+            },
+            "query_min": {
+              "min": 6,
+              "max": 6
+            },
+            "query_max": {
+              "min": 6,
+              "max": 6
+            }
+          },
+          "response": {
+            "fixed_us": 28.96730454190808,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.10608264244624804
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "KeyPool"
+          },
+          "provenance": {
+            "scope": "native_kernel_response_not_body_fit",
+            "training": "independent_short_context_same_BF16_WK_gate_state_ABI",
+            "assignment_batches": [
+              1,
+              3,
+              4,
+              5,
+              6,
+              7,
+              9,
+              10
+            ],
+            "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+            "validation_batches": [
+              3,
+              4,
+              7,
+              8
+            ],
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+              "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+              "size_bytes": 31548884
+            },
+            "source_kernel_binary_identity": "not_established",
+            "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+            "extrapolation": "long_context_has_same_producer_ABI"
+          }
+        },
+        {
+          "id": "a3-native-cann_pool_key_indexer-operator-calibration",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "cann_pool_key_indexer",
+            "dtype": "bf16",
+            "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+            "metadata.pool_size": 4,
+            "local_shape.1": 32,
+            "local_shape.2": 128,
+            "metadata.topk_tokens": 2048
+          },
+          "coordinates": {
+            "rows": {
+              "path": "metadata.padded_query_rows"
+            },
+            "query_min": {
+              "path": "metadata.query_lengths",
+              "reduce": "min"
+            },
+            "query_max": {
+              "path": "metadata.query_lengths",
+              "reduce": "max"
+            },
+            "scanned_pools": {
+              "path": "metadata.scanned_pools"
+            },
+            "context_min": {
+              "path": "metadata.context_lengths",
+              "reduce": "min"
+            },
+            "context_max": {
+              "path": "metadata.context_lengths",
+              "reduce": "max"
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 6,
+              "max": 48
+            },
+            "query_min": {
+              "min": 6,
+              "max": 6
+            },
+            "query_max": {
+              "min": 6,
+              "max": 6
+            },
+            "scanned_pools": {
+              "min": 196804,
+              "max": 1574432
+            },
+            "context_min": {
+              "min": 131201,
+              "max": 131201
+            },
+            "context_max": {
+              "min": 131201,
+              "max": 131201
+            }
+          },
+          "response": {
+            "fixed_us": 41.147088235294135,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.0
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "PoolKeyIndexer"
+          },
+          "provenance": {
+            "scope": "native_kernel_response_not_body_fit",
+            "training": "long_context_B1_B2_reassigned_from_previously_inspected_capture",
+            "assignment_batches": [
+              1,
+              2
+            ],
+            "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+            "validation_batches": [
+              3,
+              4,
+              7,
+              8
+            ],
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+              "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+              "size_bytes": 86903800
+            },
+            "source_kernel_binary_identity": "not_established",
+            "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+            "extrapolation": "B3_to_B8_outside_B1_B2_training_geometry; score_reuse_unidentified"
+          }
+        },
+        {
+          "id": "a3-q6-cap384-shortctx-GroupedMatmulSwigluQuant",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "declared_native_fusion",
+            "metadata.fusion_role": "grouped_gate_up_activation_quant",
+            "metadata.fusion_tensor_view.input_width": 4096,
+            "metadata.fusion_tensor_view.intermediate_width": 2048,
+            "metadata.fusion_tensor_view.local_experts": 18,
+            "metadata.fusion_tensor_view.routing_basis": "probability_moments",
+            "metadata.fusion_tensor_view.input_dtype": "int8",
+            "metadata.fusion_tensor_view.output_dtype": "int8",
+            "metadata.fusion_tensor_view.weight_dtype": "int8",
+            "metadata.fusion_tensor_view.input_scale_dtype": "fp32",
+            "metadata.fusion_tensor_view.output_scale_dtype": "fp32"
+          },
+          "coordinates": {
+            "expected_local_rows": {
+              "path": "metadata.fusion_phases.0.metadata.expected_rows"
+            }
+          },
+          "domain": {
+            "expected_local_rows": {
+              "min": 18,
+              "max": 24.000000001
+            }
+          },
+          "response": {
+            "fixed_us": 54.29521428571421,
+            "terms": [
+              {
+                "coordinate": "expected_local_rows",
+                "us_per_unit": 1.5019682539682577
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "GroupedMatmulSwigluQuant"
+          },
+          "provenance": {
+            "basis": "independent_short_context_complete_native_call_affine",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+              "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+              "size_bytes": 31548884
+            },
+            "training_batches": [
+              6,
+              7
+            ],
+            "training_query_rows": [
+              36,
+              42
+            ],
+            "training_expected_local_rows": [
+              18,
+              21
+            ],
+            "same_native_ABI": {
+              "input_shapes": [
+                [
+                  384,
+                  4096
+                ],
+                [
+                  18,
+                  128,
+                  256,
+                  16,
+                  32
+                ],
+                [
+                  18,
+                  4096
+                ],
+                [
+                  384
+                ],
+                [
+                  18
+                ]
+              ],
+              "input_dtypes": [
+                "INT8",
+                "INT8",
+                "FLOAT",
+                "FLOAT",
+                "INT64"
+              ],
+              "input_formats": [
+                "ND",
+                "FRACTAL_NZ",
+                "ND",
+                "ND",
+                "ND"
+              ],
+              "output_shapes": [
+                [
+                  384,
+                  2048
+                ],
+                [
+                  384
+                ]
+              ],
+              "output_dtypes": [
+                "INT8",
+                "FLOAT"
+              ],
+              "block_num": 20
+            },
+            "caller_domain": {
+              "q": 6,
+              "tp": 16,
+              "ep": 16,
+              "input_capacity": 384,
+              "local_expert_banks": 18,
+              "actual_group_list": "unobserved"
+            },
+            "conditional_transfer": "routing_distribution_not_observed; not_independent_routing_generalization",
+            "reference_work": "original_probability_moments_unchanged_and_unexecuted_at_native_boundary",
+            "source_schedule": "not_reconstructed",
+            "binary_identity": "not_established",
+            "body_timing_used": false,
+            "validation_history": "previously_inspected_long_context",
+            "extrapolation": "expected_rows24_from18_21; tested_and_not_assumed_accurate"
+          }
+        },
+        {
+          "id": "a3-q6-cap384-shortctx-GroupedMatmul",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "recipe": "grouped_down",
+            "dtype": "int8",
+            "local_shape.1": 4096,
+            "local_shape.2": 2048,
+            "metadata.matrix_weight_bank_groups": 18,
+            "metadata.routing_basis": "probability_moments",
+            "metadata.activation_format": "int8",
+            "metadata.weight_format": "int8",
+            "metadata.output_format": "bf16"
+          },
+          "coordinates": {
+            "expected_local_rows": {
+              "path": "metadata.expected_rows"
+            }
+          },
+          "domain": {
+            "expected_local_rows": {
+              "min": 18,
+              "max": 24.000000001
+            }
+          },
+          "response": {
+            "fixed_us": 40.67923809523809,
+            "terms": [
+              {
+                "coordinate": "expected_local_rows",
+                "us_per_unit": 0.15331746031746007
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "observed_a3_local_native",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "GroupedMatmul"
+          },
+          "provenance": {
+            "basis": "independent_short_context_complete_native_call_affine",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+              "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+              "size_bytes": 31548884
+            },
+            "training_batches": [
+              6,
+              7
+            ],
+            "training_query_rows": [
+              36,
+              42
+            ],
+            "training_expected_local_rows": [
+              18,
+              21
+            ],
+            "same_native_ABI": {
+              "input_shapes": [
+                [
+                  384,
+                  2048
+                ],
+                [
+                  18,
+                  2048,
+                  4096
+                ],
+                [],
+                [
+                  18,
+                  4096
+                ],
+                [],
+                [],
+                [],
+                [
+                  18
+                ],
+                [
+                  384
+                ]
+              ],
+              "input_dtypes": [
+                "INT8",
+                "INT8",
+                "INT32",
+                "DT_BF16",
+                "FLOAT",
+                "FLOAT16",
+                "FLOAT16",
+                "INT64",
+                "FLOAT"
+              ],
+              "input_formats": [
+                "ND",
+                "FRACTAL_NZ",
+                "ND",
+                "ND",
+                "ND",
+                "ND",
+                "ND",
+                "ND",
+                "ND"
+              ],
+              "output_shapes": [
+                [
+                  384,
+                  4096
+                ]
+              ],
+              "output_dtypes": [
+                "DT_BF16"
+              ],
+              "block_num": 20
+            },
+            "caller_domain": {
+              "q": 6,
+              "tp": 16,
+              "ep": 16,
+              "input_capacity": 384,
+              "local_expert_banks": 18,
+              "actual_group_list": "unobserved"
+            },
+            "conditional_transfer": "routing_distribution_not_observed; not_independent_routing_generalization",
+            "reference_work": "original_probability_moments_unchanged_and_unexecuted_at_native_boundary",
+            "source_schedule": "not_reconstructed",
+            "binary_identity": "not_established",
+            "body_timing_used": false,
+            "validation_history": "previously_inspected_long_context",
+            "extrapolation": "expected_rows24_from18_21; tested_and_not_assumed_accurate"
+          }
+        }
+      ]
+    },
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 8192,
+    "graph_buckets": [
+      6,
+      12,
+      18,
+      24,
+      30,
+      36,
+      42,
+      48,
+      54,
+      60
+    ],
+    "piecewise_capture_keys": [
+      6,
+      12,
+      18,
+      24,
+      30,
+      36,
+      42,
+      48,
+      54,
+      60
+    ]
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "declaration-placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}
