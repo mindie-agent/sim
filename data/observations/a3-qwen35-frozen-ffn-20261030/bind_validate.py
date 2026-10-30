@@ -24,7 +24,7 @@ sys.path.insert(0,str(ROOT))
 from mindie_sim import predict, target_graphs
 from helper_contract import helper_contract
 
-BASE_REVISION='1c5939cd'
+BASE_REVISION='13f4ab91'
 THREE_RULE_REVISION='c4e91818'
 BASE_PATH='examples/cases/longctx-decode-20261030/a3-fai-regular/a3-qwen35-tp4-long-context-source.json'
 PARAMETERS=ROOT/'data/observations/parameters/a3-native-decode-20261030/parameters.json'
