@@ -19,7 +19,8 @@ def recipes():
     return {IMPLEMENTATION: PlannedRecipe(paged_mla.build)}
 
 
-def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1, dispatch=None):
+def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1,
+             dispatch=None, native_query_capacity=None):
     if (not views or any(v.phase != 'decode' or v.q_len != 1 for v in views)
             or parallel.cp != 1 or parallel.pcp != 1 or padded_tokens < len(views)
             or plan.mla_variant != 'latent_mla' or plan.cache_kind != 'dense'
@@ -29,11 +30,20 @@ def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1,
         raise ModelingError('paged_mla_requires_q1_bf16_dense_latent512_rope64')
     if type(kv_splits) is not int or kv_splits < 1:
         raise ModelingError('paged_mla_requires_positive_declared_split_count')
+    if isinstance(dispatch, str) and dispatch != 'source_split_core_v2':
+        raise ModelingError('paged_mla_dispatch_policy_unknown')
+    if native_query_capacity is not None and (
+            type(native_query_capacity) is not int or native_query_capacity < len(views)):
+        raise ModelingError('paged_mla_query_capacity_below_active_sequences')
 
 
 def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
-                    head_contract=None, padded_tokens=None, kv_splits=1, dispatch=None):
+                    head_contract=None, padded_tokens=None, kv_splits=1, dispatch=None,
+                    native_query_capacity=None):
     batch = len(views)
+    capacity = batch if padded_tokens is None else padded_tokens
+    if native_query_capacity is not None:
+        capacity = native_query_capacity
     logical = plan.num_heads // runtime.parallel.tp
     physical = 1 << (logical-1).bit_length()
     if head_contract is None and physical != heads:
@@ -42,27 +52,35 @@ def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
         packed = []
         for part, producer, width in (('nope', query, 512), ('rope', rotary, 64)):
             packed.append(b.work('paged_mla_query_pad_' + part, (producer,),
-                (batch, physical, width), read=batch*heads*width*2,
-                write=batch*physical*width*2, family='copy', dtype='bf16',
+                (capacity, physical, width), read=capacity*heads*width*2,
+                write=capacity*physical*width*2, family='copy', dtype='bf16',
                 metadata=(('materialization', 'F.pad logical heads to physical'),
-                          ('zero_fill_bytes', batch*(physical-heads)*width*2))))
+                          ('zero_fill_bytes', capacity*(physical-heads)*width*2))))
         query, rotary = packed
     name = b.work('paged_mla_decode', (query, rotary, store),
                   (batch, physical, 1, 512), family='attention', dtype='bf16')
     meta = {
         'paged_mla_geometry': {'contexts': tuple(v.context for v in views),
                               'heads': physical, 'kv_splits': kv_splits,
-                              'page_size': runtime.kv_block_size, 'dispatch': dispatch},
+                              'page_size': runtime.kv_block_size, 'dispatch': dispatch,
+                              'active_sequence_count': batch,
+                              'native_query_capacity': capacity,
+                              'inactive_sequence_kv_length': 0},
         'implementation_binding': {'selector': 'paged_mla_attention',
             'implementation': IMPLEMENTATION, 'capture_dispatch': 'not_established',
             'call_boundary': 'one_native_kernel_for_independent_single_query_sequences'},
-        'attention_tensor_view': {'kind': 'paged_latent', 'query_shape': (batch,physical,1,512),
-            'query_rope_shape': (batch,physical,1,64), 'output_shape': (physical,batch,1,512),
+        'attention_tensor_view': {'kind': 'paged_latent',
+            'active_query_shape': (batch,physical,1,512),
+            'query_shape': (capacity,physical,1,512),
+            'query_rope_shape': (capacity,physical,1,64),
+            'output_shape': (physical,capacity,1,512),
             'query_dtype':'bf16','cache_dtype':'bf16','output_dtype':'bf16',
             'cache_head_shape':(1,512),'rope_cache_head_shape':(1,64)},
         'mla_head_contract': {'logical_heads': logical, 'physical_heads': physical},
         'output_view': 'NBSD[:logical_heads]; leading-head contiguous slice; no copy',
     }
     b.ops[-1] = replace(b.ops[-1], recipe=IMPLEMENTATION, source_boundary='kernel',
-                        metadata=tuple(meta.items()))
+                        metadata=tuple(meta.items()),
+                        padded_shape=(capacity,physical,1,512),
+                        launch_shape=(capacity,physical,1,512))
     return name

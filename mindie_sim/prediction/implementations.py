@@ -62,7 +62,7 @@ IMPLEMENTATIONS = {
         "mindie_sim.prediction.family_causal_conv", blocks=("causal_conv_update",)),
     "ascend_paged_mla_decode_arch35": Implementation(
         "mindie_sim.prediction.family_paged_mla", blocks=("paged_mla_attention",),
-        options=("kv_splits", "dispatch")),
+        options=("kv_splits", "dispatch", "native_query_capacity")),
     "ascend_paged_mla_decode_arch22": Implementation(
         "mindie_sim.prediction.family_paged_mla_arch22", blocks=("paged_mla_attention",),
         options=("dispatch", "retained_kv_rows", "native_query_capacity")),

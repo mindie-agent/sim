@@ -1,0 +1,1122 @@
+{
+  "boundary": "one native MLA kernel; no Body fitting",
+  "capture_dispatch": "conditional_source_compatible; original source binary unobserved",
+  "scope": "six source controls; not a trained or heldout accuracy claim",
+  "cases": [
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c1.json",
+        "sha256": "5d79df813c037cab0b2cbaf12c274c15b5f486c9718c3d050707cfe4d5cf36b4"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 1
+      },
+      "status": "completed",
+      "wall_seconds": 0.42257404199335724,
+      "peak_rss_bytes": 57589760,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "81b40e25df63f86bf59aea1394b32b7141c78e3f0a217a220db6df6869149088",
+        "size_bytes": 97434547,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c1.json",
+        "sha256": "efb7a5c5ba025c15de48c9e6c9ce0b6e002e1376b9929360d4c20d696bfb6ab5",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"1,16,1,512;12798,1,128,512;12798,1,128,512;;;;1;;;;;;;;1,1026;;;;;;;;;;1,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,1,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 1344,
+        "sum_us": 107755.92900000006,
+        "min_us": 77.025,
+        "max_us": 85.601,
+        "first_line": 205,
+        "last_line": 291971,
+        "mean_us": 80.17554241071433,
+        "mean_sum_per_forward_us": 1924.213017857144
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 56,
+        "observed_ms": {
+          "count": 56,
+          "mean": 32.484816214285715,
+          "p50": 32.4695315,
+          "p90": 32.484914,
+          "min": 32.433612,
+          "max": 33.355659
+        },
+        "predicted_ms": 26.200708021038732,
+        "relative_error": -0.19344755259792562,
+        "per_forward_diff_ms": -6.284108193246983,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.0702499868213815,
+      "relative_error": -0.1237977978182836,
+      "active_shape": [
+        1,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        1,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 1,
+        "native_query_capacity": 1,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 1,
+        "requested_kv_splits": null,
+        "physical_segments": 32,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 147868644
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    },
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c2.json",
+        "sha256": "93292d63eb3382d9149d17c6ea0d656974da177b9d9bab8acd49142978f68477"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 2
+      },
+      "status": "completed",
+      "wall_seconds": 0.8330981660401449,
+      "peak_rss_bytes": 64847872,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "sha256": "ea71026728e26f46aac8d20d0a414e4dc664d345dc087d138b05a59277723313",
+        "size_bytes": 94312857,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c2.json",
+        "sha256": "46d7dab69a47d50dd576544534c4366b4e0ea21035a5ca203dc14fd27856efb6",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"2,16,1,512;12798,1,128,512;12798,1,128,512;;;;2;;;;;;;;2,1026;;;;;;;;;;2,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,2,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 1200,
+        "sum_us": 170214.27200000008,
+        "min_us": 136.452,
+        "max_us": 147.953,
+        "first_line": 223,
+        "last_line": 282975,
+        "mean_us": 141.84522666666675,
+        "mean_sum_per_forward_us": 3404.2854400000015
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 50,
+        "observed_ms": {
+          "count": 50,
+          "mean": 36.85418582,
+          "p50": 36.8403265,
+          "p90": 36.855789,
+          "min": 36.812194,
+          "max": 37.618086
+        },
+        "predicted_ms": 27.12548455848316,
+        "relative_error": -0.2639781898597059,
+        "per_forward_diff_ms": -9.72870126151684,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.14047781267806947,
+      "relative_error": -0.009640183323268658,
+      "active_shape": [
+        2,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        2,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000,
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 2,
+        "native_query_capacity": 2,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 2,
+        "requested_kv_splits": null,
+        "physical_segments": 33,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 293126344
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    },
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c4.json",
+        "sha256": "27b706860538775aa7a647b5c577242d2b9bae2fd3b5ec179ccd4fe450b584e9"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 4
+      },
+      "status": "completed",
+      "wall_seconds": 1.9287867499515414,
+      "peak_rss_bytes": 66781184,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "045f37808c79a2d452156e51b95d8f0679bf60114525cbef0a6f3f166edad905",
+        "size_bytes": 84916836,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c4.json",
+        "sha256": "031731ddc8aacc0c0249b385615e680dbd36ff1c41eb2d4a079a041beb281fc4",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"4,16,1,512;12798,1,128,512;12798,1,128,512;;;;4;;;;;;;;4,1026;;;;;;;;;;4,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,4,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 1080,
+        "sum_us": 284424.23200000013,
+        "min_us": 257.336,
+        "max_us": 272.531,
+        "first_line": 223,
+        "last_line": 254670,
+        "mean_us": 263.3557703703705,
+        "mean_sum_per_forward_us": 6320.538488888892
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 45,
+        "observed_ms": {
+          "count": 45,
+          "mean": 40.4157188,
+          "p50": 40.391077,
+          "p90": 40.420067,
+          "min": 40.360897,
+          "max": 41.516382
+        },
+        "predicted_ms": 28.99566967056392,
+        "relative_error": -0.28256454341314546,
+        "per_forward_diff_ms": -11.42004912943608,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.27256247145677914,
+      "relative_error": 0.03495917736475174,
+      "active_shape": [
+        4,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        4,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000,
+          126000,
+          126000,
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 4,
+        "native_query_capacity": 4,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 4,
+        "requested_kv_splits": null,
+        "physical_segments": 35,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 583641744
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    },
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c6.json",
+        "sha256": "7458505b0442335b8a2b287efb60aaae20c77ff1d78928d9f56f0e720e92f847"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 6
+      },
+      "status": "completed",
+      "wall_seconds": 3.16787608305458,
+      "peak_rss_bytes": 66781184,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "sha256": "0e0c33954921e4f12924bc572e795f2a6ff9967b011f861cfafb2fa79e3ce718",
+        "size_bytes": 76385139,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c6.json",
+        "sha256": "ce6ed46f3c872c091ecf01a1c145bed575441652abe7274c813d9515f1401a4c",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"8,16,1,512;12798,1,128,512;12798,1,128,512;;;;8;;;;;;;;8,1026;;;;;;;;;;8,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,8,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 1008,
+        "sum_us": 387340.6339999995,
+        "min_us": 376.565,
+        "max_us": 393.929,
+        "first_line": 219,
+        "last_line": 229838,
+        "mean_us": 384.2665019841265,
+        "mean_sum_per_forward_us": 9222.396047619035
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 42,
+        "observed_ms": {
+          "count": 42,
+          "mean": 43.58908685714286,
+          "p50": 43.5596435,
+          "p90": 43.578481,
+          "min": 43.539096,
+          "max": 44.684268
+        },
+        "predicted_ms": 31.011939759663736,
+        "relative_error": -0.2885388982498983,
+        "per_forward_diff_ms": -12.577147097479124,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage.",
+          "Valid q=1 requests follow unpadded LMHead rows with source-confirmed speculation disabled; Body tensors retain the separately checked graph padding. State-index and per-request KV values remain unobserved."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.4061354042381895,
+      "relative_error": 0.05691076932583217,
+      "active_shape": [
+        6,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        8,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 6,
+        "native_query_capacity": 8,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 6,
+        "requested_kv_splits": null,
+        "physical_segments": 37,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 874157144
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    },
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c8.json",
+        "sha256": "ee9783668da792fe94747fbe284c447a2d3e73b16ed03af874f59b331caf5d67"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 8
+      },
+      "status": "completed",
+      "wall_seconds": 3.181433916906826,
+      "peak_rss_bytes": 66781184,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "sha256": "2176834d9e01784ea4af9448ba503ce9263a59ae585c6a2b1c3607e4a6a8924b",
+        "size_bytes": 72668484,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c8.json",
+        "sha256": "dd96184fb131b806c3ca70ecbdf772585a11be8a1cd9bf245af1e5bbabf051d5",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"8,16,1,512;12798,1,128,512;12798,1,128,512;;;;8;;;;;;;;8,1026;;;;;;;;;;8,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,8,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 960,
+        "sum_us": 488814.22199999954,
+        "min_us": 500.653,
+        "max_us": 519.998,
+        "first_line": 213,
+        "last_line": 218650,
+        "mean_us": 509.18148124999954,
+        "mean_sum_per_forward_us": 12220.35554999999
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 40,
+        "observed_ms": {
+          "count": 40,
+          "mean": 46.691246975,
+          "p50": 46.6733135,
+          "p90": 46.694333,
+          "min": 46.64187,
+          "max": 47.378606
+        },
+        "predicted_ms": 32.76160669493676,
+        "relative_error": -0.29833515235782027,
+        "per_forward_diff_ms": -13.92964028006324,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.5409197235151657,
+      "relative_error": 0.062331886437133166,
+      "active_shape": [
+        8,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        8,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 8,
+        "native_query_capacity": 8,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 8,
+        "requested_kv_splits": null,
+        "physical_segments": 39,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 1164672544
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    },
+    {
+      "case": {
+        "path": "examples/cases/kimi-a5-paged-host-20261030/c12.json",
+        "sha256": "9f0f55a0c22e357e933c0e55919a87c99f19f5653329672a47e2243fbb72fe53"
+      },
+      "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+      "runtime_files_sha256": {
+        "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+        "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+        "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+        "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+        "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+        "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+      },
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 1,
+        "context": 126000,
+        "sequences": 12
+      },
+      "status": "completed",
+      "wall_seconds": 5.351273084059358,
+      "peak_rss_bytes": 66781184,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "sha256": "4354f0403a8579c47eba38a5075add2c3582787410023ca43ce12daf0b94f242",
+        "size_bytes": 62015375,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c12.json",
+        "sha256": "a136acb891338e58a05b2b64c967f6c329c3270604d58a03c7053b988ef69736",
+        "reused_existing_extraction": true
+      },
+      "native_primitive": {
+        "abi": {
+          "Type": "FusedInferAttentionScore",
+          "Input Shapes": "\"16,16,1,512;12798,1,128,512;12798,1,128,512;;;;16;;;;;;;;16,1026;;;;;;;;;;16,16,1,64;12798,1,128,64;;;;;\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT64;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_BF16;DT_BF16;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+          "Input Formats": "ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;NULL;ND;ND;NULL;NULL;NULL;NULL;NULL",
+          "Output Shapes": "\"16,16,1,512;\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "64",
+          "Accelerator Core": "MIX_AIC"
+        },
+        "first_name": "FusedInferAttentionScore",
+        "count": 816,
+        "sum_us": 613851.576,
+        "min_us": 741.969,
+        "max_us": 765.819,
+        "first_line": 219,
+        "last_line": 186046,
+        "mean_us": 752.2690882352941,
+        "mean_sum_per_forward_us": 18054.45811764706
+      },
+      "native_body_comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 34,
+        "observed_ms": {
+          "count": 34,
+          "mean": 54.14734305882353,
+          "p50": 54.132338000000004,
+          "p90": 54.15999,
+          "min": 54.107372,
+          "max": 54.547364
+        },
+        "predicted_ms": 37.21556207251115,
+        "relative_error": -0.3126982789888391,
+        "per_forward_diff_ms": -16.931780986312383,
+        "passed": false,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage.",
+          "Valid q=1 requests follow unpadded LMHead rows with source-confirmed speculation disabled; Body tensors retain the separately checked graph padding. State-index and per-request KV values remain unobserved."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        },
+        "primary_population_passed": false
+      },
+      "duration_ms": 0.8103239864250078,
+      "relative_error": 0.07717304764695476,
+      "active_shape": [
+        12,
+        16,
+        1,
+        512
+      ],
+      "padded_shape": [
+        16,
+        16,
+        1,
+        512
+      ],
+      "geometry_metadata": {
+        "contexts": [
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000,
+          126000
+        ],
+        "heads": 16,
+        "kv_splits": 1,
+        "page_size": 128,
+        "dispatch": "source_split_core_v2",
+        "active_sequence_count": 12,
+        "native_query_capacity": 16,
+        "inactive_sequence_kv_length": 0
+      },
+      "program_metadata": {
+        "implementation": "ascend_paged_mla_decode_arch35",
+        "source": {
+          "repository": "cann/ops-transformer",
+          "branch": "arch35 BF16 noquant paged MLA",
+          "kernel": "attention/fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_mla.h",
+          "cube": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_mla.h",
+          "vector": "attention/fused_infer_attention_score/op_kernel/arch35/fia_block_vec_noquant_mla.h",
+          "sha256": {
+            "kernel": "e2de9d747702b384de60e67e62d584dced476e47ace5f68a235af61e018dbbbb",
+            "cube": "c7ecef63fb1754133d8b2588b297cb4621a72a82d3faea6945d10a440ee21574",
+            "vector": "176bd97f6286611570cf99549395a6b23d74ecd212fc9cd5d8d13ebb417b87b8"
+          },
+          "scope": "M64/S2_128/D512/rope64; declared split count; source-compatible not binary identity"
+        },
+        "source_execution_domain": "cube_vector",
+        "query_sequences": 12,
+        "requested_kv_splits": null,
+        "physical_segments": 43,
+        "active_aic_owners": 32,
+        "buffers_per_owner": {
+          "l1": 516096,
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "ub": 241920
+        },
+        "tile_sequence": "C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)",
+        "host_dispatch": "source_split_core_v2",
+        "host_source": {
+          "repository": "cann/ops-transformer",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+          "path": "attention/common/op_host/split_core_v2.cpp",
+          "sha256": "2281771228e15ce82b6881417679a57e0dacc69662f5e51217588041809fc78d",
+          "caller": "attention/fused_infer_attention_score/op_host/arch35/fia_tiling_nonquant_mla.cpp",
+          "caller_lines": "297-309,359-361",
+          "domain": "q1; N2=1; heads<=64; no mask; M64/KV128; fdTolerance=9"
+        },
+        "omitted_mechanisms": [
+          "scalar_page_translation_latency",
+          "cross_core_flag_latency",
+          "vector_instruction_issue_detail",
+          "inner_L0_instruction_issue"
+        ]
+      },
+      "work": {
+        "hbm_bytes": 1745703344
+      },
+      "live_tasks": 0,
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "service_before_input": {}
+    }
+  ]
+}

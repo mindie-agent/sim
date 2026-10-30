@@ -6,6 +6,22 @@ count is explicit; its default is one. Neither observed latency nor a model
 name selects a split. This is a source-compatible phase model, not proof that
 the capture loaded this binary or host tiling result.
 
+For the pinned q1/no-mask host algorithm, select options
+`{"dispatch": "source_split_core_v2"}`. This computes owner segments and FD
+head partitions from current contexts, physical heads and compute-unit count.
+It preserves the source's M64/KV128 tiles and `fdTolerance=9`; integer host
+cost scores choose ownership and never supply elapsed-time or resource rates.
+The planner specializes `SplitCoreV2` at source revision
+`a3925fd49cd256ad478d2faf983bf2961b8ae2c8`. Eighteen retained original-C++
+controls cover uneven contexts, tails, core counts and graph capacities.
+
+Active sequence count and native query storage are distinct. Existing graph
+capture padding supplies native capacity (B6→8 and B12→16 in the six 128K
+source cases). Padded Q/O storage is exported in native tensor views while
+inactive sequences have zero KV length and add no attention tiles. An explicit
+`native_query_capacity` can declare a caller's capacity without increasing
+active contexts. Existing caller head-pad copies keep their full capacity.
+
 The core binds one kernel across independent q=1 requests, BF16 latent512 plus
 rope64, one shared KV head, CP/PCP1 and physical query heads at most64. Each
 request keeps its own context. Its actual KV tiles are partitioned into the
@@ -36,9 +52,9 @@ again. With a generic logical-head prolog it adds only the necessary head
 padding; the leading-head NBSD output slice is a view. Logical value expansion
 and shared KV capacity do not expand to physical query head count.
 
-Known limits remain visible in the program metadata: native `SplitCore`/FD
-owner metadata is not reconstructed; equal tile splits and round-robin owner
-placement are declared policy. Inner L0 instruction scheduling, cross-core flag latency, page-translation latency and detailed
+Known limits remain visible in the program metadata: without a `dispatch`
+declaration, equal tile splits and round-robin owner placement remain the
+declared policy. Inner L0 instruction scheduling, cross-core flag latency, page-translation latency and detailed
 Vector instruction issue are not reconstructed. Matrix/softmax stages retain
 their actual physical services and finite queues without an empirical floor.
 
@@ -221,3 +237,26 @@ an assertion of body accuracy. They retain the preceding source scenario's
 communication, matrix and KDA declarations. A subsequent TP/communication
 change must use a different runtime identity. The full compact receipt and
 60-second subprocess producer are `kimi-paged-mla-body-20261030*`.
+
+## Source SplitCoreV2 128K control
+
+The six current cases in `examples/cases/kimi-a5-paged-host-20261030/` bind the
+geometry planner explicitly. Their MLA core errors at B1/2/4/6/8/12 are
+−12.38%, −0.96%, +3.50%, +5.69%, +6.23% and +7.72% against the retained native
+means. These are source-compatible controls with unobserved binary identity;
+they do not establish whole-Body accuracy or a trained heldout model.
+
+The complete 93-layer B1 Body finishes in 21.02 seconds at 102.0 MB peak RSS,
+predicting 27.01558 ms against 32.48482 ms native mean (−16.84%, fails 15%).
+B12 reaches the unchanged 90-second execution budget at 102.7 MB peak RSS and
+remains failed; no complete prediction is reported. The other four complete
+Body geometries were not rerun in this control. Both successful primitive and
+failed complete-Body outcomes are retained under
+`data/verification/kimi-a5-paged-host-20261030/`.
+
+Reproduce with the adjacent `.producer.py` using `prepare`, `core`, or
+`body --batch 1` / `body --batch 12`. Core comparison requires the retained
+native-family ledger via `--native-ledger`; Body execution needs only the
+committed input cases. The compiler oracle is `tools/paged_mla_host_v2_oracle.cpp`
+linked against the pinned original `split_core_v2.cpp` and header. Its recorded
+portability adaptation only specifies `std::max<uint64_t>` explicitly.

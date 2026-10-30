@@ -1,0 +1,63 @@
+{
+  "source_case": {
+    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-kimi93-tp8-longctx-source.json",
+    "sha256": "bdd033d8ea89594f5d8197d9985fbe265da2e719fa80aafecf9f18dbc74bc909"
+  },
+  "cases": [
+    {
+      "batch": 1,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c1.json",
+      "sha256": "5d79df813c037cab0b2cbaf12c274c15b5f486c9718c3d050707cfe4d5cf36b4",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    },
+    {
+      "batch": 2,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c2.json",
+      "sha256": "93292d63eb3382d9149d17c6ea0d656974da177b9d9bab8acd49142978f68477",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    },
+    {
+      "batch": 4,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c4.json",
+      "sha256": "27b706860538775aa7a647b5c577242d2b9bae2fd3b5ec179ccd4fe450b584e9",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    },
+    {
+      "batch": 6,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c6.json",
+      "sha256": "7458505b0442335b8a2b287efb60aaae20c77ff1d78928d9f56f0e720e92f847",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    },
+    {
+      "batch": 8,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c8.json",
+      "sha256": "ee9783668da792fe94747fbe284c447a2d3e73b16ed03af874f59b331caf5d67",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    },
+    {
+      "batch": 12,
+      "case": "examples/cases/kimi-a5-paged-host-20261030/c12.json",
+      "sha256": "9f0f55a0c22e357e933c0e55919a87c99f19f5653329672a47e2243fbb72fe53",
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 126000
+    }
+  ],
+  "training": "none; source ownership and existing declared physical services"
+}

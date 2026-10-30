@@ -1,0 +1,30 @@
+{
+  "case": {
+    "path": "examples/cases/kimi-a5-paged-host-20261030/c12.json",
+    "sha256": "9f0f55a0c22e357e933c0e55919a87c99f19f5653329672a47e2243fbb72fe53"
+  },
+  "runtime_revision": "174f59faa58e4788cf84c5bdab559acb95fb5a9d",
+  "runtime_files_sha256": {
+    "family_paged_mla.py": "68d06508e6493d7d256257def8a10293593c25664621626df71b599720209576",
+    "paged_mla.py": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+    "paged_mla_host_v2.py": "affa7d07004e09a98624dfa829df3070d61ae265516723af3bf7501690112987",
+    "paged_mla_dispatch.py": "21d0256a2a9dce591fe5dbd3105b499f517edf79a1880107e7bf9de6ddb61b30",
+    "engine.py": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+    "program.py": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097"
+  },
+  "geometry": {
+    "scope": "body",
+    "phase": "decode",
+    "tokens": 1,
+    "context": 126000,
+    "sequences": 12
+  },
+  "status": "failed",
+  "budget_seconds": 90,
+  "budget_rss_bytes": 536870912,
+  "error_type": "TimeoutError",
+  "error": "complete_body_90s_budget_exhausted",
+  "wall_seconds": 90.02135583292693,
+  "cpu_seconds": 86.258902,
+  "peak_rss_bytes": 102711296
+}

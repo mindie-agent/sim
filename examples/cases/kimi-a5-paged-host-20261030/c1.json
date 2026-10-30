@@ -1,0 +1,932 @@
+{
+  "name": "Kimi A5 TP8 q1 128K B1 source paged MLA",
+  "model": {
+    "name": "kimi-k3-e16-bf16-source-128k",
+    "hf_config": {
+      "architectures": [
+        "KimiK3ForConditionalGeneration"
+      ],
+      "auto_map": {
+        "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+        "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+        "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+      },
+      "bos_token_id": 163584,
+      "dtype": "bfloat16",
+      "eos_token_id": 163586,
+      "ignore_index": -100,
+      "image_placeholder": "<|kimi_image_placeholder|>",
+      "media_placeholder_token_id": 163605,
+      "model_type": "kimi_k3",
+      "pad_token_id": 163839,
+      "text_config": {
+        "_name_or_path": "",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "add_cross_attention": false,
+        "architectures": [
+          "KimiLinearForCausalLM"
+        ],
+        "attn_res_block_size": 12,
+        "auto_map": {
+          "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+          "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+          "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+        },
+        "bad_words_ids": null,
+        "begin_suppress_tokens": null,
+        "bos_token_id": 163584,
+        "chunk_size_feed_forward": 0,
+        "cross_attention_hidden_size": null,
+        "decoder_start_token_id": null,
+        "diversity_penalty": 0,
+        "do_sample": false,
+        "dtype": "bfloat16",
+        "early_stopping": false,
+        "encoder_no_repeat_ngram_size": 0,
+        "eos_token_id": 163586,
+        "exponential_decay_length_penalty": null,
+        "finetuning_task": null,
+        "first_k_dense_replace": 1,
+        "forced_bos_token_id": null,
+        "forced_eos_token_id": null,
+        "hidden_act": "situ",
+        "hidden_size": 7168,
+        "id2label": {
+          "0": "LABEL_0",
+          "1": "LABEL_1"
+        },
+        "initializer_range": 0.02,
+        "intermediate_size": 33792,
+        "is_decoder": false,
+        "is_encoder_decoder": false,
+        "kv_lora_rank": 512,
+        "label2id": {
+          "LABEL_0": 0,
+          "LABEL_1": 1
+        },
+        "latent_moe_use_norm": true,
+        "length_penalty": 1,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            36,
+            40,
+            44,
+            48,
+            52,
+            56,
+            60,
+            64,
+            68,
+            72,
+            76,
+            80,
+            84,
+            88,
+            92,
+            93
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            19,
+            21,
+            22,
+            23,
+            25,
+            26,
+            27,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            37,
+            38,
+            39,
+            41,
+            42,
+            43,
+            45,
+            46,
+            47,
+            49,
+            50,
+            51,
+            53,
+            54,
+            55,
+            57,
+            58,
+            59,
+            61,
+            62,
+            63,
+            65,
+            66,
+            67,
+            69,
+            70,
+            71,
+            73,
+            74,
+            75,
+            77,
+            78,
+            79,
+            81,
+            82,
+            83,
+            85,
+            86,
+            87,
+            89,
+            90,
+            91
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "max_length": 20,
+        "max_position_embeddings": 1048576,
+        "min_length": 0,
+        "mla_use_nope": true,
+        "mla_use_output_gate": true,
+        "model_type": "kimi_linear",
+        "moe_intermediate_size": 3072,
+        "moe_layer_freq": 1,
+        "moe_renormalize": true,
+        "moe_router_activation_func": "sigmoid",
+        "no_repeat_ngram_size": 0,
+        "num_attention_heads": 96,
+        "num_beam_groups": 1,
+        "num_beams": 1,
+        "num_expert_group": 1,
+        "num_experts": 16,
+        "num_experts_per_token": 8,
+        "num_hidden_layers": 93,
+        "num_key_value_heads": 128,
+        "num_nextn_predict_layers": 0,
+        "num_return_sequences": 1,
+        "num_shared_experts": 2,
+        "output_attentions": false,
+        "output_hidden_states": false,
+        "output_scores": false,
+        "pad_token_id": 163839,
+        "prefix": null,
+        "problem_type": null,
+        "pruned_heads": {},
+        "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "remove_invalid_values": false,
+        "repetition_penalty": 1,
+        "return_dict": true,
+        "return_dict_in_generate": false,
+        "rms_norm_eps": 1e-05,
+        "routed_expert_hidden_size": 3584,
+        "routed_scaling_factor": 1,
+        "sep_token_id": null,
+        "suppress_tokens": null,
+        "task_specific_params": null,
+        "temperature": 1,
+        "tf_legacy_loss": false,
+        "tie_encoder_decoder": false,
+        "tie_word_embeddings": false,
+        "tokenizer_class": null,
+        "top_k": 50,
+        "top_p": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "torchscript": false,
+        "transformers_version": "4.56.2",
+        "typical_p": 1,
+        "use_bfloat16": false,
+        "use_cache": true,
+        "use_grouped_topk": true,
+        "v_head_dim": 128,
+        "vocab_size": 163840
+      },
+      "tie_word_embeddings": false,
+      "vision_config": {
+        "_attn_implementation": "flash_attention_2",
+        "activation_func": "gelu_pytorch_tanh",
+        "attn_bias": false,
+        "init_pos_emb_height": 64,
+        "init_pos_emb_time": 4,
+        "init_pos_emb_width": 64,
+        "linear_bias": false,
+        "merge_kernel_size": [
+          2,
+          2
+        ],
+        "merge_type": "sd2_tpool",
+        "mlp_type": "mlp2",
+        "mm_hidden_size": 1024,
+        "mm_projector_type": "patchmergerv2",
+        "norm_type": "rmsnorm",
+        "patch_embed_proj_bias": false,
+        "patch_size": 14,
+        "pos_emb_interpolation_mode": "bilinear",
+        "pos_emb_type": "divided_fixed",
+        "projector_hidden_act": "gelu",
+        "projector_ln_eps": 1e-05,
+        "qkv_hidden_size": 1536,
+        "text_hidden_size": 7168,
+        "vt_hidden_size": 1024,
+        "vt_intermediate_size": 4096,
+        "vt_num_attention_heads": 12,
+        "vt_num_hidden_layers": 27
+      }
+    },
+    "quant": {
+      "name": "bf16",
+      "weight_format": "bf16",
+      "native_format": "bf16",
+      "activation_format": "bf16",
+      "expert_weight_format": "bf16",
+      "weight_block": [
+        0,
+        0
+      ],
+      "expert_block": 32,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "conditional_capture_representation",
+        "basis": "sampled operand dtypes plus distinct checkpoint launch declaration",
+        "checkpoint_config_bytes": "not_delivered"
+      },
+      "notes": [
+        "No old checkpoint calibration or FP8 source binding is inherited."
+      ]
+    },
+    "layer_overrides": {
+      "0": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "1": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "2": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "3": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "4": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "5": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "6": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "7": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "8": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "9": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "10": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "11": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "12": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "13": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "14": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "15": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "16": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "17": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "18": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "19": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "20": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "21": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "22": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "23": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "24": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "25": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "26": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "27": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "28": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "29": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "30": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "31": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "32": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "33": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "34": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "35": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "36": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "37": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "38": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "39": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "40": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "41": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "42": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "43": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "44": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "45": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "46": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "47": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "48": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "49": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "50": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "51": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "52": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "53": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "54": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "55": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "56": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "57": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "58": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "59": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "60": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "61": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "62": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "63": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "64": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "65": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "66": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "67": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "68": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "69": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "70": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "71": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "72": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "73": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "74": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "75": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "76": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "77": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "78": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "79": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "80": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "81": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "82": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "83": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "84": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "85": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "86": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "87": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "88": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "89": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "90": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "91": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "92": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      }
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "checkpoint_contract": "bounded_native_topology_and_launch_declaration",
+      "source_metadata": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/kimi-a5-tp8-128k-source-metadata.json",
+        "sha256": "e3876566a409b4e5c626c0822d70e8f39bb1c765fbe9f716cd8291b652af519e",
+        "size_bytes": 519522
+      },
+      "architecture_template_identity": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/cases/decode-a5_kimi_tp8_e16_bf16_c1_p4k.json",
+        "sha256": "5515da6b4a08bc633007a4dac5416905a6c8004de54b6a247508b231803632fe",
+        "size_bytes": 83286
+      },
+      "retained_catalog_assumptions": {
+        "attn_res_block_size": 12,
+        "hidden_act": "situ",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "latent_moe_use_norm": true,
+        "rms_norm_eps": 1e-05,
+        "v_head_dim": 128,
+        "vocab_size": 163840,
+        "moe_router_activation_func": "sigmoid",
+        "routed_scaling_factor": 1,
+        "mla_use_output_gate": true,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            36,
+            40,
+            44,
+            48,
+            52,
+            56,
+            60,
+            64,
+            68,
+            72,
+            76,
+            80,
+            84,
+            88,
+            92,
+            93
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            19,
+            21,
+            22,
+            23,
+            25,
+            26,
+            27,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            37,
+            38,
+            39,
+            41,
+            42,
+            43,
+            45,
+            46,
+            47,
+            49,
+            50,
+            51,
+            53,
+            54,
+            55,
+            57,
+            58,
+            59,
+            61,
+            62,
+            63,
+            65,
+            66,
+            67,
+            69,
+            70,
+            71,
+            73,
+            74,
+            75,
+            77,
+            78,
+            79,
+            81,
+            82,
+            83,
+            85,
+            86,
+            87,
+            89,
+            90,
+            91
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "num_shared_experts": 2,
+        "first_k_dense_replace": 1
+      },
+      "logical_physical_heads": {
+        "logical_local": 12,
+        "physical_decode": 16,
+        "basis": "TransposeBatchMatMul and FIA raw descriptors"
+      },
+      "unmodeled_features": [
+        "full native MC2 transport and dynamic expert valid rows not declared by capture"
+      ],
+      "calibration_origin": "not_declared"
+    }
+  },
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 131072,
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_capture_keys": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64
+    ],
+    "kernels": {
+      "sequence_parallel": {
+        "implementation": "vllm_ascend_kimi_sequence_parallel",
+        "enable_expert_parallel": true,
+        "padding": "right_to_tp",
+        "attention_output": "separate_reduce_scatter",
+        "shard_materialization": "view",
+        "shared_expert_layout": "tp_sharded"
+      },
+      "lowerings": {
+        "attention_residual": {
+          "implementation": "vllm_ascend_attn_res_prefix",
+          "options": {
+            "optimize_prefill": false
+          }
+        },
+        "mla_head_padding": "vllm_ascend_mla_head_padding",
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch35",
+          "options": {
+            "use_beta_sigmoid": false
+          }
+        },
+        "causal_conv_update": "ascend_causal_conv1d_update",
+        "paged_mla_attention": {
+          "implementation": "ascend_paged_mla_decode_arch35",
+          "options": {
+            "dispatch": "source_split_core_v2"
+          }
+        }
+      },
+      "families": {
+        "grouped_gemm": {
+          "kind": "ascend_bf16_grouped"
+        }
+      }
+    },
+    "metadata": {
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "draft_proposal_tokens": 0,
+      "source_metadata": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/kimi-a5-tp8-128k-source-metadata.json",
+        "sha256": "e3876566a409b4e5c626c0822d70e8f39bb1c765fbe9f716cd8291b652af519e",
+        "size_bytes": 519522
+      },
+      "routing_basis": "balanced analytic assumption; dynamic counts not exported",
+      "calibration_origin": "not_declared",
+      "removed_prior_parameter_domains": [
+        "service_regimes",
+        "paged_mla_dispatch",
+        "native_moe_protocol_window",
+        "force_eplb_source_global_bs"
+      ],
+      "unresolved_capture_contracts": [
+        "actual per-forward expert count values",
+        "actual per-forward KV lengths"
+      ],
+      "speculation": {
+        "enabled": false,
+        "basis": "same-run serve.log resolved speculative_config=None",
+        "source_line": 51,
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/logs/serve.log",
+          "sha256": "aa926e07c1a7133c41a40336163ee87db57f2a33c8a4767a8532f5a44b0ae5a5",
+          "size_bytes": 1029691
+        }
+      },
+      "paged_mla_source_control": {
+        "source_case_sha256": "bdd033d8ea89594f5d8197d9985fbe265da2e719fa80aafecf9f18dbc74bc909",
+        "scope": "Only the q1 dense MLA source implementation binding changes.",
+        "capture_dispatch": "conditional_source_compatible; binary_revision_unobserved",
+        "source_policy": "SplitCoreV2 M64/KV128, fdTolerance=9; no timing inputs",
+        "native_query_capacity": "existing graph-capture padding; inactive KV length zero"
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "context-placeholder-not-a-measurement",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

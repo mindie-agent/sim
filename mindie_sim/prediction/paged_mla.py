@@ -16,6 +16,7 @@ from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .paged_mla_dispatch import Dispatch
+from . import paged_mla_host_v2
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch35'
 SOURCE = {
@@ -84,19 +85,27 @@ class Spec:
     kv_splits: int
     page_size: int
     dispatch: Dispatch | None = None
+    host_policy: str = 'declared'
 
     @classmethod
-    def parse(cls, op):
+    def parse(cls, op, cores):
         raw = dict(op.metadata)['paged_mla_geometry']
         contexts = tuple(raw['contexts'])
-        result = cls(contexts, raw['heads'], raw['kv_splits'], raw['page_size'],
-                     Dispatch.parse(raw.get('dispatch'),contexts,raw['heads']))
+        result = cls(contexts, raw['heads'], raw['kv_splits'], raw['page_size'])
         if (not result.contexts or any(type(x) is not int or x < 0 for x in result.contexts)
                 or type(result.kv_splits) is not int or result.kv_splits < 1
                 or type(result.heads) is not int or not 1 <= result.heads <= HEAD_TILE
                 or result.page_size < 1 or KEY_TILE % result.page_size):
             raise ModelingError('paged_mla_requires_q1_heads_le64_and_page_divisor_of128')
-        return result
+        dispatch = raw.get('dispatch')
+        policy = paged_mla_host_v2.POLICY if dispatch == paged_mla_host_v2.POLICY else 'declared'
+        if policy == paged_mla_host_v2.POLICY:
+            capacity = raw.get('native_query_capacity', len(contexts))
+            if capacity < len(contexts):
+                raise ModelingError('paged_mla_query_capacity_below_active_sequences')
+            dispatch = paged_mla_host_v2.source_dispatch(contexts, result.heads, cores, capacity)
+        return cls(contexts, result.heads, result.kv_splits, result.page_size,
+                   Dispatch.parse(dispatch, contexts, result.heads), policy)
 
 
 def _ends(spec, segment):
@@ -122,7 +131,7 @@ def merge_work(spec, count, heads=None):
 
 
 def build(op, geometry):
-    spec = Spec.parse(op)
+    spec = Spec.parse(op, geometry.compute_units)
     for pool, needed in BUFFERS.items():
         if geometry.buffers.get(pool, 0) < needed:
             raise ModelingError(f'paged_mla_source_pool_capacity:{pool}:{needed}')
@@ -277,11 +286,15 @@ def _plan(spec, cores):
     return OperatorPlan(total, lower, {
         'implementation': IMPLEMENTATION, 'source': SOURCE,
         'source_execution_domain': 'cube_vector', 'query_sequences': len(spec.contexts),
-        'requested_kv_splits': spec.kv_splits, 'physical_segments': len(jobs),
+        'requested_kv_splits': spec.kv_splits if spec.host_policy == 'declared' else None,
+        'physical_segments': len(jobs),
         'active_aic_owners': len(by_owner), 'buffers_per_owner': BUFFERS,
         'tile_sequence': 'C1(i)_before_C2(i-1); V1(i)_before_V2(i-1)',
-        'host_dispatch': ('explicit_AIC_KV_and_AIV_head_metadata' if spec.dispatch else
+        'host_dispatch': (spec.host_policy if spec.host_policy != 'declared' else
+            'explicit_AIC_KV_and_AIV_head_metadata' if spec.dispatch else
             'explicit_equal_tile_splits_and_round_robin_owners; native_SplitCore_not_reconstructed'),
+        **({'host_source': paged_mla_host_v2.SOURCE}
+           if spec.host_policy == paged_mla_host_v2.POLICY else {}),
         'omitted_mechanisms': ['scalar_page_translation_latency', 'cross_core_flag_latency',
                                'vector_instruction_issue_detail',
                                'inner_L0_instruction_issue'],

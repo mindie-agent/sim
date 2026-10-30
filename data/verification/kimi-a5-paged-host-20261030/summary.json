@@ -1,0 +1,71 @@
+{
+  "schema": "kimi-a5-source-host-acceptance/1",
+  "boundary": "q1 non-speculative Decode, context126000; primitive and complete93-layer Body separate",
+  "accuracy_basis": "conditional source-compatible binary/host dispatch",
+  "training": "none; M64/KV128/fdTolerance9 ownership; no fitted split count",
+  "acceptance": "Primitive errors do not establish whole-Body acceptance; failed runs have no prediction.",
+  "cases": [
+    {
+      "batch": 1,
+      "active_queries": 1,
+      "native_query_capacity": 1,
+      "core_predicted_us": 70.2499868213815,
+      "core_observed_mean_us": 80.17554241071433,
+      "core_relative_error": -0.1237977978182836,
+      "body_status": "completed",
+      "body_wall_seconds": 21.023090375005268,
+      "body_peak_rss_bytes": 102023168,
+      "body_ms": 27.015579896752346,
+      "native_body_mean_ms": 32.484816214285715,
+      "body_relative_error": -0.16836285240019877
+    },
+    {
+      "batch": 2,
+      "active_queries": 2,
+      "native_query_capacity": 2,
+      "core_predicted_us": 140.47781267806948,
+      "core_observed_mean_us": 141.84522666666675,
+      "core_relative_error": -0.009640183323268658,
+      "body_status": "not_run_in_this_control"
+    },
+    {
+      "batch": 4,
+      "active_queries": 4,
+      "native_query_capacity": 4,
+      "core_predicted_us": 272.5624714567791,
+      "core_observed_mean_us": 263.3557703703705,
+      "core_relative_error": 0.03495917736475174,
+      "body_status": "not_run_in_this_control"
+    },
+    {
+      "batch": 6,
+      "active_queries": 6,
+      "native_query_capacity": 8,
+      "core_predicted_us": 406.1354042381895,
+      "core_observed_mean_us": 384.2665019841265,
+      "core_relative_error": 0.05691076932583217,
+      "body_status": "not_run_in_this_control"
+    },
+    {
+      "batch": 8,
+      "active_queries": 8,
+      "native_query_capacity": 8,
+      "core_predicted_us": 540.9197235151657,
+      "core_observed_mean_us": 509.18148124999954,
+      "core_relative_error": 0.062331886437133166,
+      "body_status": "not_run_in_this_control"
+    },
+    {
+      "batch": 12,
+      "active_queries": 12,
+      "native_query_capacity": 16,
+      "core_predicted_us": 810.3239864250078,
+      "core_observed_mean_us": 752.2690882352941,
+      "core_relative_error": 0.07717304764695476,
+      "body_status": "failed",
+      "body_wall_seconds": 90.02135583292693,
+      "body_peak_rss_bytes": 102711296,
+      "error": "complete_body_90s_budget_exhausted"
+    }
+  ]
+}
