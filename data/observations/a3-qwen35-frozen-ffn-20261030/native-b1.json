@@ -1,0 +1,3743 @@
+{
+  "scope": "existing_complete_q4_native_Body_diagnostic_no_fit_no_prediction",
+  "case_id": "a3-qwen35-tp4-decode-c1-p126000",
+  "source_identity": {
+    "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+    "size_bytes": 114505902,
+    "mtime_ns": 1793354317000000000,
+    "schema_version": "kernel_details_csv_46col",
+    "sha256": "c43ca21f5aabc8f4e1a0d9e9aa5476c6bea141ff7b2398bc7736d1fa94ab607a"
+  },
+  "source_hash_verified": true,
+  "extraction_identity": {
+    "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/8fd1580aad3435387624a52c9b2928d7b03ddff24786c2c5c8cf017ccf717df3.json",
+    "sha256": "8fd1580aad3435387624a52c9b2928d7b03ddff24786c2c5c8cf017ccf717df3",
+    "size_bytes": 1451140,
+    "format": "full_scoreboard_json"
+  },
+  "comparison_report_identity": {
+    "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/72571e01c09325831c22edbfa7f7a8b652b0f3c221bd2c105cf0f7c7d08f4f7a.json",
+    "sha256": "72571e01c09325831c22edbfa7f7a8b652b0f3c221bd2c105cf0f7c7d08f4f7a",
+    "size_bytes": 140385,
+    "format": "full_scoreboard_json"
+  },
+  "comparison_runtime": {
+    "package_path": "/Volumes/data/code/mindie-release-20261014/profiler/.venv/lib/python3.13/site-packages/mindie_sim",
+    "version": "0.8.0",
+    "installed_source_commit": "ee3a4d5edb95611528eb832ff4ba930c76129914",
+    "package_sha256": "597551c771e0d65c1baee64963bf9b85780d2a9243234623dc2644df40a9c551",
+    "file_count": 310,
+    "algorithm": "sha256(sorted relative-path to file-sha256 JSON)",
+    "sources_unchanged": true
+  },
+  "geometry": {
+    "query_rows": 4,
+    "sequences_per_replica": 1,
+    "tokens_per_sequence": 4,
+    "context_tokens": null,
+    "batch_basis": "captured_paged_attention_block_table_rows",
+    "context_basis": "not_observed_from_cache_capacity",
+    "output_query_rows": 4
+  },
+  "forwards": 169,
+  "body_observed_ms": {
+    "status": "compared",
+    "metric_boundary": "target_body_device_graph",
+    "reasons": [],
+    "observed_forward_count": 169,
+    "observed_ms": {
+      "count": 169,
+      "mean": 17.50544356213018,
+      "p50": 17.528001,
+      "p90": 17.655766,
+      "min": 17.197288,
+      "max": 17.823972
+    },
+    "predicted_ms": 9.582281347681779,
+    "relative_error": -0.4526113369437099,
+    "per_forward_diff_ms": -7.9231622144484,
+    "passed": false,
+    "tolerance": {
+      "kind": "relative",
+      "limit": 0.15,
+      "scope": "whole_body_forward_not_single_kernel_launch"
+    },
+    "comparison_scope": {},
+    "comparison_basis": "conditional_single_rank_topology_alignment",
+    "assumptions": [
+      "Context basis: retained_request_prompt_usage; active KV increments during this capture are not established.",
+      "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+      "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+    ],
+    "endpoints": {
+      "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+      "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+      "input_ready_to_first_kernel_ms": 0,
+      "kernel_startup_included": true
+    },
+    "primary_population_passed": false
+  },
+  "native_activity": {
+    "count": 169,
+    "mean": 16.895238142011834,
+    "p50": 16.913974,
+    "p90": 17.047332,
+    "min": 16.587149,
+    "max": 17.210185
+  },
+  "native_internal_gap": {
+    "count": 169,
+    "mean": 0.6102054201183432,
+    "p50": 0.610091,
+    "p90": 0.61547,
+    "min": 0.599543,
+    "max": 0.630128
+  },
+  "scan_counts": {
+    "rows_scanned": 363520,
+    "selected_events": 270231,
+    "scheduler_wrappers_excluded": 13520
+  },
+  "native_counts_per_body": {
+    "Abs": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "Add": {
+      "min": 99,
+      "max": 99,
+      "total": 16731
+    },
+    "AddRmsNormBias": {
+      "min": 79,
+      "max": 79,
+      "total": 13351
+    },
+    "Cast": {
+      "min": 80,
+      "max": 80,
+      "total": 13520
+    },
+    "CausalConv1d": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "ConcatD": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "Cumsum": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "DynamicQuant": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "ForeachAddList": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "FusedInferAttentionScore": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "GemmaRmsNorm": {
+      "min": 1,
+      "max": 1,
+      "total": 169
+    },
+    "GroupedMatmul": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "GroupedMatmulSwigluQuant": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "Index": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "IndexCheck": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "MatMulV2": {
+      "min": 260,
+      "max": 260,
+      "total": 43940
+    },
+    "MoeGatingTopK": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "MoeInitRoutingV3": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "MoeTokenUnpermute": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "Mul": {
+      "min": 50,
+      "max": 50,
+      "total": 8450
+    },
+    "QuantBatchMatmulV3": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "RecurrentGatedDeltaRule": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "ScatterPaKvCache": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    },
+    "Sigmoid": {
+      "min": 50,
+      "max": 50,
+      "total": 8450
+    },
+    "Slice": {
+      "min": 230,
+      "max": 230,
+      "total": 38870
+    },
+    "SwiGlu": {
+      "min": 40,
+      "max": 40,
+      "total": 6760
+    },
+    "ZerosLike": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "_layer_norm_fwd_1pass_kernel_npu": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "fused_gdn_gating_kernel": {
+      "min": 30,
+      "max": 30,
+      "total": 5070
+    },
+    "hcom_allReduce_": {
+      "min": 80,
+      "max": 80,
+      "total": 13520
+    },
+    "l2norm_fwd_kernel2": {
+      "min": 60,
+      "max": 60,
+      "total": 10140
+    },
+    "split_qkv_rmsnorm_mrope_kernel": {
+      "min": 10,
+      "max": 10,
+      "total": 1690
+    }
+  },
+  "native_groups": [
+    {
+      "abi": {
+        "Type": "GroupedMatmul",
+        "Accelerator Core": "MIX_AIC",
+        "Input Shapes": "\"32,128;256,128,2048;;256,2048;;;;256;32\"",
+        "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+        "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"32,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "20",
+        "Mix Block Num": "20"
+      },
+      "count": 6760,
+      "sum_ns": 352461488,
+      "min_ns": 47422,
+      "max_ns": 58103,
+      "locators": [
+        {
+          "csv_line": 152,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144159551,
+          "end_ns": 1793354213144216174,
+          "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+          "Task ID": "36",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 195,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144617470,
+          "end_ns": 1793354213144671952,
+          "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+          "Task ID": "87",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 52.13927337278106,
+      "activity_per_body_ms": 2.085570934911243,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "GroupedMatmulSwigluQuant",
+        "Accelerator Core": "MIX_AIC",
+        "Input Shapes": "\"32,2048;256,8,128,16,32;256,256;32;256\"",
+        "Input Data Types": "INT8;INT8;FLOAT;FLOAT;INT64",
+        "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND",
+        "Output Shapes": "\"32,128;32\"",
+        "Output Data Types": "INT8;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40"
+      },
+      "count": 6760,
+      "sum_ns": 330130105,
+      "min_ns": 43282,
+      "max_ns": 64482,
+      "locators": [
+        {
+          "csv_line": 151,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144110849,
+          "end_ns": 1793354213144156971,
+          "Name": "aclnnGroupedMatmulSwigluQuantWeightNZ_GroupedMatmulSwigluQuant_GroupedMatmulSwigluQuant",
+          "Task ID": "34",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 193,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144569348,
+          "end_ns": 1793354213144614530,
+          "Name": "aclnnGroupedMatmulSwigluQuantWeightNZ_GroupedMatmulSwigluQuant_GroupedMatmulSwigluQuant",
+          "Task ID": "85",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 48.835814349112425,
+      "activity_per_body_ms": 1.953432573964497,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Cumsum",
+        "Accelerator Core": "AI_CPU",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "0",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 318537625,
+      "min_ns": 26161,
+      "max_ns": 99824,
+      "locators": [
+        {
+          "csv_line": 149,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144059627,
+          "end_ns": 1793354213144109569,
+          "Name": "Cumsum",
+          "Task ID": "33",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 192,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144490645,
+          "end_ns": 1793354213144568268,
+          "Name": "Cumsum",
+          "Task ID": "84",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 47.12095044378698,
+      "activity_per_body_ms": 1.8848380177514792,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "FusedInferAttentionScore",
+        "Accelerator Core": "MIX_AIC",
+        "Input Shapes": "\"4,4,256;32465,128,256;32465,128,256;2048,2048;1;1;1,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"4,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40"
+      },
+      "count": 1690,
+      "sum_ns": 270358727,
+      "min_ns": 150986,
+      "max_ns": 176647,
+      "locators": [
+        {
+          "csv_line": 264,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145234874,
+          "end_ns": 1793354213145393321,
+          "Name": "aclnnFusedInferAttentionScoreV3_FusedInferAttentionScore_FusedInferAttentionScore",
+          "Task ID": "174",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 436,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213147007925,
+          "end_ns": 1793354213147173732,
+          "Name": "aclnnFusedInferAttentionScoreV3_FusedInferAttentionScore_FusedInferAttentionScore",
+          "Task ID": "381",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 159.9755781065089,
+      "activity_per_body_ms": 1.5997557810650886,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "hcom_allReduce_",
+        "Accelerator Core": "COMMUNICATION",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "0",
+        "Mix Block Num": "N/A"
+      },
+      "count": 13520,
+      "sum_ns": 188315379,
+      "min_ns": 9060,
+      "max_ns": 264670,
+      "locators": [
+        {
+          "csv_line": 142,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144008945,
+          "end_ns": 1793354213144018906,
+          "Name": "hcom_allReduce__503_1_1",
+          "Task ID": "N/A",
+          "Stream ID": "N/A",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 163,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144274836,
+          "end_ns": 1793354213144315838,
+          "Name": "hcom_allReduce__503_2_1",
+          "Task ID": "N/A",
+          "Stream ID": "N/A",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 13.92865229289941,
+      "activity_per_body_ms": 1.1142921834319528,
+      "calls_per_body": 80.0
+    },
+    {
+      "abi": {
+        "Type": "RecurrentGatedDeltaRule",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,4,128;4,4,128;4,8,128;4,8;6493,8,128,128;2;4;4,8;1\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"4,8,128;6493,8,128,128\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "8",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 124716969,
+      "min_ns": 23541,
+      "max_ns": 26741,
+      "locators": [
+        {
+          "csv_line": 138,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143963684,
+          "end_ns": 1793354213143988865,
+          "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "Task ID": "15",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 181,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144394501,
+          "end_ns": 1793354213144418382,
+          "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "Task ID": "66",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 24.59900769230769,
+      "activity_per_body_ms": 0.7379702307692307,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "MoeInitRoutingV3",
+        "Accelerator Core": "MIX_AIV",
+        "Input Shapes": "\"4,2048;4,8\"",
+        "Input Data Types": "DT_BF16;INT32",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"32,2048;32;256;32\"",
+        "Output Data Types": "INT8;INT32;INT64;FLOAT",
+        "Output Formats": "ND;ND;ND;ND",
+        "Block Num": "40",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 108775749,
+      "min_ns": 14041,
+      "max_ns": 18881,
+      "locators": [
+        {
+          "csv_line": 148,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144043267,
+          "end_ns": 1793354213144058647,
+          "Name": "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3",
+          "Task ID": "32",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 191,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144474304,
+          "end_ns": 1793354213144489905,
+          "Name": "aclnnMoeInitRoutingV3_MoeInitRoutingV3_MoeInitRoutingV3",
+          "Task ID": "83",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 16.091087130177517,
+      "activity_per_body_ms": 0.6436434852071007,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "ForeachAddList",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048;4,2048;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;FLOAT",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "40",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 107980922,
+      "min_ns": 13860,
+      "max_ns": 21141,
+      "locators": [
+        {
+          "csv_line": 162,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144259075,
+          "end_ns": 1793354213144274296,
+          "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+          "Task ID": "47",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 205,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144716594,
+          "end_ns": 1793354213144731194,
+          "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+          "Task ID": "98",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 15.973509171597632,
+      "activity_per_body_ms": 0.6389403668639053,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,2048;3072,2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,3072\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "20",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 89982750,
+      "min_ns": 14980,
+      "max_ns": 20081,
+      "locators": [
+        {
+          "csv_line": 123,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143887760,
+          "end_ns": 1793354213143904441,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "1",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 167,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144321418,
+          "end_ns": 1793354213144337138,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "52",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 17.748076923076923,
+      "activity_per_body_ms": 0.5324423076923077,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,1024;2048,1024\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "19",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 72746721,
+      "min_ns": 10020,
+      "max_ns": 12180,
+      "locators": [
+        {
+          "csv_line": 141,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143997545,
+          "end_ns": 1793354213144008325,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "21",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 184,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144427082,
+          "end_ns": 1793354213144437862,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "72",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 10.76134926035503,
+      "activity_per_body_ms": 0.4304539704142012,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "ConcatD",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"2048;2048;4096\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"8192\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "40",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 69636257,
+      "min_ns": 11941,
+      "max_ns": 15160,
+      "locators": [
+        {
+          "csv_line": 134,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143937022,
+          "end_ns": 1793354213143949883,
+          "Name": "aclnnCat_ConcatD_ConcatD",
+          "Task ID": "11",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 177,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144367560,
+          "end_ns": 1793354213144381400,
+          "Name": "aclnnCat_ConcatD_ConcatD",
+          "Task ID": "62",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 13.734961932938855,
+      "activity_per_body_ms": 0.4120488579881657,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "Mul",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,1;4,2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "32",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 69140777,
+      "min_ns": 7880,
+      "max_ns": 13141,
+      "locators": [
+        {
+          "csv_line": 161,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144250855,
+          "end_ns": 1793354213144259055,
+          "Name": "aclnnMul_MulAiCore_Mul",
+          "Task ID": "46",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 204,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144706233,
+          "end_ns": 1793354213144716574,
+          "Name": "aclnnMul_MulAiCore_Mul",
+          "Task ID": "97",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 10.227925591715977,
+      "activity_per_body_ms": 0.40911702366863906,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,2048;256,2048\"",
+        "Input Data Types": "FLOAT;FLOAT",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,256\"",
+        "Output Data Types": "FLOAT",
+        "Output Formats": "ND",
+        "Block Num": "16",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 65675423,
+      "min_ns": 7640,
+      "max_ns": 11341,
+      "locators": [
+        {
+          "csv_line": 146,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144027546,
+          "end_ns": 1793354213144035986,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "28",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 189,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144458163,
+          "end_ns": 1793354213144467704,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "79",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 9.71529926035503,
+      "activity_per_body_ms": 0.3886119704142012,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,128;2048,128\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "19",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 56335120,
+      "min_ns": 6740,
+      "max_ns": 9861,
+      "locators": [
+        {
+          "csv_line": 158,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144235814,
+          "end_ns": 1793354213144243295,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "43",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 201,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144689793,
+          "end_ns": 1793354213144698453,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "94",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 8.333597633136094,
+      "activity_per_body_ms": 0.3333439053254438,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "fused_gdn_gating_kernel",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "40",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 48648344,
+      "min_ns": 8940,
+      "max_ns": 15301,
+      "locators": [
+        {
+          "csv_line": 135,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143949903,
+          "end_ns": 1793354213143959603,
+          "Name": "fused_gdn_gating_kernel",
+          "Task ID": "12",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 178,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144381420,
+          "end_ns": 1793354213144390501,
+          "Name": "fused_gdn_gating_kernel",
+          "Task ID": "63",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 9.595334122287968,
+      "activity_per_body_ms": 0.28786002366863905,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,2048;256,2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,256\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "16",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 48339497,
+      "min_ns": 6280,
+      "max_ns": 8261,
+      "locators": [
+        {
+          "csv_line": 156,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144224694,
+          "end_ns": 1793354213144231254,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "41",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 199,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144679552,
+          "end_ns": 1793354213144686552,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "92",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 7.150813165680473,
+      "activity_per_body_ms": 0.28603252662721895,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,2048;1,2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,1\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 43395876,
+      "min_ns": 5780,
+      "max_ns": 7361,
+      "locators": [
+        {
+          "csv_line": 159,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144243315,
+          "end_ns": 1793354213144249355,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "44",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 202,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144698473,
+          "end_ns": 1793354213144704913,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "95",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 6.419508284023668,
+      "activity_per_body_ms": 0.25678033136094675,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "CausalConv1d",
+        "Accelerator Core": "MIX_AIV",
+        "Input Shapes": "\"4,2048;4,2048;;6493,6,2048;2;1;;1;;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_UNDEFINED;DT_BF16;INT32;INT32;DT_UNDEFINED;INT32;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+        "Input Formats": "ND;ND;NULL;ND;ND;ND;NULL;ND;NULL;NULL;NULL;NULL",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 41871934,
+      "min_ns": 7540,
+      "max_ns": 9961,
+      "locators": [
+        {
+          "csv_line": 130,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143921602,
+          "end_ns": 1793354213143930402,
+          "Name": "CausalConv1d",
+          "Task ID": "7",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 173,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144352579,
+          "end_ns": 1793354213144360439,
+          "Name": "CausalConv1d",
+          "Task ID": "58",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 8.258764102564102,
+      "activity_per_body_ms": 0.24776292307692308,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "AddRmsNormBias",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048;4,2048;2048;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_UNDEFINED",
+        "Input Formats": "ND;ND;ND;NULL",
+        "Output Shapes": "\"4,2048;4,1;4,2048\"",
+        "Output Data Types": "DT_BF16;FLOAT;DT_BF16",
+        "Output Formats": "ND;ND;ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 13351,
+      "sum_ns": 38603144,
+      "min_ns": 2560,
+      "max_ns": 3920,
+      "locators": [
+        {
+          "csv_line": 144,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144021666,
+          "end_ns": 1793354213144024566,
+          "Name": "AddRmsNormBias",
+          "Task ID": "25",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 165,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144318478,
+          "end_ns": 1793354213144321398,
+          "Name": "AddRmsNormBias",
+          "Task ID": "51",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.891404688787357,
+      "activity_per_body_ms": 0.22842097041420117,
+      "calls_per_body": 79.0
+    },
+    {
+      "abi": {
+        "Type": "MoeGatingTopK",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,256;\"",
+        "Input Data Types": "FLOAT;DT_UNDEFINED",
+        "Input Formats": "ND;NULL",
+        "Output Shapes": "\"4,8;4,8;4,256\"",
+        "Output Data Types": "FLOAT;INT32;FLOAT",
+        "Output Formats": "ND;ND;ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 36349036,
+      "min_ns": 4920,
+      "max_ns": 6541,
+      "locators": [
+        {
+          "csv_line": 147,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144036046,
+          "end_ns": 1793354213144041907,
+          "Name": "MoeGatingTopK",
+          "Task ID": "30",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 190,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144467784,
+          "end_ns": 1793354213144472884,
+          "Name": "MoeGatingTopK",
+          "Task ID": "81",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 5.377076331360946,
+      "activity_per_body_ms": 0.21508305325443786,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "MatMulV2",
+        "Accelerator Core": "AI_CORE",
+        "Input Shapes": "\"4,2048;16,2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,16\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 33684570,
+      "min_ns": 6241,
+      "max_ns": 7900,
+      "locators": [
+        {
+          "csv_line": 125,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143904461,
+          "end_ns": 1793354213143911941,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "2",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 168,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144337158,
+          "end_ns": 1793354213144343519,
+          "Name": "aclnnMatmul_MatMulCommon_MatMulV2",
+          "Task ID": "53",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 6.643899408284024,
+      "activity_per_body_ms": 0.1993169822485207,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "MoeTokenUnpermute",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"32,2048;32;4,8\"",
+        "Input Data Types": "DT_BF16;INT32;DT_BF16",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 28843421,
+      "min_ns": 3800,
+      "max_ns": 5340,
+      "locators": [
+        {
+          "csv_line": 155,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144220114,
+          "end_ns": 1793354213144224674,
+          "Name": "MoeTokenUnpermute",
+          "Task ID": "40",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 198,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144675492,
+          "end_ns": 1793354213144679512,
+          "Name": "MoeTokenUnpermute",
+          "Task ID": "91",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 4.266778254437869,
+      "activity_per_body_ms": 0.1706711301775148,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "QuantBatchMatmulV3",
+        "Accelerator Core": "MIX_AIC",
+        "Input Shapes": "\"4,2048;80,128,16,32;2560;4\"",
+        "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+        "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+        "Output Shapes": "\"4,2560\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "20",
+        "Mix Block Num": "20"
+      },
+      "count": 1690,
+      "sum_ns": 28280865,
+      "min_ns": 15241,
+      "max_ns": 19101,
+      "locators": [
+        {
+          "csv_line": 254,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145185052,
+          "end_ns": 1793354213145201473,
+          "Name": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+          "Task ID": "155",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 427,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213146956903,
+          "end_ns": 1793354213146974264,
+          "Name": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+          "Task ID": "362",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 16.734239644970415,
+      "activity_per_body_ms": 0.16734239644970414,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "_layer_norm_fwd_1pass_kernel_npu",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 24636529,
+      "min_ns": 4520,
+      "max_ns": 5540,
+      "locators": [
+        {
+          "csv_line": 140,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143992545,
+          "end_ns": 1793354213143997525,
+          "Name": "_layer_norm_fwd_1pass_kernel_npu",
+          "Task ID": "20",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 183,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144422142,
+          "end_ns": 1793354213144427062,
+          "Name": "_layer_norm_fwd_1pass_kernel_npu",
+          "Task ID": "71",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 4.85927593688363,
+      "activity_per_body_ms": 0.14577827810650887,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "SwiGlu",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,256\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,128\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 24147876,
+      "min_ns": 3080,
+      "max_ns": 4780,
+      "locators": [
+        {
+          "csv_line": 157,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144231274,
+          "end_ns": 1793354213144235794,
+          "Name": "SwiGlu",
+          "Task ID": "42",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 200,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144686592,
+          "end_ns": 1793354213144689773,
+          "Name": "SwiGlu",
+          "Task ID": "93",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 3.5721710059171596,
+      "activity_per_body_ms": 0.1428868402366864,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Add",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"2048;\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "2",
+        "Mix Block Num": "0"
+      },
+      "count": 13351,
+      "sum_ns": 23657086,
+      "min_ns": 1500,
+      "max_ns": 2620,
+      "locators": [
+        {
+          "csv_line": 143,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144019566,
+          "end_ns": 1793354213144021646,
+          "Name": "aclnnAdds_AddAiCore_Add",
+          "Task ID": "24",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 164,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144316838,
+          "end_ns": 1793354213144318458,
+          "Name": "aclnnAdds_AddAiCore_Add",
+          "Task ID": "50",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.771933637929743,
+      "activity_per_body_ms": 0.13998275739644972,
+      "calls_per_body": 79.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,16;2;2\"",
+        "Input Data Types": "DT_BF16;INT64;INT64",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,8\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 10140,
+      "sum_ns": 21190960,
+      "min_ns": 1880,
+      "max_ns": 2600,
+      "locators": [
+        {
+          "csv_line": 126,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143911961,
+          "end_ns": 1793354213143914062,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "3",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 127,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143914082,
+          "end_ns": 1793354213143916022,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "4",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.089838264299803,
+      "activity_per_body_ms": 0.12539029585798817,
+      "calls_per_body": 60.0
+    },
+    {
+      "abi": {
+        "Type": "l2norm_fwd_kernel2",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 10140,
+      "sum_ns": 19848606,
+      "min_ns": 1760,
+      "max_ns": 2620,
+      "locators": [
+        {
+          "csv_line": 136,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143959643,
+          "end_ns": 1793354213143961743,
+          "Name": "l2norm_fwd_kernel2",
+          "Task ID": "13",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 137,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143961763,
+          "end_ns": 1793354213143963664,
+          "Name": "l2norm_fwd_kernel2",
+          "Task ID": "14",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.9574562130177515,
+      "activity_per_body_ms": 0.1174473727810651,
+      "calls_per_body": 60.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048;2;2\"",
+        "Input Data Types": "DT_BF16;INT64;INT64",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,512\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 10140,
+      "sum_ns": 19096433,
+      "min_ns": 1680,
+      "max_ns": 2440,
+      "locators": [
+        {
+          "csv_line": 131,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143931262,
+          "end_ns": 1793354213143933242,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "8",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 132,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143933282,
+          "end_ns": 1793354213143935082,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "9",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.88327741617357,
+      "activity_per_body_ms": 0.1129966449704142,
+      "calls_per_body": 60.0
+    },
+    {
+      "abi": {
+        "Type": "Cast",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "FLOAT",
+        "Output Formats": "ND",
+        "Block Num": "8",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 16831155,
+      "min_ns": 2240,
+      "max_ns": 3180,
+      "locators": [
+        {
+          "csv_line": 145,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144024586,
+          "end_ns": 1793354213144027466,
+          "Name": "aclnnInplaceCopy_CastAiCore_Cast",
+          "Task ID": "26",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 188,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144455763,
+          "end_ns": 1793354213144458083,
+          "Name": "aclnnInplaceCopy_CastAiCore_Cast",
+          "Task ID": "77",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.4898158284023673,
+      "activity_per_body_ms": 0.09959263313609468,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Index",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1048576,64;1;3;3,4\"",
+        "Input Data Types": "DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "ND;ND;ND;ND",
+        "Output Shapes": "\"3,4,64\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "40",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 15227519,
+      "min_ns": 7340,
+      "max_ns": 15980,
+      "locators": [
+        {
+          "csv_line": 258,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145211713,
+          "end_ns": 1793354213145219294,
+          "Name": "aclnnIndex_IndexAiCore_Index",
+          "Task ID": "159",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 431,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213146984764,
+          "end_ns": 1793354213146992665,
+          "Name": "aclnnIndex_IndexAiCore_Index",
+          "Task ID": "366",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 9.01036627218935,
+      "activity_per_body_ms": 0.09010366272189349,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "split_qkv_rmsnorm_mrope_kernel",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "N/A",
+        "Input Data Types": "N/A",
+        "Input Formats": "N/A",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 11547848,
+      "min_ns": 5440,
+      "max_ns": 7860,
+      "locators": [
+        {
+          "csv_line": 262,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145222454,
+          "end_ns": 1793354213145229474,
+          "Name": "split_qkv_rmsnorm_mrope_kernel",
+          "Task ID": "162",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 434,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213146995745,
+          "end_ns": 1793354213147002405,
+          "Name": "split_qkv_rmsnorm_mrope_kernel",
+          "Task ID": "369",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 6.833046153846154,
+      "activity_per_body_ms": 0.06833046153846153,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,3072;2;2\"",
+        "Input Data Types": "DT_BF16;INT64;INT64",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,2048\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 9720715,
+      "min_ns": 1640,
+      "max_ns": 2540,
+      "locators": [
+        {
+          "csv_line": 129,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143918042,
+          "end_ns": 1793354213143920362,
+          "Name": "aclnnContiguous_SliceAiCore_Slice",
+          "Task ID": "6",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 172,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144349539,
+          "end_ns": 1793354213144351459,
+          "Name": "aclnnContiguous_SliceAiCore_Slice",
+          "Task ID": "57",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.9173007889546352,
+      "activity_per_body_ms": 0.057519023668639056,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048;2;2\"",
+        "Input Data Types": "DT_BF16;INT64;INT64",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"4,1024\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 9609523,
+      "min_ns": 1700,
+      "max_ns": 2500,
+      "locators": [
+        {
+          "csv_line": 133,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143935102,
+          "end_ns": 1793354213143937002,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "10",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 176,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144365520,
+          "end_ns": 1793354213144367520,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "61",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.8953694280078897,
+      "activity_per_body_ms": 0.05686108284023669,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,24,128;3;3\"",
+        "Input Data Types": "DT_BF16;INT64;INT64",
+        "Input Formats": "NCL;ND;ND",
+        "Output Shapes": "\"4,8,128\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "NCL",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 9579650,
+      "min_ns": 1680,
+      "max_ns": 2540,
+      "locators": [
+        {
+          "csv_line": 139,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143989525,
+          "end_ns": 1793354213143991365,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "17",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 182,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144419062,
+          "end_ns": 1793354213144420982,
+          "Name": "aclnnInplaceCopy_SliceAiCore_Slice",
+          "Task ID": "68",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.8894773175542408,
+      "activity_per_body_ms": 0.05668431952662722,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "ZerosLike",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,8,128\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "NCL",
+        "Output Shapes": "\"4,8,128\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "NCL",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 5070,
+      "sum_ns": 9530960,
+      "min_ns": 1640,
+      "max_ns": 2600,
+      "locators": [
+        {
+          "csv_line": 128,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143916042,
+          "end_ns": 1793354213143918022,
+          "Name": "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+          "Task ID": "5",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 171,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144347739,
+          "end_ns": 1793354213144349519,
+          "Name": "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+          "Task ID": "56",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.8798737672583827,
+      "activity_per_body_ms": 0.056396213017751474,
+      "calls_per_body": 30.0
+    },
+    {
+      "abi": {
+        "Type": "Abs",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"32\"",
+        "Input Data Types": "INT32",
+        "Input Formats": "ND",
+        "Output Shapes": "\"32\"",
+        "Output Data Types": "INT32",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 9419528,
+      "min_ns": 1240,
+      "max_ns": 1960,
+      "locators": [
+        {
+          "csv_line": 154,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144218674,
+          "end_ns": 1793354213144220074,
+          "Name": "aclnnAbs_AbsAiCore_Abs",
+          "Task ID": "39",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 197,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144674132,
+          "end_ns": 1793354213144675472,
+          "Name": "aclnnAbs_AbsAiCore_Abs",
+          "Task ID": "90",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.3934213017751478,
+      "activity_per_body_ms": 0.05573685207100592,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Sigmoid",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,1\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,1\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 9125357,
+      "min_ns": 1240,
+      "max_ns": 1880,
+      "locators": [
+        {
+          "csv_line": 160,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144249375,
+          "end_ns": 1793354213144250815,
+          "Name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "Task ID": "45",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 203,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144704953,
+          "end_ns": 1793354213144706213,
+          "Name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "Task ID": "96",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.3499048816568047,
+      "activity_per_body_ms": 0.05399619526627219,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Cast",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,8\"",
+        "Input Data Types": "FLOAT",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,8\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 6760,
+      "sum_ns": 8836392,
+      "min_ns": 1140,
+      "max_ns": 1860,
+      "locators": [
+        {
+          "csv_line": 153,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213144217354,
+          "end_ns": 1793354213144218654,
+          "Name": "aclnnInplaceCopy_CastAiCore_Cast",
+          "Task ID": "38",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 196,
+          "forward_id": "auto:0",
+          "layer": 1,
+          "start_ns": 1793354213144672812,
+          "end_ns": 1793354213144674112,
+          "Name": "aclnnInplaceCopy_CastAiCore_Cast",
+          "Task ID": "89",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.3071585798816567,
+      "activity_per_body_ms": 0.052286343195266274,
+      "calls_per_body": 40.0
+    },
+    {
+      "abi": {
+        "Type": "Slice",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"3,8193;2;2\"",
+        "Input Data Types": "INT64;INT64;INT64",
+        "Input Formats": "ND;ND;ND",
+        "Output Shapes": "\"3,4\"",
+        "Output Data Types": "INT64",
+        "Output Formats": "ND",
+        "Block Num": "3",
+        "Mix Block Num": "0"
+      },
+      "count": 3380,
+      "sum_ns": 8541536,
+      "min_ns": 1960,
+      "max_ns": 3481,
+      "locators": [
+        {
+          "csv_line": 255,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145202653,
+          "end_ns": 1793354213145205053,
+          "Name": "aclnnIndex_SliceAiCore_Slice",
+          "Task ID": "156",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 257,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145209553,
+          "end_ns": 1793354213145211693,
+          "Name": "aclnnIndex_SliceAiCore_Slice",
+          "Task ID": "158",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.527081656804734,
+      "activity_per_body_ms": 0.05054163313609467,
+      "calls_per_body": 20.0
+    },
+    {
+      "abi": {
+        "Type": "IndexCheck",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1;3,4\"",
+        "Input Data Types": "INT64;INT64",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "N/A",
+        "Output Data Types": "N/A",
+        "Output Formats": "N/A",
+        "Block Num": "12",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 7739419,
+      "min_ns": 4280,
+      "max_ns": 5160,
+      "locators": [
+        {
+          "csv_line": 256,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145205073,
+          "end_ns": 1793354213145209533,
+          "Name": "aclnnIndex_IndexCheck_IndexCheck",
+          "Task ID": "157",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 429,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213146977844,
+          "end_ns": 1793354213146982424,
+          "Name": "aclnnIndex_IndexCheck_IndexCheck",
+          "Task ID": "364",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 4.579537869822485,
+      "activity_per_body_ms": 0.04579537869822485,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "DynamicQuant",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,2048;4\"",
+        "Output Data Types": "INT8;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 6410141,
+      "min_ns": 3580,
+      "max_ns": 4541,
+      "locators": [
+        {
+          "csv_line": 253,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145180192,
+          "end_ns": 1793354213145183952,
+          "Name": "aclnnDynamicQuantV2_DynamicQuant_DynamicQuant",
+          "Task ID": "154",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 426,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213146951923,
+          "end_ns": 1793354213146955563,
+          "Name": "aclnnDynamicQuantV2_DynamicQuant_DynamicQuant",
+          "Task ID": "361",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 3.7929828402366867,
+      "activity_per_body_ms": 0.03792982840236687,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "Add",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"256;\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"256\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "1",
+        "Mix Block Num": "0"
+      },
+      "count": 3380,
+      "sum_ns": 5398068,
+      "min_ns": 1440,
+      "max_ns": 2160,
+      "locators": [
+        {
+          "csv_line": 260,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145219314,
+          "end_ns": 1793354213145220834,
+          "Name": "aclnnAdds_AddAiCore_Add",
+          "Task ID": "160",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 261,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145220854,
+          "end_ns": 1793354213145222434,
+          "Name": "aclnnAdds_AddAiCore_Add",
+          "Task ID": "161",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.5970615384615385,
+      "activity_per_body_ms": 0.03194123076923077,
+      "calls_per_body": 20.0
+    },
+    {
+      "abi": {
+        "Type": "Mul",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,1024;4,1024\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,1024\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 3707405,
+      "min_ns": 2020,
+      "max_ns": 2740,
+      "locators": [
+        {
+          "csv_line": 266,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145396081,
+          "end_ns": 1793354213145398121,
+          "Name": "aclnnMul_MulAiCore_Mul",
+          "Task ID": "176",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 440,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213147176512,
+          "end_ns": 1793354213147179032,
+          "Name": "aclnnMul_MulAiCore_Mul",
+          "Task ID": "383",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.1937307692307693,
+      "activity_per_body_ms": 0.02193730769230769,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "Sigmoid",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,1024\"",
+        "Input Data Types": "DT_BF16",
+        "Input Formats": "ND",
+        "Output Shapes": "\"4,1024\"",
+        "Output Data Types": "DT_BF16",
+        "Output Formats": "ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 1690,
+      "sum_ns": 3378350,
+      "min_ns": 1720,
+      "max_ns": 2360,
+      "locators": [
+        {
+          "csv_line": 265,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145394201,
+          "end_ns": 1793354213145396041,
+          "Name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "Task ID": "175",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 439,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213147174632,
+          "end_ns": 1793354213147176492,
+          "Name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+          "Task ID": "382",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 1.9990236686390532,
+      "activity_per_body_ms": 0.019990236686390533,
+      "calls_per_body": 10.0
+    },
+    {
+      "abi": {
+        "Type": "GemmaRmsNorm",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"4,2048;2048\"",
+        "Input Data Types": "DT_BF16;DT_BF16",
+        "Input Formats": "ND;ND",
+        "Output Shapes": "\"4,2048;4,1\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 905023,
+      "min_ns": 4780,
+      "max_ns": 6240,
+      "locators": [
+        {
+          "csv_line": 122,
+          "forward_id": "auto:0",
+          "layer": 0,
+          "start_ns": 1793354213143882020,
+          "end_ns": 1793354213143887740,
+          "Name": "GemmaRmsNorm",
+          "Task ID": "0",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 2273,
+          "forward_id": "auto:1",
+          "layer": 0,
+          "start_ns": 1793354213170824317,
+          "end_ns": 1793354213170829438,
+          "Name": "GemmaRmsNorm",
+          "Task ID": "0",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 5.355165680473373,
+      "activity_per_body_ms": 0.005355165680473373,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;4096393216;4;1024;4096360448;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"4096393216;4096360448\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 457659,
+      "min_ns": 2400,
+      "max_ns": 3120,
+      "locators": [
+        {
+          "csv_line": 435,
+          "forward_id": "auto:0",
+          "layer": 7,
+          "start_ns": 1793354213147002425,
+          "end_ns": 1793354213147005105,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "370",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 2591,
+          "forward_id": "auto:1",
+          "layer": 7,
+          "start_ns": 1793354213173839138,
+          "end_ns": 1793354213173841718,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "370",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.708041420118343,
+      "activity_per_body_ms": 0.002708041420118343,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;4215537664;4;1024;4215504896;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"4215537664;4215504896\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 453944,
+      "min_ns": 2440,
+      "max_ns": 3100,
+      "locators": [
+        {
+          "csv_line": 1455,
+          "forward_id": "auto:0",
+          "layer": 31,
+          "start_ns": 1793354213157503065,
+          "end_ns": 1793354213157505965,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1612",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3606,
+          "forward_id": "auto:1",
+          "layer": 31,
+          "start_ns": 1793354213184413741,
+          "end_ns": 1793354213184416361,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1612",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.6860591715976327,
+      "activity_per_body_ms": 0.002686059171597633,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;2048196608;4;1024;2048163840;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"2048196608;2048163840\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 452714,
+      "min_ns": 2520,
+      "max_ns": 3200,
+      "locators": [
+        {
+          "csv_line": 1295,
+          "forward_id": "auto:0",
+          "layer": 27,
+          "start_ns": 1793354213155749155,
+          "end_ns": 1793354213155751875,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1405",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3446,
+          "forward_id": "auto:1",
+          "layer": 27,
+          "start_ns": 1793354213182684192,
+          "end_ns": 1793354213182686912,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1405",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.6787810650887574,
+      "activity_per_body_ms": 0.002678781065088757,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;4255252480;4;1024;4255219712;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"4255252480;4255219712\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 441872,
+      "min_ns": 2380,
+      "max_ns": 2980,
+      "locators": [
+        {
+          "csv_line": 1775,
+          "forward_id": "auto:0",
+          "layer": 39,
+          "start_ns": 1793354213160929622,
+          "end_ns": 1793354213160932362,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "2026",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3926,
+          "forward_id": "auto:1",
+          "layer": 39,
+          "start_ns": 1793354213187835338,
+          "end_ns": 1793354213187837938,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "2026",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.614627218934911,
+      "activity_per_body_ms": 0.002614627218934911,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;2087911424;4;1024;2087878656;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"2087911424;2087878656\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 441519,
+      "min_ns": 2400,
+      "max_ns": 3100,
+      "locators": [
+        {
+          "csv_line": 1615,
+          "forward_id": "auto:0",
+          "layer": 35,
+          "start_ns": 1793354213159223634,
+          "end_ns": 1793354213159226114,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1819",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3766,
+          "forward_id": "auto:1",
+          "layer": 35,
+          "start_ns": 1793354213186145610,
+          "end_ns": 1793354213186148090,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1819",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.6125384615384615,
+      "activity_per_body_ms": 0.0026125384615384613,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;1968766976;4;1024;1968734208;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"1968766976;1968734208\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 438155,
+      "min_ns": 2360,
+      "max_ns": 3040,
+      "locators": [
+        {
+          "csv_line": 608,
+          "forward_id": "auto:0",
+          "layer": 11,
+          "start_ns": 1793354213148768596,
+          "end_ns": 1793354213148771136,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "577",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 2765,
+          "forward_id": "auto:1",
+          "layer": 11,
+          "start_ns": 1793354213175594988,
+          "end_ns": 1793354213175597928,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "577",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.592633136094675,
+      "activity_per_body_ms": 0.0025926331360946746,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;4175822848;4;1024;4175790080;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"4175822848;4175790080\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 432257,
+      "min_ns": 2300,
+      "max_ns": 2981,
+      "locators": [
+        {
+          "csv_line": 1131,
+          "forward_id": "auto:0",
+          "layer": 23,
+          "start_ns": 1793354213154011145,
+          "end_ns": 1793354213154013525,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1198",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3285,
+          "forward_id": "auto:1",
+          "layer": 23,
+          "start_ns": 1793354213180926141,
+          "end_ns": 1793354213180928461,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "1198",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.557733727810651,
+      "activity_per_body_ms": 0.002557733727810651,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;1929052160;4;1024;1929019392;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"1929052160;1929019392\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 431311,
+      "min_ns": 2340,
+      "max_ns": 2980,
+      "locators": [
+        {
+          "csv_line": 263,
+          "forward_id": "auto:0",
+          "layer": 3,
+          "start_ns": 1793354213145229494,
+          "end_ns": 1793354213145232014,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "163",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 2416,
+          "forward_id": "auto:1",
+          "layer": 3,
+          "start_ns": 1793354213172095428,
+          "end_ns": 1793354213172097888,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "163",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.552136094674556,
+      "activity_per_body_ms": 0.0025521360946745564,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;2008481792;4;1024;2008449024;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"2008481792;2008449024\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 425878,
+      "min_ns": 2281,
+      "max_ns": 3021,
+      "locators": [
+        {
+          "csv_line": 956,
+          "forward_id": "auto:0",
+          "layer": 19,
+          "start_ns": 1793354213152267616,
+          "end_ns": 1793354213152270036,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "991",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 3113,
+          "forward_id": "auto:1",
+          "layer": 19,
+          "start_ns": 1793354213179173471,
+          "end_ns": 1793354213179175911,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "991",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.519988165680473,
+      "activity_per_body_ms": 0.002519988165680473,
+      "calls_per_body": 1.0
+    },
+    {
+      "abi": {
+        "Type": "ScatterPaKvCache",
+        "Accelerator Core": "AI_VECTOR_CORE",
+        "Input Shapes": "\"1024;4136108032;4;1024;4136075264;;;\"",
+        "Input Data Types": "DT_BF16;DT_BF16;INT32;DT_BF16;DT_BF16;INT64;INT64;INT64",
+        "Input Formats": "NCL;NCHW;ND;NCL;NCHW;ND;ND;ND",
+        "Output Shapes": "\"4136108032;4136075264\"",
+        "Output Data Types": "DT_BF16;DT_BF16",
+        "Output Formats": "NCHW;NCHW",
+        "Block Num": "4",
+        "Mix Block Num": "0"
+      },
+      "count": 169,
+      "sum_ns": 423159,
+      "min_ns": 2280,
+      "max_ns": 3121,
+      "locators": [
+        {
+          "csv_line": 782,
+          "forward_id": "auto:0",
+          "layer": 15,
+          "start_ns": 1793354213150517626,
+          "end_ns": 1793354213150520126,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "784",
+          "Stream ID": "235",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 2939,
+          "forward_id": "auto:1",
+          "layer": 15,
+          "start_ns": 1793354213177381920,
+          "end_ns": 1793354213177384420,
+          "Name": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+          "Task ID": "784",
+          "Stream ID": "235",
+          "Device_id": "0"
+        }
+      ],
+      "mean_us": 2.5038994082840236,
+      "activity_per_body_ms": 0.0025038994082840237,
+      "calls_per_body": 1.0
+    }
+  ],
+  "scheduled_recipe_groups": {
+    "metric_boundary": "scheduled_operator_ready_to_completion_including_resource_wait",
+    "additive_to_body": false,
+    "additive_across_replicas": false,
+    "interpretation": "These scheduled intervals can overlap and include contention or peer waits. They diagnose modeled latency; their sum is neither device service time nor a decomposition of body wall span.",
+    "groups": [
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "allreduce",
+        "recipe": "catalog_tp_allreduce",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.01512538775510206,
+          "p50": 0.015125387755102082,
+          "p90": 0.015125387755102082,
+          "min": 0.01512538775510186,
+          "max": 0.015125387755102082
+        },
+        "sum_elapsed_ms": 0.1512538775510206,
+        "scheduled_interval_union_ms": 0.15125387755102082
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "allreduce",
+        "recipe": "linear_reduce",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.015125387755102056,
+          "p50": 0.015125387755102082,
+          "p90": 0.015125387755102082,
+          "min": 0.01512538775510186,
+          "max": 0.015125387755102082
+        },
+        "sum_elapsed_ms": 0.4537616326530617,
+        "scheduled_interval_union_ms": 0.45376163265306246
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "allreduce",
+        "recipe": "moe_output_reduce",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.015125387755102058,
+          "p50": 0.015125387755102082,
+          "p90": 0.015125387755102082,
+          "min": 0.01512538775510186,
+          "max": 0.015125387755102082
+        },
+        "sum_elapsed_ms": 0.6050155102040823,
+        "scheduled_interval_union_ms": 0.6050155102040815
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.14295995272735856,
+          "p50": 0.14295995272736306,
+          "p90": 0.14295995272741546,
+          "min": 0.14295995272728512,
+          "max": 0.14295995272741546
+        },
+        "sum_elapsed_ms": 1.4295995272735855,
+        "scheduled_interval_union_ms": 1.4295995272735862
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "cache_store",
+        "recipe": "kv_store",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.0025000000000000356,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.025000000000000355,
+        "scheduled_interval_union_ms": 0.025000000000000355
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "cast",
+        "recipe": "router_input_cast",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000716,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000286,
+        "scheduled_interval_union_ms": 0.1000000000000032
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "down_projection",
+        "recipe": "dense_down",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.00500000000000006,
+          "p50": 0.004999999999999893,
+          "p90": 0.005000000000000782,
+          "min": 0.004999999999999893,
+          "max": 0.005000000000000782
+        },
+        "sum_elapsed_ms": 0.2000000000000024,
+        "scheduled_interval_union_ms": 0.20000000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "attention_gate",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.0025000000000000356,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.025000000000000355,
+        "scheduled_interval_union_ms": 0.025000000000000355
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "decode_k_l2norm",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "decode_q_l2norm",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "expert_add",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000603,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000242,
+        "scheduled_interval_union_ms": 0.1000000000000032
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "linear_output_norm_gate",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000838,
+          "p50": 0.0024999999999999745,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000251,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "residual_add",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 80,
+          "mean": 0.002500000000000066,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.20000000000000528,
+        "scheduled_interval_union_ms": 0.20000000000000462
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "elementwise",
+        "recipe": "shared_gate_apply",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000603,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000242,
+        "scheduled_interval_union_ms": 0.1000000000000032
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "gate_up_projection",
+        "recipe": "dense_gate_up",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.010414545454544922,
+          "p50": 0.010414545454544566,
+          "p90": 0.010414545454545454,
+          "min": 0.010414545454544566,
+          "max": 0.01041454545454551
+        },
+        "sum_elapsed_ms": 0.41658181818179685,
+        "scheduled_interval_union_ms": 0.41658181818179685
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "gdn_gating",
+        "recipe": "ascend_gdn_decode_gating",
+        "program": "OperatorPlan",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "gemm",
+        "recipe": "linear_beta_alpha",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.005000000000000027,
+          "p50": 0.004999999999999893,
+          "p90": 0.005000000000000782,
+          "min": 0.004999999999999893,
+          "max": 0.005000000000000782
+        },
+        "sum_elapsed_ms": 0.1500000000000008,
+        "scheduled_interval_union_ms": 0.15000000000000036
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "gemm",
+        "recipe": "linear_output",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.005303350303030172,
+          "p50": 0.0053033503030301965,
+          "p90": 0.005303350303030641,
+          "min": 0.005303350303029752,
+          "max": 0.005303350303030641
+        },
+        "sum_elapsed_ms": 0.15910050909090517,
+        "scheduled_interval_union_ms": 0.159100509090905
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "gemm",
+        "recipe": "linear_qkvz",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.020829090909090672,
+          "p50": 0.020829090909090464,
+          "p90": 0.020829090909092685,
+          "min": 0.02082909090909002,
+          "max": 0.020829090909092685
+        },
+        "sum_elapsed_ms": 0.6248727272727201,
+        "scheduled_interval_union_ms": 0.6248727272727201
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "grouped_gemm",
+        "recipe": "balanced_grouped_down",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.010562470606060798,
+          "p50": 0.01056247060606097,
+          "p90": 0.01056247060606097,
+          "min": 0.010562470606060526,
+          "max": 0.01056247060606097
+        },
+        "sum_elapsed_ms": 0.4224988242424319,
+        "scheduled_interval_union_ms": 0.4224988242424317
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "grouped_gemm",
+        "recipe": "balanced_grouped_gate_up",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.020317923030303435,
+          "p50": 0.02031792303030322,
+          "p90": 0.020317923030304108,
+          "min": 0.020317923030302776,
+          "max": 0.020317923030304108
+        },
+        "sum_elapsed_ms": 0.8127169212121373,
+        "scheduled_interval_union_ms": 0.8127169212121377
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "output_projection",
+        "recipe": "attention_output",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.005303350303030208,
+          "p50": 0.005303350303030252,
+          "p90": 0.005303350303030641,
+          "min": 0.005303350303029752,
+          "max": 0.005303350303030641
+        },
+        "sum_elapsed_ms": 0.053033503030302076,
+        "scheduled_interval_union_ms": 0.05303350303030285
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "qkv_projection",
+        "recipe": "qkv_projection",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.005249855757575761,
+          "p50": 0.005249855757575972,
+          "p90": 0.005249855757575972,
+          "min": 0.005249855757575084,
+          "max": 0.005249855757575972
+        },
+        "sum_elapsed_ms": 0.05249855757575761,
+        "scheduled_interval_union_ms": 0.05249855757575794
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "quantize",
+        "recipe": "dynamic_quantize",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 90,
+          "mean": 0.0025000000000000478,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.2250000000000043,
+        "scheduled_interval_union_ms": 0.22500000000000497
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "recurrent_vector",
+        "recipe": "decode_recurrent_scan",
+        "program": "RecurrentVector",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.01248045454545425,
+          "p50": 0.012480454545453767,
+          "p90": 0.01248045454545732,
+          "min": 0.012480454545452435,
+          "max": 0.01248045454545732
+        },
+        "sum_elapsed_ms": 0.3744136363636275,
+        "scheduled_interval_union_ms": 0.37441363636362723
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "rmsnorm",
+        "recipe": "qk_norm",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.0025000000000000356,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.025000000000000355,
+        "scheduled_interval_union_ms": 0.025000000000000355
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "rmsnorm",
+        "recipe": "rmsnorm",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 80,
+          "mean": 0.0025000000000000725,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.20000000000000578,
+        "scheduled_interval_union_ms": 0.2000000000000064
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "rotary",
+        "recipe": "rotary",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 10,
+          "mean": 0.0025000000000000356,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.025000000000000355,
+        "scheduled_interval_union_ms": 0.025000000000000355
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "router",
+        "recipe": "router",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.020669090909090113,
+          "p50": 0.02066909090908986,
+          "p90": 0.020669090909091192,
+          "min": 0.020669090909088084,
+          "max": 0.020669090909091192
+        },
+        "sum_elapsed_ms": 0.8267636363636045,
+        "scheduled_interval_union_ms": 0.8267636363636051
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "router",
+        "recipe": "shared_gate",
+        "program": "SteadyMatmul",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.00500000000000006,
+          "p50": 0.004999999999999893,
+          "p90": 0.005000000000000782,
+          "min": 0.004999999999999893,
+          "max": 0.005000000000000782
+        },
+        "sum_elapsed_ms": 0.2000000000000024,
+        "scheduled_interval_union_ms": 0.20000000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "routing",
+        "recipe": "route_pack",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000495,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000198,
+        "scheduled_interval_union_ms": 0.10000000000000142
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "routing",
+        "recipe": "route_unpack",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000603,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000242,
+        "scheduled_interval_union_ms": 0.1000000000000032
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "short_convolution",
+        "recipe": "ascend_causal_conv1d_update",
+        "program": "OperatorPlan",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "swiglu",
+        "recipe": "grouped_swiglu",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000495,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000198,
+        "scheduled_interval_union_ms": 0.10000000000000142
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "swiglu",
+        "recipe": "swiglu",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000603,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000242,
+        "scheduled_interval_union_ms": 0.1000000000000032
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "alpha_contiguous",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "beta_contiguous",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000005,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "convolution_input_contiguous",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "core_output_copy",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000838,
+          "p50": 0.0024999999999999745,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000251,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "k_flat",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "q_flat",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000894,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000268,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "qkv_concatenate",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "qkv_split_materialize",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 20,
+          "mean": 8.533333333299308e-06,
+          "p50": 8.533333333282656e-06,
+          "p90": 1.3653333333252249e-05,
+          "min": 3.4133333333130622e-06,
+          "max": 1.3653333333474293e-05
+        },
+        "sum_elapsed_ms": 0.00017066666666598618,
+        "scheduled_interval_union_ms": 0.0001706666666656531
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "v_flat",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_copy",
+        "recipe": "z_norm_materialize",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000838,
+          "p50": 0.0024999999999999745,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000251,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "tensor_fill",
+        "recipe": "core_output_zero",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 30,
+          "mean": 0.0025000000000000855,
+          "p50": 0.0025000000000000022,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.07500000000000256,
+        "scheduled_interval_union_ms": 0.07500000000000284
+      },
+      {
+        "replica": 0,
+        "stage": 0,
+        "family": "topk",
+        "recipe": "router_topk",
+        "program": "ResourceEnvelope",
+        "scheduled_elapsed_ms": {
+          "count": 40,
+          "mean": 0.0025000000000000495,
+          "p50": 0.0024999999999999467,
+          "p90": 0.002500000000000391,
+          "min": 0.0024999999999995026,
+          "max": 0.002500000000000391
+        },
+        "sum_elapsed_ms": 0.10000000000000198,
+        "scheduled_interval_union_ms": 0.10000000000000142
+      }
+    ],
+    "largest_operator_intervals": [
+      {
+        "id": "r0:s0.l19.attention",
+        "op_id": "s0.l19.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 19,
+        "ready_ms": 4.505662565300029,
+        "complete_ms": 4.6486225180274445,
+        "elapsed_ms": 0.14295995272741546,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l23.attention",
+        "op_id": "s0.l23.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 23,
+        "ready_ms": 5.463890700068292,
+        "complete_ms": 5.606850652795708,
+        "elapsed_ms": 0.14295995272741546,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l27.attention",
+        "op_id": "s0.l27.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 27,
+        "ready_ms": 6.422118834836556,
+        "complete_ms": 6.565078787563971,
+        "elapsed_ms": 0.14295995272741546,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l31.attention",
+        "op_id": "s0.l31.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 31,
+        "ready_ms": 7.380346969604819,
+        "complete_ms": 7.523306922332234,
+        "elapsed_ms": 0.14295995272741546,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l35.attention",
+        "op_id": "s0.l35.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 35,
+        "ready_ms": 8.338575104373051,
+        "complete_ms": 8.481535057100414,
+        "elapsed_ms": 0.14295995272736306,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l39.attention",
+        "op_id": "s0.l39.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 39,
+        "ready_ms": 9.29680323914119,
+        "complete_ms": 9.439763191868552,
+        "elapsed_ms": 0.14295995272736306,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l7.attention",
+        "op_id": "s0.l7.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 7,
+        "ready_ms": 1.630978160995677,
+        "complete_ms": 1.7739381137229833,
+        "elapsed_ms": 0.14295995272730622,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l11.attention",
+        "op_id": "s0.l11.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 11,
+        "ready_ms": 2.589206295763788,
+        "complete_ms": 2.732166248491091,
+        "elapsed_ms": 0.1429599527273031,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l15.attention",
+        "op_id": "s0.l15.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 15,
+        "ready_ms": 3.5474344305318937,
+        "complete_ms": 3.6903943832591968,
+        "elapsed_ms": 0.1429599527273031,
+        "source_boundary": ""
+      },
+      {
+        "id": "r0:s0.l3.attention",
+        "op_id": "s0.l3.attention",
+        "replica": 0,
+        "family": "attention",
+        "recipe": "flash_attention_decode",
+        "program": "StagedGQADecode",
+        "stage": 0,
+        "layer": 3,
+        "ready_ms": 0.6727500262275811,
+        "complete_ms": 0.8157099789548662,
+        "elapsed_ms": 0.14295995272728512,
+        "source_boundary": ""
+      }
+    ]
+  },
+  "limitations": [
+    "native activity sums and scheduled intervals are not additive Body decompositions",
+    "shape-less helper geometry remains source-conditional",
+    "all-rank arrival and compiled binary identity not observed",
+    "only three retained forwards have layer windows; native grouping covers all complete Bodies without inventing unavailable layer occurrence bindings",
+    "existing ee3 prediction retained; no current runtime prediction performed"
+  ],
+  "elapsed_seconds": 2.547211333992891,
+  "peak_rss_bytes": 46039040
+}
