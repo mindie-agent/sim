@@ -1,0 +1,497 @@
+{
+  "schema_version": "mindie-cases/1",
+  "cases": [
+    {
+      "id": "decode:a5-qwen36-tp2-decode-c4-p126000-caller-fused",
+      "case_id": "a5-qwen36-tp2-decode-c4-p126000-caller-fused",
+      "phase": "decode",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "c46fd0686ed0c772bc9a72b08d311cc34c2b924c7eaa2b827a47c1326ba23ed3",
+        "size_bytes": 37384008,
+        "kind": "csv"
+      },
+      "model_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+        "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
+        "size_bytes": 10329
+      },
+      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+      "supported_scopes": [
+        "body",
+        "operators"
+      ],
+      "geometry_limit": null,
+      "geometry": {
+        "phase": "decode",
+        "context_tokens": 126000
+      },
+      "context_evidence": {
+        "basis": "retained_request_prompt_usage",
+        "representative_tokens": 126000,
+        "lower_bound_tokens": 126000,
+        "upper_bound_tokens": 129000,
+        "per_step_context_observed": false,
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+          "sha256": "19c478ac44e2bb3208373a3d9285ea005173ca219edab2750ba6c52f459d5c0f",
+          "size_bytes": 102062
+        },
+        "requested_prefix_tokens": null,
+        "requested_suffix_tokens": null,
+        "client_token_exact": true,
+        "limitation": "The initial prompt is a conditional representative, not a per-step KV length. Token bounds describe the associated client run; cache/table capacities are not active context."
+      },
+      "scenario_evidence": {
+        "client": {
+          "input_len": 126000,
+          "concurrency": 4,
+          "output_tokens": 3000
+        },
+        "capture_metadata": {
+          "benchmark_summary.json": {
+            "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+            "sha256": "19c478ac44e2bb3208373a3d9285ea005173ca219edab2750ba6c52f459d5c0f",
+            "size_bytes": 102062
+          }
+        },
+        "capture_parameters": {}
+      },
+      "calibration": {
+        "origin": "frozen_older_HCCL_response_plus_source_caller",
+        "evaluation_relation": "new_target_not_used_for_fitting; previously_inspected_not_blind",
+        "target_native_timings_used_in_rules": false,
+        "evidence_refs": [
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+            "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
+            "size_bytes": 9138
+          },
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+            "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
+            "size_bytes": 10329
+          }
+        ]
+      },
+      "template_selection": {
+        "basis": "explicit_template_case_id",
+        "template_id": "model:9cecd04b2a963cb5a3ddd4781b6f07009aae2a9e51ca53935464187dcc1f1b56",
+        "template_model_identity": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen36_tp2_128k_20261030-source-model.json",
+          "sha256": "9cecd04b2a963cb5a3ddd4781b6f07009aae2a9e51ca53935464187dcc1f1b56",
+          "size_bytes": 5225
+        },
+        "observed_parameters": {},
+        "unobserved_parameters": [
+          "model",
+          "hardware",
+          "tp",
+          "dp",
+          "ep",
+          "quant"
+        ],
+        "missing_parameters_are_not_confirmed_capture_facts": true,
+        "source_declaration_correction": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/9cecd04b2a963cb5a3ddd4781b6f07009aae2a9e51ca53935464187dcc1f1b56.json",
+          "sha256": "9cecd04b2a963cb5a3ddd4781b6f07009aae2a9e51ca53935464187dcc1f1b56",
+          "size_bytes": 5225
+        }
+      },
+      "extraction_path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/b5870010e59403a1384d2fefe2fdecd99c5756d8e392e5f653b437917974ec4f.json",
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/b5870010e59403a1384d2fefe2fdecd99c5756d8e392e5f653b437917974ec4f.json",
+        "sha256": "b5870010e59403a1384d2fefe2fdecd99c5756d8e392e5f653b437917974ec4f",
+        "size_bytes": 1443005,
+        "format": "full_scoreboard_json"
+      },
+      "forward_metadata": {
+        "body_count": 48,
+        "geometry_groups": [
+          {
+            "geometry": {
+              "query_rows": 16,
+              "sequences_per_replica": 4,
+              "tokens_per_sequence": 4,
+              "context_tokens": null,
+              "batch_basis": "captured_paged_attention_block_table_rows",
+              "context_basis": "not_observed_from_cache_capacity",
+              "output_query_rows": 16
+            },
+            "forward_count": 48
+          }
+        ]
+      }
+    },
+    {
+      "id": "decode:a5-qwen36-tp4-decode-c4-p126000-caller-fused",
+      "case_id": "a5-qwen36-tp4-decode-c4-p126000-caller-fused",
+      "phase": "decode",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "09de4209830f0a97c3c07efa793c891cce862f7c7aa77d9b938c52ec25cb1592",
+        "size_bytes": 40445953,
+        "kind": "csv"
+      },
+      "model_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+        "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
+        "size_bytes": 11912
+      },
+      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+      "supported_scopes": [
+        "body",
+        "operators"
+      ],
+      "geometry_limit": null,
+      "geometry": {
+        "phase": "decode",
+        "context_tokens": 126000
+      },
+      "context_evidence": {
+        "basis": "retained_request_prompt_usage",
+        "representative_tokens": 126000,
+        "lower_bound_tokens": 126000,
+        "upper_bound_tokens": 129000,
+        "per_step_context_observed": false,
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+          "sha256": "907e911f043516b4f331624c9689037b019e56c515072509d79a74ef7157d8b7",
+          "size_bytes": 101950
+        },
+        "requested_prefix_tokens": null,
+        "requested_suffix_tokens": null,
+        "client_token_exact": true,
+        "limitation": "The initial prompt is a conditional representative, not a per-step KV length. Token bounds describe the associated client run; cache/table capacities are not active context."
+      },
+      "scenario_evidence": {
+        "client": {
+          "input_len": 126000,
+          "concurrency": 4,
+          "output_tokens": 3000
+        },
+        "capture_metadata": {
+          "benchmark_summary.json": {
+            "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+            "sha256": "907e911f043516b4f331624c9689037b019e56c515072509d79a74ef7157d8b7",
+            "size_bytes": 101950
+          }
+        },
+        "capture_parameters": {}
+      },
+      "calibration": {
+        "origin": "frozen_older_HCCL_response_plus_source_caller",
+        "evaluation_relation": "new_target_not_used_for_fitting; previously_inspected_not_blind",
+        "target_native_timings_used_in_rules": false,
+        "evidence_refs": [
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+            "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
+            "size_bytes": 10720
+          },
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+            "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
+            "size_bytes": 11912
+          }
+        ]
+      },
+      "template_selection": {
+        "basis": "explicit_template_case_id",
+        "template_id": "model:7db7f8002a78ac7cc8e3d889db0986d89c08ce33a8d0d2b771c49980eb407ad1",
+        "template_model_identity": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen36_128k_tp4_20261030-source-model.json",
+          "sha256": "7db7f8002a78ac7cc8e3d889db0986d89c08ce33a8d0d2b771c49980eb407ad1",
+          "size_bytes": 5216
+        },
+        "observed_parameters": {},
+        "unobserved_parameters": [
+          "model",
+          "hardware",
+          "tp",
+          "dp",
+          "ep",
+          "quant"
+        ],
+        "missing_parameters_are_not_confirmed_capture_facts": true,
+        "source_declaration_correction": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7db7f8002a78ac7cc8e3d889db0986d89c08ce33a8d0d2b771c49980eb407ad1.json",
+          "sha256": "7db7f8002a78ac7cc8e3d889db0986d89c08ce33a8d0d2b771c49980eb407ad1",
+          "size_bytes": 5216
+        }
+      },
+      "extraction_path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/898c7bd3c34042e5c50dcc131915da439aace0658718a3bfcf855a9ddd569b23.json",
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/898c7bd3c34042e5c50dcc131915da439aace0658718a3bfcf855a9ddd569b23.json",
+        "sha256": "898c7bd3c34042e5c50dcc131915da439aace0658718a3bfcf855a9ddd569b23",
+        "size_bytes": 1482722,
+        "format": "full_scoreboard_json"
+      },
+      "forward_metadata": {
+        "body_count": 52,
+        "geometry_groups": [
+          {
+            "geometry": {
+              "query_rows": 16,
+              "sequences_per_replica": 4,
+              "tokens_per_sequence": 4,
+              "context_tokens": null,
+              "batch_basis": "captured_paged_attention_block_table_rows",
+              "context_basis": "not_observed_from_cache_capacity",
+              "output_query_rows": 16
+            },
+            "forward_count": 52
+          }
+        ]
+      }
+    },
+    {
+      "id": "decode:a5-qwen38-tp2-decode-c4-p126000-caller-fused",
+      "case_id": "a5-qwen38-tp2-decode-c4-p126000-caller-fused",
+      "phase": "decode",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "190526e1511a2efde9e7a386984f5c46f9a8eab6c6b260156a3d5c519c6d3101",
+        "size_bytes": 35776685,
+        "kind": "csv"
+      },
+      "model_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+        "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
+        "size_bytes": 9000
+      },
+      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+      "supported_scopes": [
+        "body",
+        "operators"
+      ],
+      "geometry_limit": null,
+      "geometry": {
+        "phase": "decode",
+        "context_tokens": 126000
+      },
+      "context_evidence": {
+        "basis": "retained_request_prompt_usage",
+        "representative_tokens": 126000,
+        "lower_bound_tokens": 126000,
+        "upper_bound_tokens": 129000,
+        "per_step_context_observed": false,
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+          "sha256": "77d5995a41ad1c1df8da252c341a0b456520217d1f3210a3abb671424f1c3a42",
+          "size_bytes": 102288
+        },
+        "requested_prefix_tokens": null,
+        "requested_suffix_tokens": null,
+        "client_token_exact": true,
+        "limitation": "The initial prompt is a conditional representative, not a per-step KV length. Token bounds describe the associated client run; cache/table capacities are not active context."
+      },
+      "scenario_evidence": {
+        "client": {
+          "input_len": 126000,
+          "concurrency": 4,
+          "output_tokens": 3000
+        },
+        "capture_metadata": {
+          "benchmark_summary.json": {
+            "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+            "sha256": "77d5995a41ad1c1df8da252c341a0b456520217d1f3210a3abb671424f1c3a42",
+            "size_bytes": 102288
+          }
+        },
+        "capture_parameters": {}
+      },
+      "calibration": {
+        "origin": "frozen_older_HCCL_response_plus_source_caller",
+        "evaluation_relation": "new_target_not_used_for_fitting; previously_inspected_not_blind",
+        "target_native_timings_used_in_rules": false,
+        "evidence_refs": [
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+            "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
+            "size_bytes": 7809
+          },
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+            "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
+            "size_bytes": 9000
+          }
+        ]
+      },
+      "template_selection": {
+        "basis": "explicit_template_case_id",
+        "template_id": "model:138c15e50186f1887de5e7132396ee08b67a3a805555168921b6e15d0cd3c7ad",
+        "template_model_identity": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen38_tp2_128k_20261030-source-model.json",
+          "sha256": "138c15e50186f1887de5e7132396ee08b67a3a805555168921b6e15d0cd3c7ad",
+          "size_bytes": 3896
+        },
+        "observed_parameters": {},
+        "unobserved_parameters": [
+          "model",
+          "hardware",
+          "tp",
+          "dp",
+          "ep",
+          "quant"
+        ],
+        "missing_parameters_are_not_confirmed_capture_facts": true,
+        "source_declaration_correction": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/138c15e50186f1887de5e7132396ee08b67a3a805555168921b6e15d0cd3c7ad.json",
+          "sha256": "138c15e50186f1887de5e7132396ee08b67a3a805555168921b6e15d0cd3c7ad",
+          "size_bytes": 3896
+        }
+      },
+      "extraction_path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7305f24077f1b6d43bbad6a884911f8c4719c9a5301d9251fda276d0221fd7b3.json",
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7305f24077f1b6d43bbad6a884911f8c4719c9a5301d9251fda276d0221fd7b3.json",
+        "sha256": "7305f24077f1b6d43bbad6a884911f8c4719c9a5301d9251fda276d0221fd7b3",
+        "size_bytes": 1432607,
+        "format": "full_scoreboard_json"
+      },
+      "forward_metadata": {
+        "body_count": 47,
+        "geometry_groups": [
+          {
+            "geometry": {
+              "query_rows": 16,
+              "sequences_per_replica": 4,
+              "tokens_per_sequence": 4,
+              "context_tokens": null,
+              "batch_basis": "captured_paged_attention_block_table_rows",
+              "context_basis": "not_observed_from_cache_capacity",
+              "output_query_rows": 16
+            },
+            "forward_count": 47
+          }
+        ]
+      }
+    },
+    {
+      "id": "decode:a5-qwen38-tp4-decode-c4-p126000-caller-fused",
+      "case_id": "a5-qwen38-tp4-decode-c4-p126000-caller-fused",
+      "phase": "decode",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "9155db6bea90dd89defd8122c093094e4a4938333d61ad1fe9f2f3e58c72d940",
+        "size_bytes": 39583490,
+        "kind": "csv"
+      },
+      "model_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+        "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
+        "size_bytes": 10582
+      },
+      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+      "supported_scopes": [
+        "body",
+        "operators"
+      ],
+      "geometry_limit": null,
+      "geometry": {
+        "phase": "decode",
+        "context_tokens": 126000
+      },
+      "context_evidence": {
+        "basis": "retained_request_prompt_usage",
+        "representative_tokens": 126000,
+        "lower_bound_tokens": 126000,
+        "upper_bound_tokens": 129000,
+        "per_step_context_observed": false,
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+          "sha256": "0c7df0a551f52859b0b25e283b52391b518d8c79b820a2fa00711a1c5b3fd353",
+          "size_bytes": 101740
+        },
+        "requested_prefix_tokens": null,
+        "requested_suffix_tokens": null,
+        "client_token_exact": true,
+        "limitation": "The initial prompt is a conditional representative, not a per-step KV length. Token bounds describe the associated client run; cache/table capacities are not active context."
+      },
+      "scenario_evidence": {
+        "client": {
+          "input_len": 126000,
+          "concurrency": 4,
+          "output_tokens": 3000
+        },
+        "capture_metadata": {
+          "benchmark_summary.json": {
+            "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/benchmark_summary.json",
+            "sha256": "0c7df0a551f52859b0b25e283b52391b518d8c79b820a2fa00711a1c5b3fd353",
+            "size_bytes": 101740
+          }
+        },
+        "capture_parameters": {}
+      },
+      "calibration": {
+        "origin": "frozen_older_HCCL_response_plus_source_caller",
+        "evaluation_relation": "new_target_not_used_for_fitting; previously_inspected_not_blind",
+        "target_native_timings_used_in_rules": false,
+        "evidence_refs": [
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+            "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
+            "size_bytes": 9391
+          },
+          {
+            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+            "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
+            "size_bytes": 10582
+          }
+        ]
+      },
+      "template_selection": {
+        "basis": "explicit_template_case_id",
+        "template_id": "model:1d420fbb4c3b122a3f735d1766e22a9265dd334ea9d504e0db8f58baf7b4cfb1",
+        "template_model_identity": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen38_128k_tp4_20261030-source-model.json",
+          "sha256": "1d420fbb4c3b122a3f735d1766e22a9265dd334ea9d504e0db8f58baf7b4cfb1",
+          "size_bytes": 3887
+        },
+        "observed_parameters": {},
+        "unobserved_parameters": [
+          "model",
+          "hardware",
+          "tp",
+          "dp",
+          "ep",
+          "quant"
+        ],
+        "missing_parameters_are_not_confirmed_capture_facts": true,
+        "source_declaration_correction": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/1d420fbb4c3b122a3f735d1766e22a9265dd334ea9d504e0db8f58baf7b4cfb1.json",
+          "sha256": "1d420fbb4c3b122a3f735d1766e22a9265dd334ea9d504e0db8f58baf7b4cfb1",
+          "size_bytes": 3887
+        }
+      },
+      "extraction_path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7e485c1c26316e01a61f215239a8c62f9c92dc451d5091d693a2b90d773880d3.json",
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7e485c1c26316e01a61f215239a8c62f9c92dc451d5091d693a2b90d773880d3.json",
+        "sha256": "7e485c1c26316e01a61f215239a8c62f9c92dc451d5091d693a2b90d773880d3",
+        "size_bytes": 1482429,
+        "format": "full_scoreboard_json"
+      },
+      "forward_metadata": {
+        "body_count": 52,
+        "geometry_groups": [
+          {
+            "geometry": {
+              "query_rows": 16,
+              "sequences_per_replica": 4,
+              "tokens_per_sequence": 4,
+              "context_tokens": null,
+              "batch_basis": "captured_paged_attention_block_table_rows",
+              "context_basis": "not_observed_from_cache_capacity",
+              "output_query_rows": 16
+            },
+            "forward_count": 52
+          }
+        ]
+      }
+    }
+  ],
+  "policy": {
+    "scope": "four_B4_caller_variants_against_same_complete_native_Bodies",
+    "new_target_timings_used_to_fit": false
+  }
+}

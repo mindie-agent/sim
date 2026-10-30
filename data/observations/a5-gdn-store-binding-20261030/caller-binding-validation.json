@@ -1,0 +1,1771 @@
+{
+  "scope": "existing_native_norm_caller_binding; no_new_latency_parameters",
+  "revision": "b586b183749803f755f46f4adf1446d815917d19",
+  "new_parameters": 0,
+  "response_domain_changes": 0,
+  "lowering_passes": [
+    "activation_quantization",
+    "norm_quant",
+    "residual_norm"
+  ],
+  "binding": {
+    "implementation": "vllm_ascend_native_norm",
+    "options": {
+      "has_bias": false,
+      "external_gamma_shift": true
+    }
+  },
+  "geometry": {
+    "tokens": 4,
+    "sequences": 4,
+    "context": 126000,
+    "scope": "body"
+  },
+  "previous_hccl_comparison": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-gdn-store-binding-20261030/hccl-frozen-validation.json",
+    "sha256": "3407413a70bf6e76ae790e8272ec46542324b214b0a133df44cba1dcf729266e",
+    "size_bytes": 130274
+  },
+  "cases": [
+    {
+      "model": "qwen36",
+      "tp": 2,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+        "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
+        "size_bytes": 10329
+      },
+      "baseline_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
+        "size_bytes": 9138
+      },
+      "baseline_engine_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+      "baseline_body": {
+        "status": "completed",
+        "body_ms": 25.79230002425294,
+        "body_relative_error": -0.18608588987466634,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.13988848484874,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 37.39196512498893,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "observed_body_ms": {
+        "count": 48,
+        "mean": 31.689215979166665,
+        "p50": 31.648181,
+        "p90": 31.861577,
+        "min": 31.5699,
+        "max": 31.922492
+      },
+      "native_kind": "AddRmsNormDynamicQuant",
+      "predicted_contract": [
+        "add_rmsnorm_dynamic_quant_active",
+        "AddRmsNormDynamicQuant",
+        [
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [],
+            null,
+            null
+          ]
+        ],
+        [
+          [
+            [
+              16,
+              5120
+            ],
+            "int8",
+            "ND"
+          ],
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              16
+            ],
+            "fp32",
+            "ND"
+          ]
+        ]
+      ],
+      "native_samples": [
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 118,
+            "csv_line": 120,
+            "task_id": "64866",
+            "stream_id": "176",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 150,
+            "csv_line": 152,
+            "task_id": "64909",
+            "stream_id": "176",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 190,
+            "csv_line": 192,
+            "task_id": "64964",
+            "stream_id": "176",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        }
+      ],
+      "native_fused_calls_per_body": 80.0,
+      "semantic_family_counts": {
+        "rmsnorm": 17,
+        "add_rmsnorm_quant": 80,
+        "add_rmsnorm": 47
+      },
+      "external_gamma": {
+        "selected_calls": 80,
+        "native_add_5120_calls": 128.0,
+        "one_dependency_per_selected_fused_call": true,
+        "preexisting_gamma_calls": 0,
+        "remaining_48": "unselected initial/plain residual norms retain semantic weight offset; no extra gamma appended"
+      },
+      "remaining_standalone_residual_calls": 1,
+      "response_rules_unchanged": true,
+      "body_prediction_status": "not_requested"
+    },
+    {
+      "model": "qwen36",
+      "tp": 4,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+        "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
+        "size_bytes": 11912
+      },
+      "baseline_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
+        "size_bytes": 10720
+      },
+      "baseline_engine_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+      "baseline_body": {
+        "status": "completed",
+        "body_ms": 24.353360669478214,
+        "body_relative_error": -0.15918368229551605,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 26.360636639286785,
+        "hccl_min_us": 26.360636639285673,
+        "hccl_max_us": 26.36063663928745,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 25.922003417043015,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "observed_body_ms": {
+        "count": 52,
+        "mean": 28.963948673076924,
+        "p50": 28.988093,
+        "p90": 29.038547,
+        "min": 28.732302,
+        "max": 29.151982
+      },
+      "native_kind": "AddRmsNormDynamicQuant",
+      "predicted_contract": [
+        "add_rmsnorm_dynamic_quant_active",
+        "AddRmsNormDynamicQuant",
+        [
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [],
+            null,
+            null
+          ]
+        ],
+        [
+          [
+            [
+              16,
+              5120
+            ],
+            "int8",
+            "ND"
+          ],
+          [
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "ND"
+          ],
+          [
+            [
+              16
+            ],
+            "fp32",
+            "ND"
+          ]
+        ]
+      ],
+      "native_samples": [
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 118,
+            "csv_line": 120,
+            "task_id": "64792",
+            "stream_id": "177",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 150,
+            "csv_line": 152,
+            "task_id": "64835",
+            "stream_id": "177",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 190,
+            "csv_line": 192,
+            "task_id": "64890",
+            "stream_id": "177",
+            "device_id": "4"
+          },
+          "contract": [
+            "add_rmsnorm_dynamic_quant_active",
+            "AddRmsNormDynamicQuant",
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  5120
+                ],
+                "int8",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              1
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16
+            ],
+            [
+              1
+            ]
+          ],
+          "output_dtypes": [
+            "INT8",
+            "INT8",
+            "DT_BF16",
+            "FLOAT",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "ND",
+            "ND",
+            "ND"
+          ]
+        }
+      ],
+      "native_fused_calls_per_body": 80.0,
+      "semantic_family_counts": {
+        "rmsnorm": 17,
+        "add_rmsnorm_quant": 80,
+        "add_rmsnorm": 47
+      },
+      "external_gamma": {
+        "selected_calls": 80,
+        "native_add_5120_calls": 128.0,
+        "one_dependency_per_selected_fused_call": true,
+        "preexisting_gamma_calls": 0,
+        "remaining_48": "unselected initial/plain residual norms retain semantic weight offset; no extra gamma appended"
+      },
+      "remaining_standalone_residual_calls": 1,
+      "response_rules_unchanged": true,
+      "body_prediction_status": "not_requested"
+    },
+    {
+      "model": "qwen38",
+      "tp": 2,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+        "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
+        "size_bytes": 9000
+      },
+      "baseline_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
+        "size_bytes": 7809
+      },
+      "baseline_engine_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+      "baseline_body": {
+        "status": "completed",
+        "body_ms": 26.348812993946005,
+        "body_relative_error": -0.19448738653163689,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.139888484848719,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 32.523327332921326,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "observed_body_ms": {
+        "count": 47,
+        "mean": 32.710615021276595,
+        "p50": 32.698718,
+        "p90": 32.776813,
+        "min": 32.661651,
+        "max": 32.793362
+      },
+      "native_kind": "AddRmsNormDynamicMxQuant",
+      "predicted_contract": [
+        "AddRmsNormDynamicMxQuant",
+        [
+          16,
+          5120
+        ],
+        "bf16",
+        "fp8_e4m3",
+        [
+          16,
+          80,
+          2
+        ],
+        "fp8_e8m0"
+      ],
+      "native_samples": [
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 117,
+            "csv_line": 119,
+            "task_id": "63480",
+            "stream_id": "176",
+            "device_id": "6"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 148,
+            "csv_line": 150,
+            "task_id": "63522",
+            "stream_id": "176",
+            "device_id": "6"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 187,
+            "csv_line": 189,
+            "task_id": "63576",
+            "stream_id": "176",
+            "device_id": "6"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        }
+      ],
+      "native_fused_calls_per_body": 80.0,
+      "semantic_family_counts": {
+        "rmsnorm": 17,
+        "add_rmsnorm_quant": 80,
+        "add_rmsnorm": 47
+      },
+      "external_gamma": {
+        "selected_calls": 80,
+        "native_add_5120_calls": 128.0,
+        "one_dependency_per_selected_fused_call": true,
+        "preexisting_gamma_calls": 0,
+        "remaining_48": "unselected initial/plain residual norms retain semantic weight offset; no extra gamma appended"
+      },
+      "remaining_standalone_residual_calls": 1,
+      "response_rules_unchanged": true,
+      "body_prediction_status": "not_requested"
+    },
+    {
+      "model": "qwen38",
+      "tp": 4,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+        "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
+        "size_bytes": 10582
+      },
+      "baseline_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
+        "size_bytes": 9391
+      },
+      "baseline_engine_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+      "baseline_body": {
+        "status": "completed",
+        "body_ms": 24.601034366446296,
+        "body_relative_error": -0.15864789427507842,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 26.360636639286785,
+        "hccl_min_us": 26.360636639285673,
+        "hccl_max_us": 26.36063663928745,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 31.073902500094846,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "observed_body_ms": {
+        "count": 52,
+        "mean": 29.23987971153846,
+        "p50": 29.178051,
+        "p90": 29.387419,
+        "min": 29.114677,
+        "max": 29.43654
+      },
+      "native_kind": "AddRmsNormDynamicMxQuant",
+      "predicted_contract": [
+        "AddRmsNormDynamicMxQuant",
+        [
+          16,
+          5120
+        ],
+        "bf16",
+        "fp8_e4m3",
+        [
+          16,
+          80,
+          2
+        ],
+        "fp8_e8m0"
+      ],
+      "native_samples": [
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 117,
+            "csv_line": 119,
+            "task_id": "63404",
+            "stream_id": "177",
+            "device_id": "0"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 148,
+            "csv_line": 150,
+            "task_id": "63446",
+            "stream_id": "177",
+            "device_id": "0"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        },
+        {
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 187,
+            "csv_line": 189,
+            "task_id": "63500",
+            "stream_id": "177",
+            "device_id": "0"
+          },
+          "contract": [
+            "AddRmsNormDynamicMxQuant",
+            [
+              16,
+              5120
+            ],
+            "bf16",
+            "fp8_e4m3",
+            [
+              16,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "input_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              5120
+            ]
+          ],
+          "input_dtypes": [
+            "DT_BF16",
+            "DT_BF16",
+            "DT_BF16"
+          ],
+          "output_shapes": [
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              5120
+            ],
+            [
+              16,
+              80,
+              2
+            ],
+            []
+          ],
+          "output_dtypes": [
+            "DT_FLOAT8_E4M3FN",
+            "DT_BF16",
+            "DT_FLOAT8_E8M0",
+            "FLOAT"
+          ],
+          "input_formats": [
+            "ND",
+            "ND",
+            "ND"
+          ],
+          "output_formats": [
+            "ND",
+            "ND",
+            "NCL",
+            "ND"
+          ]
+        }
+      ],
+      "native_fused_calls_per_body": 80.0,
+      "semantic_family_counts": {
+        "rmsnorm": 17,
+        "add_rmsnorm_quant": 80,
+        "add_rmsnorm": 47
+      },
+      "external_gamma": {
+        "selected_calls": 80,
+        "native_add_5120_calls": 128.0,
+        "one_dependency_per_selected_fused_call": true,
+        "preexisting_gamma_calls": 0,
+        "remaining_48": "unselected initial/plain residual norms retain semantic weight offset; no extra gamma appended"
+      },
+      "remaining_standalone_residual_calls": 1,
+      "response_rules_unchanged": true,
+      "body_prediction_status": "not_requested"
+    }
+  ]
+}

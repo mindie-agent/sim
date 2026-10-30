@@ -129,3 +129,34 @@ python3 data/observations/a5-gdn-store-binding-20261030/caller_inventory.py
 # Bodies with the same 90-second limit and retain their earlier timeout record:
 python3 data/observations/a5-gdn-store-binding-20261030/hccl_frozen.py --resume --retry-timeouts
 ```
+
+## Structurally verified B4 caller candidates
+
+Four explicit cases are now available under
+`examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/`. They add only the
+three fusion passes and the existing `add_rmsnorm_quant` native binding described
+above. `caller_binding.py` generated them and
+`caller-binding-validation.json` retains the actual CSV sample locations,
+complete INT8/MXFP8 tensor descriptors, matching predicted contracts and call
+counts. No convolution, output-norm or other local point-response rule was added;
+the HCCL rules remain byte-for-byte equal as JSON declarations.
+
+Each declared fused call has one external gamma dependency, zero remaining
+internal weight offset and a residual return. The baseline had no separately
+declared gamma producers; the candidate adds exactly 80. Fusion consumes 127
+standalone residual calls into 80 quantized and 47 unquantized norm calls,
+leaving the final standalone residual once. The native population contains
+128 scalar `Add [5120]` calls. The other 48 norm callers retain their semantic
+weight offset and are not claimed to have an explicit native gamma producer.
+
+The four new full Body predictions have **not been run**. This stable delivery
+contains structural and sampled ABI verification only; it does not turn the
+earlier Body errors into new accuracy evidence. `caller-cases.json` is a complete
+Profiler input manifest with absolute case paths, original capture/extraction
+identities, and both `body` and `operators` scopes. Reproduce through either the
+existing Profiler pipeline with that manifest or the bounded local producer:
+
+```sh
+python3 data/observations/a5-gdn-store-binding-20261030/caller_binding.py
+python3 data/observations/a5-gdn-store-binding-20261030/caller_binding.py --predict
+```
