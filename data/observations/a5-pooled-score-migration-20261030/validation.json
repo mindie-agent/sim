@@ -1,0 +1,154 @@
+{
+  "scope": "existing_A5_Triton_score_service_coordinate_transport",
+  "new_fitted_parameters": 0,
+  "rows": [
+    {
+      "case_id": "a5_glm53flash_tp8_c4_p8k",
+      "source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_tp8_c4_p8k.json",
+        "sha256": "a75b3f8c9eaf93bff434878027bb11da5145a44274a0bdc9db437172257a4a86",
+        "size_bytes": 50408
+      },
+      "output_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_tp8_c4_p8k.json",
+        "sha256": "0dbcb36f5b139788ba8574c488bac3bb85388c4020202a44ff30e9b3239efd32",
+        "size_bytes": 53465
+      },
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": 8200,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "body_before_ms": 18.160811174909057,
+      "body_after_ms": 18.666405150545383,
+      "native_operator": {
+        "count": 121,
+        "mean_us": 48.09739669421488,
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/22ca199bf3d6ce54598d5d791bb46b46f65fb0e6e5687f9f15c4d0ae29b06467.json",
+          "sha256": "22ca199bf3d6ce54598d5d791bb46b46f65fb0e6e5687f9f15c4d0ae29b06467",
+          "size_bytes": 87842,
+          "json_pointer": "/runtime/kernels/service_regimes/8/provenance"
+        },
+        "native_tensor_ABI": "unavailable_in_A5_Triton_rows",
+        "boundary": "retained_symbol_and_source_semantics; exact_installed_binary_not_proven",
+        "scope": "retained_complete_native_call_population_within_selected_Body_geometry"
+      },
+      "score_predicted_us": 48.09739669421488,
+      "transported_feature": 34122400,
+      "actual_logical_hbm_bytes": 8537232.0,
+      "unpooled_causal_pairs": 131240,
+      "scanned_pools": 32804,
+      "score_shape": [
+        16,
+        128
+      ],
+      "score_dtype": "fp32",
+      "live_tasks": 0,
+      "live_programs": 0,
+      "native_operator_relative_error": 0.0
+    },
+    {
+      "case_id": "a5_glm53flash_heldout_c12_p4k",
+      "source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c12_p4k.json",
+        "sha256": "e67ed9ecf0239bcef319b3eb6c3e5c3b00e8ff7985fc10249ff3a7ed803813d2",
+        "size_bytes": 71970
+      },
+      "output_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c12_p4k.json",
+        "sha256": "ba31640db1e4ece39300a668e4be79148b13f106a877bb8085ccb200460caace",
+        "size_bytes": 76340
+      },
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 4,
+        "context_tokens": 4104,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "body_before_ms": 15.200685816220615,
+      "body_after_ms": 15.490146107499072,
+      "native_operator": {
+        "count": 220,
+        "mean_us": 53.70564090909091,
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/heldout-prepared/native-populations/body-operator-a5_glm53flash_heldout_c12_p4k-heldout-prepared.actual.json",
+          "sha256": "68275bb20cb0ec160ec05513dde75a4830e27237a33ad120a285a81823bcb5de",
+          "size_bytes": 1113717
+        },
+        "native_tensor_ABI": "unavailable_in_A5_Triton_rows",
+        "boundary": "retained_symbol_and_source_semantics; exact_installed_binary_not_proven",
+        "scope": "retained_complete_native_call_population_within_selected_Body_geometry"
+      },
+      "score_predicted_us": 27.626571934405675,
+      "transported_feature": 8541520,
+      "actual_logical_hbm_bytes": 2138696.0,
+      "unpooled_causal_pairs": 32852,
+      "scanned_pools": 8210,
+      "score_shape": [
+        8,
+        128
+      ],
+      "score_dtype": "fp32",
+      "live_tasks": 0,
+      "live_programs": 0,
+      "native_operator_relative_error": -0.48559273352365406
+    },
+    {
+      "case_id": "a5_glm53flash_heldout_c24_p12k",
+      "source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c24_p12k.json",
+        "sha256": "3d57ddd8081f5da3942c7efcb47af8d0b8641c8103155ceabad358ad56068fb0",
+        "size_bytes": 71972
+      },
+      "output_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c24_p12k.json",
+        "sha256": "50cab31a62b4f7c8f77c63bdf34920bcdb0f1ecafcd6b48b056ee1a5baf81a43",
+        "size_bytes": 76343
+      },
+      "geometry": {
+        "query_rows": 96,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 4,
+        "context_tokens": 12296,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "body_before_ms": 31.14720782734038,
+      "body_after_ms": 33.64147490997078,
+      "native_operator": {
+        "count": 231,
+        "mean_us": 313.76748051948056,
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/heldout-prepared/native-populations/body-operator-a5_glm53flash_heldout_c24_p12k-heldout-prepared.actual.json",
+          "sha256": "bed3a8671d5477903f83b7c60c19dea80ecc0348ed2e355bcf95f7f50ba1b3d3",
+          "size_bytes": 1362545
+        },
+        "native_tensor_ABI": "unavailable_in_A5_Triton_rows",
+        "boundary": "retained_symbol_and_source_semantics; exact_installed_binary_not_proven",
+        "scope": "retained_complete_native_call_population_within_selected_Body_geometry"
+      },
+      "score_predicted_us": 245.94716096640119,
+      "transported_feature": 306970560,
+      "actual_logical_hbm_bytes": 76782432.0,
+      "unpooled_causal_pairs": 1180656,
+      "scanned_pools": 295128,
+      "score_shape": [
+        96,
+        128
+      ],
+      "score_dtype": "fp32",
+      "live_tasks": 0,
+      "live_programs": 0,
+      "native_operator_relative_error": -0.2161483383835524
+    }
+  ]
+}

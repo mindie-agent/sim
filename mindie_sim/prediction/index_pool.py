@@ -131,6 +131,8 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     output_width = plan.index_topk + (plan.index_kpool - 1 if plan.index_kpool_always_select_tail else 0)
     common = (("pool_size", plan.index_kpool), ("score_mode", score_mode),
               ("valid_query_rows", valid), ("padded_query_rows", tokens),
+              ("causal_token_pairs", sum(v.q_len * v.context + v.q_len * (v.q_len + 1) // 2
+                                          for v in views)),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
               ("native_owner_schedule", "not_selected"),

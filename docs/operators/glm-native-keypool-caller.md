@@ -24,10 +24,11 @@ contract. The native caller uses simple resource envelopes for `KeyPool` and
 }
 ```
 
-This is a conditional example. `tail_capacity` declares the real persistent
+`tail_capacity` declares the real persistent
 rollback ring, not a value inferred from q6. It defaults to the pool size;
 a larger capacity enables the source's retained-hidden reprojection. The
-example capacity 9 is a scenario, not an observed cache dimension.
+retained 131K capture's `_write_keypool_caches_kernel` output
+`[7646,9,256]` establishes capacity 9 for this capture.
 `block_table_columns` is the allocated table width, which can exceed the
 active context. It defaults to `ceil(runtime.max_model_len / 128)`; the retained
 B4/B8 tables have 8195 columns. All current requests must be NoPE BF16 decode
@@ -97,3 +98,33 @@ Tests cover captured B4/B8 shapes, padded dummy ownership, valid pool/token
 conservation, rollback work and residency, and isolated synthetic native
 service replacement. These establish structure and Engine behavior. They are
 not evidence that Body accuracy or native kernel accuracy passed.
+
+## Explicit operator calibration and remaining errors
+
+`data/observations/a3-native-keypool-20261030/producer.py` creates the explicit
+`examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool.json` case.
+It streams the retained CSVs, assigns two native responses, and runs all 45
+layers for B1 through B8. It does not change the default caller or fit Body
+latency. The case declares q6 graph rows from the native shapes; B5/B6 are
+prediction-only scenarios.
+
+- KeyPool uses independent short-context static-on q6 calls with the same BF16
+  WK/gate and FP32 state ABI. Equal-geometry affine assignment gives
+  `28.96730454 + 0.1060826424 * query_rows` microseconds.
+- PoolKeyIndexer uses only long-context B1/B2 means. Nonnegative affine
+  assignment gives `41.14708824` microseconds with a zero row slope. Its
+  extension to larger batches is an explicit extrapolation. Short-context
+  calls include approximately 55/489 microsecond regimes and are not blended.
+- Long-context B3/B4/B7/B8 were examined earlier; they are validation after
+  parameter assignment, not pristine holdouts. Native KeyPool passes all six
+  recorded geometries within 15%. PoolKeyIndexer fails B7/B8 at -27.9%/-32.2%.
+- The full Body passes five of six observed populations within 15%; B8 remains
+  +24.6%. B1/B2/B3/B4/B7/B8 predictions are
+  22.621/25.407/28.159/30.978/37.364/39.344 ms. Per-layer comparisons and native
+  operator checks remain in `validation.json`; a Body pass does not imply
+  that every native operator or layer passed.
+
+Installed CANN binary identity, internal score-cache reuse, actual sequence
+length values, sparse-attention valid indices and native scheduling remain
+unbound. These are observed service responses in a declared execution regime,
+not recovered hardware throughput or a proof of the private kernel algorithm.

@@ -1,0 +1,5239 @@
+{
+  "scope": "full_target_body_and_topology_aligned_layer_spans; not_serving",
+  "case": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool.json",
+    "sha256": "86af932def74d7243fec0875782f6b45143ea7785165e48f5617ce3726f9b27e",
+    "size_bytes": 19358
+  },
+  "retained_body": {
+    "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/182a821a5620a867118b292bd3930907650607a7ab6935d76f9caafd0f9a764f.json",
+    "sha256": "182a821a5620a867118b292bd3930907650607a7ab6935d76f9caafd0f9a764f",
+    "size_bytes": 1143422
+  },
+  "model_layers": 45,
+  "calibration": {
+    "schema": "mindie-sim.native-keypool-service/1",
+    "rules": [
+      {
+        "id": "a3-native-cann_key_pool-operator-calibration",
+        "match": {
+          "hardware": "Ascend910_9362",
+          "recipe": "cann_key_pool",
+          "dtype": "bf16",
+          "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+          "metadata.pool_size": 4,
+          "local_shape.1": 128,
+          "local_shape.2": 4096,
+          "metadata.tail_capacity": 9
+        },
+        "coordinates": {
+          "rows": {
+            "path": "metadata.padded_query_rows"
+          }
+        },
+        "domain": {
+          "rows": {
+            "min": 6,
+            "max": 60
+          }
+        },
+        "response": {
+          "fixed_us": 28.96730454190808,
+          "terms": [
+            {
+              "coordinate": "rows",
+              "us_per_unit": 0.10608264244624804
+            }
+          ]
+        },
+        "execution": {
+          "kind": "joint_native",
+          "resource": "observed_a3_local_native",
+          "reference_rate": 1000000000.0,
+          "native_kernel": "KeyPool"
+        },
+        "provenance": {
+          "scope": "native_kernel_response_not_body_fit",
+          "training": "independent_short_context_same_BF16_WK_gate_state_ABI",
+          "assignment_batches": [
+            1,
+            3,
+            4,
+            5,
+            6,
+            7,
+            9,
+            10
+          ],
+          "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+          "validation_batches": [
+            3,
+            4,
+            7,
+            8
+          ],
+          "validation_history": "previously_examined_not_pristine_holdout",
+          "source": {
+            "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+            "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+            "size_bytes": 31548884
+          },
+          "source_kernel_binary_identity": "not_established",
+          "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+          "extrapolation": "long_context_has_same_producer_ABI"
+        }
+      },
+      {
+        "id": "a3-native-cann_pool_key_indexer-operator-calibration",
+        "match": {
+          "hardware": "Ascend910_9362",
+          "recipe": "cann_pool_key_indexer",
+          "dtype": "bf16",
+          "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+          "metadata.pool_size": 4,
+          "local_shape.1": 32,
+          "local_shape.2": 128,
+          "metadata.topk_tokens": 2048
+        },
+        "coordinates": {
+          "rows": {
+            "path": "metadata.padded_query_rows"
+          },
+          "scanned_pools": {
+            "path": "metadata.scanned_pools"
+          }
+        },
+        "domain": {
+          "rows": {
+            "min": 6,
+            "max": 48
+          },
+          "scanned_pools": {
+            "min": 196804,
+            "max": 1574432
+          }
+        },
+        "response": {
+          "fixed_us": 41.147088235294135,
+          "terms": [
+            {
+              "coordinate": "rows",
+              "us_per_unit": 0.0
+            }
+          ]
+        },
+        "execution": {
+          "kind": "joint_native",
+          "resource": "observed_a3_local_native",
+          "reference_rate": 1000000000.0,
+          "native_kernel": "PoolKeyIndexer"
+        },
+        "provenance": {
+          "scope": "native_kernel_response_not_body_fit",
+          "training": "long_context_B1_B2_reassigned_from_previously_inspected_capture",
+          "assignment_batches": [
+            1,
+            2
+          ],
+          "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+          "validation_batches": [
+            3,
+            4,
+            7,
+            8
+          ],
+          "validation_history": "previously_examined_not_pristine_holdout",
+          "source": {
+            "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+            "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+            "size_bytes": 86903800
+          },
+          "source_kernel_binary_identity": "not_established",
+          "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+          "extrapolation": "B3_to_B8_outside_B1_B2_training_geometry; score_reuse_unidentified"
+        }
+      }
+    ],
+    "assignments": [
+      {
+        "native": "KeyPool",
+        "fixed_us": 28.96730454190808,
+        "us_per_query_row": 0.10608264244624804,
+        "training_groups": [
+          {
+            "native": "KeyPool",
+            "batch": 1,
+            "tokens": 6,
+            "count": 96,
+            "sum_us": 2813.7569999999987,
+            "min_us": 26.481,
+            "max_us": 33.3,
+            "first_line": 195,
+            "last_line": 93983,
+            "input_shapes": "\"6,4096;128,4096;128,4096;4,128;3,4,256;1,3;1;128;128;;;2;\"",
+            "output_shapes": "\"2,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 29.309968749999985
+          },
+          {
+            "native": "KeyPool",
+            "batch": 9,
+            "tokens": 54,
+            "count": 72,
+            "sum_us": 2385.4300000000007,
+            "min_us": 29.721,
+            "max_us": 36.98,
+            "first_line": 7775,
+            "last_line": 83813,
+            "input_shapes": "\"54,4096;128,4096;128,4096;4,128;19,4,256;9,3;9;128;128;;;10;\"",
+            "output_shapes": "\"22,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 33.13097222222223
+          },
+          {
+            "native": "KeyPool",
+            "batch": 10,
+            "tokens": 60,
+            "count": 204,
+            "sum_us": 7164.066999999997,
+            "min_us": 32.201,
+            "max_us": 38.941,
+            "first_line": 10344,
+            "last_line": 78695,
+            "input_shapes": "\"60,4096;128,4096;128,4096;4,128;21,4,256;10,3;10;128;128;;;11;\"",
+            "output_shapes": "\"25,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 35.117975490196066
+          },
+          {
+            "native": "KeyPool",
+            "batch": 3,
+            "tokens": 18,
+            "count": 12,
+            "sum_us": 353.389,
+            "min_us": 27.92,
+            "max_us": 34.861,
+            "first_line": 51128,
+            "last_line": 53089,
+            "input_shapes": "\"18,4096;128,4096;128,4096;4,128;7,4,256;3,3;3;128;128;;;4;\"",
+            "output_shapes": "\"7,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 29.449083333333334
+          },
+          {
+            "native": "KeyPool",
+            "batch": 5,
+            "tokens": 30,
+            "count": 24,
+            "sum_us": 771.174,
+            "min_us": 30.1,
+            "max_us": 34.801,
+            "first_line": 53685,
+            "last_line": 88900,
+            "input_shapes": "\"30,4096;128,4096;128,4096;4,128;11,4,256;5,3;5;128;128;;;6;\"",
+            "output_shapes": "\"12,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 32.13225
+          },
+          {
+            "native": "KeyPool",
+            "batch": 6,
+            "tokens": 36,
+            "count": 12,
+            "sum_us": 419.53,
+            "min_us": 32.221,
+            "max_us": 37.541,
+            "first_line": 56238,
+            "last_line": 58198,
+            "input_shapes": "\"36,4096;128,4096;128,4096;4,128;13,4,256;6,3;6;128;128;;;7;\"",
+            "output_shapes": "\"15,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 34.96083333333333
+          },
+          {
+            "native": "KeyPool",
+            "batch": 7,
+            "tokens": 42,
+            "count": 12,
+            "sum_us": 410.949,
+            "min_us": 31.7,
+            "max_us": 36.48,
+            "first_line": 84397,
+            "last_line": 86357,
+            "input_shapes": "\"42,4096;128,4096;128,4096;4,128;15,4,256;7,3;7;128;128;;;8;\"",
+            "output_shapes": "\"17,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 34.24575
+          },
+          {
+            "native": "KeyPool",
+            "batch": 4,
+            "tokens": 24,
+            "count": 12,
+            "sum_us": 384.407,
+            "min_us": 30.441,
+            "max_us": 33.561,
+            "first_line": 89482,
+            "last_line": 91443,
+            "input_shapes": "\"24,4096;128,4096;128,4096;4,128;9,4,256;4,3;4;128;128;;;5;\"",
+            "output_shapes": "\"10,128\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 32.03391666666666
+          }
+        ]
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "fixed_us": 41.147088235294135,
+        "us_per_query_row": 0.0,
+        "training_groups": [
+          {
+            "native": "PoolKeyIndexer",
+            "batch": 1,
+            "tokens": 6,
+            "count": 816,
+            "sum_us": 34967.51200000003,
+            "min_us": 32.9,
+            "max_us": 66.421,
+            "first_line": 3085,
+            "last_line": 260068,
+            "input_shapes": "\"7,32,128;38230,32,1,128;7,32;2;2;2;2,8195;;\"",
+            "output_shapes": "\"7,2051;\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 42.85234313725494
+          },
+          {
+            "native": "PoolKeyIndexer",
+            "batch": 2,
+            "tokens": 12,
+            "count": 36,
+            "sum_us": 1419.906,
+            "min_us": 37.101,
+            "max_us": 41.461,
+            "first_line": 214567,
+            "last_line": 221608,
+            "input_shapes": "\"13,32,128;38230,32,1,128;13,32;3;3;3;3,8195;;\"",
+            "output_shapes": "\"13,2051;\"",
+            "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+            "block_num": "20",
+            "mix_block_num": "40",
+            "mean_us": 39.441833333333335
+          }
+        ]
+      }
+    ],
+    "long_context_operator_groups": [
+      {
+        "native": "KeyPool",
+        "batch": 1,
+        "tokens": 6,
+        "count": 816,
+        "sum_us": 23693.406999999992,
+        "min_us": 25.58,
+        "max_us": 32.34,
+        "first_line": 3076,
+        "last_line": 260059,
+        "input_shapes": "\"6,4096;128,4096;128,4096;4,128;3,4,256;1,3;1;128;128;;;2;\"",
+        "output_shapes": "\"2,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 29.036037990196068
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 1,
+        "tokens": 6,
+        "count": 816,
+        "sum_us": 34967.51200000003,
+        "min_us": 32.9,
+        "max_us": 66.421,
+        "first_line": 3085,
+        "last_line": 260068,
+        "input_shapes": "\"7,32,128;38230,32,1,128;7,32;2;2;2;2,8195;;\"",
+        "output_shapes": "\"7,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 42.85234313725494
+      },
+      {
+        "native": "KeyPool",
+        "batch": 4,
+        "tokens": 24,
+        "count": 156,
+        "sum_us": 5050.4609999999975,
+        "min_us": 29.781,
+        "max_us": 34.62,
+        "first_line": 178984,
+        "last_line": 211435,
+        "input_shapes": "\"24,4096;128,4096;128,4096;4,128;9,4,256;4,3;4;128;128;;;5;\"",
+        "output_shapes": "\"10,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 32.374749999999985
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 4,
+        "tokens": 24,
+        "count": 156,
+        "sum_us": 6122.780999999996,
+        "min_us": 36.301,
+        "max_us": 41.401,
+        "first_line": 178993,
+        "last_line": 211444,
+        "input_shapes": "\"25,32,128;38230,32,1,128;25,32;5;5;5;5,8195;;\"",
+        "output_shapes": "\"25,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 39.24859615384613
+      },
+      {
+        "native": "KeyPool",
+        "batch": 3,
+        "tokens": 18,
+        "count": 12,
+        "sum_us": 354.42600000000004,
+        "min_us": 28.161,
+        "max_us": 34.68,
+        "first_line": 212017,
+        "last_line": 213976,
+        "input_shapes": "\"18,4096;128,4096;128,4096;4,128;7,4,256;3,3;3;128;128;;;4;\"",
+        "output_shapes": "\"7,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 29.535500000000003
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 3,
+        "tokens": 18,
+        "count": 12,
+        "sum_us": 474.971,
+        "min_us": 38.581,
+        "max_us": 40.561,
+        "first_line": 212026,
+        "last_line": 213985,
+        "input_shapes": "\"19,32,128;38230,32,1,128;19,32;4;4;4;4,8195;;\"",
+        "output_shapes": "\"19,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 39.58091666666667
+      },
+      {
+        "native": "KeyPool",
+        "batch": 2,
+        "tokens": 12,
+        "count": 36,
+        "sum_us": 1035.083,
+        "min_us": 26.8,
+        "max_us": 30.901,
+        "first_line": 214558,
+        "last_line": 221599,
+        "input_shapes": "\"12,4096;128,4096;128,4096;4,128;5,4,256;2,3;2;128;128;;;3;\"",
+        "output_shapes": "\"5,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 28.75230555555556
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 2,
+        "tokens": 12,
+        "count": 36,
+        "sum_us": 1419.906,
+        "min_us": 37.101,
+        "max_us": 41.461,
+        "first_line": 214567,
+        "last_line": 221608,
+        "input_shapes": "\"13,32,128;38230,32,1,128;13,32;3;3;3;3,8195;;\"",
+        "output_shapes": "\"13,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 39.441833333333335
+      },
+      {
+        "native": "KeyPool",
+        "batch": 8,
+        "tokens": 48,
+        "count": 144,
+        "sum_us": 4617.37,
+        "min_us": 29.56,
+        "max_us": 36.101,
+        "first_line": 227248,
+        "last_line": 254983,
+        "input_shapes": "\"48,4096;128,4096;128,4096;4,128;17,4,256;8,3;8;128;128;;;9;\"",
+        "output_shapes": "\"20,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 32.06506944444445
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 8,
+        "tokens": 48,
+        "count": 144,
+        "sum_us": 8736.672,
+        "min_us": 57.461,
+        "max_us": 63.901,
+        "first_line": 227257,
+        "last_line": 254992,
+        "input_shapes": "\"49,32,128;38230,32,1,128;49,32;9;9;9;9,8195;;\"",
+        "output_shapes": "\"49,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 60.67133333333334
+      },
+      {
+        "native": "KeyPool",
+        "batch": 7,
+        "tokens": 42,
+        "count": 12,
+        "sum_us": 413.846,
+        "min_us": 31.98,
+        "max_us": 36.861,
+        "first_line": 255559,
+        "last_line": 257519,
+        "input_shapes": "\"42,4096;128,4096;128,4096;4,128;15,4,256;7,3;7;128;128;;;8;\"",
+        "output_shapes": "\"17,128\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 34.48716666666667
+      },
+      {
+        "native": "PoolKeyIndexer",
+        "batch": 7,
+        "tokens": 42,
+        "count": 12,
+        "sum_us": 684.9730000000002,
+        "min_us": 55.581,
+        "max_us": 61.262,
+        "first_line": 255568,
+        "last_line": 257528,
+        "input_shapes": "\"43,32,128;38230,32,1,128;43,32;8;8;8;8,8195;;\"",
+        "output_shapes": "\"43,2051;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+        "block_num": "20",
+        "mix_block_num": "40",
+        "mean_us": 57.081083333333346
+      }
+    ],
+    "tail_capacity_evidence": {
+      "line": 248,
+      "input_shapes": "\"9,128;9,128;6,128\"",
+      "output_shapes": "\"7646,9,256;38230,32,1,128\""
+    },
+    "sources": [
+      {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+        "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+        "size_bytes": 31548884
+      },
+      {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+        "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+        "size_bytes": 86903800
+      }
+    ],
+    "new_parameters": 4,
+    "independent_validation_claim": false
+  },
+  "rows": [
+    {
+      "batch": 1,
+      "prediction_ms": 22.621472463449436,
+      "observed_mean_ms": 22.603161617647057,
+      "evaluation_role": "operator_training_Body_check",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 1,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 1
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 6
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 6
+        },
+        "graph_query_tokens": 6,
+        "padded_query_tokens_by_replica": {
+          "0": 6
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 6,
+        "padded_query_tokens": 6
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.25812853164811383,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.7896328382352941,
+            "p50": 0.723284,
+            "p90": 0.803716,
+            "min": 0.374348,
+            "max": 5.555411
+          },
+          "relative_error": -0.6731030940595242,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.25812853164811395,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.24770792647058823,
+            "p50": 0.24754500000000002,
+            "p90": 0.250385,
+            "min": 0.243765,
+            "max": 0.251845
+          },
+          "relative_error": 0.04206811354808626,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.25812853164811134,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.24496989705882352,
+            "p50": 0.24472500000000003,
+            "p90": 0.247365,
+            "min": 0.240825,
+            "max": 0.253685
+          },
+          "relative_error": 0.05371531256400908,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 0.6723057939293443,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6735890294117647,
+            "p50": 0.6642135,
+            "p90": 0.751815,
+            "min": 0.612292,
+            "max": 0.793096
+          },
+          "relative_error": -0.0019050718262751953,
+          "passed": true
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.4661846172671609,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.46642047058823527,
+            "p50": 0.458959,
+            "p90": 0.492129,
+            "min": 0.439129,
+            "max": 0.526491
+          },
+          "relative_error": -0.0005056667448084529,
+          "passed": true
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.4661846172671613,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4618740294117647,
+            "p50": 0.453559,
+            "p90": 0.48753,
+            "min": 0.431529,
+            "max": 0.520931
+          },
+          "relative_error": 0.009332821464083096,
+          "passed": true
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4625288676470588,
+            "p50": 0.455909,
+            "p90": 0.48779,
+            "min": 0.419168,
+            "max": 0.513211
+          },
+          "relative_error": 0.007903830173239701,
+          "passed": true
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 0.6723057939293442,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6606143382352941,
+            "p50": 0.637733,
+            "p90": 0.738055,
+            "min": 0.602292,
+            "max": 0.766876
+          },
+          "relative_error": 0.01769785337278873,
+          "passed": true
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4673346617647059,
+            "p50": 0.460439,
+            "p90": 0.489149,
+            "min": 0.425849,
+            "max": 0.50097
+          },
+          "relative_error": -0.0024608585487778667,
+          "passed": true
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.4661846172671784,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.46315660294117644,
+            "p50": 0.458199,
+            "p90": 0.48871,
+            "min": 0.418948,
+            "max": 0.51355
+          },
+          "relative_error": 0.006537776438408027,
+          "passed": true
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.46618461726717886,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.46229225,
+            "p50": 0.4586995,
+            "p90": 0.488749,
+            "min": 0.427669,
+            "max": 0.50419
+          },
+          "relative_error": 0.008419711269610941,
+          "passed": true
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 0.6723057939293637,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6702007647058823,
+            "p50": 0.647213,
+            "p90": 0.740555,
+            "min": 0.611333,
+            "max": 0.782636
+          },
+          "relative_error": 0.0031408934968990554,
+          "passed": true
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.46618461726717886,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4619553823529412,
+            "p50": 0.4610195,
+            "p90": 0.48977,
+            "min": 0.420788,
+            "max": 0.50525
+          },
+          "relative_error": 0.009155072277102327,
+          "passed": true
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.46618461726717886,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44311085294117647,
+            "p50": 0.4385285,
+            "p90": 0.475949,
+            "min": 0.416608,
+            "max": 0.48905
+          },
+          "relative_error": 0.05207221663123085,
+          "passed": true
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.46618461726717886,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44698157352941176,
+            "p50": 0.44504900000000003,
+            "p90": 0.46513,
+            "min": 0.408768,
+            "max": 0.525971
+          },
+          "relative_error": 0.04296160037680741,
+          "passed": true
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 0.6723057939293637,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.649054205882353,
+            "p50": 0.6284925,
+            "p90": 0.726795,
+            "min": 0.592892,
+            "max": 0.763255
+          },
+          "relative_error": 0.03582379997892704,
+          "passed": true
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.46618461726717086,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4544096764705882,
+            "p50": 0.4518295,
+            "p90": 0.48283,
+            "min": 0.426248,
+            "max": 0.49419
+          },
+          "relative_error": 0.025912610153989046,
+          "passed": true
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.43821026470588237,
+            "p50": 0.43649899999999997,
+            "p90": 0.459249,
+            "min": 0.410289,
+            "max": 0.49345
+          },
+          "relative_error": 0.06383773912748358,
+          "passed": true
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4302387794117647,
+            "p50": 0.4277485,
+            "p90": 0.445789,
+            "min": 0.410188,
+            "max": 0.48293
+          },
+          "relative_error": 0.08354857715184005,
+          "passed": true
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 0.672305793929338,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6693310882352941,
+            "p50": 0.6534234999999999,
+            "p90": 0.736015,
+            "min": 0.620012,
+            "max": 0.781816
+          },
+          "relative_error": 0.004444296322596797,
+          "passed": true
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44649275,
+            "p50": 0.445509,
+            "p90": 0.46493,
+            "min": 0.425369,
+            "max": 0.49869
+          },
+          "relative_error": 0.044103442367568135,
+          "passed": true
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4437841029411765,
+            "p50": 0.440539,
+            "p90": 0.460849,
+            "min": 0.415989,
+            "max": 0.49815
+          },
+          "relative_error": 0.05047615310581488,
+          "passed": true
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.45400592647058824,
+            "p50": 0.447259,
+            "p90": 0.484149,
+            "min": 0.418069,
+            "max": 0.50637
+          },
+          "relative_error": 0.026824959954267813,
+          "passed": true
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 0.672305793929338,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6579084117647058,
+            "p50": 0.637373,
+            "p90": 0.735954,
+            "min": 0.602012,
+            "max": 0.776175
+          },
+          "relative_error": 0.021883566021012157,
+          "passed": true
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4530134558823529,
+            "p50": 0.451199,
+            "p90": 0.478229,
+            "min": 0.426628,
+            "max": 0.50101
+          },
+          "relative_error": 0.029074547817029117,
+          "passed": true
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4361739558823529,
+            "p50": 0.43584849999999997,
+            "p90": 0.456589,
+            "min": 0.406768,
+            "max": 0.48371
+          },
+          "relative_error": 0.06880434051615802,
+          "passed": true
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44299742647058826,
+            "p50": 0.436159,
+            "p90": 0.47787,
+            "min": 0.413588,
+            "max": 0.49603
+          },
+          "relative_error": 0.05234159254898785,
+          "passed": true
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 0.672305793929338,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6577060882352941,
+            "p50": 0.6372925,
+            "p90": 0.732695,
+            "min": 0.599012,
+            "max": 0.776576
+          },
+          "relative_error": 0.022197917816477508,
+          "passed": true
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4504778529411765,
+            "p50": 0.448499,
+            "p90": 0.48259,
+            "min": 0.423788,
+            "max": 0.50009
+          },
+          "relative_error": 0.034866895727361014,
+          "passed": true
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44325055882352943,
+            "p50": 0.440619,
+            "p90": 0.456009,
+            "min": 0.416409,
+            "max": 0.49753
+          },
+          "relative_error": 0.05174061935647378,
+          "passed": true
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.466184617267162,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4512996470588235,
+            "p50": 0.45030899999999996,
+            "p90": 0.48143,
+            "min": 0.422509,
+            "max": 0.51153
+          },
+          "relative_error": 0.032982454795490446,
+          "passed": true
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 0.672305793929338,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6634761029411764,
+            "p50": 0.6435029999999999,
+            "p90": 0.761655,
+            "min": 0.604412,
+            "max": 0.774195
+          },
+          "relative_error": 0.013308227604611034,
+          "passed": true
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.4661846172671833,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44646486764705884,
+            "p50": 0.44494900000000004,
+            "p90": 0.45947,
+            "min": 0.422669,
+            "max": 0.483509
+          },
+          "relative_error": 0.044168648082100415,
+          "passed": true
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.44725925,
+            "p50": 0.4433285,
+            "p90": 0.47129,
+            "min": 0.417808,
+            "max": 0.491989
+          },
+          "relative_error": 0.04231408800861547,
+          "passed": true
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4400487941176471,
+            "p50": 0.4379385,
+            "p90": 0.458269,
+            "min": 0.411268,
+            "max": 0.488369
+          },
+          "relative_error": 0.05939301163618871,
+          "passed": true
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 0.6723057939293824,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.6638677205882353,
+            "p50": 0.644123,
+            "p90": 0.737655,
+            "min": 0.620193,
+            "max": 0.781296
+          },
+          "relative_error": 0.012710473908371878,
+          "passed": true
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.45029663235294115,
+            "p50": 0.450899,
+            "p90": 0.47679,
+            "min": 0.423068,
+            "max": 0.495589
+          },
+          "relative_error": 0.035283374941550205,
+          "passed": true
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4457004264705882,
+            "p50": 0.44282849999999996,
+            "p90": 0.460629,
+            "min": 0.421768,
+            "max": 0.48839
+          },
+          "relative_error": 0.04595954946417535,
+          "passed": true
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.46264601470588235,
+            "p50": 0.45748900000000003,
+            "p90": 0.49615,
+            "min": 0.432029,
+            "max": 0.535131
+          },
+          "relative_error": 0.00764861783913684,
+          "passed": true
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 0.6723057939293824,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.654506205882353,
+            "p50": 0.6327325,
+            "p90": 0.732775,
+            "min": 0.606272,
+            "max": 0.761575
+          },
+          "relative_error": 0.02719544579876576,
+          "passed": true
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4546964705882353,
+            "p50": 0.453689,
+            "p90": 0.471469,
+            "min": 0.428949,
+            "max": 0.49699
+          },
+          "relative_error": 0.025265528593327202,
+          "passed": true
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4533666911764706,
+            "p50": 0.450129,
+            "p90": 0.48427,
+            "min": 0.411468,
+            "max": 0.49263
+          },
+          "relative_error": 0.02827275655702599,
+          "passed": true
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.4484735882352941,
+            "p50": 0.446309,
+            "p90": 0.461309,
+            "min": 0.418389,
+            "max": 0.49407
+          },
+          "relative_error": 0.03949179950945303,
+          "passed": true
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 0.6723057939293824,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.659875,
+            "p50": 0.638563,
+            "p90": 0.728774,
+            "min": 0.607832,
+            "max": 0.785755
+          },
+          "relative_error": 0.018838104079382356,
+          "passed": true
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.4661846172671673,
+          "observed_ms": {
+            "count": 68,
+            "mean": 0.46031948529411765,
+            "p50": 0.455999,
+            "p90": 0.49103,
+            "min": 0.422729,
+            "max": 0.51559
+          },
+          "relative_error": 0.012741437545930046,
+          "passed": true
+        }
+      ],
+      "elapsed_seconds": 2.9265753329964355,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": 0.0008101010872780812,
+      "passed": true
+    },
+    {
+      "batch": 2,
+      "prediction_ms": 25.407438123071554,
+      "observed_mean_ms": 25.713127333333333,
+      "evaluation_role": "operator_training_Body_check",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 2,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 2
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 12
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 12
+        },
+        "graph_query_tokens": 12,
+        "padded_query_tokens_by_replica": {
+          "0": 12
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 12,
+        "padded_query_tokens": 12
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.26088548344774287,
+          "observed_ms": {
+            "count": 3,
+            "mean": 2.1261026666666667,
+            "p50": 0.744795,
+            "p90": 4.912638,
+            "min": 0.720875,
+            "max": 4.912638
+          },
+          "relative_error": -0.8772940330972997,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.26088548344774243,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.260285,
+            "p50": 0.260645,
+            "p90": 0.262265,
+            "min": 0.257945,
+            "max": 0.262265
+          },
+          "relative_error": 0.0023070228700941,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.26088548344774254,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.26364533333333334,
+            "p50": 0.263245,
+            "p90": 0.265125,
+            "min": 0.262566,
+            "max": 0.265125
+          },
+          "relative_error": -0.010468039963754894,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 0.742980576087346,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.7218413333333333,
+            "p50": 0.724635,
+            "p90": 0.730674,
+            "min": 0.710215,
+            "max": 0.730674
+          },
+          "relative_error": 0.029285165281953907,
+          "passed": true
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.5307095269602389,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5225303333333333,
+            "p50": 0.51749,
+            "p90": 0.536711,
+            "min": 0.51339,
+            "max": 0.536711
+          },
+          "relative_error": 0.015653050368825028,
+          "passed": true
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.5307095269602398,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.531844,
+            "p50": 0.536631,
+            "p90": 0.539791,
+            "min": 0.51911,
+            "max": 0.539791
+          },
+          "relative_error": -0.0021330936134660305,
+          "passed": true
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.5307095269602398,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5287173333333333,
+            "p50": 0.536291,
+            "p90": 0.539951,
+            "min": 0.50991,
+            "max": 0.539951
+          },
+          "relative_error": 0.0037679748729753104,
+          "passed": true
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 0.7429805760873434,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6896073333333333,
+            "p50": 0.695694,
+            "p90": 0.700274,
+            "min": 0.672854,
+            "max": 0.700274
+          },
+          "relative_error": 0.07739657073543782,
+          "passed": true
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.5307095269602478,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.51953,
+            "p50": 0.51587,
+            "p90": 0.53237,
+            "min": 0.51035,
+            "max": 0.53237
+          },
+          "relative_error": 0.021518539757565014,
+          "passed": true
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.5307095269602549,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5083503333333333,
+            "p50": 0.50963,
+            "p90": 0.513011,
+            "min": 0.50241,
+            "max": 0.513011
+          },
+          "relative_error": 0.04398382800363043,
+          "passed": true
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.5307095269602549,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5084236666666667,
+            "p50": 0.50575,
+            "p90": 0.535031,
+            "min": 0.48449,
+            "max": 0.535031
+          },
+          "relative_error": 0.043833247259512875,
+          "passed": true
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 0.7429805760873602,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.7208676666666667,
+            "p50": 0.721655,
+            "p90": 0.739234,
+            "min": 0.701714,
+            "max": 0.739234
+          },
+          "relative_error": 0.03067540748906783,
+          "passed": true
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.5307095269602549,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4990293333333333,
+            "p50": 0.487169,
+            "p90": 0.52521,
+            "min": 0.484709,
+            "max": 0.52521
+          },
+          "relative_error": 0.06348363014115721,
+          "passed": true
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.5307095269602549,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.49890999999999996,
+            "p50": 0.49859,
+            "p90": 0.50037,
+            "min": 0.49777,
+            "max": 0.50037
+          },
+          "relative_error": 0.06373800276654085,
+          "passed": true
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.5307095269602549,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4810566666666667,
+            "p50": 0.47637,
+            "p90": 0.50241,
+            "min": 0.46439,
+            "max": 0.50241
+          },
+          "relative_error": 0.10321623986139161,
+          "passed": true
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 0.7429805760873567,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.687867,
+            "p50": 0.696134,
+            "p90": 0.701894,
+            "min": 0.665573,
+            "max": 0.701894
+          },
+          "relative_error": 0.08012243077129244,
+          "passed": true
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.50345,
+            "p50": 0.50857,
+            "p90": 0.525831,
+            "min": 0.475949,
+            "max": 0.525831
+          },
+          "relative_error": 0.05414545031337248,
+          "passed": true
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4762163333333333,
+            "p50": 0.46445,
+            "p90": 0.50947,
+            "min": 0.454729,
+            "max": 0.50947
+          },
+          "relative_error": 0.11442949309508643,
+          "passed": true
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.47310266666666667,
+            "p50": 0.477509,
+            "p90": 0.48021,
+            "min": 0.461589,
+            "max": 0.48021
+          },
+          "relative_error": 0.12176397292258057,
+          "passed": true
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 0.7429805760873478,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.699667,
+            "p50": 0.694933,
+            "p90": 0.724634,
+            "min": 0.679434,
+            "max": 0.724634
+          },
+          "relative_error": 0.06190598682994586,
+          "passed": true
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.48205633333333336,
+            "p50": 0.47497,
+            "p90": 0.50141,
+            "min": 0.469789,
+            "max": 0.50141
+          },
+          "relative_error": 0.10092843981637123,
+          "passed": true
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4786896666666667,
+            "p50": 0.462669,
+            "p90": 0.514771,
+            "min": 0.458629,
+            "max": 0.514771
+          },
+          "relative_error": 0.10867136668279986,
+          "passed": true
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.50113,
+            "p50": 0.50701,
+            "p90": 0.51749,
+            "min": 0.47889,
+            "max": 0.51749
+          },
+          "relative_error": 0.059025655938114596,
+          "passed": true
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 0.7429805760873478,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6863403333333333,
+            "p50": 0.675513,
+            "p90": 0.711634,
+            "min": 0.671874,
+            "max": 0.711634
+          },
+          "relative_error": 0.08252500982847844,
+          "passed": true
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.500297,
+            "p50": 0.50393,
+            "p90": 0.512151,
+            "min": 0.48481,
+            "max": 0.512151
+          },
+          "relative_error": 0.060788945287034046,
+          "passed": true
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.453489,
+            "p50": 0.453329,
+            "p90": 0.453869,
+            "min": 0.453269,
+            "max": 0.453869
+          },
+          "relative_error": 0.17028092624135827,
+          "passed": false
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.5307095269602673,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.47728933333333334,
+            "p50": 0.474729,
+            "p90": 0.48431,
+            "min": 0.472829,
+            "max": 0.48431
+          },
+          "relative_error": 0.11192413049303562,
+          "passed": true
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 0.7429805760873478,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6762736666666667,
+            "p50": 0.675894,
+            "p90": 0.677373,
+            "min": 0.675554,
+            "max": 0.677373
+          },
+          "relative_error": 0.09863892786107953,
+          "passed": true
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.5307095269602637,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.49175633333333335,
+            "p50": 0.485209,
+            "p90": 0.51269,
+            "min": 0.47737,
+            "max": 0.51269
+          },
+          "relative_error": 0.07921238830395749,
+          "passed": true
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.50363,
+            "p50": 0.49999,
+            "p90": 0.51925,
+            "min": 0.49165,
+            "max": 0.51925
+          },
+          "relative_error": 0.05376869320772215,
+          "passed": true
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.48426966666666665,
+            "p50": 0.48697,
+            "p90": 0.50689,
+            "min": 0.458949,
+            "max": 0.50689
+          },
+          "relative_error": 0.09589669452805927,
+          "passed": true
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 0.7429805760873762,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6881536666666667,
+            "p50": 0.694154,
+            "p90": 0.698074,
+            "min": 0.672233,
+            "max": 0.698074
+          },
+          "relative_error": 0.07967248025616791,
+          "passed": true
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.49021666666666663,
+            "p50": 0.48661,
+            "p90": 0.50403,
+            "min": 0.48001,
+            "max": 0.50403
+          },
+          "relative_error": 0.08260196571625844,
+          "passed": true
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.47257566666666667,
+            "p50": 0.473389,
+            "p90": 0.479969,
+            "min": 0.464369,
+            "max": 0.479969
+          },
+          "relative_error": 0.12301492521523216,
+          "passed": true
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4755433333333333,
+            "p50": 0.47437,
+            "p90": 0.48155,
+            "min": 0.47071,
+            "max": 0.48155
+          },
+          "relative_error": 0.11600665966691803,
+          "passed": true
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 0.7429805760873762,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6855466666666666,
+            "p50": 0.676733,
+            "p90": 0.714954,
+            "min": 0.664953,
+            "max": 0.714954
+          },
+          "relative_error": 0.08377826370299557,
+          "passed": true
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5086503333333333,
+            "p50": 0.50779,
+            "p90": 0.525971,
+            "min": 0.49219,
+            "max": 0.525971
+          },
+          "relative_error": 0.04336809037814149,
+          "passed": true
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.4983166666666667,
+            "p50": 0.50239,
+            "p90": 0.52325,
+            "min": 0.46931,
+            "max": 0.52325
+          },
+          "relative_error": 0.06500456930373288,
+          "passed": true
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.51301,
+            "p50": 0.51483,
+            "p90": 0.51721,
+            "min": 0.50699,
+            "max": 0.51721
+          },
+          "relative_error": 0.034501329331212194,
+          "passed": true
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 0.7429805760873762,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.6683003333333334,
+            "p50": 0.670033,
+            "p90": 0.670354,
+            "min": 0.664514,
+            "max": 0.670354
+          },
+          "relative_error": 0.11174652926110995,
+          "passed": true
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.501203,
+            "p50": 0.50509,
+            "p90": 0.51977,
+            "min": 0.478749,
+            "max": 0.51977
+          },
+          "relative_error": 0.05887140930961143,
+          "passed": true
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.5039966666666666,
+            "p50": 0.50035,
+            "p90": 0.51583,
+            "min": 0.49581,
+            "max": 0.51583
+          },
+          "relative_error": 0.053002057474332176,
+          "passed": true
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.48997666666666667,
+            "p50": 0.47951,
+            "p90": 0.51661,
+            "min": 0.47381,
+            "max": 0.51661
+          },
+          "relative_error": 0.08313224499167671,
+          "passed": true
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 0.7429805760873762,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.7023206666666667,
+            "p50": 0.702994,
+            "p90": 0.705254,
+            "min": 0.698714,
+            "max": 0.705254
+          },
+          "relative_error": 0.057893653640705756,
+          "passed": true
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.5307095269602051,
+          "observed_ms": {
+            "count": 3,
+            "mean": 0.508497,
+            "p50": 0.507531,
+            "p90": 0.51679,
+            "min": 0.50117,
+            "max": 0.51679
+          },
+          "relative_error": 0.043682709947561404,
+          "passed": true
+        }
+      ],
+      "elapsed_seconds": 3.0834775828989223,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": -0.011888449285027192,
+      "passed": true
+    },
+    {
+      "batch": 3,
+      "prediction_ms": 28.159484450636523,
+      "observed_mean_ms": 31.414768,
+      "evaluation_role": "previously_inspected_validation",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 3,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 3
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 18
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 18
+        },
+        "graph_query_tokens": 18,
+        "padded_query_tokens_by_replica": {
+          "0": 18
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 18,
+        "padded_query_tokens": 18
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.2653254607019172,
+          "observed_ms": {
+            "count": 1,
+            "mean": 5.106922,
+            "p50": 5.106922,
+            "p90": 5.106922,
+            "min": 5.106922,
+            "max": 5.106922
+          },
+          "relative_error": -0.9480459147991849,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.2653254607019162,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.288766,
+            "p50": 0.288766,
+            "p90": 0.288766,
+            "min": 0.288766,
+            "max": 0.288766
+          },
+          "relative_error": -0.08117485887564257,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.2653254607019164,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.288185,
+            "p50": 0.288185,
+            "p90": 0.288185,
+            "min": 0.288185,
+            "max": 0.288185
+          },
+          "relative_error": -0.07932244668557908,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 0.8413596911301643,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.749095,
+            "p50": 0.749095,
+            "p90": 0.749095,
+            "min": 0.749095,
+            "max": 0.749095
+          },
+          "relative_error": 0.12316821114833809,
+          "passed": true
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.5841468214870416,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.588392,
+            "p50": 0.588392,
+            "p90": 0.588392,
+            "min": 0.588392,
+            "max": 0.588392
+          },
+          "relative_error": -0.007214881427617059,
+          "passed": true
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.5841468214870407,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.557191,
+            "p50": 0.557191,
+            "p90": 0.557191,
+            "min": 0.557191,
+            "max": 0.557191
+          },
+          "relative_error": 0.0483780633338311,
+          "passed": true
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.5841468214870407,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.625393,
+            "p50": 0.625393,
+            "p90": 0.625393,
+            "min": 0.625393,
+            "max": 0.625393
+          },
+          "relative_error": -0.06595241474234492,
+          "passed": true
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 0.8413596911301631,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.808256,
+            "p50": 0.808256,
+            "p90": 0.808256,
+            "min": 0.808256,
+            "max": 0.808256
+          },
+          "relative_error": 0.04095693830935132,
+          "passed": true
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.583332,
+            "p50": 0.583332,
+            "p90": 0.583332,
+            "min": 0.583332,
+            "max": 0.583332
+          },
+          "relative_error": 0.0013968400277315496,
+          "passed": true
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.600852,
+            "p50": 0.600852,
+            "p90": 0.600852,
+            "min": 0.600852,
+            "max": 0.600852
+          },
+          "relative_error": -0.027802484660021776,
+          "passed": true
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.592152,
+            "p50": 0.592152,
+            "p90": 0.592152,
+            "min": 0.592152,
+            "max": 0.592152
+          },
+          "relative_error": -0.013518789960927813,
+          "passed": true
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 0.8413596911301848,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.765375,
+            "p50": 0.765375,
+            "p90": 0.765375,
+            "min": 0.765375,
+            "max": 0.765375
+          },
+          "relative_error": 0.09927772808124757,
+          "passed": true
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.542571,
+            "p50": 0.542571,
+            "p90": 0.542571,
+            "min": 0.542571,
+            "max": 0.542571
+          },
+          "relative_error": 0.07662743030323527,
+          "passed": true
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.572471,
+            "p50": 0.572471,
+            "p90": 0.572471,
+            "min": 0.572471,
+            "max": 0.572471
+          },
+          "relative_error": 0.020395481145868866,
+          "passed": true
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.5841468214870567,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.558331,
+            "p50": 0.558331,
+            "p90": 0.558331,
+            "min": 0.558331,
+            "max": 0.558331
+          },
+          "relative_error": 0.04623748544690631,
+          "passed": true
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 0.8413596911301529,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.756356,
+            "p50": 0.756356,
+            "p90": 0.756356,
+            "min": 0.756356,
+            "max": 0.756356
+          },
+          "relative_error": 0.11238582245682305,
+          "passed": true
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.565891,
+            "p50": 0.565891,
+            "p90": 0.565891,
+            "min": 0.565891,
+            "max": 0.565891
+          },
+          "relative_error": 0.03226031424258924,
+          "passed": true
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.545731,
+            "p50": 0.545731,
+            "p90": 0.545731,
+            "min": 0.545731,
+            "max": 0.545731
+          },
+          "relative_error": 0.07039332837433299,
+          "passed": true
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.50843,
+            "p50": 0.50843,
+            "p90": 0.50843,
+            "min": 0.50843,
+            "max": 0.50843
+          },
+          "relative_error": 0.14892280449039808,
+          "passed": true
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 0.8413596911301529,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.760335,
+            "p50": 0.760335,
+            "p90": 0.760335,
+            "min": 0.760335,
+            "max": 0.760335
+          },
+          "relative_error": 0.10656446320392043,
+          "passed": true
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.540191,
+            "p50": 0.540191,
+            "p90": 0.540191,
+            "min": 0.540191,
+            "max": 0.540191
+          },
+          "relative_error": 0.08137088823592609,
+          "passed": true
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.534631,
+            "p50": 0.534631,
+            "p90": 0.534631,
+            "min": 0.534631,
+            "max": 0.534631
+          },
+          "relative_error": 0.09261681699537272,
+          "passed": true
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.633012,
+            "p50": 0.633012,
+            "p90": 0.633012,
+            "min": 0.633012,
+            "max": 0.633012
+          },
+          "relative_error": -0.0771947111791671,
+          "passed": true
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 0.8413596911301529,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.758716,
+            "p50": 0.758716,
+            "p90": 0.758716,
+            "min": 0.758716,
+            "max": 0.758716
+          },
+          "relative_error": 0.10892572600308004,
+          "passed": true
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.560031,
+            "p50": 0.560031,
+            "p90": 0.560031,
+            "min": 0.560031,
+            "max": 0.560031
+          },
+          "relative_error": 0.04306158317495479,
+          "passed": true
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.5841468214870531,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.545551,
+            "p50": 0.545551,
+            "p90": 0.545551,
+            "min": 0.545551,
+            "max": 0.545551
+          },
+          "relative_error": 0.07074649572093739,
+          "passed": true
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.5841468214870709,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.547991,
+            "p50": 0.547991,
+            "p90": 0.547991,
+            "min": 0.547991,
+            "max": 0.547991
+          },
+          "relative_error": 0.06597886003067721,
+          "passed": true
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 0.8413596911301937,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.734994,
+            "p50": 0.734994,
+            "p90": 0.734994,
+            "min": 0.734994,
+            "max": 0.734994
+          },
+          "relative_error": 0.14471640738590197,
+          "passed": true
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.567252,
+            "p50": 0.567252,
+            "p90": 0.567252,
+            "min": 0.567252,
+            "max": 0.567252
+          },
+          "relative_error": 0.02978362612572072,
+          "passed": true
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.541691,
+            "p50": 0.541691,
+            "p90": 0.541691,
+            "min": 0.541691,
+            "max": 0.541691
+          },
+          "relative_error": 0.07837645721835385,
+          "passed": true
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.53677,
+            "p50": 0.53677,
+            "p90": 0.53677,
+            "min": 0.53677,
+            "max": 0.53677
+          },
+          "relative_error": 0.08826279689078631,
+          "passed": true
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 0.8413596911301937,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.765516,
+            "p50": 0.765516,
+            "p90": 0.765516,
+            "min": 0.765516,
+            "max": 0.765516
+          },
+          "relative_error": 0.09907525267949158,
+          "passed": true
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.564191,
+            "p50": 0.564191,
+            "p90": 0.564191,
+            "min": 0.564191,
+            "max": 0.564191
+          },
+          "relative_error": 0.035370683841229766,
+          "passed": true
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.575032,
+            "p50": 0.575032,
+            "p90": 0.575032,
+            "min": 0.575032,
+            "max": 0.575032
+          },
+          "relative_error": 0.015850981314200485,
+          "passed": true
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.53041,
+            "p50": 0.53041,
+            "p90": 0.53041,
+            "min": 0.53041,
+            "max": 0.53041
+          },
+          "relative_error": 0.10131185589839409,
+          "passed": true
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 0.8413596911301937,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.739855,
+            "p50": 0.739855,
+            "p90": 0.739855,
+            "min": 0.739855,
+            "max": 0.739855
+          },
+          "relative_error": 0.1371953844066658,
+          "passed": true
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.546431,
+            "p50": 0.546431,
+            "p90": 0.546431,
+            "min": 0.546431,
+            "max": 0.546431
+          },
+          "relative_error": 0.06902211164276428,
+          "passed": true
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.542531,
+            "p50": 0.542531,
+            "p90": 0.542531,
+            "min": 0.542531,
+            "max": 0.542531
+          },
+          "relative_error": 0.07670680843503375,
+          "passed": true
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.543771,
+            "p50": 0.543771,
+            "p90": 0.543771,
+            "min": 0.543771,
+            "max": 0.543771
+          },
+          "relative_error": 0.07425151669924901,
+          "passed": true
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 0.8413596911301937,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.730054,
+            "p50": 0.730054,
+            "p90": 0.730054,
+            "min": 0.730054,
+            "max": 0.730054
+          },
+          "relative_error": 0.15246227146237645,
+          "passed": false
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.541471,
+            "p50": 0.541471,
+            "p90": 0.541471,
+            "min": 0.541471,
+            "max": 0.541471
+          },
+          "relative_error": 0.07881460223551628,
+          "passed": true
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.557131,
+            "p50": 0.557131,
+            "p90": 0.557131,
+            "min": 0.557131,
+            "max": 0.557131
+          },
+          "relative_error": 0.04849096798969588,
+          "passed": true
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.538051,
+            "p50": 0.538051,
+            "p90": 0.538051,
+            "min": 0.538051,
+            "max": 0.538051
+          },
+          "relative_error": 0.08567184428068608,
+          "passed": true
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 0.8413596911301937,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.774196,
+            "p50": 0.774196,
+            "p90": 0.774196,
+            "min": 0.774196,
+            "max": 0.774196
+          },
+          "relative_error": 0.08675282632588344,
+          "passed": true
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.5841468214870673,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.549931,
+            "p50": 0.549931,
+            "p90": 0.549931,
+            "min": 0.549931,
+            "max": 0.549931
+          },
+          "relative_error": 0.06221839010178987,
+          "passed": true
+        }
+      ],
+      "elapsed_seconds": 3.240143207949586,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": -0.10362271493978492,
+      "passed": true
+    },
+    {
+      "batch": 4,
+      "prediction_ms": 30.977620173909802,
+      "observed_mean_ms": 28.250681384615383,
+      "evaluation_role": "previously_inspected_validation",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 4,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 4
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 24
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 24
+        },
+        "graph_query_tokens": 24,
+        "padded_query_tokens_by_replica": {
+          "0": 24
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 24,
+        "padded_query_tokens": 24
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.27063194947124314,
+          "observed_ms": {
+            "count": 13,
+            "mean": 1.2196366153846154,
+            "p50": 0.779956,
+            "p90": 0.837757,
+            "min": 0.709554,
+            "max": 6.563551
+          },
+          "relative_error": -0.7781044402427204,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.27063194947124336,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.2952273846153846,
+            "p50": 0.295026,
+            "p90": 0.298826,
+            "min": 0.291086,
+            "max": 0.299946
+          },
+          "relative_error": -0.0833101413548869,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.2706319494712416,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.29294892307692305,
+            "p50": 0.292606,
+            "p90": 0.296246,
+            "min": 0.288706,
+            "max": 0.298286
+          },
+          "relative_error": -0.07618042548605453,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 0.941606042957995,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.8196212307692308,
+            "p50": 0.825377,
+            "p90": 0.841236,
+            "min": 0.785556,
+            "max": 0.876458
+          },
+          "relative_error": 0.14883071302860107,
+          "passed": true
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.6389696081599125,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.6148013846153846,
+            "p50": 0.617712,
+            "p90": 0.641253,
+            "min": 0.564211,
+            "max": 0.650093
+          },
+          "relative_error": 0.03931061989986806,
+          "passed": true
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.6389696081599143,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.6148276923076923,
+            "p50": 0.610972,
+            "p90": 0.650253,
+            "min": 0.564711,
+            "max": 0.671573
+          },
+          "relative_error": 0.03926614912481874,
+          "passed": true
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.6389696081599143,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.6119584615384616,
+            "p50": 0.610573,
+            "p90": 0.641573,
+            "min": 0.566032,
+            "max": 0.647992
+          },
+          "relative_error": 0.04413885634254777,
+          "passed": true
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 0.9416060429579987,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7840450769230769,
+            "p50": 0.796276,
+            "p90": 0.807556,
+            "min": 0.716254,
+            "max": 0.817536
+          },
+          "relative_error": 0.2009590655849245,
+          "passed": false
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.638969608159921,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.6062056153846154,
+            "p50": 0.594172,
+            "p90": 0.655733,
+            "min": 0.572911,
+            "max": 0.660533
+          },
+          "relative_error": 0.054047656345971085,
+          "passed": true
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.638969608159921,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.605217,
+            "p50": 0.616853,
+            "p90": 0.627793,
+            "min": 0.561772,
+            "max": 0.637753
+          },
+          "relative_error": 0.05576943172435844,
+          "passed": true
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.638969608159921,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.6048566923076923,
+            "p50": 0.601872,
+            "p90": 0.629873,
+            "min": 0.548531,
+            "max": 0.637193
+          },
+          "relative_error": 0.05639834408060951,
+          "passed": true
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 0.9416060429580009,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.8010957692307692,
+            "p50": 0.799936,
+            "p90": 0.840696,
+            "min": 0.725234,
+            "max": 0.844637
+          },
+          "relative_error": 0.17539759804517874,
+          "passed": false
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.638969608159921,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5934427692307692,
+            "p50": 0.583132,
+            "p90": 0.631373,
+            "min": 0.546031,
+            "max": 0.642013
+          },
+          "relative_error": 0.07671647762793454,
+          "passed": true
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5770745384615384,
+            "p50": 0.583751,
+            "p90": 0.592532,
+            "min": 0.536171,
+            "max": 0.629952
+          },
+          "relative_error": 0.10725662903690414,
+          "passed": true
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.561505,
+            "p50": 0.561251,
+            "p90": 0.584511,
+            "min": 0.53481,
+            "max": 0.598772
+          },
+          "relative_error": 0.1379588929038036,
+          "passed": true
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 0.9416060429580035,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7693046923076923,
+            "p50": 0.769456,
+            "p90": 0.782376,
+            "min": 0.720434,
+            "max": 0.838377
+          },
+          "relative_error": 0.22397023230608015,
+          "passed": false
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5675959230769231,
+            "p50": 0.566831,
+            "p90": 0.607352,
+            "min": 0.51393,
+            "max": 0.608872
+          },
+          "relative_error": 0.12574735332155362,
+          "passed": true
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5461247692307692,
+            "p50": 0.544571,
+            "p90": 0.556331,
+            "min": 0.528551,
+            "max": 0.561051
+          },
+          "relative_error": 0.1700066434634624,
+          "passed": false
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5365553076923076,
+            "p50": 0.540071,
+            "p90": 0.551751,
+            "min": 0.51623,
+            "max": 0.566751
+          },
+          "relative_error": 0.19087370677241178,
+          "passed": false
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 0.9416060429580035,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7706860769230769,
+            "p50": 0.765455,
+            "p90": 0.790096,
+            "min": 0.751255,
+            "max": 0.803656
+          },
+          "relative_error": 0.22177637711753606,
+          "passed": false
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5518449230769231,
+            "p50": 0.552531,
+            "p90": 0.576772,
+            "min": 0.536751,
+            "max": 0.577032
+          },
+          "relative_error": 0.15787892837220618,
+          "passed": false
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5603696153846154,
+            "p50": 0.561231,
+            "p90": 0.578312,
+            "min": 0.54245,
+            "max": 0.588592
+          },
+          "relative_error": 0.14026455149854433,
+          "passed": true
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.6389696081599503,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5571526153846154,
+            "p50": 0.562331,
+            "p90": 0.570412,
+            "min": 0.51657,
+            "max": 0.576911
+          },
+          "relative_error": 0.14684844065365255,
+          "passed": true
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 0.941606042958,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7803478461538461,
+            "p50": 0.774635,
+            "p90": 0.813956,
+            "min": 0.746955,
+            "max": 0.814096
+          },
+          "relative_error": 0.20664912141291625,
+          "passed": false
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5701222307692307,
+            "p50": 0.572752,
+            "p90": 0.581111,
+            "min": 0.534871,
+            "max": 0.593552
+          },
+          "relative_error": 0.12075897706674277,
+          "passed": true
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5365766923076923,
+            "p50": 0.53589,
+            "p90": 0.551171,
+            "min": 0.51209,
+            "max": 0.566371
+          },
+          "relative_error": 0.19082624594048614,
+          "passed": false
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5632635384615384,
+            "p50": 0.558031,
+            "p90": 0.588771,
+            "min": 0.537331,
+            "max": 0.593032
+          },
+          "relative_error": 0.13440612524853424,
+          "passed": true
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 0.9416060429580249,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7602167692307692,
+            "p50": 0.757095,
+            "p90": 0.780016,
+            "min": 0.719875,
+            "max": 0.793356
+          },
+          "relative_error": 0.23860204229748283,
+          "passed": false
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5758914615384616,
+            "p50": 0.580412,
+            "p90": 0.600572,
+            "min": 0.53961,
+            "max": 0.607812
+          },
+          "relative_error": 0.10953131073164579,
+          "passed": true
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5747376923076923,
+            "p50": 0.565491,
+            "p90": 0.635752,
+            "min": 0.548911,
+            "max": 0.635872
+          },
+          "relative_error": 0.11175866262457146,
+          "passed": true
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5777836923076923,
+            "p50": 0.581571,
+            "p90": 0.597152,
+            "min": 0.52079,
+            "max": 0.628372
+          },
+          "relative_error": 0.10589761647280338,
+          "passed": true
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 0.9416060429580249,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7925774615384615,
+            "p50": 0.785836,
+            "p90": 0.814136,
+            "min": 0.754895,
+            "max": 0.871278
+          },
+          "relative_error": 0.1880303044831555,
+          "passed": false
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5718991538461539,
+            "p50": 0.567491,
+            "p90": 0.600212,
+            "min": 0.547491,
+            "max": 0.623493
+          },
+          "relative_error": 0.11727671541864404,
+          "passed": true
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5575326923076923,
+            "p50": 0.555931,
+            "p90": 0.585051,
+            "min": 0.530251,
+            "max": 0.593752
+          },
+          "relative_error": 0.14606661990557623,
+          "passed": true
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5604371538461539,
+            "p50": 0.551551,
+            "p90": 0.592832,
+            "min": 0.532531,
+            "max": 0.592872
+          },
+          "relative_error": 0.14012713785092257,
+          "passed": true
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 0.9416060429580249,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7673076923076922,
+            "p50": 0.760015,
+            "p90": 0.795256,
+            "min": 0.743134,
+            "max": 0.807216
+          },
+          "relative_error": 0.2271557452084536,
+          "passed": false
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.570076,
+            "p50": 0.570331,
+            "p90": 0.593752,
+            "min": 0.52077,
+            "max": 0.620813
+          },
+          "relative_error": 0.1208498659124968,
+          "passed": true
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5599988461538461,
+            "p50": 0.557971,
+            "p90": 0.584171,
+            "min": 0.50905,
+            "max": 0.619252
+          },
+          "relative_error": 0.14101950843018551,
+          "passed": true
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5806486923076923,
+            "p50": 0.577912,
+            "p90": 0.597752,
+            "min": 0.545631,
+            "max": 0.635233
+          },
+          "relative_error": 0.10044096649981826,
+          "passed": true
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 0.9416060429580249,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7705013846153846,
+            "p50": 0.771915,
+            "p90": 0.790216,
+            "min": 0.713954,
+            "max": 0.804736
+          },
+          "relative_error": 0.2220692418717085,
+          "passed": false
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5654406923076923,
+            "p50": 0.566931,
+            "p90": 0.578332,
+            "min": 0.543551,
+            "max": 0.580412
+          },
+          "relative_error": 0.13003824601330316,
+          "passed": true
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5751604615384616,
+            "p50": 0.569672,
+            "p90": 0.592791,
+            "min": 0.558751,
+            "max": 0.596071
+          },
+          "relative_error": 0.11094146918721037,
+          "passed": true
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5721916153846154,
+            "p50": 0.573232,
+            "p90": 0.589871,
+            "min": 0.554811,
+            "max": 0.608612
+          },
+          "relative_error": 0.11670564716407172,
+          "passed": true
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 0.9416060429580249,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.7597686923076923,
+            "p50": 0.764455,
+            "p90": 0.777835,
+            "min": 0.710254,
+            "max": 0.786835
+          },
+          "relative_error": 0.23933251329167926,
+          "passed": false
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.6389696081599325,
+          "observed_ms": {
+            "count": 13,
+            "mean": 0.5942089230769231,
+            "p50": 0.585371,
+            "p90": 0.625332,
+            "min": 0.541231,
+            "max": 0.641093
+          },
+          "relative_error": 0.07532819408236135,
+          "passed": true
+        }
+      ],
+      "elapsed_seconds": 3.370455416967161,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": 0.0965264785004245,
+      "passed": true
+    },
+    {
+      "batch": 5,
+      "prediction_ms": 33.0981929803537,
+      "observed_mean_ms": null,
+      "evaluation_role": "prediction_only",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 5,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 5
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 30
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 30
+        },
+        "graph_query_tokens": 30,
+        "padded_query_tokens_by_replica": {
+          "0": 30
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 30,
+        "padded_query_tokens": 30
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.27672887339208413
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.27672887339208413
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.2767288733920822
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.024667210276762
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.6773118402300611
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.6773118402300615
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.6773118402300615
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.0246672102767667
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.6773118402300637
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.6773118402300637
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.6773118402300637
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.0246672102767729
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.6773118402300948
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.024667210276771
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.024667210276771
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.6773118402300984
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.6773118402301019
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.0246672102768208
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.0246672102768208
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.0246672102768208
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.0246672102768208
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.0246672102768208
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.6773118402300966
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.0246672102767675
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.6773118402300256
+        }
+      ],
+      "elapsed_seconds": 3.707453625043854,
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "batch": 6,
+      "prediction_ms": 35.43471071917944,
+      "observed_mean_ms": null,
+      "evaluation_role": "prediction_only",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 6,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 6
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 36
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 36
+        },
+        "graph_query_tokens": 36,
+        "padded_query_tokens_by_replica": {
+          "0": 36
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 36,
+        "padded_query_tokens": 36
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.2830878839795919
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.28308788397959134
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.2830878839795903
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.112852934546179
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.7207762834590872
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.7207762834590863
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.7207762834590885
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.112852934546182
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.7207762834591076
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.7207762834591076
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.7207762834591076
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.112852934546181
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.1128529345462006
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.1128529345462006
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.7207762834591378
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.7207762834591556
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.1128529345462184
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.1128529345462184
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.1128529345462184
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.1128529345462184
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.7207762834591094
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.1128529345462184
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.7207762834590952
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.7207762834591023
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.7207762834591023
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.1128529345461047
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.7207762834591023
+        }
+      ],
+      "elapsed_seconds": 3.7096019169548526,
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "batch": 7,
+      "prediction_ms": 37.3637778329394,
+      "observed_mean_ms": 35.747814,
+      "evaluation_role": "previously_inspected_validation",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 7,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 7
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 42
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 42
+        },
+        "graph_query_tokens": 42,
+        "padded_query_tokens_by_replica": {
+          "0": 42
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 42,
+        "padded_query_tokens": 42
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.2960217048701308,
+          "observed_ms": {
+            "count": 1,
+            "mean": 3.54015,
+            "p50": 3.54015,
+            "p90": 3.54015,
+            "min": 3.54015,
+            "max": 3.54015
+          },
+          "relative_error": -0.9163815926245693,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.29602170487013524,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.335427,
+            "p50": 0.335427,
+            "p90": 0.335427,
+            "min": 0.335427,
+            "max": 0.335427
+          },
+          "relative_error": -0.11747800603369662,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.296021704870141,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.338907,
+            "p50": 0.338907,
+            "p90": 0.338907,
+            "min": 0.338907,
+            "max": 0.338907
+          },
+          "relative_error": -0.12654000988430159,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.1913648756935191,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.033161,
+            "p50": 1.033161,
+            "p90": 1.033161,
+            "min": 1.033161,
+            "max": 1.033161
+          },
+          "relative_error": 0.15312606234025394,
+          "passed": false
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.7538935188932774,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.603372,
+            "p50": 0.603372,
+            "p90": 0.603372,
+            "min": 0.603372,
+            "max": 0.603372
+          },
+          "relative_error": 0.24946719253342442,
+          "passed": false
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.7538935188932774,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.591911,
+            "p50": 0.591911,
+            "p90": 0.591911,
+            "min": 0.591911,
+            "max": 0.591911
+          },
+          "relative_error": 0.27366026124413545,
+          "passed": false
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.7538935188932827,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.634433,
+            "p50": 0.634433,
+            "p90": 0.634433,
+            "min": 0.634433,
+            "max": 0.634433
+          },
+          "relative_error": 0.18829493247243234,
+          "passed": false
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.1913648756935329,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.00328,
+            "p50": 1.00328,
+            "p90": 1.00328,
+            "min": 1.00328,
+            "max": 1.00328
+          },
+          "relative_error": 0.18746997417822842,
+          "passed": false
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.7538935188933413,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.612712,
+            "p50": 0.612712,
+            "p90": 0.612712,
+            "min": 0.612712,
+            "max": 0.612712
+          },
+          "relative_error": 0.23042068523766668,
+          "passed": false
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.7538935188933413,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.619092,
+            "p50": 0.619092,
+            "p90": 0.619092,
+            "min": 0.619092,
+            "max": 0.619092
+          },
+          "relative_error": 0.21774068941827918,
+          "passed": false
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.7538935188933413,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.602232,
+            "p50": 0.602232,
+            "p90": 0.602232,
+            "min": 0.602232,
+            "max": 0.602232
+          },
+          "relative_error": 0.25183238169566113,
+          "passed": false
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.1913648756935284,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.040881,
+            "p50": 1.040881,
+            "p90": 1.040881,
+            "min": 1.040881,
+            "max": 1.040881
+          },
+          "relative_error": 0.14457356383057096,
+          "passed": true
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.600472,
+            "p50": 0.600472,
+            "p90": 0.600472,
+            "min": 0.600472,
+            "max": 0.600472
+          },
+          "relative_error": 0.25550153694665956,
+          "passed": false
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.567051,
+            "p50": 0.567051,
+            "p90": 0.567051,
+            "min": 0.567051,
+            "max": 0.567051
+          },
+          "relative_error": 0.32949861457511687,
+          "passed": false
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.612572,
+            "p50": 0.612572,
+            "p90": 0.612572,
+            "min": 0.612572,
+            "max": 0.612572
+          },
+          "relative_error": 0.23070189119554052,
+          "passed": false
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.1913648756935196,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.051861,
+            "p50": 1.051861,
+            "p90": 1.051861,
+            "min": 1.051861,
+            "max": 1.051861
+          },
+          "relative_error": 0.13262577060421443,
+          "passed": true
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.609293,
+            "p50": 0.609293,
+            "p90": 0.609293,
+            "min": 0.609293,
+            "max": 0.609293
+          },
+          "relative_error": 0.23732509464811624,
+          "passed": false
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640832,
+            "p50": 0.640832,
+            "p90": 0.640832,
+            "min": 0.640832,
+            "max": 0.640832
+          },
+          "relative_error": 0.17642926522619762,
+          "passed": false
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.7538935188934346,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.621513,
+            "p50": 0.621513,
+            "p90": 0.621513,
+            "min": 0.621513,
+            "max": 0.621513
+          },
+          "relative_error": 0.21299718411913293,
+          "passed": false
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.1913648756935196,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.094422,
+            "p50": 1.094422,
+            "p90": 1.094422,
+            "min": 1.094422,
+            "max": 1.094422
+          },
+          "relative_error": 0.08857906337182508,
+          "passed": true
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.753893518893479,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.638113,
+            "p50": 0.638113,
+            "p90": 0.638113,
+            "min": 0.638113,
+            "max": 0.638113
+          },
+          "relative_error": 0.18144203126010439,
+          "passed": false
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.684873,
+            "p50": 0.684873,
+            "p90": 0.684873,
+            "min": 0.684873,
+            "max": 0.684873
+          },
+          "relative_error": 0.10077856608976865,
+          "passed": true
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.649893,
+            "p50": 0.649893,
+            "p90": 0.649893,
+            "min": 0.649893,
+            "max": 0.649893
+          },
+          "relative_error": 0.16002714122724493,
+          "passed": false
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.1913648756935835,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.060341,
+            "p50": 1.060341,
+            "p90": 1.060341,
+            "min": 1.060341,
+            "max": 1.060341
+          },
+          "relative_error": 0.123567678410609,
+          "passed": true
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.678874,
+            "p50": 0.678874,
+            "p90": 0.678874,
+            "min": 0.678874,
+            "max": 0.678874
+          },
+          "relative_error": 0.1105058065172595,
+          "passed": true
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.627493,
+            "p50": 0.627493,
+            "p90": 0.627493,
+            "min": 0.627493,
+            "max": 0.627493
+          },
+          "relative_error": 0.2014373369800111,
+          "passed": false
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.635092,
+            "p50": 0.635092,
+            "p90": 0.635092,
+            "min": 0.635092,
+            "max": 0.635092
+          },
+          "relative_error": 0.1870619042494599,
+          "passed": false
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.1913648756935835,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.134803,
+            "p50": 1.134803,
+            "p90": 1.134803,
+            "min": 1.134803,
+            "max": 1.134803
+          },
+          "relative_error": 0.0498429028594245,
+          "passed": true
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.656973,
+            "p50": 0.656973,
+            "p90": 0.656973,
+            "min": 0.656973,
+            "max": 0.656973
+          },
+          "relative_error": 0.14752587837490738,
+          "passed": true
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.648333,
+            "p50": 0.648333,
+            "p90": 0.648333,
+            "min": 0.648333,
+            "max": 0.648333
+          },
+          "relative_error": 0.16281836478105838,
+          "passed": false
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.666253,
+            "p50": 0.666253,
+            "p90": 0.666253,
+            "min": 0.666253,
+            "max": 0.666253
+          },
+          "relative_error": 0.1315424003998451,
+          "passed": true
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.1913648756935835,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.111702,
+            "p50": 1.111702,
+            "p90": 1.111702,
+            "min": 1.111702,
+            "max": 1.111702
+          },
+          "relative_error": 0.0716584801444844,
+          "passed": true
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.674553,
+            "p50": 0.674553,
+            "p90": 0.674553,
+            "min": 0.674553,
+            "max": 0.674553
+          },
+          "relative_error": 0.11761939965221124,
+          "passed": true
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640793,
+            "p50": 0.640793,
+            "p90": 0.640793,
+            "min": 0.640793,
+            "max": 0.640793
+          },
+          "relative_error": 0.1765008651679998,
+          "passed": false
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.645833,
+            "p50": 0.645833,
+            "p90": 0.645833,
+            "min": 0.645833,
+            "max": 0.645833
+          },
+          "relative_error": 0.16731959948407416,
+          "passed": false
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.1913648756935835,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.091062,
+            "p50": 1.091062,
+            "p90": 1.091062,
+            "min": 1.091062,
+            "max": 1.091062
+          },
+          "relative_error": 0.09193141699883567,
+          "passed": true
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.647973,
+            "p50": 0.647973,
+            "p90": 0.647973,
+            "min": 0.647973,
+            "max": 0.647973
+          },
+          "relative_error": 0.163464401901928,
+          "passed": false
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.657053,
+            "p50": 0.657053,
+            "p90": 0.657053,
+            "min": 0.657053,
+            "max": 0.657053
+          },
+          "relative_error": 0.14738616046741737,
+          "passed": true
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.753893518893598,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.640753,
+            "p50": 0.640753,
+            "p90": 0.640753,
+            "min": 0.640753,
+            "max": 0.640753
+          },
+          "relative_error": 0.17657431005956736,
+          "passed": false
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.1913648756934805,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.091482,
+            "p50": 1.091482,
+            "p90": 1.091482,
+            "min": 1.091482,
+            "max": 1.091482
+          },
+          "relative_error": 0.091511244064016,
+          "passed": true
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.7538935188939391,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.656473,
+            "p50": 0.656473,
+            "p90": 0.656473,
+            "min": 0.656473,
+            "max": 0.656473
+          },
+          "relative_error": 0.14839988681017968,
+          "passed": true
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.7538935188939391,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.635572,
+            "p50": 0.635572,
+            "p90": 0.635572,
+            "min": 0.635572,
+            "max": 0.635572
+          },
+          "relative_error": 0.18616540516879132,
+          "passed": false
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.7538935188939391,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.685114,
+            "p50": 0.685114,
+            "p90": 0.685114,
+            "min": 0.685114,
+            "max": 0.685114
+          },
+          "relative_error": 0.10039134931403981,
+          "passed": true
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.1913648756934805,
+          "observed_ms": {
+            "count": 1,
+            "mean": 1.045501,
+            "p50": 1.045501,
+            "p90": 1.045501,
+            "min": 1.045501,
+            "max": 1.045501
+          },
+          "relative_error": 0.13951576870178073,
+          "passed": true
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.7538935188939391,
+          "observed_ms": {
+            "count": 1,
+            "mean": 0.638333,
+            "p50": 0.638333,
+            "p90": 0.638333,
+            "min": 0.638333,
+            "max": 0.638333
+          },
+          "relative_error": 0.18103484998259378,
+          "passed": false
+        }
+      ],
+      "elapsed_seconds": 4.078578500077128,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": 0.04520454965272558,
+      "passed": true
+    },
+    {
+      "batch": 8,
+      "prediction_ms": 39.34393955403932,
+      "observed_mean_ms": 31.580006,
+      "evaluation_role": "previously_inspected_validation",
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 8,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 8
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 48
+        },
+        "graph_query_tokens_by_replica": {
+          "0": 48
+        },
+        "graph_query_tokens": 48,
+        "padded_query_tokens_by_replica": {
+          "0": 48
+        },
+        "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
+        "valid_query_tokens": 48,
+        "padded_query_tokens": 48
+      },
+      "layers": [
+        {
+          "layer_id": 0,
+          "predicted_ms": 0.30130638879097105,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.1925803333333334,
+            "p50": 0.7846550000000001,
+            "p90": 0.849697,
+            "min": 0.743275,
+            "max": 5.701734
+          },
+          "relative_error": -0.7473491886715911,
+          "passed": false
+        },
+        {
+          "layer_id": 1,
+          "predicted_ms": 0.30130638879097105,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.34451516666666665,
+            "p50": 0.344307,
+            "p90": 0.347407,
+            "min": 0.340767,
+            "max": 0.354927
+          },
+          "relative_error": -0.12541908762322207,
+          "passed": true
+        },
+        {
+          "layer_id": 2,
+          "predicted_ms": 0.30130638879096894,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.33867525,
+            "p50": 0.33742700000000003,
+            "p90": 0.341267,
+            "min": 0.336367,
+            "max": 0.349727
+          },
+          "relative_error": -0.11033832914873776,
+          "passed": true
+        },
+        {
+          "layer_id": 3,
+          "predicted_ms": 1.2711446984408235,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0206353333333333,
+            "p50": 1.0200200000000001,
+            "p90": 1.034021,
+            "min": 0.99564,
+            "max": 1.038341
+          },
+          "relative_error": 0.2454445353065935,
+          "passed": false
+        },
+        {
+          "layer_id": 4,
+          "predicted_ms": 0.7889493130585827,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5685645833333334,
+            "p50": 0.5691415,
+            "p90": 0.591111,
+            "min": 0.543651,
+            "max": 0.591931
+          },
+          "relative_error": 0.38761600033754484,
+          "passed": false
+        },
+        {
+          "layer_id": 5,
+          "predicted_ms": 0.7889493130585827,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5630531666666667,
+            "p50": 0.5647614999999999,
+            "p90": 0.582792,
+            "min": 0.532551,
+            "max": 0.583472
+          },
+          "relative_error": 0.40119860745876745,
+          "passed": false
+        },
+        {
+          "layer_id": 6,
+          "predicted_ms": 0.7889493130585863,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5532475833333333,
+            "p50": 0.5578810000000001,
+            "p90": 0.572731,
+            "min": 0.53059,
+            "max": 0.572972
+          },
+          "relative_error": 0.4260330037144364,
+          "passed": false
+        },
+        {
+          "layer_id": 7,
+          "predicted_ms": 1.271144698440838,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0165253333333333,
+            "p50": 1.01594,
+            "p90": 1.036681,
+            "min": 0.987279,
+            "max": 1.052421
+          },
+          "relative_error": 0.2504800979947752,
+          "passed": false
+        },
+        {
+          "layer_id": 8,
+          "predicted_ms": 0.7889493130586107,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57836325,
+            "p50": 0.5763015,
+            "p90": 0.583872,
+            "min": 0.566611,
+            "max": 0.615233
+          },
+          "relative_error": 0.36410692252422794,
+          "passed": false
+        },
+        {
+          "layer_id": 9,
+          "predicted_ms": 0.7889493130586107,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5712298333333333,
+            "p50": 0.571311,
+            "p90": 0.595592,
+            "min": 0.542511,
+            "max": 0.600312
+          },
+          "relative_error": 0.3811416474080236,
+          "passed": false
+        },
+        {
+          "layer_id": 10,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5738013333333334,
+            "p50": 0.5726720000000001,
+            "p90": 0.595812,
+            "min": 0.551011,
+            "max": 0.597292
+          },
+          "relative_error": 0.3749520386706464,
+          "passed": false
+        },
+        {
+          "layer_id": 11,
+          "predicted_ms": 1.2711446984408052,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0075385,
+            "p50": 1.00433,
+            "p90": 1.02852,
+            "min": 0.98218,
+            "max": 1.038501
+          },
+          "relative_error": 0.2616338715004989,
+          "passed": false
+        },
+        {
+          "layer_id": 12,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5777431666666667,
+            "p50": 0.5801315,
+            "p90": 0.588852,
+            "min": 0.555631,
+            "max": 0.590392
+          },
+          "relative_error": 0.36557099863331133,
+          "passed": false
+        },
+        {
+          "layer_id": 13,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5487228333333334,
+            "p50": 0.541621,
+            "p90": 0.574112,
+            "min": 0.52317,
+            "max": 0.582972
+          },
+          "relative_error": 0.4377920238272781,
+          "passed": false
+        },
+        {
+          "layer_id": 14,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5707264166666667,
+            "p50": 0.5692010000000001,
+            "p90": 0.591832,
+            "min": 0.541771,
+            "max": 0.592332
+          },
+          "relative_error": 0.38235990138048614,
+          "passed": false
+        },
+        {
+          "layer_id": 15,
+          "predicted_ms": 1.2711446984408052,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0191736666666666,
+            "p50": 1.026951,
+            "p90": 1.03886,
+            "min": 0.99192,
+            "max": 1.039361
+          },
+          "relative_error": 0.24723071250284656,
+          "passed": false
+        },
+        {
+          "layer_id": 16,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5628345833333334,
+            "p50": 0.567352,
+            "p90": 0.581811,
+            "min": 0.53507,
+            "max": 0.586832
+          },
+          "relative_error": 0.40174277917695767,
+          "passed": false
+        },
+        {
+          "layer_id": 17,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57525825,
+            "p50": 0.5765215,
+            "p90": 0.596292,
+            "min": 0.536791,
+            "max": 0.605392
+          },
+          "relative_error": 0.3714697930165656,
+          "passed": false
+        },
+        {
+          "layer_id": 18,
+          "predicted_ms": 0.7889493130585716,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5812599166666667,
+            "p50": 0.5794414999999999,
+            "p90": 0.596812,
+            "min": 0.565511,
+            "max": 0.615352
+          },
+          "relative_error": 0.35730899454229514,
+          "passed": false
+        },
+        {
+          "layer_id": 19,
+          "predicted_ms": 1.271144698440846,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0359923333333334,
+            "p50": 1.040691,
+            "p90": 1.056101,
+            "min": 0.99998,
+            "max": 1.067421
+          },
+          "relative_error": 0.22698272713168022,
+          "passed": false
+        },
+        {
+          "layer_id": 20,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.57781825,
+            "p50": 0.577341,
+            "p90": 0.596112,
+            "min": 0.548951,
+            "max": 0.603152
+          },
+          "relative_error": 0.36539355248585914,
+          "passed": false
+        },
+        {
+          "layer_id": 21,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5930970833333333,
+            "p50": 0.583692,
+            "p90": 0.626933,
+            "min": 0.561692,
+            "max": 0.637393
+          },
+          "relative_error": 0.3302195125030749,
+          "passed": false
+        },
+        {
+          "layer_id": 22,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5812496666666667,
+            "p50": 0.584571,
+            "p90": 0.602192,
+            "min": 0.54291,
+            "max": 0.603932
+          },
+          "relative_error": 0.35733292989758647,
+          "passed": false
+        },
+        {
+          "layer_id": 23,
+          "predicted_ms": 1.2711446984408674,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.06893975,
+            "p50": 1.0652915,
+            "p90": 1.102022,
+            "min": 1.027521,
+            "max": 1.134842
+          },
+          "relative_error": 0.189164027664672,
+          "passed": false
+        },
+        {
+          "layer_id": 24,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5920237500000001,
+            "p50": 0.589302,
+            "p90": 0.623353,
+            "min": 0.562991,
+            "max": 0.630553
+          },
+          "relative_error": 0.33263118761479094,
+          "passed": false
+        },
+        {
+          "layer_id": 25,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5854483333333333,
+            "p50": 0.586882,
+            "p90": 0.615593,
+            "min": 0.540211,
+            "max": 0.621212
+          },
+          "relative_error": 0.34759852943242175,
+          "passed": false
+        },
+        {
+          "layer_id": 26,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5972484166666666,
+            "p50": 0.5977015,
+            "p90": 0.628973,
+            "min": 0.562271,
+            "max": 0.637653
+          },
+          "relative_error": 0.3209734694014046,
+          "passed": false
+        },
+        {
+          "layer_id": 27,
+          "predicted_ms": 1.2711446984408674,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0450674166666667,
+            "p50": 1.0454905,
+            "p90": 1.064341,
+            "min": 0.99732,
+            "max": 1.089522
+          },
+          "relative_error": 0.21632794034981395,
+          "passed": false
+        },
+        {
+          "layer_id": 28,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6085855,
+            "p50": 0.6163225,
+            "p90": 0.634192,
+            "min": 0.554351,
+            "max": 0.665253
+          },
+          "relative_error": 0.29636561018733154,
+          "passed": false
+        },
+        {
+          "layer_id": 29,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.5968586666666666,
+            "p50": 0.5913619999999999,
+            "p90": 0.641492,
+            "min": 0.569371,
+            "max": 0.642213
+          },
+          "relative_error": 0.3218360679334398,
+          "passed": false
+        },
+        {
+          "layer_id": 30,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6051221666666666,
+            "p50": 0.605792,
+            "p90": 0.643113,
+            "min": 0.544151,
+            "max": 0.664874
+          },
+          "relative_error": 0.3037851801143112,
+          "passed": false
+        },
+        {
+          "layer_id": 31,
+          "predicted_ms": 1.2711446984408674,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0620561666666666,
+            "p50": 1.054311,
+            "p90": 1.116062,
+            "min": 0.9944,
+            "max": 1.133143
+          },
+          "relative_error": 0.19687144459641814,
+          "passed": false
+        },
+        {
+          "layer_id": 32,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.60183375,
+            "p50": 0.599942,
+            "p90": 0.646613,
+            "min": 0.542791,
+            "max": 0.649293
+          },
+          "relative_error": 0.3109090559621528,
+          "passed": false
+        },
+        {
+          "layer_id": 33,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6020184166666667,
+            "p50": 0.5919215,
+            "p90": 0.641813,
+            "min": 0.562931,
+            "max": 0.659473
+          },
+          "relative_error": 0.31050694001525514,
+          "passed": false
+        },
+        {
+          "layer_id": 34,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6179458333333333,
+            "p50": 0.6156625,
+            "p90": 0.653753,
+            "min": 0.573611,
+            "max": 0.690974
+          },
+          "relative_error": 0.27672891457637827,
+          "passed": false
+        },
+        {
+          "layer_id": 35,
+          "predicted_ms": 1.2711446984408674,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.04461925,
+            "p50": 1.047291,
+            "p90": 1.070922,
+            "min": 1.018301,
+            "max": 1.072022
+          },
+          "relative_error": 0.21684977415538476,
+          "passed": false
+        },
+        {
+          "layer_id": 36,
+          "predicted_ms": 0.7889493130586622,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6196275,
+            "p50": 0.6138425000000001,
+            "p90": 0.658934,
+            "min": 0.575131,
+            "max": 0.662473
+          },
+          "relative_error": 0.273263877182117,
+          "passed": false
+        },
+        {
+          "layer_id": 37,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.608337,
+            "p50": 0.607822,
+            "p90": 0.635412,
+            "min": 0.553891,
+            "max": 0.662713
+          },
+          "relative_error": 0.2968951634679491,
+          "passed": false
+        },
+        {
+          "layer_id": 38,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6101688333333334,
+            "p50": 0.607362,
+            "p90": 0.656393,
+            "min": 0.561691,
+            "max": 0.662293
+          },
+          "relative_error": 0.29300165783394116,
+          "passed": false
+        },
+        {
+          "layer_id": 39,
+          "predicted_ms": 1.2711446984408,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0661894166666666,
+            "p50": 1.064331,
+            "p90": 1.098262,
+            "min": 1.02738,
+            "max": 1.106442
+          },
+          "relative_error": 0.19223158527956996,
+          "passed": false
+        },
+        {
+          "layer_id": 40,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6308311666666667,
+            "p50": 0.6304525000000001,
+            "p90": 0.671174,
+            "min": 0.552431,
+            "max": 0.688934
+          },
+          "relative_error": 0.25065049849619303,
+          "passed": false
+        },
+        {
+          "layer_id": 41,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.6031303333333333,
+            "p50": 0.6004615,
+            "p90": 0.645733,
+            "min": 0.566691,
+            "max": 0.659213
+          },
+          "relative_error": 0.30809092074394395,
+          "passed": false
+        },
+        {
+          "layer_id": 42,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.600042,
+            "p50": 0.604302,
+            "p90": 0.626593,
+            "min": 0.559491,
+            "max": 0.651533
+          },
+          "relative_error": 0.314823484120448,
+          "passed": false
+        },
+        {
+          "layer_id": 43,
+          "predicted_ms": 1.2711446984408,
+          "observed_ms": {
+            "count": 12,
+            "mean": 1.0285556666666666,
+            "p50": 1.03223,
+            "p90": 1.045841,
+            "min": 0.98916,
+            "max": 1.058381
+          },
+          "relative_error": 0.23585406180329893,
+          "passed": false
+        },
+        {
+          "layer_id": 44,
+          "predicted_ms": 0.7889493130586018,
+          "observed_ms": {
+            "count": 12,
+            "mean": 0.58150825,
+            "p50": 0.5802615,
+            "p90": 0.600272,
+            "min": 0.549291,
+            "max": 0.623192
+          },
+          "relative_error": 0.3567293551873114,
+          "passed": false
+        }
+      ],
+      "elapsed_seconds": 4.039007000043057,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "relative_error": 0.24584965417800508,
+      "passed": false
+    }
+  ],
+  "operator_validation": [
+    {
+      "batch": 1,
+      "native": "KeyPool",
+      "shape": [
+        6,
+        128,
+        4096
+      ],
+      "predicted_us": 29.60380039658557,
+      "program": "JointNativeService",
+      "observed_us": 29.036037990196068,
+      "relative_error": 0.019553714820913504,
+      "passed": true
+    },
+    {
+      "batch": 1,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        7,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 42.85234313725494,
+      "relative_error": -0.03979373768428296,
+      "passed": true
+    },
+    {
+      "batch": 2,
+      "native": "KeyPool",
+      "shape": [
+        12,
+        128,
+        4096
+      ],
+      "predicted_us": 30.240296251263057,
+      "program": "JointNativeService",
+      "observed_us": 28.75230555555556,
+      "relative_error": 0.05175204794733368,
+      "passed": true
+    },
+    {
+      "batch": 2,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        13,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 39.441833333333335,
+      "relative_error": 0.04323467642969936,
+      "passed": true
+    },
+    {
+      "batch": 3,
+      "native": "KeyPool",
+      "shape": [
+        18,
+        128,
+        4096
+      ],
+      "predicted_us": 30.87679210594054,
+      "program": "JointNativeService",
+      "observed_us": 29.535500000000003,
+      "relative_error": 0.04541287961742779,
+      "passed": true
+    },
+    {
+      "batch": 3,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        19,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 39.58091666666667,
+      "relative_error": 0.03956885541123478,
+      "passed": true
+    },
+    {
+      "batch": 4,
+      "native": "KeyPool",
+      "shape": [
+        24,
+        128,
+        4096
+      ],
+      "predicted_us": 31.51328796061803,
+      "program": "JointNativeService",
+      "observed_us": 32.374749999999985,
+      "relative_error": -0.026609071556751962,
+      "passed": true
+    },
+    {
+      "batch": 4,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        25,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 39.24859615384613,
+      "relative_error": 0.04837095507840128,
+      "passed": true
+    },
+    {
+      "batch": 5,
+      "native": "KeyPool",
+      "shape": [
+        30,
+        128,
+        4096
+      ],
+      "predicted_us": 32.14978381529552,
+      "program": "JointNativeService",
+      "observed_us": null
+    },
+    {
+      "batch": 5,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        31,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": null
+    },
+    {
+      "batch": 6,
+      "native": "KeyPool",
+      "shape": [
+        36,
+        128,
+        4096
+      ],
+      "predicted_us": 32.78627966997301,
+      "program": "JointNativeService",
+      "observed_us": null
+    },
+    {
+      "batch": 6,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        37,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": null
+    },
+    {
+      "batch": 7,
+      "native": "KeyPool",
+      "shape": [
+        42,
+        128,
+        4096
+      ],
+      "predicted_us": 33.4227755246505,
+      "program": "JointNativeService",
+      "observed_us": 34.48716666666667,
+      "relative_error": -0.030863397747456833,
+      "passed": true
+    },
+    {
+      "batch": 7,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        43,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 57.081083333333346,
+      "relative_error": -0.2791466834115659,
+      "passed": false
+    },
+    {
+      "batch": 8,
+      "native": "KeyPool",
+      "shape": [
+        48,
+        128,
+        4096
+      ],
+      "predicted_us": 34.05927137932799,
+      "program": "JointNativeService",
+      "observed_us": 32.06506944444445,
+      "relative_error": 0.06219234729363898,
+      "passed": true
+    },
+    {
+      "batch": 8,
+      "native": "PoolKeyIndexer",
+      "shape": [
+        49,
+        32,
+        128
+      ],
+      "predicted_us": 41.147088235294135,
+      "program": "JointNativeService",
+      "observed_us": 60.67133333333334,
+      "relative_error": -0.32180346178929975,
+      "passed": false
+    }
+  ],
+  "validation_history": "all_observed_Body_and_long_operator_populations_previously_examined",
+  "operator_threshold": 0.15,
+  "body_threshold": 0.15,
+  "peak_rss_bytes": 91815936,
+  "summary": {
+    "observed_body_passes": 5,
+    "observed_body_count": 6,
+    "native_operator_passes": 10,
+    "native_operator_count": 12
+  }
+}

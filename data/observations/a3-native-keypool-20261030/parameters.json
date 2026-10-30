@@ -1,0 +1,555 @@
+{
+  "schema": "mindie-sim.native-keypool-service/1",
+  "rules": [
+    {
+      "id": "a3-native-cann_key_pool-operator-calibration",
+      "match": {
+        "hardware": "Ascend910_9362",
+        "recipe": "cann_key_pool",
+        "dtype": "bf16",
+        "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+        "metadata.pool_size": 4,
+        "local_shape.1": 128,
+        "local_shape.2": 4096,
+        "metadata.tail_capacity": 9
+      },
+      "coordinates": {
+        "rows": {
+          "path": "metadata.padded_query_rows"
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 6,
+          "max": 60
+        }
+      },
+      "response": {
+        "fixed_us": 28.96730454190808,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.10608264244624804
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "observed_a3_local_native",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "KeyPool"
+      },
+      "provenance": {
+        "scope": "native_kernel_response_not_body_fit",
+        "training": "independent_short_context_same_BF16_WK_gate_state_ABI",
+        "assignment_batches": [
+          1,
+          3,
+          4,
+          5,
+          6,
+          7,
+          9,
+          10
+        ],
+        "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+        "validation_batches": [
+          3,
+          4,
+          7,
+          8
+        ],
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+          "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+          "size_bytes": 31548884
+        },
+        "source_kernel_binary_identity": "not_established",
+        "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+        "extrapolation": "long_context_has_same_producer_ABI"
+      }
+    },
+    {
+      "id": "a3-native-cann_pool_key_indexer-operator-calibration",
+      "match": {
+        "hardware": "Ascend910_9362",
+        "recipe": "cann_pool_key_indexer",
+        "dtype": "bf16",
+        "metadata.implementation": "vllm_ascend_cann_keypool_caller",
+        "metadata.pool_size": 4,
+        "local_shape.1": 32,
+        "local_shape.2": 128,
+        "metadata.topk_tokens": 2048
+      },
+      "coordinates": {
+        "rows": {
+          "path": "metadata.padded_query_rows"
+        },
+        "scanned_pools": {
+          "path": "metadata.scanned_pools"
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 6,
+          "max": 48
+        },
+        "scanned_pools": {
+          "min": 196804,
+          "max": 1574432
+        }
+      },
+      "response": {
+        "fixed_us": 41.147088235294135,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.0
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "observed_a3_local_native",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "PoolKeyIndexer"
+      },
+      "provenance": {
+        "scope": "native_kernel_response_not_body_fit",
+        "training": "long_context_B1_B2_reassigned_from_previously_inspected_capture",
+        "assignment_batches": [
+          1,
+          2
+        ],
+        "fitting": "equal_geometry_means_nonnegative_affine_in_input_query_rows",
+        "validation_batches": [
+          3,
+          4,
+          7,
+          8
+        ],
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+          "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+          "size_bytes": 86903800
+        },
+        "source_kernel_binary_identity": "not_established",
+        "reference_schedule": "logical_envelope_replaced_only_at_this_native_boundary",
+        "extrapolation": "B3_to_B8_outside_B1_B2_training_geometry; score_reuse_unidentified"
+      }
+    }
+  ],
+  "assignments": [
+    {
+      "native": "KeyPool",
+      "fixed_us": 28.96730454190808,
+      "us_per_query_row": 0.10608264244624804,
+      "training_groups": [
+        {
+          "native": "KeyPool",
+          "batch": 1,
+          "tokens": 6,
+          "count": 96,
+          "sum_us": 2813.7569999999987,
+          "min_us": 26.481,
+          "max_us": 33.3,
+          "first_line": 195,
+          "last_line": 93983,
+          "input_shapes": "\"6,4096;128,4096;128,4096;4,128;3,4,256;1,3;1;128;128;;;2;\"",
+          "output_shapes": "\"2,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 29.309968749999985
+        },
+        {
+          "native": "KeyPool",
+          "batch": 9,
+          "tokens": 54,
+          "count": 72,
+          "sum_us": 2385.4300000000007,
+          "min_us": 29.721,
+          "max_us": 36.98,
+          "first_line": 7775,
+          "last_line": 83813,
+          "input_shapes": "\"54,4096;128,4096;128,4096;4,128;19,4,256;9,3;9;128;128;;;10;\"",
+          "output_shapes": "\"22,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 33.13097222222223
+        },
+        {
+          "native": "KeyPool",
+          "batch": 10,
+          "tokens": 60,
+          "count": 204,
+          "sum_us": 7164.066999999997,
+          "min_us": 32.201,
+          "max_us": 38.941,
+          "first_line": 10344,
+          "last_line": 78695,
+          "input_shapes": "\"60,4096;128,4096;128,4096;4,128;21,4,256;10,3;10;128;128;;;11;\"",
+          "output_shapes": "\"25,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 35.117975490196066
+        },
+        {
+          "native": "KeyPool",
+          "batch": 3,
+          "tokens": 18,
+          "count": 12,
+          "sum_us": 353.389,
+          "min_us": 27.92,
+          "max_us": 34.861,
+          "first_line": 51128,
+          "last_line": 53089,
+          "input_shapes": "\"18,4096;128,4096;128,4096;4,128;7,4,256;3,3;3;128;128;;;4;\"",
+          "output_shapes": "\"7,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 29.449083333333334
+        },
+        {
+          "native": "KeyPool",
+          "batch": 5,
+          "tokens": 30,
+          "count": 24,
+          "sum_us": 771.174,
+          "min_us": 30.1,
+          "max_us": 34.801,
+          "first_line": 53685,
+          "last_line": 88900,
+          "input_shapes": "\"30,4096;128,4096;128,4096;4,128;11,4,256;5,3;5;128;128;;;6;\"",
+          "output_shapes": "\"12,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 32.13225
+        },
+        {
+          "native": "KeyPool",
+          "batch": 6,
+          "tokens": 36,
+          "count": 12,
+          "sum_us": 419.53,
+          "min_us": 32.221,
+          "max_us": 37.541,
+          "first_line": 56238,
+          "last_line": 58198,
+          "input_shapes": "\"36,4096;128,4096;128,4096;4,128;13,4,256;6,3;6;128;128;;;7;\"",
+          "output_shapes": "\"15,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 34.96083333333333
+        },
+        {
+          "native": "KeyPool",
+          "batch": 7,
+          "tokens": 42,
+          "count": 12,
+          "sum_us": 410.949,
+          "min_us": 31.7,
+          "max_us": 36.48,
+          "first_line": 84397,
+          "last_line": 86357,
+          "input_shapes": "\"42,4096;128,4096;128,4096;4,128;15,4,256;7,3;7;128;128;;;8;\"",
+          "output_shapes": "\"17,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 34.24575
+        },
+        {
+          "native": "KeyPool",
+          "batch": 4,
+          "tokens": 24,
+          "count": 12,
+          "sum_us": 384.407,
+          "min_us": 30.441,
+          "max_us": 33.561,
+          "first_line": 89482,
+          "last_line": 91443,
+          "input_shapes": "\"24,4096;128,4096;128,4096;4,128;9,4,256;4,3;4;128;128;;;5;\"",
+          "output_shapes": "\"10,128\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 32.03391666666666
+        }
+      ]
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "fixed_us": 41.147088235294135,
+      "us_per_query_row": 0.0,
+      "training_groups": [
+        {
+          "native": "PoolKeyIndexer",
+          "batch": 1,
+          "tokens": 6,
+          "count": 816,
+          "sum_us": 34967.51200000003,
+          "min_us": 32.9,
+          "max_us": 66.421,
+          "first_line": 3085,
+          "last_line": 260068,
+          "input_shapes": "\"7,32,128;38230,32,1,128;7,32;2;2;2;2,8195;;\"",
+          "output_shapes": "\"7,2051;\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 42.85234313725494
+        },
+        {
+          "native": "PoolKeyIndexer",
+          "batch": 2,
+          "tokens": 12,
+          "count": 36,
+          "sum_us": 1419.906,
+          "min_us": 37.101,
+          "max_us": 41.461,
+          "first_line": 214567,
+          "last_line": 221608,
+          "input_shapes": "\"13,32,128;38230,32,1,128;13,32;3;3;3;3,8195;;\"",
+          "output_shapes": "\"13,2051;\"",
+          "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+          "block_num": "20",
+          "mix_block_num": "40",
+          "mean_us": 39.441833333333335
+        }
+      ]
+    }
+  ],
+  "long_context_operator_groups": [
+    {
+      "native": "KeyPool",
+      "batch": 1,
+      "tokens": 6,
+      "count": 816,
+      "sum_us": 23693.406999999992,
+      "min_us": 25.58,
+      "max_us": 32.34,
+      "first_line": 3076,
+      "last_line": 260059,
+      "input_shapes": "\"6,4096;128,4096;128,4096;4,128;3,4,256;1,3;1;128;128;;;2;\"",
+      "output_shapes": "\"2,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 29.036037990196068
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 1,
+      "tokens": 6,
+      "count": 816,
+      "sum_us": 34967.51200000003,
+      "min_us": 32.9,
+      "max_us": 66.421,
+      "first_line": 3085,
+      "last_line": 260068,
+      "input_shapes": "\"7,32,128;38230,32,1,128;7,32;2;2;2;2,8195;;\"",
+      "output_shapes": "\"7,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 42.85234313725494
+    },
+    {
+      "native": "KeyPool",
+      "batch": 4,
+      "tokens": 24,
+      "count": 156,
+      "sum_us": 5050.4609999999975,
+      "min_us": 29.781,
+      "max_us": 34.62,
+      "first_line": 178984,
+      "last_line": 211435,
+      "input_shapes": "\"24,4096;128,4096;128,4096;4,128;9,4,256;4,3;4;128;128;;;5;\"",
+      "output_shapes": "\"10,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 32.374749999999985
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 4,
+      "tokens": 24,
+      "count": 156,
+      "sum_us": 6122.780999999996,
+      "min_us": 36.301,
+      "max_us": 41.401,
+      "first_line": 178993,
+      "last_line": 211444,
+      "input_shapes": "\"25,32,128;38230,32,1,128;25,32;5;5;5;5,8195;;\"",
+      "output_shapes": "\"25,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 39.24859615384613
+    },
+    {
+      "native": "KeyPool",
+      "batch": 3,
+      "tokens": 18,
+      "count": 12,
+      "sum_us": 354.42600000000004,
+      "min_us": 28.161,
+      "max_us": 34.68,
+      "first_line": 212017,
+      "last_line": 213976,
+      "input_shapes": "\"18,4096;128,4096;128,4096;4,128;7,4,256;3,3;3;128;128;;;4;\"",
+      "output_shapes": "\"7,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 29.535500000000003
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 3,
+      "tokens": 18,
+      "count": 12,
+      "sum_us": 474.971,
+      "min_us": 38.581,
+      "max_us": 40.561,
+      "first_line": 212026,
+      "last_line": 213985,
+      "input_shapes": "\"19,32,128;38230,32,1,128;19,32;4;4;4;4,8195;;\"",
+      "output_shapes": "\"19,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 39.58091666666667
+    },
+    {
+      "native": "KeyPool",
+      "batch": 2,
+      "tokens": 12,
+      "count": 36,
+      "sum_us": 1035.083,
+      "min_us": 26.8,
+      "max_us": 30.901,
+      "first_line": 214558,
+      "last_line": 221599,
+      "input_shapes": "\"12,4096;128,4096;128,4096;4,128;5,4,256;2,3;2;128;128;;;3;\"",
+      "output_shapes": "\"5,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 28.75230555555556
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 2,
+      "tokens": 12,
+      "count": 36,
+      "sum_us": 1419.906,
+      "min_us": 37.101,
+      "max_us": 41.461,
+      "first_line": 214567,
+      "last_line": 221608,
+      "input_shapes": "\"13,32,128;38230,32,1,128;13,32;3;3;3;3,8195;;\"",
+      "output_shapes": "\"13,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 39.441833333333335
+    },
+    {
+      "native": "KeyPool",
+      "batch": 8,
+      "tokens": 48,
+      "count": 144,
+      "sum_us": 4617.37,
+      "min_us": 29.56,
+      "max_us": 36.101,
+      "first_line": 227248,
+      "last_line": 254983,
+      "input_shapes": "\"48,4096;128,4096;128,4096;4,128;17,4,256;8,3;8;128;128;;;9;\"",
+      "output_shapes": "\"20,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 32.06506944444445
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 8,
+      "tokens": 48,
+      "count": 144,
+      "sum_us": 8736.672,
+      "min_us": 57.461,
+      "max_us": 63.901,
+      "first_line": 227257,
+      "last_line": 254992,
+      "input_shapes": "\"49,32,128;38230,32,1,128;49,32;9;9;9;9,8195;;\"",
+      "output_shapes": "\"49,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 60.67133333333334
+    },
+    {
+      "native": "KeyPool",
+      "batch": 7,
+      "tokens": 42,
+      "count": 12,
+      "sum_us": 413.846,
+      "min_us": 31.98,
+      "max_us": 36.861,
+      "first_line": 255559,
+      "last_line": 257519,
+      "input_shapes": "\"42,4096;128,4096;128,4096;4,128;15,4,256;7,3;7;128;128;;;8;\"",
+      "output_shapes": "\"17,128\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;FLOAT;FLOAT;INT32;INT32;FLOAT;FLOAT;DT_UNDEFINED;DT_UNDEFINED;INT32;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 34.48716666666667
+    },
+    {
+      "native": "PoolKeyIndexer",
+      "batch": 7,
+      "tokens": 42,
+      "count": 12,
+      "sum_us": 684.9730000000002,
+      "min_us": 55.581,
+      "max_us": 61.262,
+      "first_line": 255568,
+      "last_line": 257528,
+      "input_shapes": "\"43,32,128;38230,32,1,128;43,32;8;8;8;8,8195;;\"",
+      "output_shapes": "\"43,2051;\"",
+      "input_dtypes": "DT_BF16;DT_BF16;DT_BF16;INT64;INT64;INT64;INT32;DT_UNDEFINED;DT_UNDEFINED",
+      "block_num": "20",
+      "mix_block_num": "40",
+      "mean_us": 57.081083333333346
+    }
+  ],
+  "tail_capacity_evidence": {
+    "line": 248,
+    "input_shapes": "\"9,128;9,128;6,128\"",
+    "output_shapes": "\"7646,9,256;38230,32,1,128\""
+  },
+  "sources": [
+    {
+      "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p4481_20261030/kernel_details.csv",
+      "sha256": "309f05596d7c02004c00e2e8d10a49c22ab37fc4df3e68e9e24f947e9bf43957",
+      "size_bytes": 31548884
+    },
+    {
+      "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/glm5_3_flash_w8a8_static_kernel_on_c10_p128k_20261030/kernel_details.csv",
+      "sha256": "334c098253958b7ad6c428b0d9ebf7cb883fcd02ba5ce868dcd3a4ea18a68365",
+      "size_bytes": 86903800
+    }
+  ],
+  "new_parameters": 4,
+  "independent_validation_claim": false
+}
