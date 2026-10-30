@@ -1,0 +1,212 @@
+{
+  "name": "qwen36_128k_tp4_20261030 / source-declared analytic body",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 4,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "qwen3.6-27b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "bf16",
+      "scale_bytes": 2.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "fp32",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.beta_alpha": {
+          "activation_format": "bf16",
+          "weight_format": "bf16"
+        },
+        "gdn.o": {
+          "activation_format": "bf16",
+          "weight_format": "bf16"
+        }
+      },
+      "source": {
+        "kind": "same_deployment_bounded_native_abi",
+        "checkpoint_path": "/mnt/weight/Qwen3.6-27B-W8A8"
+      },
+      "notes": [
+        "Whole first 64-layer body verifies INT8 matrices with BF16 column scales and FP32 dynamic row scales; BF16 beta/alpha and GDN output projections."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "max_model_len": 131072,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 16384,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "kv_block_size": 128,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_capture_keys": [
+      4,
+      8,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128,
+      192,
+      256
+    ],
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "recurrent_implementation": "arch35_fp32",
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "from_hardware": true
+            }
+          }
+        }
+      },
+      "hccl": {
+        "allreduce": {
+          "expansion": "AIV",
+          "template": "mesh_twoshot",
+          "block_limit": 60,
+          "axes": [
+            "tp"
+          ]
+        }
+      }
+    },
+    "metadata": {
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "source_metadata": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen-a5-128k-source-deployments.json",
+        "sha256": "99f6c3e2ae91327ea706547d4391ac94f2d633953e31141dbac66680a71ab9cd",
+        "size_bytes": 888122
+      },
+      "source_metadata_pointer": "/deployments/2",
+      "draft_proposal_tokens": 3,
+      "speculation": {
+        "enabled": true,
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+        "rejection_sample_method": "synthetic",
+        "synthetic_acceptance_rates": [
+          0.8,
+          0.64,
+          0.512
+        ],
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/logs/serve.log",
+          "sha256": "aded88830dfee664f0f2ffdc3b7a4f241a17ba281edf547355af40f77f07eda4",
+          "size_bytes": 206558
+        },
+        "basis": "same_deployment_serve_log_resolved_configuration"
+      },
+      "checkpoint_path": "/mnt/weight/Qwen3.6-27B-W8A8",
+      "capture_deployment": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030",
+      "calibration_origin": "not_declared",
+      "target_timing_used_to_fit": false,
+      "body_geometry_policy": "Use actual source B/q/physical capture rows; directory concurrency is not active-batch evidence.",
+      "source_compatible_gdn": {
+        "gdn_decode": "source-compatible vllm_ascend_gdn_decode; every 48 recurrence/conv ABI in bounded whole body checked",
+        "recurrent_implementation": "arch35_fp32; captured FP32 state and local heads confirmed, compiled binary identity unknown",
+        "cache_index_row_stride": {
+          "observed": null,
+          "analytic_default": 1,
+          "basis": "native contiguous cache-index shape does not expose producer proposal-table stride; old stride4 not transferred"
+        },
+        "quantization": "W8A8_INT8_with_BF16_weight_scales_and_FP32_row_scales",
+        "HCCL": "generic analytic; no captured algorithm/template binding",
+        "frozen_or_point_service_rules": 0
+      },
+      "removed_prior_parameters": [
+        "all service_regimes",
+        "case-specific HCCL algorithm and block count",
+        "gating_beta_store issue-rate and queue",
+        "cache_index_row_stride4 assumption"
+      ],
+      "unresolved_capture_contracts": [
+        "exact per-step KV lengths",
+        "producer cache-index view stride",
+        "compiled GDN binary identity",
+        "hardware SKU"
+      ],
+      "hardware_profile_basis": "retained Ascend950DT_9582 analytic declaration; delivered deployment lacks measured SKU",
+      "gating_beta_store_binding": {
+        "basis": "Source-compatible BF16 beta scalar-store path; captured binary identity is not established.",
+        "parameters": "Reference the declared Ascend950DT_9582 hardware queue and issue service; no copied per-batch response.",
+        "source": "mindie_sim.prediction.gdn_decode; docs/operators/body-source-defaults.md",
+        "target_timing_used_for_parameters": false
+      },
+      "frozen_scalar_store_binding": {
+        "source_case": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp4-long-context-source.json",
+          "sha256": "a6ad5f66acc3b453240502ff80bb83b373b01a72bf559fd3e8f0a7000fd9d7c0",
+          "size_bytes": 5820
+        },
+        "parameter_source": "Ascend950DT_9582 hardware profile",
+        "scope": "existing BF16 scalar-store primitive applied to source-compatible GDN caller",
+        "target_timing_used_to_fit": false,
+        "captured_binary_identity": "not_established"
+      },
+      "hccl_source_candidate": {
+        "declaration": {
+          "expansion": "AIV",
+          "template": "mesh_twoshot",
+          "block_limit": 60,
+          "axes": [
+            "tp"
+          ]
+        },
+        "native_block_num": 60,
+        "legacy_selector_candidate": "mesh_twoshot",
+        "captured_template": "unobserved",
+        "source_dispatch": "conditional_candidate; block count and AivKernel name are insufficient",
+        "payload_bytes_at_B4_q4": 163840,
+        "new_latency_parameters": 0
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "body-placeholder-not-serving-population",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}
