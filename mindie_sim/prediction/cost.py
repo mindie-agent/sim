@@ -142,11 +142,22 @@ class CostModel:
             self.invocations[key] = {**record, "invocations": 0}
         self.invocations[key]["invocations"] += 1
 
-    def record_regime(self, model, key, basis, *, duration_us=None):
+    def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
+                      response_basis=None, mismatched_axes=()):
         record = self.regimes.setdefault(key, {
             "model_id": key, **model, "queries": {}, "response_us_min": None,
             "response_us_max": None})
         record["queries"][basis] = record["queries"].get(basis, 0) + 1
+        if response_basis is not None:
+            counts = record.setdefault("response_relations", {})
+            counts[response_basis] = counts.get(response_basis, 0) + 1
+        for axis in mismatched_axes:
+            counts = record.setdefault("mismatched_axes", {})
+            counts[axis] = counts.get(axis, 0) + 1
+        for name, value in (coordinate_values or {}).items():
+            bounds = record.setdefault("coordinate_ranges", {}).setdefault(
+                name, {"min": value, "max": value})
+            bounds["min"], bounds["max"] = min(bounds["min"], value), max(bounds["max"], value)
         if duration_us is not None:
             for field, select in (("response_us_min", min), ("response_us_max", max)):
                 record[field] = duration_us if record[field] is None else select(record[field], duration_us)
@@ -174,7 +185,11 @@ class CostModel:
             calibration.append("declared_primitive_service_parameters")
         if self.services:
             calibration.append("resource_service_curves")
-        if self.regimes:
+        selected_regimes = {r["id"] for r in self.regimes.values()
+                            if r["queries"].get("observable_response") or r["queries"].get("joint_native_service")}
+        queried_regimes = {r["id"] for r in self.regimes.values()
+                           if set(r["queries"]) - {"physical_identity_mismatch"}}
+        if selected_regimes:
             calibration.append("observable_kernel_regimes")
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
         return {
@@ -188,7 +203,8 @@ class CostModel:
                 "work_basis": "logical_and_analytical_reference; joint_native_queues_replace_selected_service"}
                if self.joint_native else {}),
             **({"regime_selection": {"declared": declared_regimes,
-                "unmatched": sorted(set(declared_regimes) - {r["id"] for r in self.regimes.values()})}}
+                "unmatched": sorted(set(declared_regimes) - queried_regimes),
+                "unselected": sorted(set(declared_regimes) - selected_regimes)}}
                if declared_regimes else {}),
             **({"matrix_mappings": list(self.mappings.values()),
                 "unrecorded_mapping_invocations": self.unrecorded_mappings}

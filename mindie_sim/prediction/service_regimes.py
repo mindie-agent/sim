@@ -17,6 +17,7 @@ import json
 import math
 
 from mindie_sim.schema.common import ModelingError
+from .response_functions import ResponseFunction, nonnegative as _nonnegative
 
 
 ROOTS = {"hardware", "runtime", "revision", "format", "kernel", "implementation",
@@ -50,12 +51,6 @@ class RegimeSelection:
             raise ModelingError("joint_native_service_requires_declared_single_queue_busy_ns:" + role)
         name = context.resource_names[role]
         return {name: self.duration_ms * execution["reference_rate"] / 1000}
-
-
-def _nonnegative(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-        raise ModelingError("service_regime_requires_finite_nonnegative_parameters")
-    return float(value)
 
 
 def _path(path):
@@ -132,6 +127,7 @@ def _rate(context, declaration):
 class RegimePolicy:
     def __init__(self, declarations=()):
         self.rules = []
+        self.responses = {}
         ids = set()
         for declaration in declarations:
             raw = deepcopy(declaration)
@@ -161,25 +157,22 @@ class RegimePolicy:
                 high = _nonnegative(bounds["max"]) if "max" in bounds else None
                 if high is not None and high < low:
                     raise ModelingError("service_regime_domain_reversed")
-            response = raw["response"]
-            if set(response) - {"fixed_us", "terms"}:
-                raise ModelingError("service_regime_response_unknown_fields")
-            _nonnegative(response.get("fixed_us", 0))
-            for term in response.get("terms", ()):
-                if set(term) - {"coordinate", "us_per_unit", "scale_with"}:
-                    raise ModelingError("service_regime_term_unknown_fields")
-                if term["coordinate"] not in raw.get("coordinates", {}):
-                    raise ModelingError("service_regime_term_requires_declared_coordinate")
-                _nonnegative(term["us_per_unit"])
-                if term.get("scale_with"):
-                    scaling = term["scale_with"]
-                    if set(scaling) - {"resource", "reference_rate", "dtype"} or not scaling.get("resource"):
-                        raise ModelingError("service_regime_invalid_rate_scaling")
-                    if _nonnegative(scaling["reference_rate"]) == 0:
-                        raise ModelingError("service_regime_reference_rate_must_be_positive")
+            response = ResponseFunction.from_mapping(raw["response"], raw.get("coordinates", {}))
+            if response.kind == "piecewise_linear":
+                selectors = raw.get("match", {})
+                if (not {"hardware", "dtype", "layout", "replay_scope"} <= selectors.keys()
+                        or not selectors.keys() & {"recipe", "kernel"}):
+                    raise ModelingError("service_regime_curve_requires_fixed_execution_identity")
+                # A one-coordinate table cannot identify a response to changing
+                # context, expert occupancy or other declared numerical axes.
+                for name in raw.get("coordinates", {}).keys() - {response.coordinate}:
+                    bounds = raw.get("domain", {}).get(name, {})
+                    if "min" not in bounds or "max" not in bounds or bounds["min"] != bounds["max"]:
+                        raise ModelingError("service_regime_curve_requires_fixed_other_coordinates:" + name)
             raw.setdefault("provenance", {})
             key = hashlib.sha256(json.dumps(raw, sort_keys=True, allow_nan=False).encode()).hexdigest()
             self.rules.append((raw, key))
+            self.responses[key] = response
 
     def select(self, context, record):
         """Native multi-phase groups keep their source/transport program."""
@@ -193,8 +186,15 @@ class RegimePolicy:
             return None
         axes, matches = _axes(context), []
         for raw, key in self.rules:
-            if not all(axis_equal(lookup(axes, path), value)
-                       for path, value in raw.get("match", {}).items()):
+            selectors = raw.get("match", {})
+            mismatches = [path for path, value in selectors.items()
+                          if not axis_equal(lookup(axes, path), value)]
+            if mismatches:
+                # Report a related operator's physical-domain miss, without
+                # creating per-invocation logs for unrelated kernel families.
+                kinds = selectors.keys() & {"recipe", "kernel", "family"}
+                if kinds and not kinds.intersection(mismatches):
+                    record(raw, key, "physical_identity_mismatch", mismatched_axes=mismatches)
                 continue
             values = coordinates(axes, raw.get("coordinates", {}))
             if values is None:
@@ -202,20 +202,18 @@ class RegimePolicy:
                 continue
             if any(not bounds.get("min", 0) <= values[name] <= bounds.get("max", math.inf)
                    for name, bounds in raw.get("domain", {}).items()):
-                record(raw, key, "analytic_outside_domain")
+                record(raw, key, "analytic_outside_domain", coordinate_values=values)
                 continue
-            duration = raw["response"].get("fixed_us", 0)
-            for term in raw["response"].get("terms", ()):
-                time = values[term["coordinate"]] * term["us_per_unit"]
-                if term.get("scale_with"):
-                    time *= term["scale_with"]["reference_rate"] / _rate(context, term["scale_with"])
-                duration += time
-            matches.append((raw, key, duration))
+            result = self.responses[key].evaluate(values, rate_for=lambda d: _rate(context, d))
+            if result.duration_us is None:
+                record(raw, key, result.basis, coordinate_values=values)
+                continue
+            matches.append((raw, key, result, values))
         if len(matches) > 1:
             raise ModelingError("service_regime_overlapping_domains:" + ",".join(r[0]["id"] for r in matches))
         if not matches:
             return None
-        raw, key, duration = matches[0]
+        raw, key, result, values = matches[0]
         record(raw, key, "joint_native_service" if raw.get("execution") else "observable_response",
-               duration_us=duration)
-        return RegimeSelection(duration / 1000, raw.get("execution"))
+               duration_us=result.duration_us, coordinate_values=values, response_basis=result.basis)
+        return RegimeSelection(result.duration_us / 1000, raw.get("execution"))
