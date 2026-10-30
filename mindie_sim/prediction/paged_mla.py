@@ -204,45 +204,52 @@ def _plan(spec, cores):
                 sequence, start, count, _ = job
                 begin, end = _ends(spec, job)
 
-                def cycle(index):
+                @lru_cache(maxsize=8)
+                def cycle_template(keys, old_keys, first, old_first, old_last, parity):
                     # ExecuteTask issues C1(i), C2(i-1), and independently
                     # V1(i), V2(i-1). Distinct physical pipes may overlap, but
                     # the next driver iteration cannot reorder their MMAs.
                     result = []
-                    if index < count:
-                        keys = min(KEY_TILE, spec.contexts[sequence]+1-(start+index)*KEY_TILE)
-                        work = dict(tile_work(keys, spec.heads, first=index == 0,
-                                              last=index+1 == count))
+                    if keys is not None:
+                        work = dict(tile_work(keys, spec.heads, first=first, last=False))
                         result.extend((
                             stage('load', work['load'], owner, previous=('qk','pv')),
                             stage('qk_operands', work['qk_operands'], owner, after=('load',)),
                             stage('qk', work['qk'], owner, after=('qk_operands',)),
                             stage('scores', work['scores'], owner, after=('qk',),
-                                  previous=(f'score_release{index % 2}',)),
+                                  previous=(f'score_release{parity}',)),
                             stage('softmax', work['softmax'], owner, after=('scores',),
                                   previous=('update',)),
                             stage('probability', work['probability'], owner, after=('softmax',)),
-                            Stage(f'score_release{index % 2}', after=('softmax',)),
+                            Stage(f'score_release{parity}', after=('softmax',)),
                         ))
                     else:
                         # Source flushes C2/V2 of the last valid task without
                         # fabricating a further QK or score/probability tile.
                         result.extend((Stage('qk'), Stage('softmax')))
-                    if index:
-                        old = index-1
-                        keys = min(KEY_TILE, spec.contexts[sequence]+1-(start+old)*KEY_TILE)
-                        work = dict(tile_work(keys, spec.heads, first=old == 0,
-                                              last=old+1 == count))
+                    if old_keys is not None:
+                        work = dict(tile_work(old_keys, spec.heads, first=old_first,
+                                              last=old_last))
                         result.extend((
                             stage('pv_operands', work['pv_operands'], owner,
                                   after=('qk',), previous=('probability',)),
                             stage('pv', work['pv'], owner, after=('pv_operands',)),
                             stage('partial', work['partial'], owner, after=('pv',),
-                                  previous=(f'partial_release{old % 2}',)),
+                                  previous=(f'partial_release{1-parity}',)),
                             stage('update', work['update'], owner, after=('partial','softmax')),
-                            Stage(f'partial_release{old % 2}', after=('update',)),
+                            Stage(f'partial_release{1-parity}', after=('update',)),
                         ))
                     return tuple(result)
+
+                def cycle(index):
+                    # Only prologue, two ring parities and tail/flush differ.
+                    # Reuse immutable physical stages; every original event
+                    # and dependency still executes in the same order.
+                    end = spec.contexts[sequence]+1
+                    keys = min(KEY_TILE, end-(start+index)*KEY_TILE) if index < count else None
+                    old_keys = min(KEY_TILE, end-(start+index-1)*KEY_TILE) if index else None
+                    return cycle_template(keys, old_keys, index == 0, index == 1,
+                                          index == count, index % 2)
                 return KernelProgram((stage('query', begin, owner),
                     Stage('tiles', after=('query',), program=PipelineProgram(count+1, 3, cycle)),
                     stage('output', end, owner, after=('tiles',))))

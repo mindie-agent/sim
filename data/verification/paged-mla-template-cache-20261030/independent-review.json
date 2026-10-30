@@ -1,0 +1,331 @@
+{
+  "reference_sha256": "b902acb8d09a759c8734b60d6cc4f9d93e3fce874d2f3af88a20a689a56741fc",
+  "candidate_sha256": "100f1ab25c194f9323c59edf5288756d1236d4511899fb501c53c38e41dd9ea1",
+  "wall_seconds": 0.1550689999712631,
+  "controls": [
+    {
+      "heads": 1,
+      "cores": 1,
+      "splits": 1,
+      "contexts": [
+        0,
+        128,
+        511
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "281d6671631762e2bb6ae755bcb01a3fe9fba406e90667b3e9832dcbc64640a3",
+          "duration_ms": 0.0015780000000003014,
+          "events": 153,
+          "completed_tasks": 153
+        },
+        {
+          "label": "new",
+          "sha256": "281d6671631762e2bb6ae755bcb01a3fe9fba406e90667b3e9832dcbc64640a3",
+          "duration_ms": 0.0015780000000003014,
+          "events": 153,
+          "completed_tasks": 153
+        }
+      ]
+    },
+    {
+      "heads": 1,
+      "cores": 2,
+      "splits": 2,
+      "contexts": [
+        1,
+        129,
+        520
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "9b29900ce99e273a7ea0c0cfd9aa770f8602915eaa3a2bb70dccc2345664c554",
+          "duration_ms": 0.0015780000000003014,
+          "events": 236,
+          "completed_tasks": 236
+        },
+        {
+          "label": "new",
+          "sha256": "9b29900ce99e273a7ea0c0cfd9aa770f8602915eaa3a2bb70dccc2345664c554",
+          "duration_ms": 0.0015780000000003014,
+          "events": 236,
+          "completed_tasks": 236
+        }
+      ]
+    },
+    {
+      "heads": 1,
+      "cores": 5,
+      "splits": 5,
+      "contexts": [
+        0,
+        256,
+        1024
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "964aed8f07073a0612cc90e6046e9ecfb7f325830d8c87bb0c0441f4e8e0fd4b",
+          "duration_ms": 0.0015780000000003014,
+          "events": 377,
+          "completed_tasks": 377
+        },
+        {
+          "label": "new",
+          "sha256": "964aed8f07073a0612cc90e6046e9ecfb7f325830d8c87bb0c0441f4e8e0fd4b",
+          "duration_ms": 0.0015780000000003014,
+          "events": 377,
+          "completed_tasks": 377
+        }
+      ]
+    },
+    {
+      "heads": 3,
+      "cores": 1,
+      "splits": 1,
+      "contexts": [
+        0,
+        128,
+        511
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "b1245ffe6cc5e37e5e7cf958c2316c2d45116df77def27a76d2b5ecaa3d458dc",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        },
+        {
+          "label": "new",
+          "sha256": "b1245ffe6cc5e37e5e7cf958c2316c2d45116df77def27a76d2b5ecaa3d458dc",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        }
+      ]
+    },
+    {
+      "heads": 3,
+      "cores": 2,
+      "splits": 2,
+      "contexts": [
+        1,
+        129,
+        520
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "24cb4380154ee1e1f89e99852c8cf5aa4a38b6828fa26a646c7fcd03a2dba327",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        },
+        {
+          "label": "new",
+          "sha256": "24cb4380154ee1e1f89e99852c8cf5aa4a38b6828fa26a646c7fcd03a2dba327",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        }
+      ]
+    },
+    {
+      "heads": 3,
+      "cores": 5,
+      "splits": 5,
+      "contexts": [
+        0,
+        256,
+        1024
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "01958e77592c0148510de54f423a530d675592b6500efb3b2b3952892d6e4db5",
+          "duration_ms": 0.0015780000000003014,
+          "events": 717,
+          "completed_tasks": 717
+        },
+        {
+          "label": "new",
+          "sha256": "01958e77592c0148510de54f423a530d675592b6500efb3b2b3952892d6e4db5",
+          "duration_ms": 0.0015780000000003014,
+          "events": 717,
+          "completed_tasks": 717
+        }
+      ]
+    },
+    {
+      "heads": 31,
+      "cores": 1,
+      "splits": 1,
+      "contexts": [
+        0,
+        128,
+        511
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "d8c66de37219b32dc012a779f3ebe5a619150107cdcf30922d244f580b73e6bd",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        },
+        {
+          "label": "new",
+          "sha256": "d8c66de37219b32dc012a779f3ebe5a619150107cdcf30922d244f580b73e6bd",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        }
+      ]
+    },
+    {
+      "heads": 31,
+      "cores": 2,
+      "splits": 2,
+      "contexts": [
+        1,
+        129,
+        520
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "de4dc9a0d86de9161061051e500d095502a85c9bb22f566f0e73e82a862daddf",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        },
+        {
+          "label": "new",
+          "sha256": "de4dc9a0d86de9161061051e500d095502a85c9bb22f566f0e73e82a862daddf",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        }
+      ]
+    },
+    {
+      "heads": 31,
+      "cores": 5,
+      "splits": 5,
+      "contexts": [
+        0,
+        256,
+        1024
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "6854e29056fc6ca392e6086ce58add2b1106cea004c4ab98eb6bbf3ee723d6e0",
+          "duration_ms": 0.0021210798636417394,
+          "events": 717,
+          "completed_tasks": 717
+        },
+        {
+          "label": "new",
+          "sha256": "6854e29056fc6ca392e6086ce58add2b1106cea004c4ab98eb6bbf3ee723d6e0",
+          "duration_ms": 0.0021210798636417394,
+          "events": 717,
+          "completed_tasks": 717
+        }
+      ]
+    },
+    {
+      "heads": 64,
+      "cores": 1,
+      "splits": 1,
+      "contexts": [
+        0,
+        128,
+        511
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "8c6f7aad84fa341ed5abaec97fadf202d8572083710358b778b36ba5b808bc8b",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        },
+        {
+          "label": "new",
+          "sha256": "8c6f7aad84fa341ed5abaec97fadf202d8572083710358b778b36ba5b808bc8b",
+          "duration_ms": 0.0015780000000003014,
+          "events": 273,
+          "completed_tasks": 273
+        }
+      ]
+    },
+    {
+      "heads": 64,
+      "cores": 2,
+      "splits": 2,
+      "contexts": [
+        1,
+        129,
+        520
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "e0a3be74296b9900fc55231b994777971174f3d3c299bc63e3ae4b01eeade878",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        },
+        {
+          "label": "new",
+          "sha256": "e0a3be74296b9900fc55231b994777971174f3d3c299bc63e3ae4b01eeade878",
+          "duration_ms": 0.0015780000000003014,
+          "events": 441,
+          "completed_tasks": 441
+        }
+      ]
+    },
+    {
+      "heads": 64,
+      "cores": 5,
+      "splits": 5,
+      "contexts": [
+        0,
+        256,
+        1024
+      ],
+      "complete_trace_and_result_equal": true,
+      "pair": [
+        {
+          "label": "old",
+          "sha256": "93f4336294f0efd3bbe04d90175c25bc9f7000b2ea39aa9e4b94ae40374fdb25",
+          "duration_ms": 0.0034460520606112155,
+          "events": 717,
+          "completed_tasks": 717
+        },
+        {
+          "label": "new",
+          "sha256": "93f4336294f0efd3bbe04d90175c25bc9f7000b2ea39aa9e4b94ae40374fdb25",
+          "duration_ms": 0.0034460520606112155,
+          "events": 717,
+          "completed_tasks": 717
+        }
+      ]
+    }
+  ]
+}
