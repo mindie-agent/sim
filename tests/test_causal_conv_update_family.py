@@ -143,15 +143,34 @@ def test_prepared_weight_capacity_does_not_ceil_fractional_source_heads_as_chann
         parse_case(replace(parsed, model=model))
 
 
-@pytest.mark.parametrize('field', ['draft_proposal_tokens', 'draft_accepted_tokens', 'draft_advanced_tokens'])
-def test_q1_with_explicit_speculative_state_is_not_silently_non_speculative(field):
+@pytest.mark.parametrize('field,value', [('draft_proposal_tokens',1),
+                                        ('draft_accepted_tokens',1), ('draft_advanced_tokens',2)])
+def test_q1_with_explicit_speculative_state_is_not_silently_non_speculative(field,value):
     from mindie_sim.prediction.frontend import Frontend
     from mindie_sim.schema.workload import RequestView
     parsed = parse_case(case(1))
     kernels = deepcopy(dict(parsed.runtime.kernels))
     kernels.pop('sequence_parallel')
     runtime = replace(parsed.runtime, kernels=kernels)
-    view = RequestView('spec', 1, 4096, False, 'decode', **{field: 1})
+    view = RequestView('spec', 1, 4096, False, 'decode', **{field: value})
     with pytest.raises(ValueError, match='causal_conv_update_requires_q1_non_speculative_decode'):
         Frontend().body(parsed.model, runtime, (view,), ready='input', tokens=1,
                         mode='decode', global_tokens=1)
+
+
+def test_ordinary_single_token_commit_does_not_change_native_convolution_work():
+    from mindie_sim.prediction.frontend import Frontend
+    from mindie_sim.schema.workload import RequestView
+
+    parsed = parse_case(case(1))
+    ops = []
+    for advanced in (0,1):
+        view = RequestView('r',1,4096,True,'decode',draft_advanced_tokens=advanced)
+        body,_ = Frontend().body(parsed.model,parsed.runtime,(view,),ready='input',
+                                 tokens=1,mode='decode')
+        ops.append(next(op for op in body if op.recipe==CONV))
+    assert ops[0] == ops[1]
+    result=graph_costs(parsed,(ops[1],),isolated=False,
+                       external_inputs={dep:7 for dep in ops[1].deps})
+    assert result['duration_ms']>0
+    assert not result['execution']['live_tasks']

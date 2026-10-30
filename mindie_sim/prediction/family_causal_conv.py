@@ -60,9 +60,12 @@ def prepare_model(model, runtime):
 
 def lower(b, tensors, *, plan, views, tokens, sources, key_width, value_width):
     """Bind q1 update; the selected recipe owns the complete state writeback."""
+    # The scheduler records one committed token for ordinary q1 decode;
+    # proposal/accepted rows or a larger advance require a speculative ABI.
     if not views or any(view.phase != "decode" or view.q_len != 1 or any(
             getattr(view, field) for field in ("draft_proposal_tokens",
-                                             "draft_accepted_tokens", "draft_advanced_tokens"))
+                                             "draft_accepted_tokens"))
+                        or view.draft_advanced_tokens not in (0, 1)
                         for view in views):
         raise ModelingError("causal_conv_update_requires_q1_non_speculative_decode")
     actual, width = len(views), 2 * key_width + value_width

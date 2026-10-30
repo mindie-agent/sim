@@ -139,3 +139,32 @@ def test_hc_prefill_geometry_selects_source_only_inside_its_declared_row_domain(
     assert graph_selections(large)[0]["implementation"] == "analytical"
     projection = next(op for op in large if op.recipe == "hc_projection")
     assert projection.local_shape[0] == 257 and projection.flops > 0
+
+
+def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analytical():
+    from mindie_sim.catalog.weights import stage_weight_bytes
+    from mindie_sim.prediction.gdn_decode_programs import CONV
+    from test_causal_conv_update_family import case as kimi_case
+
+    original = parse_case(kimi_case(1))
+    model = replace(original.model, layers=4, body_layers=4,
+                    layer_plans=original.model.layer_plans[:4])
+    original = replace(original, model=model,
+                       runtime=replace(original.runtime, pp_layer_partition=(4,)))
+    resident = stage_weight_bytes(original.model, original.runtime.parallel)
+    kernels = deepcopy(original.runtime.kernels)
+    for selector in ("mla_head_padding", "causal_conv_update", "kda", "paged_mla_attention"):
+        kernels["lowerings"][selector] = policy(kernels["lowerings"][selector], {
+            "phases": ["decode"], "max_query_tokens": {"max": 1}}, otherwise="analytical")
+    parsed = parse_case(replace(original, runtime=replace(original.runtime, kernels=kernels)))
+    assert stage_weight_bytes(parsed.model, parsed.runtime.parallel) == resident
+    views = (RequestView("d", 1, 4104, False, "decode", draft_advanced_tokens=1),
+             RequestView("p", 8, 0, False, "prefill"))
+    mixed = Frontend()(IterationPlan(views), parsed.model, parsed.runtime, parsed.machine)
+    assert all(row["implementation"] == "analytical" for row in mixed.implementation_selections)
+    assert any(op.recipe == "short_convolution" for op in mixed.ops)
+    assert not any(op.recipe in {CONV, "mla_query_pad_nope", "mla_query_pad_rope"} for op in mixed.ops)
+    decode = Frontend()(IterationPlan(views[:1]), parsed.model, parsed.runtime, parsed.machine)
+    assert any(op.recipe == CONV for op in decode.ops)
+    assert any(op.recipe == "mla_query_pad_nope" for op in decode.ops)
+    assert stage_weight_bytes(parsed.model, parsed.runtime.parallel) == resident

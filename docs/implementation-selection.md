@@ -59,8 +59,12 @@ other declared recipe choices. It does not assert a native implementation.
 Selection happens before lowering in both Serving and body/model probes. Source
 validation or planner failures propagate directly; they never trigger another
 case. All declared source recipe providers are registered before execution.
-Bindings that change persistent model preparation (`mla_prolog`,
-`mla_head_padding`, `causal_conv_update`, `mx_matrix`) remain unconditional.
+Bindings that change persistent cache/weight representation (`mla_prolog`,
+`mx_matrix`) remain unconditional. Conditional `mla_head_padding` and
+`causal_conv_update` reserve their prepared weights once if any branch selects
+the source. Original weights remain resident for prefill/analytical paths.
+The per-batch decision selects execution without freeing or reallocating that
+prepared inventory; all source branches must share its preparation options.
 
 `IterationWork.implementation_selections`, graph-root metadata and serving traces
 record the selected case, coverage and actual geometry. The execution

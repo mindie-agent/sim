@@ -14,7 +14,7 @@ from mindie_sim.schema.common import ModelingError
 
 _GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "max_query_tokens",
              "max_context_tokens"}
-_STATIC_SELECTORS = {"mla_prolog", "mla_head_padding", "causal_conv_update", "mx_matrix"}
+_STATIC_SELECTORS = {"mla_prolog", "mx_matrix"}
 
 
 def is_policy(raw):
@@ -57,6 +57,25 @@ def _validate_domain(domain, selector):
               or any(type(bound) is not int or bound < 0 for bound in value.values())
               or value.get("min", 0) > value.get("max", float("inf"))):
             raise ModelingError(f"implementation_domain_invalid:{selector}:{key}")
+
+
+def prepared_selection(bindings, selector):
+    """Reserve optional prepared weights once, independently of active calls.
+
+    The supported callers retain their original weights for analytical/prefill
+    work. Keeping the prepared copy resident is not selecting its device call.
+    """
+    from .implementations import select
+
+    raw = bindings.get(selector)
+    if not is_policy(raw):
+        return select(bindings, selector)
+    choices = [select({selector: binding}, selector)
+               for binding in alternatives(raw, selector) if binding != "analytical"]
+    if choices and any((choice.name, choice.options) != (choices[0].name, choices[0].options)
+                       for choice in choices[1:]):
+        raise ModelingError(f"implementation_prepared_inventory_must_be_shared:{selector}")
+    return choices[0] if choices else None
 
 
 def _matches(domain, geometry):

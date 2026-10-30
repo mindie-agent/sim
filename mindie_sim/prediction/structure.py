@@ -82,11 +82,12 @@ def parse_case(value: Case | Mapping) -> Case:
         )
     model = normalize_model(case.model)
     from .implementations import select
+    from .implementation_selection import prepared_selection
 
     prolog = select(case.runtime.kernels.get("lowerings", {}), "mla_prolog")
     if prolog:
         model = prolog.module.prepare_model(model, case.runtime)
-    head_padding = select(case.runtime.kernels.get("lowerings", {}), "mla_head_padding")
+    head_padding = prepared_selection(case.runtime.kernels.get("lowerings", {}), "mla_head_padding")
     if head_padding:
         model = head_padding.module.prepare_model(model, case.runtime)
     elif "mla_head_padding" in dict(model.metadata):
@@ -94,7 +95,7 @@ def parse_case(value: Case | Mapping) -> Case:
         # Derived prepared-weight/head state must not survive its selection.
         model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
                                              if key != "mla_head_padding"))
-    conv = select(case.runtime.kernels.get("lowerings", {}), "causal_conv_update")
+    conv = prepared_selection(case.runtime.kernels.get("lowerings", {}), "causal_conv_update")
     if conv:
         model = conv.module.prepare_model(model, case.runtime)
     elif "causal_conv_update" in dict(model.metadata):

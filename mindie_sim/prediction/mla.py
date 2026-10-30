@@ -102,7 +102,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             views=views, plan=plan, parallel=parallel, model=model, quant=quant,
             padded_tokens=padded_tokens, **selected.options)
     q, h, heads = padded_tokens, model.hidden_size, plan.num_heads // parallel.tp
-    head_contract = mla_head_padding.contract(model, plan, views)
+    head_contract = (mla_head_padding.contract(model, plan, views)
+                     if runtime and select(runtime.kernels.get("lowerings", {}), "mla_head_padding")
+                     else None)
     logical_heads = heads
     if head_contract:
         heads = head_contract["physical_heads"]
