@@ -8,7 +8,7 @@ from mindie_sim import operator_costs, target_graphs
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.mechanism import Geometry
 from mindie_sim.prediction.paged_mla_arch22 import build, BUFFERS, IMPLEMENTATION
-from mindie_sim.prediction.paged_mla_arch22_dispatch import Dispatch
+from mindie_sim.prediction.paged_mla_arch22_dispatch import Dispatch, source_dispatch
 from mindie_sim.prediction.program import RecipeContext
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -60,6 +60,7 @@ def run(raw, *, supply=1, trace=0):
 def test_retained_unmodified_host_endpoints_partition_kv_and_fd_heads():
     for raw in ORACLE:
         contexts=tuple(raw['contexts']); heads=raw['heads']
+        assert source_dispatch(contexts,heads,raw['cores'])==raw
         dispatch=Dispatch.parse(raw,contexts,heads,raw['cores'])
         actual={}
         for owner,rows in enumerate(dispatch.owners):
@@ -143,8 +144,7 @@ def test_complete_frontend_uses_arch22_core_and_preserves_logical_output_heads(t
                     'a3_kimi4_tp8_w4a8_c1_source.json').read_text())
     raw['machine']['num_devices']=tp
     raw['runtime'].update(tp=tp,ep=tp,max_model_len=131072)
-    raw['runtime']['kernels']['lowerings']['paged_mla_attention']={
-        'implementation':IMPLEMENTATION,'options':{'dispatch':declaration(heads,cores=20)}}
+    raw['runtime']['kernels']['lowerings']['paged_mla_attention']=IMPLEMENTATION
     graph=target_graphs(raw,scope='body',phase='decode',tokens=1,sequences=1,context=1024)[0]
     attention=next(o for o in graph if o.recipe==IMPLEMENTATION)
     assert dict(attention.metadata)['mla_head_contract']=={

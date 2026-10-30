@@ -14,7 +14,7 @@ from functools import lru_cache
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .paged_mla_arch22_dispatch import Dispatch
+from .paged_mla_arch22_dispatch import Dispatch, source_dispatch
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch22'
 SOURCE = {
@@ -46,6 +46,7 @@ class Spec:
     heads: int
     page_size: int
     dispatch: Dispatch
+    dispatch_origin: str
 
 
 def tile_work(keys, heads, *, first, last, splits, page_size):
@@ -108,7 +109,9 @@ def build(op, geometry):
     if (not contexts or any(type(c) is not int or c < 512 for c in contexts)
             or heads not in (8,16) or page < 1 or KEY_TILE % page):
         raise ModelingError('paged_mla_arch22_requires_q1_heads8_or16_context_ge512_page_divisor512')
-    dispatch = Dispatch.parse(raw.get('dispatch'),contexts,heads,geometry.compute_units)
+    declared = raw.get('dispatch')
+    dispatch = Dispatch.parse(declared if declared is not None else source_dispatch(
+        contexts,heads,geometry.compute_units),contexts,heads,geometry.compute_units)
     for pool, needed in BUFFERS.items():
         if geometry.buffers.get(pool,0) < needed:
             raise ModelingError(f'paged_mla_arch22_source_pool_capacity:{pool}:{needed}')
@@ -117,7 +120,8 @@ def build(op, geometry):
     if any(geometry.resource_units.get(role) != geometry.compute_units*ratio
            for role,ratio in ratios.items()):
         raise ModelingError('paged_mla_arch22_requires_paired_aic_aiv_physical_pipes')
-    return _plan(Spec(contexts,heads,page,dispatch),geometry.compute_units)
+    origin = 'source_common_SplitCore_q1_geometry' if declared is None else 'declared_common_SplitCore_endpoints'
+    return _plan(Spec(contexts,heads,page,dispatch,origin),geometry.compute_units)
 
 
 @lru_cache(maxsize=64)
@@ -229,7 +233,7 @@ def _plan(spec, cores):
         ))
     return OperatorPlan(total,lower,{
         'implementation':IMPLEMENTATION,'source':SOURCE,'source_execution_domain':'cube_vector',
-        'host_dispatch':'declared_common_SplitCore_endpoints; no native_binary_identity',
+        'host_dispatch':spec.dispatch_origin,
         'active_aic_owners':len(owners),'active_fd_aiv_owners':len(spec.dispatch.merges),
         'physical_segments':sum(map(len,owners)),'buffers_per_owner':BUFFERS,
         'tile_sequence':'C1(i);V1_C2(i-1);V2(i-2);two_drains',
