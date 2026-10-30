@@ -282,7 +282,11 @@ def test_bounded_real_q8192_h6_kv2_d256_run():
     if sys.platform != "darwin":
         peak *= 1024  # Linux reports KiB; macOS reports bytes.
     assert end.done
-    assert elapsed < 30.0
+    # This is the complete large-geometry execution control. Its 90 s budget
+    # follows the local end-to-end tier; CPU throughput varies by runner.
+    # The live task bound, rather than host speed, guards against expansion.
+    assert elapsed < 90.0
+    assert engine.peak_tasks < 4096
     assert peak < 512 * 1024 * 1024
     assert engine.summary()["live_tasks"] == 0
     assert engine.summary()["live_programs"] == 0
@@ -330,3 +334,18 @@ def test_missing_private_copy_service_is_visible_separately_from_startup():
     assert set(report["unmodeled_transfer_roles"]) == {
         "matrix_input_copy", "matrix_operand_copy", "output_store"}
     assert report["q_bytes"] > 0 and report["kv_bytes"] > 0
+
+
+def test_reused_key_panel_templates_preserve_tail_events_and_resource_service(monkeypatch):
+    import mindie_sim.prediction.attention_prefill as module
+
+    op = make_op(((9, 13), (7, 2)), heads=4, kv_heads=2, dim=8)
+    recipe = StagedGQAPrefill(query_tile=4, key_tile=5, slots=2)
+    cached, cached_end, _, _, _ = run(op, recipe, ready=7, trace_limit=10000)
+    monkeypatch.setattr(module, "lru_cache", lambda **_: lambda fn: fn)
+    expanded, expanded_end, _, _, _ = run(op, recipe, ready=7, trace_limit=10000)
+    assert cached_end.time == expanded_end.time
+    assert cached.serviced == expanded.serviced
+    assert list(cached.trace) == list(expanded.trace)
+    assert cached.summary()["live_tasks"] == cached.summary()["live_programs"] == 0
+    assert not any(cached.allocated.values())

@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from bisect import bisect_right
 from dataclasses import dataclass
+from functools import lru_cache
 import math
 from typing import Mapping
 
@@ -432,11 +433,16 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
 
     def tile(index: int):
         start = index * recipe.key_tile
-        end = min(start + recipe.key_tile, task.horizon)
-        valid = end - start
+        valid = min(recipe.key_tile, task.horizon - start)
+        return tile_template(valid, index % recipe.slots)
+
+    # All full key panels of an owner use the same work and buffer slots.
+    # Only the final partial panel differs. Reuse bound stage descriptions;
+    # PipelineProgram still creates independent events and lifetimes per panel.
+    @lru_cache(maxsize=recipe.slots + 1)
+    def tile_template(valid: int, slot: int):
         rect = rows * valid
         kv_bytes = valid * dim * spec.kv_bytes
-        slot = index % recipe.slots
         suffix = f"s{slot}"
         k_l1 = _allocation(context, core, "l1", f"k_l1_{suffix}", kv_bytes)
         k_l0b = _allocation(context, core, "l0b", f"k_l0b_{suffix}", kv_bytes)

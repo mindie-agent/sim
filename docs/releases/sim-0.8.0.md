@@ -56,3 +56,9 @@ mindie-sim predict serving-case.json
 CPU 基准，并随 Release 交付 wheel、sdist、精确源码 benchmark 和 SHA256。
 CPU 基准检验接口、执行完成和资源守恒，不替代真机精度测试。
 本地源码/隔离 wheel 结果及历史精度边界见[验证记录](../verification.md)。
+
+首次发布流水线在 Linux 上发现外部源码测试路径依赖及 Prefill 完整图的
+30 秒主机速度门限。已将带许可证的精确源码保留为小型测试 fixture；
+Prefill 重复 key-panel 描述复用保持工作量、事件及尾块一致。完整图测试
+采用端到端 90 秒预算，同时保留 512 MiB、有限活动任务和资源释放门禁。
+旧失败流水线记录保留；正式产物只由修正后标签的门禁生成。

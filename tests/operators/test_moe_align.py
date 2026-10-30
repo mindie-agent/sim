@@ -49,13 +49,8 @@ from tools.run_operator_cases import control_case, run
 ROOT = Path(__file__).resolve().parents[2]
 CASE_FILE = ROOT / "tests/fixtures/operator_cases/moe_align.json"
 MANIFEST_FILE = ROOT / "tests/fixtures/operator_sources/moe_align.json"
-WRAPPER = Path(
-    "/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/"
-    "fused_moe/moe_align_block_size.py")
-CUDA = Path(
-    "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/moe/"
-    "moe_align_sum_kernels.cu")
-MATH = Path("/Users/maoxx241/code/vllm-v0.25.1/vllm/utils/math_utils.py")
+SOURCE_FIXTURES = ROOT / "tests/fixtures/operator_sources/moe_align_vllm"
+MATH = SOURCE_FIXTURES / "math_utils.py"
 
 IMPLEMENTATION = "cuda_moe_align_block_size"
 INT32 = 4
@@ -1237,7 +1232,7 @@ def test_source_identity_hashes_lines_and_scope_match_manifest():
         "current_checkout_manifest_matched_not_historical_capture_image"
     assert {item["path"] for item in identity["files"]} == set(by_path)
     for item in identity["files"]:
-        path = Path(item["path"])
+        path = SOURCE_FIXTURES / Path(item["path"]).name
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         assert digest == item["sha256"] == by_path[item["path"]]["sha256"]
         assert path.stat().st_size == item["bytes"] == \
