@@ -69,3 +69,12 @@ retention is zero, using only the finite set of declared cases as aggregate keys
 Batch traces retain decisions from each constituent microbatch. Selecting an
 analytical branch is visible as `analytical_semantic_work`; this label describes
 the selected lowering, not the coverage of unrelated source operators.
+
+For `ascend_grouped_int32_dequant_swiglu` with `dequant_program=arch35_full_load`,
+`input_capacity_rows` may be an explicit integer allocation or `"valid_rows"`.
+The latter declares a variable-size allocation equal to the actual received
+expert-row total for that operator (minimum one allocation row for an empty
+group). Resolution happens after routing produces the integer expert histogram.
+The resulting numeric tensor extent drives the existing source tiling; it does
+not reuse a decode capture's capacity for a larger prefill batch. It is a caller
+allocation assumption, not proof of captured native allocation behavior.

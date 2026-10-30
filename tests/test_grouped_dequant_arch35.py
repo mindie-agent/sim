@@ -82,6 +82,26 @@ def test_same_valid_groups_different_capacity_changes_owner_branch_not_payload()
     assert sum(n for x in a for _,n in x) == sum(n for x in b for _,n in x) == 512
 
 
+@pytest.mark.parametrize('batch', (4,64,128))
+def test_explicit_valid_row_allocation_follows_actual_received_expert_rows(batch):
+    case, op, _ = ordinary(batch, 'valid_rows')
+    config = dict(op.metadata)['grouped_dequant']
+    rows = sum(config['expert_rows'])
+    assert config['input_capacity_rows'] == rows == batch * 8
+    abi = tensor_contract(op.to_dict())
+    assert abi[2][0][0] == (rows, 1024)
+    assert abi[3][0][0] == (rows, 512)
+    declared_case, declared_op, _ = ordinary(batch, rows)
+    geometry = Geometry.from_devices(case.machine.dies)
+    variable = build(op, geometry)
+    fixed = build(declared_op, geometry)
+    assert variable.work == fixed.work
+    assert variable.metadata['grouped_dequant_schedule'] == fixed.metadata['grouped_dequant_schedule']
+    report = graph_costs(case, [replace(op, deps=())], isolated=False)
+    assert report['duration_ms'] > 0
+    assert report['execution']['live_tasks'] == 0
+
+
 @pytest.mark.parametrize('rows,capacity,cores', (((0,5,69,0,7),1024,8),((1,)*33,33,16),((30,0,17),128,4)))
 def test_owner_partition_and_ub_tile_tail_independently_conserve_every_bank(rows,capacity,cores):
     cfg = Config(rows,33,capacity,cores,8192)

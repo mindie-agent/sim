@@ -96,6 +96,11 @@ def _rewrite(ops, gate, options):
     if (not groups or any(type(n) is not int or n < 0 for n in groups)
             or sum(groups) != rows or columns % 2):
         raise ModelingError("grouped_int32_requires_integral_expert_rows_and_even_columns")
+    if options.get("input_capacity_rows") == "valid_rows":
+        # A variable-size caller explicitly allocates its received expert rows.
+        # Fixed captured allocations remain integers and keep their own tiling.
+        options = {**options, "input_capacity_rows": max(1, rows),
+                   "input_capacity_policy": "valid_rows"}
     if (meta.get("activation_format") != "int8" or meta.get("weight_format") != "int8"
             or meta.get("activation_scale_format") != "fp32"
             or tuple(meta.get("activation_scale_shape", ())) != (rows,)):
@@ -180,7 +185,8 @@ def lower(ops, bindings):
         return tuple(ops)
     options = selected.options
     if options and (options.get("dequant_program") != "arch35_full_load"
-                    or type(options.get("input_capacity_rows")) is not int):
+                    or not (type(options.get("input_capacity_rows")) is int
+                            or options.get("input_capacity_rows") == "valid_rows")):
         raise ModelingError("grouped_int32_source_dequant_requires_arch35_full_load_and_capacity")
     current = tuple(ops)
     for gate in ops:
