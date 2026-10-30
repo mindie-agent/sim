@@ -1,7 +1,8 @@
 """Finite arch22 BF16 paged MLA with explicit GM communication and source owners.
 
 [Role] Execute declared common SplitCore ownership through the shared Engine.
-[Invariants] Aliased K/V are separately read. Q is reloaded per S2 tile; QK,
+[Invariants] Aliased K/V are separately read. Declared retained rows consume
+  finite shared L2 capacity and the same AIC copy pipe. Q reloads per S2; QK,
   probability and PV cross GM. Atomic updates retain read/write traffic.
   C1(i), V1/C2(i-1), V2(i-2) have two real drains and finite source buffers.
 [Timeouts & Locks] O(batch + owners + finite active tile windows), no locks.
@@ -48,9 +49,10 @@ class Spec:
     page_size: int
     dispatch: Dispatch
     dispatch_origin: str
+    retained_kv_rows: int = 0
 
 
-def tile_work(keys, heads, *, first, last, splits, page_size):
+def tile_work(keys, heads, *, first, last, splits, page_size, retained_kv_rows=0):
     """Source transfers and aligned matrix work; no measured service or split fit."""
     hm, kn, columns = align(heads), align(keys), align(keys, 32)
     blocks = (keys+127)//128
@@ -83,6 +85,16 @@ def tile_work(keys, heads, *, first, last, splits, page_size):
         'pv': Work(matrix={'bf16':2*hm*kn*512}),
         'partial': Work(resources={'hbm':pv*(1 if first else 2), 'fixpipe':pv}),
     }
+    if retained_kv_rows:
+        retained = min(keys, retained_kv_rows)
+        # QK fills the retained latent+rope rows. PV rereads the same latent
+        # addresses one outer iteration later; neither read nor cache fill is
+        # free. Probability, page metadata and all scratch remain offchip.
+        works['qk_load'] += Work(resources={'l2_write': retained*576*2})
+        cached = retained*512*2
+        works['pv_load'] = Work(resources={
+            'hbm': value_probability-cached, 'mte2_aic': value_probability-cached,
+            'mte2_aic_cached': cached, 'l2_read': cached})
     if last:
         read = heads*512*4
         write = heads*(512*4+64 if splits > 1 else 512*2)
@@ -107,9 +119,12 @@ def merge_work(heads, splits):
 def build(op, geometry):
     raw = dict(op.metadata)['paged_mla_geometry']
     contexts, heads, page = tuple(raw['contexts']), raw['heads'], raw['page_size']
+    retained = raw.get('retained_kv_rows',0)
     if (not contexts or any(type(c) is not int or c < 512 for c in contexts)
             or heads not in (8,16) or page < 1 or KEY_TILE % page):
         raise ModelingError('paged_mla_arch22_requires_q1_heads8_or16_context_ge512_page_divisor512')
+    if type(retained) is not int or not 0 <= retained <= KEY_TILE:
+        raise ModelingError('paged_mla_arch22_retained_rows_must_fit_source_s2_tile')
     declared = raw.get('dispatch')
     dispatch = Dispatch.parse(declared if declared is not None else source_dispatch(
         contexts,heads,geometry.compute_units),contexts,heads,geometry.compute_units)
@@ -122,7 +137,13 @@ def build(op, geometry):
            for role,ratio in ratios.items()):
         raise ModelingError('paged_mla_arch22_requires_paired_aic_aiv_physical_pipes')
     origin = 'source_common_SplitCore_q1_geometry' if declared is None else 'declared_common_SplitCore_endpoints'
-    return _plan(Spec(contexts,heads,page,dispatch,origin),geometry.compute_units)
+    # QK(i) precedes PV(i-1). Two private tile generations per live owner
+    # must survive; retaining one generation alone would reuse overwritten KV.
+    required_cache = 2*len(dispatch.owners)*retained*576*2
+    if retained and (geometry.buffer_units.get('l2',1) != 1
+                     or geometry.buffers.get('l2',0) < required_cache):
+        raise ModelingError('paged_mla_arch22_retained_kv_requires_two_tiles_in_shared_l2')
+    return _plan(Spec(contexts,heads,page,dispatch,origin,retained),geometry.compute_units)
 
 
 @lru_cache(maxsize=64)
@@ -134,7 +155,8 @@ def _plan(spec, cores):
             for tile in range(count):
                 keys = min(KEY_TILE,spec.contexts[seq]+1-(start+tile)*KEY_TILE)
                 for work in tile_work(keys,spec.heads,first=tile==0,last=tile+1==count,
-                                      splits=splits,page_size=spec.page_size).values():
+                                      splits=splits,page_size=spec.page_size,
+                                      retained_kv_rows=spec.retained_kv_rows).values():
                     total += work
     for jobs in spec.dispatch.merges:
         for _,_,heads,splits in jobs:
@@ -142,9 +164,16 @@ def _plan(spec, cores):
                 total += work
 
     def lower(ctx):
+        if spec.retained_kv_rows:
+            if ctx.physical_role('mte2_aic_cached') != ctx.physical_role('mte2_aic'):
+                raise ModelingError('paged_mla_arch22_cached_reads_must_share_aic_pipe')
+            l2 = ctx.physical_role('l2_read')
+            if (l2 != ctx.physical_role('l2_write') or l2 not in ctx.resource_names
+                    or ctx.resource_units.get(l2) != 1):
+                raise ModelingError('paged_mla_arch22_requires_one_shared_l2_service')
         def stage(name,work,owner,*,aiv=None,**kwargs):
             roles = set(work.resources) | ({'cube'} if work.matrix else set())
-            placement = ctx.owned(owner,cores,roles-{'hbm'})
+            placement = ctx.owned(owner,cores,roles-{'hbm','l2_read','l2_write'})
             # Source vecDealM<=16 gives all live rows to subblock zero.
             for role in roles & {'vector','mte2_aiv','mte3'}:
                 placement[ctx.resource_names[role]] = (2*owner if aiv is None else aiv,)
@@ -152,7 +181,8 @@ def _plan(spec, cores):
 
         @lru_cache(maxsize=256)
         def matrix(kind,keys,owner):
-            return matrix_program(ctx,kind,keys,spec.heads,spec.page_size,owner,cores,len(owners))
+            return matrix_program(ctx,kind,keys,spec.heads,spec.page_size,owner,cores,len(owners),
+                                  retained_kv_rows=spec.retained_kv_rows)
 
         def matrix_steps(kind,keys,owner,*,after=(),previous=()):
             # The cached compact IR is a three-stage chain. Put that chain in
@@ -180,7 +210,8 @@ def _plan(spec, cores):
             def work_at(index):
                 keys,offset,size,splits = keys_at(index)
                 return tile_work(keys,spec.heads,first=offset==0,last=offset+1==size,
-                                 splits=splits,page_size=spec.page_size)
+                                 splits=splits,page_size=spec.page_size,
+                                 retained_kv_rows=spec.retained_kv_rows)
 
             def cycle(index):
                 steps = []
@@ -240,6 +271,9 @@ def _plan(spec, cores):
         allocations = tuple(ctx.allocate(f'{pool}_{owner}',pool,size,
             (2*owner,2*owner+1) if pool=='ub' else (owner,))
             for owner in range(len(owners)) for pool,size in BUFFERS.items())
+        if spec.retained_kv_rows:
+            allocations += (ctx.allocate('retained_kv','l2',
+                2*len(owners)*spec.retained_kv_rows*576*2,(0,)),)
         return KernelProgram((
             Stage('reserve',acquire=allocations),
             Stage('producers',after=('reserve',),program=ParallelProgram(tuple(
@@ -257,7 +291,13 @@ def _plan(spec, cores):
         'matrix_micro_geometry':{'qk_n':128,'qk_k_l1':288,'qk_k_l0':96,
                                  'pv_n':128,'pv_k_l1':256,'pv_k_l0':128},
         'matrix_pipeline':'three_L1_refill_slots_two_L0_consumer_slots; compact_nominal_recurrence',
-        'gm_traffic':'source_transfers_and_atomic_read_write; no cache_hit_credit',
+        'gm_traffic':'source_transfers_and_atomic_read_write; declared_pv_alias_reuse_only',
+        'cache_policy':{'retained_kv_rows_per_s2_tile':spec.retained_kv_rows,
+            'resident_bytes':2*len(owners)*spec.retained_kv_rows*576*2,
+            'lifetime':'two_qk_tile_generations_per_owner_until_pv_consumption',
+            'identity':'same_source_K_V_pointer_and_page_table',
+            'eviction':'conditional_declared_retention; no_observed_hit_rate',
+            'scope':'no_cross_request_or_head_cache_discount; scratch_remains_offchip'},
         'omitted_mechanisms':['cross_core_flag_latency','scalar_page_translation_latency',
                               'inner_instruction_issue','arbitrary_contention_pipeline_phase_alignment',
                               'vector_instruction_issue'],

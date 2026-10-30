@@ -18,15 +18,16 @@ def recipes():
     return {IMPLEMENTATION: PlannedRecipe(paged_mla_arch22.build)}
 
 
-def validate(*, dispatch=None, **kwargs):
+def validate(*, dispatch=None, retained_kv_rows=0, **kwargs):
     family_paged_mla.validate(**kwargs)
 
 
-def lower_attention(b, *, dispatch=None, **kwargs):
+def lower_attention(b, *, dispatch=None, retained_kv_rows=0, **kwargs):
     name = family_paged_mla.lower_attention(b, dispatch=dispatch, **kwargs)
     op = b.ops[-1]
     metadata = dict(op.metadata)
     metadata['paged_mla_geometry'].pop('kv_splits')
+    metadata['paged_mla_geometry']['retained_kv_rows'] = retained_kv_rows
     metadata['implementation_binding']['implementation'] = IMPLEMENTATION
     metadata['implementation_binding']['host_dispatch'] = (
         'source_common_SplitCore_q1_geometry' if dispatch is None else 'declared_common_SplitCore_output')
