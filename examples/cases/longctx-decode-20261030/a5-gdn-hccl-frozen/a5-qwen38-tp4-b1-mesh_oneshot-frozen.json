@@ -1,0 +1,235 @@
+{
+  "name": "qwen38_128k_tp4_20261030 / source-declared analytic body",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 4,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "qwen3.8-27b",
+    "quantization": "w8a8_mxfp8"
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "max_model_len": 131072,
+    "max_num_seqs": 128,
+    "max_num_batched_tokens": 16384,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "kv_block_size": 128,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_capture_keys": [
+      4,
+      8,
+      16,
+      24,
+      32,
+      48,
+      64,
+      96,
+      128,
+      192,
+      256
+    ],
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "recurrent_implementation": "arch35_fp32",
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "from_hardware": true
+            }
+          }
+        }
+      },
+      "hccl": {
+        "allreduce": {
+          "expansion": "AIV",
+          "template": "mesh_oneshot",
+          "block_limit": 5,
+          "axes": [
+            "tp"
+          ]
+        }
+      },
+      "service_regimes": [
+        {
+          "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+            "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+            "dtype": "bf16",
+            "metadata.hccl_selection.ranks": 4,
+            "metadata.hccl_selection.dtype_bytes": 2,
+            "metadata.hccl_selection.block_limit": 60,
+            "metadata.hccl_selection.buffer_mode": "separate"
+          },
+          "coordinates": {
+            "payload_bytes": {
+              "path": "metadata.hccl_selection.payload_bytes"
+            }
+          },
+          "domain": {
+            "payload_bytes": {
+              "min": 65536,
+              "max": 2097152
+            }
+          },
+          "response": {
+            "fixed_us": 24.619873955981763,
+            "terms": [
+              {
+                "coordinate": "payload_bytes",
+                "us_per_unit": 1.0624772236973017e-05
+              }
+            ]
+          },
+          "provenance": {
+            "assignment_sources": [
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                "size_bytes": 852008
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                "size_bytes": 874253
+              }
+            ],
+            "holdout_source": {
+              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+              "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+              "size_bytes": 887805
+            },
+            "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+            "population": "steady layers pooled across attention/FFN",
+            "template_identity": "explicit compatible source template; capture algorithm not observed",
+            "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+            "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+            "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+            "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+          }
+        }
+      ]
+    },
+    "metadata": {
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "source_metadata": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/qwen-a5-128k-source-deployments.json",
+        "sha256": "99f6c3e2ae91327ea706547d4391ac94f2d633953e31141dbac66680a71ab9cd",
+        "size_bytes": 888122
+      },
+      "source_metadata_pointer": "/deployments/3",
+      "draft_proposal_tokens": 3,
+      "speculation": {
+        "enabled": true,
+        "method": "mtp",
+        "num_speculative_tokens": 3,
+        "rejection_sample_method": "synthetic",
+        "synthetic_acceptance_rates": [
+          0.8,
+          0.64,
+          0.512
+        ],
+        "source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/logs/serve.log",
+          "sha256": "0fac88657c8c79a62bd0da7e052168cfba6b46a4a5f282288e864045a48a8109",
+          "size_bytes": 209482
+        },
+        "basis": "same_deployment_serve_log_resolved_configuration"
+      },
+      "checkpoint_path": "/mnt/weight/Qwen3.8-27B-w8a8-mxfp8-mtp",
+      "capture_deployment": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030",
+      "calibration_origin": "not_declared",
+      "target_timing_used_to_fit": false,
+      "body_geometry_policy": "Use actual source B/q/physical capture rows; directory concurrency is not active-batch evidence.",
+      "source_compatible_gdn": {
+        "gdn_decode": "source-compatible vllm_ascend_gdn_decode; every 48 recurrence/conv ABI in bounded whole body checked",
+        "recurrent_implementation": "arch35_fp32; captured FP32 state and local heads confirmed, compiled binary identity unknown",
+        "cache_index_row_stride": {
+          "observed": null,
+          "analytic_default": 1,
+          "basis": "native contiguous cache-index shape does not expose producer proposal-table stride; old stride4 not transferred"
+        },
+        "quantization": "MXFP8_E4M3_E8M0_full_attention_and_FFN_GDN_BF16",
+        "HCCL": "generic analytic; no captured algorithm/template binding",
+        "frozen_or_point_service_rules": 0
+      },
+      "removed_prior_parameters": [
+        "all service_regimes",
+        "case-specific HCCL algorithm and block count",
+        "gating_beta_store issue-rate and queue",
+        "cache_index_row_stride4 assumption"
+      ],
+      "unresolved_capture_contracts": [
+        "exact per-step KV lengths",
+        "producer cache-index view stride",
+        "compiled GDN binary identity",
+        "hardware SKU"
+      ],
+      "hardware_profile_basis": "retained Ascend950DT_9582 analytic declaration; delivered deployment lacks measured SKU",
+      "gating_beta_store_binding": {
+        "basis": "Source-compatible BF16 beta scalar-store path; captured binary identity is not established.",
+        "parameters": "Reference the declared Ascend950DT_9582 hardware queue and issue service; no copied per-batch response.",
+        "source": "mindie_sim.prediction.gdn_decode; docs/operators/body-source-defaults.md",
+        "target_timing_used_for_parameters": false
+      },
+      "frozen_scalar_store_binding": {
+        "source_case": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
+          "sha256": "3a5e034267eea4239283206de91559972ba067f18e0c1251a5aeb81b59ae4db0",
+          "size_bytes": 4491
+        },
+        "parameter_source": "Ascend950DT_9582 hardware profile",
+        "scope": "existing BF16 scalar-store primitive applied to source-compatible GDN caller",
+        "target_timing_used_to_fit": false,
+        "captured_binary_identity": "not_established"
+      },
+      "hccl_source_candidate": {
+        "declaration": {
+          "expansion": "AIV",
+          "template": "mesh_oneshot",
+          "block_limit": 5,
+          "axes": [
+            "tp"
+          ]
+        },
+        "native_block_num": 5,
+        "captured_template": "unobserved",
+        "source_dispatch": "conditional OneShot R+1 branch matches native5; no timing-based selection"
+      },
+      "frozen_hccl_transfer": {
+        "parameter_source": {
+          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-hccl-service-regimes-20261030/tp4-parameters.json",
+          "sha256": "119e477f4ce28a1f6ade02a5ccd6385ada7efb700622920280f911ca2d06313f",
+          "size_bytes": 5350
+        },
+        "parameter_changes": 0,
+        "domain_changes": 0,
+        "evaluation_relation": "independent_new_128K_capture_not_used_in_frozen_response",
+        "source_provenance_retained_verbatim": true,
+        "captured_template": "unobserved",
+        "out_of_domain": "analytic; no extrapolation or cross-TP substitution"
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "body-placeholder-not-serving-population",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

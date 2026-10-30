@@ -1,0 +1,3271 @@
+{
+  "scope": "unchanged_HCCL_response_transfer_to_independent_long_context",
+  "revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+  "manifest": {
+    "path": "/Users/maoxx241/code/profiler/examples/structure/cases.json",
+    "sha256": "c7d9a87c33a9ed7695949d6a4f2e1de58cc674f988c6a6330727d96637202795",
+    "size_bytes": 2753512
+  },
+  "parameter_changes": 0,
+  "domain_changes": 0,
+  "selection": "B1, B4 and largest actual q4 batch in each deployment extraction",
+  "template_identity": "conditional source candidate; not captured algorithm proof",
+  "hardware_identity": "declared Ascend950DT_9582; captured SKU not independently established",
+  "response_boundary": "inclusive native call; control is not added to analytic duration",
+  "validation_role": "new 128K captures excluded from old coefficients; already inspected, not blind",
+  "context_basis": "request prompt 126000; exact per-step KV increments unobserved",
+  "previous_run": {
+    "revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+    "elapsed_seconds": 174.1864550409373,
+    "resumed_rows": 3
+  },
+  "cases": [
+    {
+      "model": "qwen36",
+      "tp": 2,
+      "batch": 1,
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 4
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
+        "size_bytes": 9138
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      },
+      "capture_id": "a5-qwen36-tp2-decode-c1-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/e5dcbe7d82ce6aee66d3203fcf21e3fdb7cba1fbe2577aa9020020553c5c7c6c.json",
+        "sha256": "e5dcbe7d82ce6aee66d3203fcf21e3fdb7cba1fbe2577aa9020020553c5c7c6c",
+        "size_bytes": 1501847,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 54,
+        "mean": 27.332327685185184,
+        "p50": 27.209456,
+        "p90": 27.44493,
+        "min": 27.168988,
+        "max": 31.021706
+      },
+      "native": {
+        "forwards": 54,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 108,
+            "sum_us": 8243.231,
+            "min_us": 9.042,
+            "max_us": 3758.579,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 112,
+              "csv_line": 114,
+              "task_id": "85721",
+              "stream_id": "162",
+              "device_id": "4"
+            },
+            "mean_us": 76.32621296296296,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 5076,
+            "sum_us": 53903.91800000009,
+            "min_us": 9.073,
+            "max_us": 18.5,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 142,
+              "csv_line": 144,
+              "task_id": "85763",
+              "stream_id": "162",
+              "device_id": "4"
+            },
+            "mean_us": 10.619369188337291,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 1728,
+            "sum_us": 18820.507999999998,
+            "min_us": 8.978,
+            "max_us": 75.99,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 198,
+              "csv_line": 200,
+              "task_id": "85847",
+              "stream_id": "162",
+              "device_id": "4"
+            },
+            "mean_us": 10.891497685185184,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+          "sha256": "3c0a9b41b60c0da85ab019ed30afed5a7700d408cc4999dd20a5ce8967d07452",
+          "size_bytes": 40861872,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 4.128741917130489,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 10.832807169117647,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 10.832807169117647,
+            "response_us_max": 10.832807169117647,
+            "response_relations": {
+              "affine": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 22.854414317353612,
+        "body_relative_error": -0.16383212653559376,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 4.128741917129817,
+        "hccl_min_us": 4.128741917128309,
+        "hccl_max_us": 4.128741917131862,
+        "parameters": [],
+        "elapsed_seconds": 14.970234125037678,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 23.712534669606026,
+        "body_relative_error": -0.13243632438744612,
+        "body_passed_15percent": true,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 10.832807169117315,
+        "hccl_min_us": 10.832807169116165,
+        "hccl_max_us": 10.832807169117942,
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 10.832807169117647,
+            "response_us_max": 10.832807169117647,
+            "response_relations": {
+              "affine": 128
+            }
+          }
+        ],
+        "elapsed_seconds": 15.60310670803301,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      }
+    },
+    {
+      "model": "qwen36",
+      "tp": 2,
+      "batch": 4,
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 16
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
+        "size_bytes": 9138
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      },
+      "capture_id": "a5-qwen36-tp2-decode-c4-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/b5870010e59403a1384d2fefe2fdecd99c5756d8e392e5f653b437917974ec4f.json",
+        "sha256": "b5870010e59403a1384d2fefe2fdecd99c5756d8e392e5f653b437917974ec4f",
+        "size_bytes": 1443005,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 48,
+        "mean": 31.689215979166665,
+        "p50": 31.648181,
+        "p90": 31.861577,
+        "min": 31.5699,
+        "max": 31.922492
+      },
+      "native": {
+        "forwards": 48,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 96,
+            "sum_us": 4631.0019999999995,
+            "min_us": 16.579,
+            "max_us": 324.247,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "64861",
+              "stream_id": "175",
+              "device_id": "4"
+            },
+            "mean_us": 48.23960416666666,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 4512,
+            "sum_us": 86520.044,
+            "min_us": 16.543,
+            "max_us": 86.232,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 147,
+              "csv_line": 149,
+              "task_id": "64904",
+              "stream_id": "175",
+              "device_id": "4"
+            },
+            "mean_us": 19.175541666666664,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 1536,
+            "sum_us": 28324.076999999997,
+            "min_us": 16.586,
+            "max_us": 83.947,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 204,
+              "csv_line": 206,
+              "task_id": "64989",
+              "stream_id": "175",
+              "device_id": "4"
+            },
+            "mean_us": 18.440154296874997,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+          "sha256": "c46fd0686ed0c772bc9a72b08d311cc34c2b924c7eaa2b827a47c1326ba23ed3",
+          "size_bytes": 37384008,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 14.139888484848486,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 14.139888484848486,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "physical_identity_mismatch": 1
+            },
+            "response_us_min": null,
+            "response_us_max": null,
+            "mismatched_axes": {
+              "metadata.hccl_selection.payload_bytes": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 25.79230002425294,
+        "body_relative_error": -0.18608588987466634,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.13988848484874,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 37.39196512498893,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 25.79230002425294,
+        "body_relative_error": -0.18608588987466634,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.13988848484874,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 37.39196512498893,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      }
+    },
+    {
+      "model": "qwen36",
+      "tp": 2,
+      "batch": 24,
+      "geometry": {
+        "query_rows": 96,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 96
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
+        "size_bytes": 9138
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      },
+      "capture_id": "a5-qwen36-tp2-decode-c24-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/29fffc3454cdd727ed2cca6fe331e3892c603388737a64cd62aa9df310bb3b27.json",
+        "sha256": "29fffc3454cdd727ed2cca6fe331e3892c603388737a64cd62aa9df310bb3b27",
+        "size_bytes": 1212382,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 25,
+        "mean": 63.87885728,
+        "p50": 63.873123,
+        "p90": 63.962872,
+        "min": 63.795922,
+        "max": 64.156985
+      },
+      "native": {
+        "forwards": 25,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 50,
+            "sum_us": 3806.173,
+            "min_us": 68.724,
+            "max_us": 361.388,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 118,
+              "csv_line": 120,
+              "task_id": "29951",
+              "stream_id": "8",
+              "device_id": "4"
+            },
+            "mean_us": 76.12346,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 2350,
+            "sum_us": 175283.07100000014,
+            "min_us": 68.041,
+            "max_us": 153.465,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 152,
+              "csv_line": 154,
+              "task_id": "29994",
+              "stream_id": "8",
+              "device_id": "4"
+            },
+            "mean_us": 74.5885408510639,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 800,
+            "sum_us": 57745.708999999995,
+            "min_us": 68.894,
+            "max_us": 137.429,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 211,
+              "csv_line": 213,
+              "task_id": "30079",
+              "stream_id": "8",
+              "device_id": "4"
+            },
+            "mean_us": 72.18213625,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+          "sha256": "df53f0db10b114e78bcc150421f709481c40664138aee733ea0ae9cd571351e2",
+          "size_bytes": 20237032,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 84.83933090909088,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 983040,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 84.83933090909088,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 983040,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "physical_identity_mismatch": 1
+            },
+            "response_us_min": null,
+            "response_us_max": null,
+            "mismatched_axes": {
+              "metadata.hccl_selection.payload_bytes": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "timed_out",
+        "error": "a5_gdn_store_Body_exceeded_90_seconds",
+        "elapsed_seconds": 90.03843120799866,
+        "body_score": "unavailable"
+      },
+      "after": {
+        "status": "timed_out",
+        "error": "a5_gdn_store_Body_exceeded_90_seconds",
+        "elapsed_seconds": 90.03843120799866,
+        "body_score": "unavailable"
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
+        "size_bytes": 7137
+      }
+    },
+    {
+      "model": "qwen36",
+      "tp": 4,
+      "batch": 1,
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 4
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-frozen.json",
+        "sha256": "b17d53308f7f41db4b19262d1a6816b7230659eb287318d8bc9bf40188fb21cb",
+        "size_bytes": 10588
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-control.json",
+        "sha256": "8ac2aae6dbd5bcf73cd3602a99181d672147fa2752c2d8aa4edc5b06dbf535d8",
+        "size_bytes": 6999
+      },
+      "capture_id": "a5-qwen36-tp4-decode-c1-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/455e92e7e9f88bf8c7d73d343ee97274ee71f0f0e325447ae1c7876466cf1e40.json",
+        "sha256": "455e92e7e9f88bf8c7d73d343ee97274ee71f0f0e325447ae1c7876466cf1e40",
+        "size_bytes": 1540583,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 58,
+        "mean": 25.585456051724137,
+        "p50": 25.621121000000002,
+        "p90": 25.710527,
+        "min": 25.391078,
+        "max": 26.576899
+      },
+      "native": {
+        "forwards": 58,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 116,
+            "sum_us": 11249.705000000005,
+            "min_us": 12.509,
+            "max_us": 1189.219,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 112,
+              "csv_line": 114,
+              "task_id": "78671",
+              "stream_id": "168",
+              "device_id": "4"
+            },
+            "mean_us": 96.98021551724142,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 5452,
+            "sum_us": 75861.95800000013,
+            "min_us": 12.375,
+            "max_us": 58.735,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 142,
+              "csv_line": 144,
+              "task_id": "78713",
+              "stream_id": "168",
+              "device_id": "4"
+            },
+            "mean_us": 13.914519075568622,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 1856,
+            "sum_us": 25855.056999999975,
+            "min_us": 12.457,
+            "max_us": 55.261,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 198,
+              "csv_line": 200,
+              "task_id": "78797",
+              "stream_id": "168",
+              "device_id": "4"
+            },
+            "mean_us": 13.930526400862055,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+          "sha256": "4e777b250dac088db985864e4214ad082853cd0ad7850d4157b2e6a4ca446e04",
+          "size_bytes": 43800647,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 6.889653630179345,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 4,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 5,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 6.889653630179345,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 4,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 5,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 21.07027202376359,
+        "body_relative_error": -0.17647463538787622,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 6.889653630178399,
+        "hccl_min_us": 6.889653630176795,
+        "hccl_max_us": 6.889653630182124,
+        "parameters": [],
+        "elapsed_seconds": 9.66314112499822,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 21.07027202376359,
+        "body_relative_error": -0.17647463538787622,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 6.889653630178399,
+        "hccl_min_us": 6.889653630176795,
+        "hccl_max_us": 6.889653630182124,
+        "parameters": [],
+        "elapsed_seconds": 9.66314112499822,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
+        "size_bytes": 7131
+      }
+    },
+    {
+      "model": "qwen36",
+      "tp": 4,
+      "batch": 4,
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 16
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
+        "size_bytes": 10720
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
+        "size_bytes": 7131
+      },
+      "capture_id": "a5-qwen36-tp4-decode-c4-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/898c7bd3c34042e5c50dcc131915da439aace0658718a3bfcf855a9ddd569b23.json",
+        "sha256": "898c7bd3c34042e5c50dcc131915da439aace0658718a3bfcf855a9ddd569b23",
+        "size_bytes": 1482722,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 52,
+        "mean": 28.963948673076924,
+        "p50": 28.988093,
+        "p90": 29.038547,
+        "min": 28.732302,
+        "max": 29.151982
+      },
+      "native": {
+        "forwards": 52,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 104,
+            "sum_us": 13406.036,
+            "min_us": 22.34,
+            "max_us": 444.118,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "64787",
+              "stream_id": "176",
+              "device_id": "4"
+            },
+            "mean_us": 128.9041923076923,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 4888,
+            "sum_us": 125344.83199999937,
+            "min_us": 22.247,
+            "max_us": 38.67,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 147,
+              "csv_line": 149,
+              "task_id": "64830",
+              "stream_id": "176",
+              "device_id": "4"
+            },
+            "mean_us": 25.643378068739644,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 1664,
+            "sum_us": 43753.651,
+            "min_us": 22.617,
+            "max_us": 36.267,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 203,
+              "csv_line": 205,
+              "task_id": "64915",
+              "stream_id": "176",
+              "device_id": "4"
+            },
+            "mean_us": 26.29426141826923,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+          "sha256": "09de4209830f0a97c3c07efa793c891cce862f7c7aa77d9b938c52ec25cb1592",
+          "size_bytes": 40445953,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 5.959192000000001,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 26.36063663928742,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 1
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 21.74197575566599,
+        "body_relative_error": -0.24934352007480354,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 5.959192000015156,
+        "hccl_min_us": 5.959191999992619,
+        "hccl_max_us": 5.9591920000343634,
+        "parameters": [],
+        "elapsed_seconds": 26.731944917002693,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 24.353360669478214,
+        "body_relative_error": -0.15918368229551605,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 26.360636639286785,
+        "hccl_min_us": 26.360636639285673,
+        "hccl_max_us": 26.36063663928745,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 25.922003417043015,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
+        "size_bytes": 7131
+      }
+    },
+    {
+      "model": "qwen36",
+      "tp": 4,
+      "batch": 8,
+      "geometry": {
+        "query_rows": 32,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 32
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
+        "size_bytes": 10720
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
+        "size_bytes": 7131
+      },
+      "capture_id": "a5-qwen36-tp4-decode-c8-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/0bb77392fdafd3f0530ba9e01d959216f96a3ea587a6ba9b8e684211f120c159.json",
+        "sha256": "0bb77392fdafd3f0530ba9e01d959216f96a3ea587a6ba9b8e684211f120c159",
+        "size_bytes": 1443078,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 48,
+        "mean": 31.6596468125,
+        "p50": 31.717695,
+        "p90": 31.764705,
+        "min": 31.45237,
+        "max": 31.799247
+      },
+      "native": {
+        "forwards": 48,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 96,
+            "sum_us": 10839.478000000008,
+            "min_us": 23.424,
+            "max_us": 350.698,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "50843",
+              "stream_id": "185",
+              "device_id": "4"
+            },
+            "mean_us": 112.91122916666676,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 4512,
+            "sum_us": 126288.77400000003,
+            "min_us": 23.16,
+            "max_us": 45.79,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 147,
+              "csv_line": 149,
+              "task_id": "50886",
+              "stream_id": "185",
+              "device_id": "4"
+            },
+            "mean_us": 27.98953324468086,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 1536,
+            "sum_us": 42955.89500000002,
+            "min_us": 23.55,
+            "max_us": 43.647,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 204,
+              "csv_line": 206,
+              "task_id": "50971",
+              "stream_id": "185",
+              "device_id": "4"
+            },
+            "mean_us": 27.966077473958347,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen36_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+          "sha256": "b55a4e2083f7feaf6e391ea22ffe03403e68b130c0abf9feea7b98ecaf4b4068",
+          "size_bytes": 37378167,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 8.318384000000002,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 327680,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 28.101399322593082,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 327680,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 28.101399322593082,
+            "response_us_max": 28.101399322593082,
+            "response_relations": {
+              "affine": 1
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 327680.0,
+                "max": 327680.0
+              }
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 23.39198914765362,
+        "body_relative_error": -0.26114181607301146,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 8.318384000001963,
+        "hccl_min_us": 8.318383999984746,
+        "hccl_max_us": 8.318384000027379,
+        "parameters": [],
+        "elapsed_seconds": 34.68693825008813,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 25.924215108938153,
+        "body_relative_error": -0.18115905516979292,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 28.101399322593295,
+        "hccl_min_us": 28.101399322592258,
+        "hccl_max_us": 28.101399322594034,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 28.101399322593082,
+            "response_us_max": 28.101399322593082,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 327680.0,
+                "max": 327680.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 35.441661958931945,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
+        "size_bytes": 7131
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 2,
+      "batch": 1,
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 4
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
+        "size_bytes": 7809
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      },
+      "capture_id": "a5-qwen38-tp2-decode-c1-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/619847a4f4913a3521be49fc51dcd65088e8adfdcc17a497bbd8a6e3c2403731.json",
+        "sha256": "619847a4f4913a3521be49fc51dcd65088e8adfdcc17a497bbd8a6e3c2403731",
+        "size_bytes": 1490076,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 53,
+        "mean": 28.446687981132076,
+        "p50": 28.429272,
+        "p90": 28.569512,
+        "min": 28.352334,
+        "max": 28.639098
+      },
+      "native": {
+        "forwards": 53,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 106,
+            "sum_us": 4669.471000000005,
+            "min_us": 9.175,
+            "max_us": 289.247,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 110,
+              "csv_line": 112,
+              "task_id": "84029",
+              "stream_id": "162",
+              "device_id": "6"
+            },
+            "mean_us": 44.05161320754722,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 4982,
+            "sum_us": 57523.030999999966,
+            "min_us": 9.09,
+            "max_us": 20.365,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 141,
+              "csv_line": 143,
+              "task_id": "84070",
+              "stream_id": "162",
+              "device_id": "6"
+            },
+            "mean_us": 11.546172420714566,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 1696,
+            "sum_us": 20484.22299999997,
+            "min_us": 8.99,
+            "max_us": 85.558,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 195,
+              "csv_line": 197,
+              "task_id": "84153",
+              "stream_id": "162",
+              "device_id": "6"
+            },
+            "mean_us": 12.077961674528284,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+          "sha256": "35b0cd6b972ccf372e302a4a112ad21adc9598b010286c3555943f98b11fb374",
+          "size_bytes": 39197792,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 4.128741917130489,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 10.832807169117647,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 10.832807169117647,
+            "response_us_max": 10.832807169117647,
+            "response_relations": {
+              "affine": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 23.386896853354546,
+        "body_relative_error": -0.17786925251662178,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 4.128741917129982,
+        "hccl_min_us": 4.128741917128309,
+        "hccl_max_us": 4.128741917131862,
+        "parameters": [],
+        "elapsed_seconds": 14.103928209049627,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 24.245017205601947,
+        "body_relative_error": -0.14770333819940595,
+        "body_passed_15percent": true,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 10.832807169117315,
+        "hccl_min_us": 10.832807169116165,
+        "hccl_max_us": 10.832807169117942,
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 10.832807169117647,
+            "response_us_max": 10.832807169117647,
+            "response_relations": {
+              "affine": 128
+            }
+          }
+        ],
+        "elapsed_seconds": 14.090157249942422,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 2,
+      "batch": 4,
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 16
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
+        "size_bytes": 7809
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      },
+      "capture_id": "a5-qwen38-tp2-decode-c4-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7305f24077f1b6d43bbad6a884911f8c4719c9a5301d9251fda276d0221fd7b3.json",
+        "sha256": "7305f24077f1b6d43bbad6a884911f8c4719c9a5301d9251fda276d0221fd7b3",
+        "size_bytes": 1432607,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 47,
+        "mean": 32.710615021276595,
+        "p50": 32.698718,
+        "p90": 32.776813,
+        "min": 32.661651,
+        "max": 32.793362
+      },
+      "native": {
+        "forwards": 47,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 94,
+            "sum_us": 2518.321,
+            "min_us": 16.61,
+            "max_us": 95.673,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "63475",
+              "stream_id": "175",
+              "device_id": "6"
+            },
+            "mean_us": 26.79064893617021,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 4418,
+            "sum_us": 92175.34699999962,
+            "min_us": 16.406,
+            "max_us": 88.14,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 145,
+              "csv_line": 147,
+              "task_id": "63517",
+              "stream_id": "175",
+              "device_id": "6"
+            },
+            "mean_us": 20.86359144409226,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 1504,
+            "sum_us": 34377.30300000006,
+            "min_us": 16.578,
+            "max_us": 88.467,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 201,
+              "csv_line": 203,
+              "task_id": "63601",
+              "stream_id": "175",
+              "device_id": "6"
+            },
+            "mean_us": 22.85724933510642,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+          "sha256": "190526e1511a2efde9e7a386984f5c46f9a8eab6c6b260156a3d5c519c6d3101",
+          "size_bytes": 35776685,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 14.139888484848486,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 14.139888484848486,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "physical_identity_mismatch": 1
+            },
+            "response_us_min": null,
+            "response_us_max": null,
+            "mismatched_axes": {
+              "metadata.hccl_selection.payload_bytes": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 26.348812993946005,
+        "body_relative_error": -0.19448738653163689,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.139888484848719,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 32.523327332921326,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 26.348812993946005,
+        "body_relative_error": -0.19448738653163689,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 14.139888484848719,
+        "hccl_min_us": 14.13988848484804,
+        "hccl_max_us": 14.13988848485026,
+        "parameters": [],
+        "elapsed_seconds": 32.523327332921326,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 2,
+      "batch": 24,
+      "geometry": {
+        "query_rows": 96,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 96
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
+        "size_bytes": 7809
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      },
+      "capture_id": "a5-qwen38-tp2-decode-c24-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/8836b446f9c6ba83b92658626d3428f1a7d5d348191c4ecc0bd9d67ad35c2d1e.json",
+        "sha256": "8836b446f9c6ba83b92658626d3428f1a7d5d348191c4ecc0bd9d67ad35c2d1e",
+        "size_bytes": 1210014,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 24,
+        "mean": 64.45742908333334,
+        "p50": 64.426828,
+        "p90": 64.558918,
+        "min": 64.378621,
+        "max": 64.599828
+      },
+      "native": {
+        "forwards": 24,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 48,
+            "sum_us": 3483.0280000000002,
+            "min_us": 69.33,
+            "max_us": 158.943,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 118,
+              "csv_line": 120,
+              "task_id": "29075",
+              "stream_id": "8",
+              "device_id": "6"
+            },
+            "mean_us": 72.56308333333334,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 2256,
+            "sum_us": 162415.9889999997,
+            "min_us": 68.858,
+            "max_us": 142.287,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 150,
+              "csv_line": 152,
+              "task_id": "29117",
+              "stream_id": "8",
+              "device_id": "6"
+            },
+            "mean_us": 71.99290292553178,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 3,
+            "core": "COMMUNICATION",
+            "count": 768,
+            "sum_us": 55696.895999999935,
+            "min_us": 68.628,
+            "max_us": 103.465,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 208,
+              "csv_line": 210,
+              "task_id": "29201",
+              "stream_id": "8",
+              "device_id": "6"
+            },
+            "mean_us": 72.52199999999992,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+          "sha256": "62a28b699208195ad044d54de0a39b05f18af9a4ef7925c81283971af986d8d7",
+          "size_bytes": 19005089,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 84.83933090909088,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 983040,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 84.83933090909088,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 2,
+          "payload_bytes": 983040,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 3,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "f1f11314b4522b9610308578dd31f0b0190117d499afc1290b8b6cb7365fe784",
+            "id": "hcom_allreduce_-physical-4",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "recipe": "hccl_entry",
+              "phase": "decode",
+              "kernel": "HCCL_AIV_allreduce_mesh_oneshot",
+              "metadata.hccl_selection.ranks": 2,
+              "metadata.hccl_selection.payload_bytes": 40960,
+              "metadata.hccl_selection.block_limit": 3,
+              "metadata.hccl_selection.collective": "allreduce",
+              "metadata.hccl_selection.template": "mesh_oneshot"
+            },
+            "response": {
+              "fixed_us": 10.832807169117647
+            },
+            "provenance": {
+              "evidence_identity": {
+                "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/case-evidence/9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98.json",
+                "sha256": "9124bb1602ffcee712d2658e13542dc1dfb9a4436bf7874b1b53fa71a4753b98",
+                "size_bytes": 413289
+              },
+              "json_pointer": "/runtime/kernels/service_regimes/2/provenance",
+              "calibration_origin": "in_sample",
+              "evaluation_relation": "in_sample",
+              "response_boundary": "inclusive_whole_native_call",
+              "native_operator_type": "hcom_allReduce_"
+            },
+            "queries": {
+              "physical_identity_mismatch": 1
+            },
+            "response_us_min": null,
+            "response_us_max": null,
+            "mismatched_axes": {
+              "metadata.hccl_selection.payload_bytes": 1
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "timed_out",
+        "error": "a5_gdn_store_Body_exceeded_90_seconds",
+        "elapsed_seconds": 90.00743566593155,
+        "body_score": "unavailable"
+      },
+      "after": {
+        "status": "timed_out",
+        "error": "a5_gdn_store_Body_exceeded_90_seconds",
+        "elapsed_seconds": 90.00743566593155,
+        "body_score": "unavailable"
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
+        "size_bytes": 5808
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 4,
+      "batch": 1,
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 4
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-frozen.json",
+        "sha256": "ebb7c7006b622f7abe0e1f342ae2bb98d4969f018ef85195ca2c62b69d9120e5",
+        "size_bytes": 9259
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-control.json",
+        "sha256": "afe81f15ff17f4f1788831e1994704a92e29377759f2e30c9d8e47e85a5da0cc",
+        "size_bytes": 5670
+      },
+      "capture_id": "a5-qwen38-tp4-decode-c1-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/83064062f6722469baa193c9d406a131e1f3b286006f7de624cf4b0609bf0f00.json",
+        "sha256": "83064062f6722469baa193c9d406a131e1f3b286006f7de624cf4b0609bf0f00",
+        "size_bytes": 1520226,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 56,
+        "mean": 25.808290446428572,
+        "p50": 25.757342,
+        "p90": 26.012423,
+        "min": 25.722263,
+        "max": 26.084781
+      },
+      "native": {
+        "forwards": 56,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 112,
+            "sum_us": 4147.946000000001,
+            "min_us": 11.879,
+            "max_us": 332.197,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 110,
+              "csv_line": 112,
+              "task_id": "77079",
+              "stream_id": "168",
+              "device_id": "0"
+            },
+            "mean_us": 37.03523214285715,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 5264,
+            "sum_us": 68511.98999999971,
+            "min_us": 11.769,
+            "max_us": 58.573,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 141,
+              "csv_line": 143,
+              "task_id": "77120",
+              "stream_id": "168",
+              "device_id": "0"
+            },
+            "mean_us": 13.015195668692956,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 5,
+            "core": "COMMUNICATION",
+            "count": 1792,
+            "sum_us": 28812.827999999972,
+            "min_us": 11.79,
+            "max_us": 62.777,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 195,
+              "csv_line": 197,
+              "task_id": "77203",
+              "stream_id": "168",
+              "device_id": "0"
+            },
+            "mean_us": 16.078587053571415,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+          "sha256": "fc2566edf251b6ae02b31cfd57540f08ec90b5708ef29e61fbe613ff47b3d0cb",
+          "size_bytes": 41393159,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 6.889653630179345,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 4,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 5,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 6.889653630179345,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_oneshot",
+          "ranks": 4,
+          "payload_bytes": 40960,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 5,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 21.308724255279078,
+        "body_relative_error": -0.1743457669344448,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 6.889653630178563,
+        "hccl_min_us": 6.889653630176795,
+        "hccl_max_us": 6.889653630182124,
+        "parameters": [],
+        "elapsed_seconds": 11.463957750005648,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 21.308724255279078,
+        "body_relative_error": -0.1743457669344448,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 6.889653630178563,
+        "hccl_min_us": 6.889653630176795,
+        "hccl_max_us": 6.889653630182124,
+        "parameters": [],
+        "elapsed_seconds": 11.463957750005648,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
+        "size_bytes": 5802
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 4,
+      "batch": 4,
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 16
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
+        "size_bytes": 9391
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
+        "size_bytes": 5802
+      },
+      "capture_id": "a5-qwen38-tp4-decode-c4-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/7e485c1c26316e01a61f215239a8c62f9c92dc451d5091d693a2b90d773880d3.json",
+        "sha256": "7e485c1c26316e01a61f215239a8c62f9c92dc451d5091d693a2b90d773880d3",
+        "size_bytes": 1482429,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 52,
+        "mean": 29.23987971153846,
+        "p50": 29.178051,
+        "p90": 29.387419,
+        "min": 29.114677,
+        "max": 29.43654
+      },
+      "native": {
+        "forwards": 52,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 104,
+            "sum_us": 7398.284000000004,
+            "min_us": 22.675,
+            "max_us": 302.932,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "63399",
+              "stream_id": "176",
+              "device_id": "0"
+            },
+            "mean_us": 71.1373461538462,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 4888,
+            "sum_us": 120749.51699999972,
+            "min_us": 21.569,
+            "max_us": 32.591,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 145,
+              "csv_line": 147,
+              "task_id": "63441",
+              "stream_id": "176",
+              "device_id": "0"
+            },
+            "mean_us": 24.703256342062136,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 1664,
+            "sum_us": 49730.470000000045,
+            "min_us": 23.276,
+            "max_us": 49.194,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 201,
+              "csv_line": 203,
+              "task_id": "63525",
+              "stream_id": "176",
+              "device_id": "0"
+            },
+            "mean_us": 29.886099759615412,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+          "sha256": "9155db6bea90dd89defd8122c093094e4a4938333d61ad1fe9f2f3e58c72d940",
+          "size_bytes": 39583490,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 5.959192000000001,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 26.36063663928742,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 163840,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 1
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 21.989649452633415,
+        "body_relative_error": -0.24795691126061659,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 5.959192000015155,
+        "hccl_min_us": 5.959191999992619,
+        "hccl_max_us": 5.9591920000343634,
+        "parameters": [],
+        "elapsed_seconds": 33.74865779199172,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 24.601034366446296,
+        "body_relative_error": -0.15864789427507842,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 26.360636639286785,
+        "hccl_min_us": 26.360636639285673,
+        "hccl_max_us": 26.36063663928745,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 26.36063663928742,
+            "response_us_max": 26.36063663928742,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 163840.0,
+                "max": 163840.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 31.073902500094846,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
+        "size_bytes": 5802
+      }
+    },
+    {
+      "model": "qwen38",
+      "tp": 4,
+      "batch": 8,
+      "geometry": {
+        "query_rows": 32,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 32
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
+        "size_bytes": 9391
+      },
+      "control_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
+        "size_bytes": 5802
+      },
+      "capture_id": "a5-qwen38-tp4-decode-c8-p126000",
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/8968c19a022ed13f634febe2670d8e49a2a7f9e5ad808e7d3b690ba16b310ed5.json",
+        "sha256": "8968c19a022ed13f634febe2670d8e49a2a7f9e5ad808e7d3b690ba16b310ed5",
+        "size_bytes": 1432352,
+        "format": "full_scoreboard_json"
+      },
+      "observed_body_ms": {
+        "count": 47,
+        "mean": 31.871339936170212,
+        "p50": 31.844654,
+        "p90": 32.02029,
+        "min": 31.801661,
+        "max": 32.090005
+      },
+      "native": {
+        "forwards": 47,
+        "calls_per_body": 128,
+        "groups": [
+          {
+            "attention": "gdn",
+            "first_layer": true,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 94,
+            "sum_us": 4293.990000000002,
+            "min_us": 24.584,
+            "max_us": 288.929,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 115,
+              "csv_line": 117,
+              "task_id": "49659",
+              "stream_id": "185",
+              "device_id": "0"
+            },
+            "mean_us": 45.68074468085108,
+            "calls_per_body": 2.0
+          },
+          {
+            "attention": "gdn",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 4418,
+            "sum_us": 122269.42899999973,
+            "min_us": 23.38,
+            "max_us": 44.693,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 145,
+              "csv_line": 147,
+              "task_id": "49701",
+              "stream_id": "185",
+              "device_id": "0"
+            },
+            "mean_us": 27.675289497510125,
+            "calls_per_body": 94.0
+          },
+          {
+            "attention": "gqa",
+            "first_layer": false,
+            "blocks": 60,
+            "core": "COMMUNICATION",
+            "count": 1504,
+            "sum_us": 46023.4080000001,
+            "min_us": 23.278,
+            "max_us": 54.126,
+            "locator": {
+              "source": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+              "table": "kernel_details.csv",
+              "row_index": 201,
+              "csv_line": 203,
+              "task_id": "49785",
+              "stream_id": "185",
+              "device_id": "0"
+            },
+            "mean_us": 30.600670212766023,
+            "calls_per_body": 32.0
+          }
+        ],
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/qwen38_128k_tp4_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+          "sha256": "83624ea8f1dd6b5ba06ee70b34f096571540b35598176b982e7a53c4589b9274",
+          "size_bytes": 35847246,
+          "kind": "csv"
+        },
+        "boundary": "deduplicated native AivKernel inside complete 64-layer target Body"
+      },
+      "primitive_before": {
+        "duration_us": 8.318384000000002,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 327680,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "primitive_after": {
+        "duration_us": 28.101399322593082,
+        "selection": {
+          "expansion": "AIV",
+          "collective": "allreduce",
+          "template": "mesh_twoshot",
+          "ranks": 4,
+          "payload_bytes": 327680,
+          "dtype_bytes": 2,
+          "topology": "MESH_1D",
+          "topology_levels": 1,
+          "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+          "selection_basis": "explicit_source_compatible_declaration",
+          "block_limit": 60,
+          "buffer_mode": "separate",
+          "level0_size": null,
+          "max_loop_bytes": null,
+          "signal_bytes": null,
+          "channel_die_map": []
+        },
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 1
+            },
+            "response_us_min": 28.101399322593082,
+            "response_us_max": 28.101399322593082,
+            "response_relations": {
+              "affine": 1
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 327680.0,
+                "max": 327680.0
+              }
+            }
+          }
+        ],
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "before": {
+        "status": "completed",
+        "body_ms": 23.660664056742394,
+        "body_relative_error": -0.25761941279756706,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 8.318384000001963,
+        "hccl_min_us": 8.318383999984746,
+        "hccl_max_us": 8.318384000027379,
+        "parameters": [],
+        "elapsed_seconds": 38.359245124971494,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "after": {
+        "status": "completed",
+        "body_ms": 26.192890018027242,
+        "body_relative_error": -0.17816790663697823,
+        "body_passed_15percent": false,
+        "hccl_call_count": 128,
+        "hccl_mean_us": 28.101399322593295,
+        "hccl_min_us": 28.101399322592258,
+        "hccl_max_us": 28.101399322594034,
+        "parameters": [
+          {
+            "model_id": "ce97ff233a94e05ef5ac0754ebb9914d7d83037792033b52e676449483295e43",
+            "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+            "match": {
+              "hardware": "Ascend950DT_9582",
+              "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+              "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+              "dtype": "bf16",
+              "metadata.hccl_selection.ranks": 4,
+              "metadata.hccl_selection.dtype_bytes": 2,
+              "metadata.hccl_selection.block_limit": 60,
+              "metadata.hccl_selection.buffer_mode": "separate"
+            },
+            "coordinates": {
+              "payload_bytes": {
+                "path": "metadata.hccl_selection.payload_bytes"
+              }
+            },
+            "domain": {
+              "payload_bytes": {
+                "min": 65536,
+                "max": 2097152
+              }
+            },
+            "response": {
+              "fixed_us": 24.619873955981763,
+              "terms": [
+                {
+                  "coordinate": "payload_bytes",
+                  "us_per_unit": 1.0624772236973017e-05
+                }
+              ]
+            },
+            "provenance": {
+              "assignment_sources": [
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+                  "size_bytes": 852008
+                },
+                {
+                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+                  "size_bytes": 874253
+                }
+              ],
+              "holdout_source": {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+                "size_bytes": 887805
+              },
+              "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+              "population": "steady layers pooled across attention/FFN",
+              "template_identity": "explicit compatible source template; capture algorithm not observed",
+              "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+              "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+              "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+              "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+            },
+            "queries": {
+              "observable_response": 128
+            },
+            "response_us_min": 28.101399322593082,
+            "response_us_max": 28.101399322593082,
+            "response_relations": {
+              "affine": 128
+            },
+            "coordinate_ranges": {
+              "payload_bytes": {
+                "min": 327680.0,
+                "max": 327680.0
+              }
+            }
+          }
+        ],
+        "elapsed_seconds": 39.01852283300832,
+        "live_tasks": 0,
+        "live_programs": 0
+      },
+      "execution_relation": "both_complete_Bodies_requested; see individual status",
+      "base_source_case": {
+        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
+        "size_bytes": 5802
+      }
+    }
+  ],
+  "elapsed_seconds": 485.6737775830552,
+  "peak_rss_bytes": 113508352,
+  "status": "incomplete_body_timeouts"
+}

@@ -201,3 +201,8 @@ python3 data/observations/a5-gdn-store-binding-20261030/produce.py
 python3 data/observations/a5-gdn-store-binding-20261030/hccl_control.py
 python3 data/observations/a5-gdn-store-binding-20261030/audit.py
 ```
+
+The separate [frozen-response transfer](a5-hccl-frozen-transfer.md) reuses the
+unchanged older TP2/TP4 native-call responses against new B1/B4/high-B captures,
+preserves physical-domain misses and two bounded Body timeouts, and inventories
+existing local response and norm-fusion caller bindings.
