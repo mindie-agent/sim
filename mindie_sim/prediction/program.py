@@ -121,8 +121,7 @@ class PipelineProgram:
         ready = engine.submit(name + ":setup", after=(ready,), latency=self.setup_ms, owner=owner)
         observation = engine.submit(name + ":span", after=(ready,), latency=self.minimum_ms, owner=owner)
         stage_tail: dict[str, Event] = {}
-        prepared_slots: list[dict[str, tuple[Stage, object]]] = [
-            {} for _ in range(min(self.slots, self.count))]
+        prepared_slots = [None for _ in range(min(self.slots, self.count))]
         next_tile, finished = 0, 0
         scoped = lambda items: scope_allocations(name, items)
 
@@ -144,25 +143,27 @@ class PipelineProgram:
             next_tile += 1
             local: dict[str, Event] = {}
             previous = dict(stage_tail)
-            slot = prepared_slots[index % self.slots]
-            stages = self.tile(index)
-            current = {}
-            for stage in stages:
+            slot = index % self.slots
+            stages = tuple(self.tile(index))
+            cached = prepared_slots[slot]
+            if cached is None or (cached[0] is not stages and (
+                    len(cached[0]) != len(stages)
+                    or any(old is not new for old, new in zip(cached[0], stages)))):
+                compiled = tuple((stage, stage.prepare(
+                    engine, f"{name}:tile{index}:{stage.name}", scoped)) for stage in stages)
+                cached = stages, compiled
+                prepared_slots[slot] = cached
+            for stage, prepared in cached[1]:
                 deps = [local[key] for key in stage.after]
                 deps.extend(previous[key] for key in stage.previous if key in previous)
                 if stage.name in stage_tail:
                     deps.append(stage_tail[stage.name])
                 task_name = f"{name}:tile{index}:{stage.name}"
-                cached = slot.get(stage.name)
-                prepared = (cached[1] if cached is not None and cached[0] is stage
-                            else stage.prepare(engine, task_name, scoped))
-                current[stage.name] = (stage, prepared)
                 event = stage.submit(engine, task_name, tuple(deps) or (ready,),
                                      scoped, owner, prepared)
                 local[stage.name] = stage_tail[stage.name] = event
             # At most one stage set per live slot: unique/generated tail stages
             # replace the previous set instead of growing an execution history.
-            prepared_slots[index % self.slots] = current
             engine.submit(f"{name}:tile{index}:retire", after=tuple(local.values()),
                           on_complete=retire, owner=owner)
 

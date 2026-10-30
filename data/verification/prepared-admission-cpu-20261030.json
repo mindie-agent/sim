@@ -1,0 +1,354 @@
+{
+  "schema": "mindie-prepared-admission-cpu-control/1",
+  "purpose": "Reduce Python event overhead without changing physical tasks, work, service or dependencies",
+  "implementation": [
+    "Prepare allocation totals once per immutable Stage; recheck allocation identity and live per-unit occupancy for every admission",
+    "Reuse an ordered prepared Stage tuple only while the exact Stage objects occupy that live pipeline slot; replace it on change and clear it on completion",
+    "Keep independent Event, dependency, release, remaining-work and allocation state for every submitted task",
+    "Retain all global service accounting when trace_limit is zero, omitting only unobservable per-task trace accumulation",
+    "Use slots for private task records and a shared empty static template; no task skipping or analytical cycle compression"
+  ],
+  "baseline_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+  "source_files": [
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
+      "sha256": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+      "bytes": 18830
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
+      "sha256": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097",
+      "bytes": 22088
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
+      "sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+      "bytes": 32018
+    }
+  ],
+  "drivers": [
+    {
+      "path": "/tmp/qwen36-full-body-cpu-control.py",
+      "sha256": "7f17aebe45878f5e65a17390fce300ae4bb970035c420d043d8fee20f806c3a5",
+      "bytes": 3869
+    },
+    {
+      "path": "/tmp/qwen36-attention-engine-control.py",
+      "sha256": "9f6cae92279bb31c35a34de61f57d795c5fb6222921cefd59995882f682c20ad",
+      "bytes": 2717
+    },
+    {
+      "path": "/tmp/prepared-pipeline-independent-review-20261030.py",
+      "sha256": "758173b89630c1f7005e626494c897848ac9884128df86cec6b75df5883bee01",
+      "bytes": 2741
+    }
+  ],
+  "targeted_tests": {
+    "passed": 115,
+    "seconds": 1.95,
+    "scope": "Engine, prepared stages, attention, matrices, coupled rates, ownership, transfer, indexed service, steady programs, source MLA and Situ"
+  },
+  "independent_review": {
+    "old_new_exact_controls": 60,
+    "trace_limits": [
+      0,
+      5,
+      10000
+    ],
+    "nested_and_duplicate_stage_names": true,
+    "status": "pass",
+    "comparison": "complete Engine summary and complete retained trace exact equality",
+    "execution_wall_seconds": 0.063502083,
+    "exit_code": 0,
+    "script_note": "Saved verbatim after the one successful in-memory invocation; not rerun. Old modules loaded with git show HEAD at review time; new modules from current working tree.",
+    "workspace": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+    "record": {
+      "path": "/tmp/prepared-pipeline-independent-review-20261030.json",
+      "sha256": "ddd95b571db9a4bdce3230dd2a08833b68a23e851f0bfd4c46fdc116e11e8f07",
+      "bytes": 531
+    }
+  },
+  "same_body_exact_control": {
+    "before": {
+      "status": "completed",
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 12
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
+      },
+      "runtime_revision": "2ec98bc3d20230f4c4477048d12c23db84e7141a",
+      "timeout_seconds": 90,
+      "wall_seconds": 69.21056612499524,
+      "cpu_seconds": 68.832251,
+      "peak_rss_bytes": 79773696,
+      "body_forward_ms": 29.10651966528171,
+      "result_sha256": "cdd7925d454b41d73d3d806fe19f50bf2c35ef49d0588f9ae50971cecaa37473",
+      "engine_source_sha256": "f033f1d19ee5176116a83991c645902d4acd806cc6ab848156c087cbf190482a",
+      "program_source_sha256": "44218db471f47c870d8920fa0d81a941ea9eac56e6dcf233125d3156e67a62e7",
+      "attention_source_sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+      "record": {
+        "path": "/tmp/qwen36-tp2-b12-original.json",
+        "sha256": "eac0e380db96e52f4578b1ad7cd2dfd29467fecd77687a72e42bcf11318deb9e",
+        "bytes": 17863
+      },
+      "execution_sha256": "11cfae8231c9ec68512c587a29c07553d116c553d0c2e4aae91741a7e4ee2b18",
+      "execution": {
+        "completed_tasks": 6902053,
+        "peak_live_tasks": 5906,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 2357935472640.0,
+          "vector_ops": 14679871488.0,
+          "hbm_bytes": 68548671488.0,
+          "link_bytes": 62914560.0
+        }
+      }
+    },
+    "after_record": {
+      "path": "/tmp/qwen36-tp2-b12-final.json",
+      "sha256": "673556101cb8d61794b506d385c3fe71853745fbe780a30dfc49b1d71dd4ce5c",
+      "bytes": 17865
+    },
+    "complete_result_sha256_equal": true,
+    "complete_execution_equal": true
+  },
+  "same_attention_exact_control": {
+    "geometry": {
+      "sequences": 24,
+      "query_tokens": 4,
+      "context_tokens": 126000,
+      "tp": 2
+    },
+    "operator_id": "s0.l3.attention",
+    "recipe": "flash_attention_decode",
+    "local_shape": [
+      96,
+      3024096,
+      12,
+      256
+    ],
+    "case_sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67",
+    "before_wall_seconds": 6.013920042081736,
+    "after_wall_seconds": 4.511493958067149,
+    "duration_ms": 2.0104938693941086,
+    "completed_tasks": 756718,
+    "complete_result_sha256_equal": true,
+    "result_sha256": "06f6c853014b5b61e885572913b8942ff9b4b6770a07671583075957d6134f8f",
+    "complete_execution_equal": true,
+    "before_record": {
+      "path": "/tmp/qwen36-attn-b24-original-engine.json",
+      "sha256": "61b257c3d1a907dd5cf13fd65f461bf030c70edaab48448f3e1e53a3fde24860",
+      "bytes": 14051
+    },
+    "after_record": {
+      "path": "/tmp/qwen36-attn-b24-slot-cache.json",
+      "sha256": "88e56de27696f4fa8e6af176b36120b21c566bb81232efd18c5d70437709dd23",
+      "bytes": 14052
+    }
+  },
+  "full_64_layer_body_controls": [
+    {
+      "status": "completed",
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 12
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
+      },
+      "runtime_revision": "2ec98bc3d20230f4c4477048d12c23db84e7141a",
+      "timeout_seconds": 90,
+      "wall_seconds": 62.491356874932535,
+      "cpu_seconds": 61.691362,
+      "peak_rss_bytes": 77922304,
+      "body_forward_ms": 29.10651966528171,
+      "result_sha256": "cdd7925d454b41d73d3d806fe19f50bf2c35ef49d0588f9ae50971cecaa37473",
+      "engine_source_sha256": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+      "program_source_sha256": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097",
+      "attention_source_sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+      "record": {
+        "path": "/tmp/qwen36-tp2-b12-final.json",
+        "sha256": "673556101cb8d61794b506d385c3fe71853745fbe780a30dfc49b1d71dd4ce5c",
+        "bytes": 17865
+      },
+      "execution_sha256": "11cfae8231c9ec68512c587a29c07553d116c553d0c2e4aae91741a7e4ee2b18",
+      "execution": {
+        "completed_tasks": 6902053,
+        "peak_live_tasks": 5906,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 2357935472640.0,
+          "vector_ops": 14679871488.0,
+          "hbm_bytes": 68548671488.0,
+          "link_bytes": 62914560.0
+        }
+      }
+    },
+    {
+      "status": "completed",
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 16
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
+      },
+      "runtime_revision": "b586b183749803f755f46f4adf1446d815917d19",
+      "timeout_seconds": 90,
+      "wall_seconds": 56.53886708396021,
+      "cpu_seconds": 56.348869,
+      "peak_rss_bytes": 79790080,
+      "body_forward_ms": 32.21540901277683,
+      "result_sha256": "14eeeb80872ce6e658850e5dd3b82d2ffff42fe0c30fbe1502a792670d4d892c",
+      "engine_source_sha256": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+      "program_source_sha256": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097",
+      "attention_source_sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+      "record": {
+        "path": "/tmp/qwen36-tp2-b16-final.json",
+        "sha256": "9dd20852a882cc1b7a4707d330e4cc16a3748510644b3091fd92e19ec2defa8e",
+        "bytes": 18387
+      },
+      "execution_sha256": "6d094d5d1ababe8c824c0842065ce4dcdbb87cc300e6753d5a66651a1738912f",
+      "execution": {
+        "completed_tasks": 9005061,
+        "peak_live_tasks": 6149,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 3143913963520.0,
+          "vector_ops": 19552665600.0,
+          "hbm_bytes": 87080865792.0,
+          "link_bytes": 83886080.0
+        }
+      }
+    },
+    {
+      "status": "completed",
+      "geometry": {
+        "scope": "body",
+        "phase": "decode",
+        "tokens": 4,
+        "context": 126000,
+        "sequences": 24
+      },
+      "case": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
+      },
+      "runtime_revision": "537cc9ade2d9f41b366f73d05b88e3ec0cf67718",
+      "timeout_seconds": 90,
+      "wall_seconds": 80.85706016607583,
+      "cpu_seconds": 80.120245,
+      "peak_rss_bytes": 82214912,
+      "body_forward_ms": 50.208417791443786,
+      "result_sha256": "b2afea6865dce9b1c3a7f43d9148047bc40860de09a11d0a9c898eeabd3bd14b",
+      "engine_source_sha256": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
+      "program_source_sha256": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097",
+      "attention_source_sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
+      "record": {
+        "path": "/tmp/qwen36-tp2-b24-slot-cache.json",
+        "sha256": "dc388690a54efe03c0b44de9b3b0a3367b91cf2dd8d5aa7059655f626e18abf6",
+        "bytes": 19361
+      },
+      "execution_sha256": "f3d82bf2f3b406d4b2bdc17ac72417e3baf1b78c096a4d26306e2743eaa74f25",
+      "execution": {
+        "completed_tasks": 13118469,
+        "peak_live_tasks": 6149,
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": 0.0,
+          "ub@r0:s0": 0.0
+        },
+        "work": {
+          "flops": 4715870945280.0,
+          "vector_ops": 29298253824.0,
+          "hbm_bytes": 124145254400.0,
+          "link_bytes": 125829120.0
+        }
+      }
+    }
+  ],
+  "prior_b24_timeout": {
+    "status": "failed",
+    "geometry": {
+      "scope": "body",
+      "phase": "decode",
+      "tokens": 4,
+      "context": 126000,
+      "sequences": 24
+    },
+    "case": {
+      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+      "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
+    },
+    "runtime_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
+    "timeout_seconds": 90,
+    "wall_seconds": 90.01784733310342,
+    "peak_rss_bytes": 80560128,
+    "error_type": "TimeoutError",
+    "error": "body_prediction_90s_budget_exhausted",
+    "record": {
+      "path": "/tmp/qwen36-tp2-b24-before.json",
+      "sha256": "6446bcfe4f1e8ec4a07c17f87b0e08d0818af68b912e8751a9b2b4f8e3ccb262",
+      "bytes": 6624
+    }
+  },
+  "b16_repeat": {
+    "earlier_completed_wall_seconds": 56.58661966701038,
+    "earlier_completed_cpu_seconds": 56.198509,
+    "earlier_completed_peak_rss_bytes": 79544320,
+    "result_sha256": "14eeeb80872ce6e658850e5dd3b82d2ffff42fe0c30fbe1502a792670d4d892c",
+    "complete_result_sha256_equal": true,
+    "note": "A second serial run repeated an already completed B16 control after recovery; both results were read successfully."
+  },
+  "limits": [
+    "These are local CPU and memory controls, not NPU accuracy acceptance.",
+    "All body controls use unchanged canonical input q4/context126000, event_limit=0, and the original 90-second limit. RSS values are bytes on this host.",
+    "B12 before and after complete results match exactly. The independent B12 baseline completed in 69.21 seconds; it did not reproduce the earlier profiler timeout.",
+    "B24 before exhausted 90 seconds, so complete old/new B24 body equality is unavailable. The real B24 attention operator has an exact complete-result control.",
+    "B16 has a repeatability control but no completed old-engine whole-body control.",
+    "Shared checkout HEAD advanced during serial controls; the recorded Engine/program/attention source hashes identify the tested files.",
+    "No full profiler sweep or additional timeout geometry is claimed by this receipt."
+  ]
+}

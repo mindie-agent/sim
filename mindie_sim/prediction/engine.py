@@ -59,7 +59,7 @@ class Event:
         return self.time is not None
 
 
-@dataclass
+@dataclass(slots=True)
 class _Task:
     event: Event
     remaining: dict[str, float]
@@ -73,13 +73,14 @@ class _Task:
     owner: str
     metadata: dict
     placement: dict
+    allocation_demands: tuple[tuple[tuple[str, int], float], ...]
     coupled: bool = False
     callback: Callable[[Event], None] | None = None
     start: float | None = None
     service: dict[str, float] = field(default_factory=dict)
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class _PreparedTask:
     """Validated static service; each submission owns its remaining work."""
 
@@ -90,6 +91,10 @@ class _PreparedTask:
     free: tuple[Allocation, ...]
     placement: dict[str, tuple[int, ...]]
     coupled: bool
+    allocation_demands: tuple[tuple[tuple[str, int], float], ...]
+
+
+_EMPTY_TASK = _PreparedTask({}, 0.0, {}, (), (), {}, False, ())
 
 
 def _fair_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, float]:
@@ -171,6 +176,9 @@ class Engine:
         placement=None, coupled=False,
     ) -> _PreparedTask:
         """Validate a template against this engine's physical resource binding."""
+        if (work is None and latency == 0 and caps is None and acquire == ()
+                and free == () and placement is None and not coupled):
+            return _EMPTY_TASK
         demands = {key: float(value) for key, value in (work or {}).items() if value}
         for key, value in demands.items():
             if key not in self.resources:
@@ -188,6 +196,7 @@ class Engine:
                 unit < 0 or unit >= self.resources[key].units for unit in units
             ):
                 raise ExecutionError(f"resource_unit_out_of_range:{key}")
+        allocation_demands = {}
         for allocation in acquire:
             if allocation.size < 0 or not math.isfinite(allocation.size):
                 raise ExecutionError(f"invalid_allocation:{allocation.name}")
@@ -199,8 +208,11 @@ class Engine:
                 unit < 0 or unit >= self.pool_units[allocation.pool] for unit in allocation.units
             ):
                 raise ExecutionError(f"buffer_unit_out_of_range:{allocation.pool}")
+            for unit in allocation.units:
+                key = allocation.pool, unit
+                allocation_demands[key] = allocation_demands.get(key, 0.0) + allocation.size
         return _PreparedTask(demands, latency, limits, tuple(acquire), tuple(free),
-                             placement, coupled)
+                             placement, coupled, tuple(allocation_demands.items()))
 
     def _submit_prepared(
         self, prepared, name, *, after=(), release=None, owner="", metadata=None,
@@ -208,21 +220,24 @@ class Engine:
     ) -> Event:
         # Dependencies and allocations remain live invocation state. Only static
         # work, supply and placement validation can be shared by repeated tiles.
-        dependencies = tuple(dict.fromkeys(after))
-        pending = tuple(event for event in dependencies if not event.done)
-        if any(event.sequence not in self._tasks and event.sequence not in self._promises
-               for event in pending):
-            raise ExecutionError(f"dependency_not_submitted:{name}")
+        dependencies = tuple(after)
+        if len(dependencies) > 1:
+            dependencies = tuple(dict.fromkeys(dependencies))
+        pending = []
+        release = max(self.now, self.now if release is None else release)
+        for predecessor in dependencies:
+            if predecessor.time is not None:
+                release = max(release, predecessor.time)
+            else:
+                if predecessor.sequence not in self._tasks and predecessor.sequence not in self._promises:
+                    raise ExecutionError(f"dependency_not_submitted:{name}")
+                pending.append(predecessor)
         self._sequence += 1
         event = Event(self._sequence, name)
-        release = max(
-            self.now, self.now if release is None else release,
-            max((event.time for event in dependencies if event.done), default=self.now),
-        )
         task = _Task(
             event, dict(prepared.demand), prepared.demand, len(pending), release,
             prepared.latency, prepared.caps, prepared.acquire, prepared.free,
-            owner, dict(metadata or {}), prepared.placement,
+            owner, dict(metadata or {}), prepared.placement, prepared.allocation_demands,
             coupled=prepared.coupled, callback=on_complete,
         )
         self._tasks[event.sequence] = task
@@ -260,15 +275,15 @@ class Engine:
             heapq.heappush(self._releases, (task.release, task.event.sequence))
 
     def _can_allocate(self, task: _Task) -> bool:
-        amounts = {}
         for item in task.acquire:
             if item.name in self.allocations:
                 raise ExecutionError(f"allocation_already_live:{item.name}")
-            for unit in item.units:
-                key = item.pool, unit
-                amounts[key] = amounts.get(key, 0.0) + item.size
-        return all(self.unit_allocated.get(key, 0) + amount <= self.pools[key[0]]
-                   for key, amount in amounts.items())
+        # Static amounts belong to the prepared stage; only current occupancy
+        # is reevaluated as other streams acquire and release the same units.
+        for key, amount in task.allocation_demands:
+            if self.unit_allocated.get(key, 0) + amount > self.pools[key[0]]:
+                return False
+        return True
 
     def _complete(self, task: _Task) -> None:
         key = task.event.sequence
@@ -398,7 +413,8 @@ class Engine:
                     # nonnegative floats, including subnormal values.
                     if residual <= 4 * math.ulp(remaining):
                         used, residual = remaining, 0.0
-                    task.service[name] = task.service.get(name, 0.0) + used
+                    if self.trace.maxlen:
+                        task.service[name] = task.service.get(name, 0.0) + used
                     self.serviced[name] += used
                     if residual:
                         task.remaining[name] = residual
