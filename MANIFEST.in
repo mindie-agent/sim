@@ -7,14 +7,11 @@ recursive-include mindie_sim/model_configs *.json
 recursive-include mindie_sim/backends/profiles *.json
 recursive-include docs *.md
 recursive-include examples *.json
-prune examples/artifacts
 recursive-include tests *.py
-recursive-include tests/fixtures/observations *.json *.csv *.sqlite
+recursive-include tests/fixtures *
+global-exclude *.py[cod]
 recursive-include data/measurements *.json *.stdout *.stderr
 recursive-include data/observations *
-recursive-include data/history *.json *.jsonl *.md
-recursive-include data/migration *.json *.jsonl
 recursive-include data/verification *.json
 recursive-include tools *.py *.ptx *.cpp *.sh
 recursive-include benchmarks *.py *.json
-recursive-include campaigns *.json *.md
