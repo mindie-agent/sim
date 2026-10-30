@@ -281,7 +281,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             prefix=prefix, plan=plan, stage=stage, requests=requests,
             rows=transport_rows, ep=parallel.ep, deps=deps,
             ids_producer=ids_producer if tokens else None,
-            realization=routing_realization, mode=mode)
+            realization=routing_realization, mode=mode, transport=transport)
         ops.extend(transport_ops)
     source = routed_input
     if latent != hidden and tokens:

@@ -3,8 +3,9 @@
 [Role] Build the histogram, dynamic INT8 producer, split scale/payload exchanges
   and transposed BF16 return for the selected ALLTOALL transport branch.
 [Invariants] The selector is an explicit physical branch, never a model name.
-  Tokens are counted once per local assignment; scales and payload are split
-  once by ``min(tp, ep)``; histogram entry bytes are never TP-shrunk. The
+  Tokens are counted once per local assignment; an explicit TP caller already
+  owns its local rows, otherwise ``min(tp, ep)`` partitions them once.
+  Histogram entry bytes are never TP-shrunk. The
   return ledger transposes source row counts and then applies BF16 row width.
   Unsupported selectors or expert representations raise; no fallback is used.
 [Timeouts & Locks] Bounded O(experts + source partitions) construction, no I/O.
@@ -65,7 +66,8 @@ def select(runtime, *, layer_scope="body"):
     if missing:
         raise ModelingError("moe_transport_missing_fields:" + ",".join(sorted(missing)))
     for key, expected in _CONFIG.items():
-        if raw[key] != expected:
+        allowed = {"int32", "int64"} if key == "histogram_dtype" else {expected}
+        if raw[key] not in allowed:
             raise ModelingError(
                 f"moe_transport_unsupported:{key}={raw[key]!r};expected={expected!r}")
     scopes = raw.get("layer_scopes")
@@ -127,9 +129,11 @@ def _count_basis(realization):
 
 
 def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
-              ids_producer, realization, mode):
-    """Local INT64 expert histogram, then one count allgather per source."""
+              ids_producer, realization, mode, transport):
+    """Typed local expert histogram, then one count allgather per source."""
     basis = _count_basis(realization)
+    count_dtype = transport.histogram_dtype
+    count_bytes = dtype_bytes(count_dtype)
     # Global expert totals do not identify any source's histogram. In the
     # supported EP1 explicit realization the source owns the complete count
     # vector; balanced cross-rank destination counts are separate provenance.
@@ -145,12 +149,13 @@ def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
         op_id=prefix + ".moe_histogram", deps=(ids_producer,) if ids_producer else (deps,),
         stage=stage, layer=plan.index, requests=requests,
         elements=_ceil_rows(count_rows), ops_per_element=0,
-        vector_ops_override=count_rows, dtype="int32", family="histogram",
+        vector_ops_override=count_rows, dtype=count_dtype, family="histogram",
         phase=mode, recipe="moe_expert_count_histogram", shape=(plan.num_experts,),
         read_bytes_override=count_rows * 4,
-        write_bytes_override=plan.num_experts * 8,
+        write_bytes_override=plan.num_experts * count_bytes,
         returns=("expert_counts",),
-        metadata=(("histogram_dtype", "int64"), ("topk_ids_producer", ids_producer),
+        metadata=(("histogram_dtype", count_dtype), ("topk_ids_producer", ids_producer),
+                  ("input_format", "int32"), ("output_format", count_dtype),
                   ("source_assignments", count_rows), ("num_experts", plan.num_experts),
                   ("routing_basis", basis), ("counts", counts),
                   ("count_values", "declared_source" if counts is not None
@@ -160,21 +165,20 @@ def histogram(*, prefix, plan, stage, requests, rows, ep, deps,
                   ("count_work", "one_increment_per_source_assignment"),
                   ("includes_zero_count_experts", True)),
     )
-    op = replace(op, dtype="int64")
     ops = [op]
     gather = None
     if ep > 1:
-        gather = comm_op(
+        gather = replace(comm_op(
             op_id=prefix + ".moe_histogram_gather", deps=(op.op_id,), stage=stage,
             layer=plan.index, requests=requests, family="allgather", phase=mode,
-            recipe="ring_allgather", link_bytes=(ep - 1) * plan.num_experts * 8,
+            recipe="ring_allgather", link_bytes=(ep - 1) * plan.num_experts * count_bytes,
             shape=(ep, plan.num_experts),
             metadata=(("group_axis", "ep"), ("steps", ep - 1),
                       ("collective_id", prefix + ".moe_histogram_gather"),
-                      ("histogram_dtype", "int64"),
+                      ("histogram_dtype", count_dtype),
                       ("traffic_model", "local_expert_count_allgather"),
                       ("histogram_tp_partitioned", False)),
-        )
+        ), dtype=count_dtype)
         ops.append(gather)
     return ops, gather.op_id if gather else None
 

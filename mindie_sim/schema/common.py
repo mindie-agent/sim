@@ -22,7 +22,8 @@ _IGNORED_DOCUMENT_FIELDS = {
 _DTYPE_BYTES = {
     "fp32": 4.0, "float32": 4.0, "bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0,
     "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
-    "int8": 1.0, "int4": 0.5, "int32": 4.0, "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
+    "int8": 1.0, "int4": 0.5, "int32": 4.0, "int64": 8.0,
+    "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
 }
 
 _DTYPE_PEAK = {

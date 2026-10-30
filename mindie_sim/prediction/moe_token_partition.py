@@ -1,11 +1,12 @@
-"""MC2 caller TP token slicing and reconstruction.
+"""Explicit MoE caller TP token slicing and reconstruction.
 
-[Role] Keep replicated router/shared work separate from MC2 source token rows.
+[Role] Keep replicated router/shared work separate from local source token rows.
 [Invariants] A TP view neither copies bytes nor changes global expert counts.
   Selection uses allocated local rows; masked packing uses only valid rows.
   Explicit MC2 padding occurs after router/shared work; finalize gathers once
   and trims its allocation back to the original input rows.
   Caller ownership is independent of the selected transport implementation.
+  The ALLTOALL caller currently requires divisible input without padding.
   This contract is not sequence parallelism or ALLGATHER dispatch.
 [Timeouts & Locks] Constant-sized graph descriptions; no I/O, locks or histories.
 [Side-Effect Policy] Immutable caller metadata and operator descriptions only.
@@ -16,6 +17,7 @@ from mindie_sim.catalog.ops import barrier_op, comm_op, vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 KIND = "vllm_ascend_mc2_tp_slice"
+ALLTOALL_KIND = "vllm_ascend_alltoall_tp_slice"
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
@@ -24,6 +26,15 @@ SOURCE = {
     "routing_path": "vllm_ascend/ops/fused_moe/routed_experts.py",
     "routing_lines": (656, 675, 713, 717),
     "scope": "independent_source_semantics; not_capture_binary_identity",
+}
+ALLTOALL_SOURCE = {
+    "repository": "vllm-ascend",
+    "revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
+    "path": "vllm_ascend/ops/fused_moe/prepare_finalize.py",
+    "sha256": "88560c839172f5b433753c796d17a5d41278204f33b2e9ca9d4b2af9ccbe16d8",
+    "symbol": "PrepareAndFinalizeWithAll2All",
+    "prepare_lines": (158, 180), "finalize_lines": (210, 225),
+    "scope": "TP-divisible input; independent_source_semantics; not_capture_binary_identity",
 }
 
 
@@ -34,6 +45,15 @@ class TokenPartition:
     tp: int
     gather_output_materialization: str = "view"
     padding: str = "none"
+    kind: str = KIND
+
+    @property
+    def caller(self):
+        return "mc2" if self.kind == KIND else "alltoall"
+
+    @property
+    def source(self):
+        return SOURCE if self.kind == KIND else ALLTOALL_SOURCE
 
     @property
     def allocated_rows(self):
@@ -46,14 +66,14 @@ class TokenPartition:
 
     def metadata(self):
         return (("moe_token_partition", {
-            "kind": KIND, "full_rows": self.full_rows,
+            "kind": self.kind, "full_rows": self.full_rows,
             "local_rows": self.local_rows, "source_local_rows": self.local_rows, "tp": self.tp,
             "routing_realization_token_scope": "replica_before_caller_tp_slice",
             "source_partitions": 1, "padding": self.padding,
             "allocated_rows": self.allocated_rows, "valid_rows": self.full_rows,
             "valid_rows_per_rank": self.valid_per_rank,
             "gather_output_materialization": self.gather_output_materialization,
-            "source": SOURCE,
+            "source": self.source,
         }),)
 
     def prepare(self, *, prefix, input_id, logits_id, width, experts,
@@ -81,33 +101,33 @@ class TokenPartition:
                 dependency = pad_id
             return replace(barrier_op(
                 op_id=prefix + suffix, deps=(dependency,), stage=stage, layer=layer,
-                requests=requests, phase=phase, recipe="mc2_tp_token_view",
+                requests=requests, phase=phase, recipe=f"{self.caller}_tp_token_view",
                 shape=(self.local_rows, columns),
                 metadata=self.metadata() + (("materialization", "view"),
                     ("input_shape", (self.allocated_rows, columns)),
                     ("output_shape", (self.local_rows, columns)),
                     ("physical_payload_bytes", 0.0))), dtype=element_dtype)
-        hidden = view(".mc2_input_view", input_id, width, dtype)
-        logits = view(".mc2_logits_view", logits_id, experts, logits_dtype)
+        hidden = view(f".{self.caller}_input_view", input_id, width, dtype)
+        logits = view(f".{self.caller}_logits_view", logits_id, experts, logits_dtype)
         return (*prepared, hidden, logits)
 
     def finalize(self, *, prefix, source, width, stage, layer, requests, phase, dtype):
         local_bytes = self.local_rows * width * dtype_bytes(dtype)
         gathered = replace(comm_op(
-            op_id=prefix + ".mc2_tp_gather", deps=(source,), stage=stage, layer=layer,
+            op_id=prefix + f".{self.caller}_tp_gather", deps=(source,), stage=stage, layer=layer,
             requests=requests, phase=phase, family="allgather", recipe="ring_allgather",
             link_bytes=(self.tp - 1) * local_bytes,
             shape=(self.allocated_rows, width),
             metadata=self.metadata() + (("group_axis", "tp"), ("steps", self.tp - 1),
                 ("input_shape", (self.local_rows, width)),
                 ("output_shape", (self.allocated_rows, width)),
-                ("collective_role", "mc2_finalize_token_reconstruction"))), dtype=dtype)
+                ("collective_role", f"{self.caller}_finalize_token_reconstruction"))), dtype=dtype)
         if self.gather_output_materialization == "view":
             return self._trim((gathered,), prefix, width, stage, layer, requests, phase, dtype)
         # Some callers materialize each gathered rank slice. The capture-backed
         # choice is explicit; no batch threshold or hidden copy multiplier.
         copies = tuple(vector_op(
-            op_id=prefix + f".mc2_gather_copy{rank}", deps=(gathered.op_id,),
+            op_id=prefix + f".{self.caller}_gather_copy{rank}", deps=(gathered.op_id,),
             stage=stage, layer=layer, requests=requests, phase=phase, dtype=dtype,
             family="tensor_materialization", recipe="tensor_copy",
             elements=self.local_rows * width, ops_per_element=0,
@@ -118,9 +138,9 @@ class TokenPartition:
                 ("gathered_slice", rank), ("invocation_class", "vector")))
             for rank in range(self.tp))
         complete = replace(barrier_op(
-            op_id=prefix + ".mc2_gather_complete", deps=tuple(op.op_id for op in copies),
+            op_id=prefix + f".{self.caller}_gather_complete", deps=tuple(op.op_id for op in copies),
             stage=stage, layer=layer, requests=requests, phase=phase,
-            recipe="mc2_gather_copies_complete", shape=(self.allocated_rows, width),
+            recipe=f"{self.caller}_gather_copies_complete", shape=(self.allocated_rows, width),
             metadata=self.metadata()), dtype=dtype)
         return self._trim((gathered, *copies, complete), prefix, width,
                           stage, layer, requests, phase, dtype)
@@ -129,9 +149,9 @@ class TokenPartition:
         if self.allocated_rows == self.full_rows:
             return ops
         trimmed = replace(barrier_op(
-            op_id=prefix + ".mc2_output_trim", deps=(ops[-1].op_id,),
+            op_id=prefix + f".{self.caller}_output_trim", deps=(ops[-1].op_id,),
             stage=stage, layer=layer, requests=requests, phase=phase,
-            recipe="mc2_tp_output_view", shape=(self.full_rows, width),
+            recipe=f"{self.caller}_tp_output_view", shape=(self.full_rows, width),
             metadata=self.metadata() + (("materialization", "view"),
                 ("input_shape", (self.allocated_rows, width)),
                 ("output_shape", (self.full_rows, width)),
@@ -172,9 +192,16 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     raw = kernels.get("moe_token_partition")
     if raw is None:
         return None
-    if (not isinstance(raw, dict) or raw.get("kind") != KIND
-            or set(raw) - {"kind", "gather_output_materialization", "padding"}):
-        raise ModelingError("moe_token_partition_requires_vllm_ascend_mc2_tp_slice")
+    if (not isinstance(raw, dict) or raw.get("kind") not in {KIND, ALLTOALL_KIND}
+            or set(raw) - {"kind", "gather_output_materialization", "padding", "layer_scopes"}):
+        raise ModelingError("moe_token_partition_requires_explicit_vllm_ascend_tp_slice")
+    scopes = raw.get("layer_scopes")
+    if scopes is not None:
+        if (not isinstance(scopes, (list, tuple)) or not scopes
+                or any(scope not in {"body", "draft"} for scope in scopes)):
+            raise ModelingError("moe_token_partition_layer_scopes_require_body_or_draft")
+        if plan.scope not in scopes:
+            return None
     materialization = raw.get("gather_output_materialization", "view")
     if materialization not in {"view", "per_rank_copy"}:
         raise ModelingError("mc2_gather_output_materialization_requires_view_or_per_rank_copy")
@@ -184,12 +211,14 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
             or getattr(runtime, "moe_recipe", "alltoall") != "alltoall"):
         raise ModelingError("mc2_tp_slice_requires_dp1_ep_equals_tp_without_sequence_parallel")
     if (plan.expert_latent_size not in (0, None, model.hidden_size)
-            or getattr(runtime, "kernels", {}).get("moe_transport")):
+            or (raw["kind"] == KIND and kernels.get("moe_transport"))):
         raise ModelingError("mc2_tp_slice_requires_direct_hidden_rows_without_separate_transport")
     padding = raw.get("padding", "none")
+    if raw["kind"] == ALLTOALL_KIND and padding != "none":
+        raise ModelingError("alltoall_tp_slice_requires_divisible_rows_without_padding")
     if padding not in {"none", "right_to_tp"}:
         raise ModelingError("mc2_tp_slice_padding_requires_none_or_right_to_tp")
     if tokens <= 0 or (tokens % parallel.tp and padding == "none"):
         raise ModelingError("mc2_tp_slice_requires_positive_tp_divisible_physical_rows")
     local = (tokens + parallel.tp - 1) // parallel.tp
-    return TokenPartition(tokens, local, parallel.tp, materialization, padding)
+    return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"])
