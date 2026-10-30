@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from mindie_sim import graph_costs, target_graphs
+from mindie_sim import graph_costs, target_graphs, target_operators
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.prediction.structure import parse_case
@@ -74,6 +74,60 @@ def test_default_and_parent_category_inheritance_preserve_physical_work():
             assert op.dtype == 'int8'
 
 
+def test_output_b_child_changes_only_its_operands_and_resident_weights():
+    raw = raw_case({'mla.o_b': BF16})
+    c = parse_case(raw)
+    ops = graph(raw)[0]
+    by_recipe = {op.recipe: op for op in ops}
+    a, b, qb = (by_recipe[r] for r in ('grouped_output_a', 'grouped_output_b', 'q_b'))
+    assert b.dtype == 'bf16'
+    assert a.dtype == qb.dtype == 'int8'
+    assert not any(op.op_id == b.op_id + '.quantize' for op in ops)
+    assert dict(a.metadata)['activation_producer'] == 'explicit_quantization'
+    terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[0], c.model)}
+    assert term_bytes(terms['wo_b'], c.model.quant, c.runtime.parallel) == 4096 * 1024 * 2
+    assert dict(b.metadata)['packed_weight_bytes'] == 4096 * 1024 * 2
+    assert graph(parse_case(c.to_dict())) == graph(c)
+
+
+@pytest.mark.parametrize('name,tokens,hidden,expert_format', [
+    ('v4f-a3-w8a8-tp8', 4096, 4096, 'int8'),
+    ('v4pro-a3-w4a8-tp16', 1024, 7168, 'int4'),
+])
+def test_retained_prefill_output_abi_preserves_other_quantized_roles(name, tokens, hidden, expert_format):
+    # Real pre4096.kernel_details.csv tensor contracts: V4F lines 143-144,
+    # V4Pro lines 144-145. TransposeBatchMatMul and MatMulV3 both read BF16.
+    raw = json.loads((ROOT / 'examples/cases' / (name + '.json')).read_text())
+    raw['model']['layers'] = 1
+    c = parse_case(raw)
+    ops = target_operators(c, scope='body', phase='prefill', tokens=tokens, context=0)
+    by_recipe = {op.recipe: op for op in ops}
+    terms = {term.name: term for term in layer_weight_terms(c.model.layer_plans[0], c.model)}
+    for role, weight, n, k in (('grouped_output_a', 'wo_a', 1024, 4096),
+                               ('grouped_output_b', 'wo_b', hidden, 1024)):
+        op = by_recipe[role]
+        assert op.local_shape == (tokens, n, k)
+        assert op.dtype == 'bf16'
+        assert op.flops == 2 * tokens * n * k
+        assert op.hbm_bytes == 2 * (tokens * k + n * k + tokens * n)
+        assert dict(op.metadata)['packed_weight_bytes'] == n * k * 2
+        assert term_bytes(terms[weight], c.model.quant, c.runtime.parallel) == n * k * 2
+        assert not any(other.op_id == op.op_id + '.quantize' for other in ops)
+    for role in ('q_a', 'kv_a', 'q_b', 'dense_gate_up', 'dense_down'):
+        op = by_recipe[role]
+        assert op.dtype == 'int8'
+        assert dict(op.metadata)['activation_producer'] == 'explicit_quantization'
+    assert dict(by_recipe['grouped_gate_up'].metadata)['weight_format'] == expert_format
+    assert c.model.quant.index_dtype == 'int8'
+    base_raw = {**raw, 'model': {key: value for key, value in raw['model'].items() if key != 'quant'}}
+    base_quant = parse_case(base_raw).model.quant.to_dict()
+    actual_quant = c.model.quant.to_dict()
+    for metadata in ('source', 'notes', 'category_overrides'):
+        base_quant.pop(metadata)
+        actual_quant.pop(metadata)
+    assert actual_quant == base_quant
+
+
 def test_real_ordinary_graph_preserves_dependency_and_releases_resources():
     raw = raw_case({'mla.o_a': BF16})
     graphs = graph(raw)
@@ -85,19 +139,21 @@ def test_real_ordinary_graph_preserves_dependency_and_releases_resources():
     assert a.deps and not a.deps[0].endswith('quantize')
 
 
-def test_prepared_mx_validation_uses_the_same_child_as_runtime_and_capacity():
+@pytest.mark.parametrize('role,category', [
+    ('grouped_output_a', 'mla.o_a'), ('grouped_output_b', 'mla.o_b')])
+def test_prepared_mx_validation_uses_the_same_child_as_runtime_and_capacity(role, category):
     raw = json.loads((ROOT/'examples/cases/high-concurrency-20261030/'
         'v41-dynamic-rotary-conditional/a5_v41_fp8_tp1_dp8_ep8_c128_p2k-dynamic-rotary-source.json').read_text())
     raw['model']['layers']=1
-    raw['model']['quant']['category_overrides']={'mla.o_a':BF16}
+    raw['model']['quant']['category_overrides']={category:BF16}
     raw['runtime']['kernels']['lowerings']['mx_matrix']={
         'implementation':'ascend_prepared_mx32_matrix', 'options':{
-            'projection_recipes':['grouped_output_a'],
+            'projection_recipes':[role],
             'scale_storage':'replace_checkpoint_scales'}}
     # Preparation cannot accept parent MX when the actual child matrix is BF16.
     with pytest.raises(ModelingError,match='prepared_mx32_requires_e4m3_operands'):
         parse_case(raw)
-    raw['runtime']['kernels']['lowerings']['mx_matrix']['options']['projection_recipes']=['q_b','grouped_output_b']
+    raw['runtime']['kernels']['lowerings']['mx_matrix']['options']['projection_recipes']=['q_b']
     c=parse_case(raw)
-    a=next(o for o in graph(c)[0] if o.recipe=='grouped_output_a')
-    assert a.dtype=='bf16'
+    output=next(o for o in graph(c)[0] if o.recipe==role)
+    assert output.dtype=='bf16'

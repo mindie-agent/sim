@@ -430,7 +430,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              tokens=q, heads=groups, input_width=group_width,
                              output_width=plan.o_lora_rank, role="grouped_output"),
                          weight_bytes_override=b.quant.matrix_bytes(groups * plan.o_lora_rank, group_width, "mla.o_a"))
-        last = b.matrix("grouped_output_b", (first,), q, h, groups * plan.o_lora_rank)
+        last = b.matrix("grouped_output_b", (first,), q, h, groups * plan.o_lora_rank,
+                        category="mla.o_b")
     else:
         last = b.matrix("output", outputs, q, h, output_width, category="mla.o")
     if parallel.tp > 1 and (not plan.o_groups or group_parallel):

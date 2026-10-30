@@ -64,7 +64,7 @@ def prepare_model(model, runtime, selection):
                      or (r != "q_b" and plan.o_groups > 0)]
         for role in supported:
             category = {"q_b": "mla.q_b", "grouped_output_a": "mla.o_a",
-                        "grouped_output_b": "mla"}[role]
+                        "grouped_output_b": "mla.o_b"}[role]
             runtime_quant(projection_quant(model.quant, plan), category)
         layers[str(plan.index)] = tuple(ROLES[r] for r in supported)
     metadata = {**dict(model.metadata), "prepared_mx32_matrix": {

@@ -89,12 +89,12 @@ def test_grouped_output_keeps_native_batch_view_and_declared_precision(
     original = next(op for op in _ops(case, tokens) if op.recipe == "grouped_output_a")
     view = dict(original.metadata)["native_tensor_view"]
     assert (view["batch"], view["rows"], view["n"], view["k"]) == native[2]
-    assert predicted_contract(original.to_dict()) is None
-    # A separate caller-declared floating-point scenario demonstrates the
-    # geometry adapter; it does not change the retained quantized base case.
+    assert predicted_contract(original.to_dict()) == native
+    # Equal tensor geometry cannot identify a different operand precision.
     raw = json.loads((ROOT / "examples/cases" / f"{case}.json").read_text())
-    raw["model"]["quantization"] = "bf16"
-    floating = next(op for op in target_operators(raw, phase="prefill", tokens=tokens)
-                    if op.recipe == "grouped_output_a")
-    assert predicted_contract(floating.to_dict()) == native
-    assert floating.flops == original.flops
+    raw["model"]["quant"]["category_overrides"]["mla.o_a"] = {
+        "weight_format": "int8", "activation_format": "int8"}
+    quantized = next(op for op in target_operators(raw, phase="prefill", tokens=tokens)
+                     if op.recipe == "grouped_output_a")
+    assert predicted_contract(quantized.to_dict()) is None
+    assert quantized.flops == original.flops

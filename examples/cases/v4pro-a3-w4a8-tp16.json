@@ -28,7 +28,57 @@
   },
   "model": {
     "catalog_key": "deepseek-v4-pro-0813",
-    "quantization": "w4a8_dynamic"
+    "quantization": "w4a8_dynamic",
+    "quant": {
+      "name": "W4A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int4",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "int8",
+      "index_scale_dtype": "fp16",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "mla.o_a": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "mla.o_b": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        }
+      },
+      "source": {
+        "base_preset": "w4a8_dynamic",
+        "output_projection_abi": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4pro-prefill/raw/pre4096.kernel_details.csv#lines=144-145",
+        "output_projection_capture_sha256": "5ffe5625942e4caf787ce047438576527b8513452d6dd6871b24682a19968abd"
+      },
+      "notes": [
+        "Grouped output A and B use BF16 operands in the retained TransposeBatchMatMul and MatMulV3 tensor ABI; no observed duration is a parameter.",
+        "The base preset remains on Q/K and shared/expert projections; the catalog INT8 indexer representation is retained."
+      ]
+    }
   },
   "workload": {
     "requests": [

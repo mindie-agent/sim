@@ -190,7 +190,7 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     _t("wo_a", plan.o_groups * plan.o_lora_rank, group_width,
                        "mla.o_a", "group_out", groups=plan.o_groups),
                     _t("wo_b", h, plan.o_groups * plan.o_lora_rank,
-                       "mla", "group_in", groups=plan.o_groups),
+                       "mla.o_b", "group_in", groups=plan.o_groups),
                 ])
             else:
                 terms.append(_t("o_proj", h, heads * plan.head_dim, "mla", "in_tp"))
@@ -216,7 +216,7 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                     _t("wo_a", plan.o_groups * plan.o_lora_rank, group_width,
                        "mla.o_a", "group_out", groups=plan.o_groups),
                     _t("wo_b", h, plan.o_groups * plan.o_lora_rank,
-                       "mla", "group_in", groups=plan.o_groups),
+                       "mla.o_b", "group_in", groups=plan.o_groups),
                 ])
             else:
                 terms.append(_t("o_proj", h, heads * plan.v_head_dim, "mla.o", "in_tp"))
