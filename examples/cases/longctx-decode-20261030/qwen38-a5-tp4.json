@@ -1,0 +1,194 @@
+{
+  "name": "qwen38-a5-tp4-longctx-decode-126000-3000",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 4,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "qwen3.8-27b",
+    "quantization": "w8a8_mxfp8"
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "device-body analysis only; workload placeholder is not a replay of the concurrent server",
+      "geometry_policy": "supply actual query rows and sequence count from profiler; capture padding must be stated separately",
+      "capture_summary": "/Volumes/data/mindie-sim-data/a5/qwen3_8_27b_w8a8_mxfp8_mtp_high_conc_decode_tpot5ms_near_c4_20261030/benchmark_summary.json",
+      "capture_client": "/Volumes/data/mindie-sim-data/a5/qwen3_8_27b_w8a8_mxfp8_mtp_high_conc_decode_tpot5ms_near_c4_20261030/client_cell.json",
+      "source_image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5 (c3d00a196905)",
+      "source_model_path": "/mnt/weight/Qwen3.8-27B-w8a8-mxfp8-mtp",
+      "mtp_policy": "metadata proves 3 proposed tokens per draft event; actual target query geometry awaits tensor extraction",
+      "calibration": {
+        "origin": "observed",
+        "evaluation_relation": "retrospective_cross_TP_frozen_training_validation",
+        "frozen_model_sha256": "ca169cb6744c4e55845d6c06bf8f6c34f9b4e317f4989aea6508a53de5b29e9b",
+        "target_timing_used_to_fit": false
+      },
+      "source_mechanism_transfer": {
+        "implementation": "vllm_ascend_gdn_decode",
+        "recurrent_implementation": "arch35_fp32",
+        "frozen_training_case": {
+          "path": "examples/structure/cases/decode-qwen36-a5-tp2-c1.json",
+          "sha256": "264c22db0ed0410fa0c622503f5e8c24abe0f287a5502ab068ae9a4d320fca2f",
+          "size_bytes": 30043
+        },
+        "is_parameter_generalization": false,
+        "native_contract_validation": "all retained recurrent cohort targets; kernel binary identity not captured"
+      },
+      "longctx_decode_scenario": {
+        "source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+          "sha256": "2bace0926d283f461a3b0b126c76fd1a0081df118245f11c40fc1f697e3f45f9",
+          "size_bytes": 5690
+        },
+        "prompt_tokens": 126000,
+        "output_tokens": 3000,
+        "snapshot_contexts": [
+          126000,
+          127500,
+          128999
+        ],
+        "global_concurrency": [
+          1,
+          2,
+          4,
+          8,
+          16,
+          32,
+          64
+        ],
+        "distribution": "explicit balanced global concurrency across preserved DP replicas",
+        "query_tokens_per_sequence": 1,
+        "boundary": "complete target model body, one Decode query per active sequence",
+        "not_executed": [
+          "Prefill",
+          "output head",
+          "sampling",
+          "draft model",
+          "host scheduler",
+          "client transport"
+        ],
+        "accuracy": "prediction scenario; no same-boundary long-context measurement bound",
+        "parameters": "existing source-case physical services unchanged; no new fit",
+        "source_domain_changes": []
+      }
+    },
+    "kernels": {
+      "service_regimes": [
+        {
+          "id": "frozen-native-matrix-bf16",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "dtype": "bf16",
+            "layout": "bf16",
+            "metadata.program_kind": "matmul",
+            "metadata.weight_dtype": "bf16",
+            "metadata.input_format": "bf16",
+            "metadata.output_format": "bf16",
+            "metadata.matrix_groups": 1,
+            "metadata.dequant_before_compute": false
+          },
+          "coordinates": {
+            "giga_flops": {
+              "path": "work.cube",
+              "scale": 1e-09
+            },
+            "mega_hbm_bytes": {
+              "path": "work.hbm",
+              "scale": 1e-06
+            }
+          },
+          "domain": {
+            "giga_flops": {
+              "min": 0
+            },
+            "mega_hbm_bytes": {
+              "min": 0
+            }
+          },
+          "response": {
+            "fixed_us": 6.983604343486468,
+            "terms": [
+              {
+                "coordinate": "giga_flops",
+                "us_per_unit": 1.7627632046361619
+              },
+              {
+                "coordinate": "mega_hbm_bytes",
+                "us_per_unit": 0.37770682509919956
+              }
+            ]
+          },
+          "provenance": {
+            "calibration_origin": "observed",
+            "evaluation_relation": "retrospective_cross_TP_frozen_training_validation",
+            "training_source_sha256": [
+              "7e0e459dec657f249ebbf82da9a7ceccf904aa3eff2e161cd8e312d1b04e6d2d",
+              "adada115f0f1c6cddaee97dbfed2aba8c5c0e9f1ade856ad2cc4dbd1f4f11841",
+              "bd178d03944f57ad7586ee2a7bfae85f18aab7e457dd36c788fb8573bb0ed896"
+            ],
+            "frozen_model_sha256": "ca169cb6744c4e55845d6c06bf8f6c34f9b4e317f4989aea6508a53de5b29e9b",
+            "specification_sha256": "5402fe549cb91fb09eadc935d5ca0d55314c7639a04ac906a0b652fb3aeac7cb",
+            "native_boundary": {
+              "native_operator_type": "MatMulV3",
+              "source_implementation": "ordinary_declared_matrix_program_with_normalized_native_contract",
+              "precision": {
+                "activation": "bf16",
+                "weight": "bf16",
+                "output": "bf16",
+                "activation_scale": ""
+              },
+              "layout": {
+                "declared_layout": "bf16",
+                "scope": "normalized_active_matrix_contract; native_strides_and_weight_scale_values_not_retained"
+              },
+              "execution_boundary": "inclusive_whole_native_call_once"
+            },
+            "body_residual_used": false,
+            "heldout_observed_values_used_in_fit": false,
+            "coordinate_projection": {
+              "work.flops": "work.cube",
+              "work.hbm_bytes": "work.hbm"
+            }
+          }
+        }
+      ],
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            },
+            "recurrent_implementation": "arch35_fp32",
+            "cache_index_row_stride": 4
+          }
+        }
+      }
+    },
+    "max_model_len": 129000,
+    "max_num_seqs": 64
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 126000,
+        "output_tokens": 3000
+      }
+    ]
+  }
+}

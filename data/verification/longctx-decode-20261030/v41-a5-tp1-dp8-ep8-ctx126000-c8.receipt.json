@@ -1,0 +1,85 @@
+{
+  "scenario": {
+    "id": "v41-a5-tp1-dp8-ep8-ctx126000-c8",
+    "deployment": "v41-a5-tp1-dp8-ep8",
+    "input": {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+      "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
+      "size_bytes": 64101
+    },
+    "context_tokens": 126000,
+    "query_tokens_per_sequence": 1,
+    "generated_before": 0,
+    "kv_length": 126001,
+    "global_concurrency": 8,
+    "sequences_by_replica": [
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ],
+    "selected_participants": [
+      0,
+      1,
+      2,
+      3,
+      4,
+      5,
+      6,
+      7
+    ],
+    "unprobed_replicas": [],
+    "sequences_in_executed_cohort": 8,
+    "per_dp_input": null,
+    "symmetric_per_dp": true,
+    "complete_layers": 40,
+    "parallel": {
+      "tp": 1,
+      "dp": 8,
+      "ep": 8,
+      "pp": 1,
+      "pcp": 1
+    },
+    "status": "prepared_not_executed"
+  },
+  "effective_input_sha256": "e3742d389cb7e17b8bd3f9443bf6d21154e69a74133929630535836573da128d",
+  "effective_input_serialization": "sorted compact JSON of base + declared global workload and probe metadata",
+  "runtime_before": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "runtime_after": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "runtime_unchanged": true,
+  "status": "completed",
+  "returncode": 0,
+  "elapsed_seconds": 43.27937670808751,
+  "peak_sampled_rss_bytes": 371015680,
+  "progress": [
+    {
+      "event": "graph_constructed",
+      "operators_by_replica": {
+        "0": 2504,
+        "1": 2504,
+        "2": 2504,
+        "3": 2504,
+        "4": 2504,
+        "5": 2504,
+        "6": 2504,
+        "7": 2504
+      }
+    }
+  ],
+  "result": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v41-a5-tp1-dp8-ep8-ctx126000-c8.json",
+    "sha256": "103d0f88ab3228a61d93a74f7bc5343c136cc1081d0274aab7ba2fd852aa4a8d",
+    "size_bytes": 80213
+  },
+  "duration_ms": 12.4403011481165
+}

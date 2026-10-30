@@ -1,0 +1,938 @@
+{
+  "schema": "mindie-longctx-decode-summary/1",
+  "workload": {
+    "prompt_tokens": 126000,
+    "output_tokens": 3000
+  },
+  "contexts": [
+    126000,
+    127500,
+    128999
+  ],
+  "deployments": 11,
+  "prepared_scenarios": 231,
+  "capacity_counts": {
+    "within_declared_capacity": 189,
+    "outside_declared_capacity": 42
+  },
+  "actual_runs": [
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 14.516751749906689,
+      "peak_sampled_rss_bytes": 93175808,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "qwen35-a5-tp4-ep4-ctx126000-c4",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen35-a5-tp4-ep4-ctx126000-c4.receipt.json",
+        "sha256": "75aa21e26181fb5916388ec2b8169bfdcb62d8c5e30c22f89aeabff0166c19e3",
+        "size_bytes": 1946
+      },
+      "body_ms": 12.669513352332046,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 4
+        },
+        "sequences_in_cohort": 4,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 4
+        },
+        "cache_bytes_per_sequence_stage": [
+          1307156480.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 5228625920.0,
+            "cache_capacity_bytes": 82568796121.6,
+            "headroom_bytes": 77340170201.6,
+            "resident_bytes": 15431123392.0,
+            "weights_bytes": 10202087872.0,
+            "workspace_bytes": 409600.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 3190
+      },
+      "physical_work": {
+        "flops": 25685688320.0,
+        "vector_ops": 282671720.0,
+        "hbm_bytes": 7048908480.0,
+        "link_bytes": 4454400.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "a5-arch35-dsq-full-load-normal-smallrows-effective-service-v1",
+          "a5-fullmesh-per-token-int8-e256-w2048-ep4-dispatch-response-v1",
+          "a5-fullmesh-per-token-int8-e256-w2048-ep4-combine-response-v1",
+          "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+          "a5-aiv-tp4-allgather-mesh-observable-service-v1",
+          "q35-complete-9cddff9eb823abb2",
+          "q35-complete-45e7235e7985fe32",
+          "q35-complete-5bb6c667e01a35d4",
+          "q35-complete-437fc486a84634a5",
+          "q35-complete-0be0946dccabe16c",
+          "q35-smallrows-DSQ-complete-native-response",
+          "q35-complete-0171a99515ebfbdc",
+          "q35-complete-6f6b081ccaac9137",
+          "q35-complete-2c32061e2006a7fb",
+          "q35-complete-eda48f3afda1ad70",
+          "q35-complete-f4a72ab45d555036",
+          "q35-complete-0e54bf1668973d48",
+          "q35-c4-complete-source-expert_up",
+          "q35-c4-complete-source-expert_down",
+          "q35-c4-batched-GQA-observed-complete-service",
+          "q35-c4-source-helper-ascend_gdn_decode_gating",
+          "q35-c4-source-helper-decode_q_l2norm",
+          "q35-c4-source-helper-decode_k_l2norm",
+          "q35-c4-source-helper-linear_output_norm_gate",
+          "q35-bf16-shared-22e710051d857fc0",
+          "q35-bf16-shared-698e1358016a9298",
+          "q35-bf16-shared-ec85f0cc9b04032e"
+        ],
+        "unmatched": [
+          "a5-arch35-dsq-full-load-normal-smallrows-effective-service-v1",
+          "q35-bf16-shared-22e710051d857fc0",
+          "q35-bf16-shared-698e1358016a9298",
+          "q35-bf16-shared-ec85f0cc9b04032e",
+          "q35-c4-batched-GQA-observed-complete-service",
+          "q35-c4-complete-source-expert_down",
+          "q35-c4-complete-source-expert_up",
+          "q35-c4-source-helper-ascend_gdn_decode_gating",
+          "q35-c4-source-helper-decode_k_l2norm",
+          "q35-c4-source-helper-decode_q_l2norm",
+          "q35-c4-source-helper-linear_output_norm_gate",
+          "q35-complete-0171a99515ebfbdc",
+          "q35-complete-0be0946dccabe16c",
+          "q35-complete-0e54bf1668973d48",
+          "q35-complete-2c32061e2006a7fb",
+          "q35-complete-437fc486a84634a5",
+          "q35-complete-45e7235e7985fe32",
+          "q35-complete-5bb6c667e01a35d4",
+          "q35-complete-6f6b081ccaac9137",
+          "q35-complete-9cddff9eb823abb2",
+          "q35-complete-eda48f3afda1ad70",
+          "q35-complete-f4a72ab45d555036",
+          "q35-smallrows-DSQ-complete-native-response"
+        ],
+        "unselected": [
+          "a5-aiv-tp4-allgather-mesh-observable-service-v1",
+          "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+          "a5-arch35-dsq-full-load-normal-smallrows-effective-service-v1",
+          "a5-fullmesh-per-token-int8-e256-w2048-ep4-combine-response-v1",
+          "a5-fullmesh-per-token-int8-e256-w2048-ep4-dispatch-response-v1",
+          "q35-bf16-shared-22e710051d857fc0",
+          "q35-bf16-shared-698e1358016a9298",
+          "q35-bf16-shared-ec85f0cc9b04032e",
+          "q35-c4-batched-GQA-observed-complete-service",
+          "q35-c4-complete-source-expert_down",
+          "q35-c4-complete-source-expert_up",
+          "q35-c4-source-helper-ascend_gdn_decode_gating",
+          "q35-c4-source-helper-decode_k_l2norm",
+          "q35-c4-source-helper-decode_q_l2norm",
+          "q35-c4-source-helper-linear_output_norm_gate",
+          "q35-complete-0171a99515ebfbdc",
+          "q35-complete-0be0946dccabe16c",
+          "q35-complete-0e54bf1668973d48",
+          "q35-complete-2c32061e2006a7fb",
+          "q35-complete-437fc486a84634a5",
+          "q35-complete-45e7235e7985fe32",
+          "q35-complete-5bb6c667e01a35d4",
+          "q35-complete-6f6b081ccaac9137",
+          "q35-complete-9cddff9eb823abb2",
+          "q35-complete-eda48f3afda1ad70",
+          "q35-complete-f4a72ab45d555036",
+          "q35-smallrows-DSQ-complete-native-response"
+        ]
+      }
+    },
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 11.592620041919872,
+      "peak_sampled_rss_bytes": 72613888,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "qwen36-a5-tp2-ctx126000-c1",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.receipt.json",
+        "sha256": "0f630472d68aa114ed4d56a78321097aa1f6d982213f245b2b087a43dce138b1",
+        "size_bytes": 1930
+      },
+      "body_ms": 21.732868230535175,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 1
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 1
+        },
+        "cache_bytes_per_sequence_stage": [
+          4208361472.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 4208361472.0,
+            "cache_capacity_bytes": 76345815449.6,
+            "headroom_bytes": 72137453977.6,
+            "resident_bytes": 20633839616.0,
+            "weights_bytes": 16425395200.0,
+            "workspace_bytes": 82944.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 2016
+      },
+      "physical_work": {
+        "flops": 49123360768.0,
+        "vector_ops": 381114720.0,
+        "hbm_bytes": 17283488128.0,
+        "link_bytes": 1310720.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "causalconv1d-physical-4",
+          "recurrentgateddeltarule-physical-4",
+          "hcom_allreduce_-physical-4",
+          "ascend_gdn_decode_gating-observed-complete",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "convolution_input_contiguous-complete-cohort-response",
+          "v_flat-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "swiglu-complete-cohort-response",
+          "dense_down-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "kv_store-complete-cohort-response",
+          "attention_output-complete-cohort-response"
+        ],
+        "unmatched": [
+          "ascend_gdn_decode_gating-observed-complete",
+          "attention_output-complete-cohort-response",
+          "causalconv1d-physical-4",
+          "convolution_input_contiguous-complete-cohort-response",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "dense_down-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "hcom_allreduce_-physical-4",
+          "kv_store-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "recurrentgateddeltarule-physical-4",
+          "swiglu-complete-cohort-response",
+          "v_flat-complete-cohort-response"
+        ],
+        "unselected": [
+          "ascend_gdn_decode_gating-observed-complete",
+          "attention_output-complete-cohort-response",
+          "causalconv1d-physical-4",
+          "convolution_input_contiguous-complete-cohort-response",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "dense_down-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "hcom_allreduce_-physical-4",
+          "kv_store-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "recurrentgateddeltarule-physical-4",
+          "swiglu-complete-cohort-response",
+          "v_flat-complete-cohort-response"
+        ]
+      }
+    },
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 11.595819249982014,
+      "peak_sampled_rss_bytes": 72253440,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "qwen36-a5-tp2-ctx128999-c1",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx128999-c1.receipt.json",
+        "sha256": "ad0d446fa973bb955b1314ee43181a0d505d46a31954c7754736892d635a5b9e",
+        "size_bytes": 1933
+      },
+      "body_ms": 22.105075018415373,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 128999,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 129000,
+        "sequences_by_replica": {
+          "0": 1
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 1
+        },
+        "cache_bytes_per_sequence_stage": [
+          4304830464.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 4304830464.0,
+            "cache_capacity_bytes": 76345815449.6,
+            "headroom_bytes": 72040984985.6,
+            "resident_bytes": 20730308608.0,
+            "weights_bytes": 16425395200.0,
+            "workspace_bytes": 82944.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 2016
+      },
+      "physical_work": {
+        "flops": 49712988160.0,
+        "vector_ops": 383993760.0,
+        "hbm_bytes": 17381759360.0,
+        "link_bytes": 1310720.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "causalconv1d-physical-4",
+          "recurrentgateddeltarule-physical-4",
+          "hcom_allreduce_-physical-4",
+          "ascend_gdn_decode_gating-observed-complete",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "convolution_input_contiguous-complete-cohort-response",
+          "v_flat-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "swiglu-complete-cohort-response",
+          "dense_down-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "kv_store-complete-cohort-response",
+          "attention_output-complete-cohort-response"
+        ],
+        "unmatched": [
+          "ascend_gdn_decode_gating-observed-complete",
+          "attention_output-complete-cohort-response",
+          "causalconv1d-physical-4",
+          "convolution_input_contiguous-complete-cohort-response",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "dense_down-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "hcom_allreduce_-physical-4",
+          "kv_store-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "recurrentgateddeltarule-physical-4",
+          "swiglu-complete-cohort-response",
+          "v_flat-complete-cohort-response"
+        ],
+        "unselected": [
+          "ascend_gdn_decode_gating-observed-complete",
+          "attention_output-complete-cohort-response",
+          "causalconv1d-physical-4",
+          "convolution_input_contiguous-complete-cohort-response",
+          "decode_k_l2norm-observed-complete",
+          "decode_q_l2norm-observed-complete",
+          "dense_down-complete-cohort-response",
+          "dense_gate_up-complete-cohort-response",
+          "hcom_allreduce_-physical-4",
+          "kv_store-complete-cohort-response",
+          "linear_beta_alpha-complete-cohort-response",
+          "linear_output-complete-cohort-response",
+          "linear_output_norm_gate-observed-complete",
+          "linear_qkvz-complete-cohort-response",
+          "qkv_projection-complete-cohort-response",
+          "recurrentgateddeltarule-physical-4",
+          "swiglu-complete-cohort-response",
+          "v_flat-complete-cohort-response"
+        ]
+      }
+    },
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 20.174358333926648,
+      "peak_sampled_rss_bytes": 70778880,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "qwen38-a5-tp4-ctx126000-c4",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen38-a5-tp4-ctx126000-c4.receipt.json",
+        "sha256": "4c360709a267874f292a2b13c7e9c179d2c0c989f1616df48fcc3155a5e36257",
+        "size_bytes": 1928
+      },
+      "body_ms": 22.89299085680515,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 4
+        },
+        "sequences_in_cohort": 4,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 4
+        },
+        "cache_bytes_per_sequence_stage": [
+          2104180736.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 8416722944.0,
+            "cache_capacity_bytes": 82951898777.6,
+            "headroom_bytes": 74535175833.6,
+            "resident_bytes": 18236117760.0,
+            "weights_bytes": 9819167488.0,
+            "workspace_bytes": 227328.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 1840
+      },
+      "physical_work": {
+        "flops": 98246721536.0,
+        "vector_ops": 673343360.0,
+        "hbm_bytes": 16274324480.0,
+        "link_bytes": 7864320.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "frozen-native-matrix-bf16"
+        ],
+        "unmatched": [],
+        "unselected": []
+      }
+    },
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 43.27937670808751,
+      "peak_sampled_rss_bytes": 371015680,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "v41-a5-tp1-dp8-ep8-ctx126000-c8",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v41-a5-tp1-dp8-ep8-ctx126000-c8.receipt.json",
+        "sha256": "a695a1b5454be877e3948a091d4c2ed1bdbf3503a473d52c35aeb1b155941fb0",
+        "size_bytes": 2207
+      },
+      "body_ms": 12.4403011481165,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1,
+          "6": 1,
+          "7": 1
+        },
+        "sequences_in_cohort": 8,
+        "deployment_dp": 8,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 1,
+          "1": 1,
+          "2": 1,
+          "3": 1,
+          "4": 1,
+          "5": 1,
+          "6": 1,
+          "7": 1
+        },
+        "cache_bytes_per_sequence_stage": [
+          144996722.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 4,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 5,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 6,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 7,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 144996722.0,
+            "cache_capacity_bytes": 49517431329.759995,
+            "headroom_bytes": 49372434607.759995,
+            "resident_bytes": 47522027590.0,
+            "weights_bytes": 47376763604.0,
+            "workspace_bytes": 267264.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 2504,
+        "1": 2504,
+        "2": 2504,
+        "3": 2504,
+        "4": 2504,
+        "5": 2504,
+        "6": 2504,
+        "7": 2504
+      },
+      "physical_work": {
+        "flops": 2349487423488.0,
+        "vector_ops": 1524454560.1920881,
+        "hbm_bytes": 98969097472.0,
+        "link_bytes": 32686080.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "retained-service-7257e1b4847ec701",
+          "retained-service-cfb7a0c62bf66df6",
+          "retained-service-cd6d381a19ac7525",
+          "retained-service-59203968cee0a44a",
+          "retained-service-1b15bbba588a4f61",
+          "retained-service-982a20fe01387e22",
+          "retained-service-71df69acf053e4ba",
+          "retained-service-88379fef94a9a51b",
+          "retained-service-62e52c7a678686f3",
+          "retained-service-2039bfd8a18ffead",
+          "retained-service-a6e047064901e6a6",
+          "retained-service-6333c43b3c8b07d0",
+          "retained-service-130643094b147e7f",
+          "retained-service-636ff48daa66bb97",
+          "retained-service-d0ea4f0d7c32f74c",
+          "retained-service-7ede6e36460a581d",
+          "retained-service-783c452b7ab64ee5",
+          "retained-service-3cf5f71229b0ed7c",
+          "retained-service-917bc4190f8adaab",
+          "retained-service-10e5e40a3a11e2c4",
+          "retained-service-53a023f439291ed7",
+          "retained-service-9826e8d5425e0732",
+          "retained-service-7abf72c757a21a48",
+          "retained-service-4aa0d0d7f87d7430",
+          "retained-service-4fce023c772b569b"
+        ],
+        "unmatched": [],
+        "unselected": []
+      }
+    },
+    {
+      "status": "failed",
+      "returncode": 1,
+      "elapsed_seconds": 0.25454429199453443,
+      "peak_sampled_rss_bytes": 294912,
+      "runtime_unchanged": null,
+      "runtime_before": null,
+      "runtime_after": null,
+      "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.receipt.json",
+        "sha256": "c5132448767cffd6cc31c52d86e2928b959b6790756caf0f0a98fcd8f89df196",
+        "size_bytes": 4831
+      },
+      "attempt": "original_source_unpadded_domain",
+      "error": "vice-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 222, in <module>\n    worker(entry, OUT / (entry['id'] + '.json'))\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 145, in worker\n    graphs = target_graphs(case, phase='decode', tokens=entry['query_tokens_per_sequence'],\n                           context=entry['context_tokens'], sequences=entry['sequences_by_replica'],\n                           scope='body')\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 162, in target_graphs\n    r: _target_ops(case, group, scope, global_views=global_views,\n       ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   resource_fusion=resource_fusion, cohort_tokens=padded_cohort,\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   phase=phase, replica=r)\n                   ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 104, in _target_ops\n    ops, _ = frontend.body(case.model, case.runtime, local, ready=\"analysis_input\",\n             ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          tokens=local_tokens, mode=views[0].phase if views else phase,\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          global_tokens=global_tokens, replica=replica)\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/frontend.py\", line 189, in body\n    ffn_ops, previous = self.ffn[layer.ffn](\n                        ~~~~~~~~~~~~~~~~~~~^\n        **{**common, \"tokens\": ffn_tokens},\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        runtime=runtime, sequence_plan=sp,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 717, in moe\n    return MOE_RECIPES[moe_recipe](chunks=mc2_chunks, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 115, in alltoall\n    token_partition = moe_token_partition.select(\n        runtime, parallel=parallel, plan=plan, model=model, tokens=tokens,\n        sequence_plan=sequence_plan, reduce_after_join=reduce_after_join)\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/moe_token_partition.py\", line 222, in select\n    raise ModelingError(\"mc2_tp_slice_requires_positive_tp_divisible_physical_rows\")\nmindie_sim.schema.common.ModelingError: mc2_tp_slice_requires_positive_tp_divisible_physical_rows\n"
+    },
+    {
+      "status": "completed",
+      "returncode": 0,
+      "elapsed_seconds": 2.5980636249296367,
+      "peak_sampled_rss_bytes": 83345408,
+      "runtime_unchanged": true,
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
+      "receipt": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1.receipt.json",
+        "sha256": "682c2e20f31f2ff049169f32a86a872387c203364dabe26e38e83830efd8da8c",
+        "size_bytes": 1950
+      },
+      "body_ms": 21.489631348850494,
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 1
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 1
+        },
+        "cache_bytes_per_sequence_stage": [
+          885144576.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 885144576.0,
+            "cache_capacity_bytes": 24522683658.4,
+            "headroom_bytes": 23637539082.4,
+            "resident_bytes": 38209989980.0,
+            "weights_bytes": 37324624220.0,
+            "workspace_bytes": 221184.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      },
+      "operators_by_replica": {
+        "0": 2969
+      },
+      "physical_work": {
+        "flops": 16117071872.0,
+        "vector_ops": 124825693.01600742,
+        "hbm_bytes": 3332344620.0,
+        "link_bytes": 4161024.0
+      },
+      "source_service_selection": {
+        "declared": [
+          "a3-retained-call-13d2f9a1640e2aa2",
+          "a3-retained-call-be2594aa1f48cfc5",
+          "a3-retained-call-dc22869d5d1aacf5",
+          "a3-retained-call-8d059020c17f3e0d",
+          "a3-retained-call-4e1ce6f5eaf4f3aa",
+          "a3-retained-call-48f3f0ebdcebe1fe",
+          "a3-retained-call-bcdea8ac58ea47ec",
+          "a3-retained-call-58938f284782b403",
+          "a3-retained-call-6733c73744359d0c",
+          "a3-retained-call-a7523594446d20a2"
+        ],
+        "unmatched": [
+          "a3-retained-call-13d2f9a1640e2aa2",
+          "a3-retained-call-48f3f0ebdcebe1fe",
+          "a3-retained-call-4e1ce6f5eaf4f3aa",
+          "a3-retained-call-58938f284782b403",
+          "a3-retained-call-6733c73744359d0c",
+          "a3-retained-call-8d059020c17f3e0d",
+          "a3-retained-call-a7523594446d20a2",
+          "a3-retained-call-bcdea8ac58ea47ec",
+          "a3-retained-call-be2594aa1f48cfc5"
+        ],
+        "unselected": [
+          "a3-retained-call-13d2f9a1640e2aa2",
+          "a3-retained-call-48f3f0ebdcebe1fe",
+          "a3-retained-call-4e1ce6f5eaf4f3aa",
+          "a3-retained-call-58938f284782b403",
+          "a3-retained-call-6733c73744359d0c",
+          "a3-retained-call-8d059020c17f3e0d",
+          "a3-retained-call-a7523594446d20a2",
+          "a3-retained-call-bcdea8ac58ea47ec",
+          "a3-retained-call-be2594aa1f48cfc5"
+        ]
+      }
+    }
+  ],
+  "mutable_source_changes_not_promoted": [
+    {
+      "deployment": "qwen36-a5-tp8",
+      "status": "candidate_declared_not_accepted; frozen input preserved",
+      "frozen_source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
+        "sha256": "163d6f8541d710dec6b3c82637227c70d185ee20b7f953a0fd17435b4aa501fe",
+        "size_bytes": 10182
+      },
+      "current_source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
+        "sha256": "e05a0dd31a516cc41a9c9913ae4592ca827015805197aa61aa36e30328c70370",
+        "size_bytes": 48389
+      },
+      "candidate_hccl": {
+        "allreduce": {
+          "expansion": "AIV",
+          "template": "mesh_twoshot",
+          "axes": [
+            "tp"
+          ],
+          "block_limit": 64
+        }
+      },
+      "candidate_service_regime_count": 17
+    },
+    {
+      "deployment": "qwen38-a5-tp4",
+      "status": "candidate_declared_not_accepted; frozen input preserved",
+      "frozen_source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+        "sha256": "2bace0926d283f461a3b0b126c76fd1a0081df118245f11c40fc1f697e3f45f9",
+        "size_bytes": 5690
+      },
+      "current_source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+        "sha256": "cd73c65d431f1daba48ee96568f90834878067ed02df0d918b8d969be7d72648",
+        "size_bytes": 43864
+      },
+      "candidate_hccl": {
+        "allreduce": {
+          "expansion": "AICPU_TS",
+          "template": "mesh_oneshot",
+          "axes": [
+            "tp"
+          ]
+        }
+      },
+      "candidate_service_regime_count": 16
+    }
+  ],
+  "boundary": "full target-body single-Decode snapshot; no Prefill or Serving replay",
+  "accuracy": "unscored; no same-boundary measurement bound to these scenarios",
+  "unbound": {
+    "v4pro": "no current reconciled Decode base identified"
+  },
+  "limitations": [
+    "Declared capacity is not real allocator admission.",
+    "Full source-derived and empirical service domains remain explicit; unmatched entries do not gain a measurement.",
+    "Prepared scenarios are not completed executions.",
+    "Current probes use q=1; this is not a speculative q=4/6 verification trajectory."
+  ]
+}

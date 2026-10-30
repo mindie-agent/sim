@@ -1,0 +1,64 @@
+{
+  "scenario": {
+    "id": "qwen36-a5-tp2-ctx126000-c1",
+    "deployment": "qwen36-a5-tp2",
+    "input": {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+      "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
+      "size_bytes": 31247
+    },
+    "context_tokens": 126000,
+    "query_tokens_per_sequence": 1,
+    "generated_before": 0,
+    "kv_length": 126001,
+    "global_concurrency": 1,
+    "sequences_by_replica": [
+      1
+    ],
+    "selected_participants": [
+      0
+    ],
+    "unprobed_replicas": [],
+    "sequences_in_executed_cohort": 1,
+    "per_dp_input": null,
+    "symmetric_per_dp": true,
+    "complete_layers": 64,
+    "parallel": {
+      "tp": 2,
+      "dp": 1,
+      "ep": 1,
+      "pp": 1,
+      "pcp": 1
+    },
+    "status": "prepared_not_executed"
+  },
+  "effective_input_sha256": "cb221d10f0d08e42da165522e84e6bc7614c576b72c0b2c2bcb84eadc0c920c3",
+  "effective_input_serialization": "sorted compact JSON of base + declared global workload and probe metadata",
+  "runtime_before": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "runtime_after": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "runtime_unchanged": true,
+  "status": "completed",
+  "returncode": 0,
+  "elapsed_seconds": 11.592620041919872,
+  "peak_sampled_rss_bytes": 72613888,
+  "progress": [
+    {
+      "event": "graph_constructed",
+      "operators_by_replica": {
+        "0": 2016
+      }
+    }
+  ],
+  "result": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.json",
+    "sha256": "b57adfe1b22a12c0915c2fcb665adbb9c15b5ca8109502d4453960128560bfd9",
+    "size_bytes": 15148
+  },
+  "duration_ms": 21.732868230535175
+}

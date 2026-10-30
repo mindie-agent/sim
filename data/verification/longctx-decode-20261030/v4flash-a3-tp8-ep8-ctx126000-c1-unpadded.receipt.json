@@ -1,0 +1,51 @@
+{
+  "scenario": {
+    "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
+    "deployment": "v4flash-a3-tp8-ep8",
+    "input": {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+      "sha256": "01fd4e4109067f3e8b460a0ca1ef1e99221f0be6f81a24c0f8be388f2be48cf9",
+      "size_bytes": 17811
+    },
+    "context_tokens": 126000,
+    "query_tokens_per_sequence": 1,
+    "global_concurrency": 1,
+    "sequences_by_replica": [
+      1
+    ],
+    "per_dp_input": null,
+    "symmetric_per_dp": true,
+    "complete_layers": 43,
+    "parallel": {
+      "tp": 8,
+      "dp": 1,
+      "ep": 8,
+      "pp": 1,
+      "pcp": 1
+    },
+    "status": "prepared_not_executed"
+  },
+  "effective_input": {
+    "path": "/tmp/mindie-longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.case.json",
+    "sha256": "bec5b0ebea96f3d263be2d883a63a7dd9710ced2de452f3ee603c09b3a0d8e42",
+    "size_bytes": 18015
+  },
+  "status": "failed",
+  "returncode": 1,
+  "elapsed_seconds": 0.25454429199453443,
+  "peak_sampled_rss_bytes": 294912,
+  "stdout": {
+    "path": "/tmp/mindie-longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.stdout.log",
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "size_bytes": 0
+  },
+  "stderr": {
+    "path": "/tmp/mindie-longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.stderr.log",
+    "sha256": "08f195f67a234ef8d0ed29678ddc9f574599fb52776ebe850588118c33b26d1a",
+    "size_bytes": 3071
+  },
+  "error_tail": "vice-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 222, in <module>\n    worker(entry, OUT / (entry['id'] + '.json'))\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 145, in worker\n    graphs = target_graphs(case, phase='decode', tokens=entry['query_tokens_per_sequence'],\n                           context=entry['context_tokens'], sequences=entry['sequences_by_replica'],\n                           scope='body')\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 162, in target_graphs\n    r: _target_ops(case, group, scope, global_views=global_views,\n       ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   resource_fusion=resource_fusion, cohort_tokens=padded_cohort,\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   phase=phase, replica=r)\n                   ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 104, in _target_ops\n    ops, _ = frontend.body(case.model, case.runtime, local, ready=\"analysis_input\",\n             ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          tokens=local_tokens, mode=views[0].phase if views else phase,\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          global_tokens=global_tokens, replica=replica)\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/frontend.py\", line 189, in body\n    ffn_ops, previous = self.ffn[layer.ffn](\n                        ~~~~~~~~~~~~~~~~~~~^\n        **{**common, \"tokens\": ffn_tokens},\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        runtime=runtime, sequence_plan=sp,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 717, in moe\n    return MOE_RECIPES[moe_recipe](chunks=mc2_chunks, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 115, in alltoall\n    token_partition = moe_token_partition.select(\n        runtime, parallel=parallel, plan=plan, model=model, tokens=tokens,\n        sequence_plan=sequence_plan, reduce_after_join=reduce_after_join)\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/moe_token_partition.py\", line 222, in select\n    raise ModelingError(\"mc2_tp_slice_requires_positive_tp_divisible_physical_rows\")\nmindie_sim.schema.common.ModelingError: mc2_tp_slice_requires_positive_tp_divisible_physical_rows\n",
+  "attempt": "original_source_unpadded_domain",
+  "runtime_unchanged": null,
+  "runtime_identity_note": "Original structural-failure control preceded package hashing; it is not timing acceptance evidence."
+}
