@@ -1,0 +1,120 @@
+{
+  "schema": "mindie-gqa-occupancy-control/1",
+  "boundary": "complete_target_body_one_explicit_snapshot",
+  "mapping": "analytic target_cores=20 from declared AIC count; not reconstructed captured dispatch",
+  "measurement_role": "no measurements consumed by prediction; no tolerance verdict",
+  "context_basis": "initial prompt condition126976; per-step KV values unavailable",
+  "rows": [
+    {
+      "model": "qwen36",
+      "context": 126976,
+      "q": 4,
+      "batch": 1,
+      "target_cores": 20,
+      "body_ms": 15.67651444284403,
+      "wall_seconds": 3.7563039580127224,
+      "runtime_before": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "runtime_after": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "capacity": "within_declared_capacity",
+      "attention_ms_sum": 2.316392513938749,
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "model": "qwen36",
+      "context": 126976,
+      "q": 4,
+      "batch": 4,
+      "target_cores": 20,
+      "body_ms": 23.94315591440716,
+      "wall_seconds": 9.54796387499664,
+      "runtime_before": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "runtime_after": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "capacity": "within_declared_capacity",
+      "attention_ms_sum": 8.69264166787566,
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "model": "qwen35",
+      "context": 126976,
+      "q": 2,
+      "batch": 1,
+      "target_cores": 20,
+      "body_ms": 8.765317963141626,
+      "wall_seconds": 3.55295420892071,
+      "runtime_before": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "runtime_after": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "capacity": "within_declared_capacity",
+      "attention_ms_sum": 1.3100565212120212,
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "model": "qwen35",
+      "context": 126976,
+      "q": 2,
+      "batch": 4,
+      "target_cores": 20,
+      "body_ms": 14.151805341940845,
+      "wall_seconds": 8.171696875011548,
+      "runtime_before": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "runtime_after": "07a3e718f72fcb3b2a3dee007d3d258317e7b095e239601c1059c9d04c2fd87b",
+      "capacity": "within_declared_capacity",
+      "attention_ms_sum": 5.104316509088427,
+      "live_tasks": 0,
+      "live_programs": 0
+    }
+  ],
+  "isolated_split_control": [
+    {
+      "splits": 1,
+      "duration_us": 2694.078825757513,
+      "wall_seconds": 0.26731058303266764,
+      "work": {
+        "matrix@r0:s0": 0.0115435,
+        "vector@r0:s0": 15237420.0,
+        "memory@r0:s0": 130052096.0,
+        "mte3@r0:s0": 12288.0
+      }
+    },
+    {
+      "splits": 4,
+      "duration_us": 678.5061363636346,
+      "wall_seconds": 0.18894954200368375,
+      "work": {
+        "matrix@r0:s0": 0.0115435,
+        "vector@r0:s0": 15237420.0,
+        "memory@r0:s0": 130052096.0,
+        "mte3@r0:s0": 12288.0
+      }
+    },
+    {
+      "splits": 10,
+      "duration_us": 276.26969696969576,
+      "wall_seconds": 0.1762957499595359,
+      "work": {
+        "matrix@r0:s0": 0.0115435,
+        "vector@r0:s0": 15237420.0,
+        "memory@r0:s0": 130052096.0,
+        "mte3@r0:s0": 12288.0
+      }
+    },
+    {
+      "splits": 20,
+      "duration_us": 144.77453212121227,
+      "wall_seconds": 0.1875515840947628,
+      "work": {
+        "matrix@r0:s0": 0.0115435,
+        "vector@r0:s0": 15237420.0,
+        "memory@r0:s0": 130052096.0,
+        "mte3@r0:s0": 12288.0
+      }
+    }
+  ],
+  "limitations": [
+    "uniform per-query split mapping may underbalance ragged batches and nondivisor query counts",
+    "the64K/128K A3 native caller may select legacy FAI;20launched cores do not prove20splits",
+    "no automatic change to existing defaults or explicit source cases"
+  ]
+}

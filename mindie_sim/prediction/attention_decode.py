@@ -108,18 +108,24 @@ class StagedGQADecode:
     ``(token, query_head_in_group)`` rows in one owner task.  ``kv_splits`` is
     an explicit requested partition count, reduced to real key tiles.
     ``slots`` is the bounded key/value pipeline window.
+    Optional ``target_cores`` increases partitions to fill the declared owner
+    budget after batch/head/query parallelism. It is an analytic mapping;
+    captured dispatch should continue to declare its explicit split count.
     """
 
     key_tile: int = 128
     query_tile: int = 64
     kv_splits: int = 1
     slots: int = 2
+    target_cores: int | None = None
 
     def __post_init__(self):
         _positive_int(self.key_tile, "key_tile")
         _positive_int(self.query_tile, "query_tile")
         _positive_int(self.kv_splits, "kv_splits")
         _positive_int(self.slots, "slots")
+        if self.target_cores is not None:
+            _positive_int(self.target_cores, "target_cores")
 
     def spec(self, op: OpSpec) -> "_Spec":
         return _spec(op, self)
@@ -250,6 +256,14 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
         raise ModelingError("attention_decode_context_parallel_not_selected")
 
     group = heads // kv_heads
+    # A fixed split count is a mapping declaration, not a source selector.
+    # The optional occupancy mapping shares cores between independent query
+    # tiles first, then partitions their KV loops. Short contexts still cap the
+    # split count at real key tiles; partial writes/merges are never removed.
+    query_tasks = kv_heads * sum(_ceil_div(query * group, recipe.query_tile)
+                                for query, _ in requests if query)
+    splits = (max(recipe.kv_splits, _ceil_div(recipe.target_cores, query_tasks))
+              if recipe.target_cores and query_tasks else recipe.kv_splits)
     outputs = []
     for request_index, (query, context) in enumerate(requests):
         if query == 0:
@@ -257,7 +271,7 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
         rows = query * group
         length = context + query
         tile_count = _ceil_div(length, recipe.key_tile)
-        partitions = _split_ranges(tile_count, recipe.kv_splits)
+        partitions = _split_ranges(tile_count, splits)
         for kv_head in range(kv_heads):
             for query_tile, row_start in enumerate(
                     range(0, rows, recipe.query_tile)):
@@ -279,7 +293,7 @@ def _spec(op: OpSpec, recipe: StagedGQADecode) -> _Spec:
                 ))
     return _Spec(
         requests, heads, kv_heads, dim, query_dtype, kv_dtype,
-        recipe.key_tile, recipe.query_tile, recipe.kv_splits, recipe.slots,
+        recipe.key_tile, recipe.query_tile, splits, recipe.slots,
         tuple(outputs),
     )
 
