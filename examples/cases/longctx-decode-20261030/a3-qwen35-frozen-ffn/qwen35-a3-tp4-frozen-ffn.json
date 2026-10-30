@@ -4978,10 +4978,19 @@
           "size_bytes": 652045
         },
         "selected_rule_ids": [
+          "a3-native-gating-2048-short-context",
+          "a3-native-norm-gate-2048",
           "a3-native-count_prefix-2048-short-context",
           "a3-native-gate_up-2048-short-context",
-          "a3-native-expert_down-2048-short-context"
+          "a3-native-expert_down-2048-short-context",
+          "a3-native-expert_add-2048-short-context"
         ],
+        "three_rule_baseline_revision": "c4e91818",
+        "helper_source_contract": {
+          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/helper-source-contract.json",
+          "sha256": "0793a5a7ea6d684b5f9f5069f1fcf74cb1923cf8add4a6d876d781ce771ab1e4",
+          "size_bytes": 20597
+        },
         "parameter_changes": 0,
         "domain_changes": 0,
         "new_target_timings_used_to_fit": false,
@@ -6520,6 +6529,220 @@
           }
         },
         {
+          "id": "a3-native-gating-2048-short-context",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "phase": "decode",
+            "recipe": "ascend_gdn_decode_gating",
+            "local_shape.1": 8
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0",
+              "scale": 1
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 2,
+              "max": 16
+            }
+          },
+          "response": {
+            "fixed_us": 8.810405263157895,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.005417105263157936
+              }
+            ]
+          },
+          "provenance": {
+            "kind": "operator_response_calibration",
+            "training_capture_context": 4096,
+            "validation_capture_context": 16384,
+            "parameter_boundary": "inclusive native kernel duration, not a body residual",
+            "source_rows": [
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c1/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191616294_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "e88837abfb9e2d3d7d0230c33612e29c9174534cd3e4089ffcaefe1fcaa876a5",
+                "line": 2220,
+                "median_us": 8.82,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 2220,
+                "median_us": 8.8,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 6911,
+                "median_us": 8.82,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 2220,
+                "median_us": 8.84,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 9819,
+                "median_us": 8.96,
+                "coordinate": 8
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 127131,
+                "median_us": 8.780000000000001,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 2220,
+                "median_us": 8.821,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 15633,
+                "median_us": 8.861,
+                "coordinate": 16
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 131128,
+                "median_us": 8.83,
+                "coordinate": 4
+              }
+            ],
+            "limitations": [
+              "capture binary not reconstructed",
+              "routing distribution not identified by grouped tensor ABI",
+              "training and validation contexts separated; historical observations not pristine heldout"
+            ]
+          }
+        },
+        {
+          "id": "a3-native-norm-gate-2048",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "phase": "decode",
+            "recipe": "linear_output_norm_gate",
+            "local_shape.1": 128,
+            "metadata.gate_layout.storage_shape.1": 1024,
+            "metadata.caller_implementation": "vllm_ascend_gdn_decode"
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0",
+              "scale": 0.125
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 2,
+              "max": 16
+            }
+          },
+          "response": {
+            "fixed_us": 4.7044999999999995,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0
+              }
+            ]
+          },
+          "provenance": {
+            "kind": "operator_response_calibration",
+            "training_capture_context": 4096,
+            "validation_capture_context": 16384,
+            "parameter_boundary": "inclusive native kernel duration, not a body residual",
+            "source_rows": [
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c1/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191616294_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "e88837abfb9e2d3d7d0230c33612e29c9174534cd3e4089ffcaefe1fcaa876a5",
+                "line": 2225,
+                "median_us": 4.7,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 2225,
+                "median_us": 4.72,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 6916,
+                "median_us": 4.74,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 2225,
+                "median_us": 4.7005,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 9824,
+                "median_us": 4.46,
+                "coordinate": 8
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 127136,
+                "median_us": 4.8,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 2225,
+                "median_us": 4.72,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 15638,
+                "median_us": 4.74,
+                "coordinate": 16
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 131133,
+                "median_us": 4.76,
+                "coordinate": 4
+              }
+            ],
+            "limitations": [
+              "capture binary not reconstructed",
+              "routing distribution not identified by grouped tensor ABI",
+              "training and validation contexts separated; historical observations not pristine heldout"
+            ]
+          }
+        },
+        {
           "id": "a3-native-count_prefix-2048-short-context",
           "match": {
             "hardware": "Ascend910_9362",
@@ -6835,6 +7058,114 @@
                 "line": 131148,
                 "median_us": 50.631,
                 "coordinate": 32
+              }
+            ],
+            "limitations": [
+              "capture binary not reconstructed",
+              "routing distribution not identified by grouped tensor ABI",
+              "training and validation contexts separated; historical observations not pristine heldout"
+            ]
+          }
+        },
+        {
+          "id": "a3-native-expert_add-2048-short-context",
+          "match": {
+            "hardware": "Ascend910_9362",
+            "phase": "decode",
+            "recipe": "expert_add",
+            "dtype": "bf16",
+            "local_shape.1": 2048,
+            "metadata.input_tensor_count": 2
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0",
+              "scale": 1
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 2,
+              "max": 16
+            }
+          },
+          "response": {
+            "fixed_us": 15.951736842105264,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.003769736842105196
+              }
+            ]
+          },
+          "provenance": {
+            "kind": "operator_response_calibration",
+            "training_capture_context": 4096,
+            "validation_capture_context": 16384,
+            "parameter_boundary": "inclusive native kernel duration, not a body residual",
+            "source_rows": [
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c1/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191616294_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "e88837abfb9e2d3d7d0230c33612e29c9174534cd3e4089ffcaefe1fcaa876a5",
+                "line": 2246,
+                "median_us": 16.1,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 2250,
+                "median_us": 16.12,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+                "line": 6938,
+                "median_us": 15.74,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 2249,
+                "median_us": 16.0305,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 9847,
+                "median_us": 16.14,
+                "coordinate": 8
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c4/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191645967_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "480bf96b1ee270ce76def3f39e5eccf5703cce216f55532c2786de2187b0b30b",
+                "line": 127157,
+                "median_us": 15.74,
+                "coordinate": 4
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 2247,
+                "median_us": 16.0705,
+                "coordinate": 2
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 15663,
+                "median_us": 16.04,
+                "coordinate": 16
+              },
+              {
+                "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+                "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+                "line": 131157,
+                "median_us": 15.750499999999999,
+                "coordinate": 4
               }
             ],
             "limitations": [

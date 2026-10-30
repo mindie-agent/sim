@@ -1,0 +1,565 @@
+{
+  "scope": "source_geometry_homology_for_frozen_helper_responses",
+  "sources": {
+    "caller": {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+      "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
+      "size_bytes": 33354,
+      "lines": [
+        [
+          317,
+          340
+        ],
+        [
+          367,
+          374
+        ],
+        [
+          532,
+          536
+        ]
+      ]
+    },
+    "gating": {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/fused_gdn_gating.py.txt",
+      "sha256": "5587bf3440e64eda125899f5de2d1ab609061e2b5336f847af101ada51d81058",
+      "size_bytes": 3011,
+      "lines": [
+        [
+          14,
+          56
+        ],
+        [
+          59,
+          101
+        ]
+      ]
+    },
+    "norm_kernel": {
+      "repository": "/Volumes/data/code/vllm-ascend-pr16544-review-fixes",
+      "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+      "path": "vllm_ascend/ops/triton/layernorm_gated.py",
+      "sha256": "ecdd125ce32f969e1b1c0e4f8b4e84ee8657332cd02cdcc4c72edd2bff13aff2",
+      "size_bytes": 5466,
+      "lines": [
+        [
+          16,
+          103
+        ],
+        [
+          106,
+          168
+        ]
+      ]
+    },
+    "norm_wrapper": {
+      "repository": "/Volumes/data/code/vllm-ascend-pr16544-review-fixes",
+      "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+      "path": "vllm_ascend/ops/layernorm.py",
+      "sha256": "976a2858d11db5ba5de8e8604f3681da00cf7cc5493116cea0c05a4836971ca7",
+      "size_bytes": 7565,
+      "lines": [
+        [
+          157,
+          197
+        ]
+      ]
+    }
+  },
+  "geometry": {
+    "gating": "a,b contiguous [T,8]; wrapper sets seq_len=1 and grid=(40,1), BLK_HEADS=8, BLK_BATCHES=64; no per-request q/context/history argument",
+    "gating_dtype": "BF16 a,b and beta; FP32 g; native beta/g consumer slots corroborate output precision",
+    "norm_gate": "caller reshapes BF16 recurrent output and z to [T*8,128]; one 128-wide group, BLOCK_M=64, grid=(ceil(T*8/64),1); no q/context/history argument",
+    "expert_add": "two BF16 [T,2048] operands and BF16 output, ND, scalar FLOAT, AIV Block40/Mix0"
+  },
+  "limitations": [
+    "Source geometry and native exported fields agree; capture binary identity is unobserved.",
+    "Gating/norm tensor descriptors are N/A; their full typed ABI is source-conditional, not directly exported.",
+    "Old q2 and new q4 recurrent sequence metadata, state capacity, history and checkpoints differ; no recurrent/conv/route_pack response is transferred."
+  ],
+  "new_coefficients": 0,
+  "cases": [
+    {
+      "batch": 1,
+      "tokens": 4,
+      "old_q": 2,
+      "new_q": 4,
+      "same_flat_geometry": true,
+      "gating_grid": [
+        40,
+        1
+      ],
+      "norm_grid": [
+        1,
+        1
+      ],
+      "old_recurrent_consumer": {
+        "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191630521_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "sha256": "f5b281abfe2beb1e8a4b6c8ad9347247b2d6e5a53a42e2429a1f7700a389f513",
+        "native_abi": {
+          "Type": "RecurrentGatedDeltaRule",
+          "Input Shapes": "\"4,4,128;4,4,128;4,8,128;4,8;6443,8,128,128;3;4;4,8;2\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "Input Formats": "ND;ND;ND;ND;ND;ND;ND;ND;ND",
+          "Output Shapes": "\"4,8,128;6443,8,128,128\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "16",
+          "Mix Block Num": "0",
+          "Accelerator Core": "AI_VECTOR_CORE"
+        },
+        "first": {
+          "line": 6914,
+          "type": "RecurrentGatedDeltaRule",
+          "input": "\"4,4,128;4,4,128;4,8,128;4,8;6443,8,128,128;3;4;4,8;2\"",
+          "dtype": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "block": "16"
+        }
+      },
+      "new_recurrent_consumer": {
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+          "size_bytes": 114505902,
+          "mtime_ns": 1793354317000000000,
+          "schema_version": "kernel_details_csv_46col",
+          "sha256": "c43ca21f5aabc8f4e1a0d9e9aa5476c6bea141ff7b2398bc7736d1fa94ab607a"
+        },
+        "native_abi": {
+          "Type": "RecurrentGatedDeltaRule",
+          "Accelerator Core": "AI_VECTOR_CORE",
+          "Input Shapes": "\"4,4,128;4,4,128;4,8,128;4,8;6493,8,128,128;2;4;4,8;1\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "Input Formats": "ND;ND;ND;ND;ND;ND;ND;ND;ND",
+          "Output Shapes": "\"4,8,128;6493,8,128,128\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "8",
+          "Mix Block Num": "0"
+        },
+        "locations": [
+          {
+            "csv_line": 138,
+            "forward_id": "auto:0",
+            "layer": 0,
+            "start_ns": 1793354213143963684,
+            "end_ns": 1793354213143988865,
+            "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+            "Task ID": "15",
+            "Stream ID": "235",
+            "Device_id": "0"
+          },
+          {
+            "csv_line": 181,
+            "forward_id": "auto:0",
+            "layer": 1,
+            "start_ns": 1793354213144394501,
+            "end_ns": 1793354213144418382,
+            "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+            "Task ID": "66",
+            "Stream ID": "235",
+            "Device_id": "0"
+          }
+        ]
+      },
+      "helper_checks": [
+        {
+          "op": "gating",
+          "old_rows": 6,
+          "native_abi": {
+            "Type": "fused_gdn_gating_kernel",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "N/A",
+            "Input Data Types": "N/A",
+            "Input Formats": "N/A",
+            "Output Shapes": "N/A",
+            "Output Data Types": "N/A",
+            "Output Formats": "N/A",
+            "Block Num": "40",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 40,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191735232_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "90afd6a4dd8b77d7e9dc0b794dd782e7f810e507f7c0b9dead69ba300c0f52b4",
+            "first": {
+              "line": 12885,
+              "type": "fused_gdn_gating_kernel",
+              "input": "N/A",
+              "dtype": "N/A",
+              "block": "40"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 135,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354213143949903,
+              "end_ns": 1793354213143959603,
+              "Name": "fused_gdn_gating_kernel",
+              "Task ID": "12",
+              "Stream ID": "235",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 178,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354213144381420,
+              "end_ns": 1793354213144390501,
+              "Name": "fused_gdn_gating_kernel",
+              "Task ID": "63",
+              "Stream ID": "235",
+              "Device_id": "0"
+            }
+          ]
+        },
+        {
+          "op": "norm_gate",
+          "old_rows": 6,
+          "native_abi": {
+            "Type": "_layer_norm_fwd_1pass_kernel_npu",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "N/A",
+            "Input Data Types": "N/A",
+            "Input Formats": "N/A",
+            "Output Shapes": "N/A",
+            "Output Data Types": "N/A",
+            "Output Formats": "N/A",
+            "Block Num": "1",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 1,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191735232_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "90afd6a4dd8b77d7e9dc0b794dd782e7f810e507f7c0b9dead69ba300c0f52b4",
+            "first": {
+              "line": 12890,
+              "type": "_layer_norm_fwd_1pass_kernel_npu",
+              "input": "N/A",
+              "dtype": "N/A",
+              "block": "1"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 140,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354213143992545,
+              "end_ns": 1793354213143997525,
+              "Name": "_layer_norm_fwd_1pass_kernel_npu",
+              "Task ID": "20",
+              "Stream ID": "235",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 183,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354213144422142,
+              "end_ns": 1793354213144427062,
+              "Name": "_layer_norm_fwd_1pass_kernel_npu",
+              "Task ID": "71",
+              "Stream ID": "235",
+              "Device_id": "0"
+            }
+          ]
+        },
+        {
+          "op": "expert_add",
+          "old_rows": 6,
+          "native_abi": {
+            "Type": "ForeachAddList",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "\"4,2048;4,2048;\"",
+            "Input Data Types": "DT_BF16;DT_BF16;FLOAT",
+            "Input Formats": "ND;ND;ND",
+            "Output Shapes": "\"4,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "40",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 40,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c2/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191735232_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "90afd6a4dd8b77d7e9dc0b794dd782e7f810e507f7c0b9dead69ba300c0f52b4",
+            "first": {
+              "line": 12912,
+              "type": "ForeachAddList",
+              "input": "\"4,2048;4,2048;\"",
+              "dtype": "DT_BF16;DT_BF16;FLOAT",
+              "block": "40"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 162,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354213144259075,
+              "end_ns": 1793354213144274296,
+              "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+              "Task ID": "47",
+              "Stream ID": "235",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 205,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354213144716594,
+              "end_ns": 1793354213144731194,
+              "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+              "Task ID": "98",
+              "Stream ID": "235",
+              "Device_id": "0"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "batch": 4,
+      "tokens": 16,
+      "old_q": 2,
+      "new_q": 4,
+      "same_flat_geometry": true,
+      "gating_grid": [
+        40,
+        1
+      ],
+      "norm_grid": [
+        2,
+        1
+      ],
+      "old_recurrent_consumer": {
+        "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_4096_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023191701965_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "sha256": "208c837e295b53df204238ddcc2adf6256e912c4f9f3e36f997b1bf527e8e5b9",
+        "native_abi": {
+          "Type": "RecurrentGatedDeltaRule",
+          "Input Shapes": "\"16,4,128;16,4,128;16,8,128;16,8;6443,8,128,128;9;16;16,8;8\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "Input Formats": "ND;ND;ND;ND;ND;ND;ND;ND;ND",
+          "Output Shapes": "\"16,8,128;6443,8,128,128\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "40",
+          "Mix Block Num": "0",
+          "Accelerator Core": "AI_VECTOR_CORE"
+        },
+        "first": {
+          "line": 15636,
+          "type": "RecurrentGatedDeltaRule",
+          "input": "\"16,4,128;16,4,128;16,8,128;16,8;6443,8,128,128;9;16;16,8;8\"",
+          "dtype": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "block": "40"
+        }
+      },
+      "new_recurrent_consumer": {
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+          "size_bytes": 95696128,
+          "mtime_ns": 1793354545000000000,
+          "schema_version": "kernel_details_csv_46col",
+          "sha256": "af27e304a2059bb15def5ad8830663a0bf5fb4923971f0909ee40239d92e95e3"
+        },
+        "native_abi": {
+          "Type": "RecurrentGatedDeltaRule",
+          "Accelerator Core": "AI_VECTOR_CORE",
+          "Input Shapes": "\"16,4,128;16,4,128;16,8,128;16,8;6493,8,128,128;5;16;16,8;4\"",
+          "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;DT_BF16;FLOAT;INT32;INT32;FLOAT;INT32",
+          "Input Formats": "ND;ND;ND;ND;ND;ND;ND;ND;ND",
+          "Output Shapes": "\"16,8,128;6493,8,128,128\"",
+          "Output Data Types": "DT_BF16;FLOAT",
+          "Output Formats": "ND;ND",
+          "Block Num": "32",
+          "Mix Block Num": "0"
+        },
+        "locations": [
+          {
+            "csv_line": 142,
+            "forward_id": "auto:0",
+            "layer": 0,
+            "start_ns": 1793354447073173205,
+            "end_ns": 1793354447073203886,
+            "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+            "Task ID": "16",
+            "Stream ID": "165",
+            "Device_id": "0"
+          },
+          {
+            "csv_line": 187,
+            "forward_id": "auto:0",
+            "layer": 1,
+            "start_ns": 1793354447073744968,
+            "end_ns": 1793354447073774649,
+            "Name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+            "Task ID": "68",
+            "Stream ID": "165",
+            "Device_id": "0"
+          }
+        ]
+      },
+      "helper_checks": [
+        {
+          "op": "gating",
+          "old_rows": 2,
+          "native_abi": {
+            "Type": "fused_gdn_gating_kernel",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "N/A",
+            "Input Data Types": "N/A",
+            "Input Formats": "N/A",
+            "Output Shapes": "N/A",
+            "Output Data Types": "N/A",
+            "Output Formats": "N/A",
+            "Block Num": "40",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 40,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023193606890_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "8080c0b8f6c3f84b7df5ae357b26f0ad4efa5b7e8d2151404f23d623aacdedca",
+            "first": {
+              "line": 47780,
+              "type": "fused_gdn_gating_kernel",
+              "input": "N/A",
+              "dtype": "N/A",
+              "block": "40"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 139,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354447073159104,
+              "end_ns": 1793354447073169025,
+              "Name": "fused_gdn_gating_kernel",
+              "Task ID": "13",
+              "Stream ID": "165",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 184,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354447073731387,
+              "end_ns": 1793354447073740708,
+              "Name": "fused_gdn_gating_kernel",
+              "Task ID": "65",
+              "Stream ID": "165",
+              "Device_id": "0"
+            }
+          ]
+        },
+        {
+          "op": "norm_gate",
+          "old_rows": 2,
+          "native_abi": {
+            "Type": "_layer_norm_fwd_1pass_kernel_npu",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "N/A",
+            "Input Data Types": "N/A",
+            "Input Formats": "N/A",
+            "Output Shapes": "N/A",
+            "Output Data Types": "N/A",
+            "Output Formats": "N/A",
+            "Block Num": "2",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 2,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023193606890_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "8080c0b8f6c3f84b7df5ae357b26f0ad4efa5b7e8d2151404f23d623aacdedca",
+            "first": {
+              "line": 47785,
+              "type": "_layer_norm_fwd_1pass_kernel_npu",
+              "input": "N/A",
+              "dtype": "N/A",
+              "block": "2"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 144,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354447073207946,
+              "end_ns": 1793354447073212907,
+              "Name": "_layer_norm_fwd_1pass_kernel_npu",
+              "Task ID": "21",
+              "Stream ID": "165",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 189,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354447073778869,
+              "end_ns": 1793354447073783889,
+              "Name": "_layer_norm_fwd_1pass_kernel_npu",
+              "Task ID": "73",
+              "Stream ID": "165",
+              "Device_id": "0"
+            }
+          ]
+        },
+        {
+          "op": "expert_add",
+          "old_rows": 2,
+          "native_abi": {
+            "Type": "ForeachAddList",
+            "Accelerator Core": "AI_VECTOR_CORE",
+            "Input Shapes": "\"16,2048;16,2048;\"",
+            "Input Data Types": "DT_BF16;DT_BF16;FLOAT",
+            "Input Formats": "ND;ND;ND",
+            "Output Shapes": "\"16,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "40",
+            "Mix Block Num": "0"
+          },
+          "expected_source_blocks": 40,
+          "old_source": {
+            "capture": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-gdn/prof/p_16384_c8/dp0_pp0_tp0_dcp0_ep0_rank0_351_20261023193606890_ascend_pt/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+            "sha256": "8080c0b8f6c3f84b7df5ae357b26f0ad4efa5b7e8d2151404f23d623aacdedca",
+            "first": {
+              "line": 47807,
+              "type": "ForeachAddList",
+              "input": "\"16,2048;16,2048;\"",
+              "dtype": "DT_BF16;DT_BF16;FLOAT",
+              "block": "40"
+            }
+          },
+          "new_locations": [
+            {
+              "csv_line": 168,
+              "forward_id": "auto:0",
+              "layer": 0,
+              "start_ns": 1793354447073622183,
+              "end_ns": 1793354447073639184,
+              "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+              "Task ID": "48",
+              "Stream ID": "165",
+              "Device_id": "0"
+            },
+            {
+              "csv_line": 213,
+              "forward_id": "auto:0",
+              "layer": 1,
+              "start_ns": 1793354447074099002,
+              "end_ns": 1793354447074113523,
+              "Name": "aclnnForeachAddListV2_ForeachAddListV2_ForeachAddList",
+              "Task ID": "100",
+              "Stream ID": "165",
+              "Device_id": "0"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

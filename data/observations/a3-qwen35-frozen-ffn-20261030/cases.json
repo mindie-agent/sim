@@ -13,8 +13,8 @@
       },
       "model_case": {
         "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
-        "sha256": "b8db2f738d668d23065157e8ac181d15a7853e37a0cd9fd9665338e412cd7414",
-        "size_bytes": 235753
+        "sha256": "f23cce762277afba26941171c71cf1c33d264d18903b5b2fad9add30c8d33036",
+        "size_bytes": 252029
       },
       "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
       "supported_scopes": [
@@ -135,8 +135,8 @@
       },
       "model_case": {
         "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
-        "sha256": "b8db2f738d668d23065157e8ac181d15a7853e37a0cd9fd9665338e412cd7414",
-        "size_bytes": 235753
+        "sha256": "f23cce762277afba26941171c71cf1c33d264d18903b5b2fad9add30c8d33036",
+        "size_bytes": 252029
       },
       "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
       "supported_scopes": [

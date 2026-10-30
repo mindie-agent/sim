@@ -1,6 +1,6 @@
-"""Transfer three existing A3 FFN responses after exact native ABI checks.
+"""Transfer six frozen A3 responses after native ABI and caller checks.
 
-[Role] Bind count-prefix, fused gate/up and expert-down to independent q4 inputs.
+[Role] Bind FFN and three caller helpers to independent q4 inputs.
 [Invariants] Copy old responses and domains unchanged; no target latency fit.
   Shared BF16, TP join reduction and FAI declarations remain the pinned source.
 [Timeouts & Locks] Serial Body predictions each have a 90-second budget.
@@ -22,14 +22,21 @@ ROOT=Path(__file__).resolve().parents[3]
 HERE=Path(__file__).resolve().parent
 sys.path.insert(0,str(ROOT))
 from mindie_sim import predict, target_graphs
+from helper_contract import helper_contract
 
 BASE_REVISION='1c5939cd'
+THREE_RULE_REVISION='c4e91818'
 BASE_PATH='examples/cases/longctx-decode-20261030/a3-fai-regular/a3-qwen35-tp4-long-context-source.json'
 PARAMETERS=ROOT/'data/observations/parameters/a3-native-decode-20261030/parameters.json'
 OLD_EVIDENCE=PARAMETERS.with_name('operator-evidence.json')
 OUTPUT=ROOT/'examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json'
-RECIPES={'count_prefix':'expert_group_list_cumsum','gate_up':'declared_native_fusion','expert_down':'balanced_grouped_down'}
-NATIVE={'count_prefix':'Cumsum','gate_up':'GroupedMatmulSwigluQuant','expert_down':'GroupedMatmul'}
+RECIPES={'count_prefix':'expert_group_list_cumsum','gate_up':'declared_native_fusion','expert_down':'balanced_grouped_down',
+         'expert_add':'expert_add','gating':'ascend_gdn_decode_gating','norm_gate':'linear_output_norm_gate'}
+NATIVE={'count_prefix':'Cumsum','gate_up':'GroupedMatmulSwigluQuant','expert_down':'GroupedMatmul',
+        'expert_add':'ForeachAddList','gating':'fused_gdn_gating_kernel','norm_gate':'_layer_norm_fwd_1pass_kernel_npu'}
+RULE_IDS={'a3-native-count_prefix-2048-short-context','a3-native-gate_up-2048-short-context',
+          'a3-native-expert_down-2048-short-context','a3-native-expert_add-2048-short-context',
+          'a3-native-gating-2048-short-context','a3-native-norm-gate-2048'}
 
 
 def identity(path):
@@ -54,9 +61,12 @@ def main():
     original_bytes=subprocess.check_output(['git','show',f'{BASE_REVISION}:{BASE_PATH}'],cwd=ROOT,timeout=15)
     raw=json.loads(original_bytes)
     old_records=json.loads(OLD_EVIDENCE.read_text())['records']
-    rules=[r for r in json.loads(PARAMETERS.read_text())['service_regimes']
-           if r['match'].get('recipe') in RECIPES.values()]
-    assert len(rules)==3
+    rules=[r for r in json.loads(PARAMETERS.read_text())['service_regimes'] if r['id'] in RULE_IDS]
+    assert len(rules)==6
+    baseline=json.loads(subprocess.check_output(['git','show',
+        f'{THREE_RULE_REVISION}:data/observations/a3-qwen35-frozen-ffn-20261030/validation.json'],cwd=ROOT,timeout=15))
+    contract=helper_contract(ROOT,HERE,old_records)
+    save(HERE/'helper-source-contract.json',contract)
     assert raw['runtime']['moe_recipe']=='tp_join_reduce'
     quant=dict(raw['model']['quant']['category_overrides'])
     assert dict(quant['shared_expert'])=={'weight_format':'bf16','activation_format':'bf16'}
@@ -71,17 +81,20 @@ def main():
         'base_case_sha256':sha256(original_bytes).hexdigest(),
         'parameter_identity':identity(PARAMETERS),'operator_evidence_identity':identity(OLD_EVIDENCE),
         'selected_rule_ids':[r['id'] for r in rules],
+        'three_rule_baseline_revision':THREE_RULE_REVISION,
+        'helper_source_contract':identity(HERE/'helper-source-contract.json'),
         'parameter_changes':0,'domain_changes':0,'new_target_timings_used_to_fit':False,
         'evaluation_relation':'new_q4_128K_captures_not_used_to_assign_old_4K_responses; previously_inspected_not_blind',
         'count_prefix_contract':'native descriptor N/A; 256 INT64 entries inferred from fused consumer ABI and pinned count-to-prefix caller',
         'captured_binary_identity':'unobserved','routing_values':'not_exported; declared force-EPLB realization remains conditional'}
     raw['runtime']['metadata']['ffn_source_contract']['grouped_execution']='declared fused gate/up/activation/quant, explicit count-prefix producer and unchanged old exact-domain native responses; captured binary unobserved'
     save(OUTPUT,raw)
-    report={'scope':'frozen_A3_FFN_response_transfer_to_new_q4_Bodies',
+    report={'scope':'frozen_A3_FFN_and_helper_response_transfer_to_new_q4_Bodies',
         'runtime_revision':subprocess.check_output(['git','rev-parse','HEAD'],cwd=ROOT,text=True,timeout=15).strip(),
         'base_revision':BASE_REVISION,'base_case_sha256':sha256(original_bytes).hexdigest(),
         'candidate_case':identity(OUTPUT),'parameters':identity(PARAMETERS),'old_operator_evidence':identity(OLD_EVIDENCE),
         'response_rules_copied_verbatim':rules,'new_coefficients':0,'domain_changes':0,
+        'three_rule_baseline_revision':THREE_RULE_REVISION,'helper_source_contract':identity(HERE/'helper-source-contract.json'),
         'boundary':'whole target Body; native activity diagnostics are not a wall-span correction',
         'cases':[]}
     manifest={'schema_version':'mindie-cases/1','cases':[],
@@ -94,20 +107,35 @@ def main():
         comparisons=[]
         for op,kind in NATIVE.items():
             observed,=[g for g in ledger['native_groups'] if g['abi']['Type']==kind]
-            assert observed['calls_per_body']==40
-            candidates=[r for r in old_records if r['op']==op and r['coordinate']==(256 if op=='count_prefix' else rows)]
+            expected_calls=30 if op in ('gating','norm_gate') else 40
+            assert observed['calls_per_body']==expected_calls
+            coordinate=256 if op=='count_prefix' else batch*4 if op in ('expert_add','gating','norm_gate') else rows
+            candidates=[r for r in old_records if r['op']==op and r['width']==2048 and r['coordinate']==coordinate]
             matched=[r for r in candidates if r['native_abi']==observed['abi']]
             assert matched,(batch,op)
             rule=next(r for r in rules if r['match']['recipe']==RECIPES[op])
-            coordinate=256 if op=='count_prefix' else rows
             response=rule['response']['fixed_us']+sum(t['us_per_unit']*coordinate for t in rule['response']['terms'])
             comparisons.append({'op':op,'native_abi':observed['abi'],'observed_mean_us':observed['mean_us'],
                 'frozen_response_us':response,'observed_calls_per_body':observed['calls_per_body'],
                 'matching_old_records':len(matched),'representative_old_source':{k:matched[0][k] for k in ['capture','sha256','split','coordinate','first','consumer_abi']},
-                'new_locators':observed['locators'],'all_physical_ABI_fields_equal':True})
+                'new_locators':observed['locators'],'all_exported_native_ABI_fields_equal':True,
+                'tensor_geometry_basis':'conditional_source_and_recurrent_ABI' if op in ('gating','norm_gate') else
+                    'conditional_source_and_fused_consumer_ABI' if op=='count_prefix' else 'fully_typed_native_ABI',
+                'relative_operator_error':response/observed['mean_us']-1})
         ops=target_graphs(raw,scope='body',phase='decode',tokens=4,context=126000,sequences=batch)[0]
         selected={recipe:[o for o in ops if o.recipe==recipe] for recipe in RECIPES.values()}
-        assert all(len(v)==40 for v in selected.values())
+        assert all(len(v)==(30 if k in ('ascend_gdn_decode_gating','linear_output_norm_gate') else 40) for k,v in selected.items())
+        for op in selected['ascend_gdn_decode_gating']:
+            assert op.local_shape==(batch*4,8) and op.dtype=='bf16'
+            assert dict(op.metadata)['caller_implementation']=='vllm_ascend_gdn_decode'
+        for op in selected['linear_output_norm_gate']:
+            meta=dict(op.metadata)
+            assert op.local_shape==(batch*4*8,128) and op.dtype=='bf16'
+            assert meta['caller_implementation']=='vllm_ascend_gdn_decode'
+            assert meta['gate_layout']['storage_shape']==(batch*4,1024)
+        for op in selected['expert_add']:
+            assert op.local_shape==(batch*4,2048) and op.dtype=='bf16'
+            assert dict(op.metadata)['input_tensor_count']==2
         for fused in selected['declared_native_fusion']:
             assert fused.local_shape==(rows,128)
             prefix=next(o for o in selected['expert_group_list_cumsum'] if o.layer==fused.layer)
@@ -134,6 +162,8 @@ def main():
             'source':ledger['source_identity'],'ledger':identity(ledger_path),'abi_comparisons':comparisons,
             'source_graph_count':{k:len(v) for k,v in selected.items()},
             'shared_precision_and_TP_join_unchanged':True,'prior_ee3_body':ledger['body_observed_ms'],
+            'three_rule_baseline':{k:v for k,v in next(r for r in baseline['cases'] if r['batch']==batch)['after'].items()
+                                   if k not in ('execution','service_regimes')},
             'after':body}
         report['cases'].append(row)
         entry=deepcopy(next(r for r in original_manifest['cases'] if r['source']['sha256']==ledger['source_identity']['sha256']))
