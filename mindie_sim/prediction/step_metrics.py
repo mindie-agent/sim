@@ -51,9 +51,14 @@ class StepSummary:
         self.total.record(step)
         key = step.mode, step.replay_scope, step.graph_bucket
         self.groups.setdefault(key, StepTotals()).record(step)
+        seen = set()
         for decision in step.implementation_selections:
-            key = decision["selector"], decision["case"], decision["implementation"], decision["coverage"]
-            self.selections[key] = self.selections.get(key, 0) + 1
+            key = (decision["selector"], decision["case"], decision["implementation"],
+                   decision["coverage"], decision["model_scope"])
+            counts = self.selections.setdefault(key, [0, 0])
+            counts[0] += key not in seen
+            counts[1] += 1
+            seen.add(key)
 
     def to_dict(self):
         return {"unit": "replica_microbatch", "total": self.total.to_dict(),
@@ -64,6 +69,8 @@ class StepSummary:
                 "device_duration_boundary": "scheduled_release_to_all_device_ops_complete",
                 "implementation_selections": [
                     {"selector": selector, "case": case, "implementation": implementation,
-                     "coverage": coverage, "steps": count}
-                    for (selector, case, implementation, coverage), count in self.selections.items()],
+                     "coverage": coverage, "model_scope": model_scope,
+                     "steps": counts[0], "calls": counts[1]}
+                    for (selector, case, implementation, coverage, model_scope), counts
+                    in self.selections.items()],
                 "sum_semantics": "overlapping_step_durations_are_additive_not_makespan"}

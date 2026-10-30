@@ -25,9 +25,9 @@ from .feedforward import FFN_BUILDERS, RoutingPolicy
 from .graph import GraphPolicy
 from .routing_realizations import select_realization
 from .structure import normalize_model, stage_map
-from .transforms import lower_implementations
 from . import family_attnres, sequence_parallel
-from .implementation_selection import resolve as resolve_implementations, annotate
+from .implementation_selection import (resolve as resolve_implementations, LoweringRegion,
+                                       lower_regions)
 
 
 def _scope(ops, block, role="body"):
@@ -349,6 +349,7 @@ class Frontend:
         valid = sum(view.q_len for view in views)
         bucket, scope = self.graph.select(views, runtime) if views else (None, "none")
         padded = max(valid, bucket or 0)
+        declared_runtime = runtime
         runtime, selections = resolve_implementations(
             runtime, views, padded_tokens=padded, replay_scope=scope,
             global_views=global_views)
@@ -358,13 +359,13 @@ class Frontend:
             op_id="iteration_input", deps=(), stage=0, layer=-1, requests=requests, phase=mode,
             recipe="input_ready", shape=(valid, model.hidden_size),
         )
-        ops.append(entry)
         previous = entry.op_id
+        before, after = [], []
         if any(view.draft_proposal_tokens for view in (global_views or plan.requests)):
             from .speculation import draft_program
-            draft_ops, previous = draft_program(self, model, runtime, plan.requests, previous,
-                                                global_views=global_views, replica=replica)
-            ops.extend(draft_ops)
+            before, previous = draft_program(
+                self, model, declared_runtime, plan.requests, previous,
+                global_views=global_views, replica=replica, replay_scope=scope)
         media_counts = {str(request): int(count) for request, count in
                         _media_counts(runtime).items()}
         for index, view in enumerate(views):
@@ -437,19 +438,17 @@ class Frontend:
         if dict(runtime.metadata).get("draft_mode") and (
                 preparation_views or global_views and global_preparation):
             from .speculation import draft_program
-            preparation, _ = draft_program(
-                self, model, runtime, preparation_views, committed.op_id,
+            after, _ = draft_program(
+                self, model, declared_runtime, preparation_views, committed.op_id,
                 global_views=global_preparation if global_views else None, prefill=True,
-                replica=replica)
-            ops.extend(preparation)
-        ops = self.graph.apply(lower_implementations(
-            ops, runtime, model.activation_dtype, resource_fusion=False,
-            local_tokens=local_tokens), scope, runtime)
-        if resource_fusion:
-            from .native_fusion import lower_native_fusions
-            ops = lower_native_fusions(ops, runtime, local_tokens=local_tokens)
+                replica=replica, replay_scope=scope)
+        regions = (*before, LoweringRegion(tuple(ops), runtime, model.activation_dtype,
+                                          local_tokens, selections), *after)
+        ops, selections = lower_regions(
+            regions, graph=self.graph, replay_scope=scope, runtime=runtime,
+            prefix=(entry,), resource_fusion=resource_fusion)
         return IterationWork(
-            ops=annotate(ops, selections),
+            ops=ops,
             plan=plan, stage_count=runtime.parallel.pp,
             valid_tokens=valid, padded_tokens=padded, graph_bucket=bucket, mode=mode,
             recipe="structural", replay_scope=scope,

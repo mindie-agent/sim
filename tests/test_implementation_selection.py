@@ -168,3 +168,73 @@ def test_optional_prepared_weights_stay_resident_when_mixed_calls_select_analyti
     assert any(op.recipe == CONV for op in decode.ops)
     assert any(op.recipe == "mla_query_pad_nope" for op in decode.ops)
     assert stage_weight_bytes(parsed.model, parsed.runtime.parallel) == resident
+
+
+def test_draft_calls_select_their_own_phase_and_q1_geometry_before_target_verification():
+    from test_draft_and_media import draft_case
+
+    parsed = draft_case()
+    parsed = replace(parsed, machine=parse_case(declared_case()).machine)
+    native = "vllm_cuda_rms_norm"
+    selection = {"cases": [
+        {"domain": {"model_scopes": ["target"], "phases": ["prefill"]},
+         "binding": native},
+        {"domain": {"model_scopes": ["draft"], "phases": ["decode"],
+                    "max_query_tokens": {"max": 1}}, "binding": native}],
+        "otherwise": "analytical"}
+    parsed = replace(parsed, runtime=replace(parsed.runtime,
+        kernels={"lowerings": {"rmsnorm": selection}}))
+    view = RequestView("r", 1, 4, True, "decode", draft_proposal_tokens=2)
+    work = Frontend()(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)
+    target, = [record for record in work.implementation_selections
+               if record["model_scope"] == "target"]
+    drafts = [record for record in work.implementation_selections
+              if record["model_scope"] == "draft"]
+    assert target["implementation"] == "analytical"
+    assert target["geometry"]["max_query_tokens"] == 3
+    assert len(drafts) == 2 and all(record["case"] == 1 for record in drafts)
+    assert [record["geometry"]["max_context_tokens"] for record in drafts] == [4, 5]
+    assert all(record["geometry"]["max_query_tokens"] == 1 for record in drafts)
+    selected = [op for op in work.ops if op.recipe.startswith("cuda_norm.")]
+    assert selected and all(op.phase == "draft" for op in selected)
+    result = predict(parsed, trace_limit=0, event_limit=0)
+    decisions = result["execution"]["step_summary"]["implementation_selections"]
+    assert {(row["model_scope"], row["case"]) for row in decisions} == {
+        ("target", 0), ("target", "otherwise"), ("draft", 1), ("draft", "otherwise")}
+    draft_decodes, = [row for row in decisions if row["model_scope"] == "draft" and row["case"] == 1]
+    assert draft_decodes["calls"] > draft_decodes["steps"]
+    assert result["requests"][0]["generated_tokens"] == 6
+    assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
+
+
+def test_target_mxfp8_routing_does_not_rewrite_explicit_analytical_bf16_draft():
+    from test_moe_init_mxfp8 import case as glm_case
+    from mindie_sim.prediction.moe_init_mxfp8 import RECIPE
+
+    parsed = parse_case(glm_case(16))
+    # Keep the real target MoE and draft quantization contracts while limiting
+    # this graph-only test to the first target MoE layer and its predecessors.
+    parsed = replace(parsed, model=replace(parsed.model, layers=4, body_layers=4,
+                                           layer_plans=parsed.model.layer_plans[:4]),
+                     runtime=replace(parsed.runtime, pp_layer_partition=(4,)))
+    view = RequestView("r", 4, 0, True, "prefill", draft_prepare=True)
+    with pytest.raises(ModelingError, match="moe_init_mxfp8_requires_complete_BF16_to_E4M3"):
+        Frontend()(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)
+    kernels = {**parsed.runtime.kernels, "lowerings": {"moe_init_routing": policy(
+        RECIPE, {"model_scopes": ["target"]}, otherwise="analytical")}}
+    parsed = replace(parsed, runtime=replace(parsed.runtime, kernels=kernels))
+    work = Frontend()(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)
+    native = [op for op in work.ops if op.recipe == RECIPE]
+    assert len(native) == 1 and native[0].phase == "prefill"
+    draft = [op for op in work.ops if op.recipe in {"grouped_gate_up", "balanced_grouped_gate_up"}
+             and op.phase == "draft_prefill"]
+    assert len(draft) == 1 and dict(draft[0].metadata)["activation_format"] == "bf16"
+    assert draft[0].local_shape[0] == 4 * parsed.model.auxiliary.mtp.top_k
+    probe = target_graphs(parsed, phase="prefill", tokens=4, scope="model", draft_prepare=True)[0]
+    assert {(record["model_scope"], record["implementation"])
+            for record in graph_selections(probe)} == {("target", RECIPE), ("draft", "analytical")}
+    # Once the caller explicitly selects the native source for draft, its ABI
+    # mismatch remains an error rather than choosing the analytical branch.
+    kernels["lowerings"]["moe_init_routing"]["otherwise"] = RECIPE
+    with pytest.raises(ModelingError, match="moe_init_mxfp8_requires_complete_BF16_to_E4M3"):
+        Frontend()(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)

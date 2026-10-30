@@ -14,10 +14,11 @@ from mindie_sim.catalog.draft import optional_draft_spec, draft_quant
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op
 from mindie_sim.schema.model import LayerPlan
 from .structure import stage_map
+from .implementation_selection import resolve, LoweringRegion
 
 
 def draft_program(frontend, model, runtime, views, ready, *, global_views=None, prefill=False,
-                  replica=0):
+                  replica=0, replay_scope="none"):
     kind = dict(runtime.metadata).get("draft_mode", "mtp")
     draft = optional_draft_spec(model, kind)
     selected_view = lambda view: view.phase == "prefill" if prefill else bool(view.draft_proposal_tokens)
@@ -53,20 +54,29 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         quant=draft_quant(model, draft), activation_dtype=draft.activation_dtype,
         compute_dtype=draft.activation_dtype,
     )
-    ops, previous = [], ready
+    regions, previous = [], ready
     stage = runtime.parallel.pp - 1
     # Feature projection shards its output; the draft body consumes a complete
     # hidden vector, so TP must gather before entering the first layer.
     tp = runtime.parallel.tp
     for step in range(steps):
+        ops = []
         selected = tuple(view for view in active if not serial or view.draft_proposal_tokens > step)
-        proposal_views = tuple(replace(
-            view, q_len=view.q_len if prefill else 1 if serial else view.draft_proposal_tokens,
-            samples=not prefill, phase="prefill" if prefill else "decode",
-            context=view.context + (step if serial else 0),
-            draft_verify=False, draft_proposal_tokens=0,
-        ) for view in selected)
+
+        def proposal(view):
+            return replace(
+                view, q_len=view.q_len if prefill else 1 if serial else view.draft_proposal_tokens,
+                samples=not prefill, phase="prefill" if prefill else "decode",
+                context=view.context + (step if serial else 0),
+                draft_verify=False, draft_proposal_tokens=0,
+            )
+        proposal_views = tuple(proposal(view) for view in selected)
+        global_proposals = tuple(proposal(view) for view in all_active
+                                 if not serial or view.draft_proposal_tokens > step)
         rows = sum(view.q_len for view in proposal_views)
+        selected_runtime, selections = resolve(
+            runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
+            global_views=global_proposals, model_scope="draft")
         requests = tuple(view.request_id for view in proposal_views)
         prefix = "draft_prefill." if prefill else f"draft{step}."
         feature_deps = [previous]
@@ -123,14 +133,17 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         global_tokens = sum(view.q_len if prefill else 1 if serial else view.draft_proposal_tokens
                             for view in all_active if not serial or view.draft_proposal_tokens > step)
         body, previous = frontend.body(
-            draft_model, runtime, proposal_views, prefix=prefix, ready=projection.op_id if rows else previous,
+            draft_model, selected_runtime, proposal_views, prefix=prefix,
+            ready=projection.op_id if rows else previous,
             tokens=rows, mode="draft_prefill" if prefill else "draft",
             stages=(stage,) * draft.layers, global_tokens=global_tokens, replica=replica,
         )
         ops.extend(body)
         if prefill:
+            regions.append(LoweringRegion(tuple(ops), selected_runtime,
+                                          draft_model.activation_dtype, rows, selections))
             continue
-        heads, previous = frontend.logits(draft_model, runtime, proposal_views, previous,
+        heads, previous = frontend.logits(draft_model, selected_runtime, proposal_views, previous,
                                          prefix=prefix, mode="draft", stage=stage, sample=False)
         ops.extend(heads)
         if draft.markov_rank and rows:
@@ -168,4 +181,6 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
                 recipe="draft_sample")
             ops.append(sample)
             previous = sample.op_id
-    return ops, previous
+        regions.append(LoweringRegion(tuple(ops), selected_runtime,
+                                      draft_model.activation_dtype, rows, selections))
+    return regions, previous
