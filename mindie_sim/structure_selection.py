@@ -18,9 +18,22 @@ ARRAYS = ('nodes', 'source_calls', 'subgraphs', 'resource_operators')
 
 
 def select_structure_targets(case, target_ids, **geometry):
-    graphs, options = _structure_inputs(case, **geometry)
     requested = set(target_ids)
-    targets, external, all_ids = {}, set(), set()
+    targets = {}
+
+    def collect(key, row):
+        identifier = row.get('subgraph_id', row.get('node_id'))
+        if key in {'nodes', 'subgraphs'} and identifier in requested:
+            targets[identifier] = row
+
+    identity = _scan_structure(case, collect, **geometry)
+    return {**identity, 'targets': targets}
+
+
+def _scan_structure(case, consume, **geometry):
+    """Hash the complete export while visiting one replica's records at a time."""
+    graphs, options = _structure_inputs(case, **geometry)
+    external, all_ids = set(), set()
     encoder = json.JSONEncoder(sort_keys=True, separators=(',', ':'), allow_nan=False)
     execution = _json_value({**options['execution'], 'expand_calls': options['expand_calls'],
                              'replicas': sorted(graphs), 'kernel_bindings': options['kernels']})
@@ -42,9 +55,7 @@ def select_structure_targets(case, target_ids, **geometry):
                         stream.write(b',')
                     stream.write(encoder.encode(row).encode('utf-8'))
                     counts[key] += 1
-                    identifier = row.get('subgraph_id', row.get('node_id'))
-                    if key in {'nodes', 'subgraphs'} and identifier in requested:
-                        targets[identifier] = row
+                    consume(key, row)
             del part
         # Per-replica exports see cross-replica dependencies as external. Full
         # identity excludes every declared node regardless of its replica.
@@ -66,4 +77,4 @@ def select_structure_targets(case, target_ids, **geometry):
                     digest.update(chunk.encode('utf-8'))
         digest.update(b'}')
     return {'graph_id': 'sha256:' + digest.hexdigest(), 'execution': execution,
-            'targets': targets, 'record_counts': counts}
+            'record_counts': counts}
