@@ -84,6 +84,12 @@ def parse_case(value: Case | Mapping) -> Case:
     from .implementations import select
     from .implementation_selection import prepared_selection
 
+    pool = select(case.runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+    if pool and pool.name == "vllm_ascend_cann_keypool_caller":
+        model = pool.module.prepare_model(model, case.runtime, pool)
+    elif "native_keypool_caller" in dict(model.metadata):
+        model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
+                                             if key != "native_keypool_caller"))
     prolog = select(case.runtime.kernels.get("lowerings", {}), "mla_prolog")
     if prolog:
         model = prolog.module.prepare_model(model, case.runtime)

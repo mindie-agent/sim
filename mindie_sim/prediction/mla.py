@@ -194,11 +194,16 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
 
     if plan.index_kpool > 1 and (parallel.cp != 1 or parallel.pcp != 1):
         raise ModelingError("pooled_indexer_context_partition_not_declared")
+    pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+                    if runtime and plan.index_kpool > 1 else None)
     if plan.owns_index_k and plan.index_kpool > 1:
-        from .index_pool import producer
-        index_store, pool_weights = producer(
+        from . import index_pool
+        pool_module = pool_binding.module if pool_binding else index_pool
+        producer_options = (pool_binding.options if pool_binding and
+                            pool_binding.name == "vllm_ascend_cann_keypool_caller" else {})
+        index_store, pool_weights = pool_module.producer(
             b, source=deps, views=views, plan=plan, model=model, quant=quant,
-            padded_tokens=q)
+            padded_tokens=q, **producer_options)
     elif plan.owns_index_k:
         index_source = long_store if plan.index_input == "compressed" else deps
         if (plan.index_input == "compressed"
@@ -290,12 +295,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                         valid * plan.candidate_topk_blocks * 4))
         shard = cp if parallel.cp_plan == "dsa_cp" else 1
         if plan.index_kpool > 1:
-            from .index_pool import selection
-            binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
-                       if runtime else None)
-            topk = selection(b, query=q_index, weights=weights, cache=index_store,
+            from . import index_pool
+            pool_module = pool_binding.module if pool_binding else index_pool
+            topk = pool_module.selection(b, query=q_index, weights=weights, cache=index_store,
                              views=views, plan=plan, quant=quant, padded_tokens=q,
-                             **(binding.options if binding else {}))
+                             **(pool_binding.options if pool_binding else {}))
         else:
             rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
                        plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)

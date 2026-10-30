@@ -333,7 +333,9 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         if plan.index_kpool > 1 and seq:
             # Raw normalized keys and gates remain FP32 in a bounded ring;
             # the pooled BF16 plane is independent of uncompressed token KV.
-            rows = plan.index_kpool if capacity_padded else min(seq, plan.index_kpool)
+            capacity = dict(model.metadata).get("native_keypool_caller", {}).get(
+                "tail_capacity", plan.index_kpool)
+            rows = capacity if capacity_padded else min(seq, capacity)
             result["index_pool_tail"] = rows * 2 * plan.index_dim * 4
         if plan.index_input == "hidden" and plan.compress_ratio and seq:
             result["index_compressor_state"] = min(seq, plan.compressor_state_rows) * 2 * plan.compressor_width * plan.index_dim * 4

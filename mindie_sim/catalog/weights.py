@@ -168,6 +168,10 @@ def _indexer_terms(plan, model):
         quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
         roles = {"indexer_wk": "indexer.pool_projection", "indexer_weights": "indexer.weights",
                  "indexer_pool_gate": "indexer.pool_gate"}
+        if "native_keypool_caller" in dict(model.metadata):
+            # Native CANN preserves BF16 WK/gate and only prepares FP32
+            # head weights; the fallback's FP32 K/gate copies do not exist.
+            roles = {"indexer_weights": "indexer.weights"}
         copies = [replace(term, name=term.name + "_prepared_" + quant.format_for(roles[term.name]),
                           category=roles[term.name], source_owned=False, runtime_quant=quant)
                   for term in terms if term.name in roles

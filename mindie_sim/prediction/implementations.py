@@ -34,6 +34,9 @@ class Selection:
 
 
 IMPLEMENTATIONS = {
+    "vllm_ascend_cann_keypool_caller": Implementation(
+        "mindie_sim.prediction.index_pool_native", blocks=("pool_key_indexer",),
+        options=("score_mode", "tail_capacity", "block_table_columns")),
     "causal_pool_indexer_analytic": Implementation(
         "mindie_sim.prediction.index_pool", blocks=("pool_key_indexer",),
         options=("score_mode",)),
