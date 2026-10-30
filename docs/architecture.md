@@ -267,10 +267,15 @@ these terms. Workspace estimates simultaneous layer tensors, residual history,
 draft feature staging and the default vision score buffers. Compiler graph pools,
 communication reserves and runtime allocations are explicit user parameters.
 
-Public metrics use `device_token_commit`. Host scheduling, launch and queue work
-that causes commit delay is included. Client transport, serialization and stream
-consumption are outside this boundary. A service run at `client_stream` can be
-shown next to prediction, but is marked non-comparable at that boundary.
+Default request latencies use `device_token_commit`. Host scheduling, launch and
+queue work that causes commit delay is included. Explicit `runtime.serving_io`
+adds causal input/output copies and host preparation/results. Named
+`metric_boundaries` distinguish actual device commits, host result readiness and
+explicit client delivery; top-level metrics retain the legacy scheduler window
+for compatibility. Undeclared client transport, serialization and consumption
+remain outside prediction. See [Serving I/O](serving-io.md) for event and payload
+contracts; a captured `client_stream` remains non-comparable unless its measured
+boundary matches an explicit modeled delivery contract.
 
 TTFT includes queueing. TPOT is `(last - first)/(output_tokens - 1)` and does not
 replace maximum ITL. Throughput uses the modeled serving window. Unserved requests

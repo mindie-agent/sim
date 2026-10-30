@@ -14,6 +14,9 @@ piecewise capture charges one replay per declared segment. Capture is enabled
 only by the case's graph declaration. Scheduler and completion costs remain
 separate parameters.
 
+Explicit host input/result processing, H2D/D2H resources and separately named
+output boundaries are described in [Serving I/O](serving-io.md).
+
 ```json
 {
   "runtime": {

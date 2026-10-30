@@ -18,7 +18,7 @@ from mindie_sim.schema.workload import IterationPlan
 from .capacity import Memory, MemoryPolicy
 from .cost import CostModel
 from .execution import Execution, ScheduledIteration, SubmissionPolicy
-from .metrics import summarize
+from .metrics import serving_boundaries, summarize
 from .primitives import PrimitiveStore
 from .program import RecipeBook
 from .scheduler import Scheduler
@@ -70,7 +70,8 @@ def predict(
     schedulers = [scheduler_factory(case, group, memory, replica)
                   for replica, group in enumerate(groups)]
     cost = CostModel(case, primitives)
-    execution = Execution(case, cost, recipes=recipes, submission=submission, trace_limit=event_limit)
+    execution = Execution(case, cost, recipes=recipes, submission=submission, trace_limit=event_limit,
+                          include_serving_io=True)
     engine = execution.engine
     engine.now = min((r.arrival_ms for r in case.workload.requests), default=0)
     in_flight: dict[int, ScheduledIteration] = {}
@@ -96,11 +97,17 @@ def predict(
                   if (arrival := scheduler.next_arrival(engine.now)) is not None]
         arrival = min(future) if future else float("inf")
         if not in_flight:
+            deliveries = tuple(execution.serving_io.client_tails.values())
+            if deliveries:
+                engine.advance(until=deliveries, horizon=arrival)
+                continue
             if arrival == float("inf"):
                 break
+            engine.advance(horizon=arrival)
             engine.now = arrival
             continue
-        engine.advance(until=tuple(step.completion for step in in_flight.values()), horizon=arrival)
+        engine.advance(until=(tuple(step.completion for step in in_flight.values())
+                              + tuple(execution.serving_io.client_tails.values())), horizon=arrival)
         for replica, step in list(in_flight.items()):
             if not step.completion.done:
                 continue
@@ -113,8 +120,11 @@ def predict(
     # Async scheduling can leave an unused finite CPU preparation after an
     # admission failure. Drain actual work without extending the token window.
     engine.advance()
-    rows = sorted((state.to_dict() for scheduler in schedulers for state in scheduler.states),
-                  key=lambda row: (row["arrival_ms"], row["request_id"]))
+    states = [state for scheduler in schedulers for state in scheduler.states]
+    rows, boundaries = serving_boundaries(
+        states, case.slo, host_results=execution.serving_io.enabled,
+        client_delivery=execution.serving_io.client_delivery_ms is not None)
+    rows.sort(key=lambda row: (row["arrival_ms"], row["request_id"]))
     metrics = summarize(rows, case.slo, now_ms=serving_end)
     return {
         "schema": "mindie-sim.predict/2",
@@ -122,6 +132,8 @@ def predict(
         "status": "modeled" if all(row["status"] == "served" for row in rows) else "infeasible",
         "execution_status": "completed" if all(row["status"] == "served" for row in rows) else "blocked",
         "metrics": metrics, "requests": rows, "memory": memory.to_dict(),
+        "metric_boundaries": boundaries,
+        "throughput_window_boundary": "legacy_scheduler_completion",
         "execution": {**execution.summary(), "iterations": iterations,
                       "iteration_modes": modes, "graph_scopes": scopes},
         "parameters": cost.summary(),

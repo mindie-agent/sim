@@ -88,6 +88,8 @@ Runtime mechanisms include:
   unpadded all-to-all with unrestricted expert groups; probability moments
   remain the default. See `operator-family-selection.md`.
 - `submission` (`scheduler_ms`, `graph_replay_ms`, `completion_ms`),
+- `serving_io` (explicit host preparation/results, H2D/D2H payloads and capacities,
+  optional client delivery; see [Serving I/O](serving-io.md)),
   `attention_policy` (`query_tile`, KV reuse, fused batch, recurrent chunk), `kernels`.
 - `lowering_passes`: ordered pass names, default `["activation_quantization"]`;
   optional `norm_quant` and `residual_norm` declare implementation fusion.

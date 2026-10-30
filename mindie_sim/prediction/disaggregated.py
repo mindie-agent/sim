@@ -17,7 +17,7 @@ from .dispatch import cohorts, submit_batch
 from .engine import Engine
 from .execution import Execution
 from .frontend import Frontend
-from .metrics import summarize
+from .metrics import serving_boundaries, summarize
 from .pd_connector import PDConnector
 from .scheduler import Scheduler
 from .structure import parse_case
@@ -47,8 +47,14 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     connector = PDConnector(raw["connector"])
     engine = Engine(connector.resources(), trace_limit=event_limit)
     memory = {name: Memory(case, memory_policy) for name, case in cases.items()}
+    client_declared = [case.runtime.serving_io.get("client_delivery_ms") is not None
+                       for case in cases.values()]
+    if any(client_declared) and not all(client_declared):
+        raise ModelingError("pd_client_delivery_boundary_requires_both_pool_declarations")
+    client_tails = {}
     execution = {name: Execution(case, CostModel(case, primitives), recipes=recipes,
-                                submission=submission, engine=engine, namespace=name + ":")
+                                submission=submission, engine=engine, namespace=name + ":",
+                                include_serving_io=True, client_tails=client_tails)
                  for name, case in cases.items()}
     lowerers = {name: lower or Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
                 for name, case in cases.items()}
@@ -118,9 +124,11 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
         arrivals = [time for name, group in schedulers.items() for replica, scheduler in enumerate(group)
                     if (name, replica) not in flights if (time := scheduler.next_arrival(engine.now)) is not None]
         horizon = min(arrivals, default=math.inf)
-        targets = tuple(s.completion for s in flights.values()) + tuple(transfers.values())
+        targets = (tuple(s.completion for s in flights.values()) + tuple(transfers.values())
+                   + tuple(client_tails.values()))
         if not targets:
             if math.isfinite(horizon):
+                engine.advance(horizon=horizon)
                 engine.now = horizon
                 continue
             for state in states:
@@ -150,18 +158,27 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                 del transfers[request]
     serving_end = engine.now
     engine.advance()
-    rows = [state.to_dict() for state in states]
+    rows, boundaries = serving_boundaries(
+        states, cases["prefill"].slo,
+        host_results=any(pool.serving_io.enabled for pool in execution.values()),
+        client_delivery=all(client_declared))
     return {
         "schema": "mindie-sim.predict/2", "deployment": "disaggregated",
         **combine_coverage(case.model for case in cases.values()),
         "status": "modeled" if all(state.finish_ms is not None for state in states) else "infeasible",
         "metrics": summarize(rows, cases["prefill"].slo, now_ms=serving_end),
+        "metric_boundaries": boundaries,
+        "throughput_window_boundary": "legacy_scheduler_completion",
         "requests": rows, "memory": {name: ledger.to_dict() for name, ledger in memory.items()},
         "execution": {**engine.summary(), "iterations": iterations,
                       "handoffs": handoffs, "handoff_bytes": handoff_bytes,
                       "connector": connector.summary(),
                       "submission": {name: pool.submission_summary()
                                      for name, pool in execution.items()},
+                      "serving_io": {name: pool.serving_io.summary()
+                                     for name, pool in execution.items()},
+                      "step_summary": {name: pool.step_summary.to_dict()
+                                       for name, pool in execution.items()},
                       "transfer_layout": "destination_shards"},
         "traces": traces, "events": list(engine.trace), "metric_boundary": "device_token_commit",
     }

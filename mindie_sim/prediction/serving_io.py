@@ -72,11 +72,15 @@ class ServingIO:
             return ready
         stage = 0 if direction == "h2d" else execution.case.runtime.parallel.pp - 1
         volume = policy.volume(tokens, requests)
-        return execution.engine.submit(
-            prefix + ":" + direction,
+        copied = execution.engine.submit(
+            prefix + ":" + direction + ":payload",
             {self.name(direction, replica): volume,
              execution.stage_names[replica, stage]["hbm"]: volume},
-            after=(ready,), latency=policy.latency_us / 1000, owner=f"replica:{replica}")
+            after=(ready,), owner=f"replica:{replica}")
+        if not policy.latency_us:
+            return copied
+        return execution.engine.submit(prefix + ":" + direction + ":complete", after=(copied,),
+                                       latency=policy.latency_us / 1000, owner=f"replica:{replica}")
 
     def input(self, execution, prefix, replica, schedule, work):
         if not self.enabled or not work.plan.requests:

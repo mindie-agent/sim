@@ -68,3 +68,22 @@ def summarize(rows: Sequence[Mapping], slo, *, now_ms=None) -> dict:
             "failures": failures if configured else {},
         },
     }
+
+
+def serving_boundaries(states, slo, *, host_results=False, client_delivery=False):
+    """Keep output event windows separate from the legacy scheduler window."""
+    rows = [state.to_dict() for state in states]
+    metrics = {"device_token_commit": summarize(rows, slo)}
+    fields = ("generated_tokens", "first_token_abs_ms", "last_token_abs_ms", "finish_ms",
+              "ttft_ms", "tpot_ms", "e2e_ms", "status", "itl")
+    for enabled, boundary, attribute in (
+        (host_results, "host_result_ready", "host_result"),
+        (client_delivery, "client_delivery", "client_delivery"),
+    ):
+        if not enabled:
+            continue
+        delivered = [getattr(state, attribute).row(state) for state in states]
+        metrics[boundary] = summarize(delivered, slo)
+        for row, output in zip(rows, delivered, strict=True):
+            row.setdefault("boundaries", {})[boundary] = {key: output[key] for key in fields}
+    return rows, metrics
