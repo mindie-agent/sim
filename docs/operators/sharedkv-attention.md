@@ -19,10 +19,10 @@ validation.
 
 The five dispatch, host and SCFA source files in local `vllm-ascend` were
 independently hashed against git revision
-`175ef4d49c2072f9233619636f0309f4f88b4e2c`. Hashes and source line references
-are retained in
-`data/verification/sharedkv-attention-coarse-20261029.json`. Unrelated source
-worktree changes are not evidence for this plan.
+`175ef4d49c2072f9233619636f0309f4f88b4e2c`. The metadata generator's C++ and
+header hashes at that same revision are retained in
+`prediction.sharedkv_metadata.SOURCE`. The source partition is deterministic;
+matching it does not establish a historical capture's binary or metadata values.
 
 ## Exact selection contract
 
@@ -40,17 +40,18 @@ following `sharedkv_attention_geometry` metadata:
   "sparse_block_size": 1, "query_dtype": "bf16", "cache_dtype": "bf16",
   "output_dtype": "bf16", "sinks_dtype": "fp32",
   "return_softmax_lse": false, "metadata_s2_split": false,
-  "selected_rows": "valid_prefix", "owner_schedule": "one_query_per_core"
+  "selected_rows": "valid_prefix", "owner_schedule": "metadata_cost_balanced"
 }
 ```
 
 `query` is positive; `context` nonnegative; window is 1..512; ratio is4 or128;
 selected capacity is512 or1024; local query heads are4,8,12 or16. These are
-source-domain restrictions, not model-name switches. A whole-query cyclic
-owner policy is an explicit scenario: it does not reconstruct metadata's
-`bN2/gS1/S2` partition. Multiple views/sequences, cross-core S2 splits, decode,
-LSE output, other dtypes and other branches are rejected. The dense causal
-window and independent compressed selections remain different regions.
+source-domain restrictions, not model-name switches. Owners follow the source
+metadata generator's contiguous query ranges. Its `supportFd=false` setting
+keeps each query's complete S2 chain on one core. Multiple views/sequences,
+cross-core S2 splits, decode, LSE output, other dtypes and other branches are
+rejected. The dense causal window and independent compressed selections remain
+different regions.
 
 Host `GetSASTemplateMode` selects SCFA only when both original/compressed KV
 and compressed sparse indices exist. SWA and CFA dispatch to the other C++
@@ -64,6 +65,14 @@ interspersed invalid entries and scalar response/issue cost are not inferred.
 
 ## Physical paths and ownership
 
+- Each 512-row original or compressed tile contributes the source scheduling
+  weight `6*ceil(heads/16) + 10*ceil(rows/64)`. A core receives consecutive
+  complete queries up to `max(remaining_cost/remaining_cores, max_query_cost)`,
+  using integer division and half the last S2 block's cost as inclusive
+  tolerance. If the remaining sequence fits, that core receives all of it.
+  These weights determine ownership only; they are not durations or resource
+  rates. Equal-cost intervals avoid per-query allocation during partitioning.
+  Only enabled owners initialize sinks or reserve scratch.
 - Original KV has no AIV gather. `CalcParams` sets `v0S2DealSize=0`; QK and PV
   each use AIC `DataCopyPA` from original KV. Both copies are external reads in
   this no-hit scenario. Original page-table control work remains unmodeled.
@@ -86,7 +95,9 @@ copy roles. Explicit `resident` instead requires `mte2_aic_cached` and
 `l2_read/l2_write` modes on one shared cache resource. It reserves the complete
 per-owner host workspace: four gathered-KV buffers, two score/probability/PV/
 accumulator buffers and the declared valid-size allocation. Cache residency
-never turns the final output or input KV into a resident temporary.
+never turns the final output or input KV into a resident temporary. The source
+uses ordinary GM workspace and does not guarantee L2 residency. Fitting that
+workspace in cache is a capacity check, not a cache-hit or bandwidth observation.
 
 Each owner uses an existing `PipelineProgram` with two active tiles. Phase
 DAGs preserve gather/publication before AIC consumption, softmax before PV,

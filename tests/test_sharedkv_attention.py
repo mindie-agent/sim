@@ -21,7 +21,7 @@ def _shape(query=32, context=0, window=128, ratio=4, topk=512, **changes):
                  branch="SCFA", query_layout="TND", cache_layout="PA_ND",
                  sequences=1, views=1, kv_heads=1, query_dtype="bf16",
                  cache_dtype="bf16", output_dtype="bf16", sinks_dtype="fp32",
-                 sparse_block_size=1, owner_schedule="one_query_per_core",
+                 sparse_block_size=1, owner_schedule="metadata_cost_balanced",
                  metadata_s2_split=False, return_softmax_lse=False,
                  selected_rows="valid_prefix")
     return {**shape, **changes}
@@ -280,4 +280,25 @@ def test_1024_selected_rows_have_one_output_and_bounded_two_slots():
     expected = (2 * 128 * 512 * 2 + 1024 * (512 * 2 + 8)
                 + 3 * 8 * 512 * 2 + 8 * 512 * 2 + 2 * 8 * 4)
     assert plan.work.resources["hbm"] == expected
+    assert engine.serviced == pytest.approx(context.bind(plan.work))
+
+
+def test_metadata_query_ranges_drive_private_owners_without_changing_query_work():
+    from collections import Counter
+
+    # Source costs are 16 for q0..2 and 32 for q3..7. The contiguous source
+    # partition is [0,3), [3,4), [4,6), [6,8), rather than two queries per core.
+    plan, engine, context, done, _ = _run(_op(query=8), cores=4, trace_limit=1000)
+    engine.advance(until=(done,))
+    final_stores = [row for row in engine.trace
+                    if row["task"].endswith(":accum_store") and row["demand"].get("hbm")]
+    assert Counter(row["placement"]["mte3"][0] for row in final_stores) == {0: 3, 2: 1, 4: 2, 6: 2}
+    serial, _, _, _, _ = _run(_op(query=8), cores=1)
+    assert plan.work.matrix == serial.work.matrix
+    expected = dict(serial.work.resources)
+    # Only initialization changes with the enabled core count. All query
+    # phases, including both external KV reads and scratch copies, are equal.
+    for role in ("hbm", "mte2_aiv"):
+        expected[role] += (4 - 1) * 2 * 8 * 4
+    assert plan.work.resources == expected
     assert engine.serviced == pytest.approx(context.bind(plan.work))

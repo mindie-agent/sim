@@ -12,6 +12,7 @@ from dataclasses import replace
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.catalog.cache_format import cache_format
 from .mechanism import PlannedRecipe
+from .sharedkv_metadata import OWNER_SCHEDULE
 
 
 IMPLEMENTATION = "vllm_ascend_sharedkv_scfa"
@@ -36,7 +37,7 @@ def lower_op(op, *, selection, view, plan, views, heads, parallel, model, quant)
         raise ModelingError("sharedkv_scfa_packed_cache_representation_not_supported")
     options = selection.options
     declarations = {
-        "owner_schedule": "one_query_per_core",
+        "owner_schedule": OWNER_SCHEDULE,
         "selected_rows": "valid_prefix",
         "sinks_dtype": "fp32",
         "metadata_s2_split": False,

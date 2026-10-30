@@ -2,8 +2,8 @@
 
 [Role] Price only the demonstrated SparseAttnSharedkv SCFA branch.
 [Invariants] Original-window and selected compressed rows are separate typed
-  regions; one query has one final output after the combined S2 list. Resident
-  GM reads use the declared cached service mode. SWA/CFA are not this plan.
+  regions; one query has one final output after the combined S2 list. Source
+  metadata owns contiguous query ranges. GM residency remains a declaration.
 [Timeouts & Locks] Streaming O(query/key-tiles) arithmetic, two slots per owner.
 [Side-Effect Policy] Pure plans and ordinary Engine submissions; no observations.
 """
@@ -14,7 +14,7 @@ from functools import lru_cache, partial
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from .sparse_attention import selected_query_owners
+from .sharedkv_metadata import OWNER_SCHEDULE, SOURCE as METADATA_SOURCE, query_partitions
 
 
 SOURCE = {
@@ -24,6 +24,7 @@ SOURCE = {
     "scope": "SparseAttnSharedkv SCFA only, TND/PA_ND, D512 BF16, one KV head",
     "dispatch": "sparse_attn_sharedkv.cpp routes SCFA_TEMPLATE to Scfa; all other modes to Swa",
     "capture_identity": "not asserted",
+    "metadata_partition": METADATA_SOURCE,
 }
 
 
@@ -41,9 +42,10 @@ def _scratch_bytes(heads):
     return 4 * 512 * 512 * 2 + 2 * _align(heads, 16) * 512 * 14 + 4096
 
 
-def source_tiles(query, context, window, ratio, topk, owner, owners):
+def source_tiles(query, context, window, ratio, topk, owner, owners, heads=8):
     """Lazy combined original-then-compressed S2 tiles for one owner."""
-    for position in range(owner, query, owners):
+    partitions = query_partitions(query, context, window, ratio, topk, heads, owners)
+    for position in range(*partitions[owner]):
         original = min(context + position + 1, window)
         selected = min((context + position + 1) // ratio, topk)
         total_tiles = (original + 511) // 512 + (selected + 511) // 512
@@ -167,7 +169,7 @@ def build(op, geometry, *, scratch_policy="offchip", slots=2):
         "query_dtype": "bf16", "cache_dtype": "bf16", "output_dtype": "bf16",
         "sinks_dtype": "fp32", "return_softmax_lse": False,
         "metadata_s2_split": False, "selected_rows": "valid_prefix",
-        "owner_schedule": "one_query_per_core",
+        "owner_schedule": OWNER_SCHEDULE,
     }
     if (op.phase != "prefill" or shape["query"] < 1
             or any(shape.get(key) != value for key, value in declarations.items())
@@ -175,7 +177,9 @@ def build(op, geometry, *, scratch_policy="offchip", slots=2):
             or not (0 < shape["window"] <= 512 and shape["cmp_ratio"] in {4, 128}
                     and shape["topk"] in {512, 1024})):
         raise ModelingError("sharedkv_attention_source_geometry_outside_reviewed_domain")
-    owners = selected_query_owners(shape["query"], geometry.compute_units)
+    owners = len(query_partitions(shape["query"], shape["context"], shape["window"],
+                                  shape["cmp_ratio"], shape["topk"], shape["heads"],
+                                  geometry.compute_units))
     per_owner_scratch = _scratch_bytes(shape["heads"])
     if scratch_policy == "resident":
         if (geometry.buffer_units.get("l2", 1) != 1
@@ -189,11 +193,12 @@ def build(op, geometry, *, scratch_policy="offchip", slots=2):
 @lru_cache(maxsize=4)
 def _plan(query, context, window, ratio, topk, heads, width, compute_units,
           scratch_policy, slots):
-    owners = selected_query_owners(query, compute_units)
+    partitions = query_partitions(query, context, window, ratio, topk, heads, compute_units)
+    owners = len(partitions)
     per_owner_scratch = _scratch_bytes(heads)
 
     def tiles(owner):
-        return source_tiles(query, context, window, ratio, topk, owner, compute_units)
+        return source_tiles(query, context, window, ratio, topk, owner, compute_units, heads)
 
     @lru_cache(maxsize=1024)
     def phases(key):
@@ -278,7 +283,8 @@ def _plan(query, context, window, ratio, topk, heads, width, compute_units,
                 ctx.record_mapping({
                     "program": "sharedkv_attention_pipeline", "source": SOURCE,
                     "scratch_policy": scratch_policy, "owners": owners,
-                    "owner_schedule": "one_query_per_core", "metadata_s2_split": False,
+                    "owner_schedule": OWNER_SCHEDULE, "owner": owner,
+                    "query_range": partitions[owner], "metadata_s2_split": False,
                     "producer_slots": slots, "sparse_block_size": 1,
                     "cmp_ratio": ratio, "topk_rows": topk, "window_rows": window,
                     "branch": "SCFA", "selected_rows": "valid_prefix",

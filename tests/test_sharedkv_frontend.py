@@ -20,7 +20,7 @@ def selected_case():
     raw["runtime"]["kernels"].setdefault("lowerings", {})["sharedkv_attention"] = {
         "implementation": "vllm_ascend_sharedkv_scfa",
         "options": {
-            "owner_schedule": "one_query_per_core", "selected_rows": "valid_prefix",
+            "owner_schedule": "metadata_cost_balanced", "selected_rows": "valid_prefix",
             "sinks_dtype": "fp32", "metadata_s2_split": False,
             "return_softmax_lse": False, "scratch_policy": "offchip",
         },

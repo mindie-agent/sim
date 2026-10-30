@@ -230,7 +230,7 @@ def test_bf16_scfa_source_does_not_relabel_a_packed_cache(ordinary):
     kernels = deepcopy(model.runtime.kernels)
     kernels["lowerings"]["sharedkv_attention"] = {
         "implementation": "vllm_ascend_sharedkv_scfa", "options": {
-            "owner_schedule": "one_query_per_core", "selected_rows": "valid_prefix",
+            "owner_schedule": "metadata_cost_balanced", "selected_rows": "valid_prefix",
             "sinks_dtype": "fp32", "metadata_s2_split": False, "return_softmax_lse": False}}
     model = replace(model, runtime=replace(model.runtime, kernels=kernels))
     with pytest.raises(ModelingError, match="packed_cache_representation_not_supported"):
