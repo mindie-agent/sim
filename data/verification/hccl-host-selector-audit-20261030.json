@@ -1,0 +1,92 @@
+{
+  "source_root": "/Volumes/data-tmp/tmp/sim-hccl-source-20261030",
+  "source_head": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+  "scope": "Read-only source audit; source selector costs are not physical runtime parameters or capture dispatch proof.",
+  "conditional_assumptions": [
+    "Single-level MESH_1D topology",
+    "Both AIV template candidates survive filters",
+    "No HCCL_ALGO preference or external algorithm plugin changes selection",
+    "No tuner changes costs",
+    "Source revision corresponds to selected implementation; capture binary revision remains unknown"
+  ],
+  "modern_cost_equations": {
+    "util": 0.5456176470588235,
+    "B": "1/1400e9 + (R-1)/900e9",
+    "one_seconds": "S*(1/56e9/util+B)+1e-6",
+    "two_seconds": "S*((2/R)/56e9/util+B/R)+2e-6",
+    "arithmetic": "Python double reevaluation of source float expressions; small float rounding does not change preferred candidate"
+  },
+  "conditional_results": [
+    {
+      "ranks": 2,
+      "payload_bytes": 163840,
+      "host_selector_cost_only_us": {
+        "oneshot": 6.661279134911649,
+        "twoshot": 7.511742626975142
+      },
+      "preferred_aiv_template": "OneShot",
+      "ordinary_num_blocks_at_limit_60": {
+        "oneshot": 3,
+        "twoshot": 60
+      }
+    },
+    {
+      "ranks": 4,
+      "payload_bytes": 163840,
+      "host_selector_cost_only_us": {
+        "oneshot": 7.025368023800539,
+        "twoshot": 4.846893535709793
+      },
+      "preferred_aiv_template": "TwoShot",
+      "ordinary_num_blocks_at_limit_60": {
+        "oneshot": 5,
+        "twoshot": 60
+      }
+    }
+  ],
+  "legacy_selector": {
+    "threshold_bytes": 131072,
+    "in_board_max_ranks": 8,
+    "condition": "MESH_1D and R<=8 uses OneShot iff S<131072; otherwise TwoShot. Non-MESH_1D chooses TwoShot.",
+    "result_at_163840": "TwoShot for both R2 and R4"
+  },
+  "num_blocks": {
+    "one": "min(limit,R+1)",
+    "two": "floor(limit/(R+1))*(R+1) if limit>=R+1 else limit",
+    "R2_twoshot_3_blocks_limits": [
+      3,
+      4,
+      5
+    ],
+    "R4_twoshot_60_blocks_limits": [
+      60,
+      61,
+      62,
+      63,
+      64
+    ],
+    "limit_sources": [
+      "AivParamStorage.aivCoreLimit",
+      "OPBASE runtime aclrtGetResInCurrentThread vector-core count if stored limit is zero",
+      "Graph-mode API aivCoreLimit argument"
+    ],
+    "capture_caveat": "Ordinary launch passes logical numBlocks as blockDim. SuperKernel preserves logical numBlocks in hiddenInput; outer full-core physical launches can contain idle cores, so physical block count alone does not prove logical template/count."
+  },
+  "source_references": {
+    "modern_gate": "src/ops/op_common/op_common.cc:183-189,723-729",
+    "cost_pipeline": "src/ops/op_common/selector/selector_engine.cc:272-287,416-494",
+    "oneshot_coeff": "src/ops/all_reduce/algorithm/template/aiv/aiv_temp_all_reduce_mesh_1D_oneshot.cc:25-70",
+    "twoshot_coeff": "src/ops/all_reduce/algorithm/template/aiv/aiv_temp_all_reduce_mesh_1D_twoshot.cc:16,26-75",
+    "data_ratio": "src/ops/all_reduce/algorithm/executor/ins_v2_all_reduce_sole_executor.cc:102-104,118-129",
+    "cost_rates": "src/ops/op_common/selector/cost_model.cc:113-124,519-538,561-597",
+    "cost_function_util": "src/ops/op_common/selector/cost_table.cc:393-404,443-446,486-496",
+    "legacy_threshold_selector": "src/ops/all_reduce/selector/all_reduce_auto_selector.cc:36-37,680-694",
+    "oneshot_blocks": "src/ops/all_reduce/algorithm/template/aiv/aiv_temp_all_reduce_mesh_1D_oneshot.cc:110-121",
+    "twoshot_blocks": "src/ops/all_reduce/algorithm/template/aiv/aiv_temp_all_reduce_mesh_1D_twoshot.cc:115-127",
+    "limit_sources": "src/ops/op_common/op_common.cc:1247-1263;src/ops/interface_graph_mode/calc_resource_graph_mode.cc:330-347",
+    "ordinary_launch": "src/ops/op_common/algorithm/template/aiv/hccl_aiv_utils.cc:1141-1143",
+    "superkernel_logical_count": "src/ops/interface_graph_mode/calc_resource_graph_mode.cc:507-520;src/ops/op_common/algorithm/template/aiv/aiv_communication_base_v2.h:154-165,281-285,312-313",
+    "superkernel_oneshot_idle_path": "src/ops/all_reduce/algorithm/template/aiv/kernel/aiv_all_reduce_mesh_1d_oneshot.h:81-102,161-180",
+    "twoshot_small_core_branch": "src/ops/all_reduce/algorithm/template/aiv/kernel/aiv_all_reduce_mesh_1d_twoshot.h:390-404,415-437"
+  }
+}

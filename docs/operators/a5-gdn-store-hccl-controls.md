@@ -72,11 +72,13 @@ error is smaller.
 | 4 / OneShot | 60 | 5 | 24.348 | 25.643 / 24.703 |
 | 4 / TwoShot | 60 | 60 | 5.959 | 25.643 / 24.703 |
 
-TwoShot/3 raises `hccl_aiv_small_core_branch_not_selected`; its block count is
-not changed to make the program run. OneShot with `block_limit=60` constructs
-only `R+1=5` source owners, so its apparently close TP4 latency is not evidence
-of matching the recorded 60-block dispatch. The implemented source programs
-also leave flag/poll retries and first-operator barriers unpriced.
+TwoShot/3 raises `hccl_aiv_small_core_branch_not_selected` because Sim has not
+implemented that source branch; its block count is not changed to make the
+program run. The source itself has a legal small-core ReduceScatter/AllGather
+path. OneShot with `block_limit=60` constructs only `R+1=5` source owners, so
+its apparently close TP4 latency is not evidence of matching the recorded
+60-block dispatch. The implemented source programs also leave flag/poll retries
+and first-operator barriers unpriced.
 
 | Model / TP | OneShot Body ms / error | TwoShot Body ms / error |
 | --- | ---: | ---: |
@@ -89,6 +91,64 @@ All six executed candidates fail the 15% Body criterion. The run took 194.6 s
 across six individually bounded probes, with peak RSS 89.9 MB and zero
 remaining live tasks/programs. The beta-only and HCCL case copies are separate,
 so the reports preserve their exact input identities.
+
+## Current host-selector source audit
+
+The subsequent read-only audit of HCCL
+`c2d6790464654ccf58aca39448de4b65fdc7b184` distinguishes the current selector
+from the legacy 128 KiB rule. For `MESH_1D`, `op_common.cc` sends both initial
+selection and reselection to `SelectorEngine`, which generates candidate costs,
+applies an optional tuner and selects the minimum. The legacy threshold is not
+the active selection rule for this topology in that source revision.
+[Selector entry](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/op_common/op_common.cc#L183),
+[cost selection](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/op_common/selector/selector_engine.cc#L272).
+
+With a single physical mesh level, both AIV candidates retained, source default
+costs and no tuner, `HCCL_ALGO` preference or algorithm plugin override, the
+ranking at `S=163840` bytes is:
+
+| Ranks | OneShot host cost us | TwoShot host cost us | Preferred candidate / ordinary blocks |
+| --- | ---: | ---: | --- |
+| 2 | 6.661279 | 7.511743 | OneShot / 3 |
+| 4 | 7.025368 | 4.846894 | TwoShot / 60 at core limit 60–64 |
+
+These numbers are HCCL host-selector ranking estimates. They are not measured
+kernel durations or inputs to Sim's physical rates, setup or primitive service.
+The calculation uses the source equations, with seconds as the cost unit:
+
+```text
+u = 0.7135 / 0.85 * 0.65
+B = 1 / 1400e9 + (R - 1) / 900e9
+C_one = S * (1 / (56e9 * u) + B) + 1e-6
+C_two = S * ((2 / R) / (56e9 * u) + B / R) + 2e-6
+```
+
+The executor supplies `dataRatio=1/R` and separate input/scratch buffer types;
+the template coefficients, mesh utilization and fixed selector costs then give
+the two expressions. The checked constants and exact line ranges are retained
+in [the source audit](../../data/verification/hccl-host-selector-audit-20261030.json).
+[Executor inputs](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/all_reduce/algorithm/executor/ins_v2_all_reduce_sole_executor.cc#L102),
+[cost parameters](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/op_common/selector/cost_model.cc#L113),
+[utilization](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/op_common/selector/cost_table.cc#L443).
+
+Ordinary launch uses the host-computed block count directly. OneShot uses
+`min(limit,R+1)`; TwoShot uses `floor(limit/(R+1))*(R+1)` when `limit>=R+1`,
+otherwise `limit`. Thus TP2 OneShot naturally launches three blocks, while TP4
+TwoShot launches 60 at limits 60–64. A legal TP2 TwoShot three-core branch also
+exists at limits 3–5: owners 0/1 scatter and gather half the payload, and owner 2
+reduces the local half in place. It is not the preferred candidate under the
+conditions above, and no new Sim branch is added by this audit.
+[Host block arithmetic](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/all_reduce/algorithm/template/aiv/aiv_temp_all_reduce_mesh_1D_twoshot.cc#L115),
+[small-core entry](https://github.com/hicann/hccl/blob/c2d6790464654ccf58aca39448de4b65fdc7b184/src/ops/all_reduce/algorithm/template/aiv/kernel/aiv_all_reduce_mesh_1d_twoshot.h#L390).
+
+The OneShot device program has only `R` payload producers and one consumer even
+if an outer SuperKernel launches more physical cores; the remaining cores still
+join synchronization. SuperKernel preserves the logical `numBlocks` argument,
+so a physical launch count alone cannot identify its internal template. The
+captured binary revision, selection overrides and outer launch mode remain
+unknown. TP2 OneShot/3 and TP4 TwoShot/60 are therefore source-conditioned
+declarations supported by the default selector and compatible native counts,
+not captured dispatch proof or choices made from Body error.
 
 ## Remaining native roles
 
