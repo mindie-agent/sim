@@ -32,7 +32,7 @@ def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1,
 
 
 def lower_attention(b, *, views, plan, heads, runtime, query, rotary, store,
-                    head_contract=None, kv_splits=1, dispatch=None):
+                    head_contract=None, padded_tokens=None, kv_splits=1, dispatch=None):
     batch = len(views)
     logical = plan.num_heads // runtime.parallel.tp
     physical = 1 << (logical-1).bit_length()

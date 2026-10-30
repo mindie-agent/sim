@@ -27,7 +27,7 @@ def validate(*, dispatch=None, retained_kv_rows=0, native_query_capacity=None, *
         raise ModelingError('paged_mla_query_capacity_below_active_sequences')
 
 
-def lower_attention(b, *, dispatch=None, retained_kv_rows=0,
+def lower_attention(b, *, padded_tokens=None, dispatch=None, retained_kv_rows=0,
                     native_query_capacity=None, **kwargs):
     name = family_paged_mla.lower_attention(b, dispatch=dispatch, **kwargs)
     op = b.ops[-1]
@@ -38,7 +38,11 @@ def lower_attention(b, *, dispatch=None, retained_kv_rows=0,
     metadata['implementation_binding']['host_dispatch'] = (
         'source_common_SplitCore_q1_geometry' if dispatch is None else 'declared_common_SplitCore_output')
     active = len(kwargs['views'])
-    capacity = active if native_query_capacity is None else native_query_capacity
+    # GraphPolicy already selected the incoming query storage rows. SP-only
+    # padding has been sliced away by the caller before this boundary.
+    capacity = active if padded_tokens is None else padded_tokens
+    if native_query_capacity is not None:
+        capacity = native_query_capacity
     heads = metadata['paged_mla_geometry']['heads']
     metadata['paged_mla_geometry'].update(
         active_sequence_count=active, native_query_capacity=capacity,

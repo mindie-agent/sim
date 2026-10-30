@@ -91,8 +91,12 @@ live tasks/programs and released buffers to floating-point precision
 (maximum residual 2.33e−10 bytes).
 
 `native_query_capacity` optionally declares native query/output storage rows
-separately from valid `contexts`. Its default is the active sequence count;
-it must not be smaller. The source caller appends zero KV lengths to inactive
+separately from valid `contexts`. Its default is the query row count already
+selected by `GraphPolicy` and passed through the attention caller: a full
+capture maps active B6/B12 to declared buckets B8/B16. Eager execution retains
+the active count; SP-only right padding does not expand the attention input.
+An explicit capacity overrides the caller value and must not be smaller than
+the active sequence count. The source caller appends zero KV lengths to inactive
 query rows. Native tensor contracts and padded/launch shapes retain capacity,
 while semantic/local shapes and all QK/PV work retain only active sequences.
 This option declares existing caller storage; it does not add caller padding

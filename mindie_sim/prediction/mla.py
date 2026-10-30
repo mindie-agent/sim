@@ -344,7 +344,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         outputs.append(selected.module.lower_attention(
             b, views=views, plan=plan, heads=heads, runtime=runtime,
             query=q_ready, rotary=rotary, store=store,
-            **({"head_contract": head_contract} if paged else {}), **selected.options))
+            **({"head_contract": head_contract, "padded_tokens": q} if paged else {}),
+            **selected.options))
     for index, view in enumerate(() if selected else views):
         context, query = view.context, view.q_len
         if plan.cache_kind == "dense":
