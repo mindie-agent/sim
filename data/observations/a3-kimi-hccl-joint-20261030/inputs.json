@@ -1,0 +1,1161 @@
+{
+  "schema": "kimi-hccl-retrospective-source-assignment/1",
+  "status": "frozen_before_new_HCOM_duration_extraction",
+  "source_inventory": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/kimi-mla-cache-domain-20261030.json",
+    "sha256": "3b3576eb5f3bcf7b5779732dfeb91606b765152c7ba23536e5f8b2bae36d80a8",
+    "size_bytes": 380897
+  },
+  "extraction_report_identity": {
+    "path": "/Users/maoxx241/code/profiler/examples/structure/results/decode.json",
+    "sha256": "61ebcbd6d48e9e9eb5e349dc2ec827252656e615683e49eb180a823dcbba824f",
+    "size_bytes": 4665107
+  },
+  "canonical_cases": [
+    {
+      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+      "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
+      "size_bytes": 17742
+    },
+    {
+      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+      "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
+      "size_bytes": 15110
+    }
+  ],
+  "assignment_amendment": {
+    "original_training": "4K TP8/TP16 each B2/B24/B48",
+    "replacement": "TP16 B24 excluded; TP16 B12 replaces it before B12 HCOM duration extraction",
+    "reason": "TP16 B24 extraction has overlapping forwards and includes lm_head AG in 78/177 body windows; independent Profiler repair pending",
+    "causal_counterexample": {
+      "csv_line": 28155,
+      "name": "hcom_reduceScatter__503_14_103",
+      "start_ns": 1793353592288758635,
+      "end_ns": 1793353592297256625,
+      "dependent_attnres_start_ns": 1793353592288789296,
+      "next_forward_start_ns": 1793353592293357847
+    },
+    "timing_threshold_used_for_exclusion": false,
+    "replacement_source_duration_seen_before_selection": false
+  },
+  "caller_source": [
+    {
+      "repository": "/Users/maoxx241/code/vllm-ascend",
+      "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+      "path": "vllm_ascend/models/kimi_k3.py",
+      "sha256": "af6a25c85fcf1677673f0180cb24eeab1ddd7d3715704432e551483f5407c2f3",
+      "symbols": [
+        "AscendKimiLinearModel.__init__/forward",
+        "AscendKimiDecoderLayer.forward_attn_residual",
+        "AscendKimiMLP.forward"
+      ],
+      "captured_binary_identity": "not_established"
+    },
+    {
+      "repository": "/Users/maoxx241/code/vllm-ascend",
+      "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+      "path": "vllm_ascend/ops/fused_moe/shared_experts.py",
+      "sha256": "c25f66f94b5a8485c9afca7243a774954eda5db5a43daa7af788c17e242bcb9f",
+      "symbols": [
+        "SharedExperts._gather_sp_input",
+        "SharedExperts._pad_and_reduce_scatter"
+      ],
+      "captured_binary_identity": "not_established"
+    },
+    {
+      "repository": "/Users/maoxx241/code/vllm-v0.27.1-k3-ops-validation",
+      "revision": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
+      "path": "vllm/models/common/ops/sequence_parallel.py",
+      "sha256": "699fde98360fc8d604055e2987d93108ee489e87cc5563949d2a3dcd838eb8bd",
+      "symbols": [
+        "sp_shard",
+        "sp_all_gather",
+        "sp_reduce_scatter"
+      ],
+      "captured_binary_identity": "not_established"
+    }
+  ],
+  "sources": [
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "3554dcb2b430dd5eb499e180639b45c5cd18099a6c20d05e1b4fe2e66c6ba5f4",
+        "size_bytes": 20706836
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1-extraction.json",
+        "sha256": "e1c431b5b8e1d8d5e564402408f8cbc90dd430ceb09c12b00e859dec67545b24",
+        "size_bytes": 438083
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 1,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        1
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c12",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "sha256": "ea494b46fa323656fbd3221ac8757751f0fa64443d768e12a434727b2c3497f6",
+        "size_bytes": 20181904
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c12-head-unpadding-extraction.json",
+        "sha256": "9179c45eca5aa5e1687e8f2dbf211d45b39bd15eaa24e25d203bb686299f1ad4",
+        "size_bytes": 425082
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 12,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c16",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+        "sha256": "31fcbcb4b0bb8bd31cf19851f0317c3eedc5c4c15a0bb34a186d13199bbb6ae7",
+        "size_bytes": 16621834
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c16-extraction.json",
+        "sha256": "4325bebaf5549c25e0effa140941f5520302cd9cbf650ee2a5f122916972385b",
+        "size_bytes": 378947
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 16,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c2",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "sha256": "e5d77ab06a8e920cf4618b3ee692576eb30fb3c611242794d5dd441c58d68368",
+        "size_bytes": 21688834
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c2-extraction.json",
+        "sha256": "145638a02184a6a3a379172478e23033f16c775c875d93deac51db1f8c0d1dbd",
+        "size_bytes": 435104
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 2,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        2
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c24",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+        "sha256": "a8e3a1a73bafcf496ac6b582f941a641934c7c8604905a4f41010af2367b8d0f",
+        "size_bytes": 12845342
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c24-extraction.json",
+        "sha256": "dc126df04b867c674d4f90cc77e6ee2dd13f1773d8b9bc062e580e6e8a2c0710",
+        "size_bytes": 317586
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 24,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c32",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+        "sha256": "c802535d1ce5847a433bd829d5bfcbb41335726482a199ad5a0c8c2d5e6a7c65",
+        "size_bytes": 10497998
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c32-extraction.json",
+        "sha256": "0f4dd8639fb8a6b279b98c82fd2488a2649ed9e227337e3dfc67655fc473bbce",
+        "size_bytes": 278023
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 32,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        32
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c4",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "7b94b3ad53e6f290f4a1bc57d82a4b39de5041b78dac8a1715d9e8515643abb5",
+        "size_bytes": 21973796
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c4-extraction.json",
+        "sha256": "c7e16b56693892b87b79a7fa2c291cc7420d590ebe97000eab9ed10302d1a2d1",
+        "size_bytes": 439169
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 4,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        4
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c48",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+        "sha256": "444a004af91cc22397e2f274fa941d6baf2833458c146cdcbfc6f172c058d854",
+        "size_bytes": 7696198
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c48-extraction.json",
+        "sha256": "e75ecc15258826d4960cdb62f4c14d3712cbfbf2507febeecdd6ea6ab3795f3d",
+        "size_bytes": 232639
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 48,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        48
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c6",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "sha256": "7a2f1703d265db51f6bc83b288e2dfea35e0eff0155c0ecc08adc594fbdc8787",
+        "size_bytes": 20529885
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c6-head-unpadding-extraction.json",
+        "sha256": "827a7d5feb982a08ecaa1a91ab1c944422e7cbae7eb5af38a2dc936564955b47",
+        "size_bytes": 430756
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 6,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c64",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+        "sha256": "b66fec0e9aeb4bfd6806d2119b4bb71b5baee0116a07109a1e2dfdeba6773b83",
+        "size_bytes": 6253384
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c64-extraction.json",
+        "sha256": "6c83221ab01aab806bfe798f3604f42fb5da1b31062223323905e374a78aec75",
+        "size_bytes": 209901
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 64,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        64
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c8",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "sha256": "d85b1d94ee14b2cc6b081bc7288d767a3747affb5feaaf6cd95d729f500fcb18",
+        "size_bytes": 19707907
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c8-extraction.json",
+        "sha256": "565578c04643be0ae635f0c51fb19288e438bf1dc233c1fa9b7f6c30fa214045",
+        "size_bytes": 429788
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 8,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p16k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p16k/kernel_details.csv",
+        "sha256": "18c459ca5b8ed2e0df7f7a184eb575ea27695630747d42b37566777f3650fda8",
+        "size_bytes": 16739604
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p16k-head-unpadding-extraction.json",
+        "sha256": "b5e60f89d682412175d38019b76afb3bb5a9cefebef9cb5ccd423b5c65ff847f",
+        "size_bytes": 368472
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 12,
+      "context_lower_bound": 16384,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p32k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p32k/kernel_details.csv",
+        "sha256": "0a5110616afdfebf11152221d5569491b1f4079db02282cf0e39d2bd5aeaa4a4",
+        "size_bytes": 16737785
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p32k-head-unpadding-extraction.json",
+        "sha256": "b122bc905cc92963e42cea8bb33157ca52aca0c2904bc1e377a46b4e59471b6e",
+        "size_bytes": 368435
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 12,
+      "context_lower_bound": 32768,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p4k/kernel_details.csv",
+        "sha256": "eaefbda6e8b6b899da943bd665806d65d1371c36e8696084bf79fdc7a9a221cc",
+        "size_bytes": 16916978
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p4k-head-unpadding-extraction.json",
+        "sha256": "2dca7f63671a87f3eaaaa730289f2becea5c4947bb5318434ea9ded8761ab512",
+        "size_bytes": 371162
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 12,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p8k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p8k/kernel_details.csv",
+        "sha256": "c5cb903d70a9a6ff2271182bdb46b2700369216d2ab3bca182107e2c525698e9",
+        "size_bytes": 16830467
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p8k-head-unpadding-extraction.json",
+        "sha256": "85ff72c6d57a2c90e9517fd8e928285b54cdf3bb68d9dfb5fcb28d17c7342115",
+        "size_bytes": 370050
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 12,
+      "context_lower_bound": 8192,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p16k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p16k/kernel_details.csv",
+        "sha256": "3c82010b83edbfcadd3b0ed04a5596980860c8c6801df044f8c6cf54cc914170",
+        "size_bytes": 15961222
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p16k-extraction.json",
+        "sha256": "4522a11d0f38f2bd09c79acbd272a8b8ee6ccc12fe5a69265ad199c68e2c8a7d",
+        "size_bytes": 365671
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 24,
+      "context_lower_bound": 16384,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p32k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p32k/kernel_details.csv",
+        "sha256": "79e7ecb6c145460b6dcfe12dff660a83bc1d402bd96abee873c008f7b4f8e3b8",
+        "size_bytes": 16214474
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p32k-extraction.json",
+        "sha256": "cb505b1c5faa8ac3c4f62566d2d12f7eb21eb494dc764e15fccd127d3c2d7a0e",
+        "size_bytes": 369618
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 24,
+      "context_lower_bound": 32768,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p4k/kernel_details.csv",
+        "sha256": "8e1b18f02318ab650d5b7444163dc7a0dd0dc2980bc6f70307c80990e130bfd3",
+        "size_bytes": 16801673
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p4k-extraction.json",
+        "sha256": "51ff6770f41a45dcf33dacfa61ba5b242535dafe8f6037ce32bb5ba8e0d64b40",
+        "size_bytes": 378567
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 24,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p8k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p8k/kernel_details.csv",
+        "sha256": "97f4a2cf48b4cca9c0d28e6567c26176d6d33542c193f5e757b2d39a46a3d749",
+        "size_bytes": 16382529
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p8k-extraction.json",
+        "sha256": "78d7116622c25df99474b0b2eb57711eae62776b93693527e67ce77b888982cc",
+        "size_bytes": 372232
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 24,
+      "context_lower_bound": 8192,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c2-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c2_p4k/kernel_details.csv",
+        "sha256": "1e816d73ff9a5743ee0b87648c591a5a46b7d944ee1b0424a2f4cf54fb9e2315",
+        "size_bytes": 18076883
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c2-p4k-extraction.json",
+        "sha256": "e3bbf3d37334e3a66694bf080d4e52f8d9694f45d769f5b049a6aa0b35d313ac",
+        "size_bytes": 377790
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 2,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        2
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c48-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c48_p4k/kernel_details.csv",
+        "sha256": "f864b8937e07ebf3b4e9879250f691c398cffd4d0c90b029046793fefdf86eea",
+        "size_bytes": 13444348
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c48-p4k-extraction.json",
+        "sha256": "a4cea5c2b1d8d1df7ba692b6ba5412cf2f79e40f50a88f5751bf6bf473ec5927",
+        "size_bytes": 322831
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 48,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        48
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c6-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c6_p4k/kernel_details.csv",
+        "sha256": "6af60db1a7aa74149627818fd872e81c9b26d18b62de661734fe3f3791e4c999",
+        "size_bytes": 16388913
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c6-p4k-head-unpadding-extraction.json",
+        "sha256": "11db010824a5cb8f63d130ddeefdad2aee5556f0696a595c170b36d0b2b463be",
+        "size_bytes": 363430
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 6,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c8-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c8_p4k/kernel_details.csv",
+        "sha256": "87a2cf8a81193173a769544908fc35eb485621378c0f6c98be2bad33a1c79ee3",
+        "size_bytes": 15948245
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c8-p4k-extraction.json",
+        "sha256": "5b6543c23443519516a8e5f1248a18d2ffad7850abce8210a8aea2c0c43c6a57",
+        "size_bytes": 365998
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 8,
+      "client_concurrency": 8,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c1",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "0ab84756eeed12352b0087ca6c9be43d720602a09ca907fdcb23ca7b671175d7",
+        "size_bytes": 19486354
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/edf89fa21c28d8a08bff8365e9387b344b8ae15487a31a92b3815074822426dd.json",
+        "sha256": "edf89fa21c28d8a08bff8365e9387b344b8ae15487a31a92b3815074822426dd",
+        "size_bytes": 606235
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 1,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        1
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c12",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "sha256": "e09199e5ab7e75012524a124fe87ebb63efd753235b976ab3e4496a944b254c4",
+        "size_bytes": 18280058
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/199969c81fa9706a732a8172a55cf980609e919a40bab601a302eb489116f5e1.json",
+        "sha256": "199969c81fa9706a732a8172a55cf980609e919a40bab601a302eb489116f5e1",
+        "size_bytes": 573176
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 12,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c16",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+        "sha256": "c3dcbef37969338502b7b93feb8f59033c51da7c73139ef9525314f6754bfc68",
+        "size_bytes": 17245372
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/8efe53d8062ec49f63496b0fbeacbb59bfd124fa1ee925800137248b8cb47bd1.json",
+        "sha256": "8efe53d8062ec49f63496b0fbeacbb59bfd124fa1ee925800137248b8cb47bd1",
+        "size_bytes": 564587
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 16,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c2",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "sha256": "a6c841b939055c4cb88ae455d05b6a2f18e196b6c649cc793278e5ad98c5b87a",
+        "size_bytes": 20946651
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c1c45d2db1e7fa52a8c2d212aa20221aff88a3b0f418bb293cc85a58cc0dfc7a.json",
+        "sha256": "c1c45d2db1e7fa52a8c2d212aa20221aff88a3b0f418bb293cc85a58cc0dfc7a",
+        "size_bytes": 614027
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 2,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        2
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c24",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+        "sha256": "e21e412d78c57ba02254e07f7a983c8972eb6db9e9f7e06e969394cd99a79357",
+        "size_bytes": 15173997
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/38ee940f2166722c821ea07556981882f67db2993b0fba5e4d5f9d089d4139a2.json",
+        "sha256": "38ee940f2166722c821ea07556981882f67db2993b0fba5e4d5f9d089d4139a2",
+        "size_bytes": 489277
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 24,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c32",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+        "sha256": "62b3f43b7c5da867768c3f3b2591cd247cd6acee0df7bfc6cb11a3cc8b3f5f94",
+        "size_bytes": 11662100
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/4ec7a720b54cac9270f60d62595c8aa57226ca30ca463f41e5671480a3e75bfb.json",
+        "sha256": "4ec7a720b54cac9270f60d62595c8aa57226ca30ca463f41e5671480a3e75bfb",
+        "size_bytes": 433661
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 32,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        32
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c4",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "462cfc90519918bc578b9e382fb8b9ba98f945e38c8be7483399af3e0af18db6",
+        "size_bytes": 20407999
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/0d0971d348f0909dedf291a8ef347ee8d20e950dd991ee70794b4dce863cdf9f.json",
+        "sha256": "0d0971d348f0909dedf291a8ef347ee8d20e950dd991ee70794b4dce863cdf9f",
+        "size_bytes": 602287
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 4,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        4
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c48",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+        "sha256": "c7a2bab6b8de5f798cdcd95fdea36d31b1bc6073b75070288b6bf1fd858462c9",
+        "size_bytes": 8707082
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5144350e325cb681d32041253020abb8ca52d704f29556bd19ae861d30a0b1b2.json",
+        "sha256": "5144350e325cb681d32041253020abb8ca52d704f29556bd19ae861d30a0b1b2",
+        "size_bytes": 365777
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 48,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        48
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c6",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "sha256": "0c29d27ae7fb3cb342f47f260b51fc8fc4a7757f043fc38349d3f36eb196501e",
+        "size_bytes": 20889791
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5ea89ca1657c4014737ad32ac6a99ba8b5c32835c04a251602d11a3dc8eb1e34.json",
+        "sha256": "5ea89ca1657c4014737ad32ac6a99ba8b5c32835c04a251602d11a3dc8eb1e34",
+        "size_bytes": 601858
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 6,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c64",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+        "sha256": "4efd9558d8bd621a57a224d796366888a899bd105ce278f3060ee704646e6134",
+        "size_bytes": 6984772
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/890b41b3e5cd60fa2604f06c874347ea261a0fc03f6c77cbde6ce046c769cc86.json",
+        "sha256": "890b41b3e5cd60fa2604f06c874347ea261a0fc03f6c77cbde6ce046c769cc86",
+        "size_bytes": 326760
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 64,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        64
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c8",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "sha256": "31cae10038155c42786bdab3cceca114b3cd4aab5d73976358f6b1b63ca0f314",
+        "size_bytes": 19160219
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/959b201faae46b31e64ba3a733f0005854323fe0f30b85423278e34150ce789e.json",
+        "sha256": "959b201faae46b31e64ba3a733f0005854323fe0f30b85423278e34150ce789e",
+        "size_bytes": 575261
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 8,
+      "context_lower_bound": 126000,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p16k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p16k/kernel_details.csv",
+        "sha256": "284379517c0bd73fc65585cefdb46cdf5143f37efe84b592fd34f5f02f6da802",
+        "size_bytes": 15901620
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/8d82e4c40b532cfd2467084529da75b9dabc4b09702b53b85aa221294e81c806.json",
+        "sha256": "8d82e4c40b532cfd2467084529da75b9dabc4b09702b53b85aa221294e81c806",
+        "size_bytes": 518003
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 12,
+      "context_lower_bound": 16384,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p32k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p32k/kernel_details.csv",
+        "sha256": "b5c18183a25ad5aa13d94ae1cbd4feec0109fbbbf0474dd4786ec9c0f8988339",
+        "size_bytes": 15725814
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/f1318f3551cc88422f3d685ccd0eb6d630c0039c0721dcc0fdda27d68e38c008.json",
+        "sha256": "f1318f3551cc88422f3d685ccd0eb6d630c0039c0721dcc0fdda27d68e38c008",
+        "size_bytes": 514215
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 12,
+      "context_lower_bound": 32768,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p4k/kernel_details.csv",
+        "sha256": "b98be4ef1438ff886f5c6e9f31418da690c5dd0c8ccd5c02f0354838f463439f",
+        "size_bytes": 14306099
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/1aaf963beab128ac894018fa192668829a659d6f23e2a194ded42929ebbff24b.json",
+        "sha256": "1aaf963beab128ac894018fa192668829a659d6f23e2a194ded42929ebbff24b",
+        "size_bytes": 482692
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 12,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p8k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p8k/kernel_details.csv",
+        "sha256": "6c79dd9157570d9442f63c1d266ee13772919a9818c5ac00487005d03ce0f7a9",
+        "size_bytes": 15282800
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/870ae383b8ce0f0c8bf671f91b0c57c502be12cc9930c4dc7d204124565dac55.json",
+        "sha256": "870ae383b8ce0f0c8bf671f91b0c57c502be12cc9930c4dc7d204124565dac55",
+        "size_bytes": 504031
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 12,
+      "context_lower_bound": 8192,
+      "native_attention_query_capacities": [
+        16
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p16k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p16k/kernel_details.csv",
+        "sha256": "ce775b31c94536e97ded1e2db3f051212c2d9df2f7f41af8263e465351f33d6c",
+        "size_bytes": 15898489
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/aac67ad13f7f1179fd24c1a1cf016b02ac36cccd50b1318ed494982a521b4501.json",
+        "sha256": "aac67ad13f7f1179fd24c1a1cf016b02ac36cccd50b1318ed494982a521b4501",
+        "size_bytes": 502163
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 24,
+      "context_lower_bound": 16384,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p32k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p32k/kernel_details.csv",
+        "sha256": "c8e5dbacc89540de33e2240809e25dbb0f92a525388f997ec76275b42bbbae1f",
+        "size_bytes": 16896921
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/b90392e92938d0a209b5f75e5c2826f78ebb68acbb6c7d085ba462e0e80de9ab.json",
+        "sha256": "b90392e92938d0a209b5f75e5c2826f78ebb68acbb6c7d085ba462e0e80de9ab",
+        "size_bytes": 523724
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 24,
+      "context_lower_bound": 32768,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p4k/kernel_details.csv",
+        "sha256": "0e3ffbdaa496b730037a8379bf609f8d3abef631cfcaa6a5ec37e220b691d62b",
+        "size_bytes": 16262648
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5c087f2c33ae5cf4d39e43991c795d3daa691a2f88e8e21d1499cadf70d7ffbb.json",
+        "sha256": "5c087f2c33ae5cf4d39e43991c795d3daa691a2f88e8e21d1499cadf70d7ffbb",
+        "size_bytes": 507038
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 24,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p8k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p8k/kernel_details.csv",
+        "sha256": "4ee7620db31ec4f2ca820792164dc8825b2218e921de7af383f019a61a4e493e",
+        "size_bytes": 16261759
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/d3676a11b7a33cce20535f4e4c2e0f920ca89f2143b00a89b12f8dde66aba031.json",
+        "sha256": "d3676a11b7a33cce20535f4e4c2e0f920ca89f2143b00a89b12f8dde66aba031",
+        "size_bytes": 509898
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 24,
+      "context_lower_bound": 8192,
+      "native_attention_query_capacities": [
+        24
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c2-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c2_p4k/kernel_details.csv",
+        "sha256": "45912269b0152dfd7a6832d22ce130b42bd21964ed145d6001076797454ad25b",
+        "size_bytes": 16924440
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/fd8ca5c7a0890f852ca2c78567a08945d4d5b8003495f62d0602d92f46f2ca3b.json",
+        "sha256": "fd8ca5c7a0890f852ca2c78567a08945d4d5b8003495f62d0602d92f46f2ca3b",
+        "size_bytes": 523402
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 2,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        2
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c48-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c48_p4k/kernel_details.csv",
+        "sha256": "6543b4af2e998914518e479b450679041fed3f985c14f1e0565da9e238ee76cb",
+        "size_bytes": 14534653
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/d26f26b0b049aec8d3e36c74754644be884c77313ea8e9ce663af0346cd72f5e.json",
+        "sha256": "d26f26b0b049aec8d3e36c74754644be884c77313ea8e9ce663af0346cd72f5e",
+        "size_bytes": 496509
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 48,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        48
+      ],
+      "assignment": "train",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c6-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c6_p4k/kernel_details.csv",
+        "sha256": "3f812e3b6f5528c55a29bb5631554f303f082f00d6215e208d8d704eafab3340",
+        "size_bytes": 17024693
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/26981dabca8082bae34530dd4a6c034d91cec2d12beaca696eaff677bc7b0be6.json",
+        "sha256": "26981dabca8082bae34530dd4a6c034d91cec2d12beaca696eaff677bc7b0be6",
+        "size_bytes": 518882
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 6,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c8-p4k",
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c8_p4k/kernel_details.csv",
+        "sha256": "fe9df220c08a1312a9e13230a7e5bf6d590a9e245fc0efe79d1cd94b146e09e6",
+        "size_bytes": 16531708
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/2d18b1af8f73e403f42785901f3371015d4931d3b1d1dc8d0fad8c8207d498e7.json",
+        "sha256": "2d18b1af8f73e403f42785901f3371015d4931d3b1d1dc8d0fad8c8207d498e7",
+        "size_bytes": 516780
+      },
+      "extraction_selection": "current source-identical Profiler extraction, including physical graph capacity and unpadded head alignment",
+      "tp": 16,
+      "client_concurrency": 8,
+      "context_lower_bound": 4096,
+      "native_attention_query_capacities": [
+        8
+      ],
+      "assignment": "validation",
+      "original_assignment": "unassigned",
+      "evaluation_relation": "retrospective"
+    }
+  ],
+  "physical_contract": {
+    "dtype": "bf16",
+    "hidden_width": 7168,
+    "query_rows": "native graph storage capacity; inactive rows remain allocated",
+    "local_rows": "ceil(native_query_capacity / tp)",
+    "allgather_input_bytes": "local_rows * hidden_width * 2",
+    "reduce_scatter_input_bytes": "tp * local_rows * hidden_width * 2",
+    "calls_per_body": {
+      "allgather": 9,
+      "reduce_scatter": 8
+    },
+    "call_structure": "four attention AG/RS + dense FFN AG/RS + three shared FFN AG/RS + final AG",
+    "topology": "two fixed single-node TP groups, 8 or 16 physical ranks; no unseen topology transfer",
+    "payload_basis": "source-conditional; raw HCOM input/output descriptors are N/A"
+  },
+  "training_policy": "per-collective, per-fixed-rank continuous payload interpolation; equal source weighting; no call ordinal, context or batch selector",
+  "validation_policy": "all remaining sources; retain unsupported payloads and all errors without refitting",
+  "limits": [
+    "Historical sources were unassigned; this retrospective split is not blind prospective validation.",
+    "HCOM duration includes the observed collective boundary and peer/control effects, not an isolated physical link rate.",
+    "AI_CPU controllers overlap HCOM and are not added. No Body duration is a fit target.",
+    "No runtime joint-collective execution boundary is installed by this evidence producer."
+  ]
+}

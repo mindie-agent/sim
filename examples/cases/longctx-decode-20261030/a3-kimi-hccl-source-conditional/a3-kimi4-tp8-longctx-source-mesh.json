@@ -1,0 +1,566 @@
+{
+  "name": "a3-kimi4-tp8-longctx-source-analytic",
+  "model": {
+    "name": "kimi-k3-4layer-w4a8-conditional",
+    "hf_config": {
+      "architectures": [
+        "KimiK3ForConditionalGeneration"
+      ],
+      "auto_map": {
+        "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+        "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+        "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+      },
+      "bos_token_id": 163584,
+      "dtype": "bfloat16",
+      "eos_token_id": 163586,
+      "ignore_index": -100,
+      "image_placeholder": "<|kimi_image_placeholder|>",
+      "media_placeholder_token_id": 163605,
+      "model_type": "kimi_k3",
+      "pad_token_id": 163839,
+      "text_config": {
+        "_name_or_path": "",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "add_cross_attention": false,
+        "architectures": [
+          "KimiLinearForCausalLM"
+        ],
+        "attn_res_block_size": 12,
+        "auto_map": {
+          "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+          "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+          "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+        },
+        "bad_words_ids": null,
+        "begin_suppress_tokens": null,
+        "bos_token_id": 163584,
+        "chunk_size_feed_forward": 0,
+        "cross_attention_hidden_size": null,
+        "decoder_start_token_id": null,
+        "diversity_penalty": 0,
+        "do_sample": false,
+        "dtype": "bfloat16",
+        "early_stopping": false,
+        "encoder_no_repeat_ngram_size": 0,
+        "eos_token_id": 163586,
+        "exponential_decay_length_penalty": null,
+        "finetuning_task": null,
+        "first_k_dense_replace": 1,
+        "forced_bos_token_id": null,
+        "forced_eos_token_id": null,
+        "hidden_act": "situ",
+        "hidden_size": 7168,
+        "id2label": {
+          "0": "LABEL_0",
+          "1": "LABEL_1"
+        },
+        "initializer_range": 0.02,
+        "intermediate_size": 33792,
+        "is_decoder": false,
+        "is_encoder_decoder": false,
+        "kv_lora_rank": 512,
+        "label2id": {
+          "LABEL_0": 0,
+          "LABEL_1": 1
+        },
+        "latent_moe_use_norm": true,
+        "length_penalty": 1,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "max_length": 20,
+        "max_position_embeddings": 1048576,
+        "min_length": 0,
+        "mla_use_nope": true,
+        "mla_use_output_gate": true,
+        "model_type": "kimi_linear",
+        "moe_intermediate_size": 3072,
+        "moe_layer_freq": 1,
+        "moe_renormalize": true,
+        "moe_router_activation_func": "sigmoid",
+        "no_repeat_ngram_size": 0,
+        "num_attention_heads": 96,
+        "num_beam_groups": 1,
+        "num_beams": 1,
+        "num_expert_group": 1,
+        "num_experts": 896,
+        "num_experts_per_token": 16,
+        "num_hidden_layers": 4,
+        "num_key_value_heads": 96,
+        "num_nextn_predict_layers": 0,
+        "num_return_sequences": 1,
+        "num_shared_experts": 2,
+        "output_attentions": false,
+        "output_hidden_states": false,
+        "output_scores": false,
+        "pad_token_id": 163839,
+        "prefix": null,
+        "problem_type": null,
+        "pruned_heads": {},
+        "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "remove_invalid_values": false,
+        "repetition_penalty": 1,
+        "return_dict": true,
+        "return_dict_in_generate": false,
+        "rms_norm_eps": 1e-05,
+        "routed_expert_hidden_size": 3584,
+        "routed_scaling_factor": 1,
+        "sep_token_id": null,
+        "suppress_tokens": null,
+        "task_specific_params": null,
+        "temperature": 1,
+        "tf_legacy_loss": false,
+        "tie_encoder_decoder": false,
+        "tie_word_embeddings": false,
+        "tokenizer_class": null,
+        "top_k": 50,
+        "top_p": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "torchscript": false,
+        "transformers_version": "4.56.2",
+        "typical_p": 1,
+        "use_bfloat16": false,
+        "use_cache": true,
+        "use_grouped_topk": true,
+        "v_head_dim": 128,
+        "vocab_size": 163840
+      },
+      "tie_word_embeddings": false,
+      "vision_config": {
+        "_attn_implementation": "flash_attention_2",
+        "activation_func": "gelu_pytorch_tanh",
+        "attn_bias": false,
+        "init_pos_emb_height": 64,
+        "init_pos_emb_time": 4,
+        "init_pos_emb_width": 64,
+        "linear_bias": false,
+        "merge_kernel_size": [
+          2,
+          2
+        ],
+        "merge_type": "sd2_tpool",
+        "mlp_type": "mlp2",
+        "mm_hidden_size": 1024,
+        "mm_projector_type": "patchmergerv2",
+        "norm_type": "rmsnorm",
+        "patch_embed_proj_bias": false,
+        "patch_size": 14,
+        "pos_emb_interpolation_mode": "bilinear",
+        "pos_emb_type": "divided_fixed",
+        "projector_hidden_act": "gelu",
+        "projector_ln_eps": 1e-05,
+        "qkv_hidden_size": 1536,
+        "text_hidden_size": 7168,
+        "vt_hidden_size": 1024,
+        "vt_intermediate_size": 4096,
+        "vt_num_attention_heads": 12,
+        "vt_num_hidden_layers": 27
+      }
+    },
+    "quant": {
+      "name": "W4A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int4",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "conv_weight_bf16",
+        "conv_weight_f32",
+        "embedding",
+        "lm_head",
+        "mtp",
+        "norm",
+        "projector",
+        "router",
+        "vision"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "kda": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "kda.q": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        },
+        "kda.k": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        },
+        "kda.v": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        },
+        "mla": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "mla.q_a": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        },
+        "mla.q_b": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        },
+        "mla.kv_a": {
+          "weight_format": "int8",
+          "activation_format": "int8"
+        }
+      },
+      "source": {
+        "kind": "conditional_capture_representation",
+        "basis": "sampled operand dtypes plus distinct checkpoint launch declaration",
+        "checkpoint_config_bytes": "not_delivered"
+      },
+      "notes": [
+        "No old checkpoint calibration or FP8 source binding is inherited."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "native V2 MC2 protocol remains declared analytical exchange",
+        "source scalar valid expert group_list and actual per-call sequence lengths unobserved",
+        "captured physical projection fusion/physical padded heads may differ from logical analytical operators"
+      ],
+      "degraded_submodules": [
+        "native_projection_packing",
+        "native_moe_dispatch"
+      ],
+      "checkpoint_contract": "conditional_source_and_tensor_declaration",
+      "field_evidence": {
+        "hidden_size": {
+          "value": 7168,
+          "basis": "router/input projection tensors"
+        },
+        "routed_expert_hidden_size": {
+          "value": 3584,
+          "basis": "latent projection and grouped matrix K/N"
+        },
+        "moe_intermediate_size": {
+          "value": 3072,
+          "basis": "grouped gate/up N6144 and down K3072"
+        },
+        "intermediate_size": {
+          "value": 33792,
+          "basis": "first dense layer N8448=2*33792/TP8, down K4224"
+        },
+        "num_shared_experts": {
+          "value": 2,
+          "basis": "MoE shared N1536=2*(2*3072)/TP8, down K768"
+        },
+        "linear_attn_config.num_heads": {
+          "value": 96,
+          "basis": "RecurrentKda local heads12 at TP8"
+        },
+        "linear_attn_config.head_dim": {
+          "value": 128,
+          "basis": "RecurrentKda native dimension"
+        },
+        "q_lora_rank": {
+          "value": 1536,
+          "basis": "q_a/q_b matrix operands"
+        },
+        "kv_lora_rank": {
+          "value": 512,
+          "basis": "FIA cache/head operands"
+        },
+        "qk_nope_head_dim": {
+          "value": 128,
+          "basis": "absorbed Q projection operands"
+        },
+        "qk_rope_head_dim": {
+          "value": 64,
+          "basis": "FIA RoPE operands"
+        },
+        "first_k_dense_replace": {
+          "value": 1,
+          "basis": "first dense FFN precedes router/grouped FFNs"
+        },
+        "num_hidden_layers": {
+          "value": 4,
+          "basis": "independent four-layer checkpoint launch declaration"
+        },
+        "attention_schedule": {
+          "value": [
+            "kda",
+            "kda",
+            "kda",
+            "mla"
+          ],
+          "basis": "bounded native capture first target cycle"
+        },
+        "num_experts": {
+          "value": 896,
+          "basis": "router N896; grouped weight bank112 at EP8"
+        },
+        "num_experts_per_token": {
+          "value": 16,
+          "basis": "MoeDistributeDispatchV2 top-k input [1,16]"
+        },
+        "num_attention_heads": {
+          "value": 96,
+          "basis": "q_b N2304=12*(128+64); native FIA separately pads local12 to16"
+        },
+        "quant": {
+          "value": "W4A8 experts, W8A8 QKV/dense/shared/latent; BF16 BFG/output/router",
+          "basis": "bounded native tensor contracts; source category overrides are explicit"
+        }
+      },
+      "retained_catalog_assumptions": {
+        "attn_res_block_size": 12,
+        "hidden_act": "situ",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "latent_moe_use_norm": true,
+        "rms_norm_eps": 1e-05,
+        "v_head_dim": 128,
+        "vocab_size": 163840,
+        "moe_router_activation_func": "sigmoid",
+        "routed_scaling_factor": 1,
+        "mla_use_output_gate": true,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "num_shared_experts": 2,
+        "first_k_dense_replace": 1
+      },
+      "catalog_assumption_source": {
+        "path": "/Users/maoxx241/code/sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
+        "bytes": 6991,
+        "sha256": "ceb15bb6babc95c3afc948f0887a732b69e8ac126dae36ef7b6aeb1effb2b46f"
+      },
+      "inheritance_note": "Values are explicit structural assumptions unless field_evidence independently confirms them; layer counts are this checkpoint, not a truncated accuracy surrogate.",
+      "current_capture_evidence": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/kimi-tp8-source-metadata.json",
+        "sha256": "6130d20ad44d5138503431aad1f0acd5b08e25ed3e021aa9794b28d9bd2d78c8",
+        "size_bytes": 172130
+      }
+    }
+  },
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "rates": {
+      "l2": 3630000000000
+    },
+    "buffers": {
+      "l2": 176160768
+    },
+    "resource_units": {
+      "l2": 1
+    },
+    "buffer_units": {
+      "l2": 1
+    },
+    "service_modes": {
+      "mte2_aic_cached": {
+        "resource": "mte2_aic",
+        "rate": 3630000000000
+      },
+      "l2_read": {
+        "resource": "l2",
+        "rate": 3630000000000
+      },
+      "l2_write": {
+        "resource": "l2",
+        "rate": 2838000000000
+      }
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 131072,
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.85,
+    "graph_mode": "auto",
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      },
+      "sequence_parallel": {
+        "implementation": "vllm_ascend_kimi_sequence_parallel",
+        "enable_expert_parallel": true,
+        "padding": "right_to_tp",
+        "attention_output": "separate_reduce_scatter",
+        "shard_materialization": "view",
+        "shared_expert_layout": "tp_sharded"
+      },
+      "lowerings": {
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch22",
+          "options": {
+            "use_beta_sigmoid": false
+          }
+        },
+        "kda_input_projection": "vllm_ascend_kda_mixed_projection",
+        "paged_mla_attention": {
+          "implementation": "ascend_paged_mla_decode_arch22",
+          "options": {
+            "retained_kv_rows": 512
+          }
+        }
+      },
+      "hccl": {
+        "allgather": {
+          "expansion": "AICPU_TS",
+          "template": "mesh",
+          "buffer_mode": "separate",
+          "axes": [
+            "tp"
+          ]
+        },
+        "reduce_scatter": {
+          "expansion": "AICPU_TS",
+          "template": "mesh",
+          "buffer_mode": "separate",
+          "axes": [
+            "tp"
+          ]
+        }
+      }
+    },
+    "metadata": {
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "deployment_evidence": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/kimi-tp8-source-metadata.json",
+        "sha256": "6130d20ad44d5138503431aad1f0acd5b08e25ed3e021aa9794b28d9bd2d78c8",
+        "size_bytes": 172130
+      },
+      "draft_proposal_tokens": 0,
+      "speculation": {
+        "enabled": false,
+        "basis": "resolved speculative_config=None, serve.log:62"
+      },
+      "routing_basis": "force_eplb=True observed startup; balanced routing remains an explicit analytic scenario, scalar group_list not captured",
+      "source_graph_mode": "FULL_DECODE_ONLY resolved startup; graph_mode=auto/full with the exact captured key list",
+      "sp_contract": "explicit Kimi source right-to-TP SP; sampled local router M1 versus attention M2; FlashComm1 disabled is separate from model-specific SP",
+      "unresolved_capture_contracts": [
+        "checkpoint config.json and quant-description bytes unavailable; scalar architecture assumptions are explicit in original template",
+        "Ascend910_9362 hardware inherited from source-bound A3 catalog; no per-suite npu-smi delivered",
+        "native V2 MC2 implementation / valid expert group list / exact captured binary not identified",
+        "per-call context scalar values unavailable; initial prompt and output bounds only"
+      ],
+      "calibration_origin": "analytic",
+      "calibration_evidence": {
+        "evaluation_relation": "not_declared",
+        "removed_historical_point_rule_count": 6,
+        "reason": "old c1/c4 overlapping exact matchers differ; no source/context/concurrency point selection"
+      },
+      "removed_historical_transport_assumption": "direct_peer_collective max_inflight_per_rank=8 was not established by this source; use untuned analytical default",
+      "source_mechanism_bindings": {
+        "basis": "Retained INT8 QKV/BF16 BFG projection and q1 BF16 latent512/rope64 paged MLA ABI; source-compatible, captured binary identity not established.",
+        "kda_input_projection_source_commit": "8cb47fd5951e016c25c6d176c7bdd2a437a8321a",
+        "paged_mla_source_commit": "0c21374b16da715b8532e8e6bf65a5ea6fc172c8",
+        "dispatch": "Source geometry-derived arch22 SplitCore; no observed timing or captured host endpoints supplied.",
+        "head_padding": "Generic quantized prolog retains its original precision; BF16-only prepared-head caller is not selected.",
+        "target_timing_used_for_parameters": false,
+        "retained_kv_source_commit": "297906443615291557064fc8f02c4f3bae5c84b1",
+        "retained_kv_scope": "Declared bounded 512-row QK-to-PV reuse of the same KV through L2; not observed cache hits, extra active KV rows, cross-request sharing or cross-forward warmth. No latency fit.",
+        "l2_platform_mapping": {
+          "source_commit": "ee3a4d5e",
+          "source": "data/verification/kimi-mla-cache-domain-20261030.producer.py:25-41; docs/operators/paged-mla-arch22.md",
+          "basis": "Explicit platform mapping: read 110 and write 86 bytes/cycle \u00d7 20 AIC owners \u00d7 1.65 GHz; 168 MiB shared L2 per physical die. Not a timing fit, measured cache-hit rate or SKU default.",
+          "resource_sharing": "Cached MTE2 uses the original mte2_aic pipe; L2 read/write share one l2 resource. Other rates, buffers and modes remain unchanged."
+        }
+      },
+      "conditional_hccl_source_control": {
+        "basis": "explicit_source_compatible_AICPU_TS_mesh_separate; captured_executor_and_payload_arguments_not_observed",
+        "canonical_input": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+          "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
+          "bytes": 17742
+        },
+        "fit": "none",
+        "unpriced": [
+          "hccl_copy",
+          "hccl_reduce",
+          "hccl_control"
+        ],
+        "limits": [
+          "HCOM event descriptors are N/A; payload is caller-declared only.",
+          "No source selector task constants are installed as measured hardware rates.",
+          "One physical node and original rank count are unchanged."
+        ]
+      }
+    },
+    "graph_capture_mode": "full",
+    "graph_capture_keys": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64
+    ]
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}
