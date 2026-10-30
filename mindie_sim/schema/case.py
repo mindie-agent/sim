@@ -51,6 +51,7 @@ class Software:
     kernel_format: str = ""
     kernels: dict = field(default_factory=dict)
     submission: dict = field(default_factory=dict)
+    serving_io: dict = field(default_factory=dict)
     attention_policy: dict = field(default_factory=dict)
     routing: dict = field(default_factory=dict)
     tensor_layouts: dict = field(default_factory=dict)

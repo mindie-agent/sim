@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import json
 import hashlib
 import math
@@ -20,6 +20,7 @@ from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.model import RequestSpec
 from mindie_sim.schema.workload import IterationPlan, RequestView
 from .capacity import Memory
+from .serving_io import TokenTimeline
 
 _PREEMPTED = object()
 
@@ -49,6 +50,8 @@ class Progress:
     acceptance_credit: float = 0
     release_ms: float = 0
     location: str = "prefill"
+    host_result: TokenTimeline = field(default_factory=TokenTimeline)
+    client_delivery: TokenTimeline = field(default_factory=TokenTimeline)
 
     def __post_init__(self):
         # A fully cached prefix still needs its final hidden state for sampling.
@@ -316,7 +319,7 @@ class Scheduler:
             if state.done:
                 self.memory.release(self.replica, view.request_id)
                 successor = self.successors.get(view.request_id)
-                if successor is not None:
+                if successor is not None and not self.case.runtime.serving_io:
                     successor.release_ms = max(successor.request.arrival_ms,
                                                state.finish_ms + successor.request.gap_ms)
             else:

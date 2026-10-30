@@ -23,6 +23,8 @@ from .engine import Engine, Event, Resource
 from .mechanism import Geometry, Work
 from .program import RecipeBook, RecipeContext
 from .topology import Topology
+from .serving_io import ServingIO
+from .step_metrics import StepSummary
 
 
 class ResourceRates(Mapping):
@@ -83,6 +85,9 @@ class ScheduledIteration:
     replay_scope: str
     operators: int
     commits: Mapping[str, Event]
+    device_complete: Event
+    host_results: Mapping[str, Event]
+    client_deliveries: Mapping[str, Event]
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +97,8 @@ class ScheduledIteration:
             "mode": self.mode, "valid_tokens": self.valid_tokens,
             "padded_tokens": self.padded_tokens, "graph_bucket": self.graph_bucket,
             "replay_scope": self.replay_scope, "operators": self.operators,
+            "device_end_ms": self.device_complete.time,
+            "host_result_ready_ms": max((event.time for event in self.host_results.values()), default=None),
         }
 
 
@@ -111,6 +118,8 @@ class Execution:
         submission: SubmissionPolicy | None = None, trace_limit: int = 0,
         engine: Engine | None = None, namespace: str = "",
         include_submission: bool = True, on_operator=None,
+        include_serving_io: bool = False,
+        client_tails=None,
     ):
         self.case, self.cost = case, cost
         self.namespace = namespace
@@ -123,6 +132,9 @@ class Execution:
         self.regimes = RegimePolicy(case.runtime.kernels.get("service_regimes", ()))
         self.submission = submission or SubmissionPolicy(**case.runtime.submission)
         self.submission_source = "api.submission" if submission is not None else "runtime.submission"
+        self.serving_io = ServingIO(case.runtime.serving_io if include_serving_io else {},
+                                    namespace, case.runtime.parallel.dp, client_tails)
+        self.step_summary = StepSummary()
         self.stage_names: dict[tuple[int, int], dict[str, str]] = {}
         self.stage_dies: dict[tuple[int, int], tuple[Any, ...]] = {}
         self.streams: dict[tuple[int, int, str], Event] = {}
@@ -131,6 +143,7 @@ class Execution:
         self.prepared = {}
         self.schedules = {}
         resources, pools, pool_units = [], {}, {}
+        resources.extend(self.serving_io.resources())
         p = case.runtime.parallel
         width = p.tp * p.pcp
         for replica in range(p.dp):
@@ -183,7 +196,7 @@ class Execution:
         self.recipes_used: dict[str, int] = {}
         self._collectives = None
 
-    def add_group(self, works, release_ms, *, external_inputs=None):
+    def add_group(self, works, release_ms, *, external_inputs=None, emitted_tokens=None):
         """Compile an EP cohort before releasing any of its collective events."""
         graphs = bind_cohort_traffic(self.case, {r: work.ops for r, work in works.items()})
         works = {r: replace(work, ops=graphs[r]) for r, work in works.items()}
@@ -191,6 +204,7 @@ class Execution:
         steps = {replica: self.add(
             work, replica, release_ms,
             external_inputs=(external_inputs or {}).get(replica),
+            emitted_tokens=(emitted_tokens or {}).get(replica),
         ) for replica, work in works.items()}
         for key, participants in self._collectives.items():
             if len(participants) != len(works):
@@ -388,7 +402,7 @@ class Execution:
         return context
 
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
-            external_inputs=None) -> ScheduledIteration:
+            external_inputs=None, emitted_tokens=None) -> ScheduledIteration:
         if self._collectives is None:
             work = replace(work, ops=bind_cohort_traffic(
                 self.case, {replica: work.ops})[replica])
@@ -404,6 +418,7 @@ class Execution:
             schedule = engine.submit(prefix + ":schedule", {f"{self.namespace}scheduler@r{replica}": scheduler_ms},
                                      release=release_ms, owner=f"replica:{replica}")
         self.schedules[replica] = schedule
+        prepared, input_ready = self.serving_io.input(self, prefix, replica, schedule, work)
         graph_launch: dict[int, Event] = {}
         physical_ops = self.recipes.expand(work.ops)
         from .kernel_groups import KernelGroups, declaration
@@ -414,7 +429,7 @@ class Execution:
             stage_key = replica, op.stage
             name = prefix + ":" + op.op_id
             names = self.stage_names[stage_key]
-            deps = [schedule, *(ids[key] for key in op.deps)]
+            deps = [input_ready, *(ids[key] for key in op.deps)]
             deps.extend(kernel_groups.entry_dependencies(op, ids))
             stream_key = replica, op.stage, op.stream or "main"
             stream_tail = kernel_groups.stream_tail(op, stream_key)
@@ -436,7 +451,7 @@ class Execution:
                 else:
                     dies = self.stage_dies[stage_key]
                     duration = self.submission.launch_ms(dies, captured=captured)
-                    host_deps = (schedule,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
+                    host_deps = (prepared,) + ((self.hosts[stage_key],) if stage_key in self.hosts else ())
                     launch = engine.submit(name + ":submit", {names["host"]: duration},
                                            after=host_deps, owner=owner)
                     self.hosts[stage_key] = launch
@@ -469,15 +484,29 @@ class Execution:
                 commits.update((request, complete) for request in op.requests)
             for key in self.work:
                 self.work[key] += float(getattr(op, key))
-        completion = engine.submit(prefix + ":complete",
-                                   after=tuple(ids[op.op_id] for op in physical_ops) or (schedule,),
+        device_complete = engine.submit(prefix + ":device_complete",
+                                        after=tuple(ids[op.op_id] for op in physical_ops) or (input_ready,),
+                                        owner=f"replica:{replica}")
+        completion = engine.submit(prefix + ":complete", after=(device_complete,),
                                    latency=self.submission.completion_ms if self.include_submission else 0,
                                    owner=f"replica:{replica}")
         for view in work.plan.requests:
             commits.setdefault(view.request_id, completion)
-        return ScheduledIteration(replica, work.plan.iteration, completion, release_ms,
+        host_results, clients, host_complete = self.serving_io.output(
+            self, prefix, replica, work, commits, completion,
+            emitted_tokens if emitted_tokens is not None else {
+                view.request_id: int(view.draft_advanced_tokens or 1)
+                for view in work.plan.requests if view.samples})
+        if self.serving_io.enabled:
+            completion = engine.submit(prefix + ":step_ready", after=(completion, host_complete),
+                                       owner=f"replica:{replica}")
+        step = ScheduledIteration(replica, work.plan.iteration, completion, release_ms,
                                   work.mode, work.valid_tokens, work.padded_tokens,
-                                  work.graph_bucket, scope, len(physical_ops), commits)
+                                  work.graph_bucket, scope, len(physical_ops), commits,
+                                  device_complete, host_results, clients)
+        engine.submit(prefix + ":step_metrics", after=(completion,),
+                      on_complete=lambda _: self.step_summary.record(step))
+        return step
 
     def prepare_next(self, replica):
         if self.include_submission and self.case.runtime.async_scheduling:
@@ -516,5 +545,7 @@ class Execution:
                if self.cost.joint_native else {}),
             "recipes": dict(self.recipes_used),
             "submission": self.submission_summary(),
+            "serving_io": self.serving_io.summary(),
+            "step_summary": self.step_summary.to_dict(),
             "rank_model": "representative_local_shard_per_stage",
         }
