@@ -126,7 +126,7 @@ def attention_contract(op):
         return _scfa_attention_contract(op, view)
     if op.get("recipe") == "ascend_sparse_flash_attention_arch22":
         return _indexed_attention_contract(op, view)
-    if op.get("recipe") == "ascend_paged_mla_decode_arch35":
+    if op.get("recipe") in {"ascend_paged_mla_decode_arch35", "ascend_paged_mla_decode_arch22"}:
         return _paged_mla_attention_contract(op, view)
     if not view or op.get("source_boundary"):
         return None
@@ -150,11 +150,12 @@ def _paged_mla_attention_contract(op, view):
     geometry = op["metadata"].get("paged_mla_geometry", {})
     batch = len(geometry.get("contexts", ()))
     heads, page = geometry.get("heads", 0), geometry.get("page_size", 0)
+    key_tile = 512 if op.get("recipe") == "ascend_paged_mla_decode_arch22" else 128
     if (not view or view.get("kind") != "paged_latent"
             or op.get("source_boundary") != "kernel"
             or op["metadata"].get("implementation_binding", {}).get("implementation")
-            != "ascend_paged_mla_decode_arch35"
-            or batch < 1 or not 1 <= heads <= 64 or page < 1 or 128 % page
+            != op.get("recipe")
+            or batch < 1 or not 1 <= heads <= 64 or page < 1 or key_tile % page
             or tuple(op["local_shape"]) != (batch, heads, 1, 512)
             or tuple(view.get("query_shape", ())) != (batch, heads, 1, 512)
             or tuple(view.get("query_rope_shape", ())) != (batch, heads, 1, 64)
