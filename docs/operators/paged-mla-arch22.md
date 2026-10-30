@@ -76,3 +76,14 @@ python3 data/verification/kimi-mla-cache-domain-20261030.producer.py \
 Use `--scope core` or `--scope layer` for narrower boundaries and
 `--retained-kv-rows 0` for the cold comparison. Native duration, model label,
 TP label and Body totals never set retention, rates, ownership or work.
+
+The eight retained full-body controls are in
+`data/verification/kimi-mla-body-domain-20261030.json`. At TP8, B1@128K,
+B24@4K/32K and B64@128K have body errors −17.07%, −19.43%, −11.32% and
+−10.70%; TP16 gives −4.52%, −3.79%, +6.30% and −7.55%. Each uses the
+prompt lower bound because per-call context values are not captured. The
+artifact retains native body/activity/gap statistics and all four layer
+spans. Two TP8 points remain outside 15%; no all-domain pass is claimed.
+All controls completed in 0.72–44.24 seconds below 42 MB peak RSS, with no
+live tasks/programs and released buffers to floating-point precision
+(maximum residual 2.33e−10 bytes).
