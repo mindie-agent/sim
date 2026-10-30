@@ -9,7 +9,7 @@ from bisect import bisect_right
 from collections import Counter, defaultdict
 from decimal import Decimal
 from hashlib import sha256
-import argparse, csv, json, resource, signal, sys, time
+import argparse, csv, gzip, json, resource, signal, sys, time
 from pathlib import Path
 
 parser=argparse.ArgumentParser(description=__doc__)
@@ -43,7 +43,8 @@ layer_starts=[[s['start_ns'] for s in stages] for stages in layers]
 groups={}; counts=Counter(); forward_counts=[Counter() for _ in forwards]
 hcom_seen=set(); latest_forward=-1
 abi_keys=['Type','Accelerator Core','Input Shapes','Input Data Types','Input Formats','Output Shapes','Output Data Types','Output Formats','Block Num','Mix Block Num']
-with source_path.open(newline='') as f:
+opener=gzip.open if source_path.suffix=='.gz' else open
+with opener(source_path,'rt',newline='') as f:
  reader=csv.DictReader(f)
  for line,row in enumerate(reader,2):
   counts['rows_scanned']+=1
