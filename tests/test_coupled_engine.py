@@ -55,3 +55,32 @@ def test_fifo_eligibility_does_not_consume_other_coupled_resources_early():
     assert engine.serviced == pytest.approx({"queue": 5, "read": 0})
     engine.advance(until=(later,))
     assert later.time == pytest.approx(7)
+
+
+@pytest.mark.parametrize('right_owners', ((1, 3), (3, 1)))
+def test_capped_flows_and_independent_components_share_only_their_owners(right_owners):
+    # Only two of four owners participate: 60 read and 40 compute units/ms.
+    # The capped flow takes (12, 4). Compute then splits its remaining 36
+    # between the second coupled flow and the ordinary compute component.
+    # The ordinary read component can reclaim the final 30 read units/ms.
+    engine = Engine([Resource('read', 120, units=4), Resource('compute', 80, units=4)])
+    placement = {'read': (1, 3), 'compute': (1, 3)}
+    left = engine.submit('capped', {'read': 60, 'compute': 20},
+                         placement=placement, caps={'read': 12}, coupled=True)
+    right = engine.submit('coupled', {'read': 60, 'compute': 60}, coupled=True,
+                          placement={'read': right_owners, 'compute': right_owners})
+    ordinary = engine.submit('independent-components', {'read': 20, 'compute': 20},
+                             placement=placement)
+    # A disjoint owner cannot affect the rates or lend its unused capacity.
+    separate = engine.submit('other-owner', {'read': 100}, placement={'read': (0,)})
+    engine._settle()
+    rates = engine._rates()
+    assert rates['read'] == pytest.approx({left.sequence: 12, right.sequence: 18,
+                                           ordinary.sequence: 30, separate.sequence: 30})
+    assert rates['compute'] == pytest.approx({left.sequence: 4, right.sequence: 18,
+                                              ordinary.sequence: 18})
+    engine.advance(horizon=0.5)
+    assert engine.serviced == pytest.approx({'read': 45, 'compute': 20})
+    engine.advance()
+    assert engine.serviced == pytest.approx({'read': 240, 'compute': 100})
+    assert engine.summary()['live_tasks'] == 0

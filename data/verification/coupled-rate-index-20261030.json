@@ -1,0 +1,180 @@
+{
+  "schema": "mindie-coupled-rate-index-control/1",
+  "purpose": "CPU implementation optimization; preserves physical allocation and all measured virtual execution values",
+  "reference_git_revision": "148bb8c4",
+  "reference_solver": {
+    "path": "/tmp/coupled-before-index.py",
+    "sha256": "27b49740685c233d8b64e356702f2cd1644e4311d72ba8af9e1aa7b25794b1c5",
+    "bytes": 3765
+  },
+  "solver": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/coupled.py",
+    "sha256": "ded01c62e242d8dceeb5125ae8058d92411e68dbe221351ef5505721da0dc26b",
+    "bytes": 5541
+  },
+  "control_driver": {
+    "path": "/tmp/benchmark-kimi-coupled.py",
+    "sha256": "674a9b7a81fad437a9cbb764b5a736f7bbf16b82635a8e22cfc9d80b27ada5f7",
+    "bytes": 3719
+  },
+  "source_pipeline": [
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22.py",
+      "sha256": "8e41e94710c1afe598559981b6e55aed7d1334acc746b3db43d6a68f1e50a9ae",
+      "bytes": 13615
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22_matrix.py",
+      "sha256": "cecd717d123adc5ca97f9aebed3e7a8ded0a055b470bb4577d1fbfbaddea9cc3",
+      "bytes": 3493
+    }
+  ],
+  "changes": [
+    "allocation-local dense flow and owner indices",
+    "identical owner constraints share one representative with original per-unit capacity",
+    "only affected owner slopes recomputed, in original insertion order; no subtractive coefficient update",
+    "no cross-call cache or retained historical tasks"
+  ],
+  "pure_allocation_controls": {
+    "seed": 301030,
+    "scenarios": 2000,
+    "scope": "mixed coupled and independent flows, finite caps, FIFO, overlapping/pinned/all-owner placement; exact previous-solver equality",
+    "driver": {
+      "path": "/tmp/compare-coupled-index.py",
+      "sha256": "df87d6ab4aa68caf7910b8e25af5bc3d18d59e72c3bb4dddef17da092e815acb",
+      "bytes": 1540
+    }
+  },
+  "targeted_tests": {
+    "passed": 85,
+    "elapsed_seconds": 0.76,
+    "files": [
+      "tests/test_coupled_engine.py",
+      "tests/test_owner_rate_templates.py",
+      "tests/test_prediction_engine.py",
+      "tests/test_paged_mla_arch22.py",
+      "tests/test_paged_mla_arch22_pipeline.py",
+      "tests/test_execution_rate_view.py",
+      "tests/test_steady_pipeline.py",
+      "tests/test_matrix_steady.py"
+    ]
+  },
+  "controls": [
+    {
+      "tp": 8,
+      "batch_slots": 64,
+      "context_tokens": 126000,
+      "scope": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
+      "operator_count": 59,
+      "before_wall_seconds": 59.28332716599107,
+      "after_wall_seconds": 30.359932249994017,
+      "speedup": 1.9526831179276676,
+      "after_peak_rss_bytes": 40124416,
+      "graph_duration_ms": 21.670257544185514,
+      "attention_duration_ms": 19.351176337195934,
+      "exact_timeline_equal": true,
+      "exact_engine_execution_equal": true,
+      "exact_source_work_equal": true,
+      "timeline_sha256": "9ab6a08311617b38c751a33290d5467f0769e419cfc72e4e4864ea764f8fbaff",
+      "engine_execution_sha256": "999ba05b2064cc548cacab62f354d089e636ad3b68d9297d8cfbc22d4612f7d3",
+      "source_work": {
+        "matrix_flops": {
+          "bf16": 280791875584
+        },
+        "resources": {
+          "mte3": 775690240,
+          "fixpipe": 1034158080,
+          "vector": 1075862064,
+          "hbm": 21458906624,
+          "mte2_aic": 18098339328,
+          "mte1": 19743768576,
+          "mte2_aiv": 520165376
+        }
+      },
+      "execution": {
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": -2.3283064365386963e-10,
+          "ub@r0:s0": 0.0
+        },
+        "peak_live_tasks": 1105,
+        "completed_tasks": 225414
+      },
+      "before_run": {
+        "path": "/tmp/kimi-coupled-before-tp8.json",
+        "sha256": "a4560c3d2cae69260cc4906edf88ecc7fa055ec9e3593f774b6845f5468dfc66",
+        "bytes": 48979
+      },
+      "after_run": {
+        "path": "/tmp/kimi-coupled-final-tp8.json",
+        "sha256": "997a698972297b48e4febc3a4572fb3115ce3d76de6147c876eb994ac3db7ce0",
+        "bytes": 48980
+      }
+    },
+    {
+      "tp": 16,
+      "batch_slots": 64,
+      "context_tokens": 126000,
+      "scope": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
+      "operator_count": 59,
+      "before_wall_seconds": 68.43701274995692,
+      "after_wall_seconds": 36.597652832977474,
+      "speedup": 1.8699836588506458,
+      "after_peak_rss_bytes": 39993344,
+      "graph_duration_ms": 20.63189620319916,
+      "attention_duration_ms": 18.87503899165871,
+      "exact_timeline_equal": true,
+      "exact_engine_execution_equal": true,
+      "exact_source_work_equal": true,
+      "timeline_sha256": "f47e323cbe225a7e9aa0c1022cbac4ef6e263160c7980fb0dfda70361b15dde7",
+      "engine_execution_sha256": "9c261da1228adae433fe3c7aa8db55763e54ac0918bba4b7e74d85c5e5a32f7c",
+      "source_work": {
+        "matrix_flops": {
+          "bf16": 280791875584
+        },
+        "resources": {
+          "mte2_aic": 17823627776,
+          "fixpipe": 1034158080,
+          "vector": 554033432,
+          "mte3": 645483520,
+          "mte2_aiv": 260082688,
+          "mte1": 19743768576,
+          "hbm": 20793905664
+        }
+      },
+      "execution": {
+        "live_tasks": 0,
+        "live_programs": 0,
+        "live_allocated": {
+          "l0a@r0:s0": 0.0,
+          "l0b@r0:s0": 0.0,
+          "l0c@r0:s0": 0.0,
+          "l1@r0:s0": -2.3283064365386963e-10,
+          "ub@r0:s0": 0.0
+        },
+        "peak_live_tasks": 1029,
+        "completed_tasks": 226405
+      },
+      "before_run": {
+        "path": "/tmp/kimi-coupled-before-tp16.json",
+        "sha256": "88cc9015af635f90c2646fbe3f2c3c30af5ffeda8c60db97642a58bd809e6ba0",
+        "bytes": 56942
+      },
+      "after_run": {
+        "path": "/tmp/kimi-coupled-final-tp16.json",
+        "sha256": "6dabcf099fdd64a15a3f41b513902727fd3f5e047d8a2cf9ad4f66dea4ac733e",
+        "bytes": 56943
+      }
+    }
+  ],
+  "measurement_limits": [
+    "CPU wall times are local single-process controls, not device benchmark timings",
+    "macOS ru_maxrss is recorded in bytes",
+    "before/after use the same committed source pipeline and ordinary complete layer-3 graph",
+    "runtime accuracy against measured device durations is not evaluated"
+  ]
+}

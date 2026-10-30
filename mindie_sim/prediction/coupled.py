@@ -22,57 +22,99 @@ def coupled_rates(resources, tasks):
         for name in task.remaining:
             if resources[name].policy == "fifo":
                 fifo_first[name] = min(key, fifo_first.get(name, key))
-    coefficients, limits, consumers = {}, {}, {}
+    # Dense ordinals are local to this allocation. They avoid repeatedly
+    # hashing (task, component) and (resource, owner) in progressive filling;
+    # no completed task, prior allocation or clock state is retained.
+    keys, coefficients, limits, owners = [], [], [], []
+    consumers, capacities, members, default_units = [], [], {}, {}
     for key, task in tasks.items():
         if not task.remaining:
             continue
         groups = [tuple(task.remaining)] if task.coupled else [
             (name,) for name in task.remaining]
-        for index, names in enumerate(groups):
-            flow = key, index
-            scale = max(task.remaining[name] / resources[name].rate for name in names)
+        for names in groups:
+            flow = len(keys)
+            keys.append(key)
+            owners.append([])
+            scale = (task.remaining[names[0]] / resources[names[0]].rate if len(names) == 1
+                     else max(task.remaining[name] / resources[name].rate for name in names))
             demand = {name: task.remaining[name] / scale for name in names}
-            coefficients[flow] = demand
+            coefficients.append(demand)
             limit = math.inf
             for name, amount in demand.items():
                 resource = resources[name]
-                limit = min(limit, task.caps.get(name, math.inf) / amount)
+                cap = task.caps.get(name)
+                if cap is not None:
+                    limit = min(limit, cap / amount)
                 if name in fifo_first and fifo_first[name] != key:
                     limit = 0
-                units = task.placement.get(name, tuple(range(resource.units)))
-                for unit in units:
-                    consumers.setdefault((name, unit), {})[flow] = amount / len(units)
-            limits[flow] = limit
+                units = task.placement.get(name)
+                if units is None:
+                    if name not in default_units:
+                        default_units[name] = tuple(range(resource.units))
+                    units = default_units[name]
+                per_unit = amount / len(units)
+                members.setdefault(name, []).append((flow, per_unit, units))
+            limits.append(limit)
 
-    remaining = {pair: resources[pair[0]].rate / resources[pair[0]].units
-                 for pair in consumers}
-    assigned = dict.fromkeys(coefficients, 0.0)
-    active = {flow for flow in coefficients if limits[flow] > 0}
-    while active:
-        slopes = {pair: sum(value for flow, value in rows.items() if flow in active)
-                  for pair, rows in consumers.items()}
-        bounds = {pair: remaining[pair] / slope
-                  for pair, slope in slopes.items() if slope}
-        delta = min(min(bounds.values()), min(limits[flow] - assigned[flow]
-                                             for flow in active))
-        for flow in active:
+    for name, rows in members.items():
+        common = rows[0][2]
+        if all(units == common for _, _, units in rows):
+            # Identical placement gives every participating owner the exact
+            # same constraint. One representative preserves its per-unit
+            # capacity; it neither pools idle units nor changes contention.
+            groups = [tuple((flow, amount) for flow, amount, _ in rows)]
+        else:
+            by_unit = {}
+            for flow, amount, units in rows:
+                for unit in units:
+                    by_unit.setdefault(unit, []).append((flow, amount))
+            groups = by_unit.values()
+        capacity = resources[name].rate / resources[name].units
+        for rows in groups:
+            slot = len(consumers)
+            consumers.append(rows)
+            capacities.append(capacity)
+            for flow, _ in rows:
+                owners[flow].append(slot)
+
+    remaining = capacities
+    assigned = [0.0] * len(keys)
+    active = [limit > 0 for limit in limits]
+    pending = [flow for flow, enabled in enumerate(active) if enabled]
+    slopes = [sum(value for flow, value in rows if active[flow])
+              for rows in consumers]
+    while pending:
+        # Keep each owner's insertion order and sum from zero, preserving
+        # floating-point arithmetic as flows retire. Subtracting retired
+        # coefficients from a cached sum would introduce cancellation drift.
+        bounds = [amount / slope if slope else math.inf
+                  for amount, slope in zip(remaining, slopes)]
+        delta = min(min(bounds), min(limits[flow] - assigned[flow]
+                                     for flow in pending))
+        for flow in pending:
             assigned[flow] += delta
-        for pair, slope in slopes.items():
-            remaining[pair] = max(0.0, remaining[pair] - delta * slope)
-        saturated = {pair for pair, bound in bounds.items() if bound <= delta}
-        # Use the existing resource-to-flow index once per saturated resource.
-        # Testing every active flow against every saturated unit is quadratic
-        # for multi-rank pipelines, although the exclusion set is identical.
-        blocked = set()
-        for pair in saturated:
-            blocked.update(consumers[pair])
-        active -= {flow for flow in active
-                   if assigned[flow] >= limits[flow]
-                   or flow in blocked}
+        for slot, slope in enumerate(slopes):
+            if slope:
+                remaining[slot] = max(0.0, remaining[slot] - delta * slope)
+            if bounds[slot] <= delta:
+                for flow, _ in consumers[slot]:
+                    active[flow] = False
+        survivors, changed = [], set()
+        for flow in pending:
+            if active[flow] and assigned[flow] < limits[flow]:
+                survivors.append(flow)
+            else:
+                active[flow] = False
+                changed.update(owners[flow])
+        pending = survivors
+        if pending:
+            for slot in changed:
+                slopes[slot] = sum(value for flow, value in consumers[slot] if active[flow])
 
     result = {}
-    for (key, index), fraction in assigned.items():
+    for flow, fraction in enumerate(assigned):
         if fraction:
-            for name, amount in coefficients[key, index].items():
-                result.setdefault(name, {})[key] = amount * fraction
+            for name, amount in coefficients[flow].items():
+                result.setdefault(name, {})[keys[flow]] = amount * fraction
     return result
