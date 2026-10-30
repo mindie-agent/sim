@@ -163,6 +163,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     long_store = store if plan.cache_kind == "dense" else None
     compressed_latent = None
     index_store, topk, candidate = None, None, None
+    pool_weights = None
 
     def owner(mapping, layer, name, volume):
         if layer not in mapping:
@@ -191,7 +192,14 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                rows * cache_format(model, "compressed_kv").row_bytes(
                                    plan.cache_row_elements) / cp)
 
-    if plan.owns_index_k:
+    if plan.index_kpool > 1 and (parallel.cp != 1 or parallel.pcp != 1):
+        raise ModelingError("pooled_indexer_context_partition_not_declared")
+    if plan.owns_index_k and plan.index_kpool > 1:
+        from .index_pool import producer
+        index_store, pool_weights = producer(
+            b, source=deps, views=views, plan=plan, model=model, quant=quant,
+            padded_tokens=q)
+    elif plan.owns_index_k:
         index_source = long_store if plan.index_input == "compressed" else deps
         if (plan.index_input == "compressed"
                 and cache_format(model, "compressed_kv").group_size):
@@ -232,17 +240,19 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                                 sum(index_selection_cost(model, plan, v.kv_len).index_read_bytes for v in views))
         q_index = b.matrix("index_q", (q_norm,), q, plan.index_heads * plan.index_dim,
                            plan.q_lora_rank, category="indexer_fp8")
-        q_index = b.vector(
-            "index_query_rotary", (q_index,), valid * plan.index_heads * plan.qk_rope_head_dim, 6,
-            family="rotary", shape=(valid, plan.index_heads, plan.index_dim))
+        if plan.index_kpool == 1:
+            q_index = b.vector(
+                "index_query_rotary", (q_index,), valid * plan.index_heads * plan.qk_rope_head_dim, 6,
+                family="rotary", shape=(valid, plan.index_heads, plan.index_dim))
         q_index = index_representation(
-            b, "index_query", q_index, valid * plan.index_heads, plan.index_dim,
+            b, "index_query", q_index, (q if plan.index_kpool > 1 else valid) * plan.index_heads, plan.index_dim,
             quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
         weights_input = deps
         weights_dtype = compute_dtype_for(b.quant, "indexer.weights")[1]
         # A declared FP32 projection consumes an FP32 input, not a BF16
         # allocation relabelled by the matrix's compute identity.
-        if weights_dtype in {"fp32", "fp16", "bf16"} and weights_dtype != model.activation_dtype:
+        if (pool_weights is None and weights_dtype in {"fp32", "fp16", "bf16"}
+                and weights_dtype != model.activation_dtype):
             weights_input = b.vector(
                 "index_weights_input_cast", (deps,), q * h, 1,
                 family="cast", dtype=weights_dtype, shape=(q, h),
@@ -250,8 +260,11 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 write_bytes_override=q * h * dtype_bytes(weights_dtype),
                 metadata=(("input_format", model.activation_dtype),
                           ("output_format", weights_dtype)))
-        weights = b.matrix("index_weights", (weights_input,), q, plan.index_heads, h,
-                            category="indexer.weights")
+        # The KPool producer's fused [K, head weights] projection exposes a
+        # strided column view. Its consumer cast reads only the head slice.
+        weights = pool_weights or b.matrix(
+            "index_weights", (weights_input,), q, plan.index_heads, h,
+            category="indexer.weights")
         if quant.index_dtype == "int8":
             weights = b.vector(
                 "index_weights_fp16", (weights,), q * plan.index_heads, 1,
@@ -259,27 +272,47 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 read_bytes_override=q * plan.index_heads * dtype_bytes(weights_dtype),
                 write_bytes_override=q * plan.index_heads * 2,
                 metadata=(("source_semantics", "quant_indexer_weights_float16"),))
+        elif plan.index_kpool > 1:
+            if weights_dtype != quant.index_dtype:
+                weights = b.vector(
+                    "index_weights_cast", (weights,), q * plan.index_heads, 1,
+                    family="cast", dtype=quant.index_dtype, shape=(q, plan.index_heads),
+                    read_bytes_override=q * plan.index_heads * dtype_bytes(weights_dtype),
+                    write_bytes_override=q * plan.index_heads * dtype_bytes(quant.index_dtype),
+                    metadata=(("input_format", weights_dtype), ("output_format", quant.index_dtype))
+                    + ((("input_column_slice", (plan.index_dim, plan.index_dim + plan.index_heads)),)
+                       if pool_weights else ()))
+            weights = b.vector("index_weights_scale", (weights,), q * plan.index_heads, 1,
+                               dtype=quant.index_dtype, shape=(q, plan.index_heads))
         selection_deps = [q_index, weights, index_store]
         if plan.candidate_filter:
             selection_deps.append(owner(candidate_ids, plan.candidate_source_layer_id, "candidate",
                                         valid * plan.candidate_topk_blocks * 4))
-        rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
-                   plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
-                   for v in views)
         shard = cp if parallel.cp_plan == "dsa_cp" else 1
-        scores = b.work("index_scores", selection_deps, (valid, plan.index_heads, plan.index_dim),
-                        flops=2 * rows * plan.index_heads * plan.index_dim / shard,
-                        vector=rows * plan.index_heads * 2 / shard,
-                        read=rows * index_row_bytes(model, plan.index_dim) / shard,
-                        write=rows * 4 / shard, family="indexer", dtype=quant.index_dtype)
-        topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
-                     vector=rows * math.log2(max(2, plan.index_topk)) / shard,
-                     read=rows * 4 / shard, write=valid * plan.index_topk * 4,
-                     family="topk", dtype="fp32",
-                     metadata=(("selection_output_dtype", "int32"),))
-        declare_indexer(
-            b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model, quant=quant,
-            tokens=valid, scores=scores, topk=topk)
+        if plan.index_kpool > 1:
+            from .index_pool import selection
+            binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
+                       if runtime else None)
+            topk = selection(b, query=q_index, weights=weights, cache=index_store,
+                             views=views, plan=plan, quant=quant, padded_tokens=q,
+                             **(binding.options if binding else {}))
+        else:
+            rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
+                       plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
+                       for v in views)
+            scores = b.work("index_scores", selection_deps, (valid, plan.index_heads, plan.index_dim),
+                            flops=2 * rows * plan.index_heads * plan.index_dim / shard,
+                            vector=rows * plan.index_heads * 2 / shard,
+                            read=rows * index_row_bytes(model, plan.index_dim) / shard,
+                            write=rows * 4 / shard, family="indexer", dtype=quant.index_dtype)
+            topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
+                         vector=rows * math.log2(max(2, plan.index_topk)) / shard,
+                         read=rows * 4 / shard, write=valid * plan.index_topk * 4,
+                         family="topk", dtype="fp32",
+                         metadata=(("selection_output_dtype", "int32"),))
+            declare_indexer(
+                b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model, quant=quant,
+                tokens=valid, scores=scores, topk=topk)
         if shard > 1:
             gathered = b.communicate("candidate_gather", (topk,), valid * plan.index_topk * 8 * (cp - 1),
                                      "allgather", "cp")
@@ -330,7 +363,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 query, context, plan.index_topk,
                 compression_ratio=1 if plan.cache_kind == "dense" else plan.compress_ratio,
                 window=0 if plan.cache_kind == "dense" else plan.window,
-                query_tile=query_tile)
+                query_tile=query_tile, index_pool_size=plan.index_kpool,
+                index_pool_tail=plan.index_kpool_always_select_tail)
+            if plan.index_kpool > 1:
+                pairs = traffic.total_cache_rows
             sweeps = traffic.total_cache_rows
             selection_reads = traffic.index_read_bytes
             selection_metadata = tuple(traffic.metadata().items()) + (
@@ -342,6 +378,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     "heads": heads, "latent": latent_dim,
                     "rope": plan.qk_rope_head_dim, "cp": cp,
                     "query_dtype": model.activation_dtype, "cache_dtype": quant.kv_dtype,
+                    **({"index_pool_size": plan.index_kpool,
+                        "index_pool_tail": plan.index_kpool_always_select_tail}
+                       if plan.index_kpool > 1 else {}),
                 }),
             )
         local_pairs = pairs / cp

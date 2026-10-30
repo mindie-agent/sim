@@ -34,6 +34,9 @@ class Selection:
 
 
 IMPLEMENTATIONS = {
+    "causal_pool_indexer_analytic": Implementation(
+        "mindie_sim.prediction.index_pool", blocks=("pool_key_indexer",),
+        options=("score_mode",)),
     "vllm_ascend_sparse_mla_metadata": Implementation(
         "mindie_sim.prediction.sparse_mla_metadata", blocks=("sparse_mla_metadata",),
         options=("layer_groups", "schedule")),

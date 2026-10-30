@@ -80,7 +80,7 @@ def test_indexer_execution_and_shared_attention_dependency_follow_catalog_owners
     ops = {op.op_id: op for op in target_operators(case, phase="decode", tokens=1, context=4096)}
     structure = _export(case, phase="decode", tokens=1, context=4096)
     indexers = {g["layer"]: g for g in structure["subgraphs"]
-                if g["role"] == "lightning_indexer"}
+                if g["role"] in {"lightning_indexer", "pool_key_indexer"}}
     for plan in case.model.layer_plans:
         if plan.attention != "mla":
             continue
@@ -90,10 +90,12 @@ def test_indexer_execution_and_shared_attention_dependency_follow_catalog_owners
         if plan.indexer:
             assert prefix + ".index_topk" in attention.deps
             group = indexers[plan.index]
-            assert group["node_ids"] == [
-                f"rank:0/{prefix}.index_scores", f"rank:0/{prefix}.index_topk"]
+            expected = (["index_pool_query_fp32", "index_pool_weights_fp32", "index_pool_weighted_query",
+                         "index_pool_scores", "index_pool_topk", "index_topk"]
+                        if plan.index_kpool > 1 else ["index_scores", "index_topk"])
+            assert group["node_ids"] == [f"rank:0/{prefix}.{name}" for name in expected]
             topk = ops[prefix + ".index_topk"]
-            assert topk.dtype == "fp32"
+            assert topk.dtype == ("int32" if plan.index_kpool > 1 else "fp32")
             assert dict(topk.metadata)["selection_output_dtype"] == "int32"
         elif plan.topk_owner_layer_id >= 0:
             owner = f"s0.l{plan.topk_owner_layer_id}.index_topk"

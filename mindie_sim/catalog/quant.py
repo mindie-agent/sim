@@ -44,6 +44,11 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
         defaults[plan.attention] = fields
         if plan.attention == "mla":
             defaults["indexer_fp8"] = fields
+    if plan.index_kpool > 1:
+        # KPool caches FP32 copies and casts hidden once before both F.linear
+        # calls. Query projection still uses its independent native format.
+        for category in ("indexer.weights", "indexer.pool_projection", "indexer.pool_gate"):
+            defaults[category] = {"weight_format": "fp32", "activation_format": "fp32"}
     explicit = {key: dict(value) for key, value in quant.category_overrides}
     # Apply explicit ancestors after *all* source defaults: an explicit
     # indexer parent must override the native indexer.weights child default.

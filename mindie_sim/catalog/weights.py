@@ -146,12 +146,28 @@ def _indexer_terms(plan, model):
                    "compressor_fp32_runtime" if plan.compressor_norm_dtype == "fp32" else "norm"),
             ])
         else:
-            terms.extend([_t("indexer_wk", plan.index_dim, width, "indexer_fp8"),
-                          _t("indexer_k_norm", plan.index_dim, 1, "norm"),
-                          _t("indexer_k_norm_bias", plan.index_dim, 1, "norm")])
+            terms.extend([_t("indexer_wk", plan.index_dim, width,
+                             "linear_param_bf16" if plan.index_kpool > 1 else "indexer_fp8"),
+                          _t("indexer_k_norm", plan.index_dim, 1,
+                             "param_fp32" if plan.index_kpool > 1 else "norm"),
+                          _t("indexer_k_norm_bias", plan.index_dim, 1,
+                             "param_fp32" if plan.index_kpool > 1 else "norm")])
+            if plan.index_kpool > 1:
+                terms.extend([
+                    _t("indexer_pool_gate", plan.index_dim, width, "linear_param_bf16"),
+                    _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
+                ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
         terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim, plan.q_lora_rank, "indexer_fp8"),
-                      _t("indexer_weights", plan.index_heads, model.hidden_size, "indexer.weights")])
+                      _t("indexer_weights", plan.index_heads, model.hidden_size,
+                         "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights")])
+    if plan.index_kpool > 1:
+        # process_weights_after_loading retains the BF16 parameter objects
+        # and registers FP32 execution copies; these add no checkpoint terms.
+        copies = [replace(term, name=term.name + "_prepared_fp32", source_owned=False,
+                          runtime_dtype="fp32") for term in terms
+                  if term.name in {"indexer_wk", "indexer_weights", "indexer_pool_gate"}]
+        terms.extend(copies)
     return terms
 
 

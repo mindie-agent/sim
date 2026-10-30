@@ -166,6 +166,9 @@ class LayerPlan:
     index_heads: int = 0
     index_dim: int = 0
     index_topk: int = 0
+    index_kpool: int = 1
+    index_kpool_compress: bool = False
+    index_kpool_always_select_tail: bool = False
     candidate_block_size: int = 1
     candidate_topk_blocks: int = 0
     qk_norm: bool = False

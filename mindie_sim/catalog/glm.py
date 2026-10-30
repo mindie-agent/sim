@@ -36,6 +36,17 @@ from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError
 
 
+def _index_pool(c):
+    size = int(c.get("index_kpool") or 1)
+    compress = bool(c.get("index_kpool_compress", False))
+    tail = bool(c.get("index_kpool_always_select_tail", False))
+    topk = _int(c, "index_topk")
+    if size < 1 or (size > 1 and (not compress or topk <= 0 or topk % size)):
+        raise ModelingError("model_config_index_pool_requires_compression_and_integral_topk_pools")
+    return dict(index_kpool=size, index_kpool_compress=compress,
+                index_kpool_always_select_tail=tail)
+
+
 def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     if c.get("layer_types") or c.get("linear_attn_config"):
         return _glm_hybrid_plans(c)
@@ -98,6 +109,7 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             ),
             kv_owner_layer_id=index,
             native_layer_id=index, scope="body",
+            **_index_pool(c),
         ))
     return plans
 
@@ -238,6 +250,7 @@ def _glm_hybrid_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 owns_topk=True,
                 index_source_layer_id=index,
                 index_source_status="exact_native_full_schedule",
+                **_index_pool(c),
                 **ffn_fields,
             ))
         else:

@@ -73,7 +73,8 @@ def _window_sweeps(query, context, window, query_tile):
 
 
 def sparse_attention_traffic(query, context, topk, *, compression_ratio=1,
-                             window=0, query_tile=128, index_bytes=4):
+                             window=0, query_tile=128, index_bytes=4,
+                             index_pool_size=1, index_pool_tail=False):
     """Count causal valid selections and a separate dense-window read path.
 
     Dense indexed attention passes ``window=0``. A compressed indexed cache can
@@ -85,10 +86,17 @@ def sparse_attention_traffic(query, context, topk, *, compression_ratio=1,
             or query < 0 or context < 0 or window < 0
             or min(topk, compression_ratio, query_tile, index_bytes) <= 0):
         raise ValueError("sparse_attention_requires_integer_causal_geometry")
-    unsaturated = min(query, max(0, topk * compression_ratio - 1 - context))
-    rows = (_completed_prefix(context + unsaturated, compression_ratio)
-            - _completed_prefix(context, compression_ratio)
-            + (query - unsaturated) * topk)
+    if index_pool_size > 1:
+        from mindie_sim.catalog.index_pool import pool_selection
+        if compression_ratio != 1 or window:
+            raise ValueError("index_pool_requires_uncompressed_token_kv_without_dense_window")
+        rows = pool_selection(query, context, topk, index_pool_size,
+                              always_select_tail=index_pool_tail).selected_tokens
+    else:
+        unsaturated = min(query, max(0, topk * compression_ratio - 1 - context))
+        rows = (_completed_prefix(context + unsaturated, compression_ratio)
+                - _completed_prefix(context, compression_ratio)
+                + (query - unsaturated) * topk)
     return SparseAttentionTraffic(
         gather_rows=rows,
         window_sweep_rows=_window_sweeps(query, context, window, query_tile),

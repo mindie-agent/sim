@@ -14,6 +14,7 @@ from dataclasses import replace
 from functools import lru_cache, partial
 
 from mindie_sim.schema.common import ModelingError
+from mindie_sim.catalog.index_pool import selected_tokens
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .sparse_attention import selected_query_owners
 from .program import KernelProgram, ParallelProgram, Stage
@@ -285,7 +286,8 @@ def build_pipeline(shape, geometry, *, scratch_policy, key_tile=512, slots=3,
     return _plan(sequences, topk, heads, latent, rope, geometry.compute_units,
                  scratch_policy, key_tile, slots, compact, operand_modes,
                  phase_factory, source_items, tuple(paired_vector_stages), vector_buffer_bytes,
-                 phase_unit_weights)
+                 phase_unit_weights, shape.get("index_pool_size", 1),
+                 shape.get("index_pool_tail", False))
 
 
 def query_positions(owner, query, compute_units):
@@ -310,7 +312,7 @@ def sequence_query_positions(owner, sequences, compute_units):
 def _plan(sequences, topk, heads, latent, rope, compute_units,
           scratch_policy, key_tile, slots, compact, operand_modes,
           phase_factory, source_items, paired_vector_stages, vector_buffer_bytes,
-          phase_unit_weights):
+          phase_unit_weights, index_pool_size, index_pool_tail):
     # Repeated model layers share geometry, never dependencies or Engine state.
     # Cache only bounded phase histograms and pure nominal timing calculations.
     query = sum(row[0] for row in sequences)
@@ -321,7 +323,8 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
     def tile_keys(owner):
         for sequence, position in sequence_query_positions(owner, sequences, compute_units):
             context = sequences[sequence][1]
-            count = min(context + position + 1, topk)
+            count = selected_tokens(context + position + 1, topk,
+                                    index_pool_size, index_pool_tail)
             for start in range(0, count, key_tile):
                 keys = min(key_tile, count - start)
                 yield keys, start == 0, start + keys == count

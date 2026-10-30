@@ -239,7 +239,7 @@ def index_selection_cost(model, plan, sequence_tokens):
         return IndexReadCost(0, 0, 0, 0., 0., 0, 0.)
     owner = plan.index_k_owner_layer_id
     producer = model.layer_plans[owner] if owner >= 0 else plan
-    rows = completed_rows(sequence_tokens, max(1, producer.compress_ratio))
+    rows = completed_rows(sequence_tokens, max(1, producer.compress_ratio, producer.index_kpool))
     candidates = 0
     if plan.candidate_filter:
         source = model.layer_plans[plan.candidate_source_layer_id]
@@ -247,7 +247,8 @@ def index_selection_cost(model, plan, sequence_tokens):
             completed_rows(sequence_tokens, max(1, source.compress_ratio)),
             blocks=plan.candidate_topk_blocks, block_size=plan.candidate_block_size)
     scored = min(rows, candidates) if plan.candidate_filter else rows
-    selected = min(scored, plan.index_topk) if plan.index_topk else scored
+    limit = plan.index_topk // plan.index_kpool
+    selected = min(scored, limit) if plan.index_topk else scored
     width = index_row_bytes(model, plan.index_dim)
     writes = rows if plan.owns_index_k else 0
     return IndexReadCost(scored, selected, candidates, width, scored * width, writes, writes * width)
@@ -324,10 +325,16 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
                 result["compressor_state"] = rows * 2 * plan.compressor_width * plan.head_dim * 4
     if plan.owns_index_k:
-        rows = completed_rows(seq, max(1, plan.compress_ratio))
+        index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
+        rows = completed_rows(seq, index_ratio)
         if parallel.cp_plan == "dsa_cp":
-            rows = index_k_capacity_rows(rows, cp, max(1, plan.compress_ratio)) if capacity_padded else rows / cp
+            rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
         result["index_k"] = rows * index_row_bytes(model, plan.index_dim)
+        if plan.index_kpool > 1 and seq:
+            # Raw normalized keys and gates remain FP32 in a bounded ring;
+            # the pooled BF16 plane is independent of uncompressed token KV.
+            rows = plan.index_kpool if capacity_padded else min(seq, plan.index_kpool)
+            result["index_pool_tail"] = rows * 2 * plan.index_dim * 4
         if plan.index_input == "hidden" and plan.compress_ratio and seq:
             result["index_compressor_state"] = min(seq, plan.compressor_state_rows) * 2 * plan.compressor_width * plan.index_dim * 4
     return result

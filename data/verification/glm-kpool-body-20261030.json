@@ -1,0 +1,377 @@
+{
+  "source": {
+    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-glm53flash-heldout-tp16.json",
+    "sha256": "18c65290b6794a859e873324526b06def428284e322c9c0f00fc886cf2fa38d6",
+    "size_bytes": 18735
+  },
+  "retained_comparison": {
+    "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/182a821a5620a867118b292bd3930907650607a7ab6935d76f9caafd0f9a764f.json",
+    "sha256": "182a821a5620a867118b292bd3930907650607a7ab6935d76f9caafd0f9a764f",
+    "size_bytes": 1143422
+  },
+  "runtime_sha256_before": "6a526cf6f93bae2f3a7993afb2441dee891ecd66636164d2bb2bbb13dad85082",
+  "model_layers": 45,
+  "query_tokens_per_sequence": 6,
+  "context_tokens": 131201,
+  "context_basis": "conditional_initial_same_run_prompt; per-call_context_not_observed",
+  "scope": "full_target_body; not_Serving",
+  "new_response_parameters": 0,
+  "pool_schedule_basis": "analytic_causal_pool_phases; native_dispatch_not_established",
+  "rows": [
+    {
+      "sequences": 1,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 22.603161617647057,
+      "previous_prediction_ms": 23.704275212040372,
+      "prediction_ms": 23.072157275165424,
+      "relative_error": 0.020749117554962115,
+      "previous_relative_error": 0.04871502549155071,
+      "elapsed_seconds": 2.2458769170334563,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 1,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 1
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 6
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 6
+        },
+        "valid_query_tokens": 6,
+        "padded_query_tokens": 6
+      },
+      "passed": true
+    },
+    {
+      "sequences": 2,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 25.713127333333333,
+      "previous_prediction_ms": 28.391995451423295,
+      "prediction_ms": 26.34041932705266,
+      "relative_error": 0.024395787629695853,
+      "previous_relative_error": 0.10418289783900381,
+      "elapsed_seconds": 2.4048937499755993,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 2,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 2
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 12
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 12
+        },
+        "valid_query_tokens": 12,
+        "padded_query_tokens": 12
+      },
+      "passed": true
+    },
+    {
+      "sequences": 3,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 31.414768,
+      "previous_prediction_ms": 33.053061463520585,
+      "prediction_ms": 29.574937682716314,
+      "relative_error": -0.05856577763947468,
+      "previous_relative_error": 0.05215042375995216,
+      "elapsed_seconds": 2.480075165978633,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 3,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 3
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 18
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 18
+        },
+        "valid_query_tokens": 18,
+        "padded_query_tokens": 18
+      },
+      "passed": true
+    },
+    {
+      "sequences": 4,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 28.250681384615383,
+      "previous_prediction_ms": 37.772889093630646,
+      "prediction_ms": 32.88459498575478,
+      "relative_error": 0.1640283835299956,
+      "previous_relative_error": 0.33706116958300414,
+      "elapsed_seconds": 2.5519217919791117,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 4,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 4
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 24
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 24
+        },
+        "valid_query_tokens": 24,
+        "padded_query_tokens": 24
+      },
+      "passed": false
+    },
+    {
+      "sequences": 7,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 35.747814,
+      "previous_prediction_ms": 49.87800797459763,
+      "prediction_ms": 40.74531753074776,
+      "relative_error": 0.13979885681255255,
+      "previous_relative_error": 0.3952743508903127,
+      "elapsed_seconds": 3.088142916909419,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 7,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 7
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 42
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 42
+        },
+        "valid_query_tokens": 42,
+        "padded_query_tokens": 42
+      },
+      "passed": true
+    },
+    {
+      "sequences": 8,
+      "tokens_per_sequence": 6,
+      "target_layers": 45,
+      "observed_mean_ms": 31.580006,
+      "previous_prediction_ms": 53.76610905150106,
+      "prediction_ms": 43.217000831611706,
+      "relative_error": 0.3684924832380243,
+      "previous_relative_error": 0.7025363786030014,
+      "elapsed_seconds": 3.435679375077598,
+      "live_tasks": 0,
+      "live_programs": 0,
+      "geometry": {
+        "phase": "decode",
+        "tokens_per_sequence": 6,
+        "context_tokens": 131201,
+        "sequences_per_replica": 8,
+        "participating_replicas": [
+          0
+        ],
+        "sequences_by_replica": {
+          "0": 8
+        },
+        "valid_query_tokens_by_replica": {
+          "0": 48
+        },
+        "padded_query_tokens_by_replica": {
+          "0": 48
+        },
+        "valid_query_tokens": 48,
+        "padded_query_tokens": 48
+      },
+      "passed": false
+    }
+  ],
+  "runtime_sha256_after": "6a526cf6f93bae2f3a7993afb2441dee891ecd66636164d2bb2bbb13dad85082",
+  "sources_unchanged": true,
+  "process_peak_rss_bytes": 95305728,
+  "comparison_policy": {
+    "relative_tolerance": 0.15,
+    "previous_prediction_basis": "retained earlier runtime; not an isolated source-toggle control",
+    "status": "partial; B4 and B8 remain outside tolerance",
+    "no_latency_fit": true
+  },
+  "semantic_sources": {
+    "repository": "https://github.com/vllm-project/vllm-ascend",
+    "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+    "scope": "Triton backend functional semantics; captured native dispatch not established",
+    "files": [
+      {
+        "path": "vllm_ascend/attention/indexer_kpool.py",
+        "sha256": "d884d09dc93a302f1cc6409220ab8f100793438fd20bbc16a16226745fbb7cd5",
+        "size_bytes": 20661
+      },
+      {
+        "path": "vllm_ascend/models/glm5next/attention.py",
+        "sha256": "f9db29953dc11e0391586e9d07a6a303aa7fb1f87b35bf155a3c088e5baa5394",
+        "size_bytes": 12522
+      },
+      {
+        "path": "vllm_ascend/models/glm5next/sparse_attn_indexer_kpool.py",
+        "sha256": "3076207231693f88bfa95d0507d52ae99ed246f049de1845eaa39c28d39f64d3",
+        "size_bytes": 6065
+      },
+      {
+        "path": "vllm_ascend/ops/triton/glm5_next_kpool_tail_compress.py",
+        "sha256": "c91e5bdb84ee14caa0713e84f978ba9354a612b7f08683481190a53eaf3aa751",
+        "size_bytes": 12183
+      },
+      {
+        "path": "vllm_ascend/ops/triton/glm5_next_lightning_indexer.py",
+        "sha256": "d23c0719dee9a631eb51813ac39e59700d2f6b080d2178005ff29f2b2d9b83cc",
+        "size_bytes": 9682
+      }
+    ]
+  },
+  "score_algebra": {
+    "selected": "linear_weighted_query",
+    "scope": "source head-weighted query followed by FP32 matvec; no per-head ReLU",
+    "alternative": "per_head_relu requires explicit declaration; not selected for this comparison"
+  },
+  "producer_precision": {
+    "hidden": "fp32 shared cast",
+    "key_and_head_weights": "joint FP32 linear; two zero-copy column views",
+    "gate": "FP32 linear",
+    "normalization": "FP32",
+    "query_and_head_weights_interface": "BF16",
+    "pooled_cache": "BF16",
+    "tail": "FP32",
+    "prepared_weight_storage": "retained BF16 WK/weights/gate parameters plus separate FP32 execution copies"
+  },
+  "limitations": [
+    "Per-call active KV context is unobserved; 131201 is same-run initial prompt; context bound 131265 comes from requested output64.",
+    "The retained prior comparison spans are single-rank topology-aligned Body observations; exchange symmetry is a declared condition.",
+    "The FP32 tail capacity describes contiguous-forward semantics; speculative rollback retention and native dispatch are not reconstructed.",
+    "Frozen input metadata retains earlier unsupported-field labels; these are not edited by this source correction.",
+    "All45 target layers and q6 requests remain; no target query is removed by index_share_for_mtp_iteration."
+  ],
+  "focused_tests": {
+    "passed": 82,
+    "skipped": 3,
+    "elapsed_seconds": 7.5,
+    "reason_skipped": "retained profiler source fixture unavailable"
+  },
+  "layer_operator_controls": [
+    {
+      "context_tokens": 4096,
+      "sequences": 1,
+      "query_tokens": 6,
+      "layer": 3,
+      "scope": "intact one-layer indexer and attention operator sum; not Body span",
+      "before_ms": 0.1402260578787879,
+      "after_ms": 0.2093958230303031
+    },
+    {
+      "context_tokens": 131201,
+      "sequences": 1,
+      "query_tokens": 6,
+      "layer": 3,
+      "scope": "intact one-layer indexer and attention operator sum; not Body span",
+      "before_ms": 0.30706269850378787,
+      "after_ms": 0.24953924969696978
+    },
+    {
+      "context_tokens": 131265,
+      "sequences": 1,
+      "query_tokens": 6,
+      "layer": 3,
+      "scope": "intact one-layer indexer and attention operator sum; not Body span",
+      "before_ms": 0.3071478985037879,
+      "after_ms": 0.24956004969696977
+    },
+    {
+      "context_tokens": 131201,
+      "sequences": 4,
+      "query_tokens": 6,
+      "layer": 3,
+      "scope": "intact one-layer indexer and attention operator sum; not Body span",
+      "before_ms": 0.9211452231060606,
+      "after_ms": 0.47687121329913956
+    },
+    {
+      "context_tokens": 131201,
+      "sequences": 8,
+      "query_tokens": 6,
+      "layer": 3,
+      "scope": "intact one-layer indexer and attention operator sum; not Body span",
+      "before_ms": 1.7925716583333335,
+      "after_ms": 0.8339109110706472
+    }
+  ],
+  "superseded_review_result": {
+    "status": "superseded_after_source_review",
+    "reasons": [
+      "default score replaced by source linear weighted query",
+      "FP32 fused WK/weights and gate source projection repaired",
+      "ACL graph padded row capacity repaired"
+    ],
+    "runtime_sha256": "a31737d2c5793c3abd1b66446d0f5f9cf89fdfd9bd65341776d9881051dd8487",
+    "rows": [
+      {
+        "batch": 1,
+        "body_ms": 22.718136528498704
+      },
+      {
+        "batch": 2,
+        "body_ms": 25.986704500386058
+      },
+      {
+        "batch": 3,
+        "body_ms": 29.221528776049677
+      },
+      {
+        "batch": 4,
+        "body_ms": 32.53149199908811
+      },
+      {
+        "batch": 7,
+        "body_ms": 40.393132304081135
+      },
+      {
+        "batch": 8,
+        "body_ms": 42.865121524945074
+      }
+    ]
+  }
+}

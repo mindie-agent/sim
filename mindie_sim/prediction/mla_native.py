@@ -64,9 +64,9 @@ def batched_matrix_metadata(*, tokens, heads, input_width, output_width, role):
     )
 
 
-def index_layer_norm(builder, *, source, rows, width):
+def index_layer_norm(builder, *, source, rows, width, input_dtype=None, output_dtype=None):
     """LayerNorm.forward normalizes FP32 and casts back to its input dtype."""
-    dtype = builder.model.activation_dtype
+    dtype = input_dtype or builder.model.activation_dtype
     elements = rows * width
     ready = source
     if dtype != "fp32":
@@ -85,12 +85,13 @@ def index_layer_norm(builder, *, source, rows, width):
         metadata=(("reduction_width", width), ("norm_has_weight", True),
                   ("norm_has_bias", True), ("norm_eps", 1e-6),
                   ("norm_parameter_dtype", "fp32"), ("native_source", LAYER_NORM_SOURCE)))
-    if dtype != "fp32":
+    output_dtype = output_dtype or dtype
+    if output_dtype != "fp32":
         ready = builder.vector(
             "index_norm_output_cast", (ready,), elements, 1, family="cast",
-            dtype=dtype, shape=(rows, width),
+            dtype=output_dtype, shape=(rows, width),
             read_bytes_override=elements * 4,
-            write_bytes_override=elements * dtype_bytes(dtype),
-            metadata=(("input_format", "fp32"), ("output_format", dtype),
+            write_bytes_override=elements * dtype_bytes(output_dtype),
+            metadata=(("input_format", "fp32"), ("output_format", output_dtype),
                       ("native_source", LAYER_NORM_SOURCE)))
     return ready
