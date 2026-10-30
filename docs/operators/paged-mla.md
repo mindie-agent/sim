@@ -248,10 +248,17 @@ they do not establish whole-Body accuracy or a trained heldout model.
 
 The complete 93-layer B1 Body finishes in 21.02 seconds at 102.0 MB peak RSS,
 predicting 27.01558 ms against 32.48482 ms native mean (−16.84%, fails 15%).
-B12 reaches the unchanged 90-second execution budget at 102.7 MB peak RSS and
-remains failed; no complete prediction is reported. The other four complete
-Body geometries were not rerun in this control. Both successful primitive and
-failed complete-Body outcomes are retained under
+B12 originally reached the unchanged 90-second budget at revision `f11514e5`.
+The bounded immutable stage-template cache in `d7c78e29` completes the same
+93-layer input in 67.08 seconds at 104.2 MB peak RSS: 46.209804 ms against
+54.147343 ms native mean (−14.66%, passes 15%). Every task and physical
+resource demand remains: seven complete result/trace comparisons, including
+the B12/126K primitive, and twelve independent ragged/head/owner controls are
+exactly equal to the pre-cache implementation. The cache retains at most eight
+stage templates per active job, covering prologue, ring parity, tail and drain.
+It does not replace repeated tiles with an approximate steady-state period.
+The other four complete Body geometries were not rerun in this control.
+Primitive and complete-Body outcomes remain separate under
 `data/verification/kimi-a5-paged-host-20261030/`.
 
 Reproduce with the adjacent `.producer.py` using `prepare`, `core`, or

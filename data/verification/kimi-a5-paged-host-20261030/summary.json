@@ -62,10 +62,12 @@
       "core_predicted_us": 810.3239864250078,
       "core_observed_mean_us": 752.2690882352941,
       "core_relative_error": 0.07717304764695476,
-      "body_status": "failed",
-      "body_wall_seconds": 90.02135583292693,
-      "body_peak_rss_bytes": 102711296,
-      "error": "complete_body_90s_budget_exhausted"
+      "body_status": "completed",
+      "body_wall_seconds": 67.08231066702865,
+      "body_peak_rss_bytes": 104153088,
+      "body_ms": 46.2098040509031,
+      "native_body_mean_ms": 54.14734305882353,
+      "body_relative_error": -0.14659147724565913
     }
   ]
 }
