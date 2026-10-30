@@ -106,12 +106,13 @@ def test_source_single_aiv_and_two_drains_keep_cube_and_vector_dependencies():
         name=event['task']
         if ':producers:program:group0:tile' in name:
             iteration=int(name.split(':group0:tile')[1].split(':')[0])
-            commands[iteration,name.rsplit(':',1)[1]]=event
-    order=[commands[i,name] for i in range(4) for name in ('qk','pv')
+            suffix=name.split(':group0:tile')[1].split(':',1)[1]
+            commands[iteration,suffix]=event
+    order=[(i,name) for i in range(4) for name in ('qk','pv')
            if (i,name) in commands and commands[i,name]['demand']]
     assert len(order)==6
     for before,after in zip(order,order[1:]):
-        assert after['start_ms']>=before['end_ms']-1e-12
+        assert commands[after[0],after[1]+'_load']['start_ms']>=commands[before]['end_ms']-1e-12
     assert commands[4,'output_read']['start_ms']>=commands[3,'partial']['end_ms']-1e-12
     assert len([e for e in events if e['task'].endswith(':output_write')])==1
     for event in events:

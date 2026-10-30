@@ -8,13 +8,14 @@
 [Side-Effect Policy] Immutable virtual work only; no device, source or timing I/O.
 """
 from bisect import bisect_right
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .paged_mla_arch22_dispatch import Dispatch, source_dispatch
+from .paged_mla_arch22_matrix import matrix_program
 
 IMPLEMENTATION = 'ascend_paged_mla_decode_arch22'
 SOURCE = {
@@ -149,6 +150,19 @@ def _plan(spec, cores):
                 placement[ctx.resource_names[role]] = (2*owner if aiv is None else aiv,)
             return Stage(name,ctx.bind(work),placement=placement,**kwargs)
 
+        @lru_cache(maxsize=256)
+        def matrix(kind,keys,owner):
+            return matrix_program(ctx,kind,keys,spec.heads,spec.page_size,owner,cores,len(owners))
+
+        def matrix_steps(kind,keys,owner,*,after=(),previous=()):
+            # The cached compact IR is a three-stage chain. Put that chain in
+            # the existing tile window; zero-time nested wrappers add no work
+            # or dependency and otherwise dominate large-batch event counts.
+            load,steady,cube = matrix(kind,keys,owner).stages
+            return (replace(load,name=kind+'_load',after=after,previous=previous),
+                    replace(steady,name=kind+'_steady',after=(kind+'_load',)),
+                    replace(cube,name=kind,after=(kind+'_steady',)))
+
         def owner_program(owner):
             jobs = owners[owner]
             prefix = [0]
@@ -156,11 +170,15 @@ def _plan(spec, cores):
                 prefix.append(prefix[-1]+count)
             count = prefix[-1]
 
-            def work_at(index):
+            def keys_at(index):
                 job = bisect_right(prefix,index)-1
                 seq,start,size,splits = jobs[job]
                 offset = index-prefix[job]
                 keys = min(KEY_TILE,spec.contexts[seq]+1-(start+offset)*KEY_TILE)
+                return keys,offset,size,splits
+
+            def work_at(index):
+                keys,offset,size,splits = keys_at(index)
                 return tile_work(keys,spec.heads,first=offset==0,last=offset+1==size,
                                  splits=splits,page_size=spec.page_size)
 
@@ -168,10 +186,8 @@ def _plan(spec, cores):
                 steps = []
                 if index < count:
                     w = work_at(index)
+                    steps.extend(matrix_steps('qk',keys_at(index)[0],owner,previous=('qk','pv')))
                     steps.extend((
-                        stage('qk_load',w['qk_load'],owner,previous=('qk','pv')),
-                        stage('qk_operands',w['qk_operands'],owner,after=('qk_load',)),
-                        stage('qk',w['qk'],owner,after=('qk_operands',)),
                         stage('score_store',w['score_store'],owner,after=('qk',),
                               previous=('probability',)),
                     ))
@@ -187,9 +203,10 @@ def _plan(spec, cores):
                         stage('nupdate_compute',w['nupdate_compute'],owner,
                               after=('probability',),previous=('partial',)),
                         stage('nupdate',w['nupdate'],owner,after=('nupdate_compute',)),
-                        stage('pv_load',w['pv_load'],owner,after=('qk','probability')),
-                        stage('pv_operands',w['pv_operands'],owner,after=('pv_load',)),
-                        stage('pv',w['pv'],owner,after=('pv_operands',)),
+                    ))
+                    steps.extend(matrix_steps('pv',keys_at(index-1)[0],owner,
+                                              after=('qk','probability'),previous=('pv',)))
+                    steps.extend((
                         stage('partial',w['partial'],owner,after=('pv','nupdate'),
                               previous=(f'output_release{(bisect_right(prefix,index-1)-1)%2}',)),
                     ))
@@ -239,7 +256,9 @@ def _plan(spec, cores):
         'tile_sequence':'C1(i);V1_C2(i-1);V2(i-2);two_drains',
         'matrix_micro_geometry':{'qk_n':128,'qk_k_l1':288,'qk_k_l0':96,
                                  'pv_n':128,'pv_k_l1':256,'pv_k_l0':128},
+        'matrix_pipeline':'three_L1_refill_slots_two_L0_consumer_slots; compact_nominal_recurrence',
         'gm_traffic':'source_transfers_and_atomic_read_write; no cache_hit_credit',
         'omitted_mechanisms':['cross_core_flag_latency','scalar_page_translation_latency',
-                              'inner_L1_L0_overlap_and_instruction_issue','vector_instruction_issue'],
+                              'inner_instruction_issue','arbitrary_contention_pipeline_phase_alignment',
+                              'vector_instruction_issue'],
     })

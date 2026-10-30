@@ -20,26 +20,26 @@
       "external_inputs": [
         "s0.l2.ffn.residual"
       ],
-      "graph_duration_ms": 1.0579872931489405,
-      "attention_duration_ms": 0.3876144828179351,
+      "graph_duration_ms": 1.007997873491787,
+      "attention_duration_ms": 0.33762506316078067,
       "source_core_work": {
         "matrix_flops": {
           "bf16": 4387373056
         },
         "resources": {
-          "mte2_aiv": 9329664,
-          "mte3": 12162048,
-          "fixpipe": 16158720,
+          "mte1": 308496384,
+          "mte2_aic": 282786552,
           "hbm": 335379192,
           "vector": 17664592,
-          "mte2_aic": 282786552,
-          "mte1": 308496384
+          "mte2_aiv": 9329664,
+          "fixpipe": 16158720,
+          "mte3": 12162048
         }
       },
       "source_core_dispatch": {
         "active_aic_owners": 19,
         "active_fd_aiv_owners": 2,
-        "input": "matching heads/cores=20/contexts in the retained oracle fixture"
+        "input": "automatic source_common_SplitCore_q1_geometry; exact retained C++ oracle matching"
       },
       "execution": {
         "live_tasks": 0,
@@ -51,13 +51,13 @@
           "l1@r0:s0": 0.0,
           "ub@r0:s0": 0.0
         },
-        "peak_live_tasks": 912,
-        "completed_tasks": 6764,
+        "peak_live_tasks": 1330,
+        "completed_tasks": 8740,
         "buffer_release_tolerance_bytes": 1e-07,
         "all_buffers_released": true
       },
-      "wall_seconds": 0.3524110410362482,
-      "maxrss_bytes": 39010304,
+      "wall_seconds": 0.3866235000314191,
+      "maxrss_bytes": 39419904,
       "source_case_sha256": "92ac02c25e1905e3185d6b780f3fbec108cd307bbca283d371567973ce0a272a",
       "kv_length": 126001,
       "attention_implementation": "ascend_paged_mla_decode_arch22"
@@ -81,26 +81,26 @@
       "external_inputs": [
         "s0.l2.ffn.residual"
       ],
-      "graph_duration_ms": 1.318079453906721,
-      "attention_duration_ms": 0.3827370255670619,
+      "graph_duration_ms": 1.263286366884003,
+      "attention_duration_ms": 0.32794393854434567,
       "source_core_work": {
         "matrix_flops": {
           "bf16": 4387373056
         },
         "resources": {
-          "mte2_aiv": 4664832,
-          "mte3": 9816576,
-          "fixpipe": 16158720,
+          "mte1": 308496384,
+          "mte2_aic": 278494184,
           "hbm": 324076520,
           "vector": 9065768,
-          "mte2_aic": 278494184,
-          "mte1": 308496384
+          "mte2_aiv": 4664832,
+          "fixpipe": 16158720,
+          "mte3": 9816576
         }
       },
       "source_core_dispatch": {
         "active_aic_owners": 19,
         "active_fd_aiv_owners": 1,
-        "input": "matching heads/cores=20/contexts in the retained oracle fixture"
+        "input": "automatic source_common_SplitCore_q1_geometry; exact retained C++ oracle matching"
       },
       "execution": {
         "live_tasks": 0,
@@ -112,13 +112,13 @@
           "l1@r0:s0": 0.0,
           "ub@r0:s0": 0.0
         },
-        "peak_live_tasks": 908,
-        "completed_tasks": 7899,
+        "peak_live_tasks": 1326,
+        "completed_tasks": 9875,
         "buffer_release_tolerance_bytes": 1e-07,
         "all_buffers_released": true
       },
-      "wall_seconds": 0.2186858329223469,
-      "maxrss_bytes": 41254912,
+      "wall_seconds": 0.35954983392730355,
+      "maxrss_bytes": 41517056,
       "source_case_sha256": "92ac02c25e1905e3185d6b780f3fbec108cd307bbca283d371567973ce0a272a",
       "kv_length": 126001,
       "attention_implementation": "ascend_paged_mla_decode_arch22"
@@ -142,26 +142,26 @@
       "external_inputs": [
         "s0.l2.ffn.residual"
       ],
-      "graph_duration_ms": 25.250755029861352,
-      "attention_duration_ms": 22.931673822871822,
+      "graph_duration_ms": 21.670340085152286,
+      "attention_duration_ms": 19.351258878162707,
       "source_core_work": {
         "matrix_flops": {
           "bf16": 280791875584
         },
         "resources": {
-          "mte2_aiv": 520165376,
-          "mte3": 775690240,
-          "fixpipe": 1034158080,
+          "mte1": 19743768576,
+          "mte2_aic": 18098339328,
           "hbm": 21458906624,
           "vector": 1075862064,
-          "mte2_aic": 18098339328,
-          "mte1": 19743768576
+          "mte2_aiv": 520165376,
+          "fixpipe": 1034158080,
+          "mte3": 775690240
         }
       },
       "source_core_dispatch": {
         "active_aic_owners": 20,
         "active_fd_aiv_owners": 38,
-        "input": "matching heads/cores=20/contexts in the retained oracle fixture"
+        "input": "automatic source_common_SplitCore_q1_geometry; exact retained C++ oracle matching"
       },
       "execution": {
         "live_tasks": 0,
@@ -173,13 +173,13 @@
           "l1@r0:s0": -2.3283064365386963e-10,
           "ub@r0:s0": 0.0
         },
-        "peak_live_tasks": 1105,
-        "completed_tasks": 225414,
+        "peak_live_tasks": 1545,
+        "completed_tasks": 351878,
         "buffer_release_tolerance_bytes": 1e-07,
         "all_buffers_released": true
       },
-      "wall_seconds": 10.668304875027388,
-      "maxrss_bytes": 44269568,
+      "wall_seconds": 63.82632641703822,
+      "maxrss_bytes": 41549824,
       "source_case_sha256": "92ac02c25e1905e3185d6b780f3fbec108cd307bbca283d371567973ce0a272a",
       "kv_length": 126001,
       "attention_implementation": "ascend_paged_mla_decode_arch22"
@@ -203,26 +203,26 @@
       "external_inputs": [
         "s0.l2.ffn.residual"
       ],
-      "graph_duration_ms": 24.410143955478613,
-      "attention_duration_ms": 22.65328674393816,
+      "graph_duration_ms": 20.63189620299691,
+      "attention_duration_ms": 18.875038991456456,
       "source_core_work": {
         "matrix_flops": {
           "bf16": 280791875584
         },
         "resources": {
-          "mte2_aiv": 260082688,
-          "mte3": 645483520,
-          "fixpipe": 1034158080,
+          "mte1": 19743768576,
+          "mte2_aic": 17823627776,
           "hbm": 20793905664,
           "vector": 554033432,
-          "mte2_aic": 17823627776,
-          "mte1": 19743768576
+          "mte2_aiv": 260082688,
+          "fixpipe": 1034158080,
+          "mte3": 645483520
         }
       },
       "source_core_dispatch": {
         "active_aic_owners": 20,
         "active_fd_aiv_owners": 19,
-        "input": "matching heads/cores=20/contexts in the retained oracle fixture"
+        "input": "automatic source_common_SplitCore_q1_geometry; exact retained C++ oracle matching"
       },
       "execution": {
         "live_tasks": 0,
@@ -234,13 +234,13 @@
           "l1@r0:s0": -2.3283064365386963e-10,
           "ub@r0:s0": 0.0
         },
-        "peak_live_tasks": 1029,
-        "completed_tasks": 226405,
+        "peak_live_tasks": 1469,
+        "completed_tasks": 352869,
         "buffer_release_tolerance_bytes": 1e-07,
         "all_buffers_released": true
       },
-      "wall_seconds": 10.17027333297301,
-      "maxrss_bytes": 44335104,
+      "wall_seconds": 77.14940891601145,
+      "maxrss_bytes": 41549824,
       "source_case_sha256": "92ac02c25e1905e3185d6b780f3fbec108cd307bbca283d371567973ce0a272a",
       "kv_length": 126001,
       "attention_implementation": "ascend_paged_mla_decode_arch22"
@@ -252,15 +252,20 @@
   "dispatch_oracle_cases": 28,
   "validation": {
     "focused_tests": "48 passed in 11.85s (new arch22 plus existing arch35/core structure)",
-    "final_arch22_tests": "8 passed in 0.12s after separating Nupdate vector broadcast and atomic transfer",
+    "final_arch22_tests": "34 passed in 0.25s: source host/GM/frontends and nominal compact-vs-finite refill controls",
     "lf_check": "passed",
-    "accuracy_acceptance": false
+    "accuracy_acceptance": false,
+    "pipeline": "source N128/K288/K96 QK and N128/K256/K128 PV; three L1 refill slots, two L0 consumer slots",
+    "measurement_revision": "compact pipeline before zero-work wrapper inlining; final inlined macro dependencies verified by delayed-input/ordering/work tests",
+    "cpu_performance_status": "failed: B64 measured 63.83s and 77.15s exceeds requested 60s; coupled_rates hotspot remediation pending",
+    "pipeline_parameters": "unchanged rates, bytes and FLOPs; no observed target duration inputs"
   },
   "limitations": [
     "Captured kernel binary identity and dispatch are not established by source compatibility.",
     "All GM transfers and atomic read/write traffic receive HBM service; no L2 hit credit is inferred.",
-    "The finite S2 phase model omits inner L1/L0 overlap and instruction issue.",
     "The complete-layer controls inherit the explicit four-layer checkpoint case assumptions; they do not assert captured occurrence identity.",
-    "No measured operator, layer, body, or client duration sets dispatch, rates, or work."
+    "No measured operator, layer, body, or client duration sets dispatch, rates, or work.",
+    "Nominal finite refill overlap is preserved; arbitrary contention phase alignment and instruction issue remain approximations.",
+    "B64 source control must be rerun after the shared coupled-rate CPU hotspot is fixed; this is not a passing throughput acceptance."
   ]
 }
