@@ -438,12 +438,28 @@
           "coordinates": {
             "rows": {
               "path": "metadata.padded_query_rows"
+            },
+            "query_min": {
+              "path": "metadata.query_lengths",
+              "reduce": "min"
+            },
+            "query_max": {
+              "path": "metadata.query_lengths",
+              "reduce": "max"
             }
           },
           "domain": {
             "rows": {
               "min": 6,
               "max": 60
+            },
+            "query_min": {
+              "min": 6,
+              "max": 6
+            },
+            "query_max": {
+              "min": 6,
+              "max": 6
             }
           },
           "response": {
@@ -508,8 +524,24 @@
             "rows": {
               "path": "metadata.padded_query_rows"
             },
+            "query_min": {
+              "path": "metadata.query_lengths",
+              "reduce": "min"
+            },
+            "query_max": {
+              "path": "metadata.query_lengths",
+              "reduce": "max"
+            },
             "scanned_pools": {
               "path": "metadata.scanned_pools"
+            },
+            "context_min": {
+              "path": "metadata.context_lengths",
+              "reduce": "min"
+            },
+            "context_max": {
+              "path": "metadata.context_lengths",
+              "reduce": "max"
             }
           },
           "domain": {
@@ -517,9 +549,25 @@
               "min": 6,
               "max": 48
             },
+            "query_min": {
+              "min": 6,
+              "max": 6
+            },
+            "query_max": {
+              "min": 6,
+              "max": 6
+            },
             "scanned_pools": {
               "min": 196804,
               "max": 1574432
+            },
+            "context_min": {
+              "min": 131201,
+              "max": 131201
+            },
+            "context_max": {
+              "min": 131201,
+              "max": 131201
             }
           },
           "response": {

@@ -127,8 +127,11 @@ def parameters(short, long):
                              else 'B3_to_B8_outside_B1_B2_training_geometry; score_reuse_unidentified')}
         match = {'hardware': 'Ascend910_9362', 'recipe': recipe, 'dtype': 'bf16',
                  'metadata.implementation': IMPLEMENTATION, 'metadata.pool_size': 4}
-        coordinates = {'rows': {'path': 'metadata.padded_query_rows'}}
-        domain = {'rows': {'min': 6, 'max': 60 if native == 'KeyPool' else 48}}
+        coordinates = {'rows': {'path': 'metadata.padded_query_rows'},
+                       'query_min': {'path': 'metadata.query_lengths', 'reduce': 'min'},
+                       'query_max': {'path': 'metadata.query_lengths', 'reduce': 'max'}}
+        domain = {'rows': {'min': 6, 'max': 60 if native == 'KeyPool' else 48},
+                  'query_min': {'min': 6, 'max': 6}, 'query_max': {'min': 6, 'max': 6}}
         if native == 'KeyPool':
             match.update({'local_shape.1': 128, 'local_shape.2': 4096,
                           'metadata.tail_capacity': 9})
@@ -136,6 +139,9 @@ def parameters(short, long):
             match.update({'local_shape.1': 32, 'local_shape.2': 128, 'metadata.topk_tokens': 2048})
             coordinates['scanned_pools'] = {'path': 'metadata.scanned_pools'}
             domain['scanned_pools'] = {'min': 196804, 'max': 1574432}
+            for edge in ('min', 'max'):
+                coordinates['context_' + edge] = {'path': 'metadata.context_lengths', 'reduce': edge}
+                domain['context_' + edge] = {'min': 131201, 'max': 131201}
         rules.append({'id': 'a3-native-' + recipe + '-operator-calibration', 'match': match,
             'coordinates': coordinates, 'domain': domain,
             'response': {'fixed_us': intercept, 'terms': [{'coordinate': 'rows', 'us_per_unit': slope}]},

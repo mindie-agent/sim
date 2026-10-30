@@ -3,7 +3,7 @@
 [Role] Preserve the existing operator function while renaming its physical axes.
 [Invariants] No refit, no Body residual, and no A3 CANN parameters. The old
   260-byte uncompressed-pair feature was a geometry proxy, not native traffic.
-[Timeouts & Locks] Stream capture CSVs; finite Body probes; no device contexts.
+[Timeouts & Locks] Small retained population JSONs; finite Body probes; no device contexts.
 [Side-Effect Policy] Local explicit cases and migration evidence only.
 """
 from copy import deepcopy

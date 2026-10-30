@@ -128,3 +128,19 @@ Installed CANN binary identity, internal score-cache reuse, actual sequence
 length values, sparse-attention valid indices and native scheduling remain
 unbound. These are observed service responses in a declared execution regime,
 not recovered hardware throughput or a proof of the private kernel algorithm.
+
+`residuals.py` reuses the retained complete-Body segmentation and streams the
+same capture to locate the remaining B7/B8 error. B7 has one Forward; B8 has
+12. Layer 0 alone decreases from 3.540 ms to 1.193 ms between those populations,
+so their total means are not a matched steady-state workload pair.
+
+The dominant B8 operator differences are routed FFN gate-up and down: predicted
+duration sums are 9.379 and 4.733 ms, versus observed 2.899 and 1.524 ms across
+42 layers. Native B7/B8 shapes are identical: 384-row activation capacity and
+18 expert weight banks. Actual group-list values are not retained. The default
+probability-moment model assumes 24 local rows and 13.344 active experts at B8,
+charging 224.31/112.37 MB of gate-up/down weight reads per layer. The resulting
+223.31/112.68 us costs differ substantially from native means 69.02/36.28 us.
+Expert grouping and weight reuse therefore dominate the next source-model
+investigation. Capacity 384 is not evidence of 384 valid rows, and observed
+kernel duration sums are diagnostic rather than additive Body wall time.

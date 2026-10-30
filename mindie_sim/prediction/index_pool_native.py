@@ -95,6 +95,7 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens, **options):
     state_bytes = batch * pool * 2 * width * 4
     common = _common(valid_query_rows=sum(v.q_len for v in views), padded_query_rows=count,
                      pool_size=pool, completed_pools=completed, pooled_capacity=capacity,
+                     query_lengths=tuple(v.q_len for v in views),
                      tail_capacity=declaration["tail_capacity"])
     start = len(b.ops)
     gather = b.work("cann_keypool_state_gather", (source,), (batch, pool, 2 * width),
@@ -189,6 +190,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     dummy_queries = tokens + 1 - valid
     safe_scans = scanned + sum(max(0, min(v.q_len, pool - 1 - v.context)) for v in views) + dummy_queries
     common = _common(valid_query_rows=valid, padded_query_rows=tokens, pool_size=pool,
+        query_lengths=tuple(v.q_len for v in views), context_lengths=tuple(v.context for v in views),
         active_requests=batch, native_requests=batch + 1, native_query_rows=tokens + 1,
         sentinel_rows=1, dummy_request_queries=dummy_queries, scanned_pools=scanned,
         safe_reference_scanned_pools=safe_scans, selected_pools=selected,
