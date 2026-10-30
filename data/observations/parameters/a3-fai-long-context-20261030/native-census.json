@@ -1,0 +1,3672 @@
+{
+  "boundary": "native device kernel call; q4 only",
+  "context_uncertainty": "declared prompt; generated suffix and seq_lens values not captured",
+  "records": [
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+      "sha256": "c43ca21f5aabc8f4e1a0d9e9aa5476c6bea141ff7b2398bc7736d1fa94ab607a",
+      "first_line": 264,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"4,4,256;32465,128,256;32465,128,256;2048,2048;1;1;1,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"4,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 1,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c1.json",
+        "sha256": "789d0ff70c41eb9eb6669ca905ece7951a61f4c165121a5905c40470513a1980",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2197,
+      "mean_us": 158.47453163404643,
+      "median_us": 158.707,
+      "retained_samples": 2048,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 146.2510022758306,
+        "aic_mac_time(us)": 13.38922576240323,
+        "aic_mte1_time(us)": 36.37137141556672,
+        "aic_mte2_time(us)": 110.5574278561675,
+        "aiv_time(us)": 148.8484997724171,
+        "aiv_vec_time(us)": 7.664864360491515
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+      "sha256": "3f5925d931a01ecf41914fc6db8117380e0e783d8913e8139f492978feee4e39",
+      "first_line": 277,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,4,256;32465,128,256;32465,128,256;2048,2048;12;12;12,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c12.json",
+        "sha256": "3201d2664d53757720a51482622630839c9ad8727e13fcc5ab8ae14e81317cab",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1261,
+      "mean_us": 1146.1010317208559,
+      "median_us": 1044.002,
+      "retained_samples": 1261,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1030.2644567803318,
+        "aic_mac_time(us)": 160.40379857256139,
+        "aic_mte1_time(us)": 444.4544076130054,
+        "aic_mte2_time(us)": 929.6922854877076,
+        "aiv_time(us)": 1035.8658120539258,
+        "aiv_vec_time(us)": 89.96923156225218
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+      "sha256": "42c5c2d88d88fcb0d64535b8c70afc41d32251df0ea775c6f1796a8bdb084a80",
+      "first_line": 279,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"64,4,256;32465,128,256;32465,128,256;2048,2048;16;16;16,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"64,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 16,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c16.json",
+        "sha256": "17307b592f612a8a3549bd8cb5996be8c76ee52c049447cf1b2a0363cfc755ee",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1131,
+      "mean_us": 1427.3979610963763,
+      "median_us": 1371.555,
+      "retained_samples": 1131,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1358.294082228118,
+        "aic_mac_time(us)": 213.70773209549057,
+        "aic_mte1_time(us)": 591.9453642793981,
+        "aic_mte2_time(us)": 1209.1408868258186,
+        "aiv_time(us)": 1367.881285587977,
+        "aiv_vec_time(us)": 119.80058267020328
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+      "sha256": "025d5a0fbee10ee4484cf5a2a215d91787bd00b371a7ef71e29069121dfb1a32",
+      "first_line": 271,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,4,256;32465,128,256;32465,128,256;2048,2048;2;2;2,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c2.json",
+        "sha256": "70ca874f0374f3c76c822aca49c99854b1ef308c1173f56e0ac8995814ba4c0c",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2028,
+      "mean_us": 226.83757051282032,
+      "median_us": 226.789,
+      "retained_samples": 2028,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 216.86034270216916,
+        "aic_mac_time(us)": 26.931323964497015,
+        "aic_mte1_time(us)": 73.45682001972384,
+        "aic_mte2_time(us)": 179.65604930966484,
+        "aiv_time(us)": 219.3167988165681,
+        "aiv_vec_time(us)": 15.179261341222919
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+      "sha256": "b6f022c5d25e2beda33e3102fbfc1ea7635fdbb0b6ef58a460aa6e99446dc2b8",
+      "first_line": 99,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,4,256;32465,128,256;32465,128,256;2048,2048;24;24;24,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c24.json",
+        "sha256": "0d44ec5622d85e705cb077934970c6cbd61d4ce5b01db84e448dab288ab15c21",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 745,
+      "mean_us": 3428.5021651006737,
+      "median_us": 3443.337,
+      "retained_samples": 745,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2227.7873897849468,
+        "aic_mac_time(us)": 319.2809650537635,
+        "aic_mte1_time(us)": 886.6930188172037,
+        "aic_mte2_time(us)": 2022.962727150537,
+        "aiv_time(us)": 2229.608850806454,
+        "aiv_vec_time(us)": 178.29960349462365
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+      "sha256": "b71f6c480bdb6a9f1b9aa46c6a216b86a2e3d2922dffbce8172055ef229bac38",
+      "first_line": 26,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"128,4,256;32465,128,256;32465,128,256;2048,2048;32;32;32,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"128,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 32,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c32.json",
+        "sha256": "3d18236b85a21505fb40820ad72b780ea143476e985052d1f555ea1d0400f1d4",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 718,
+      "mean_us": 3427.437394150418,
+      "median_us": 3430.3469999999998,
+      "retained_samples": 718,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2825.4773403068352,
+        "aic_mac_time(us)": 428.66273500697315,
+        "aic_mte1_time(us)": 1186.8601757322172,
+        "aic_mte2_time(us)": 2542.584408647139,
+        "aiv_time(us)": 2827.123828451886,
+        "aiv_vec_time(us)": 237.70557461645737
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+      "sha256": "af27e304a2059bb15def5ad8830663a0bf5fb4923971f0909ee40239d92e95e3",
+      "first_line": 273,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"16,4,256;32465,128,256;32465,128,256;2048,2048;4;4;4,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"16,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 4,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c4.json",
+        "sha256": "eae57f18f190404eee8e9df8f999d3e9211aa3d263f10ff9c88920e103ba4739",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1794,
+      "mean_us": 394.0605128205128,
+      "median_us": 395.88599999999997,
+      "retained_samples": 1794,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 385.3095540691187,
+        "aic_mac_time(us)": 53.71942920847263,
+        "aic_mte1_time(us)": 148.17609308807147,
+        "aic_mte2_time(us)": 329.239119843924,
+        "aiv_time(us)": 388.1015652173908,
+        "aiv_vec_time(us)": 30.166198439241892
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+      "sha256": "a82d89db3a3e8634acb1e4002299a743931c2efa7197bcdd7ab003754df9119a",
+      "first_line": 15,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"192,4,256;32465,128,256;32465,128,256;2048,2048;48;48;48,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"192,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 48,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c48.json",
+        "sha256": "692f1724ad20a2c6a87e3a3c34ca9a5901cc3b78354164b3f77471997f354b60",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 553,
+      "mean_us": 5114.813014466548,
+      "median_us": 5131.465,
+      "retained_samples": 553,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 4196.801721014489,
+        "aic_mac_time(us)": 642.9581884057969,
+        "aic_mte1_time(us)": 1781.7563333333346,
+        "aic_mte2_time(us)": 3804.7556884058,
+        "aiv_time(us)": 4198.103793478263,
+        "aiv_vec_time(us)": 356.63255072463767
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+      "sha256": "96c3ba58ef7e5c4551bc414c3271637bbb652b1700dd4ad524b8f2e68ab6041b",
+      "first_line": 276,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c6.json",
+        "sha256": "40721cfb35c16fa77335922888752c06b90056cf6e3ebf2b42dd2a6190891df5",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1573,
+      "mean_us": 745.0044431023522,
+      "median_us": 572.228,
+      "retained_samples": 1573,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 557.8190673871584,
+        "aic_mac_time(us)": 80.56246408137304,
+        "aic_mte1_time(us)": 222.80739987285443,
+        "aic_mte2_time(us)": 478.1272739987286,
+        "aiv_time(us)": 560.2520356007637,
+        "aiv_vec_time(us)": 45.08573935155744
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+      "sha256": "119e731f61826bac87cf5ff04af549dc9f5551e16fd82a0c38893c44571db6b4",
+      "first_line": 167,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"256,4,256;32465,128,256;32465,128,256;2048,2048;64;64;64,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"256,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 64,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c64.json",
+        "sha256": "9a848c6299d79b522d8d5197d8f307ff2148be7976ed7c1922fb38e3790aab8f",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 449,
+      "mean_us": 6937.063518930951,
+      "median_us": 6940.26,
+      "retained_samples": 449,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 5662.361585746094,
+        "aic_mac_time(us)": 854.4074677060136,
+        "aic_mte1_time(us)": 2372.0380534521164,
+        "aic_mte2_time(us)": 5123.932579064592,
+        "aiv_time(us)": 5663.871089086858,
+        "aiv_vec_time(us)": 475.17720489977717
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+      "sha256": "b2c51431224c4ec6fc4fe914c436f5a1e31097ef9ae81fe62dca596a5c29c659",
+      "first_line": 275,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"32,4,256;32465,128,256;32465,128,256;2048,2048;8;8;8,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"32,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 8,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c8.json",
+        "sha256": "be9da183a9abbbc2a5dc3262d48c14840853e7efef7d01b52c54c03b6f46a936",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1443,
+      "mean_us": 872.930817740817,
+      "median_us": 722.449,
+      "retained_samples": 1443,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 709.5223811503813,
+        "aic_mac_time(us)": 106.94611781011774,
+        "aic_mte1_time(us)": 296.91404227304224,
+        "aic_mte2_time(us)": 604.8702730422731,
+        "aiv_time(us)": 712.7233374913392,
+        "aiv_vec_time(us)": 60.040452529452494
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c12_p24k/kernel_details.csv",
+      "sha256": "1c63598ed97074054a02df546fe024ac3209da01d17b6f201d7c7736addaf8ed",
+      "first_line": 280,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,4,256;32465,128,256;32465,128,256;2048,2048;12;12;12,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c12_p24k.json",
+        "sha256": "9696ccc08b26b5fdd7a63336ed5b33ca4197d3fa0ca451363d6d7bb6bfc87e31",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 715,
+      "mean_us": 234.78487832167815,
+      "median_us": 217.096,
+      "retained_samples": 715,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 202.89502517482535,
+        "aic_mac_time(us)": 30.730718881118882,
+        "aic_mte1_time(us)": 87.84684475524479,
+        "aic_mte2_time(us)": 149.8801468531468,
+        "aiv_time(us)": 207.80392167832164,
+        "aiv_vec_time(us)": 17.960352447552452
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c12_p64k/kernel_details.csv",
+      "sha256": "5b2dc84b01b299fb99edf17a35a32afb5849fa5ef17f7849bdc8491bb4d2e949",
+      "first_line": 277,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,4,256;32465,128,256;32465,128,256;2048,2048;12;12;12,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c12_p64k.json",
+        "sha256": "aa9676de34714efc69408bd3a12cbead2dfc6350cfe7fe4ccacaae654d25a674",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 676,
+      "mean_us": 528.1106523668641,
+      "median_us": 463.948,
+      "retained_samples": 676,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 462.56679585798867,
+        "aic_mac_time(us)": 80.26239497041422,
+        "aic_mte1_time(us)": 230.53963017751477,
+        "aic_mte2_time(us)": 374.3407559171594,
+        "aiv_time(us)": 467.7684630177515,
+        "aiv_vec_time(us)": 45.80057248520718
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c12_p8k/kernel_details.csv",
+      "sha256": "40643bed3781adea33965ed74aaa917b3309a55d949e98fe5042619ad9bd31fe",
+      "first_line": 277,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,4,256;32465,128,256;32465,128,256;2048,2048;12;12;12,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c12_p8k.json",
+        "sha256": "627f718bd9c8b76fbee3fbcc77903e54d94c9b5c5a30fbf5888bcc2226e8e0b3",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 624,
+      "mean_us": 154.67589743589744,
+      "median_us": 154.62,
+      "retained_samples": 624,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 95.70400641025643,
+        "aic_mac_time(us)": 11.113807692307688,
+        "aic_mte1_time(us)": 30.752075320512795,
+        "aic_mte2_time(us)": 71.44135416666671,
+        "aiv_time(us)": 96.32164102564109,
+        "aiv_vec_time(us)": 6.525942307692311
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c12_p96k/kernel_details.csv",
+      "sha256": "99961af5069b709a07209e587b478b6732083f9477cf31b8296d9b1789aa4a4e",
+      "first_line": 280,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,4,256;32465,128,256;32465,128,256;2048,2048;12;12;12,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c12_p96k.json",
+        "sha256": "53acc2cbf09ed2e444b49d67239d76a4ae415a87e0c97607fa9fe6b30c2da9ab",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 806,
+      "mean_us": 813.4416501240681,
+      "median_us": 727.789,
+      "retained_samples": 806,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 722.4553449131515,
+        "aic_mac_time(us)": 120.67759925558316,
+        "aic_mte1_time(us)": 342.3927692307691,
+        "aic_mte2_time(us)": 609.9451265508686,
+        "aiv_time(us)": 727.4406476426794,
+        "aiv_vec_time(us)": 68.218100496278
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c24_p24k/kernel_details.csv",
+      "sha256": "9184f9db05ae8fc174938de01e2459ed7607f7dd63af1150f0ba163d382c1e79",
+      "first_line": 282,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,4,256;32465,128,256;32465,128,256;2048,2048;24;24;24,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c24_p24k.json",
+        "sha256": "c2cd67bcbdd58af097b8889a46ad08f28d214b7be1fb43d7b2fe459eeb02fdd5",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 962,
+      "mean_us": 631.9656756756751,
+      "median_us": 641.41,
+      "retained_samples": 962,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 459.4849324324327,
+        "aic_mac_time(us)": 62.47758939708932,
+        "aic_mte1_time(us)": 173.36579106029114,
+        "aic_mte2_time(us)": 402.69544386694383,
+        "aiv_time(us)": 461.7021320166321,
+        "aiv_vec_time(us)": 35.38122037422035
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c24_p64k/kernel_details.csv",
+      "sha256": "8027775f6aa74a41bdf411446183d27c6fc173cfe6b0473473f99b9fbf7d4fb2",
+      "first_line": 279,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,4,256;32465,128,256;32465,128,256;2048,2048;24;24;24,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c24_p64k.json",
+        "sha256": "f13eac6a408c4f7f305d585addfde9cd6cf564e3144a4671b3914bc8cb2881d4",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 819,
+      "mean_us": 1576.9623003663014,
+      "median_us": 1581.643,
+      "retained_samples": 819,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1123.3423846153855,
+        "aic_mac_time(us)": 164.8416019536022,
+        "aic_mte1_time(us)": 457.2764493284498,
+        "aic_mte2_time(us)": 1004.4725934065923,
+        "aiv_time(us)": 1125.9179389499384,
+        "aiv_vec_time(us)": 91.96329304029295
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c24_p8k/kernel_details.csv",
+      "sha256": "7cdf2ba37fffebe434e488bfee562e63e444bc2518d0d86469c87205712692a7",
+      "first_line": 278,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,4,256;32465,128,256;32465,128,256;2048,2048;24;24;24,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c24_p8k.json",
+        "sha256": "a0fc3db80ae89ce48dd63a38b89df7c48112dbd25afc021ca4c8f900ecc575bd",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 858,
+      "mean_us": 266.48033333333314,
+      "median_us": 269.64099999999996,
+      "retained_samples": 858,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 197.90398601398564,
+        "aic_mac_time(us)": 22.444794871794883,
+        "aic_mte1_time(us)": 61.928257575757506,
+        "aic_mte2_time(us)": 164.88658741258723,
+        "aiv_time(us)": 200.1922692307694,
+        "aiv_vec_time(us)": 13.074694638694643
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c24_p96k/kernel_details.csv",
+      "sha256": "eaade2d4e72f07581b3ea2427fda1ca7245478336d8377736ffccba93a08131a",
+      "first_line": 19,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,4,256;32465,128,256;32465,128,256;2048,2048;24;24;24,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c24_p96k.json",
+        "sha256": "d1be3f1843a6d314d7e43caa658e9b0e2bfb976800c6181483a04e5ae66ccc6e",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 678,
+      "mean_us": 2580.5685117994117,
+      "median_us": 2585.968,
+      "retained_samples": 678,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1691.9496838995565,
+        "aic_mac_time(us)": 244.76784933530286,
+        "aic_mte1_time(us)": 678.9342895125552,
+        "aic_mte2_time(us)": 1529.310759231904,
+        "aiv_time(us)": 1694.3361063515504,
+        "aiv_vec_time(us)": 136.52000886262917
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c2_p24k/kernel_details.csv",
+      "sha256": "ca00bc8a7b456cda5189ee1fdecdb0049dc7dd1418fc1d8cd06fa3bebc96913e",
+      "first_line": 271,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,4,256;32465,128,256;32465,128,256;2048,2048;2;2;2,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c2_p24k.json",
+        "sha256": "65086540748375fc3772e6fae160268a8007275bcdd1f9ac2b8cb75da000fce9",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 26,
+      "mean_us": 83.39999999999999,
+      "median_us": 83.31,
+      "retained_samples": 26,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 74.5298846153846,
+        "aic_mac_time(us)": 5.27,
+        "aic_mte1_time(us)": 14.491769230769233,
+        "aic_mte2_time(us)": 43.61615384615386,
+        "aiv_time(us)": 76.36942307692307,
+        "aiv_vec_time(us)": 3.1836538461538453
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c2_p64k/kernel_details.csv",
+      "sha256": "f5db239eaab58e1fdb4a6ec5b554489a11d6f9947c8c6b730d581aaf023b79bd",
+      "first_line": 272,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,4,256;32465,128,256;32465,128,256;2048,2048;2;2;2,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c2_p64k.json",
+        "sha256": "ae188dd5d545431fb8fd4a50972bd73301b8415746dccf176812730ba206bf0e",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 52,
+      "mean_us": 137.12961538461536,
+      "median_us": 137.68,
+      "retained_samples": 52,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 127.59182692307692,
+        "aic_mac_time(us)": 13.687076923076924,
+        "aic_mte1_time(us)": 38.07451923076923,
+        "aic_mte2_time(us)": 92.11238461538461,
+        "aiv_time(us)": 130.0559423076923,
+        "aiv_vec_time(us)": 7.865480769230767
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c2_p96k/kernel_details.csv",
+      "sha256": "ad48f14265be72b8de3a854d2d16cb0a93851661e09e5af72dbc9f07f8321b7a",
+      "first_line": 272,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,4,256;32465,128,256;32465,128,256;2048,2048;2;2;2,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c2_p96k.json",
+        "sha256": "0553f17f1b64b9897ef5ad7fccef58dab4fba793227adc832ace110dd8043fd9",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 13,
+      "mean_us": 183.39800000000002,
+      "median_us": 183.547,
+      "retained_samples": 13,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 173.43599999999998,
+        "aic_mac_time(us)": 20.53046153846154,
+        "aic_mte1_time(us)": 55.91884615384615,
+        "aic_mte2_time(us)": 140.80953846153847,
+        "aiv_time(us)": 175.84638461538464,
+        "aiv_vec_time(us)": 11.616615384615384
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c6_p24k/kernel_details.csv",
+      "sha256": "355a29d438c5fd2329608781b367c9923d0a91aeff2cebd2ecd8256a6b1bd257",
+      "first_line": 281,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c6_p24k.json",
+        "sha256": "614a09397cb09717509351bfc3e8a2b4af07b0658d136e8eb882b33ce5850e0e",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 429,
+      "mean_us": 159.40278787878796,
+      "median_us": 126.105,
+      "retained_samples": 429,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 113.67031002330994,
+        "aic_mac_time(us)": 14.936748251748243,
+        "aic_mte1_time(us)": 42.37611888111887,
+        "aic_mte2_time(us)": 80.01295571095571,
+        "aiv_time(us)": 116.21628438228439,
+        "aiv_vec_time(us)": 8.767951048951044
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c6_p64k/kernel_details.csv",
+      "sha256": "f96dd5d30c084d2839509533e88038c498c8e1fdb41e8269be27306c558d5c7d",
+      "first_line": 275,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c6_p64k.json",
+        "sha256": "755a1a2374a2bc3d5581008aedc277c5ff170a73dda470e133b877843d3c22e0",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 533,
+      "mean_us": 355.96999812382757,
+      "median_us": 260.935,
+      "retained_samples": 533,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 256.53568855534706,
+        "aic_mac_time(us)": 40.749684803001834,
+        "aic_mte1_time(us)": 115.53630769230764,
+        "aic_mte2_time(us)": 210.22842026266414,
+        "aiv_time(us)": 259.06503752345196,
+        "aiv_vec_time(us)": 23.21102251407127
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c6_p8k/kernel_details.csv",
+      "sha256": "7f60fdc5462a7d341cf24c6741313a4df2034118eebc2d2d5a45f1a0513c230b",
+      "first_line": 277,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "18",
+        "Mix Block Num": "36",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c6_p8k.json",
+        "sha256": "d4f950666fa78250999304c79ceeda4e0e62fa84bb91b3be19aaf3e0bd2c4848",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 297,
+      "mean_us": 80.90326599326605,
+      "median_us": 82.743,
+      "retained_samples": 297,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 71.2408754208755,
+        "aic_mac_time(us)": 6.08188888888889,
+        "aic_mte1_time(us)": 16.735333333333333,
+        "aic_mte2_time(us)": 47.80052861952862,
+        "aiv_time(us)": 75.65187205387198,
+        "aiv_vec_time(us)": 3.9778215488215527
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c6_p8k/kernel_details.csv",
+      "sha256": "7f60fdc5462a7d341cf24c6741313a4df2034118eebc2d2d5a45f1a0513c230b",
+      "first_line": 2081,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c6_p8k.json",
+        "sha256": "d4f950666fa78250999304c79ceeda4e0e62fa84bb91b3be19aaf3e0bd2c4848",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 54,
+      "mean_us": 138.06140740740744,
+      "median_us": 137.7655,
+      "retained_samples": 54,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 50.03668518518517,
+        "aic_mac_time(us)": 5.419185185185186,
+        "aic_mte1_time(us)": 15.171259259259262,
+        "aic_mte2_time(us)": 31.444351851851845,
+        "aiv_time(us)": 49.69172222222223,
+        "aiv_vec_time(us)": 2.333296296296297
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/prof/decode_c6_p96k/kernel_details.csv",
+      "sha256": "ca9a62a73957c7294a4aa9b20fa368a667b90cc3cbdf64ef4b7f9e294b625529",
+      "first_line": 275,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,4,256;32465,128,256;32465,128,256;2048,2048;6;6;6,1025\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,4,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen35_35b_tp4_128k_20261030/raw/cellset_decode_c6_p96k.json",
+        "sha256": "92e153a509b0a50fd70c8fa332f25207912c19bf1a8f99a1cac591ab047472a9",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 559,
+      "mean_us": 531.0032468694101,
+      "median_us": 390.636,
+      "retained_samples": 559,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 385.0603327370301,
+        "aic_mac_time(us)": 60.915259391771116,
+        "aic_mte1_time(us)": 171.37450268336306,
+        "aic_mte2_time(us)": 324.5534937388193,
+        "aiv_time(us)": 387.73383005366713,
+        "aiv_vec_time(us)": 34.37744901610021
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+      "sha256": "cd085fe6ae98e3f8b5e965b6518e80d879ef8ed9ba273fa2fefa06d96778521f",
+      "first_line": 227,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"4,12,256;8806,128,512;8806,128,512;2048,2048;1;1;1,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"4,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 1,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c1.json",
+        "sha256": "073c1a861b65402485d957c8c6defa3e4413a08793f7163f3c1f072eb7d79fd7",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2029,
+      "mean_us": 309.243164120256,
+      "median_us": 309.78,
+      "retained_samples": 2029,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 297.9031345490385,
+        "aic_mac_time(us)": 45.36731789058648,
+        "aic_mte1_time(us)": 76.44545490389355,
+        "aic_mte2_time(us)": 261.2083316904879,
+        "aiv_time(us)": 300.726754066042,
+        "aiv_vec_time(us)": 22.730604731394653
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+      "sha256": "ef29302a954526a8e1be85fb78ff2faab62ffdfea0a4ee41c4cbf5d5fb9f75d2",
+      "first_line": 116,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,12,256;8806,128,512;8806,128,512;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c12.json",
+        "sha256": "4d059a9ec29f9f54ad09269763023f3c2f704cfdac12f6e11dd6c3f37f54fa10",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 702,
+      "mean_us": 3591.4630199430194,
+      "median_us": 3598.29,
+      "retained_samples": 702,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2193.6198744650483,
+        "aic_mac_time(us)": 540.9160613409416,
+        "aic_mte1_time(us)": 944.637136947219,
+        "aic_mte2_time(us)": 1976.7459871611975,
+        "aiv_time(us)": 2193.826295292439,
+        "aiv_vec_time(us)": 268.57256776034257
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+      "sha256": "13e5b8da856be4b67cdf1f3935853c59983213f8bc642af5c5ca2223d27eae87",
+      "first_line": 77,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"64,12,256;8806,128,512;8806,128,512;2048,2048;16;16;16,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"64,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 16,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c16.json",
+        "sha256": "06eb49afadb6a26c4295fd2c799ee92cbba5a70dc6856dd6fd6a1e8ae86f8af7",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 685,
+      "mean_us": 3596.3670948905115,
+      "median_us": 3585.56,
+      "retained_samples": 685,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2893.9931710526316,
+        "aic_mac_time(us)": 721.5363845029233,
+        "aic_mte1_time(us)": 1260.9861681286538,
+        "aic_mte2_time(us)": 2603.33394883041,
+        "aiv_time(us)": 2893.003691520468,
+        "aiv_vec_time(us)": 358.0381973684211
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+      "sha256": "b2f5d571c44133dc2759ead73247d4859f9a3f7ee1509254af03508832cf4f7c",
+      "first_line": 232,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,12,256;8806,128,512;8806,128,512;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c2.json",
+        "sha256": "f867b20b218fda386be25051ab63d98653c9481dcb2307a9b643ac384a870e36",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1819,
+      "mean_us": 463.79980208906,
+      "median_us": 463.36,
+      "retained_samples": 1819,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 454.0444491478836,
+        "aic_mac_time(us)": 90.11287355689915,
+        "aic_mte1_time(us)": 155.23642056074772,
+        "aic_mte2_time(us)": 401.9606305662452,
+        "aiv_time(us)": 457.4355695437043,
+        "aiv_vec_time(us)": 45.25202913688863
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+      "sha256": "c43cd599adb2e3cf694b01ecc009f2f90774297be5e2e0cabf9a01a099eff212",
+      "first_line": 122,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,12,256;8806,128,512;8806,128,512;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c24.json",
+        "sha256": "d021642bc34792f7afd4b7974fdcc4c6725fe0cc6e45808347f55f54dd970f26",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 516,
+      "mean_us": 5443.274844961238,
+      "median_us": 5438.9,
+      "retained_samples": 516,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 4404.6086388349495,
+        "aic_mac_time(us)": 1081.5649145631075,
+        "aic_mte1_time(us)": 1886.7453475728148,
+        "aic_mte2_time(us)": 3945.5842019417432,
+        "aiv_time(us)": 4405.799269902915,
+        "aiv_vec_time(us)": 536.6233203883494
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+      "sha256": "7ba8dc6128683239bf65e917722566fb56f11119e865b306caa5489f43fcc4b6",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"16,12,256;8806,128,512;8806,128,512;2048,2048;4;4;4,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"16,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 4,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c4.json",
+        "sha256": "43dcd79ddd23d4af04958aa51097c3c5a3c82de84d156096e30a0c83d1ca0c41",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1496,
+      "mean_us": 824.2003743315522,
+      "median_us": 828.4300000000001,
+      "retained_samples": 1496,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 813.9440073529418,
+        "aic_mac_time(us)": 179.02731149732637,
+        "aic_mte1_time(us)": 312.5242934491982,
+        "aic_mte2_time(us)": 743.0616758021393,
+        "aiv_time(us)": 818.3889371657765,
+        "aiv_vec_time(us)": 90.19037967914413
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+      "sha256": "9da266097621980ff78d450a8f2525e3611d795313023027353400e8015a4cfc",
+      "first_line": 238,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,12,256;8806,128,512;8806,128,512;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c6.json",
+        "sha256": "a1e3f832c80ca4f748c0b9452415e1fe0fab5b9c3c7bed9fc4a21ef328dfcf22",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1258,
+      "mean_us": 1302.7226073131949,
+      "median_us": 1300.37,
+      "retained_samples": 1258,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1291.2899403815586,
+        "aic_mac_time(us)": 267.0742686804453,
+        "aic_mte1_time(us)": 466.34861844197195,
+        "aic_mte2_time(us)": 1193.5419149443549,
+        "aiv_time(us)": 1297.372788553259,
+        "aiv_vec_time(us)": 135.05777980922107
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+      "sha256": "9564eff4f8a05fd558058e6e0fa2e065c740d7e5dfec945e0277e43643eee5d0",
+      "first_line": 233,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"32,12,256;8806,128,512;8806,128,512;2048,2048;8;8;8,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"32,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 8,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c8.json",
+        "sha256": "035133681089d46d5e638aabdf7e384b53608781147ad666831ac2c582ffe4ef",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1122,
+      "mean_us": 1579.3360071301267,
+      "median_us": 1576.08,
+      "retained_samples": 1122,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1564.5893119429602,
+        "aic_mac_time(us)": 358.33965329768245,
+        "aic_mte1_time(us)": 623.2601274509792,
+        "aic_mte2_time(us)": 1454.5607344028513,
+        "aiv_time(us)": 1573.6859385026737,
+        "aiv_vec_time(us)": 179.8962638146165
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c12_p24k/kernel_details.csv",
+      "sha256": "57358cb18c9985b3673c4eb6ce62de7daf7f75bcab21d1cf925887405aa43815",
+      "first_line": 241,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,12,256;8806,128,512;8806,128,512;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c12_p24k.json",
+        "sha256": "46e156e417012320127ac1f58585b9538ec1df6115579be5509a57263df2b660",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1071,
+      "mean_us": 648.8108870214752,
+      "median_us": 649.36,
+      "retained_samples": 1071,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 455.629264239029,
+        "aic_mac_time(us)": 106.31724929971998,
+        "aic_mte1_time(us)": 186.66828478057872,
+        "aic_mte2_time(us)": 395.44315126050407,
+        "aiv_time(us)": 457.08129505135315,
+        "aiv_vec_time(us)": 53.4662240896359
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c12_p64k/kernel_details.csv",
+      "sha256": "846e367a2f519ee7acbb9ef53d2dd339923354d752bc81e0680034ba66821f4e",
+      "first_line": 247,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,12,256;8806,128,512;8806,128,512;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c12_p64k.json",
+        "sha256": "0d8a1d5efe04888b4ccd7b94261f3bb503076060fd95822aec9cee08d0904b5a",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 782,
+      "mean_us": 1761.9396163682834,
+      "median_us": 1755.3600000000001,
+      "retained_samples": 782,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1132.338152173912,
+        "aic_mac_time(us)": 277.16117263427094,
+        "aic_mte1_time(us)": 485.1349616368291,
+        "aic_mte2_time(us)": 1013.5038836317133,
+        "aiv_time(us)": 1133.8943427109975,
+        "aiv_vec_time(us)": 137.98618158567766
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c12_p8k/kernel_details.csv",
+      "sha256": "759188dc72c57cf7a9dbd4f4b9d93f0d78f861ec3301ad9e577e83afa1f0940d",
+      "first_line": 236,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,12,256;8806,128,512;8806,128,512;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c12_p8k.json",
+        "sha256": "d242344491156fa87996d82c888e2b0ad7894452d714c672a34ffef30625ad5d",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1161,
+      "mean_us": 281.2055124892332,
+      "median_us": 280.7,
+      "retained_samples": 1161,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 208.3198466838931,
+        "aic_mac_time(us)": 38.00726528854436,
+        "aic_mte1_time(us)": 66.42646770025843,
+        "aic_mte2_time(us)": 175.15145650301432,
+        "aiv_time(us)": 210.0677906976745,
+        "aiv_vec_time(us)": 19.594979328165355
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c12_p96k/kernel_details.csv",
+      "sha256": "26222bcbcfffb6feb0fa64566fa13267281bc9e7b878312963ccf2306367be9a",
+      "first_line": 116,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,12,256;8806,128,512;8806,128,512;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c12_p96k.json",
+        "sha256": "4014c1b936ad0704a41940f6c27bfd097eb1b19223f9bd06d9df639658080577",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 648,
+      "mean_us": 2714.190000000002,
+      "median_us": 2713.1499999999996,
+      "retained_samples": 648,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1680.4496646058728,
+        "aic_mac_time(us)": 414.173519319938,
+        "aic_mte1_time(us)": 723.8263632148382,
+        "aic_mte2_time(us)": 1515.1327357032462,
+        "aiv_time(us)": 1681.7900556414215,
+        "aiv_vec_time(us)": 205.83634466769715
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c24_p24k/kernel_details.csv",
+      "sha256": "6199d7f60a32ebad4810f70238f66c9d205ae9c4b20ac45f6506218b63e8372b",
+      "first_line": 245,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,12,256;8806,128,512;8806,128,512;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c24_p24k.json",
+        "sha256": "48b0104dd891e1327768fa39a966df55417724f7501490259bc751d1c842781c",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 833,
+      "mean_us": 950.3995438175258,
+      "median_us": 950.48,
+      "retained_samples": 833,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 783.4882028811527,
+        "aic_mac_time(us)": 212.26580432172855,
+        "aic_mte1_time(us)": 378.61935534213757,
+        "aic_mte2_time(us)": 679.051159663866,
+        "aiv_time(us)": 784.438272509003,
+        "aiv_vec_time(us)": 106.48527731092435
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c24_p64k/kernel_details.csv",
+      "sha256": "871d1d9916e556e16d9cff7997b6595b69100104e18c5f642d93f09b4a874b27",
+      "first_line": 122,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,12,256;8806,128,512;8806,128,512;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c24_p64k.json",
+        "sha256": "8442e30b0d49aae8899543048b51994b4c5697a5a097e9227f8df6d327574652",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 599,
+      "mean_us": 2599.3937562604347,
+      "median_us": 2599.14,
+      "retained_samples": 599,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2121.8101151919864,
+        "aic_mac_time(us)": 553.8692287145236,
+        "aic_mte1_time(us)": 975.5854156928217,
+        "aic_mte2_time(us)": 1905.0558113522548,
+        "aiv_time(us)": 2122.760365609345,
+        "aiv_vec_time(us)": 275.52025208681164
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c24_p8k/kernel_details.csv",
+      "sha256": "79903421ae97d39a0877092d8c16a92d15495a67df14e3056e3259a78149b0ff",
+      "first_line": 248,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,12,256;8806,128,512;8806,128,512;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c24_p8k.json",
+        "sha256": "6fc6e4345e74a0c55cae71cb5ca99106731096d7d8558694fc51d146192466a2",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 952,
+      "mean_us": 414.5066386554618,
+      "median_us": 414.33,
+      "retained_samples": 952,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 352.63734663865523,
+        "aic_mac_time(us)": 75.55177205882346,
+        "aic_mte1_time(us)": 133.71293802521012,
+        "aic_mte2_time(us)": 301.61107668067245,
+        "aiv_time(us)": 353.5885262605039,
+        "aiv_vec_time(us)": 38.750388655462196
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c24_p96k/kernel_details.csv",
+      "sha256": "3f10c241989ea9b857e8634a8e209d5a31851091c2f274572f206f2b9510e767",
+      "first_line": 122,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,12,256;8806,128,512;8806,128,512;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c24_p96k.json",
+        "sha256": "c87015eeb8d97fae97be3a3f94f9a8726b2a0b1e2b43ba62d49b859d099d9cd9",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 483,
+      "mean_us": 4077.9566459627304,
+      "median_us": 4077.26,
+      "retained_samples": 483,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 3298.4047219917024,
+        "aic_mac_time(us)": 827.941742738589,
+        "aic_mte1_time(us)": 1448.9414149377578,
+        "aic_mte2_time(us)": 2982.4642780082995,
+        "aiv_time(us)": 3299.5864004149357,
+        "aiv_vec_time(us)": 411.43471576763494
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c2_p24k/kernel_details.csv",
+      "sha256": "5d26e79830fe80bf17c4c31337f15794c1a1f236b00d4ed95124498781eeafce",
+      "first_line": 236,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,12,256;8806,128,512;8806,128,512;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c2_p24k.json",
+        "sha256": "762a0cd5f9834d12299ae84b01d27c77becee0d29d81f0b6c94cb93ab8b3c06c",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 986,
+      "mean_us": 126.88427991886384,
+      "median_us": 127.17,
+      "retained_samples": 986,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 117.34048478701827,
+        "aic_mac_time(us)": 17.420163286004083,
+        "aic_mte1_time(us)": 30.924250507099384,
+        "aic_mte2_time(us)": 83.36054766734286,
+        "aiv_time(us)": 120.64619776876262,
+        "aiv_vec_time(us)": 9.232628803245442
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c2_p64k/kernel_details.csv",
+      "sha256": "315614f843ab3b22a937b7072ffcf48ffb424c377f3a841cedf8b2a4c133d429",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,12,256;8806,128,512;8806,128,512;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c2_p64k.json",
+        "sha256": "17bb2cc561bf8d2287b7aa2fa9bd9016a6cffae9b96c7592bb3538bb722930e7",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 986,
+      "mean_us": 268.3394117647057,
+      "median_us": 268.11,
+      "retained_samples": 986,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 258.42718154158234,
+        "aic_mac_time(us)": 45.75979817444222,
+        "aic_mte1_time(us)": 80.22960040567963,
+        "aic_mte2_time(us)": 207.6063782961462,
+        "aiv_time(us)": 262.0329563894521,
+        "aiv_vec_time(us)": 23.367836713996002
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c2_p8k/kernel_details.csv",
+      "sha256": "390d1404c8e4187de16b6cc58d7d2dc67bced82df708468ec18df23656b19e7e",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,12,256;8806,128,512;8806,128,512;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "18",
+        "Mix Block Num": "36",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c2_p8k.json",
+        "sha256": "ba0548e154c99a6c8b4a2171d263fb569319d829ee76990cc274ec7404e3b8fc",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 770,
+      "mean_us": 72.24948051948044,
+      "median_us": 72.04,
+      "retained_samples": 770,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 62.55432467532468,
+        "aic_mac_time(us)": 7.018000000000007,
+        "aic_mte1_time(us)": 12.246819480519484,
+        "aic_mte2_time(us)": 37.05371948051943,
+        "aiv_time(us)": 66.55195454545456,
+        "aiv_vec_time(us)": 3.9491623376623393
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c2_p96k/kernel_details.csv",
+      "sha256": "5c991b257e8f070ea09744dbca27b16760c7c9d55b7795f52271d0eaa3ba128d",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,12,256;8806,128,512;8806,128,512;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c2_p96k.json",
+        "sha256": "c6d7153be6671c2659c3714b4b6e316993cd78e97a5c74e37b6ce4a87197f9ec",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1054,
+      "mean_us": 362.2770777988612,
+      "median_us": 361.9,
+      "retained_samples": 1054,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 352.25051518026527,
+        "aic_mac_time(us)": 68.8704297912714,
+        "aic_mte1_time(us)": 118.34502561669835,
+        "aic_mte2_time(us)": 312.6601280834913,
+        "aiv_time(us)": 355.6584089184063,
+        "aiv_vec_time(us)": 34.641693548386996
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c6_p24k/kernel_details.csv",
+      "sha256": "68b04f6d48cb43520cdfed083e16b857d439fc905b5afa87d9c90371e4e4dfe8",
+      "first_line": 232,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,12,256;8806,128,512;8806,128,512;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c6_p24k.json",
+        "sha256": "985249cccc7eae1a7dc6af606581c503f16a5c52dfe6abe02d02e1010bfb8505",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1255,
+      "mean_us": 268.774422310757,
+      "median_us": 271.52,
+      "retained_samples": 1255,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 255.9479466135461,
+        "aic_mac_time(us)": 49.31192669322704,
+        "aic_mte1_time(us)": 93.07894820717132,
+        "aic_mte2_time(us)": 190.17602071713148,
+        "aiv_time(us)": 262.4401482071713,
+        "aiv_vec_time(us)": 27.162043824701172
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c6_p64k/kernel_details.csv",
+      "sha256": "9891baf8c44df07a08a31a9cd776b07d1d3219c4dc87102ec8eaeb3a418f7322",
+      "first_line": 233,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,12,256;8806,128,512;8806,128,512;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c6_p64k.json",
+        "sha256": "332dda576094599fb0eccc7f4339d4013aea6e332c82092331a6a407d4e27457",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1207,
+      "mean_us": 653.1951946975981,
+      "median_us": 653.16,
+      "retained_samples": 1207,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 640.2691996686001,
+        "aic_mac_time(us)": 133.4123106876553,
+        "aic_mte1_time(us)": 243.00455260977654,
+        "aic_mte2_time(us)": 555.814189726594,
+        "aiv_time(us)": 646.8816984258493,
+        "aiv_vec_time(us)": 69.70526346313174
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c6_p8k/kernel_details.csv",
+      "sha256": "23e20c98fb000bab5185216d6686985964ffb9496ff0d726f5d07a294399dfbb",
+      "first_line": 234,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,12,256;8806,128,512;8806,128,512;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c6_p8k.json",
+        "sha256": "1930222c6022c5ea2e11d77e5bb770e400afbc0b814710da9c9d1611bc9f1ced",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1069,
+      "mean_us": 161.5896913002808,
+      "median_us": 161.24,
+      "retained_samples": 1069,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 100.53302899906443,
+        "aic_mac_time(us)": 19.014133769878438,
+        "aic_mte1_time(us)": 33.23146024321796,
+        "aic_mte2_time(us)": 76.1354396632368,
+        "aiv_time(us)": 100.79787464920487,
+        "aiv_vec_time(us)": 9.836543498596805
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/prof/decode_c6_p96k/kernel_details.csv",
+      "sha256": "d203acd7ae744246cc0898154c62ad7a8cc68884e8757886878dbe9177cab3b0",
+      "first_line": 235,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,12,256;8806,128,512;8806,128,512;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,12,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030/raw/cellset_decode_c6_p96k.json",
+        "sha256": "9857abca175848ec277f029102eb2a560de24d92361026bc2ea56b7400e8bdbc",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1088,
+      "mean_us": 959.4508823529412,
+      "median_us": 960.13,
+      "retained_samples": 1088,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 948.1019724264704,
+        "aic_mac_time(us)": 201.86217555147067,
+        "aic_mte1_time(us)": 359.7234770220583,
+        "aic_mte2_time(us)": 862.4791957720608,
+        "aiv_time(us)": 954.0650000000005,
+        "aiv_vec_time(us)": 103.48878952205892
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+      "sha256": "2bfb16c171bbcc2a362739da7a974b002d6952b90d8685235fdc6b70c0f90577",
+      "first_line": 228,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"4,6,256;21770,128,256;21770,128,256;2048,2048;1;1;1,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"4,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 1,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c1.json",
+        "sha256": "a04e897eb81e420f48ceb3674ba861b692fc64c1607d0e3c70c134d9181604aa",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2312,
+      "mean_us": 171.70075259515548,
+      "median_us": 171.34,
+      "retained_samples": 2048,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 156.74000216262988,
+        "aic_mac_time(us)": 22.751764705882376,
+        "aic_mte1_time(us)": 38.52035467128028,
+        "aic_mte2_time(us)": 122.14893598615916,
+        "aiv_time(us)": 159.86415051903123,
+        "aiv_vec_time(us)": 11.48110942906565
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+      "sha256": "c17ffca95fb5d35b7d6d73f9bb8196562c21555b0593a42b36b0fb3e74d73393",
+      "first_line": 239,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,6,256;21770,128,256;21770,128,256;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c12.json",
+        "sha256": "63866a6c1ccd16ac39301a0882b66955cfe60a99870e80cbc48c8f4ef1d0ecaf",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1428,
+      "mean_us": 1105.0319649859953,
+      "median_us": 1104.284,
+      "retained_samples": 1428,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1093.756351540615,
+        "aic_mac_time(us)": 262.5418564425773,
+        "aic_mte1_time(us)": 474.56617857142845,
+        "aic_mte2_time(us)": 1001.7046239495808,
+        "aiv_time(us)": 1099.4599761904765,
+        "aiv_vec_time(us)": 135.1898074229691
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+      "sha256": "aca8dec00d2fac8f892cf0bbdf676425fd28ddf6cc3dbb94d8e35fec7836ac8a",
+      "first_line": 238,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"64,6,256;21770,128,256;21770,128,256;2048,2048;16;16;16,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"64,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 16,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c16.json",
+        "sha256": "411093bcb0c17f70203c187560bfa3e72e7f25ad9abbc3a760af82b3b3552d1c",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1241,
+      "mean_us": 1429.8790136986313,
+      "median_us": 1423.117,
+      "retained_samples": 1241,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1413.675803384368,
+        "aic_mac_time(us)": 354.340803384367,
+        "aic_mte1_time(us)": 632.0006188557606,
+        "aic_mte2_time(us)": 1308.7198162771952,
+        "aiv_time(us)": 1423.9267679290863,
+        "aiv_vec_time(us)": 180.0046809024982
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+      "sha256": "00201438f7e4e858b01d0c33dbae08faa7c4cd98306dc0d9db99ecbf8e1eea78",
+      "first_line": 234,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,6,256;21770,128,256;21770,128,256;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c2.json",
+        "sha256": "1e0589cd203c9fd689b20728d56a7bc345b86e52da3d64786f0df6cac1c6ef5f",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2329,
+      "mean_us": 241.775312580507,
+      "median_us": 241.46949999999998,
+      "retained_samples": 2048,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 230.0161292400168,
+        "aic_mac_time(us)": 44.7029742378703,
+        "aic_mte1_time(us)": 78.27829927007284,
+        "aic_mte2_time(us)": 197.3171030485187,
+        "aiv_time(us)": 233.6401640188927,
+        "aiv_vec_time(us)": 22.774157578360004
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+      "sha256": "abba47f3c8666d616d498c97456ede6d53690c5912730a47bc7479c87373491d",
+      "first_line": 23,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,6,256;21770,128,256;21770,128,256;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c24.json",
+        "sha256": "d70fb8d501e312a00db5b05004d19b45f53aa5d0df01b2e607ab22602c0e798e",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 752,
+      "mean_us": 3507.2268444148926,
+      "median_us": 3504.7200000000003,
+      "retained_samples": 752,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2302.009296937418,
+        "aic_mac_time(us)": 540.5480199733681,
+        "aic_mte1_time(us)": 952.2177896138489,
+        "aic_mte2_time(us)": 2085.8222010652457,
+        "aiv_time(us)": 2303.4761291611185,
+        "aiv_vec_time(us)": 268.5497203728365
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+      "sha256": "4c32e5157c2e74d0119ec93c16afe530b9428bb04a11c2cc8e74dea2a09dfd37",
+      "first_line": 76,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"128,6,256;21770,128,256;21770,128,256;2048,2048;32;32;32,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"128,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 32,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c32.json",
+        "sha256": "cf2d5b1a6d3cbb6c77a227a724ab8ae99cba8e41717b3e69a30ab43b2d44d522",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 718,
+      "mean_us": 3539.770266016711,
+      "median_us": 3535.9390000000003,
+      "retained_samples": 718,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 2921.0427099023686,
+        "aic_mac_time(us)": 721.0892733612283,
+        "aic_mte1_time(us)": 1272.938355648536,
+        "aic_mte2_time(us)": 2627.723133891216,
+        "aiv_time(us)": 2921.7122887029313,
+        "aiv_vec_time(us)": 358.11814644351443
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+      "sha256": "70233f8fc7ff1fba55a118d5371a7f9ca74e27f684497e5bfcda29807f4cff44",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"16,6,256;21770,128,256;21770,128,256;2048,2048;4;4;4,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"16,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 4,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c4.json",
+        "sha256": "8ac1cdc12ef485da79b035dbde14fb3296542ffaea00b48bf101e5a553cee234",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 2108,
+      "mean_us": 417.91714184060817,
+      "median_us": 417.671,
+      "retained_samples": 2048,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 408.6534606261857,
+        "aic_mac_time(us)": 89.93061717267547,
+        "aic_mte1_time(us)": 157.36875332068314,
+        "aic_mte2_time(us)": 358.6308984819732,
+        "aiv_time(us)": 411.9204658444028,
+        "aiv_vec_time(us)": 45.28649383301711
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+      "sha256": "a248ece82d18428a654c26ee16a95c34a5169b6925198579f61766ad0323111d",
+      "first_line": 122,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"192,6,256;21770,128,256;21770,128,256;2048,2048;48;48;48,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"192,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 48,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c48.json",
+        "sha256": "f1a8d2453888301a7d344542241db3baaf64cf9d43b5c3d7650155d716c7c178",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 517,
+      "mean_us": 5334.3408336556995,
+      "median_us": 5338.113,
+      "retained_samples": 517,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 4374.8927311412,
+        "aic_mac_time(us)": 1080.6784081237925,
+        "aic_mte1_time(us)": 1905.710367504837,
+        "aic_mte2_time(us)": 3902.1984294003887,
+        "aiv_time(us)": 4376.007657640232,
+        "aiv_vec_time(us)": 536.6148394584143
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+      "sha256": "605308cafe35cdaa321eeb6a380a40eb836f09f1e4e23d0dce30643671d75a3a",
+      "first_line": 238,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,6,256;21770,128,256;21770,128,256;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c6.json",
+        "sha256": "d70f0ef5be7785d2bc7b5df47c93caa5256740435ec9b4dc12b333f2dff7c9cc",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1836,
+      "mean_us": 605.9962864923751,
+      "median_us": 605.234,
+      "retained_samples": 1836,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 596.4455294117643,
+        "aic_mac_time(us)": 132.14017919389994,
+        "aic_mte1_time(us)": 237.64316176470624,
+        "aic_mte2_time(us)": 521.4477222222216,
+        "aiv_time(us)": 600.1732690631808,
+        "aiv_vec_time(us)": 67.79597549019613
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+      "sha256": "d6244cd4030fe6dcea8d66a15cdf349c408a55e474b924ad525610b27293060b",
+      "first_line": 130,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"256,6,256;21770,128,256;21770,128,256;2048,2048;64;64;64,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"256,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 64,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c64.json",
+        "sha256": "da4f1c3299c13fccdc03d5cb3c3987537149c35b3b1c6ffd0dd8d70e49bd7787",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 400,
+      "mean_us": 7149.896457500015,
+      "median_us": 7149.486,
+      "retained_samples": 400,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 5838.239429999994,
+        "aic_mac_time(us)": 1440.8188300000006,
+        "aic_mte1_time(us)": 2542.3660350000005,
+        "aic_mte2_time(us)": 5226.259057499998,
+        "aiv_time(us)": 5839.272794999998,
+        "aiv_vec_time(us)": 715.1433499999999
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+      "sha256": "d26f013bbe6a590a1aebb7c7cdebc8f216be43a2f4eff7192e7109ac62c3ec91",
+      "first_line": 237,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"32,6,256;21770,128,256;21770,128,256;2048,2048;8;8;8,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"32,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 126000,
+      "active_batch": 8,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_128k_in126k_out3k_c8.json",
+        "sha256": "08c8c159d2e8949f77f95a28c7e9a205a568f45f56754092990a8a1a812993a6",
+        "design": {
+          "prompt_tokens": 126000,
+          "shared_tokens": 125000,
+          "fresh_tokens": 1000,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 3000,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "independent_126k_validation",
+      "event_count": 1666,
+      "mean_us": 772.4097118847551,
+      "median_us": 772.47,
+      "retained_samples": 1666,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 762.5191692677079,
+        "aic_mac_time(us)": 176.89217707082838,
+        "aic_mte1_time(us)": 316.45895678271364,
+        "aic_mte2_time(us)": 681.557282112844,
+        "aiv_time(us)": 766.8795054021604,
+        "aiv_vec_time(us)": 90.28330612244903
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c12_p24k/kernel_details.csv",
+      "sha256": "b2a8750c90b18146914fdfc37ea3121bad3745a745e4fca667ef0f53cd529eef",
+      "first_line": 241,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,6,256;21770,128,256;21770,128,256;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c12_p24k.json",
+        "sha256": "38051d6a6bf9bd1b561cf23f077c41fd6dd6f70bc25a9386ec3ebc748e40cd9e",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1080,
+      "mean_us": 244.52311574074093,
+      "median_us": 249.91,
+      "retained_samples": 1080,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 232.47704166666665,
+        "aic_mac_time(us)": 48.4703259259259,
+        "aic_mte1_time(us)": 92.63520925925916,
+        "aic_mte2_time(us)": 166.64903240740747,
+        "aiv_time(us)": 238.51052500000017,
+        "aiv_vec_time(us)": 26.89842592592587
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c12_p64k/kernel_details.csv",
+      "sha256": "ca2a4d1fa28006106a501229c40477f249f6e587ba7541ef504c7db13f57bc9c",
+      "first_line": 241,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,6,256;21770,128,256;21770,128,256;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c12_p64k.json",
+        "sha256": "b2a6f6320b9d69941e866cc02ab6d3e1ca99200fe5fddc4910b822a3600156e0",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1252,
+      "mean_us": 545.9185463258782,
+      "median_us": 562.24,
+      "retained_samples": 1252,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 534.4113266773154,
+        "aic_mac_time(us)": 125.57552156549515,
+        "aic_mte1_time(us)": 241.9766892971249,
+        "aic_mte2_time(us)": 410.2387236421725,
+        "aiv_time(us)": 540.2294904153348,
+        "aiv_vec_time(us)": 68.56360782747595
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c12_p8k/kernel_details.csv",
+      "sha256": "543361babb90f411c64349568f83c980f0ade8a54ad982e7f655dfd80df391e1",
+      "first_line": 234,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,6,256;21770,128,256;21770,128,256;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c12_p8k.json",
+        "sha256": "0d0abd5d369337b23de786e3aa7c3dd340dc1efe251b126018cf81671be257f5",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 931,
+      "mean_us": 161.61854887218047,
+      "median_us": 161.267,
+      "retained_samples": 931,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 100.2879613319012,
+        "aic_mac_time(us)": 19.01116219119229,
+        "aic_mte1_time(us)": 33.26878947368421,
+        "aic_mte2_time(us)": 76.49024274973155,
+        "aiv_time(us)": 100.6211460794844,
+        "aiv_vec_time(us)": 9.83827712137487
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c12_p96k/kernel_details.csv",
+      "sha256": "73c5e64330dae3d8b7570f10060b6ed6df763376a6baa0cf2d33b7a57f9da141",
+      "first_line": 238,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"48,6,256;21770,128,256;21770,128,256;2048,2048;12;12;12,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"48,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 12,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c12_p96k.json",
+        "sha256": "87dec6f3ed6a179297cb03ae798906b0592671b3d2f46ad37e60573f115d1428",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1201,
+      "mean_us": 795.498494587844,
+      "median_us": 800.392,
+      "retained_samples": 1201,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 784.23876602831,
+        "aic_mac_time(us)": 193.60726894254776,
+        "aic_mte1_time(us)": 361.26977851790207,
+        "aic_mte2_time(us)": 671.39118900916,
+        "aiv_time(us)": 789.9042722731064,
+        "aiv_vec_time(us)": 102.08367610324707
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c24_p24k/kernel_details.csv",
+      "sha256": "78d303f96c816f27857b4983b6c689adf5e002cbebff77c0b639c350ddab5ce4",
+      "first_line": 238,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,6,256;21770,128,256;21770,128,256;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c24_p24k.json",
+        "sha256": "9e731194e2473239388bbbbe472a10a970b25bfa2d0acfe3e99d5f69ff604a29",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1105,
+      "mean_us": 667.3078352941176,
+      "median_us": 668.487,
+      "retained_samples": 1105,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 483.86240180995486,
+        "aic_mac_time(us)": 106.3393972850679,
+        "aic_mte1_time(us)": 187.8694190045247,
+        "aic_mte2_time(us)": 423.42448687782814,
+        "aiv_time(us)": 485.63187058823564,
+        "aiv_vec_time(us)": 53.53016108597276
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c24_p64k/kernel_details.csv",
+      "sha256": "109ac7bb175d208611d50ea55ce61312f3c72297ea3405f75746536107161225",
+      "first_line": 248,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,6,256;21770,128,256;21770,128,256;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c24_p64k.json",
+        "sha256": "4d457a8601144a64dfbcde3e64e726696d07423e89899ab69eb80652dc5e8ec1",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 833,
+      "mean_us": 1697.7209243697473,
+      "median_us": 1701.168,
+      "retained_samples": 833,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1174.3351740696276,
+        "aic_mac_time(us)": 277.2260072028812,
+        "aic_mte1_time(us)": 489.53011044417764,
+        "aic_mte2_time(us)": 1047.8284501800727,
+        "aiv_time(us)": 1176.326986794717,
+        "aiv_vec_time(us)": 138.08248259303735
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c24_p8k/kernel_details.csv",
+      "sha256": "9b324c657775337f23858d79e863409c7a6c0f401dd69b87be40ae7a6d8c841c",
+      "first_line": 244,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,6,256;21770,128,256;21770,128,256;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c24_p8k.json",
+        "sha256": "10429ad186f89d8e079932fc6c66e49f3f5a87264a610d52090b97fff758348a",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 1224,
+      "mean_us": 291.2809084967312,
+      "median_us": 290.672,
+      "retained_samples": 1224,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 217.07336356209152,
+        "aic_mac_time(us)": 38.08665604575172,
+        "aic_mte1_time(us)": 66.88067320261433,
+        "aic_mte2_time(us)": 182.90098774509792,
+        "aiv_time(us)": 218.81174183006524,
+        "aiv_vec_time(us)": 19.669613562091495
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c24_p96k/kernel_details.csv",
+      "sha256": "c850c33c278c8e5b368fd19d8493df8ffa493dff541317b51613441a823c8228",
+      "first_line": 237,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"96,6,256;21770,128,256;21770,128,256;2048,2048;24;24;24,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"96,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 24,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c24_p96k.json",
+        "sha256": "4b03f7f9189ea96bfed8ce1fac3e306de358a7c744e7ae2042e7e57aff744f20",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 680,
+      "mean_us": 2636.7696985294137,
+      "median_us": 2635.0074999999997,
+      "retained_samples": 680,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 1752.0446323529427,
+        "aic_mac_time(us)": 413.9093455882351,
+        "aic_mte1_time(us)": 729.7666249999994,
+        "aic_mte2_time(us)": 1580.516405882353,
+        "aiv_time(us)": 1753.7570014705868,
+        "aiv_vec_time(us)": 205.82323676470577
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c2_p24k/kernel_details.csv",
+      "sha256": "1b28264cd661a41b2f058337199d837c6a17f56360035f083ce603cfee4de54a",
+      "first_line": 234,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,6,256;21770,128,256;21770,128,256;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c2_p24k.json",
+        "sha256": "93a128aab6b5b94d8b4dc77afae73dcfbd4e30c24cf8e653b5b46f4facacf1ee",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 187,
+      "mean_us": 92.3327219251337,
+      "median_us": 92.558,
+      "retained_samples": 187,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 81.30439572192516,
+        "aic_mac_time(us)": 8.75835828877005,
+        "aic_mte1_time(us)": 15.366770053475935,
+        "aic_mte2_time(us)": 50.73198395721925,
+        "aiv_time(us)": 84.46521390374332,
+        "aiv_vec_time(us)": 4.716042780748663
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c2_p64k/kernel_details.csv",
+      "sha256": "5a7cea178dede60ffbdb5a454d8681b8f9fc8dc21f0b4522d70bf72f94d875dd",
+      "first_line": 256,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,6,256;21770,128,256;21770,128,256;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c2_p64k.json",
+        "sha256": "369c5f34ef53f51e0cc73b7120eb28a7e317746e64038d35bd596354ec4fbbd0",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 340,
+      "mean_us": 147.4224323529412,
+      "median_us": 147.2455,
+      "retained_samples": 340,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 135.259544117647,
+        "aic_mac_time(us)": 22.208876470588244,
+        "aic_mte1_time(us)": 40.275594117647046,
+        "aic_mte2_time(us)": 100.48602647058829,
+        "aiv_time(us)": 139.43275294117646,
+        "aiv_vec_time(us)": 11.782282352941174
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c2_p8k/kernel_details.csv",
+      "sha256": "55894ec1bc7d9488a3d8da86fcea49c4e41f482fb2482cce20fb52acf3a33e0f",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,6,256;21770,128,256;21770,128,256;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "18",
+        "Mix Block Num": "36",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c2_p8k.json",
+        "sha256": "86f21d9b770fc5318918ce4ff75c934ba9f19b1ec06cbe36c1e5ff36e6ac0481",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 153,
+      "mean_us": 57.94695424836601,
+      "median_us": 57.842,
+      "retained_samples": 153,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 47.813392156862776,
+        "aic_mac_time(us)": 3.5128692810457514,
+        "aic_mte1_time(us)": 6.248882352941179,
+        "aic_mte2_time(us)": 21.200738562091512,
+        "aiv_time(us)": 50.64745751633986,
+        "aiv_vec_time(us)": 2.0724705882352934
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c2_p96k/kernel_details.csv",
+      "sha256": "dc4fbc946b93d3d3325296abc0825d41e9682bc5657cd0fe0afbf05d7e98cca3",
+      "first_line": 235,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"8,6,256;21770,128,256;21770,128,256;2048,2048;2;2;2,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"8,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 2,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c2_p96k.json",
+        "sha256": "0e2b64b343112a6841e20d7a0847417c14102fd0e1b9b2a685c150e2b1fabcff",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 408,
+      "mean_us": 195.51490196078433,
+      "median_us": 195.12,
+      "retained_samples": 408,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 184.2751519607843,
+        "aic_mac_time(us)": 34.19376470588235,
+        "aic_mte1_time(us)": 59.528071078431395,
+        "aic_mte2_time(us)": 156.08262990196064,
+        "aiv_time(us)": 187.40610784313728,
+        "aiv_vec_time(us)": 17.422931372549023
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c6_p24k/kernel_details.csv",
+      "sha256": "a2f8a962f2fd588153e8b2b77ee3d438a936bf30fca62f47736709f5fc5f2dd3",
+      "first_line": 233,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,6,256;21770,128,256;21770,128,256;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 24512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c6_p24k.json",
+        "sha256": "87f3a745702ffa244373f6211097eae35d3ba65f6b72ffbcd765b20c0bb07e23",
+        "design": {
+          "prompt_tokens": 24512,
+          "shared_tokens": 24000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.97911227154047,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 694,
+      "mean_us": 147.66382708933696,
+      "median_us": 148.446,
+      "retained_samples": 694,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 138.00354178674365,
+        "aic_mac_time(us)": 24.905984149855897,
+        "aic_mte1_time(us)": 46.729461095100824,
+        "aic_mte2_time(us)": 95.82748847262246,
+        "aiv_time(us)": 141.59901008645554,
+        "aiv_vec_time(us)": 13.626017291066294
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c6_p64k/kernel_details.csv",
+      "sha256": "92c2ce9f48f4de7daa8e6785f41d48f161655e81d56ee3f16fef2e278db9eedd",
+      "first_line": 232,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,6,256;21770,128,256;21770,128,256;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 64512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c6_p64k.json",
+        "sha256": "e4dafdad35a537019d572ace65a7ef7f7c239ac5558aa3c53eeacd1c98560853",
+        "design": {
+          "prompt_tokens": 64512,
+          "shared_tokens": 64000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9920634920634921,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 712,
+      "mean_us": 300.60834410112375,
+      "median_us": 299.732,
+      "retained_samples": 712,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 291.13190449438207,
+        "aic_mac_time(us)": 65.04384129213469,
+        "aic_mte1_time(us)": 122.37271067415719,
+        "aic_mte2_time(us)": 232.27194241573048,
+        "aiv_time(us)": 294.89840168539337,
+        "aiv_vec_time(us)": 34.714522471910115
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c6_p8k/kernel_details.csv",
+      "sha256": "0ab4fb87bebd4fa85697479fe57556cf4e515173dcb889ae69b00926daeceac5",
+      "first_line": 231,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,6,256;21770,128,256;21770,128,256;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "18",
+        "Mix Block Num": "36",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 8512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c6_p8k.json",
+        "sha256": "68a21fb10a2ad8bf6b66f8b4d7587710276c2791c05372adbee3101d4b65c920",
+        "design": {
+          "prompt_tokens": 8512,
+          "shared_tokens": 8000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9398496240601504,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 623,
+      "mean_us": 88.9017752808988,
+      "median_us": 90.364,
+      "retained_samples": 623,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 78.58004975922965,
+        "aic_mac_time(us)": 10.254699839486358,
+        "aic_mte1_time(us)": 17.877924558587498,
+        "aic_mte2_time(us)": 56.22142054574636,
+        "aiv_time(us)": 83.97433547351525,
+        "aiv_vec_time(us)": 5.633123595505616
+      }
+    },
+    {
+      "source": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/prof/decode_c6_p96k/kernel_details.csv",
+      "sha256": "b80fb0ca39501bea96e20ad867134a278e478b88589bb1a76e7f8a070f4f8a11",
+      "first_line": 236,
+      "native_abi": {
+        "Type": "FusedInferAttentionScore",
+        "Input Shapes": "\"24,6,256;21770,128,256;21770,128,256;2048,2048;6;6;6,1029\"",
+        "Input Data Types": "DT_BF16;DT_BF16;DT_BF16;INT8;INT64;INT64;INT32",
+        "Input Formats": "ND;ND;ND;ND;ND;ND;ND",
+        "Output Shapes": "\"24,6,256;\"",
+        "Output Data Types": "DT_BF16;FLOAT",
+        "Output Formats": "ND;ND",
+        "Block Num": "20",
+        "Mix Block Num": "40",
+        "Accelerator Core": "MIX_AIC"
+      },
+      "declared_context": 96512,
+      "active_batch": 6,
+      "query_tokens": 4,
+      "experiment_declaration": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen38_27b_tp4_128k_20261030/raw/cellset_decode_c6_p96k.json",
+        "sha256": "5b8a575d493e82422fcef4f08c177813c5f69facddf8ab86158a90afb9852185",
+        "design": {
+          "prompt_tokens": 96512,
+          "shared_tokens": 96000,
+          "fresh_tokens": 512,
+          "designed_hit_ratio": 0.9946949602122016,
+          "max_tokens": 512,
+          "seed": 20261030
+        }
+      },
+      "original_split": "unassigned",
+      "analysis_role": "candidate_operator_calibration",
+      "event_count": 778,
+      "mean_us": 426.0761182519281,
+      "median_us": 429.39750000000004,
+      "retained_samples": 778,
+      "median_basis": "first_at_most_2048_events_per_native_ABI",
+      "pmu_mean_us": {
+        "aicore_time(us)": 416.6122982005145,
+        "aic_mac_time(us)": 98.52556812339336,
+        "aic_mte1_time(us)": 180.6190064267353,
+        "aic_mte2_time(us)": 356.22250642673504,
+        "aiv_time(us)": 420.31277892030835,
+        "aiv_vec_time(us)": 51.17857326478134
+      }
+    }
+  ]
+}

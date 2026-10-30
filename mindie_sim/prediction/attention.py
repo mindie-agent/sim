@@ -179,8 +179,15 @@ def _cache_tensor_view(views, kv_heads, width, model, quant, parallel):
 def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode):
     if mode not in {"decode", "draft"}:
         return ()
+    requests = tuple((view.q_len, view.context) for view in views)
+    # A response for a homogeneous native batch must not also match a ragged
+    # batch merely because its first request has the same shape.
+    queries = {query for query, _ in requests}
+    contexts = {context for _, context in requests}
     return (("gqa_decode", {
-        "requests": tuple((view.q_len, view.context) for view in views),
+        "requests": requests,
+        **({"uniform_query_tokens": next(iter(queries))} if len(queries) == 1 else {}),
+        **({"uniform_context_tokens": next(iter(contexts))} if len(contexts) == 1 else {}),
         "query_heads": heads, "kv_heads": kv_heads, "head_dim": width,
         "query_dtype": model.activation_dtype, "kv_dtype": quant.kv_dtype,
         "causal": not plan.noncausal_attention, "window": plan.window or 0,
