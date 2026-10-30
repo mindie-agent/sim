@@ -141,6 +141,10 @@ def gemm_op(
     )
     if packed:
         meta = meta + (
+            # Column-scale representation is part of the kernel ABI; an
+            # activation-scale format does not identify packed weight scales.
+            ("weight_scale_format", quant.scale_format),
+            ("weight_scale_bytes", quant.scale_bytes),
             ("dequant", "fused" if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"} else "none"),
             ("dequant_traffic", 0.0),
             ("weight_bytes", weight_bytes),
