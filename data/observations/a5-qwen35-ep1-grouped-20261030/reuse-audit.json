@@ -1,0 +1,191 @@
+{
+  "frozen_parameter_manifest": {
+    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
+    "sha256": "f9863f1b4f5d7f1eac3422f59a1dfec2d09b1d87687cef79fcc1b6070bbc740a"
+  },
+  "native_target": {
+    "declared_banks": 256,
+    "weight_format": "INT8 FRACTAL_NZ",
+    "output": "BF16",
+    "column_scale": "BF16",
+    "row_scale": "FP32",
+    "up_nk": [
+      256,
+      2048
+    ],
+    "down_nk": [
+      2048,
+      128
+    ]
+  },
+  "rules": [
+    {
+      "id": "a5-int8-grouped-int32-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "int8",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "int32",
+        "metadata.matrix_output_contract": "int32_quant_matmul_without_epilogue"
+      },
+      "domain": {
+        "active_banks": {
+          "min": 32,
+          "max": 64
+        },
+        "declared_banks": {
+          "min": 64,
+          "max": 64
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 16
+        },
+        "n": {
+          "min": 1024,
+          "max": 1024
+        },
+        "k": {
+          "min": 2048,
+          "max": 2048
+        }
+      }
+    },
+    {
+      "id": "a5-int8-grouped-bf16-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "int8",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast"
+      },
+      "domain": {
+        "active_banks": {
+          "min": 32,
+          "max": 64
+        },
+        "declared_banks": {
+          "min": 64,
+          "max": 64
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 16
+        },
+        "n": {
+          "min": 2048,
+          "max": 2048
+        },
+        "k": {
+          "min": 512,
+          "max": 512
+        }
+      }
+    },
+    {
+      "id": "a5-mxa8w4-nznk-4608x5120-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_format": "mxfp4",
+        "metadata.activation_format": "fp8_e4m3",
+        "metadata.output_format": "bf16",
+        "metadata.program_execution.implementation": "ascend_mxa8w4_nznk",
+        "metadata.program_execution.mxa8w4.producer_mode": "dynamic_buffer4"
+      },
+      "domain": {
+        "active_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "declared_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 2
+        },
+        "n": {
+          "min": 4608,
+          "max": 4608
+        },
+        "k": {
+          "min": 5120,
+          "max": 5120
+        }
+      }
+    },
+    {
+      "id": "a5-mxa8w4-nznk-5120x2304-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_format": "mxfp4",
+        "metadata.activation_format": "fp8_e4m3",
+        "metadata.output_format": "bf16",
+        "metadata.program_execution.implementation": "ascend_mxa8w4_nznk",
+        "metadata.program_execution.mxa8w4.producer_mode": "dynamic_buffer4"
+      },
+      "domain": {
+        "active_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "declared_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 2
+        },
+        "n": {
+          "min": 5120,
+          "max": 5120
+        },
+        "k": {
+          "min": 2304,
+          "max": 2304
+        }
+      }
+    }
+  ],
+  "reuse_decision": "none",
+  "reasons": [
+    "A5 existing INT8 rules require64 banks; target has256.",
+    "Existing up response requiresINT32 output N1024/K2048; target BF16 N256/K2048.",
+    "Existing down response requiresK512; target K128.",
+    "Target uses probability-moment routing, not declared balanced64-bank histogram.",
+    "Existing effective mte2 inverse-scaling assumption is not imported as a physical bandwidth."
+  ],
+  "old_short_context_probe": {
+    "capture": {
+      "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-grouped/probe/probe_grouped_graph.json",
+      "sha256": "b89924f519db9739f24595b7203f22ec230907a018d546f74076505376414fe9"
+    },
+    "protocol": {
+      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/protocols/grouped-call-protocol.json",
+      "sha256": "9ce423f285dca84c17a123214574467fef580e5e13af64e7629cc3711a95ca31"
+    },
+    "producer": {
+      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
+      "sha256": "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a"
+    },
+    "column_scale": "producer declares FP32 [E,N]; retained target native column scale BF16 [256,N]",
+    "boundaries": [
+      "eager complete event",
+      "one-call graph replay complete event",
+      "eight-call graph replay complete event"
+    ],
+    "reuse_decision": "not a same-boundary frozen native single-kernel response; raw roles remain unassigned"
+  },
+  "new_assignment": "64K c1/c4 hold native GroupedMatmul kernels only;126K independent fixed validation; no Body fitting"
+}

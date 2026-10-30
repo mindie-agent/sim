@@ -1,0 +1,397 @@
+{
+  "schema": "operator-service-calibration/1",
+  "producer": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/fit.py",
+    "sha256": "885a027ecee9f1f530318e7da6be53d8f2d0b35136223f8fe9467bdbe350ad9a",
+    "size_bytes": 12036
+  },
+  "native_ledger": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/native.json",
+    "sha256": "0e7bba5d8de40d6d920e1550aa275c03ef8ff366fc55218a74b6ec9fcf572860",
+    "size_bytes": 47879
+  },
+  "service_regimes": [
+    {
+      "id": "a5-ep1-int8-nz-bf16-grouped_gate_up-joint-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "core_count": 32,
+        "physical_rates.resources.fixpipe": 6758400000000.0,
+        "physical_rates.resources.hbm": 4000000000000.0,
+        "physical_rates.resources.mte1": 13516800000000.0,
+        "physical_rates.resources.mte2_aic": 4224000000000.0,
+        "physical_rates.resources.mte2_aiv": 4224000000000.0,
+        "physical_rates.resources.mte3": 13516800000000.0,
+        "physical_rates.resources.native_grouped_call": 1000000000.0,
+        "physical_rates.resources.reg_alu_lanes": 13516800000000.0,
+        "physical_rates.resources.reg_data_writes": 211200000000.0,
+        "physical_rates.resources.reg_reduce_lanes": 6758400000000.0,
+        "physical_rates.resources.reg_shuffle_lanes": 6758400000000.0,
+        "physical_rates.resources.reg_special_lanes": 3379200000000.0,
+        "physical_rates.resources.reg_ub_accesses": 211200000000.0,
+        "physical_rates.resources.reg_ub_stores": 105600000000.0,
+        "physical_rates.resources.scalar_store_issue": 5657458563.535912,
+        "physical_rates.resources.vector": 6758400000000.0,
+        "physical_rates.compute_peaks.bf16": 432537600000000.0,
+        "physical_rates.compute_peaks.fp16": 432537600000000.0,
+        "physical_rates.compute_peaks.fp32": 27033600000000.0,
+        "physical_rates.compute_peaks.fp8_e4m3": 865075200000000.0,
+        "physical_rates.compute_peaks.fp8_e5m2": 865075200000000.0,
+        "physical_rates.compute_peaks.hf32": 216268800000000.0,
+        "physical_rates.compute_peaks.int8": 865075200000000.0,
+        "physical_rates.service_modes.reg_issue_slots": [
+          "vector",
+          211200000000.0
+        ],
+        "physical_rates.service_modes.ub_copy": [
+          "vector",
+          27033600000000.0
+        ],
+        "resource_units.fixpipe": 32,
+        "resource_units.mte1": 32,
+        "resource_units.mte2_aic": 32,
+        "resource_units.mte2_aiv": 64,
+        "resource_units.mte3": 64,
+        "resource_units.native_grouped_call": 1,
+        "resource_units.reg_alu_lanes": 64,
+        "resource_units.reg_data_writes": 64,
+        "resource_units.reg_reduce_lanes": 64,
+        "resource_units.reg_shuffle_lanes": 64,
+        "resource_units.reg_special_lanes": 64,
+        "resource_units.reg_ub_accesses": 64,
+        "resource_units.reg_ub_stores": 64,
+        "resource_units.scalar_store_issue": 64,
+        "resource_units.vector": 64,
+        "runtime": "",
+        "revision": "",
+        "format": "",
+        "implementation": {},
+        "dtype": "int8",
+        "layout": "int8_per_channel",
+        "replay_scope": "none",
+        "family": "grouped_gemm",
+        "phase": "decode",
+        "recipe": "grouped_gate_up",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "bf16",
+        "metadata.activation_scale_format": "fp32",
+        "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast",
+        "metadata.matrix_weight_bank_groups": 256,
+        "metadata.routing_basis": "probability_moments",
+        "local_shape.1": 256,
+        "local_shape.2": 2048
+      },
+      "coordinates": {
+        "rows_per_declared_bank": {
+          "path": "local_shape.0",
+          "scale": 0.00390625
+        }
+      },
+      "domain": {
+        "rows_per_declared_bank": {
+          "min": 0.125,
+          "max": 0.5
+        }
+      },
+      "response": {
+        "fixed_us": 27.148691492768275,
+        "terms": [
+          {
+            "coordinate": "rows_per_declared_bank",
+            "us_per_unit": 16.355580302751736
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "native_grouped_call",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul"
+      },
+      "provenance": {
+        "kind": "conditional_native_operator_response",
+        "boundary": "inclusive single GroupedMatmul kernel duration",
+        "training": [
+          {
+            "case_id": "a5-qwen35-tp4-longctx-p65536-c1-hold",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_hold/kernel_details.csv.gz",
+              "size_bytes": 27904964,
+              "mtime_ns": 1792695827861351286,
+              "schema_version": "kernel_details_csv_48col",
+              "sha256": "01d05033c0393ba9a105728b9fadca974a297dd861a26f4ecd01c16ae06be2d9"
+            },
+            "extraction": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664.json",
+              "sha256": "c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664",
+              "reused_existing_extraction": true
+            },
+            "routed_rows": 32,
+            "declared_banks": 256,
+            "rows_per_bank": 0.125,
+            "mean_us": 29.193139030612244,
+            "calls": 7840,
+            "first_csv_line": 73,
+            "last_csv_line": 388612,
+            "native_signature": {
+              "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+              "Type": "GroupedMatmul",
+              "Accelerator Core": "MIX_AIC",
+              "Input Shapes": "M,2048;256,8,128,16,32;;256,256;;;;256;M",
+              "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+              "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+              "Output Shapes": "M,256",
+              "Output Data Types": "DT_BF16",
+              "Output Formats": "ND",
+              "Block Num": "32",
+              "Mix Block Num": "64"
+            }
+          },
+          {
+            "case_id": "a5-qwen35-tp4-longctx-p65536-c4-hold",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_hold/kernel_details.csv.gz",
+              "size_bytes": 32643777,
+              "mtime_ns": 1792695828433141801,
+              "schema_version": "kernel_details_csv_48col",
+              "sha256": "c107f1fa16155ddc86704da431c10d0c9a9032ad7f2071d22d55f6ffafd17ca6"
+            },
+            "extraction": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f.json",
+              "sha256": "dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f",
+              "reused_existing_extraction": true
+            },
+            "routed_rows": 128,
+            "declared_banks": 256,
+            "rows_per_bank": 0.5,
+            "mean_us": 35.326481644144145,
+            "calls": 8880,
+            "first_csv_line": 74,
+            "last_csv_line": 447971,
+            "native_signature": {
+              "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+              "Type": "GroupedMatmul",
+              "Accelerator Core": "MIX_AIC",
+              "Input Shapes": "M,2048;256,8,128,16,32;;256,256;;;;256;M",
+              "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+              "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+              "Output Shapes": "M,256",
+              "Output Data Types": "DT_BF16",
+              "Output Formats": "ND",
+              "Block Num": "32",
+              "Mix Block Num": "64"
+            }
+          }
+        ],
+        "original_role": "unassigned",
+        "assignment": "retrospective64K hold",
+        "histogram": "group_list values unknown; rows/256 is an aggregate coordinate, not a balanced histogram",
+        "native_weight_column_scale": "BF16 [256,N]; per-token scale FP32[M]",
+        "scope": "Explicit EP1 caller case; column-scale format is retained in case declaration and native protocol, not exposed as an independent regime-match axis.",
+        "limitations": [
+          "binary revision and actual route histogram unobserved",
+          "correlated calls within two captures, not independent hardware trials",
+          "no opaque duration converted into HBM/MTE/Cube supply",
+          "only unmodified physical-rate domain; changes revert to analytical program",
+          "126K sources and64K o32 sources never assign coefficients",
+          "no whole-Body totals, residuals or concurrency labels enter response"
+        ]
+      }
+    },
+    {
+      "id": "a5-ep1-int8-nz-bf16-grouped_down-joint-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "core_count": 32,
+        "physical_rates.resources.fixpipe": 6758400000000.0,
+        "physical_rates.resources.hbm": 4000000000000.0,
+        "physical_rates.resources.mte1": 13516800000000.0,
+        "physical_rates.resources.mte2_aic": 4224000000000.0,
+        "physical_rates.resources.mte2_aiv": 4224000000000.0,
+        "physical_rates.resources.mte3": 13516800000000.0,
+        "physical_rates.resources.native_grouped_call": 1000000000.0,
+        "physical_rates.resources.reg_alu_lanes": 13516800000000.0,
+        "physical_rates.resources.reg_data_writes": 211200000000.0,
+        "physical_rates.resources.reg_reduce_lanes": 6758400000000.0,
+        "physical_rates.resources.reg_shuffle_lanes": 6758400000000.0,
+        "physical_rates.resources.reg_special_lanes": 3379200000000.0,
+        "physical_rates.resources.reg_ub_accesses": 211200000000.0,
+        "physical_rates.resources.reg_ub_stores": 105600000000.0,
+        "physical_rates.resources.scalar_store_issue": 5657458563.535912,
+        "physical_rates.resources.vector": 6758400000000.0,
+        "physical_rates.compute_peaks.bf16": 432537600000000.0,
+        "physical_rates.compute_peaks.fp16": 432537600000000.0,
+        "physical_rates.compute_peaks.fp32": 27033600000000.0,
+        "physical_rates.compute_peaks.fp8_e4m3": 865075200000000.0,
+        "physical_rates.compute_peaks.fp8_e5m2": 865075200000000.0,
+        "physical_rates.compute_peaks.hf32": 216268800000000.0,
+        "physical_rates.compute_peaks.int8": 865075200000000.0,
+        "physical_rates.service_modes.reg_issue_slots": [
+          "vector",
+          211200000000.0
+        ],
+        "physical_rates.service_modes.ub_copy": [
+          "vector",
+          27033600000000.0
+        ],
+        "resource_units.fixpipe": 32,
+        "resource_units.mte1": 32,
+        "resource_units.mte2_aic": 32,
+        "resource_units.mte2_aiv": 64,
+        "resource_units.mte3": 64,
+        "resource_units.native_grouped_call": 1,
+        "resource_units.reg_alu_lanes": 64,
+        "resource_units.reg_data_writes": 64,
+        "resource_units.reg_reduce_lanes": 64,
+        "resource_units.reg_shuffle_lanes": 64,
+        "resource_units.reg_special_lanes": 64,
+        "resource_units.reg_ub_accesses": 64,
+        "resource_units.reg_ub_stores": 64,
+        "resource_units.scalar_store_issue": 64,
+        "resource_units.vector": 64,
+        "runtime": "",
+        "revision": "",
+        "format": "",
+        "implementation": {},
+        "dtype": "int8",
+        "layout": "int8_per_channel",
+        "replay_scope": "none",
+        "family": "grouped_gemm",
+        "phase": "decode",
+        "recipe": "grouped_down",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "bf16",
+        "metadata.activation_scale_format": "fp32",
+        "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast",
+        "metadata.matrix_weight_bank_groups": 256,
+        "metadata.routing_basis": "probability_moments",
+        "local_shape.1": 2048,
+        "local_shape.2": 128
+      },
+      "coordinates": {
+        "rows_per_declared_bank": {
+          "path": "local_shape.0",
+          "scale": 0.00390625
+        }
+      },
+      "domain": {
+        "rows_per_declared_bank": {
+          "min": 0.125,
+          "max": 0.5
+        }
+      },
+      "response": {
+        "fixed_us": 26.935365382729668,
+        "terms": [
+          {
+            "coordinate": "rows_per_declared_bank",
+            "us_per_unit": 19.816253468774892
+          }
+        ]
+      },
+      "execution": {
+        "kind": "joint_native",
+        "resource": "native_grouped_call",
+        "reference_rate": 1000000000.0,
+        "native_kernel": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul"
+      },
+      "provenance": {
+        "kind": "conditional_native_operator_response",
+        "boundary": "inclusive single GroupedMatmul kernel duration",
+        "training": [
+          {
+            "case_id": "a5-qwen35-tp4-longctx-p65536-c1-hold",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_hold/kernel_details.csv.gz",
+              "size_bytes": 27904964,
+              "mtime_ns": 1792695827861351286,
+              "schema_version": "kernel_details_csv_48col",
+              "sha256": "01d05033c0393ba9a105728b9fadca974a297dd861a26f4ecd01c16ae06be2d9"
+            },
+            "extraction": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664.json",
+              "sha256": "c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664",
+              "reused_existing_extraction": true
+            },
+            "routed_rows": 32,
+            "declared_banks": 256,
+            "rows_per_bank": 0.125,
+            "mean_us": 29.41239706632653,
+            "calls": 7840,
+            "first_csv_line": 76,
+            "last_csv_line": 388615,
+            "native_signature": {
+              "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+              "Type": "GroupedMatmul",
+              "Accelerator Core": "MIX_AIC",
+              "Input Shapes": "M,128;256,64,8,16,32;;256,2048;;;;256;M",
+              "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+              "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+              "Output Shapes": "M,2048",
+              "Output Data Types": "DT_BF16",
+              "Output Formats": "ND",
+              "Block Num": "32",
+              "Mix Block Num": "64"
+            }
+          },
+          {
+            "case_id": "a5-qwen35-tp4-longctx-p65536-c4-hold",
+            "source": {
+              "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_hold/kernel_details.csv.gz",
+              "size_bytes": 32643777,
+              "mtime_ns": 1792695828433141801,
+              "schema_version": "kernel_details_csv_48col",
+              "sha256": "c107f1fa16155ddc86704da431c10d0c9a9032ad7f2071d22d55f6ffafd17ca6"
+            },
+            "extraction": {
+              "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f.json",
+              "sha256": "dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f",
+              "reused_existing_extraction": true
+            },
+            "routed_rows": 128,
+            "declared_banks": 256,
+            "rows_per_bank": 0.5,
+            "mean_us": 36.843492117117115,
+            "calls": 8880,
+            "first_csv_line": 77,
+            "last_csv_line": 447974,
+            "native_signature": {
+              "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+              "Type": "GroupedMatmul",
+              "Accelerator Core": "MIX_AIC",
+              "Input Shapes": "M,128;256,64,8,16,32;;256,2048;;;;256;M",
+              "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+              "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+              "Output Shapes": "M,2048",
+              "Output Data Types": "DT_BF16",
+              "Output Formats": "ND",
+              "Block Num": "32",
+              "Mix Block Num": "64"
+            }
+          }
+        ],
+        "original_role": "unassigned",
+        "assignment": "retrospective64K hold",
+        "histogram": "group_list values unknown; rows/256 is an aggregate coordinate, not a balanced histogram",
+        "native_weight_column_scale": "BF16 [256,N]; per-token scale FP32[M]",
+        "scope": "Explicit EP1 caller case; column-scale format is retained in case declaration and native protocol, not exposed as an independent regime-match axis.",
+        "limitations": [
+          "binary revision and actual route histogram unobserved",
+          "correlated calls within two captures, not independent hardware trials",
+          "no opaque duration converted into HBM/MTE/Cube supply",
+          "only unmodified physical-rate domain; changes revert to analytical program",
+          "126K sources and64K o32 sources never assign coefficients",
+          "no whole-Body totals, residuals or concurrency labels enter response"
+        ]
+      }
+    }
+  ],
+  "source_case": {
+    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
+    "sha256": "fbac3d688d7a92e6e598c1ba6406cef4c2f8addf68dfa9b4dd56c02d9a9b5a53",
+    "size_bytes": 2673
+  },
+  "body_durations_used": false
+}

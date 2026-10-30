@@ -1,0 +1,1220 @@
+{
+  "name": "A5 Qwen3.5 TP4 EP1 conditional grouped native response",
+  "machine": {
+    "name": "Ascend950DT_9582",
+    "architecture": "A5",
+    "hardware_key": "",
+    "sku": "Ascend950DT_9582",
+    "devices": [
+      {
+        "rank": 0,
+        "memory_bytes": 103079215104,
+        "compute_peaks": {
+          "bf16": 432537600000000.0,
+          "fp16": 432537600000000.0,
+          "fp32": 27033600000000.0,
+          "fp8_e4m3": 865075200000000.0,
+          "fp8_e5m2": 865075200000000.0,
+          "hf32": 216268800000000.0,
+          "int8": 865075200000000.0
+        },
+        "rates": {
+          "fixpipe": 6758400000000.0,
+          "hbm": 4000000000000.0,
+          "mte1": 13516800000000.0,
+          "mte2_aic": 4224000000000.0,
+          "mte2_aiv": 4224000000000.0,
+          "mte3": 13516800000000.0,
+          "reg_alu_lanes": 13516800000000.0,
+          "reg_data_writes": 211200000000.0,
+          "reg_reduce_lanes": 6758400000000.0,
+          "reg_shuffle_lanes": 6758400000000.0,
+          "reg_special_lanes": 3379200000000.0,
+          "reg_ub_accesses": 211200000000.0,
+          "reg_ub_stores": 105600000000.0,
+          "scalar_store_issue": 5657458563.535912,
+          "vector": 6758400000000.0,
+          "native_grouped_call": 1000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "l1": 524288,
+          "ub": 253952
+        },
+        "compute_units": 32,
+        "launch_us": 0.0,
+        "node": 0,
+        "package": 0,
+        "resource_units": {
+          "fixpipe": 32,
+          "mte1": 32,
+          "mte2_aic": 32,
+          "mte2_aiv": 64,
+          "mte3": 64,
+          "reg_alu_lanes": 64,
+          "reg_data_writes": 64,
+          "reg_reduce_lanes": 64,
+          "reg_shuffle_lanes": 64,
+          "reg_special_lanes": 64,
+          "reg_ub_accesses": 64,
+          "reg_ub_stores": 64,
+          "scalar_store_issue": 64,
+          "vector": 64,
+          "native_grouped_call": 1
+        },
+        "buffer_units": {
+          "l0a": 32,
+          "l0b": 32,
+          "l0c": 32,
+          "l1": 32,
+          "ub": 64
+        },
+        "service_modes": {
+          "reg_issue_slots": {
+            "resource": "vector",
+            "rate": 211200000000.0
+          },
+          "ub_copy": {
+            "resource": "vector",
+            "rate": 27033600000000.0
+          }
+        },
+        "work_units": {
+          "scalar_store_issue": "stores",
+          "native_grouped_call": "busy_ns"
+        },
+        "store_queues": {
+          "scalar_store_issue": {
+            "element_bytes": 2,
+            "granule_bytes": 128,
+            "outstanding": 8,
+            "response_ms": 9.125e-05,
+            "row_control_ms": 7e-06
+          }
+        },
+        "kernel_invocations": {
+          "cube": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001578,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.578,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
+              "excludes": [
+                "empty_aic",
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "6_to_7us_matrix_residual"
+              ]
+            }
+          },
+          "empty_aic": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.000439,
+            "provenance": {
+              "basis": "conservative_empty_task_envelope",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582",
+              "observed_us": 0.439,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "inclusive conservative completion envelope; no inference of useful-work setup or block-count dependence",
+              "excludes": [
+                "32MiB_weight_matmul_latency",
+                "host_submission",
+                "6_to_7us_matrix_residual",
+                "additive_startup"
+              ]
+            }
+          },
+          "vector": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001312,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.312,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
+              "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+              "excludes": [
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          },
+          "w8a8_nd_bf16": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.003037,
+            "provenance": {
+              "basis": "declared_execution_class",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 3.037,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "explicit w8a8_nd_bf16 invocation class; ordinary format metadata alone does not establish ND dispatch",
+              "excludes": [
+                "NZ",
+                "W4A8",
+                "MXFP8",
+                "grouped_gemm",
+                "INT32_output",
+                "other_SKUs",
+                "host_submission",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "rank": 1,
+        "memory_bytes": 103079215104,
+        "compute_peaks": {
+          "bf16": 432537600000000.0,
+          "fp16": 432537600000000.0,
+          "fp32": 27033600000000.0,
+          "fp8_e4m3": 865075200000000.0,
+          "fp8_e5m2": 865075200000000.0,
+          "hf32": 216268800000000.0,
+          "int8": 865075200000000.0
+        },
+        "rates": {
+          "fixpipe": 6758400000000.0,
+          "hbm": 4000000000000.0,
+          "mte1": 13516800000000.0,
+          "mte2_aic": 4224000000000.0,
+          "mte2_aiv": 4224000000000.0,
+          "mte3": 13516800000000.0,
+          "reg_alu_lanes": 13516800000000.0,
+          "reg_data_writes": 211200000000.0,
+          "reg_reduce_lanes": 6758400000000.0,
+          "reg_shuffle_lanes": 6758400000000.0,
+          "reg_special_lanes": 3379200000000.0,
+          "reg_ub_accesses": 211200000000.0,
+          "reg_ub_stores": 105600000000.0,
+          "scalar_store_issue": 5657458563.535912,
+          "vector": 6758400000000.0,
+          "native_grouped_call": 1000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "l1": 524288,
+          "ub": 253952
+        },
+        "compute_units": 32,
+        "launch_us": 0.0,
+        "node": 0,
+        "package": 1,
+        "resource_units": {
+          "fixpipe": 32,
+          "mte1": 32,
+          "mte2_aic": 32,
+          "mte2_aiv": 64,
+          "mte3": 64,
+          "reg_alu_lanes": 64,
+          "reg_data_writes": 64,
+          "reg_reduce_lanes": 64,
+          "reg_shuffle_lanes": 64,
+          "reg_special_lanes": 64,
+          "reg_ub_accesses": 64,
+          "reg_ub_stores": 64,
+          "scalar_store_issue": 64,
+          "vector": 64,
+          "native_grouped_call": 1
+        },
+        "buffer_units": {
+          "l0a": 32,
+          "l0b": 32,
+          "l0c": 32,
+          "l1": 32,
+          "ub": 64
+        },
+        "service_modes": {
+          "reg_issue_slots": {
+            "resource": "vector",
+            "rate": 211200000000.0
+          },
+          "ub_copy": {
+            "resource": "vector",
+            "rate": 27033600000000.0
+          }
+        },
+        "work_units": {
+          "scalar_store_issue": "stores",
+          "native_grouped_call": "busy_ns"
+        },
+        "store_queues": {
+          "scalar_store_issue": {
+            "element_bytes": 2,
+            "granule_bytes": 128,
+            "outstanding": 8,
+            "response_ms": 9.125e-05,
+            "row_control_ms": 7e-06
+          }
+        },
+        "kernel_invocations": {
+          "cube": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001578,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.578,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
+              "excludes": [
+                "empty_aic",
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "6_to_7us_matrix_residual"
+              ]
+            }
+          },
+          "empty_aic": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.000439,
+            "provenance": {
+              "basis": "conservative_empty_task_envelope",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582",
+              "observed_us": 0.439,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "inclusive conservative completion envelope; no inference of useful-work setup or block-count dependence",
+              "excludes": [
+                "32MiB_weight_matmul_latency",
+                "host_submission",
+                "6_to_7us_matrix_residual",
+                "additive_startup"
+              ]
+            }
+          },
+          "vector": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001312,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.312,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
+              "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+              "excludes": [
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          },
+          "w8a8_nd_bf16": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.003037,
+            "provenance": {
+              "basis": "declared_execution_class",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 3.037,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "explicit w8a8_nd_bf16 invocation class; ordinary format metadata alone does not establish ND dispatch",
+              "excludes": [
+                "NZ",
+                "W4A8",
+                "MXFP8",
+                "grouped_gemm",
+                "INT32_output",
+                "other_SKUs",
+                "host_submission",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "rank": 2,
+        "memory_bytes": 103079215104,
+        "compute_peaks": {
+          "bf16": 432537600000000.0,
+          "fp16": 432537600000000.0,
+          "fp32": 27033600000000.0,
+          "fp8_e4m3": 865075200000000.0,
+          "fp8_e5m2": 865075200000000.0,
+          "hf32": 216268800000000.0,
+          "int8": 865075200000000.0
+        },
+        "rates": {
+          "fixpipe": 6758400000000.0,
+          "hbm": 4000000000000.0,
+          "mte1": 13516800000000.0,
+          "mte2_aic": 4224000000000.0,
+          "mte2_aiv": 4224000000000.0,
+          "mte3": 13516800000000.0,
+          "reg_alu_lanes": 13516800000000.0,
+          "reg_data_writes": 211200000000.0,
+          "reg_reduce_lanes": 6758400000000.0,
+          "reg_shuffle_lanes": 6758400000000.0,
+          "reg_special_lanes": 3379200000000.0,
+          "reg_ub_accesses": 211200000000.0,
+          "reg_ub_stores": 105600000000.0,
+          "scalar_store_issue": 5657458563.535912,
+          "vector": 6758400000000.0,
+          "native_grouped_call": 1000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "l1": 524288,
+          "ub": 253952
+        },
+        "compute_units": 32,
+        "launch_us": 0.0,
+        "node": 0,
+        "package": 2,
+        "resource_units": {
+          "fixpipe": 32,
+          "mte1": 32,
+          "mte2_aic": 32,
+          "mte2_aiv": 64,
+          "mte3": 64,
+          "reg_alu_lanes": 64,
+          "reg_data_writes": 64,
+          "reg_reduce_lanes": 64,
+          "reg_shuffle_lanes": 64,
+          "reg_special_lanes": 64,
+          "reg_ub_accesses": 64,
+          "reg_ub_stores": 64,
+          "scalar_store_issue": 64,
+          "vector": 64,
+          "native_grouped_call": 1
+        },
+        "buffer_units": {
+          "l0a": 32,
+          "l0b": 32,
+          "l0c": 32,
+          "l1": 32,
+          "ub": 64
+        },
+        "service_modes": {
+          "reg_issue_slots": {
+            "resource": "vector",
+            "rate": 211200000000.0
+          },
+          "ub_copy": {
+            "resource": "vector",
+            "rate": 27033600000000.0
+          }
+        },
+        "work_units": {
+          "scalar_store_issue": "stores",
+          "native_grouped_call": "busy_ns"
+        },
+        "store_queues": {
+          "scalar_store_issue": {
+            "element_bytes": 2,
+            "granule_bytes": 128,
+            "outstanding": 8,
+            "response_ms": 9.125e-05,
+            "row_control_ms": 7e-06
+          }
+        },
+        "kernel_invocations": {
+          "cube": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001578,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.578,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
+              "excludes": [
+                "empty_aic",
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "6_to_7us_matrix_residual"
+              ]
+            }
+          },
+          "empty_aic": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.000439,
+            "provenance": {
+              "basis": "conservative_empty_task_envelope",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582",
+              "observed_us": 0.439,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "inclusive conservative completion envelope; no inference of useful-work setup or block-count dependence",
+              "excludes": [
+                "32MiB_weight_matmul_latency",
+                "host_submission",
+                "6_to_7us_matrix_residual",
+                "additive_startup"
+              ]
+            }
+          },
+          "vector": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001312,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.312,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
+              "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+              "excludes": [
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          },
+          "w8a8_nd_bf16": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.003037,
+            "provenance": {
+              "basis": "declared_execution_class",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 3.037,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "explicit w8a8_nd_bf16 invocation class; ordinary format metadata alone does not establish ND dispatch",
+              "excludes": [
+                "NZ",
+                "W4A8",
+                "MXFP8",
+                "grouped_gemm",
+                "INT32_output",
+                "other_SKUs",
+                "host_submission",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          }
+        }
+      },
+      {
+        "rank": 3,
+        "memory_bytes": 103079215104,
+        "compute_peaks": {
+          "bf16": 432537600000000.0,
+          "fp16": 432537600000000.0,
+          "fp32": 27033600000000.0,
+          "fp8_e4m3": 865075200000000.0,
+          "fp8_e5m2": 865075200000000.0,
+          "hf32": 216268800000000.0,
+          "int8": 865075200000000.0
+        },
+        "rates": {
+          "fixpipe": 6758400000000.0,
+          "hbm": 4000000000000.0,
+          "mte1": 13516800000000.0,
+          "mte2_aic": 4224000000000.0,
+          "mte2_aiv": 4224000000000.0,
+          "mte3": 13516800000000.0,
+          "reg_alu_lanes": 13516800000000.0,
+          "reg_data_writes": 211200000000.0,
+          "reg_reduce_lanes": 6758400000000.0,
+          "reg_shuffle_lanes": 6758400000000.0,
+          "reg_special_lanes": 3379200000000.0,
+          "reg_ub_accesses": 211200000000.0,
+          "reg_ub_stores": 105600000000.0,
+          "scalar_store_issue": 5657458563.535912,
+          "vector": 6758400000000.0,
+          "native_grouped_call": 1000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "l1": 524288,
+          "ub": 253952
+        },
+        "compute_units": 32,
+        "launch_us": 0.0,
+        "node": 0,
+        "package": 3,
+        "resource_units": {
+          "fixpipe": 32,
+          "mte1": 32,
+          "mte2_aic": 32,
+          "mte2_aiv": 64,
+          "mte3": 64,
+          "reg_alu_lanes": 64,
+          "reg_data_writes": 64,
+          "reg_reduce_lanes": 64,
+          "reg_shuffle_lanes": 64,
+          "reg_special_lanes": 64,
+          "reg_ub_accesses": 64,
+          "reg_ub_stores": 64,
+          "scalar_store_issue": 64,
+          "vector": 64,
+          "native_grouped_call": 1
+        },
+        "buffer_units": {
+          "l0a": 32,
+          "l0b": 32,
+          "l0c": 32,
+          "l1": 32,
+          "ub": 64
+        },
+        "service_modes": {
+          "reg_issue_slots": {
+            "resource": "vector",
+            "rate": 211200000000.0
+          },
+          "ub_copy": {
+            "resource": "vector",
+            "rate": 27033600000000.0
+          }
+        },
+        "work_units": {
+          "scalar_store_issue": "stores",
+          "native_grouped_call": "busy_ns"
+        },
+        "store_queues": {
+          "scalar_store_issue": {
+            "element_bytes": 2,
+            "granule_bytes": 128,
+            "outstanding": 8,
+            "response_ms": 9.125e-05,
+            "row_control_ms": 7e-06
+          }
+        },
+        "kernel_invocations": {
+          "cube": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001578,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.578,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
+              "excludes": [
+                "empty_aic",
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "6_to_7us_matrix_residual"
+              ]
+            }
+          },
+          "empty_aic": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.000439,
+            "provenance": {
+              "basis": "conservative_empty_task_envelope",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582",
+              "observed_us": 0.439,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "inclusive conservative completion envelope; no inference of useful-work setup or block-count dependence",
+              "excludes": [
+                "32MiB_weight_matmul_latency",
+                "host_submission",
+                "6_to_7us_matrix_residual",
+                "additive_startup"
+              ]
+            }
+          },
+          "vector": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.001312,
+            "provenance": {
+              "basis": "declared_engineering_extrapolation",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 1.312,
+              "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+              "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
+              "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+              "excludes": [
+                "host_submission",
+                "stream_launch_cadence",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          },
+          "w8a8_nd_bf16": {
+            "startup_ms": 0.0,
+            "minimum_ms": 0.003037,
+            "provenance": {
+              "basis": "declared_execution_class",
+              "declared_on": "2026-10-30",
+              "boundary": "device_kernel_completion",
+              "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582",
+              "observed_us": 3.037,
+              "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+              "scope": "explicit w8a8_nd_bf16 invocation class; ordinary format metadata alone does not establish ND dispatch",
+              "excludes": [
+                "NZ",
+                "W4A8",
+                "MXFP8",
+                "grouped_gemm",
+                "INT32_output",
+                "other_SKUs",
+                "host_submission",
+                "additive_startup",
+                "body_residual_fit"
+              ]
+            }
+          }
+        }
+      }
+    ],
+    "links": [
+      {
+        "name": "d2d_intra_node:0",
+        "capacity_bytes_per_ms": 392000000.0,
+        "members": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "latency_us": 1.8,
+        "channel": "d2d_intra_node",
+        "semantics": "per_port"
+      }
+    ],
+    "ranks_per_node": 8,
+    "dies_per_package": 1,
+    "assumptions": {
+      "kernel_invocations": "A5 9582 ordinary vector1.312us and Cube1.578us are engineering class extrapolations from nonempty BF16 library controls. Explicit empty_aic retains0.439us; explicit w8a8_nd_bf16 carries3.037us for the declared INT8 ND row/channel-scale BF16 MIX_AIC boundary, never inferred for NZ/W4/MXFP8/grouped kernels. Inclusive completion minima, zero startup; runtime rules and explicit classes override defaults.",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "matrix_precision": "arch3510 ordinary FP32 MMAD has 16x16x1 parallelism; HF32 has 16x16x8. Both use storage k0=8. The caller declares inherited CTRL.HF32; nominal clock is 1.65 GHz.",
+      "memory_path": "shared HBM; independent AIC/AIV read owners use nominal INI ddr_read_rate 80/40 B/cycle per core. These memory-path supply declarations are not measured MTE2 instruction rates. Shared L2 capacity and cache behavior are not characterized.",
+      "onchip_transfer": "arch3510 nominal instruction bandwidth: MTE1 LoadData2DV2 256 B/cycle/AIC, Fixpipe local destination128 B/cycle/AIC, MTE3 UB-to-L1 128 B/cycle/AIV; UB-to-UB DataCopy uses PIPE_V at 256 payload B/cycle/AIV. Startup and shared L1 ingress are not characterized; Fixpipe-to-GM issue rate remains a declared nominal assumption.",
+      "profile": "registered SKU geometry and nominal rates",
+      "register_capacity": "Pinned arch3510 Reg tables: at most two issue slots, two data-register writes, two UB accesses and one UB store per cycle. Single-issue calls occupy both slots. ALU/special lane capacity assumes ideal dual issue; reduce/shuffle single issue. Active masked lanes impose capacity bounds only; masked instruction service, dependency latency, compiler pairing and predicate-write ports remain uncharacterized. This is not a cycle-accurate instruction schedule.",
+      "scalar_store_queue": "BF16 UB-to-GM store issue and finite queue, independently identified on Ascend950DT_9582 image c3d00a196905; data/observations/gating-probe-20261028/native-queue-holdout/parameters.json SHA256 6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb. Train first24 address-isolation rows; heldout retained separately. This is a primitive calibration, not kernel startup or model latency. Not inherited by other SKUs or A3.",
+      "transfer_bandwidth_precedence": "explicit machine.links > explicit transfer_channels channel bandwidth > convenience bytes_per_s > same-layer Gb/s > profile effective; within a channel explicit effective > explicit calibrated > explicit derived > explicit uni_peak, and null preserves unknown/disabled semantics",
+      "transfer_bandwidth_units": "inter_node_bw_gbps/intra_node_bw_gbps are decimal Gb/s and divided by 8; inter_node_bw_bytes_per_s/intra_node_bw_bytes_per_s are B/s and win over same-layer Gb/s; transfer_channels.*_bw_gbps and Link.capacity_gbps keep the historical GB/s meaning",
+      "transfer_channel_scope": "Only d2d_intra_package, d2d_intra_node and d2d_inter_node generate device graph links. Other registered channels remain metadata; they do not override host/offload services or the P/D connector. Generated links retain per_port capacity unless semantics is explicitly declared.",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden"
+    }
+  },
+  "model": {
+    "catalog_key": "qwen3.5-35b-a3b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.qkvz": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.beta_alpha": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.o": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "routed_expert": {
+          "scale_format": "bf16",
+          "scale_bytes": 2
+        }
+      },
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 8192,
+    "max_model_len": 133000,
+    "metadata": {
+      "capture_source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/scripts/serve_qwen35_attn.sh",
+        "sha256": "305f9cfe159845996f49ebe9c15c31464bed26b5122a0dfa4ed518c97317c816",
+        "size_bytes": 2511
+      },
+      "captured_execution_mode": "FULL_DECODE_ONLY",
+      "draft_proposal_tokens": 3,
+      "physical_geometry_policy": "captured tensor q/B supplied by profiler; graph padding is not re-applied to physical rows",
+      "new_latency_parameter_fit": true,
+      "runtime_recipe_basis": "uncalibrated catalog baseline; no high-concurrency EP/MC2 policy transferred",
+      "native_grouped_response": {
+        "source_case": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
+          "sha256": "fbac3d688d7a92e6e598c1ba6406cef4c2f8addf68dfa9b4dd56c02d9a9b5a53",
+          "size_bytes": 2673
+        },
+        "parameters": "data/observations/a5-qwen35-ep1-grouped-20261030/parameters.json",
+        "role": "explicit conditional grouped response; EP1 retained",
+        "case_change": "routed_expert column scale BF16/2B from native ABI; all other quant categories unchanged"
+      }
+    },
+    "kernels": {
+      "service_regimes": [
+        {
+          "id": "a5-ep1-int8-nz-bf16-grouped_gate_up-joint-v1",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "core_count": 32,
+            "physical_rates.resources.fixpipe": 6758400000000.0,
+            "physical_rates.resources.hbm": 4000000000000.0,
+            "physical_rates.resources.mte1": 13516800000000.0,
+            "physical_rates.resources.mte2_aic": 4224000000000.0,
+            "physical_rates.resources.mte2_aiv": 4224000000000.0,
+            "physical_rates.resources.mte3": 13516800000000.0,
+            "physical_rates.resources.native_grouped_call": 1000000000.0,
+            "physical_rates.resources.reg_alu_lanes": 13516800000000.0,
+            "physical_rates.resources.reg_data_writes": 211200000000.0,
+            "physical_rates.resources.reg_reduce_lanes": 6758400000000.0,
+            "physical_rates.resources.reg_shuffle_lanes": 6758400000000.0,
+            "physical_rates.resources.reg_special_lanes": 3379200000000.0,
+            "physical_rates.resources.reg_ub_accesses": 211200000000.0,
+            "physical_rates.resources.reg_ub_stores": 105600000000.0,
+            "physical_rates.resources.scalar_store_issue": 5657458563.535912,
+            "physical_rates.resources.vector": 6758400000000.0,
+            "physical_rates.compute_peaks.bf16": 432537600000000.0,
+            "physical_rates.compute_peaks.fp16": 432537600000000.0,
+            "physical_rates.compute_peaks.fp32": 27033600000000.0,
+            "physical_rates.compute_peaks.fp8_e4m3": 865075200000000.0,
+            "physical_rates.compute_peaks.fp8_e5m2": 865075200000000.0,
+            "physical_rates.compute_peaks.hf32": 216268800000000.0,
+            "physical_rates.compute_peaks.int8": 865075200000000.0,
+            "physical_rates.service_modes.reg_issue_slots": [
+              "vector",
+              211200000000.0
+            ],
+            "physical_rates.service_modes.ub_copy": [
+              "vector",
+              27033600000000.0
+            ],
+            "resource_units.fixpipe": 32,
+            "resource_units.mte1": 32,
+            "resource_units.mte2_aic": 32,
+            "resource_units.mte2_aiv": 64,
+            "resource_units.mte3": 64,
+            "resource_units.native_grouped_call": 1,
+            "resource_units.reg_alu_lanes": 64,
+            "resource_units.reg_data_writes": 64,
+            "resource_units.reg_reduce_lanes": 64,
+            "resource_units.reg_shuffle_lanes": 64,
+            "resource_units.reg_special_lanes": 64,
+            "resource_units.reg_ub_accesses": 64,
+            "resource_units.reg_ub_stores": 64,
+            "resource_units.scalar_store_issue": 64,
+            "resource_units.vector": 64,
+            "runtime": "",
+            "revision": "",
+            "format": "",
+            "implementation": {},
+            "dtype": "int8",
+            "layout": "int8_per_channel",
+            "replay_scope": "none",
+            "family": "grouped_gemm",
+            "phase": "decode",
+            "recipe": "grouped_gate_up",
+            "metadata.weight_format": "int8",
+            "metadata.activation_format": "int8",
+            "metadata.output_format": "bf16",
+            "metadata.activation_scale_format": "fp32",
+            "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast",
+            "metadata.matrix_weight_bank_groups": 256,
+            "metadata.routing_basis": "probability_moments",
+            "local_shape.1": 256,
+            "local_shape.2": 2048
+          },
+          "coordinates": {
+            "rows_per_declared_bank": {
+              "path": "local_shape.0",
+              "scale": 0.00390625
+            }
+          },
+          "domain": {
+            "rows_per_declared_bank": {
+              "min": 0.125,
+              "max": 0.5
+            }
+          },
+          "response": {
+            "fixed_us": 27.148691492768275,
+            "terms": [
+              {
+                "coordinate": "rows_per_declared_bank",
+                "us_per_unit": 16.355580302751736
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "native_grouped_call",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul"
+          },
+          "provenance": {
+            "kind": "conditional_native_operator_response",
+            "boundary": "inclusive single GroupedMatmul kernel duration",
+            "training": [
+              {
+                "case_id": "a5-qwen35-tp4-longctx-p65536-c1-hold",
+                "source": {
+                  "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_hold/kernel_details.csv.gz",
+                  "size_bytes": 27904964,
+                  "mtime_ns": 1792695827861351286,
+                  "schema_version": "kernel_details_csv_48col",
+                  "sha256": "01d05033c0393ba9a105728b9fadca974a297dd861a26f4ecd01c16ae06be2d9"
+                },
+                "extraction": {
+                  "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664.json",
+                  "sha256": "c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664",
+                  "reused_existing_extraction": true
+                },
+                "routed_rows": 32,
+                "declared_banks": 256,
+                "rows_per_bank": 0.125,
+                "mean_us": 29.193139030612244,
+                "calls": 7840,
+                "first_csv_line": 73,
+                "last_csv_line": 388612,
+                "native_signature": {
+                  "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+                  "Type": "GroupedMatmul",
+                  "Accelerator Core": "MIX_AIC",
+                  "Input Shapes": "M,2048;256,8,128,16,32;;256,256;;;;256;M",
+                  "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+                  "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+                  "Output Shapes": "M,256",
+                  "Output Data Types": "DT_BF16",
+                  "Output Formats": "ND",
+                  "Block Num": "32",
+                  "Mix Block Num": "64"
+                }
+              },
+              {
+                "case_id": "a5-qwen35-tp4-longctx-p65536-c4-hold",
+                "source": {
+                  "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_hold/kernel_details.csv.gz",
+                  "size_bytes": 32643777,
+                  "mtime_ns": 1792695828433141801,
+                  "schema_version": "kernel_details_csv_48col",
+                  "sha256": "c107f1fa16155ddc86704da431c10d0c9a9032ad7f2071d22d55f6ffafd17ca6"
+                },
+                "extraction": {
+                  "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f.json",
+                  "sha256": "dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f",
+                  "reused_existing_extraction": true
+                },
+                "routed_rows": 128,
+                "declared_banks": 256,
+                "rows_per_bank": 0.5,
+                "mean_us": 35.326481644144145,
+                "calls": 8880,
+                "first_csv_line": 74,
+                "last_csv_line": 447971,
+                "native_signature": {
+                  "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+                  "Type": "GroupedMatmul",
+                  "Accelerator Core": "MIX_AIC",
+                  "Input Shapes": "M,2048;256,8,128,16,32;;256,256;;;;256;M",
+                  "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+                  "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+                  "Output Shapes": "M,256",
+                  "Output Data Types": "DT_BF16",
+                  "Output Formats": "ND",
+                  "Block Num": "32",
+                  "Mix Block Num": "64"
+                }
+              }
+            ],
+            "original_role": "unassigned",
+            "assignment": "retrospective64K hold",
+            "histogram": "group_list values unknown; rows/256 is an aggregate coordinate, not a balanced histogram",
+            "native_weight_column_scale": "BF16 [256,N]; per-token scale FP32[M]",
+            "scope": "Explicit EP1 caller case; column-scale format is retained in case declaration and native protocol, not exposed as an independent regime-match axis.",
+            "limitations": [
+              "binary revision and actual route histogram unobserved",
+              "correlated calls within two captures, not independent hardware trials",
+              "no opaque duration converted into HBM/MTE/Cube supply",
+              "only unmodified physical-rate domain; changes revert to analytical program",
+              "126K sources and64K o32 sources never assign coefficients",
+              "no whole-Body totals, residuals or concurrency labels enter response"
+            ]
+          }
+        },
+        {
+          "id": "a5-ep1-int8-nz-bf16-grouped_down-joint-v1",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "core_count": 32,
+            "physical_rates.resources.fixpipe": 6758400000000.0,
+            "physical_rates.resources.hbm": 4000000000000.0,
+            "physical_rates.resources.mte1": 13516800000000.0,
+            "physical_rates.resources.mte2_aic": 4224000000000.0,
+            "physical_rates.resources.mte2_aiv": 4224000000000.0,
+            "physical_rates.resources.mte3": 13516800000000.0,
+            "physical_rates.resources.native_grouped_call": 1000000000.0,
+            "physical_rates.resources.reg_alu_lanes": 13516800000000.0,
+            "physical_rates.resources.reg_data_writes": 211200000000.0,
+            "physical_rates.resources.reg_reduce_lanes": 6758400000000.0,
+            "physical_rates.resources.reg_shuffle_lanes": 6758400000000.0,
+            "physical_rates.resources.reg_special_lanes": 3379200000000.0,
+            "physical_rates.resources.reg_ub_accesses": 211200000000.0,
+            "physical_rates.resources.reg_ub_stores": 105600000000.0,
+            "physical_rates.resources.scalar_store_issue": 5657458563.535912,
+            "physical_rates.resources.vector": 6758400000000.0,
+            "physical_rates.compute_peaks.bf16": 432537600000000.0,
+            "physical_rates.compute_peaks.fp16": 432537600000000.0,
+            "physical_rates.compute_peaks.fp32": 27033600000000.0,
+            "physical_rates.compute_peaks.fp8_e4m3": 865075200000000.0,
+            "physical_rates.compute_peaks.fp8_e5m2": 865075200000000.0,
+            "physical_rates.compute_peaks.hf32": 216268800000000.0,
+            "physical_rates.compute_peaks.int8": 865075200000000.0,
+            "physical_rates.service_modes.reg_issue_slots": [
+              "vector",
+              211200000000.0
+            ],
+            "physical_rates.service_modes.ub_copy": [
+              "vector",
+              27033600000000.0
+            ],
+            "resource_units.fixpipe": 32,
+            "resource_units.mte1": 32,
+            "resource_units.mte2_aic": 32,
+            "resource_units.mte2_aiv": 64,
+            "resource_units.mte3": 64,
+            "resource_units.native_grouped_call": 1,
+            "resource_units.reg_alu_lanes": 64,
+            "resource_units.reg_data_writes": 64,
+            "resource_units.reg_reduce_lanes": 64,
+            "resource_units.reg_shuffle_lanes": 64,
+            "resource_units.reg_special_lanes": 64,
+            "resource_units.reg_ub_accesses": 64,
+            "resource_units.reg_ub_stores": 64,
+            "resource_units.scalar_store_issue": 64,
+            "resource_units.vector": 64,
+            "runtime": "",
+            "revision": "",
+            "format": "",
+            "implementation": {},
+            "dtype": "int8",
+            "layout": "int8_per_channel",
+            "replay_scope": "none",
+            "family": "grouped_gemm",
+            "phase": "decode",
+            "recipe": "grouped_down",
+            "metadata.weight_format": "int8",
+            "metadata.activation_format": "int8",
+            "metadata.output_format": "bf16",
+            "metadata.activation_scale_format": "fp32",
+            "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast",
+            "metadata.matrix_weight_bank_groups": 256,
+            "metadata.routing_basis": "probability_moments",
+            "local_shape.1": 2048,
+            "local_shape.2": 128
+          },
+          "coordinates": {
+            "rows_per_declared_bank": {
+              "path": "local_shape.0",
+              "scale": 0.00390625
+            }
+          },
+          "domain": {
+            "rows_per_declared_bank": {
+              "min": 0.125,
+              "max": 0.5
+            }
+          },
+          "response": {
+            "fixed_us": 26.935365382729668,
+            "terms": [
+              {
+                "coordinate": "rows_per_declared_bank",
+                "us_per_unit": 19.816253468774892
+              }
+            ]
+          },
+          "execution": {
+            "kind": "joint_native",
+            "resource": "native_grouped_call",
+            "reference_rate": 1000000000.0,
+            "native_kernel": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul"
+          },
+          "provenance": {
+            "kind": "conditional_native_operator_response",
+            "boundary": "inclusive single GroupedMatmul kernel duration",
+            "training": [
+              {
+                "case_id": "a5-qwen35-tp4-longctx-p65536-c1-hold",
+                "source": {
+                  "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_hold/kernel_details.csv.gz",
+                  "size_bytes": 27904964,
+                  "mtime_ns": 1792695827861351286,
+                  "schema_version": "kernel_details_csv_48col",
+                  "sha256": "01d05033c0393ba9a105728b9fadca974a297dd861a26f4ecd01c16ae06be2d9"
+                },
+                "extraction": {
+                  "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664.json",
+                  "sha256": "c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664",
+                  "reused_existing_extraction": true
+                },
+                "routed_rows": 32,
+                "declared_banks": 256,
+                "rows_per_bank": 0.125,
+                "mean_us": 29.41239706632653,
+                "calls": 7840,
+                "first_csv_line": 76,
+                "last_csv_line": 388615,
+                "native_signature": {
+                  "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+                  "Type": "GroupedMatmul",
+                  "Accelerator Core": "MIX_AIC",
+                  "Input Shapes": "M,128;256,64,8,16,32;;256,2048;;;;256;M",
+                  "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+                  "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+                  "Output Shapes": "M,2048",
+                  "Output Data Types": "DT_BF16",
+                  "Output Formats": "ND",
+                  "Block Num": "32",
+                  "Mix Block Num": "64"
+                }
+              },
+              {
+                "case_id": "a5-qwen35-tp4-longctx-p65536-c4-hold",
+                "source": {
+                  "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_hold/kernel_details.csv.gz",
+                  "size_bytes": 32643777,
+                  "mtime_ns": 1792695828433141801,
+                  "schema_version": "kernel_details_csv_48col",
+                  "sha256": "c107f1fa16155ddc86704da431c10d0c9a9032ad7f2071d22d55f6ffafd17ca6"
+                },
+                "extraction": {
+                  "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f.json",
+                  "sha256": "dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f",
+                  "reused_existing_extraction": true
+                },
+                "routed_rows": 128,
+                "declared_banks": 256,
+                "rows_per_bank": 0.5,
+                "mean_us": 36.843492117117115,
+                "calls": 8880,
+                "first_csv_line": 77,
+                "last_csv_line": 447974,
+                "native_signature": {
+                  "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+                  "Type": "GroupedMatmul",
+                  "Accelerator Core": "MIX_AIC",
+                  "Input Shapes": "M,128;256,64,8,16,32;;256,2048;;;;256;M",
+                  "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+                  "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+                  "Output Shapes": "M,2048",
+                  "Output Data Types": "DT_BF16",
+                  "Output Formats": "ND",
+                  "Block Num": "32",
+                  "Mix Block Num": "64"
+                }
+              }
+            ],
+            "original_role": "unassigned",
+            "assignment": "retrospective64K hold",
+            "histogram": "group_list values unknown; rows/256 is an aggregate coordinate, not a balanced histogram",
+            "native_weight_column_scale": "BF16 [256,N]; per-token scale FP32[M]",
+            "scope": "Explicit EP1 caller case; column-scale format is retained in case declaration and native protocol, not exposed as an independent regime-match axis.",
+            "limitations": [
+              "binary revision and actual route histogram unobserved",
+              "correlated calls within two captures, not independent hardware trials",
+              "no opaque duration converted into HBM/MTE/Cube supply",
+              "only unmodified physical-rate domain; changes revert to analytical program",
+              "126K sources and64K o32 sources never assign coefficients",
+              "no whole-Body totals, residuals or concurrency labels enter response"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4104,
+        "output_tokens": 256
+      }
+    ]
+  }
+}

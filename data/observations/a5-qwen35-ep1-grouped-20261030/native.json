@@ -1,0 +1,1391 @@
+{
+  "schema": "a5-ep1-grouped-native/1",
+  "boundary": "inclusive native kernel entirely inside retained q4 complete Body windows",
+  "split": "Retrospective source split; no Body total used; raw roles remain unassigned.",
+  "limitations": [
+    "group_list values and native binary identity unobserved",
+    "means pool correlated layer calls; not independent hardware trials"
+  ],
+  "cases": [
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p126976-c1-hold",
+      "assignment_role": "fixed_126k_validation",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p126976_c1_hold/kernel_details.csv.gz",
+        "size_bytes": 22938359,
+        "mtime_ns": 1792695828835759368,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "3f5501a5e1ada0f2d1b72aaff01be0428a7ea9e99529ec0009966aaccdf93171"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5e0a11090da02c0c85502297eb3b6a448700000697cd7a7d14bd63fa7febe11a.json",
+        "sha256": "5e0a11090da02c0c85502297eb3b6a448700000697cd7a7d14bd63fa7febe11a",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/179fda9d53a81dc7000b6a60d97d0ef1ca281ce4653d5b828ca42fb095664019.json",
+        "sha256": "179fda9d53a81dc7000b6a60d97d0ef1ca281ce4653d5b828ca42fb095664019",
+        "size_bytes": 153661,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 126976,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 161,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 6440,
+          "sum_ns": 191736681,
+          "min_ns": 26020,
+          "max_ns": 33212,
+          "first_csv_line": 73,
+          "last_csv_line": 319172,
+          "locators": [
+            {
+              "csv_line": 73,
+              "forward_id": "auto:0",
+              "start_ns": 1792695053079710622,
+              "duration_ns": 28897,
+              "device": "5",
+              "stream": "186",
+              "task": "83357"
+            },
+            {
+              "csv_line": 117,
+              "forward_id": "auto:0",
+              "start_ns": 1792695053079932031,
+              "duration_ns": 30405,
+              "device": "5",
+              "stream": "186",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 6440
+            }
+          ],
+          "mean_us": 29.772776552795033,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 6440,
+          "sum_ns": 194187132,
+          "min_ns": 27287,
+          "max_ns": 34163,
+          "first_csv_line": 76,
+          "last_csv_line": 319175,
+          "locators": [
+            {
+              "csv_line": 76,
+              "forward_id": "auto:0",
+              "start_ns": 1792695053079747965,
+              "duration_ns": 29610,
+              "device": "5",
+              "stream": "186",
+              "task": "83360"
+            },
+            {
+              "csv_line": 120,
+              "forward_id": "auto:0",
+              "start_ns": 1792695053079970094,
+              "duration_ns": 30159,
+              "device": "5",
+              "stream": "186",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 6440
+            }
+          ],
+          "mean_us": 30.15328136645963,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 319427,
+        "selected_grouped_kernels": 12880,
+        "wall_seconds": 1.3197932089678943,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p126976-c1-o32",
+      "assignment_role": "fixed_126k_validation",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p126976_c1_o32/kernel_details.csv.gz",
+        "size_bytes": 4155825,
+        "mtime_ns": 1792695827119771196,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "ecfb9815cbc1f1f539372cccdae8187b2ca9c95639dc61b2e6c5464cf4e07dba"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/680d8fe2cccab747c1131fb633b88b1966c4ef739dc68f30a92ed2a3f136a829.json",
+        "sha256": "680d8fe2cccab747c1131fb633b88b1966c4ef739dc68f30a92ed2a3f136a829",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/3e2f8bc7d1b27f2444f0febfa85e1b23c1dd6ad8d752d5a4f209a9b126f2d9a6.json",
+        "sha256": "3e2f8bc7d1b27f2444f0febfa85e1b23c1dd6ad8d752d5a4f209a9b126f2d9a6",
+        "size_bytes": 152383,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 126976,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 9,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 360,
+          "sum_ns": 10347541,
+          "min_ns": 25860,
+          "max_ns": 31737,
+          "first_csv_line": 34770,
+          "last_csv_line": 52298,
+          "locators": [
+            {
+              "csv_line": 34770,
+              "forward_id": "auto:0",
+              "start_ns": 1792694907997571199,
+              "duration_ns": 30719,
+              "device": "6",
+              "stream": "186",
+              "task": "83357"
+            },
+            {
+              "csv_line": 34814,
+              "forward_id": "auto:0",
+              "start_ns": 1792694907997799904,
+              "duration_ns": 29411,
+              "device": "6",
+              "stream": "186",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 360
+            }
+          ],
+          "mean_us": 28.743169444444444,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 360,
+          "sum_ns": 10384157,
+          "min_ns": 25299,
+          "max_ns": 33016,
+          "first_csv_line": 34773,
+          "last_csv_line": 52301,
+          "locators": [
+            {
+              "csv_line": 34773,
+              "forward_id": "auto:0",
+              "start_ns": 1792694907997610947,
+              "duration_ns": 33016,
+              "device": "6",
+              "stream": "186",
+              "task": "83360"
+            },
+            {
+              "csv_line": 34817,
+              "forward_id": "auto:0",
+              "start_ns": 1792694907997837111,
+              "duration_ns": 28931,
+              "device": "6",
+              "stream": "186",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 360
+            }
+          ],
+          "mean_us": 28.844880555555555,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 52553,
+        "selected_grouped_kernels": 720,
+        "wall_seconds": 0.3166777500882745,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p126976-c4-hold",
+      "assignment_role": "fixed_126k_validation",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p126976_c4_hold/kernel_details.csv.gz",
+        "size_bytes": 32511187,
+        "mtime_ns": 1792695829403015556,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "0626b092a826f348260ead478a693981495c0a3237d67ef72d04178027b957ab"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/38f00a9fe52467cd29643ff98de585ba87dc276f81a5690fa6ec7403277f00eb.json",
+        "sha256": "38f00a9fe52467cd29643ff98de585ba87dc276f81a5690fa6ec7403277f00eb",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/9334713071813302b45f4007ae46e0ef80042af7ff124fc57ac803f3121df3a4.json",
+        "sha256": "9334713071813302b45f4007ae46e0ef80042af7ff124fc57ac803f3121df3a4",
+        "size_bytes": 153934,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": 126976,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 221,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"128,2048;256,8,128,16,32;;256,256;;;;256;128\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"128,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 8840,
+          "sum_ns": 321327242,
+          "min_ns": 28528,
+          "max_ns": 47279,
+          "first_csv_line": 74,
+          "last_csv_line": 445958,
+          "locators": [
+            {
+              "csv_line": 74,
+              "forward_id": "auto:0",
+              "start_ns": 1792695104661685240,
+              "duration_ns": 39200,
+              "device": "5",
+              "stream": "190",
+              "task": "73834"
+            },
+            {
+              "csv_line": 119,
+              "forward_id": "auto:0",
+              "start_ns": 1792695104661963512,
+              "duration_ns": 39496,
+              "device": "5",
+              "stream": "190",
+              "task": "73890"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 16,
+              "tokens_per_sequence": 4,
+              "sequences": 4,
+              "kernel_calls": 8840
+            }
+          ],
+          "mean_us": 36.34923552036199,
+          "routed_rows": 128,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"128,128;256,64,8,16,32;;256,2048;;;;256;128\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"128,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 8840,
+          "sum_ns": 336022745,
+          "min_ns": 30155,
+          "max_ns": 48695,
+          "first_csv_line": 77,
+          "last_csv_line": 445961,
+          "locators": [
+            {
+              "csv_line": 77,
+              "forward_id": "auto:0",
+              "start_ns": 1792695104661733380,
+              "duration_ns": 39274,
+              "device": "5",
+              "stream": "190",
+              "task": "73837"
+            },
+            {
+              "csv_line": 122,
+              "forward_id": "auto:0",
+              "start_ns": 1792695104662011427,
+              "duration_ns": 39649,
+              "device": "5",
+              "stream": "190",
+              "task": "73893"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 16,
+              "tokens_per_sequence": 4,
+              "sequences": 4,
+              "kernel_calls": 8840
+            }
+          ],
+          "mean_us": 38.01162273755656,
+          "routed_rows": 128,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 446217,
+        "selected_grouped_kernels": 17680,
+        "wall_seconds": 1.817560707917437,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p126976-c4-o32",
+      "assignment_role": "fixed_126k_validation",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p126976_c4_o32/kernel_details.csv.gz",
+        "size_bytes": 14480721,
+        "mtime_ns": 1792695827371181248,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "f5039e8c912289a80b967c1c415cf38d33f7ff4bf948b4ed95ecd581335d0948"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/991584297e0ecc783117fe689367132805a32dcc072f8349bc9ef4b7f601a90a.json",
+        "sha256": "991584297e0ecc783117fe689367132805a32dcc072f8349bc9ef4b7f601a90a",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/8d3ca1d943d5a4826679449aaa91da6ff1593a7d7ff2bec2efc5bbf99feacaf6.json",
+        "sha256": "8d3ca1d943d5a4826679449aaa91da6ff1593a7d7ff2bec2efc5bbf99feacaf6",
+        "size_bytes": 152732,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 126976,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 11,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 440,
+          "sum_ns": 12967159,
+          "min_ns": 26401,
+          "max_ns": 32657,
+          "first_csv_line": 157390,
+          "last_csv_line": 178886,
+          "locators": [
+            {
+              "csv_line": 157390,
+              "forward_id": "auto:0",
+              "start_ns": 1792694948475145284,
+              "duration_ns": 29784,
+              "device": "5",
+              "stream": "186",
+              "task": "83357"
+            },
+            {
+              "csv_line": 157434,
+              "forward_id": "auto:0",
+              "start_ns": 1792694948475367862,
+              "duration_ns": 30735,
+              "device": "5",
+              "stream": "186",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 440
+            }
+          ],
+          "mean_us": 29.47081590909091,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 440,
+          "sum_ns": 13105871,
+          "min_ns": 26802,
+          "max_ns": 33183,
+          "first_csv_line": 157393,
+          "last_csv_line": 178889,
+          "locators": [
+            {
+              "csv_line": 157393,
+              "forward_id": "auto:0",
+              "start_ns": 1792694948475183024,
+              "duration_ns": 29936,
+              "device": "5",
+              "stream": "186",
+              "task": "83360"
+            },
+            {
+              "csv_line": 157437,
+              "forward_id": "auto:0",
+              "start_ns": 1792694948475406176,
+              "duration_ns": 29986,
+              "device": "5",
+              "stream": "186",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 440
+            }
+          ],
+          "mean_us": 29.786070454545452,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 179141,
+        "selected_grouped_kernels": 880,
+        "wall_seconds": 0.7038665830623358,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p65536-c1-hold",
+      "assignment_role": "parameter_assignment",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_hold/kernel_details.csv.gz",
+        "size_bytes": 27904964,
+        "mtime_ns": 1792695827861351286,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "01d05033c0393ba9a105728b9fadca974a297dd861a26f4ecd01c16ae06be2d9"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664.json",
+        "sha256": "c99aeff826f6d87ff29aaab2f537dc364fbf038f48545f4d08654c6382762664",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/cb37e09e77ba0354d19c8bd83714399e83219320c72b0b6a9ca3ab1d422e4eb6.json",
+        "sha256": "cb37e09e77ba0354d19c8bd83714399e83219320c72b0b6a9ca3ab1d422e4eb6",
+        "size_bytes": 155051,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 65536,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 196,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 7840,
+          "sum_ns": 228874210,
+          "min_ns": 25654,
+          "max_ns": 34426,
+          "first_csv_line": 73,
+          "last_csv_line": 388612,
+          "locators": [
+            {
+              "csv_line": 73,
+              "forward_id": "auto:0",
+              "start_ns": 1792694973544393198,
+              "duration_ns": 27489,
+              "device": "5",
+              "stream": "186",
+              "task": "83357"
+            },
+            {
+              "csv_line": 117,
+              "forward_id": "auto:0",
+              "start_ns": 1792694973544610868,
+              "duration_ns": 26479,
+              "device": "5",
+              "stream": "186",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 7840
+            }
+          ],
+          "mean_us": 29.193139030612244,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 7840,
+          "sum_ns": 230593193,
+          "min_ns": 26351,
+          "max_ns": 33867,
+          "first_csv_line": 76,
+          "last_csv_line": 388615,
+          "locators": [
+            {
+              "csv_line": 76,
+              "forward_id": "auto:0",
+              "start_ns": 1792694973544428846,
+              "duration_ns": 27772,
+              "device": "5",
+              "stream": "186",
+              "task": "83360"
+            },
+            {
+              "csv_line": 120,
+              "forward_id": "auto:0",
+              "start_ns": 1792694973544644919,
+              "duration_ns": 26897,
+              "device": "5",
+              "stream": "186",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 7840
+            }
+          ],
+          "mean_us": 29.41239706632653,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 388867,
+        "selected_grouped_kernels": 15680,
+        "wall_seconds": 1.515733917010948,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p65536-c1-o32",
+      "assignment_role": "64k_nonassignment_control",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c1_o32/kernel_details.csv.gz",
+        "size_bytes": 3010616,
+        "mtime_ns": 1792695826890794407,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "6339243380ea8e57e2e87c3abe5a2708e99f12e2543dcbeb86fa4b48f6c56aa5"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/3c0f9a07699a8b0a6ef8da8bff96f5a4ee44a5ed3fede3c3e04e68a8f3f7bd5a.json",
+        "sha256": "3c0f9a07699a8b0a6ef8da8bff96f5a4ee44a5ed3fede3c3e04e68a8f3f7bd5a",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/c7c07e00d4ae6dea0e8abcd4774049dfafd84cb88a89d22d1a24c500cf4ae32c.json",
+        "sha256": "c7c07e00d4ae6dea0e8abcd4774049dfafd84cb88a89d22d1a24c500cf4ae32c",
+        "size_bytes": 152798,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 65536,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 11,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 440,
+          "sum_ns": 13123804,
+          "min_ns": 26827,
+          "max_ns": 32879,
+          "first_csv_line": 17426,
+          "last_csv_line": 38922,
+          "locators": [
+            {
+              "csv_line": 17426,
+              "forward_id": "auto:0",
+              "start_ns": 1792694849253265927,
+              "duration_ns": 31268,
+              "device": "6",
+              "stream": "186",
+              "task": "83357"
+            },
+            {
+              "csv_line": 17470,
+              "forward_id": "auto:0",
+              "start_ns": 1792694849253496279,
+              "duration_ns": 29068,
+              "device": "6",
+              "stream": "186",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 440
+            }
+          ],
+          "mean_us": 29.826827272727275,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 440,
+          "sum_ns": 13228359,
+          "min_ns": 27805,
+          "max_ns": 33648,
+          "first_csv_line": 17429,
+          "last_csv_line": 38925,
+          "locators": [
+            {
+              "csv_line": 17429,
+              "forward_id": "auto:0",
+              "start_ns": 1792694849253306213,
+              "duration_ns": 32856,
+              "device": "6",
+              "stream": "186",
+              "task": "83360"
+            },
+            {
+              "csv_line": 17473,
+              "forward_id": "auto:0",
+              "start_ns": 1792694849253533398,
+              "duration_ns": 29237,
+              "device": "6",
+              "stream": "186",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 440
+            }
+          ],
+          "mean_us": 30.064452272727273,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 39177,
+        "selected_grouped_kernels": 880,
+        "wall_seconds": 0.15318445896264166,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p65536-c4-hold",
+      "assignment_role": "parameter_assignment",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_hold/kernel_details.csv.gz",
+        "size_bytes": 32643777,
+        "mtime_ns": 1792695828433141801,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "c107f1fa16155ddc86704da431c10d0c9a9032ad7f2071d22d55f6ffafd17ca6"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f.json",
+        "sha256": "dd459c167559e01ebb69113e123d6635c6e1158b0eaef536d802a525833d4d9f",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/bd0d2f1ef0d9bff78342ba7815feb7e70d3aaceed5b09cb3365f745aec7e733a.json",
+        "sha256": "bd0d2f1ef0d9bff78342ba7815feb7e70d3aaceed5b09cb3365f745aec7e733a",
+        "size_bytes": 155135,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": 65536,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 222,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"128,2048;256,8,128,16,32;;256,256;;;;256;128\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"128,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 8880,
+          "sum_ns": 313699157,
+          "min_ns": 28199,
+          "max_ns": 48250,
+          "first_csv_line": 74,
+          "last_csv_line": 447971,
+          "locators": [
+            {
+              "csv_line": 74,
+              "forward_id": "auto:0",
+              "start_ns": 1792695014018950997,
+              "duration_ns": 35083,
+              "device": "5",
+              "stream": "190",
+              "task": "73834"
+            },
+            {
+              "csv_line": 119,
+              "forward_id": "auto:0",
+              "start_ns": 1792695014019216251,
+              "duration_ns": 35815,
+              "device": "5",
+              "stream": "190",
+              "task": "73890"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 16,
+              "tokens_per_sequence": 4,
+              "sequences": 4,
+              "kernel_calls": 8880
+            }
+          ],
+          "mean_us": 35.326481644144145,
+          "routed_rows": 128,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"128,128;256,64,8,16,32;;256,2048;;;;256;128\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"128,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 8880,
+          "sum_ns": 327170210,
+          "min_ns": 29278,
+          "max_ns": 47829,
+          "first_csv_line": 77,
+          "last_csv_line": 447974,
+          "locators": [
+            {
+              "csv_line": 77,
+              "forward_id": "auto:0",
+              "start_ns": 1792695014018995130,
+              "duration_ns": 33773,
+              "device": "5",
+              "stream": "190",
+              "task": "73837"
+            },
+            {
+              "csv_line": 122,
+              "forward_id": "auto:0",
+              "start_ns": 1792695014019260172,
+              "duration_ns": 33677,
+              "device": "5",
+              "stream": "190",
+              "task": "73893"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 16,
+              "tokens_per_sequence": 4,
+              "sequences": 4,
+              "kernel_calls": 8880
+            }
+          ],
+          "mean_us": 36.843492117117115,
+          "routed_rows": 128,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 40,
+            "max": 40,
+            "mean": 40.0
+          }
+        }
+      ],
+      "scan": {
+        "rows": 448230,
+        "selected_grouped_kernels": 17760,
+        "wall_seconds": 1.7177832089364529,
+        "peak_rss_bytes": 45350912
+      }
+    },
+    {
+      "case_id": "a5-qwen35-tp4-longctx-p65536-c4-o32",
+      "assignment_role": "64k_nonassignment_control",
+      "original_role": "unassigned",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-decode-attn/raw/prof/p65536_c4_o32/kernel_details.csv.gz",
+        "size_bytes": 8548673,
+        "mtime_ns": 1792695827043166087,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "8b0b40d0cc97118a04558f6d8875cf88b1d921e1a6ee6e24ca0a1ac8d1304155"
+      },
+      "source_hash_verified": true,
+      "extraction_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/ee25c171f1c96951ba6907a563ced9b2cd6cab02bdc782f8b16a29a378bab741.json",
+        "sha256": "ee25c171f1c96951ba6907a563ced9b2cd6cab02bdc782f8b16a29a378bab741",
+        "reused_existing_extraction": true
+      },
+      "comparison_identity": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/current/bcb90bedbe51d1bda8aaaaf002957fcc3d44b7913c3786dbbd8e939f28f09fb9.json",
+        "sha256": "bcb90bedbe51d1bda8aaaaf002957fcc3d44b7913c3786dbbd8e939f28f09fb9",
+        "size_bytes": 296900,
+        "format": "full_scoreboard_json"
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": 65536,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "forwards": 11,
+      "groups": [
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"64,2048;256,8,128,16,32;;256,256;;;;256;64\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"64,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 40,
+          "sum_ns": 1410247,
+          "min_ns": 30993,
+          "max_ns": 37590,
+          "first_csv_line": 85369,
+          "last_csv_line": 87054,
+          "locators": [
+            {
+              "csv_line": 85369,
+              "forward_id": "auto:0",
+              "start_ns": 1792694880584682201,
+              "duration_ns": 36260,
+              "device": "4",
+              "stream": "186",
+              "task": "78611"
+            },
+            {
+              "csv_line": 85414,
+              "forward_id": "auto:0",
+              "start_ns": 1792694880584929327,
+              "duration_ns": 35004,
+              "device": "4",
+              "stream": "186",
+              "task": "78667"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 8,
+              "tokens_per_sequence": 4,
+              "sequences": 2,
+              "kernel_calls": 40
+            }
+          ],
+          "mean_us": 35.256175000000006,
+          "routed_rows": 64,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 0,
+            "max": 40,
+            "mean": 3.6363636363636362
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"64,128;256,64,8,16,32;;256,2048;;;;256;64\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"64,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 40,
+          "sum_ns": 1425269,
+          "min_ns": 31534,
+          "max_ns": 38718,
+          "first_csv_line": 85372,
+          "last_csv_line": 87057,
+          "locators": [
+            {
+              "csv_line": 85372,
+              "forward_id": "auto:0",
+              "start_ns": 1792694880584727746,
+              "duration_ns": 37398,
+              "device": "4",
+              "stream": "186",
+              "task": "78614"
+            },
+            {
+              "csv_line": 85417,
+              "forward_id": "auto:0",
+              "start_ns": 1792694880584972929,
+              "duration_ns": 36077,
+              "device": "4",
+              "stream": "186",
+              "task": "78670"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 8,
+              "tokens_per_sequence": 4,
+              "sequences": 2,
+              "kernel_calls": 40
+            }
+          ],
+          "mean_us": 35.631724999999996,
+          "routed_rows": 64,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 0,
+            "max": 40,
+            "mean": 3.6363636363636362
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,2048;256,8,128,16,32;;256,256;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,256\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 400,
+          "sum_ns": 11774988,
+          "min_ns": 26238,
+          "max_ns": 33076,
+          "first_csv_line": 87392,
+          "last_csv_line": 106904,
+          "locators": [
+            {
+              "csv_line": 87392,
+              "forward_id": "auto:1",
+              "start_ns": 1792694880609265215,
+              "duration_ns": 30732,
+              "device": "4",
+              "stream": "184",
+              "task": "83357"
+            },
+            {
+              "csv_line": 87436,
+              "forward_id": "auto:1",
+              "start_ns": 1792694880609491130,
+              "duration_ns": 29735,
+              "device": "4",
+              "stream": "184",
+              "task": "83412"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 400
+            }
+          ],
+          "mean_us": 29.43747,
+          "routed_rows": 32,
+          "n": 256,
+          "k": 2048,
+          "calls_per_forward": {
+            "min": 0,
+            "max": 40,
+            "mean": 36.36363636363637
+          }
+        },
+        {
+          "abi": {
+            "Name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "Type": "GroupedMatmul",
+            "Accelerator Core": "MIX_AIC",
+            "Input Shapes": "\"32,128;256,64,8,16,32;;256,2048;;;;256;32\"",
+            "Input Data Types": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+            "Input Formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+            "Output Shapes": "\"32,2048\"",
+            "Output Data Types": "DT_BF16",
+            "Output Formats": "ND",
+            "Block Num": "32",
+            "Mix Block Num": "64"
+          },
+          "count": 400,
+          "sum_ns": 11880384,
+          "min_ns": 26874,
+          "max_ns": 34354,
+          "first_csv_line": 87395,
+          "last_csv_line": 106907,
+          "locators": [
+            {
+              "csv_line": 87395,
+              "forward_id": "auto:1",
+              "start_ns": 1792694880609304327,
+              "duration_ns": 32371,
+              "device": "4",
+              "stream": "184",
+              "task": "83360"
+            },
+            {
+              "csv_line": 87439,
+              "forward_id": "auto:1",
+              "start_ns": 1792694880609528931,
+              "duration_ns": 31061,
+              "device": "4",
+              "stream": "184",
+              "task": "83415"
+            }
+          ],
+          "forward_geometry_counts": [
+            {
+              "query_rows": 4,
+              "tokens_per_sequence": 4,
+              "sequences": 1,
+              "kernel_calls": 400
+            }
+          ],
+          "mean_us": 29.70096,
+          "routed_rows": 32,
+          "n": 2048,
+          "k": 128,
+          "calls_per_forward": {
+            "min": 0,
+            "max": 40,
+            "mean": 36.36363636363637
+          }
+        }
+      ],
+      "scan": {
+        "rows": 107159,
+        "selected_grouped_kernels": 880,
+        "wall_seconds": 0.4286825000308454,
+        "peak_rss_bytes": 45350912
+      }
+    }
+  ]
+}
