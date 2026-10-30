@@ -1,0 +1,142 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "mla_decode-0",
+      "split": "development",
+      "params": {
+        "contexts": [
+          1
+        ],
+        "heads": 16,
+        "key_heads": 1,
+        "latent_dim": 512,
+        "rope_dim": 64,
+        "page_size": 16,
+        "num_kv_splits": 1,
+        "dtype": "bf16",
+        "cache_dtype": "bf16",
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      },
+      "expected_dispatch": {
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      }
+    },
+    {
+      "id": "mla_decode-1",
+      "split": "development",
+      "params": {
+        "contexts": [
+          129
+        ],
+        "heads": 16,
+        "key_heads": 1,
+        "latent_dim": 512,
+        "rope_dim": 64,
+        "page_size": 16,
+        "num_kv_splits": 2,
+        "dtype": "bf16",
+        "cache_dtype": "bf16",
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      },
+      "expected_dispatch": {
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      }
+    },
+    {
+      "id": "mla_decode-2",
+      "split": "development",
+      "params": {
+        "contexts": [
+          512,
+          17
+        ],
+        "heads": 32,
+        "key_heads": 1,
+        "latent_dim": 512,
+        "rope_dim": 64,
+        "page_size": 16,
+        "num_kv_splits": 4,
+        "dtype": "bf16",
+        "cache_dtype": "bf16",
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      },
+      "expected_dispatch": {
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      }
+    },
+    {
+      "id": "mla_decode-3",
+      "split": "heldout_geometry",
+      "params": {
+        "contexts": [
+          31,
+          513
+        ],
+        "heads": 8,
+        "key_heads": 1,
+        "latent_dim": 512,
+        "rope_dim": 64,
+        "page_size": 16,
+        "num_kv_splits": 8,
+        "dtype": "bf16",
+        "cache_dtype": "bf16",
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      },
+      "expected_dispatch": {
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      }
+    },
+    {
+      "id": "mla_decode-4",
+      "split": "heldout_geometry",
+      "params": {
+        "contexts": [
+          1025
+        ],
+        "heads": 24,
+        "key_heads": 1,
+        "latent_dim": 512,
+        "rope_dim": 64,
+        "page_size": 16,
+        "num_kv_splits": 4,
+        "dtype": "bf16",
+        "cache_dtype": "bf16",
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      },
+      "expected_dispatch": {
+        "implementation": "triton_decode_grouped_mla",
+        "is_mla": true,
+        "is_hip": false,
+        "logit_cap": 0.0
+      }
+    }
+  ]
+}

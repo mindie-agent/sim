@@ -1,0 +1,173 @@
+{
+  "machine": {
+    "name": "declared-two-endpoint-ccu-control",
+    "num_devices": 8,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000000.0,
+        "fp32": 1000000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000000.0,
+        "ccu_copy": 100000000.0,
+        "ccu_buffer_bytes": 200000000.0,
+        "ccu_control": 1000000.0,
+        "hccl_control": 1000000.0
+      },
+      "resource_units": {
+        "ccu_copy": 2,
+        "ccu_buffer_bytes": 2,
+        "ccu_control": 2
+      },
+      "work_units": {
+        "ccu_copy": "bytes",
+        "ccu_buffer_bytes": "bytes",
+        "ccu_control": "ops",
+        "hccl_control": "ops"
+      }
+    },
+    "links": [
+      {
+        "name": "connector",
+        "capacity_bytes_per_ms": 100000.0,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "semantics": "per_port",
+        "transaction_bytes": 256,
+        "protocol_overhead_bytes": 32,
+        "switch_hops": 1,
+        "switch_hop_latency_us": 1,
+        "switch_capacity_bytes_per_ms": 400000.0
+      }
+    ],
+    "assumptions": {
+      "rates": "Synthetic mechanism-control rates, not hardware measurements.",
+      "placement": "Two explicitly declared CCU endpoint owners; no A3/A5 SKU inference."
+    }
+  },
+  "model": {
+    "name": "two-endpoint-ccu-caller-control",
+    "layers": 2,
+    "hidden_size": 128,
+    "num_heads": 16,
+    "num_kv_heads": 16,
+    "head_dim": 8,
+    "intermediate_size": 256,
+    "vocab_size": 1536
+  },
+  "runtime": {
+    "tp": 8,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "hccl": {
+        "allgather": {
+          "expansion": "CCU_MS",
+          "template": "mesh_2die_broadcast_v1",
+          "topology": "TWO_DIE_REGULAR",
+          "signal_bytes": 8,
+          "channel_die_map": [
+            [
+              null,
+              0,
+              0,
+              0,
+              1,
+              1,
+              1,
+              1
+            ],
+            [
+              1,
+              null,
+              0,
+              0,
+              0,
+              1,
+              1,
+              1
+            ],
+            [
+              1,
+              1,
+              null,
+              0,
+              0,
+              0,
+              1,
+              1
+            ],
+            [
+              1,
+              1,
+              1,
+              null,
+              0,
+              0,
+              0,
+              1
+            ],
+            [
+              1,
+              1,
+              1,
+              1,
+              null,
+              0,
+              0,
+              0
+            ],
+            [
+              0,
+              1,
+              1,
+              1,
+              1,
+              null,
+              0,
+              0
+            ],
+            [
+              0,
+              0,
+              1,
+              1,
+              1,
+              1,
+              null,
+              0
+            ],
+            [
+              0,
+              0,
+              0,
+              1,
+              1,
+              1,
+              1,
+              null
+            ]
+          ]
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 3,
+        "output_tokens": 3
+      }
+    ]
+  }
+}

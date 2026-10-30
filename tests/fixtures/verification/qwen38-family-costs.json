@@ -1,0 +1,3032 @@
+{
+  "costs": {
+    "operator_sum_ms": 14.71620616309091,
+    "operator_occurrences": 1180,
+    "physical_groups": 252,
+    "families": [
+      {
+        "family": "gate_up_projection",
+        "recipe": "dense_gate_up",
+        "occurrences": 67,
+        "isolated_ms": 3.5304220189090914,
+        "share": 0.23990028270761746,
+        "cumulative_share": 0.23990028270761746
+      },
+      {
+        "family": "logits",
+        "recipe": "vocab_logits",
+        "occurrences": 4,
+        "isolated_ms": 2.614602200242425,
+        "share": 0.17766822313212746,
+        "cumulative_share": 0.41756850583974486
+      },
+      {
+        "family": "down_projection",
+        "recipe": "dense_down",
+        "occurrences": 67,
+        "isolated_ms": 2.6116428586666665,
+        "share": 0.17746712907684162,
+        "cumulative_share": 0.5950356349165865
+      },
+      {
+        "family": "gemm",
+        "recipe": "linear_qkvz",
+        "occurrences": 48,
+        "isolated_ms": 2.062586973090909,
+        "share": 0.14015752091486702,
+        "cumulative_share": 0.7351931558314535
+      },
+      {
+        "family": "gemm",
+        "recipe": "linear_output",
+        "occurrences": 48,
+        "isolated_ms": 1.2357658065454546,
+        "share": 0.08397312410890426,
+        "cumulative_share": 0.8191662799403577
+      },
+      {
+        "family": "gdn_gating",
+        "recipe": "delta_gates",
+        "occurrences": 48,
+        "isolated_ms": 0.5545065556363628,
+        "share": 0.03767999370837146,
+        "cumulative_share": 0.8568462736487292
+      },
+      {
+        "family": "qkv_projection",
+        "recipe": "qkv_projection",
+        "occurrences": 19,
+        "isolated_ms": 0.48205418278787865,
+        "share": 0.0327566886088412,
+        "cumulative_share": 0.8896029622575705
+      },
+      {
+        "family": "recurrent_vector",
+        "recipe": "recurrent_scan0",
+        "occurrences": 48,
+        "isolated_ms": 0.46334603636363636,
+        "share": 0.031485427101839256,
+        "cumulative_share": 0.9210883893594098
+      },
+      {
+        "family": "gemm",
+        "recipe": "linear_beta_alpha",
+        "occurrences": 48,
+        "isolated_ms": 0.3967690938181818,
+        "share": 0.026961370982509166,
+        "cumulative_share": 0.948049760341919
+      },
+      {
+        "family": "attention",
+        "recipe": "flash_attention",
+        "occurrences": 19,
+        "isolated_ms": 0.319250432,
+        "share": 0.02169379991432156,
+        "cumulative_share": 0.9697435602562406
+      },
+      {
+        "family": "output_projection",
+        "recipe": "attention_output",
+        "occurrences": 19,
+        "isolated_ms": 0.28880283539393936,
+        "share": 0.019624815811446938,
+        "cumulative_share": 0.9893683760676876
+      },
+      {
+        "family": "gemm",
+        "recipe": "draft_features",
+        "occurrences": 3,
+        "isolated_ms": 0.12680929163636362,
+        "share": 0.008616982545026354,
+        "cumulative_share": 0.9979853586127139
+      },
+      {
+        "family": "swiglu",
+        "recipe": "swiglu",
+        "occurrences": 67,
+        "isolated_ms": 0.006763008,
+        "share": 0.00045956192275710384,
+        "cumulative_share": 0.998444920535471
+      },
+      {
+        "family": "quantize",
+        "recipe": "dynamic_quantize",
+        "occurrences": 80,
+        "isolated_ms": 0.003675136,
+        "share": 0.00024973393001366425,
+        "cumulative_share": 0.9986946544654846
+      },
+      {
+        "family": "add_rmsnorm_quant",
+        "recipe": "add_rmsnorm_quantize",
+        "occurrences": 80,
+        "isolated_ms": 0.003084799999999999,
+        "share": 0.0002096192432895412,
+        "cumulative_share": 0.9989042737087741
+      },
+      {
+        "family": "elementwise",
+        "recipe": "short_convolution",
+        "occurrences": 48,
+        "isolated_ms": 0.0027033599999999997,
+        "share": 0.00018369951943050255,
+        "cumulative_share": 0.9990879732282046
+      },
+      {
+        "family": "add_rmsnorm",
+        "recipe": "add_rmsnorm",
+        "occurrences": 54,
+        "isolated_ms": 0.0021657600000000005,
+        "share": 0.00014716836499830037,
+        "cumulative_share": 0.9992351415932029
+      },
+      {
+        "family": "sampling",
+        "recipe": "sample_logits",
+        "occurrences": 1,
+        "isolated_ms": 0.00198656,
+        "share": 0.0001349913135208996,
+        "cumulative_share": 0.9993701329067239
+      },
+      {
+        "family": "tensor_copy",
+        "recipe": "convolution_input_contiguous",
+        "occurrences": 48,
+        "isolated_ms": 0.0019660800000000003,
+        "share": 0.00013359965049491098,
+        "cumulative_share": 0.9995037325572189
+      },
+      {
+        "family": "elementwise",
+        "recipe": "linear_output_norm_gate",
+        "occurrences": 48,
+        "isolated_ms": 0.001772544,
+        "share": 0.00012044843489931816,
+        "cumulative_share": 0.9996241809921181
+      },
+      {
+        "family": "sampling",
+        "recipe": "draft_sample",
+        "occurrences": 3,
+        "isolated_ms": 0.00148992,
+        "share": 0.00010124348514067471,
+        "cumulative_share": 0.9997254244772588
+      },
+      {
+        "family": "tensor_copy",
+        "recipe": "output_gate_reshape",
+        "occurrences": 48,
+        "isolated_ms": 0.001179648,
+        "share": 8.015979029694657e-05,
+        "cumulative_share": 0.9998055842675558
+      },
+      {
+        "family": "elementwise",
+        "recipe": "qk_l2norm",
+        "occurrences": 48,
+        "isolated_ms": 0.0007864320000000001,
+        "share": 5.343986019796439e-05,
+        "cumulative_share": 0.9998590241277537
+      },
+      {
+        "family": "tensor_copy",
+        "recipe": "qkv_split_materialize",
+        "occurrences": 38,
+        "isolated_ms": 0.0004802559999999999,
+        "share": 3.2634497959433975e-05,
+        "cumulative_share": 0.9998916586257132
+      },
+      {
+        "family": "rmsnorm",
+        "recipe": "qk_norm",
+        "occurrences": 19,
+        "isolated_ms": 0.0004802559999999998,
+        "share": 3.263449795943397e-05,
+        "cumulative_share": 0.9999242931236726
+      },
+      {
+        "family": "rotary",
+        "recipe": "rotary",
+        "occurrences": 19,
+        "isolated_ms": 0.0004802559999999998,
+        "share": 3.263449795943397e-05,
+        "cumulative_share": 0.9999569276216319
+      },
+      {
+        "family": "elementwise",
+        "recipe": "attention_gate",
+        "occurrences": 19,
+        "isolated_ms": 0.00041164799999999997,
+        "share": 2.7972426822371977e-05,
+        "cumulative_share": 0.9999849000484543
+      },
+      {
+        "family": "cache_store",
+        "recipe": "kv_store",
+        "occurrences": 19,
+        "isolated_ms": 0.00013721599999999998,
+        "share": 9.324142274123993e-06,
+        "cumulative_share": 0.9999942241907285
+      },
+      {
+        "family": "rmsnorm",
+        "recipe": "rmsnorm",
+        "occurrences": 4,
+        "isolated_ms": 4.608e-05,
+        "share": 3.1312418084744755e-06,
+        "cumulative_share": 0.999997355432537
+      },
+      {
+        "family": "embedding",
+        "recipe": "embedding",
+        "occurrences": 1,
+        "isolated_ms": 2.048e-05,
+        "share": 1.3916630259886558e-06,
+        "cumulative_share": 0.999998747095563
+      },
+      {
+        "family": "tensor_copy",
+        "recipe": "gate_beta_contiguous",
+        "occurrences": 48,
+        "isolated_ms": 9.216e-06,
+        "share": 6.262483616948951e-07,
+        "cumulative_share": 0.9999993733439247
+      },
+      {
+        "family": "tensor_copy",
+        "recipe": "gate_alpha_contiguous",
+        "occurrences": 48,
+        "isolated_ms": 9.216e-06,
+        "share": 6.262483616948951e-07,
+        "cumulative_share": 0.9999999995922865
+      },
+      {
+        "family": "acceptance",
+        "recipe": "speculative_acceptance",
+        "occurrences": 1,
+        "isolated_ms": 6.000000000000001e-09,
+        "share": 4.0771377714511404e-10,
+        "cumulative_share": 1.0000000000000002
+      },
+      {
+        "family": "token_commit",
+        "recipe": "token_commit",
+        "occurrences": 1,
+        "isolated_ms": 0.0,
+        "share": 0.0,
+        "cumulative_share": 1.0000000000000002
+      }
+    ],
+    "top_signatures": [
+      {
+        "replica": 0,
+        "physical_id": "c1dd2205c9ec76b78dc5e07b4513ece60ab2080e226b29905ef8f5440b184964",
+        "family": "gate_up_projection",
+        "recipe": "dense_gate_up",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          34816,
+          5120
+        ],
+        "semantic_shape": [
+          4,
+          34816,
+          5120
+        ],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 64,
+        "per_call_ms": 0.05066973436363637,
+        "isolated_ms": 3.242862999272728,
+        "matrix_mapping_keys": [
+          "6328d934e65c27d9e403919f9b59e144485468fc1835d4562b85fe0ce7aafb61"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "776c8305213ecdcb49d75822f745796ba3b6005550fb415213cc3b5d9b082cdd",
+        "family": "down_projection",
+        "recipe": "dense_down",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          5120,
+          17408
+        ],
+        "semantic_shape": [
+          4,
+          5120,
+          17408
+        ],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 64,
+        "per_call_ms": 0.03744389248484848,
+        "isolated_ms": 2.3964091190303027,
+        "matrix_mapping_keys": [
+          "f29816c330c5cdbcf332b5fb412675fb995817711cd761041e05fd9eadd3183a"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "a039f9f7f111e4c372657812859842c378c458490a49a0ca68989a0e53c9d331",
+        "family": "gemm",
+        "recipe": "linear_qkvz",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          16384,
+          5120
+        ],
+        "semantic_shape": [
+          4,
+          16384,
+          5120
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 48,
+        "per_call_ms": 0.04297056193939394,
+        "isolated_ms": 2.062586973090909,
+        "matrix_mapping_keys": [
+          "fdcdec18adde8db843948073c0412a889015eb08ee193f516df285fedaa90e7c"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "85ad725f1d70815150a3a5ea767ffda211df35186702fad7e64ba2b492389fbd",
+        "family": "logits",
+        "recipe": "vocab_logits",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          1,
+          248320,
+          5120
+        ],
+        "semantic_shape": [
+          1,
+          248320,
+          5120
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 3,
+        "per_call_ms": 0.6496703776969699,
+        "isolated_ms": 1.9490111330909097,
+        "matrix_mapping_keys": [
+          "afe5043516af5c1a8bc999148ea8e82ab4d734ae0e9b5c1d0bbd37de3de5b948"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "49fd83edfa83b2b091b478091a39563021ac2b0f9ec828f4eee1091595262b2b",
+        "family": "gemm",
+        "recipe": "linear_output",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          5120,
+          6144
+        ],
+        "semantic_shape": [
+          4,
+          5120,
+          6144
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 48,
+        "per_call_ms": 0.025745120969696972,
+        "isolated_ms": 1.2357658065454546,
+        "matrix_mapping_keys": [
+          "81b0dfc80ff9f49f12dc093c779b77da0854bcf4ae436c93457666eda8426dc6"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "5454fa5039e11e5affda2ca7b3c29771749b168ff5a07e3d1650f66e073e4aab",
+        "family": "logits",
+        "recipe": "vocab_logits",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          248320,
+          5120
+        ],
+        "semantic_shape": [
+          4,
+          248320,
+          5120
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 1,
+        "per_call_ms": 0.6655910671515152,
+        "isolated_ms": 0.6655910671515152,
+        "matrix_mapping_keys": [
+          "a05bb1bd5cb274928f270cb0242285d003b976bfe7af830d256b40669a29f605"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "82929e5d384dff53700302ef181bc137e2898b29cb1944d6cb024b4999314500",
+        "family": "gdn_gating",
+        "recipe": "delta_gates",
+        "program": "TiledPointwise",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          48
+        ],
+        "semantic_shape": [
+          4,
+          48
+        ],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 48,
+        "per_call_ms": 0.01155221990909089,
+        "isolated_ms": 0.5545065556363628,
+        "matrix_mapping_keys": []
+      },
+      {
+        "replica": 0,
+        "physical_id": "888bd5b10ae9ccf23946af728f76bb2c5569f470e7e8f69665f4047d54abe7da",
+        "family": "recurrent_vector",
+        "recipe": "recurrent_scan0",
+        "program": "RecurrentVector",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          48,
+          128,
+          128
+        ],
+        "semantic_shape": [
+          4,
+          48,
+          128,
+          128
+        ],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 48,
+        "per_call_ms": 0.009653042424242425,
+        "isolated_ms": 0.46334603636363636,
+        "matrix_mapping_keys": []
+      },
+      {
+        "replica": 0,
+        "physical_id": "47b88963e4c357279104ab6f5a2921952cc555fe1cca66c34f295aec7cd75171",
+        "family": "gemm",
+        "recipe": "linear_beta_alpha",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          96,
+          5120
+        ],
+        "semantic_shape": [
+          4,
+          96,
+          5120
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 48,
+        "per_call_ms": 0.008266022787878788,
+        "isolated_ms": 0.3967690938181818,
+        "matrix_mapping_keys": [
+          "a644b3db48f6d3d6d03220399335dc7fa885a9e908ebf6e6c821bf92184c8584"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "0b3164b999a2e513e1fedc71129d4eddb608383a6fe1dbca64d2b4bf1cfee9e2",
+        "family": "qkv_projection",
+        "recipe": "qkv_projection",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          14336,
+          5120
+        ],
+        "semantic_shape": [
+          4,
+          14336,
+          5120
+        ],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 16,
+        "per_call_ms": 0.022172264969696962,
+        "isolated_ms": 0.3547562395151514,
+        "matrix_mapping_keys": [
+          "2d147c0c757d32e0a8880942ca714b88acbd309b22a248c08d5f6693de6aa18f"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "881b5d9417914524cd58a081e87a0d350e7a7117c6f6b2b36064eee893e27158",
+        "family": "gate_up_projection",
+        "recipe": "dense_gate_up",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          1,
+          34816,
+          5120
+        ],
+        "semantic_shape": [
+          1,
+          34816,
+          5120
+        ],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 3,
+        "per_call_ms": 0.09585300654545457,
+        "isolated_ms": 0.2875590196363637,
+        "matrix_mapping_keys": [
+          "b130b5c71a31ee1cd2f1b106d6fd819f90a17318a895018c3d51b1ba9693723a"
+        ]
+      },
+      {
+        "replica": 0,
+        "physical_id": "bf47978273891dd9f26e4a143dccf1644b1b981fd760ca3f19a59ce18aeb68c0",
+        "family": "attention",
+        "recipe": "flash_attention",
+        "program": "ResourceEnvelope",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "local_shape": [
+          4,
+          16388,
+          24,
+          256
+        ],
+        "semantic_shape": [
+          4,
+          16388,
+          24,
+          256
+        ],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "matrix_groups": 1,
+        "matrix_mapping_domain": "",
+        "occurrences": 16,
+        "per_call_ms": 0.016805887999999998,
+        "isolated_ms": 0.26889420799999997,
+        "matrix_mapping_keys": []
+      }
+    ],
+    "programs": [
+      {
+        "family": "SteadyMatmul",
+        "program": "SteadyMatmul",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "occurrences": 323,
+        "isolated_ms": 13.34945526109091,
+        "share": 0.9071261378881814,
+        "cumulative_share": 0.9071261378881814
+      },
+      {
+        "family": "TiledPointwise",
+        "program": "TiledPointwise",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "occurrences": 48,
+        "isolated_ms": 0.5545065556363628,
+        "share": 0.03767999370837146,
+        "cumulative_share": 0.9448061315965529
+      },
+      {
+        "family": "RecurrentVector",
+        "program": "RecurrentVector",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "occurrences": 48,
+        "isolated_ms": 0.46334603636363636,
+        "share": 0.031485427101839256,
+        "cumulative_share": 0.9762915586983922
+      },
+      {
+        "family": "ResourceEnvelope",
+        "program": "ResourceEnvelope",
+        "source_boundary": "analytic",
+        "implementation": "",
+        "occurrences": 761,
+        "isolated_ms": 0.34889831000000276,
+        "share": 0.023708441301608003,
+        "cumulative_share": 1.0000000000000002
+      }
+    ],
+    "semantic_work": {
+      "flops": 242133909504.0,
+      "vector_ops": 1295911906.0,
+      "hbm_bytes": 45425644568.0,
+      "mte2_bytes": 44735053836.0,
+      "mte3_bytes": 690590732.0,
+      "link_bytes": 0.0
+    },
+    "executed_service": {
+      "memory@r0:s0": 45426805784.00001,
+      "mte1@r0:s0": 44329574399.99999,
+      "mte2@r0:s0": 45537673228.00002,
+      "mte3@r0:s0": 690572300.0,
+      "matrix@r0:s0": 0.3860288257575758,
+      "vector@r0:s0": 1409047522.0,
+      "scalar_store_issue@r0:s0": 9216.000000000007
+    },
+    "calibration": [
+      "declared_primitive_service_parameters"
+    ],
+    "declared_parameter_sources": [
+      "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+    ],
+    "matrix_mappings": [
+      {
+        "key": "7fa42c78185100daf10127c655c296298c233453d622285a90561190d008ca29",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            5120,
+            10240
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "99bdc40b710544beab53e3ab90402116838bc9aed1c44084721ff214639b37ab",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            14336,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04227072
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04210688
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "e57a731ef13ff141bd83fd678edb29ad274ae1f18193429c1931e8b9bfa1da65",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            5120,
+            6144
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025362432
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025362432
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025264128
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025264128
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025362432
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025362432
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025264128
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025264128
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "b130b5c71a31ee1cd2f1b106d6fd819f90a17318a895018c3d51b1ba9693723a",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            34816,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.09510912
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.09510912
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.1052672
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.1052672
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.09510912
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.09510912
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.1052672
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.1052672
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "8bc1075a4f98412ab281b8a3e634b94716d0c64522524a2c089b3c4c146cd25e",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            5120,
+            17408
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071860224
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071860224
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071581696
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071581696
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071860224
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071860224
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071581696
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.071581696
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "afe5043516af5c1a8bc999148ea8e82ab4d734ae0e9b5c1d0bbd37de3de5b948",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            1,
+            248320,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.64462848
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.64462848
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65265664
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65265664
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33024.0,
+                "l0c": 512,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.64462848
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66048.0,
+                "l0c": 512,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.64462848
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 65792.0,
+                "l0c": 1024,
+                "l0a": 256.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65265664
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 131584.0,
+                "l0c": 1024,
+                "l0a": 512.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65265664
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 3
+      },
+      {
+        "key": "fdcdec18adde8db843948073c0412a889015eb08ee193f516df285fedaa90e7c",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            16384,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04325376
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04325376
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0425984
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0425984
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04325376
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.04325376
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0425984
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0425984
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 48
+      },
+      {
+        "key": "a644b3db48f6d3d6d03220399335dc7fa885a9e908ebf6e6c821bf92184c8584",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            96,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 25600.0,
+                "l0c": 1536,
+                "l0a": 1024.0,
+                "l0b": 24576.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 51200.0,
+                "l0c": 1536,
+                "l0a": 2048.0,
+                "l0b": 49152.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 25600.0,
+                "l0c": 1536,
+                "l0a": 1024.0,
+                "l0b": 24576.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 51200.0,
+                "l0c": 1536,
+                "l0a": 2048.0,
+                "l0b": 49152.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 25600.0,
+                "l0c": 1536,
+                "l0a": 1024.0,
+                "l0b": 24576.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 51200.0,
+                "l0c": 1536,
+                "l0a": 2048.0,
+                "l0b": 49152.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 25600.0,
+                "l0c": 1536,
+                "l0a": 1024.0,
+                "l0b": 24576.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 51200.0,
+                "l0c": 1536,
+                "l0a": 2048.0,
+                "l0b": 49152.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.008192
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 48
+      },
+      {
+        "key": "81b0dfc80ff9f49f12dc093c779b77da0854bcf4ae436c93457666eda8426dc6",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            5120,
+            6144
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025952256
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025952256
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02555904
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02555904
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025952256
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.025952256
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02555904
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02555904
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 48
+      },
+      {
+        "key": "6328d934e65c27d9e403919f9b59e144485468fc1835d4562b85fe0ce7aafb61",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            34816,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.05018112
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.05018112
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.054912
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.054912
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.05018112
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.05018112
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.054912
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.054912
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 64
+      },
+      {
+        "key": "f29816c330c5cdbcf332b5fb412675fb995817711cd761041e05fd9eadd3183a",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            5120,
+            17408
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.037914624
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.037914624
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.03734016
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.03734016
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.037914624
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.037914624
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.03734016
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.03734016
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 64
+      },
+      {
+        "key": "2d147c0c757d32e0a8880942ca714b88acbd309b22a248c08d5f6693de6aa18f",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            14336,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02230272
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02230272
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0219648
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0219648
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02230272
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.02230272
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0219648
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.0219648
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 16
+      },
+      {
+        "key": "53e431eb800671de7d7d34d398580129d416f7dc70cd341cf9cb91131286638b",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            5120,
+            6144
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 256,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.013381632
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.013381632
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.01317888
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.01317888
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 17424.0,
+                "l0c": 2048,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.013381632
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34848.0,
+                "l0c": 2048,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.013381632
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 34320.0,
+                "l0c": 4096,
+                "l0a": 528.0,
+                "l0b": 16896.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.01317888
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 68640.0,
+                "l0c": 4096,
+                "l0a": 1056.0,
+                "l0b": 33792.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.01317888
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 16
+      },
+      {
+        "key": "a05bb1bd5cb274928f270cb0242285d003b976bfe7af830d256b40669a29f605",
+        "diagnostic": {
+          "basis": "declared_candidates_resource_lower_bound",
+          "shape": [
+            4,
+            248320,
+            5120
+          ],
+          "groups": 1,
+          "selected": {
+            "tile_m": 128,
+            "tile_n": 128,
+            "tile_k": 128,
+            "compute_m": 128,
+            "compute_n": 128,
+            "slots": 2,
+            "compute_slots": 2,
+            "reuse_inputs": true,
+            "reuse_weights": true
+          },
+          "candidates": [
+            {
+              "tile": [
+                128,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65961984
+            },
+            {
+              "tile": [
+                128,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65961984
+            },
+            {
+              "tile": [
+                128,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.6602752
+            },
+            {
+              "tile": [
+                128,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.6602752
+            },
+            {
+              "tile": [
+                256,
+                128,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 33792.0,
+                "l0c": 2048,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65961984
+            },
+            {
+              "tile": [
+                256,
+                128,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 67584.0,
+                "l0c": 2048,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.65961984
+            },
+            {
+              "tile": [
+                256,
+                256,
+                64
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 66560.0,
+                "l0c": 4096,
+                "l0a": 1024.0,
+                "l0b": 32768.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.6602752
+            },
+            {
+              "tile": [
+                256,
+                256,
+                128
+              ],
+              "footprint_bytes_per_owner": {
+                "l1": 133120.0,
+                "l0c": 4096,
+                "l0a": 2048.0,
+                "l0b": 65536.0
+              },
+              "exceeded_pools": {},
+              "resource_bound_ms": 0.6602752
+            }
+          ],
+          "capacity_screening": "declared_pools_only",
+          "declared_pools": {
+            "l0a": 65536,
+            "l0b": 65536,
+            "l0c": 262144,
+            "l1": 524288,
+            "ub": 253952
+          },
+          "read_role_bindings": {
+            "matrix_operands": "mte2",
+            "output_scales": "mte2"
+          },
+          "unmodeled_transfer_roles": [],
+          "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
+          "conversion_latency": "not_inferred_from_transfer_bytes",
+          "execution_abstraction": "closed_form_k_pipeline",
+          "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+          "contention": "dominant_resource_fair_coupled_fluid_progress",
+          "buffer_model": "finite_selected_tile_reservation",
+          "output_tile_execution": "coupled_owner_run"
+        },
+        "invocations": 1
+      }
+    ],
+    "matrix_mapping_coverage": {
+      "physical_groups_with_mapping": 14,
+      "recorded_invocations": 323,
+      "unrecorded_invocations": 0
+    },
+    "remaining_live_tasks": 0,
+    "remaining_allocations": 0.0,
+    "interpretation": "Occurrence-weighted isolated programs in one independent DP cohort. Source boundaries describe selection, not accuracy; service units follow the declared resource bindings and are not interchangeable with semantic work."
+  },
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/model-scoreboard-20261029-qwen38_a5-final-0-prediction.json",
+    "sha256": "456f0acf10942a97eb026586795c30b8a2db00a13327c533a97f4e237c237019",
+    "size_bytes": 91815
+  }
+}

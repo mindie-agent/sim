@@ -41,7 +41,7 @@ jobs:
       - run: uv build
       - run: |
           uv venv /tmp/sim-wheel
-          uv pip install --python /tmp/sim-wheel/bin/python --no-deps dist/*.whl
+          uv pip install --python /tmp/sim-wheel/bin/python dist/*.whl
           cd /tmp
-          /tmp/sim-wheel/bin/python -c "import importlib.metadata as m; assert not [x for x in m.requires('mindie-sim') or [] if 'extra ==' not in x]"
+          /tmp/sim-wheel/bin/python -c "from mindie_sim.backends.ascend import profiles; assert profiles(); import ijson"
           /tmp/sim-wheel/bin/mindie-sim --help

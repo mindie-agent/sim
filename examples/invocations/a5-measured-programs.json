@@ -1,0 +1,422 @@
+{
+  "machine": {
+    "device": {
+      "kernel_invocations": {
+        "empty_aic_blocks1": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.0004765,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.4765,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aic",
+              "kernel_source_sha256": "9e461396b741876d63bafed4db58f583e27ae5caab686e030a4b1d89dee6b2ea",
+              "kernel_binary_sha256": "521440a40f83ef583463bcb8c0cc26d59fa7d619c64bb96bc36faef9ac248cbd",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_CORE",
+              "blocks": 1,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "empty_aic_blocks8": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000583,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.583,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aic",
+              "kernel_source_sha256": "9e461396b741876d63bafed4db58f583e27ae5caab686e030a4b1d89dee6b2ea",
+              "kernel_binary_sha256": "521440a40f83ef583463bcb8c0cc26d59fa7d619c64bb96bc36faef9ac248cbd",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_CORE",
+              "blocks": 8,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "empty_aic_blocks64": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.0011585,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 1.1585,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aic",
+              "kernel_source_sha256": "9e461396b741876d63bafed4db58f583e27ae5caab686e030a4b1d89dee6b2ea",
+              "kernel_binary_sha256": "521440a40f83ef583463bcb8c0cc26d59fa7d619c64bb96bc36faef9ac248cbd",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_CORE",
+              "blocks": 64,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "empty_aiv_blocks1": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000482,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.482,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aiv",
+              "kernel_source_sha256": "db72b94c14901231c4bb5ff17246d292d00c03f1e3543367dacd0f281619dd24",
+              "kernel_binary_sha256": "4f3968a5632433b1eba523f9f552ab75a43f6dda90ad86948b0ebcafe22145d3",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 1,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "empty_aiv_blocks8": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000591,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.591,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aiv",
+              "kernel_source_sha256": "db72b94c14901231c4bb5ff17246d292d00c03f1e3543367dacd0f281619dd24",
+              "kernel_binary_sha256": "4f3968a5632433b1eba523f9f552ab75a43f6dda90ad86948b0ebcafe22145d3",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 8,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "empty_aiv_blocks64": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000986,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.986,
+            "sample_count": 500,
+            "warmup_count": 50,
+            "run_id": "PROF_000001_20261029203948164_02376823RNMREREK",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/summary.json",
+              "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+              "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "empty_aiv",
+              "kernel_source_sha256": "db72b94c14901231c4bb5ff17246d292d00c03f1e3543367dacd0f281619dd24",
+              "kernel_binary_sha256": "4f3968a5632433b1eba523f9f552ab75a43f6dda90ad86948b0ebcafe22145d3",
+              "host_binary_sha256": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 64,
+              "body": "immediate return; no compute, copy or global memory access",
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "No universal vector/cube floor.",
+              "No independently identified additive startup.",
+              "No graph replay or clock/thermal sweep."
+            ]
+          }
+        },
+        "tiny_aiv_add_fp32_n64_blocks1": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.00097,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.97,
+            "sample_count": 150,
+            "warmup_count": 20,
+            "run_id": "tiny-a5-1793278251",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/tiny/summary.json",
+              "sha256": "af215242acf1ccb25b7ca68ac645bd92b53ae705a403e303a55757082acdab41"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/op_summary-aiv-20261029T205100.csv",
+              "sha256": "10db5205f8c1b7ddc05275c84bf5d86258bf4675b90a01e9d045466d63cfb6fd"
+            },
+            "producer_log": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/msprof-aiv.log",
+              "sha256": "bcbd12a9450d618b924d5e92be613089dffc6cd97b4ae2a5169867cabd57abc6"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "tiny_aiv_add",
+              "kernel_source_sha256": "103f5405b99d3d5a388c1ae4ea12b16f27d55bef1cf5873a5ed7a401e42dc4aa",
+              "kernel_binary_sha256": "9f61803f35a2395a4fa98c1937e88cb47a5a3257e98cc2be8bf15534c7f51e30",
+              "host_binary_sha256": "ef2925ec87d372dd553bcbe4ea8d77c78a6e02a8d654d2263fb9d57ad4b2139a",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 1,
+              "dtype": "fp32",
+              "elements": 64,
+              "body": "two GM input reads, one vector Add, one GM output write",
+              "logical_transfer_bytes": 768,
+              "vector_adds": 64,
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "shape_binding": "fixed producer order; exactly 170 chronological launches per shape",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "Inclusive complete-kernel constraint, not additive startup.",
+              "No extrapolation to other shapes or implementations.",
+              "No nonempty Cube result or graph replay."
+            ]
+          }
+        },
+        "tiny_aiv_add_fp32_n256_blocks1": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000989,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 0.989,
+            "sample_count": 150,
+            "warmup_count": 20,
+            "run_id": "tiny-a5-1793278251",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/tiny/summary.json",
+              "sha256": "af215242acf1ccb25b7ca68ac645bd92b53ae705a403e303a55757082acdab41"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/op_summary-aiv-20261029T205100.csv",
+              "sha256": "10db5205f8c1b7ddc05275c84bf5d86258bf4675b90a01e9d045466d63cfb6fd"
+            },
+            "producer_log": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/msprof-aiv.log",
+              "sha256": "bcbd12a9450d618b924d5e92be613089dffc6cd97b4ae2a5169867cabd57abc6"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "tiny_aiv_add",
+              "kernel_source_sha256": "103f5405b99d3d5a388c1ae4ea12b16f27d55bef1cf5873a5ed7a401e42dc4aa",
+              "kernel_binary_sha256": "9f61803f35a2395a4fa98c1937e88cb47a5a3257e98cc2be8bf15534c7f51e30",
+              "host_binary_sha256": "ef2925ec87d372dd553bcbe4ea8d77c78a6e02a8d654d2263fb9d57ad4b2139a",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 1,
+              "dtype": "fp32",
+              "elements": 256,
+              "body": "two GM input reads, one vector Add, one GM output write",
+              "logical_transfer_bytes": 3072,
+              "vector_adds": 256,
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "shape_binding": "fixed producer order; exactly 170 chronological launches per shape",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "Inclusive complete-kernel constraint, not additive startup.",
+              "No extrapolation to other shapes or implementations.",
+              "No nonempty Cube result or graph replay."
+            ]
+          }
+        },
+        "tiny_aiv_add_fp32_n1024_blocks1": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001009,
+          "provenance": {
+            "basis": "independent_primitive_measurement",
+            "boundary": "profiler_device_task_duration",
+            "statistic": "steady_p50_after_per_condition_warmup",
+            "observed_us": 1.009,
+            "sample_count": 150,
+            "warmup_count": 20,
+            "run_id": "tiny-a5-1793278251",
+            "source_summary": {
+              "path": "data/verification/a5-invocation-20261029/tiny/summary.json",
+              "sha256": "af215242acf1ccb25b7ca68ac645bd92b53ae705a403e303a55757082acdab41"
+            },
+            "raw_capture": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/op_summary-aiv-20261029T205100.csv",
+              "sha256": "10db5205f8c1b7ddc05275c84bf5d86258bf4675b90a01e9d045466d63cfb6fd"
+            },
+            "producer_log": {
+              "path": "data/verification/a5-invocation-20261029/tiny/raw/msprof-aiv.log",
+              "sha256": "bcbd12a9450d618b924d5e92be613089dffc6cd97b4ae2a5169867cabd57abc6"
+            },
+            "observation_split": "unassigned",
+            "support": {
+              "hardware": "Ascend950DT_9582",
+              "host": "rack06os1",
+              "physical_device": 0,
+              "cann": "9.2.0",
+              "compiler": "bisheng clang 15.0.5 -O2",
+              "implementation": "tiny_aiv_add",
+              "kernel_source_sha256": "103f5405b99d3d5a388c1ae4ea12b16f27d55bef1cf5873a5ed7a401e42dc4aa",
+              "kernel_binary_sha256": "9f61803f35a2395a4fa98c1937e88cb47a5a3257e98cc2be8bf15534c7f51e30",
+              "host_binary_sha256": "ef2925ec87d372dd553bcbe4ea8d77c78a6e02a8d654d2263fb9d57ad4b2139a",
+              "task_type": "AI_VECTOR_CORE",
+              "blocks": 1,
+              "dtype": "fp32",
+              "elements": 1024,
+              "body": "two GM input reads, one vector Add, one GM output write",
+              "logical_transfer_bytes": 12288,
+              "vector_adds": 1024,
+              "launch_api": "aclrtLaunchKernelWithHostArgs",
+              "shape_binding": "fixed producer order; exactly 170 chronological launches per shape",
+              "selection": "explicit matching invocation_class only; geometry and implementation are caller assertions"
+            },
+            "limits": [
+              "Inclusive complete-kernel constraint, not additive startup.",
+              "No extrapolation to other shapes or implementations.",
+              "No nonempty Cube result or graph replay."
+            ]
+          }
+        }
+      }
+    }
+  }
+}

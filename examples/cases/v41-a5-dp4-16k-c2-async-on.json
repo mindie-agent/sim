@@ -1,0 +1,118 @@
+{
+  "name": "v41-flash-a5-dp4-16k-c2-async-on",
+  "machine": {
+    "arch_family": "A5",
+    "compute_peaks": {
+      "bf16": 432537600000000.0,
+      "fp8_e4m3": 865075200000000.0,
+      "int8": 865075200000000.0
+    },
+    "device": {
+      "aic_count": 32,
+      "aiv_count": 64,
+      "cube_flops_per_s": 432537600000000.0,
+      "hbm_bw_bytes_per_s": 4000000000000.0,
+      "hbm_gib": 96,
+      "l2_bytes": 134217728,
+      "launch_us": 20,
+      "mte_bw_bytes_per_s": 4000000000000.0,
+      "l1_bytes": 524288,
+      "ub_bytes": 253952,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144,
+      "rates": {
+        "host_memory": 64000000000.0,
+        "host_vector": 50000000000.0,
+        "h2d": 32000000000.0
+      }
+    },
+    "dies_per_package": 2,
+    "hardware_key": "Ascend950DT_9582",
+    "links": [
+      {
+        "capacity_gbps": 392,
+        "channel": "d2d_intra_node",
+        "latency_us": 2.5,
+        "members": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "name": "d2d"
+      }
+    ],
+    "name": "a5-950dt-9582-4die",
+    "num_devices": 4,
+    "ranks_per_node": 8,
+    "sku": "Ascend950DT_9582",
+    "backend": "ascend",
+    "assumptions": {
+      "host_path": "example nominal host memory 64GB/s, vector 50Gops/s, H2D 32GB/s; replace with host parameters"
+    }
+  },
+  "model": {
+    "catalog_key": "deepseek-v4.1-flash"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 15360,
+        "output_tokens": 1024
+      },
+      {
+        "id": "r1",
+        "prompt_tokens": 15360,
+        "output_tokens": 1024
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "max_model_len": 16384,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.94,
+    "kv_block_size": 128,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tp": 1,
+    "dp": 4,
+    "ep": 4,
+    "pp": 1,
+    "engram_cpu_offload": true,
+    "metadata": {
+      "recipe": "vllm serve ... --max-model-len 16384 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.94 (async default/on)",
+      "topology": "TP1 x DP4 + EP4 on four Ascend950DT 9582 dies 0-3, one rank per die; one API server, world_size=4 HCCL",
+      "weights": "measured per-die model load 78.88 GiB of 96 GiB; analytic body+vision weight plane 77.63 GiB after the 45.78 GiB Engram table plane is host-offloaded; 67.24 GiB of routed-expert weights are EP4-sharded (96 local experts/die)",
+      "engram": "EngramConfig(cpu_offload=True, embedding_across_dp=False, dp_shared_memory=True); 94.42 GiB/rank host-resident, node-local DP group 4. The tables are not on the die; the per-token query/gather/broadcast remain device work and the CPU decode + H2D staging is a declared measurement gap, not a zero-cost path.",
+      "capacity": "max_model_len=4096 is an explicit launch flag, not a 4-die hardware ceiling. Measured KV 2.81-2.82 GiB/die = 73,682-73,705 tokens = 17.99x at 4,096; the 4,096-token envelope is fully covered (p3072/o1024 = 4,096 admitted as-is, no o512 fallback). p4096/o1024 = 5,120 would be illegal. 16k/64k/128k were not attempted under this launch and are not claimed impossible.",
+      "kv_pool_source": "measured engine lines 2026-10-25 05:17 (rack08os7): Available KV cache memory 0.51-0.52 GiB; 24,752-24,794 tokens; Maximum concurrency 1.51x @16,384",
+      "host": "rack08os7 177.31.27.1, dies 0-3 only, 4 x Ascend950DT 9582, 96 GiB HBM each; ring 197.33.51.1 / enp39s0f0; port 18247; DP-RPC 13247",
+      "image": "b57207c2daf9 = sha256:b57207c2daf9237b2f0c741d36ae1bf81ea9896f0e39b490728c5c2569e0f680; vLLM 0.30.0, vllm-ascend 0.30.0rc2.dev214+gfeecbef94, torch_npu 2.10.0.post7.dev20261020, CANN 9.2.0",
+      "quantization": "deepseek_v4_fp8: FP8 dynamic linears + MXFP4 group32 routed experts, BF16 KV, int8 indexer; norms, router, embedding, LM head, compressor runtime copies, vision and Engram gates stay BF16/FP32",
+      "graph": "FULL CUDA graphs, capture sizes [1,2,4,8]; APC off; no MTP/speculative decode (speculative_config=None), so every engine step commits exactly one token (tokens/step=1.00)",
+      "measured_rows": "No V4.1 A5 serving row is bound. The generic A5 BF16 physical operator calibration is the only measured input; the MXFP4 grouped expert, CSA2/MLA attention, Engram host lookup and DP4 c4 admission rows are declared missing.",
+      "no_measured_latency": "the 2026-10-25 c2 TTFT/TPOT/E2E are measured evidence, not case inputs; predict never reads them",
+      "kv_pool_tokens": "24773",
+      "kv_pool_measured_tokens": "24773",
+      "kv_pool_declared_output_tokens": "1024",
+      "kv_pool_source_detail": "dp4-small serve.log worker init: 2.82 GiB/die, 73,705 tokens, 17.99x@4096",
+      "cell": "p15360/o1024 c2 (2 requests) async on; legal 15360+1024=16384",
+      "async_scheduling": "True (mcb=2); declared so the group plan is explicit",
+      "kv_pool_blocks": "1193",
+      "kv_page_groups": "12 engine groups (9-layer sparse + 3-layer state ring + 10 x 4-layer SWA); SWA 66 pages at mcb=1, 129 at mcb=2; 348.27 vs 626.36 MiB/request",
+      "validation": "async-off admitted and served c2 2/2 token-exact; async-on at the same B=8192 refused (0.61 GiB needed > 0.51 GiB). No latency value in this case.",
+      "dp_step_admission": "ep_lockstep_burst",
+      "dp_step_admission_source": "measured DP4 c4 completion events: the head request completes one prompt step alone, the three remaining requests complete in the next EP-lockstep wave, and the head first ITL equals that wave. Topology is one API server plus four EngineCore/Worker pairs over the four dies; EP4 spans the DP domain. Runtime scope: serve.log non-default args data_parallel_size=4 and max_num_batched_tokens=4096, [scheduler.py:288] Chunked prefill is enabled with max_num_batched_tokens=4096, and four EngineCore_DP0..3 processes with separate KV pools; vLLM v0.30.0 SchedulerConfig.max_num_batched_tokens is the single-iteration budget of each EngineCore scheduler, not a global pool. Raw: raw/matrix/p2048_o1024_c4.json and p3072_o1024_c4.json"
+    },
+    "async_scheduling": true
+  }
+}

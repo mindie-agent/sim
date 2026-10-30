@@ -1,0 +1,215 @@
+{
+  "candidate": "protocol.json",
+  "results": [
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 192,
+      "heads": 3,
+      "units": 1,
+      "leading_dim": 12,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        31.157749,
+        31.041401,
+        31.037451,
+        31.106298,
+        30.998402
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 31.8885,
+      "measured_median_us": 31.041401,
+      "error_pct": 2.728932885471247
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 512,
+      "heads": 5,
+      "units": 1,
+      "leading_dim": 20,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        141.276459,
+        141.098206,
+        141.424896,
+        141.303101,
+        141.103394
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 138.32,
+      "measured_median_us": 141.276459,
+      "error_pct": -2.0926763177154584
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 257,
+      "heads": 7,
+      "units": 1,
+      "leading_dim": 47,
+      "offset_elements": 5,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        81.883553,
+        81.859497,
+        81.949501,
+        81.951454,
+        81.914803
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 80.6130625,
+      "measured_median_us": 81.914803,
+      "error_pct": -1.5891395112065498
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 128,
+      "heads": 15,
+      "units": 1,
+      "leading_dim": 96,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        68.622795,
+        68.66555,
+        68.755295,
+        68.69825,
+        68.648949
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 68.295875,
+      "measured_median_us": 68.66555,
+      "error_pct": -0.5383704055381466
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 1024,
+      "heads": 24,
+      "units": 1,
+      "leading_dim": 80,
+      "offset_elements": 9,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        909.628601,
+        909.559204,
+        909.658325,
+        909.553711,
+        909.510742
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 898.578,
+      "measured_median_us": 909.559204,
+      "error_pct": -1.2073105248902594
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 384,
+      "heads": 13,
+      "units": 1,
+      "leading_dim": 64,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        170.404449,
+        170.401886,
+        170.412598,
+        170.386551,
+        170.352646
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 169.3305,
+      "measured_median_us": 170.401886,
+      "error_pct": -0.6287406936329232
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 4096,
+      "heads": 13,
+      "units": 64,
+      "leading_dim": 64,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        32.517849,
+        32.576599,
+        32.507,
+        32.51025,
+        32.472351
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 28.22175,
+      "measured_median_us": 32.51025,
+      "error_pct": -13.19122430618036
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 8192,
+      "heads": 24,
+      "units": 64,
+      "leading_dim": 80,
+      "offset_elements": 9,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        118.306297,
+        118.42955,
+        118.2798,
+        118.328957,
+        118.386696
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 112.32225,
+      "measured_median_us": 118.328957,
+      "error_pct": -5.076278159030845
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 4097,
+      "heads": 7,
+      "units": 64,
+      "leading_dim": 47,
+      "offset_elements": 5,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        43.964249,
+        43.894753,
+        43.989201,
+        43.923599,
+        43.900452
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 39.9815,
+      "measured_median_us": 43.923599,
+      "error_pct": -8.974899802723368
+    },
+    {
+      "primitive": "strided_store_ld",
+      "tokens": 64,
+      "heads": 5,
+      "units": 1,
+      "leading_dim": 64,
+      "offset_elements": 0,
+      "warmup": 512,
+      "repetitions": 20,
+      "durations_us": [
+        9.401751,
+        9.3798,
+        9.38535,
+        9.3469,
+        9.37105
+      ],
+      "all_elements_verified": true,
+      "predicted_us": 9.39575,
+      "measured_median_us": 9.3798,
+      "error_pct": 0.17004626964327585
+    }
+  ]
+}

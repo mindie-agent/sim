@@ -1,0 +1,58 @@
+{
+  "candidates": [
+    {
+      "id": "fixed-128",
+      "case": "../cases/qwen38-a5.json"
+    },
+    {
+      "id": "hierarchy-fixed-128",
+      "case": "../cases/qwen38-a5.json",
+      "overrides": {
+        "runtime": {
+          "kernels": {
+            "programs": {
+              "matmul": {
+                "kind": "hierarchical_matmul",
+                "tile_m": 128,
+                "tile_n": 128
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "hierarchy-selected",
+      "case": "../cases/qwen38-a5.json",
+      "overrides": {
+        "runtime": {
+          "kernels": {
+            "programs": {
+              "matmul": {
+                "kind": "mapped_matmul"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "probes": [
+    {
+      "id": "prefill256",
+      "phase": "prefill",
+      "tokens": 256,
+      "scope": "model"
+    },
+    {
+      "id": "decode1-context2048",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 2048,
+      "scope": "model"
+    }
+  ],
+  "level": "operators",
+  "top_families": 8,
+  "max_evaluations": 6
+}

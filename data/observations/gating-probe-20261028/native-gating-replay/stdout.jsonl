@@ -1,0 +1,4 @@
+{"primitive":"gating","tokens":64,"heads":48,"units":64,"leading_dim":48,"offset_elements":0,"warmup":512,"repetitions":20,"durations_us":[152.843491,152.812408,152.667206,152.862595,152.724091],"all_elements_verified":true}
+{"primitive":"gating","tokens":4096,"heads":48,"units":64,"leading_dim":48,"offset_elements":0,"warmup":512,"repetitions":20,"durations_us":[172.535446,172.806305,172.651093,172.806595,172.838150],"all_elements_verified":true}
+{"primitive":"gating","tokens":16384,"heads":48,"units":64,"leading_dim":48,"offset_elements":0,"warmup":512,"repetitions":20,"durations_us":[647.812622,647.719604,647.405396,647.357849,647.665405],"all_elements_verified":true}
+{"peak_rss_kib":175400,"tensor_budget_bytes":16777216}

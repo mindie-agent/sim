@@ -1,0 +1,1392 @@
+{
+  "schema": "mindie-sim.memory-service-replay/1",
+  "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout",
+  "new_device_execution": false,
+  "scope": "one_retained_copy_protocol; heldout_work_on_the_same_device_and_capture",
+  "hardware_projection": {
+    "memory_bytes_per_second": 1000000000000.0,
+    "rate_basis": "caller_declared_physical_ceiling; not_fit_from_copy_duration",
+    "compute_fields": "unused_schema_placeholders; not_GPU_compute_capabilities"
+  },
+  "limits": [
+    "only_one_heldout_work_size; not_independent_run_or_cross_device_validation",
+    "batched_event_average; isolated_launch_and_concurrent_device_timings_not_measured",
+    "retained_source_hashes_do_not_prove_loaded_binary_identity",
+    "copy_service_does_not_calibrate_other_memory_kernels",
+    "concurrency_is_a_resource_conservation_control; not_a_GPU_accuracy_result"
+  ],
+  "calibration": {
+    "model": {
+      "schema": "mindie-sim.service-curve/1",
+      "resource": "hbm",
+      "work_unit": "bytes",
+      "identity": {
+        "hardware": {
+          "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+          "architecture": "cuda",
+          "compute_units": 1,
+          "resource_units": {
+            "hbm": 1
+          }
+        },
+        "runtime": "cuda_driver_api",
+        "revision": "617.42",
+        "format": "",
+        "kernel": "stream_copy",
+        "implementation": {
+          "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+          "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+        },
+        "dtype": "uint32",
+        "layout": "contiguous",
+        "replay_scope": "none",
+        "axes": {
+          "block_threads": 256,
+          "word_bytes": 4,
+          "alignment_bytes": 4,
+          "load_cache": "cg",
+          "store_cache": "wb"
+        }
+      },
+      "boundary": "device_kernel",
+      "active_units": 1,
+      "startup_ms": 0,
+      "knots": [
+        [
+          134217728,
+          0.17002665996551514
+        ],
+        [
+          201326592,
+          0.2563413381576538
+        ],
+        [
+          268435456,
+          0.34534398714701336
+        ]
+      ],
+      "provenance": {
+        "observation_boundary": "cuda_event_device",
+        "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+        "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+        "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+        "training_sources": [
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+          "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+        ],
+        "training_trials": 15,
+        "training_samples": 15,
+        "aggregation": "median_of_run_medians_at_each_work",
+        "startup_estimator": "nonnegative_affine_on_training_knots"
+      }
+    },
+    "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+    "affine_reference": {
+      "startup_ms": 0,
+      "units_per_ms": 781446923.4539808
+    },
+    "heldout": [
+      {
+        "work": 234881024,
+        "observed_ms": 0.29717334111531574,
+        "predicted_ms": 0.3008426626523336,
+        "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/2",
+        "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=0",
+        "repeat_index": 0,
+        "basis": "interpolated",
+        "relative_error": 0.012347411525026386
+      },
+      {
+        "work": 234881024,
+        "observed_ms": 0.3205546736717224,
+        "predicted_ms": 0.3008426626523336,
+        "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/5",
+        "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=1",
+        "repeat_index": 0,
+        "basis": "interpolated",
+        "relative_error": -0.06149344445239857
+      },
+      {
+        "work": 234881024,
+        "observed_ms": 0.3205973307291667,
+        "predicted_ms": 0.3008426626523336,
+        "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/8",
+        "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=2",
+        "repeat_index": 0,
+        "basis": "interpolated",
+        "relative_error": -0.06161831738244061
+      },
+      {
+        "work": 234881024,
+        "observed_ms": 0.2923520008722941,
+        "predicted_ms": 0.3008426626523336,
+        "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/15",
+        "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=3",
+        "repeat_index": 0,
+        "basis": "interpolated",
+        "relative_error": 0.029042598493274507
+      },
+      {
+        "work": 234881024,
+        "observed_ms": 0.30182000001271564,
+        "predicted_ms": 0.3008426626523336,
+        "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/18",
+        "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=4",
+        "repeat_index": 0,
+        "basis": "interpolated",
+        "relative_error": -0.0032381464460302656
+      }
+    ]
+  },
+  "heldout_engine": [
+    {
+      "work": 234881024,
+      "observed_ms": 0.29717334111531574,
+      "predicted_ms": 0.3008426626523336,
+      "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/2",
+      "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=0",
+      "repeat_index": 0,
+      "basis": "interpolated",
+      "relative_error": 0.012347411525026386,
+      "engine_predicted_ms": 0.3008426626523333,
+      "engine_relative_error": 0.012347411525025276,
+      "declared_bytes": 234881024.0,
+      "serviced_bytes": 234881024.0
+    },
+    {
+      "work": 234881024,
+      "observed_ms": 0.3205546736717224,
+      "predicted_ms": 0.3008426626523336,
+      "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/5",
+      "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=1",
+      "repeat_index": 0,
+      "basis": "interpolated",
+      "relative_error": -0.06149344445239857,
+      "engine_predicted_ms": 0.3008426626523333,
+      "engine_relative_error": -0.06149344445239957,
+      "declared_bytes": 234881024.0,
+      "serviced_bytes": 234881024.0
+    },
+    {
+      "work": 234881024,
+      "observed_ms": 0.3205973307291667,
+      "predicted_ms": 0.3008426626523336,
+      "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/8",
+      "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=2",
+      "repeat_index": 0,
+      "basis": "interpolated",
+      "relative_error": -0.06161831738244061,
+      "engine_predicted_ms": 0.3008426626523333,
+      "engine_relative_error": -0.06161831738244161,
+      "declared_bytes": 234881024.0,
+      "serviced_bytes": 234881024.0
+    },
+    {
+      "work": 234881024,
+      "observed_ms": 0.2923520008722941,
+      "predicted_ms": 0.3008426626523336,
+      "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/15",
+      "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=3",
+      "repeat_index": 0,
+      "basis": "interpolated",
+      "relative_error": 0.029042598493274507,
+      "engine_predicted_ms": 0.3008426626523333,
+      "engine_relative_error": 0.029042598493273397,
+      "declared_bytes": 234881024.0,
+      "serviced_bytes": 234881024.0
+    },
+    {
+      "work": 234881024,
+      "observed_ms": 0.30182000001271564,
+      "predicted_ms": 0.3008426626523336,
+      "source": "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/18",
+      "run_id": "data/measurements/gpu/sim-probe-20261027-234735.stdout:trial=4",
+      "repeat_index": 0,
+      "basis": "interpolated",
+      "relative_error": -0.0032381464460302656,
+      "engine_predicted_ms": 0.3008426626523333,
+      "engine_relative_error": -0.003238146446031376,
+      "declared_bytes": 234881024.0,
+      "serviced_bytes": 234881024.0
+    }
+  ],
+  "scores_by_work": [
+    {
+      "work_bytes": 234881024,
+      "trials": 5,
+      "observed_median_ms": 0.30182000001271564,
+      "engine_predicted_ms": 0.3008426626523333,
+      "median_relative_error": -0.003238146446031376,
+      "trial_error_min": -0.06161831738244161,
+      "trial_error_max": 0.029042598493273397
+    }
+  ],
+  "prior_affine_method": {
+    "bytes_per_ms": 785839906.6142311,
+    "setup_ms": 0,
+    "train_trials": 15,
+    "heldout": [
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.29717334111531574,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": 0.005782338422857469
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.3205546736717224,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.06757965959345691
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.3205973307291667,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.06770372272253056
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.2923520008722941,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": 0.022369257101333417
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.30182000001271564,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.009702147202625855
+      }
+    ]
+  },
+  "analytic_operator_costs": {
+    "schema": "mindie-sim.operators/1",
+    "boundary": "sum_of_isolated_device_programs",
+    "operator_occurrences": 4,
+    "operator_sum_ms": 0.8388608,
+    "operators": [
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            16777216
+          ],
+          "local_shape": [
+            16777216
+          ],
+          "padded_shape": [
+            16777216
+          ],
+          "launch_shape": [
+            16777216
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 134217728,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceEnvelope",
+        "declared_service": {
+          "memory@r0:s0": 134217728.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.134217728,
+        "total_ms": 0.134217728,
+        "input_ready_ms": 0,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 134217728.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "none",
+          "declared_parameter_sources": []
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            25165824
+          ],
+          "local_shape": [
+            25165824
+          ],
+          "padded_shape": [
+            25165824
+          ],
+          "launch_shape": [
+            25165824
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 201326592,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceEnvelope",
+        "declared_service": {
+          "memory@r0:s0": 201326592.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.201326592,
+        "total_ms": 0.201326592,
+        "input_ready_ms": 0,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 201326592.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "none",
+          "declared_parameter_sources": []
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            29360128
+          ],
+          "local_shape": [
+            29360128
+          ],
+          "padded_shape": [
+            29360128
+          ],
+          "launch_shape": [
+            29360128
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 234881024,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceEnvelope",
+        "declared_service": {
+          "memory@r0:s0": 234881024.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.234881024,
+        "total_ms": 0.234881024,
+        "input_ready_ms": 0,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 234881024.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "none",
+          "declared_parameter_sources": []
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            33554432
+          ],
+          "local_shape": [
+            33554432
+          ],
+          "padded_shape": [
+            33554432
+          ],
+          "launch_shape": [
+            33554432
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 268435456,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceEnvelope",
+        "declared_service": {
+          "memory@r0:s0": 268435456.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.268435456,
+        "total_ms": 0.268435456,
+        "input_ready_ms": 0,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 268435456.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "none",
+          "declared_parameter_sources": []
+        }
+      }
+    ]
+  },
+  "calibrated_operator_costs": {
+    "schema": "mindie-sim.operators/1",
+    "boundary": "sum_of_isolated_device_programs",
+    "operator_occurrences": 4,
+    "operator_sum_ms": 1.0725546479225159,
+    "operators": [
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            16777216
+          ],
+          "local_shape": [
+            16777216
+          ],
+          "padded_shape": [
+            16777216
+          ],
+          "launch_shape": [
+            16777216
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 134217728,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceService",
+        "declared_service": {
+          "memory@r0:s0": 134217728.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.17002665996551514,
+        "total_ms": 0.17002665996551514,
+        "input_ready_ms": 7,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 134217728.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "anchor": 1
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            25165824
+          ],
+          "local_shape": [
+            25165824
+          ],
+          "padded_shape": [
+            25165824
+          ],
+          "launch_shape": [
+            25165824
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 201326592,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceService",
+        "declared_service": {
+          "memory@r0:s0": 201326592.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.2563413381576538,
+        "total_ms": 0.2563413381576538,
+        "input_ready_ms": 7,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 201326592.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "anchor": 1
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            29360128
+          ],
+          "local_shape": [
+            29360128
+          ],
+          "padded_shape": [
+            29360128
+          ],
+          "launch_shape": [
+            29360128
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 234881024,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceService",
+        "declared_service": {
+          "memory@r0:s0": 234881024.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.3008426626523333,
+        "total_ms": 0.3008426626523333,
+        "input_ready_ms": 7,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 234881024.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "interpolated": 1
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      },
+      {
+        "operator": {
+          "op_id": "copy",
+          "family": "copy",
+          "phase": "primitive",
+          "stage": 0,
+          "layer": 0,
+          "requests": [],
+          "semantic_shape": [
+            33554432
+          ],
+          "local_shape": [
+            33554432
+          ],
+          "padded_shape": [
+            33554432
+          ],
+          "launch_shape": [
+            33554432
+          ],
+          "recipe": "stream_copy",
+          "deps": [],
+          "dtype": "uint32",
+          "layout": "contiguous",
+          "coverage": "decomposed",
+          "notes": [],
+          "metadata": {
+            "kernel": "stream_copy",
+            "implementation": {
+              "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+              "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+            },
+            "service_axes": {
+              "block_threads": 256,
+              "word_bytes": 4,
+              "alignment_bytes": 4,
+              "load_cache": "cg",
+              "store_cache": "wb"
+            }
+          },
+          "flops": 0.0,
+          "hbm_bytes": 268435456,
+          "mte2_bytes": 0.0,
+          "mte3_bytes": 0.0,
+          "vector_ops": 0.0,
+          "link_bytes": 0.0,
+          "link_scope": "d2d"
+        },
+        "occurrences": 1,
+        "program": "ResourceService",
+        "declared_service": {
+          "memory@r0:s0": 268435456.0
+        },
+        "service_delta": {},
+        "duration_ms": 0.34534398714701364,
+        "total_ms": 0.34534398714701364,
+        "input_ready_ms": 7,
+        "service_before_input": {},
+        "serviced": {
+          "memory@r0:s0": 268435456.0
+        },
+        "peak_buffers": {},
+        "peak_buffers_per_unit": {},
+        "remaining_buffers": {},
+        "live_tasks": 0,
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 1
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "anchor": 1
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "composition_controls": [
+    {
+      "work_per_invocation_bytes": 234881024,
+      "observed_concurrency": false,
+      "physical_shared_rate_bytes_per_ms": 1000000000.0,
+      "parallel": {
+        "duration_ms": 0.469762048,
+        "execution": {
+          "time_ms": 0.469762048,
+          "serviced": {
+            "scheduler@r0": 0.0,
+            "memory@r0:s0": 469762048.0,
+            "vector@r0:s0": 0.0,
+            "matrix@r0:s0": 0.0,
+            "host@r0:s0": 0.0
+          },
+          "resource_busy_ms": {
+            "scheduler@r0": 0.0,
+            "memory@r0:s0": 0.469762048,
+            "vector@r0:s0": 0.0,
+            "matrix@r0:s0": 0.0,
+            "host@r0:s0": 0.0
+          },
+          "peak_allocated": {},
+          "live_allocated": {},
+          "peak_allocated_per_unit": {},
+          "completed_tasks": 12,
+          "live_tasks": 0,
+          "live_programs": 0,
+          "peak_live_tasks": 12,
+          "retained_trace_events": 0,
+          "trace_dropped": 0,
+          "work": {
+            "flops": 0.0,
+            "vector_ops": 0.0,
+            "hbm_bytes": 469762048.0,
+            "link_bytes": 0.0
+          },
+          "recipes": {
+            "stream_copy": 2
+          },
+          "rank_model": "representative_local_shard_per_stage"
+        },
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 2
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "interpolated": 2
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      },
+      "serial": {
+        "duration_ms": 0.6016853253046672,
+        "execution": {
+          "time_ms": 0.6016853253046672,
+          "serviced": {
+            "scheduler@r0": 0.0,
+            "memory@r0:s0": 469762048.0,
+            "vector@r0:s0": 0.0,
+            "matrix@r0:s0": 0.0,
+            "host@r0:s0": 0.0
+          },
+          "resource_busy_ms": {
+            "scheduler@r0": 0.0,
+            "memory@r0:s0": 0.6016853253046672,
+            "vector@r0:s0": 0.0,
+            "matrix@r0:s0": 0.0,
+            "host@r0:s0": 0.0
+          },
+          "peak_allocated": {},
+          "live_allocated": {},
+          "peak_allocated_per_unit": {},
+          "completed_tasks": 12,
+          "live_tasks": 0,
+          "live_programs": 0,
+          "peak_live_tasks": 12,
+          "retained_trace_events": 0,
+          "trace_dropped": 0,
+          "work": {
+            "flops": 0.0,
+            "vector_ops": 0.0,
+            "hbm_bytes": 469762048.0,
+            "link_bytes": 0.0
+          },
+          "recipes": {
+            "stream_copy": 2
+          },
+          "rank_model": "representative_local_shard_per_stage"
+        },
+        "basis": {
+          "operator_occurrences": {
+            "measured_primitive": 0,
+            "analytic_work": 2
+          },
+          "calibration": "resource_service_curves",
+          "declared_parameter_sources": [],
+          "service_models": [
+            {
+              "model_id": "618dc59768e1f3f7859f2242c6c1abd27d1fc786a140714b3460277a4c42d989",
+              "resource": "hbm",
+              "work_unit": "bytes",
+              "identity": {
+                "hardware": {
+                  "key": "GPU-a59e8f34-47d6-75d2-7e65-4752827d5d47",
+                  "architecture": "cuda",
+                  "compute_units": 1,
+                  "resource_units": {
+                    "hbm": 1
+                  }
+                },
+                "runtime": "cuda_driver_api",
+                "revision": "617.42",
+                "format": "",
+                "kernel": "stream_copy",
+                "implementation": {
+                  "cuda_probe.py": "3eaa56cab4e4b0b3effbabf1f1cf4a96db02e16ed645b7b133da59f45169faec",
+                  "copy.ptx": "5b9db6e08d63fad13efc6be1db0d49f99c33397d52f56f12f3be8f68e2e059a2"
+                },
+                "dtype": "uint32",
+                "layout": "contiguous",
+                "replay_scope": "none",
+                "axes": {
+                  "block_threads": 256,
+                  "word_bytes": 4,
+                  "alignment_bytes": 4,
+                  "load_cache": "cg",
+                  "store_cache": "wb"
+                }
+              },
+              "boundary": "device_kernel",
+              "active_units": 1,
+              "provenance": {
+                "observation_boundary": "cuda_event_device",
+                "duration_normalization": "recorded_device_event_batch_ms_divided_by_24_launches",
+                "implementation_binding": "retained_probe_source; loaded_binary_hash_not_captured",
+                "abstraction": "one_memory_service_plus_startup_for_this_copy_protocol",
+                "training_sources": [
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/0",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/1",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/10",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/11",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/12",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/13",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/14",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/16",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/17",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/19",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/3",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/4",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/6",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/7",
+                  "data/measurements/gpu/sim-probe-20261027-234735.stdout#/samples/9"
+                ],
+                "training_trials": 15,
+                "training_samples": 15,
+                "aggregation": "median_of_run_medians_at_each_work",
+                "startup_estimator": "nonnegative_affine_on_training_knots"
+              },
+              "queries": {
+                "interpolated": 2
+              },
+              "capacity_limited_queries": 0
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "source_sha256": "c91993c76a5891ba89ebfc4637870aced1eb00080c624f3fa5f4bc3fc62b2809"
+}

@@ -1,0 +1,68 @@
+{
+  "name": "catalog-full-model-glm53-a3-w4a8-reduced",
+  "machine": {
+    "name": "a3-9362-8die-tp8",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "note": "one A3 host (192.168.13.165), 4 two-die packages = 8 dies, dies 8-15 exposed, one rank per die; default transfer channels materialize 4 SIO intra-package links at 448 GB/s and one 8-die HCCS_SW intra-node link at 196 GB/s",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "GLM-5.3-W4A8",
+    "quantization": "w4a8_dynamic"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 8,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 16,
+    "max_model_len": 73728,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.97,
+    "graph_mode": "auto",
+    "vllm_impl": "vllm-ascend-0.30.0rc2.dev200+g8fd0bc488",
+    "vllm_version": "0.30.0rc2.dev200+g8fd0bc488",
+    "kernel_format": "bf16",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "kv_block_size": 128,
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/GLM-5.3-W4A8-INT --served-model-name glm53-w4a8 --host 0.0.0.0 --port 18236 --tensor-parallel-size 8 --distributed-executor-backend mp --quantization ascend --trust-remote-code --max-model-len 73728 --max-num-seqs 16 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.97 --enable-chunked-prefill --no-enable-prefix-caching --model-loader-extra-config '{\"enable_multithread_load\": true, \"num_threads\": 128}'",
+      "weights": "GLM-5.3-W4A8-INT (378 GiB, 99 shards); 78 body layers, hidden 6144, 256 routed experts top-8 + 1 shared, MLA kv_lora_rank 512 / q_lora_rank 2048, qk 192+64 rope, v 256, DSA index_topk 2048, vocab 154 880; measured per-rank weight load 49.6497 GB (x8 = 397 GB); W4A8_DYNAMIC routed experts + W8A8_DYNAMIC attention/shared/dense + FLOAT norms/gates/embedding/LM head; served expert layout is TP8 (expert_parallel 1): 256 expert groups resident on every rank at 1/8 intermediate width (gate/up n=512, down k=256 per rank), 45.30 GB of expert weights per rank, zero dispatch/combine/all-to-all kernels",
+      "host": "192.168.13.165 (A3, openEuler), 8 NPU packages x 2 dies = 16 dies of 65 536 MB; only dies 8-15 exposed to torch as ranks 0-7",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...)",
+      "fabric": "4 SIO intra-package die pairs (448 GB/s, direct) + one 8-die HCCS_SW switched intra-node fabric (196 GB/s declared default); TP8 all-reduce spans four packages (measured 8-rank hcom_allReduce: attention alpha 24.75 us / 93.66 GB/s payload, expert-MLP alpha 31.37 us / 101.90 GB/s payload); the served trace carries 157 all-reduces per forward and zero all-to-all",
+      "measured_baseline": ".workstreams/hp-serving/glm53-a3-w4a8/report.md (2026-10-23, 192.168.13.165 dies 8-15)",
+      "mtp": "none: speculative_config=None in the measured serve log; the checkpoint's one num_nextn_predict_layers layer is loaded but never run, so one token per sequence per step",
+      "reduced_config": true,
+      "reduced_config_reason": "the briefed 131 072 @ gmu 0.90 recipe fails engine init on 64 GiB dies (11.62 GiB KV needed vs 3.68 GiB available; estimated max model length 41 472). The measured recipe is max-model-len 73 728 @ gmu 0.97 (KV 7.98 GiB / 89 856 tokens / 1.22x). Every measured cell is reduced_config and the 126 976 row cannot exist at this max_model_len.",
+      "unsupported_context": "131072 (and any prompt+output above 73728) is unsupported on this TP8/64 GiB configuration; it is refused, never extrapolated",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted",
+      "expert_parallel": "the served recipe does not pass --enable-expert-parallel: the trace shows 256 expert groups resident on every rank at 1/8 intermediate width and zero dispatch/combine/all-to-all kernels, so the case declares ep=1 (TP8 expert sharding). The EP8 32-local-expert layout in the original case was a modeling error; an EP8 dispatch/combine row was never measured and is declared missing.",
+      "enable_prefix_caching": false,
+      "graph": "cudagraph_mode=FULL_AND_PIECEWISE (decode-FULL + piecewise prefill); cudagraph_capture_sizes=[1,2,4,8,16]; Graph capturing finished in 18 secs, took 0.21 GiB; no --compilation-config flag was passed, this is the image default",
+      "kv_cache": "Setting kv cache block size to 128 for ASCEND_SFA_INDEXER backend; Available KV cache memory: 7.98 GiB -> NPU KV cache size: 89,856 tokens, Maximum concurrency for 73,728 tokens per request: 1.22x",
+      "engine_config": "Initializing a V1 LLM engine (v0.30.0): max_seq_len=73728, speculative_config=None, tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1, enable_prefix_caching=False, enable_chunked_prefill=True"
+    }
+  }
+}

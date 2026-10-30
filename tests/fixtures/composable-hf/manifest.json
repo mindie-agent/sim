@@ -1,0 +1,46 @@
+[
+  {
+    "repo": "MiniMaxAI/MiniMax-M1-80k",
+    "revision": "8d1494b1a260e22040d5b9b2eb332eb44500b34d",
+    "url": "https://huggingface.co/MiniMaxAI/MiniMax-M1-80k/resolve/8d1494b1a260e22040d5b9b2eb332eb44500b34d/config.json",
+    "sha256": "de9574bcaf3586337a2b2ca5755ade806e9dab521056ca1f12b8efa7de352921",
+    "file": "minimax-m1-80k.json",
+    "bytes": 1866,
+    "model_type": "minimax_m1"
+  },
+  {
+    "repo": "MiniMaxAI/MiniMax-Text-01",
+    "revision": "a7351bf2bee0e1253919d349f1ad304e6dac13e9",
+    "url": "https://huggingface.co/MiniMaxAI/MiniMax-Text-01/resolve/a7351bf2bee0e1253919d349f1ad304e6dac13e9/config.json",
+    "sha256": "c2ea48d088280bc153a61f9404f7f632ecd227bf22ac815bf4168410ebfdfcd2",
+    "file": "minimax-text-01.json",
+    "bytes": 1891,
+    "model_type": "minimax_text_01"
+  },
+  {
+    "repo": "stepfun-ai/Step-2-mini",
+    "error": "HTTP Error 401: Unauthorized"
+  },
+  {
+    "repo": "stepfun-ai/step2-mini",
+    "error": "HTTP Error 401: Unauthorized"
+  },
+  {
+    "repo": "stepfun-ai/step3",
+    "revision": "e2d67fc936dc60f8f606f2429728f1dea503e10d",
+    "url": "https://huggingface.co/stepfun-ai/step3/resolve/e2d67fc936dc60f8f606f2429728f1dea503e10d/config.json",
+    "sha256": "d817cef5cb09412ae57de4922b4bfb20abd84899c5405ca4e2017cf37188d453",
+    "file": "step3.json",
+    "bytes": 1540,
+    "model_type": "step3_vl"
+  },
+  {
+    "repo": "baichuan-inc/Baichuan2-7B-Base",
+    "revision": "f9d4d8dd2f7a3dbede3bda3b0cf0224e9272bbe5",
+    "url": "https://huggingface.co/baichuan-inc/Baichuan2-7B-Base/resolve/f9d4d8dd2f7a3dbede3bda3b0cf0224e9272bbe5/config.json",
+    "sha256": "2e264cbf7a05092292cb30a554566979edb923d71c31b2d89a22e29d29f7244b",
+    "file": "baichuan2-7b-base.json",
+    "bytes": 738,
+    "model_type": "baichuan"
+  }
+]

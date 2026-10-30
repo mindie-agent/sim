@@ -1,0 +1,105 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "moe_combine-0",
+      "split": "development",
+      "params": {
+        "tokens": 1,
+        "hidden": 128,
+        "topk": 2,
+        "dtype": "bf16",
+        "weight_dtype": "fp32",
+        "compute_capability": 89,
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      }
+    },
+    {
+      "id": "moe_combine-1",
+      "split": "development",
+      "params": {
+        "tokens": 3,
+        "hidden": 256,
+        "topk": 4,
+        "dtype": "bf16",
+        "weight_dtype": "fp32",
+        "compute_capability": 89,
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      }
+    },
+    {
+      "id": "moe_combine-2",
+      "split": "development",
+      "params": {
+        "tokens": 16,
+        "hidden": 512,
+        "topk": 8,
+        "dtype": "bf16",
+        "weight_dtype": "fp32",
+        "compute_capability": 89,
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      }
+    },
+    {
+      "id": "moe_combine-3",
+      "split": "heldout_geometry",
+      "params": {
+        "tokens": 5,
+        "hidden": 130,
+        "topk": 3,
+        "dtype": "bf16",
+        "weight_dtype": "fp32",
+        "compute_capability": 89,
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      }
+    },
+    {
+      "id": "moe_combine-4",
+      "split": "heldout_geometry",
+      "params": {
+        "tokens": 33,
+        "hidden": 1024,
+        "topk": 2,
+        "dtype": "bf16",
+        "weight_dtype": "fp32",
+        "compute_capability": 89,
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_moe_fused_mul_sum",
+        "apply_router_weight_on_input": false,
+        "has_expert_map": false
+      }
+    }
+  ]
+}

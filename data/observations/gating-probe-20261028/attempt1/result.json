@@ -1,0 +1,1 @@
+{"descendants_drained": true, "exit_code": 1, "finished_at": 1793126570.9951918, "started_at": 1793126548.2555919, "state": "failed", "timings": {"clock_domain": "remote-supervisor:3e942359-cdaa-4bc1-ac5a-64c5f1e9a5b0:412008", "descendant_drain_ms": 0.058, "shell_ms": 22739.134, "spawn_ms": 0.408}}

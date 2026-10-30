@@ -1,0 +1,79 @@
+{
+  "name": "qwen38-a5-tp4-c128-source-gdn-queue",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 4,
+    "ranks_per_node": 8,
+    "device": {
+      "rates": {
+        "scalar_store_issue": 5657458563.535912
+      },
+      "resource_units": {
+        "scalar_store_issue": 64
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "qwen3.8-27b",
+    "quantization": "w8a8_mxfp8"
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "device-body analysis only; workload placeholder is not a replay of the concurrent server",
+      "geometry_policy": "supply actual query rows and sequence count from profiler; capture padding must be stated separately",
+      "capture_summary": "/Volumes/data/mindie-sim-data/a5/qwen3_8_27b_w8a8_mxfp8_mtp_high_conc_decode_tpot30ms_near_c128_20261030/benchmark_summary.json",
+      "capture_client": "/Volumes/data/mindie-sim-data/a5/qwen3_8_27b_w8a8_mxfp8_mtp_high_conc_decode_tpot30ms_near_c128_20261030/client_cell.json",
+      "source_image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5 (c3d00a196905)",
+      "source_model_path": "/mnt/weight/Qwen3.8-27B-w8a8-mxfp8-mtp",
+      "mtp_policy": "metadata proves 3 proposed tokens per draft event; actual target query geometry awaits tensor extraction",
+      "gdn_primitive_parameters": {
+        "identity": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
+          "sha256": "6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb",
+          "bytes": 1046
+        },
+        "hardware": "Ascend950DT_9582",
+        "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+        "scope": "scalar UB-to-GM loop, BF16 stores, retained compiler binary",
+        "calibration": "existing independent BF16 scalar-store primitive; no capture-duration fit",
+        "new_capture_binary_verified": false,
+        "g_fp32": "positive-stride aligned FP32 DMA inferred from retained compiler binary",
+        "recurrence": "analytic core retained in this first source-caller control"
+      }
+    },
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4104,
+        "output_tokens": 384
+      }
+    ]
+  }
+}

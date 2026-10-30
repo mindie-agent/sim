@@ -1,0 +1,5 @@
+{
+  "exit_code": 127,
+  "build": "completed",
+  "disassembly": "incorrect tool path; recovered using cann-9.2.0/tools/bisheng_compiler/bin/llvm-objdump"
+}

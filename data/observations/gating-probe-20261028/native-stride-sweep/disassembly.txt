@@ -1,0 +1,285 @@
+
+/scratch/stride-sweep/store-ld.o:	file format elf64-hiipu
+
+Disassembly of section .text:
+
+0000000000000000 <load_gm_to_ubuf_1d_bfloat16_t>:
+       0:				07060010	MOVI 		X3, #16
+       4:				07020000	MOVI 		X1, #0
+       8:				07040400	MOVI 		X2, #1024
+       c:				07870008	MOVK 		X3, #8, #2
+      10:				028c1900	MOV		PAD_VAL_OUTTOUB, X1
+      14:				07c50004	MOVK 		X2, #4, #3
+      18:				07c70400	MOVK 		X3, #1024, #3
+      1c:				74820189	MOV_OUT_TO_UB_ALIGN_V2.b16	[X1], [X0], X3, X2
+      20:				4061f000	RET
+
+0000000000000024 <store_ubuf_to_gm_2d_bfloat16_t>:
+      24:				0a000000	CMPI.EQ	X0, #0
+      28:				40200034	JUMPCI 		#248 <store_ubuf_to_gm_2d_bfloat16_t+0xd4>
+      2c:				0a001000	CMPI.EQ	X1, #0
+      30:				40200032	JUMPCI 		#248 <store_ubuf_to_gm_2d_bfloat16_t+0xd4>
+      34:				070c0000	MOVI 		X6, #0
+      38:				028a3880	MOV		X5, SYS_VA_BASE
+      3c:				074d0008	MOVK 		X6, #8, #1
+      40:				000a5301	ADD.s64 	X5, X5, X6
+      44:				070c0000	MOVI 		X6, #0
+      48:				02c60201	SHLI.b64 	X3, #1
+      4c:				02ca6400	SBITSET0.b64  	X5, X6
+      50:				028c6900	MOV		PAD_VAL_OUTTOUB, X6
+      54:				00042181	ADD.s64 	X2, X2, X3
+      58:				0a804001	CMPI.LT	X4, #1
+      5c:				40a41403	SET_FLAGI.MTE3.S  	#7 <load_gm_to_ubuf_1d_bfloat16_t+0x5>
+      60:				40c41403	WAIT_FLAGI.MTE3.S  	#7 <load_gm_to_ubuf_1d_bfloat16_t+0x5>
+      64:				02c80201	SHLI.b64 	X4, #1
+      68:				40200011	JUMPCI 		#172 <store_ubuf_to_gm_2d_bfloat16_t+0x88>
+      6c:				07060000	MOVI 		X3, #0
+      70:				020e1800	MOV 		X7, X1
+      74:				00105181	ADD.s64 	X8, X5, X3
+      78:				1c508000	LD_IO.b16 		X8, [X8], #0, #0
+      7c:				00122181	ADD.s64 	X9, X2, X3
+      80:				088e7001	SUBI 	X7, X7, #1
+      84:				18509000	ST_DEV.b16	X8, [X9], #0
+      88:				08063002	ADDI 	X3, X3, #2
+      8c:				0a407000	CMPI.NE	X7, #0
+      90:				4020fff9	JUMPCI 		#116 <store_ubuf_to_gm_2d_bfloat16_t+0x50>
+      94:				080c6001	ADDI 	X6, X6, #1
+      98:				080a5010	ADDI 	X5, X5, #16
+      9c:				00042201	ADD.s64 	X2, X2, X4
+      a0:				0000601e	CMP.NE.s64	X6, X0
+      a4:				4020fff2	JUMPCI 		#108 <store_ubuf_to_gm_2d_bfloat16_t+0x48>
+      a8:				40000012	JUMPI 		#240 <store_ubuf_to_gm_2d_bfloat16_t+0xcc>
+      ac:				07060000	MOVI 		X3, #0
+      b0:				070c0000	MOVI 		X6, #0
+      b4:				020e1800	MOV 		X7, X1
+      b8:				00105301	ADD.s64 	X8, X5, X6
+      bc:				1c508000	LD_IO.b16 		X8, [X8], #0, #0
+      c0:				00122301	ADD.s64 	X9, X2, X6
+      c4:				088e7001	SUBI 	X7, X7, #1
+      c8:				18509000	ST_DEV.b16	X8, [X9], #0
+      cc:				080c6002	ADDI 	X6, X6, #2
+      d0:				0a407000	CMPI.NE	X7, #0
+      d4:				4020fff9	JUMPCI 		#184 <store_ubuf_to_gm_2d_bfloat16_t+0x94>
+      d8:				08063001	ADDI 	X3, X3, #1
+      dc:				080a5010	ADDI 	X5, X5, #16
+      e0:				00042201	ADD.s64 	X2, X2, X4
+      e4:				0000300e	CMP.EQ.s64	X3, X0
+      e8:				40200002	JUMPCI 		#240 <store_ubuf_to_gm_2d_bfloat16_t+0xcc>
+      ec:				4000fff1	JUMPI 		#176 <store_ubuf_to_gm_2d_bfloat16_t+0x8c>
+      f0:				40a40283	SET_FLAGI.S.MTE3  	#7 <load_gm_to_ubuf_1d_bfloat16_t>
+      f4:				40c40283	WAIT_FLAGI.S.MTE3  	#7 <load_gm_to_ubuf_1d_bfloat16_t>
+      f8:				4061f000	RET
+
+00000000000000fc <strided_store_ld$local>:
+      fc:				02004880	MOV		X0, PARA_BASE
+     100:				07c10000	MOVK 		X0, #0, #3
+     104:				08c00000	DC_PRELOADI	[X0], #0
+     108:				073afe80	MOVI 		X29, #65152
+     10c:				077b000f	MOVK 		X29, #15, #1
+     110:				029e3880	MOV		X15, SYS_VA_BASE
+     114:				02224880	MOV		X17, PARA_BASE
+     118:				003bd781	ADD.s64 	X29, X29, X15
+     11c:				021f0880	MOV		X15, COREID
+     120:				07207fff	MOVI 		X16, #32767
+     124:				026202b4	SHRI.u64 	X17, #52
+     128:				00def80a	AND.b64  	X15, X15, X16
+     12c:				08231002	ADDI 	X17, X17, #2
+     130:				02e2020e	SHLI.b64 	X17, #14
+     134:				081ef001	ADDI 	X15, X15, #1
+     138:				003af884	MADD.s64 	X29, X15, X17
+     13c:				083dd758	ADDI 	X30, X29, #1880
+     140:				02024880	MOV		X1, PARA_BASE
+     144:				07c30000	MOVK 		X1, #0, #3
+     148:				0804102c	ADDI 	X2, X1, #44
+     14c:				0ca62100	LDP.b32 	X19, X2, [X2], #0
+     150:				082c1024	ADDI 	X22, X1, #36
+     154:				0ca96b00	LDP.b32 	X20, X22, [X22], #0
+     158:				0ce41020	LDP.b64 	X18, X0, [X1], #16
+     15c:				1caa1020	LD_IO.b32 		X21, [X1], #32, #0
+     160:				0706003c	MOVI 		X3, #60
+     164:				02822980	SIGNEXT.s32 	X1, X2
+     168:				02043880	MOV		X2, CTRL
+     16c:				02c43400	SBITSET0.b64  	X2, X3
+     170:				02062900	MOV		CTRL, X2
+     174:				02043880	MOV		X2, CTRL
+     178:				07060030	MOVI 		X3, #48
+     17c:				02c43440	SBITSET1.b64  	X2, X3
+     180:				02062900	MOV		CTRL, X2
+     184:				02041880	MOV		X2, BLOCKID
+     188:				02842980	SIGNEXT.s32 	X2, X2
+     18c:				02b36980	SIGNEXT.s32 	X25, X22
+     190:				00342086	REM.s64 	X26, X2, X1
+     194:				072eff98	MOVI 		X23, #65432
+     198:				076fffff	MOVK 		X23, #65535, #1
+     19c:				07afffff	MOVK 		X23, #65535, #2
+     1a0:				40437000	CALL 		X23
+     1a4:				40a01080	SET_FLAGI.MTE2.V  	#0 <load_gm_to_ubuf_1d_bfloat16_t+0x4>
+     1a8:				15e02000	WAIT_FLAGI_V.MTE2 	#0 <load_gm_to_ubuf_1d_bfloat16_t+0x4>
+     1ac:				07000000	MOVI 		X0, #0
+     1b0:				07080000	MOVI 		X4, #0
+     1b4:				07410004	MOVK 		X0, #4, #1
+     1b8:				02004c0f	INSERT 		X0, X4, #0, #15
+     1bc:				02c00220	SHLI.b64 	X0, #32
+     1c0:				07020006	MOVI 		X1, #6
+     1c4:				02001c1f	INSERT 		X0, X1, #0, #31
+     1c8:				07020000	MOVI 		X1, #0
+     1cc:				07434000	MOVK 		X1, #16384, #1
+     1d0:				43001084	PUSH_PB 	X0, X1, X1, X1
+     1d4:				02000880	MOV		X0, PC
+     1d8:				0702008b	MOVI 		X1, #139
+     1dc:				41400000	NOP
+     1e0:				41400000	NOP
+     1e4:				02c20202	SHLI.b64 	X1, #2
+     1e8:				00021001	ADD.s64 	X1, X1, X0
+     1ec:			15e0022515410000	VF 		X1, #17
+     1f4:				15e0a800	SET_FLAGI_V.MTE3 	#0 <load_gm_to_ubuf_1d_bfloat16_t+0x5>
+     1f8:				40c00680	WAIT_FLAGI.V.MTE3  	#0 <load_gm_to_ubuf_1d_bfloat16_t+0x1>
+     1fc:				0a819001	CMPI.LT	X25, #1
+     200:				40200053	JUMPCI 		#844 <strided_store_ld$local+0x250>
+     204:				00019207	MAX.s64  	X0, X25, X4
+     208:				03c1e890	ST_IO.b64 		X0, [X30], #-1904, #0
+     20c:				08015007	ADDI 	X0, X21, #7
+     210:				02820980	SIGNEXT.s32 	X1, X0
+     214:				024202bc	SHRI.u64 	X1, #60
+     218:				07040007	MOVI 		X2, #7
+     21c:				00c2110a	AND.b64  	X1, X1, X2
+     220:				00000081	ADD.s64 	X0, X0, X1
+     224:				02800980	SIGNEXT.s32 	X0, X0
+     228:				02000283	SHRI.s64 	X0, #3
+     22c:				0007ab03	MUL.s64 	X3, X26, X22
+     230:				03c1e888	ST_IO.b64 		X0, [X30], #-1912, #0
+     234:				00380207	MAX.s64  	X28, X0, X4
+     238:				02814980	SIGNEXT.s32 	X0, X20
+     23c:				02a73980	SIGNEXT.s32 	X19, X19
+     240:				02f80203	SHLI.b64 	X28, #3
+     244:				03c7e880	ST_IO.b64 		X3, [X30], #-1920, #0
+     248:				02c60206	SHLI.b64 	X3, #6
+     24c:				03c1e878	ST_IO.b64 		X0, [X30], #-1928, #0
+     250:				07320008	MOVI 		X25, #8
+     254:				07000000	MOVI 		X0, #0
+     258:				03c7e8a0	ST_IO.b64 		X3, [X30], #-1888, #0
+     25c:				03c1e898	ST_IO.b64 		X0, [X30], #-1896, #0
+     260:				4000000b	JUMPI 		#652 <strided_store_ld$local+0x190>
+     264:				1cc1e8a0	LD_IO.b64 		X0, [X30], #-1888, #0
+     268:				1cc3e898	LD_IO.b64 		X1, [X30], #-1896, #0
+     26c:				08000040	ADDI 	X0, X0, #64
+     270:				03c1e8a0	ST_IO.b64 		X0, [X30], #-1888, #0
+     274:				1cc1e890	LD_IO.b64 		X0, [X30], #-1904, #0
+     278:				08021001	ADDI 	X1, X1, #1
+     27c:				03c3e898	ST_IO.b64 		X1, [X30], #-1896, #0
+     280:				0000101e	CMP.NE.s64	X1, X0
+     284:				40200002	JUMPCI 		#652 <strided_store_ld$local+0x190>
+     288:				40000031	JUMPI 		#844 <strided_store_ld$local+0x250>
+     28c:				1cc1e888	LD_IO.b64 		X0, [X30], #-1912, #0
+     290:				0a800001	CMPI.LT	X0, #1
+     294:				4020fff4	JUMPCI 		#612 <strided_store_ld$local+0x168>
+     298:				1cc1e8a0	LD_IO.b64 		X0, [X30], #-1888, #0
+     29c:				1cc3e898	LD_IO.b64 		X1, [X30], #-1896, #0
+     2a0:				1cc5e878	LD_IO.b64 		X2, [X30], #-1928, #0
+     2a4:				07360000	MOVI 		X27, #0
+     2a8:				073a0008	MOVI 		X29, #8
+     2ac:				07300000	MOVI 		X24, #0
+     2b0:				072c0000	MOVI 		X22, #0
+     2b4:				02800980	SIGNEXT.s32 	X0, X0
+     2b8:				00353003	MUL.s64 	X26, X19, X0
+     2bc:				1cc1e880	LD_IO.b64 		X0, [X30], #-1920, #0
+     2c0:				00000081	ADD.s64 	X0, X0, X1
+     2c4:				02c00206	SHLI.b64 	X0, #6
+     2c8:				02800980	SIGNEXT.s32 	X0, X0
+     2cc:				08020040	ADDI 	X1, X0, #64
+     2d0:				00040107	MAX.s64  	X2, X0, X2
+     2d4:				00021108	MIN.s64  	X1, X1, X2
+     2d8:				00001002	SUB.s64 	X0, X1, X0
+     2dc:				07020040	MOVI 		X1, #64
+     2e0:				00000088	MIN.s64  	X0, X0, X1
+     2e4:				00280207	MAX.s64  	X20, X0, X4
+     2e8:				02818980	SIGNEXT.s32 	X0, X24
+     2ec:				02835980	SIGNEXT.s32 	X1, X21
+     2f0:				00001007	MAX.s64  	X0, X1, X0
+     2f4:				02800a00	ZEROEXT.u32 	X0, X0
+     2f8:				0001d008	MIN.s64  	X0, X29, X0
+     2fc:				00000d81	ADD.s64 	X0, X0, X27
+     300:				00000c88	MIN.s64  	X0, X0, X25
+     304:				0007ab01	ADD.s64 	X3, X26, X22
+     308:				00020207	MAX.s64  	X1, X0, X4
+     30c:				02014800	MOV 		X0, X20
+     310:				02052800	MOV 		X2, X18
+     314:				02093800	MOV 		X4, X19
+     318:				40e01400	BAR.MTE3 <load_gm_to_ubuf_1d_bfloat16_t+0x5>
+     31c:				072eff3f	MOVI 		X23, #65343
+     320:				076fffff	MOVK 		X23, #65535, #1
+     324:				07afffff	MOVK 		X23, #65535, #2
+     328:				40437000	CALL 		X23
+     32c:				082d6008	ADDI 	X22, X22, #8
+     330:				07080000	MOVI 		X4, #0
+     334:				08318008	ADDI 	X24, X24, #8
+     338:				083bd008	ADDI 	X29, X29, #8
+     33c:				08b7b008	SUBI 	X27, X27, #8
+     340:				0001cb1e	CMP.NE.s64	X28, X22
+     344:				4020ffe9	JUMPCI 		#744 <strided_store_ld$local+0x1ec>
+     348:				4000ffc7	JUMPI 		#612 <strided_store_ld$local+0x168>
+     34c:				02003880	MOV		X0, CTRL
+     350:				0702003c	MOVI 		X1, #60
+     354:				02c01440	SBITSET1.b64  	X0, X1
+     358:				02060900	MOV		CTRL, X0
+     35c:				40e01800	BAR.ALL <load_gm_to_ubuf_1d_bfloat16_t+0x6>
+     360:				071e0000	MOVI 		X15, #0
+     364:				402ef000	DCCI 		X15, #1
+     368:				41600000	END
+     36c:				41400000	NOP
+     370:				41400000	NOP
+     374:				41400000	NOP
+     378:				41400000	NOP
+     37c:				41400000	NOP
+     380:				41400000	NOP
+     384:				41400000	NOP
+     388:				41400000	NOP
+     38c:				41400000	NOP
+     390:				41400000	NOP
+     394:				41400000	NOP
+     398:				41400000	NOP
+     39c:				41400000	NOP
+     3a0:				41400000	NOP
+     3a4:				41400000	NOP
+     3a8:				41400000	NOP
+     3ac:				41400000	NOP
+     3b0:				41400000	NOP
+     3b4:				41400000	NOP
+     3b8:				41400000	NOP
+     3bc:				41400000	NOP
+     3c0:				41400000	NOP
+     3c4:				41400000	NOP
+     3c8:				41400000	NOP
+     3cc:				41400000	NOP
+     3d0:				41400000	NOP
+     3d4:				41400000	NOP
+     3d8:				41400000	NOP
+     3dc:				41400000	NOP
+     3e0:				41400000	NOP
+     3e4:				41400000	NOP
+     3e8:				41400000	NOP
+     3ec:				41400000	NOP
+     3f0:				41400000	NOP
+     3f4:				41400000	NOP
+     3f8:				41400000	NOP
+     3fc:				41400000	NOP
+
+0000000000000400 <strided_store_ld_fused_0_outlined_vf_0.vector.thread>:
+     400:				c601010d	SMOVI 		S67, #128
+     404:				82040155	PSET.b32 	P1, #0
+     408:				c200004d	SMOV.b32 		S65, S0
+     40c:				c400004d	SMOV.b32 		S66, S0
+     410:				c918004d	SMOV.b32 		S68, S67
+     414:				c1802b1e	VLOOPV2_V310 	S3, #10, #1, #1
+     418:				010843b8	VLDI 	V0, [S65], #8, #14, #1
+     41c:				80090411	VCVTFF.bf162f32 	V0, V0, P1, #0
+     420:				800087c8	VMULS.f32 	V0, V0, S4, P1
+     424:				80084411	VCVTFF.f322bf16 	V0, V0, P1, #0, #0, #0
+     428:				4110419e	VSTI 	V0, [S66], #8, #7, P1, #1
+     42c:				011843b8	VLDI 	V0, [S67], #8, #14, #1
+     430:				80090411	VCVTFF.bf162f32 	V0, V0, P1, #0
+     434:				800087c8	VMULS.f32 	V0, V0, S4, P1
+     438:				80084411	VCVTFF.f322bf16 	V0, V0, P1, #0, #0, #0
+     43c:				4120419e	VSTI 	V0, [S68], #8, #7, P1, #1
+     440:				c0000017	SEND
+     444:				41400000	VST 	V0, [S72], A0, #0, P0

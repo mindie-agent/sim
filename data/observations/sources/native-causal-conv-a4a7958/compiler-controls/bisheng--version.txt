@@ -1,0 +1,4 @@
+2026-09-29T14:46:00+08:00 clang version 15.0.5 (clang-5c68a1cb1231 flang-5c68a1cb1231)
+Target: aarch64-unknown-linux-gnu
+Thread model: posix
+InstalledDir: /usr/local/Ascend/cann-9.2.0/tools/bisheng_compiler/bin

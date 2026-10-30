@@ -1,0 +1,7 @@
+{"primitive":"strided_store","tokens":4096,"heads":32,"units":64,"repetitions":20,"durations_us":[126.765396,126.406509,126.383301,126.394302,126.413162],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":8192,"heads":32,"units":64,"repetitions":20,"durations_us":[242.693085,242.751633,242.644318,242.812836,242.535721],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":4096,"heads":64,"units":64,"repetitions":20,"durations_us":[166.833755,166.585297,166.855347,166.792847,167.022049],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":8192,"heads":64,"units":64,"repetitions":20,"durations_us":[316.458069,316.316956,316.244202,316.471283,316.491852],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":12288,"heads":40,"units":64,"repetitions":20,"durations_us":[419.189117,418.997253,418.508362,419.002045,419.065369],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":4225,"heads":33,"units":64,"repetitions":20,"durations_us":[237.737701,237.675812,237.768402,237.610260,237.566162],"all_elements_verified":true}
+{"peak_rss_kib":175448,"tensor_budget_bytes":16777216}

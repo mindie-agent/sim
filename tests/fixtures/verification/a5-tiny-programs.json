@@ -1,0 +1,267 @@
+{
+  "schema": 2,
+  "status": "partial_hardware_collected",
+  "run_id": "tiny-a5-1793278251",
+  "measured_utc": "2026-10-29T12:50:51+00:00",
+  "endpoint": {
+    "host": "rack06os1",
+    "addr": "177.25.21.1",
+    "npu": 0,
+    "device": "Ascend950DT 9582",
+    "cann": "9.2.0"
+  },
+  "aiv": {
+    "op": "tiny_aiv_add",
+    "task_type": "AI_VECTOR_CORE",
+    "block_num": 1,
+    "rows": 510,
+    "shapes": {
+      "64": {
+        "rows": 170,
+        "min_us": 0.876,
+        "p50_us": 0.9665,
+        "max_us": 5.308
+      },
+      "256": {
+        "rows": 170,
+        "min_us": 0.916,
+        "p50_us": 0.9885,
+        "max_us": 2.317
+      },
+      "1024": {
+        "rows": 170,
+        "min_us": 0.923,
+        "p50_us": 1.009,
+        "max_us": 1.571
+      }
+    }
+  },
+  "cube": {
+    "op": "aclnnMatmul",
+    "status": "blocked",
+    "failure": "aclnnMatmulGetWorkspaceSize returned 561103 before any kernel launch",
+    "task_type": null,
+    "rows": 0,
+    "run_id": "tiny-a5-1793278239",
+    "root_diagnostic": "MatMulV3 SpaceRegistry is nullptr; inferShape function does not exist",
+    "diagnostic": {
+      "path": "data/verification/a5-invocation-20261029/tiny/raw/cube-api-failure.log",
+      "sha256": "ca184e43def658504987ba65072cf5901caff0b0198c9b6a47c75e2259e08c8e"
+    },
+    "retry": "Not launched: independent fresh preflight at 12:53:45 UTC returned dcmi initialize -8001; no new device context or system repair attempted.",
+    "retry_preflight": {
+      "time_utc": "2026-10-29T12:53:45Z",
+      "command": "npu-smi info && npu-smi info -t usages -i 0",
+      "exit_code": 191,
+      "path": "data/verification/a5-invocation-20261029/tiny/raw/retry-preflight-failed.txt",
+      "sha256": "07e1231dfe0550b9e4d2e765435c2f86d260d0108e2e29d856b074aa85072a52"
+    }
+  },
+  "boundaries": {
+    "profiled_run": {
+      "run_id": "tiny-a5-1793278251",
+      "device_kernel": "Task Duration(us); first20warmup per shape excluded in independent_review",
+      "events_and_host_submit": "from exact same msprof application stdout; raw/msprof-aiv.log"
+    },
+    "unprofiled_run": {
+      "run_id": "tiny-a5-1793278233",
+      "source": "run-identity-and-post.log",
+      "note": "separate process run; not the source of accepted profiler rows"
+    }
+  },
+  "launch_elimination": {
+    "symbol": "T tiny_aiv_add",
+    "rows": 510,
+    "verdict": "real launched AIV kernel rows; no compute elimination"
+  },
+  "limitations": [
+    "Tiny cube valid-work control failed before launch because installed aclnn MatMulV3 inferShape registration was unavailable; no AIC/MIX duration or numerical result.",
+    "Source command for failed Cube did not source the CANN setup; an OPP-environment cause remains plausible but is not proven by the retained diagnostic.",
+    "A fresh preflight failed independently at12:53:45UTC withdcmi-8001; this does not establish causation by the probe and no retry/workload was launched.",
+    "Shape binding is fixed source launch order; raw profiler shape fields are unknown, not measured tensor descriptors.",
+    "No graph replay; no parameter fit; device/event/host values are different physical boundaries.",
+    "This finite probe relies on device reset/process exit for some small allocations and events; it is retained measured source, not a reusable production cleanup harness."
+  ],
+  "split": "unassigned",
+  "independent_review": {
+    "run_id": "tiny-a5-1793278251",
+    "split": "unassigned",
+    "profiler": {
+      "path": "data/verification/a5-invocation-20261029/tiny/raw/op_summary-aiv-20261029T205100.csv",
+      "sha256": "10db5205f8c1b7ddc05275c84bf5d86258bf4675b90a01e9d045466d63cfb6fd"
+    },
+    "producer": {
+      "path": "data/verification/a5-invocation-20261029/tiny/raw/msprof-aiv.log",
+      "sha256": "bcbd12a9450d618b924d5e92be613089dffc6cd97b4ae2a5169867cabd57abc6"
+    },
+    "shape_binding": "fixed producer order; exactly 170 chronological launches per shape",
+    "physical_unique_rows": 510,
+    "conditions": [
+      {
+        "shape": [
+          64
+        ],
+        "blocks": 1,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 170,
+          "min_us": 0.876,
+          "p10_us": 0.9079,
+          "p50_us": 0.9664999999999999,
+          "p90_us": 1.0853,
+          "p99_us": 1.2434400000000003,
+          "max_us": 5.308,
+          "mean_us": 1.0118588235294117
+        },
+        "warmup_launches": 20,
+        "steady_launches": {
+          "n": 150,
+          "min_us": 0.876,
+          "p10_us": 0.9079,
+          "p50_us": 0.97,
+          "p90_us": 1.0853,
+          "p99_us": 1.2040199999999999,
+          "max_us": 1.329,
+          "mean_us": 0.9889733333333334
+        },
+        "steady_core_time": {
+          "n": 150,
+          "min_us": 0.66,
+          "p10_us": 0.67,
+          "p50_us": 0.7,
+          "p90_us": 0.81,
+          "p99_us": 0.93,
+          "max_us": 1.05,
+          "mean_us": 0.7324666666666667
+        },
+        "event_batch_span_divided_by_50_us": [
+          4.31408,
+          4.12074,
+          4.11902
+        ],
+        "host_submit_us_per_launch": 1.896733,
+        "numeric_check": {
+          "kind": "numeric_check",
+          "op": "tiny_aiv_add",
+          "shape": [
+            64
+          ],
+          "passed": true,
+          "max_abs_err": 0
+        }
+      },
+      {
+        "shape": [
+          256
+        ],
+        "blocks": 1,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 170,
+          "min_us": 0.916,
+          "p10_us": 0.9409,
+          "p50_us": 0.9884999999999999,
+          "p90_us": 1.112,
+          "p99_us": 1.2916200000000004,
+          "max_us": 2.317,
+          "mean_us": 1.0214470588235294
+        },
+        "warmup_launches": 20,
+        "steady_launches": {
+          "n": 150,
+          "min_us": 0.916,
+          "p10_us": 0.9409,
+          "p50_us": 0.989,
+          "p90_us": 1.1111,
+          "p99_us": 1.25951,
+          "max_us": 1.362,
+          "mean_us": 1.0156266666666667
+        },
+        "steady_core_time": {
+          "n": 150,
+          "min_us": 0.69,
+          "p10_us": 0.7,
+          "p50_us": 0.73,
+          "p90_us": 0.84,
+          "p99_us": 0.9656999999999993,
+          "max_us": 1.01,
+          "mean_us": 0.7591333333333333
+        },
+        "event_batch_span_divided_by_50_us": [
+          4.23686,
+          4.15748,
+          4.15958
+        ],
+        "host_submit_us_per_launch": 2.102467,
+        "numeric_check": {
+          "kind": "numeric_check",
+          "op": "tiny_aiv_add",
+          "shape": [
+            256
+          ],
+          "passed": true,
+          "max_abs_err": 0
+        }
+      },
+      {
+        "shape": [
+          1024
+        ],
+        "blocks": 1,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 170,
+          "min_us": 0.923,
+          "p10_us": 0.9625,
+          "p50_us": 1.009,
+          "p90_us": 1.125,
+          "p99_us": 1.2818300000000002,
+          "max_us": 1.571,
+          "mean_us": 1.0365
+        },
+        "warmup_launches": 20,
+        "steady_launches": {
+          "n": 150,
+          "min_us": 0.923,
+          "p10_us": 0.958,
+          "p50_us": 1.009,
+          "p90_us": 1.1241,
+          "p99_us": 1.2466299999999997,
+          "max_us": 1.346,
+          "mean_us": 1.0338733333333334
+        },
+        "steady_core_time": {
+          "n": 150,
+          "min_us": 0.71,
+          "p10_us": 0.72,
+          "p50_us": 0.75,
+          "p90_us": 0.8509999999999999,
+          "p99_us": 0.9352999999999997,
+          "max_us": 0.97,
+          "mean_us": 0.7799333333333334
+        },
+        "event_batch_span_divided_by_50_us": [
+          4.13304,
+          4.1676,
+          4.1342
+        ],
+        "host_submit_us_per_launch": 1.834333,
+        "numeric_check": {
+          "kind": "numeric_check",
+          "op": "tiny_aiv_add",
+          "shape": [
+            1024
+          ],
+          "passed": true,
+          "max_abs_err": 0
+        }
+      }
+    ]
+  },
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/a5-invocation-20261029/tiny/summary.json",
+    "sha256": "af215242acf1ccb25b7ca68ac645bd92b53ae705a403e303a55757082acdab41",
+    "size_bytes": 8021
+  }
+}

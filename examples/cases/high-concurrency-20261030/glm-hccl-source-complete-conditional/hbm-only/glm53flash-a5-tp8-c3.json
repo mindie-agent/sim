@@ -1,0 +1,266 @@
+{
+  "name": "glm53flash-a5-tp8-c3:source-accepted-conditional",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_mxfp8",
+    "quant": {
+      "name": "W8A8_MXFP8",
+      "weight_format": "fp8_e4m3",
+      "native_format": "bf16",
+      "activation_format": "fp8_e4m3",
+      "expert_weight_format": "fp8_e4m3",
+      "weight_block": [
+        1,
+        32
+      ],
+      "expert_block": 32,
+      "scale_format": "fp8_e8m0",
+      "scale_bytes": 1.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "gdn",
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 32,
+      "activation_scale_format": "fp8_e8m0",
+      "activation_scale_pack": 2,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_mxfp8",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_tpot10ms_c3_20261030",
+      "client_concurrency": 3,
+      "captured_execution_mode": "not_established",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentKda",
+          "tensor_batch_slots": 4,
+          "query_rows_per_slot": 4,
+          "tensor_query_rows": 16,
+          "first_csv_row": 147,
+          "sample_count": 74,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "compatible_variant": {
+        "variant": "attention-plus-down",
+        "not_observed_dispatch": true,
+        "scope": "conditional body declaration; unchanged precision and routing",
+        "indexed": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        },
+        "source_down": true,
+        "KDA": "explicit symbolic accepted-state source reference; captured values and flags unobserved",
+        "evidence_assumptions": {
+          "indexed_captured_schedule_and_valid_mask_identity": "not_established",
+          "indexed_geometry_extension": "BF16_rope0_is_not_retained_native_rope64_kernel",
+          "MXFP8_down_captured_dispatch_identity": "not_established",
+          "scope": "evidence limitations, not model structural coverage"
+        },
+        "validation": "mechanism execution only; no claimed body or kernel accuracy"
+      },
+      "accepted_state_scenario": {
+        "id": "glm53flash-a5-tp8-c3",
+        "baseline": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c3--attention-plus-down.json",
+          "sha256": "2bbe203c1e722b47350b57d4fc8027b9fc3993cd00cbf79b765ace521cf7c3d7",
+          "size_bytes": 5066
+        },
+        "prototype": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
+          "size_bytes": 9296
+        },
+        "tokens_per_sequence": 4,
+        "sequences_per_replica": 4,
+        "context_tokens": 4104,
+        "scope": "body",
+        "source_architecture": "arch35",
+        "value_identity": "not_established",
+        "acceptance_changes_query_work": false,
+        "sigmoid_placement": "explicit in-kernel scenario, not inferred from BF16 beta",
+        "private_external_fp32_sigmoid_boundary": "not_matched_by_this_conditional_native_program",
+        "observed_geometry_identity": {
+          "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-glm53flash-a5-tp8-c3.json",
+          "sha256": "bf5edbe58200c74a25abe7bd2db1de5f1034c82d7aa72541da6cafd21af17327",
+          "size_bytes": 1697808
+        }
+      },
+      "mxfp8_gate_up_condition": {
+        "parent": {
+          "path": "examples/cases/high-concurrency-20261030/glm-source-accepted-26/glm53flash-a5-tp8-c3.json",
+          "sha256": "6f7241425e3866916bbfdfc499b55e746f0f99bede5ec2683092854338ff27f1"
+        },
+        "boundary": "two_FP32_UB_products_then_SwiGLU_MX",
+        "l1_k": "explicit512; captured_host_tiling_not_established",
+        "capture_binary_identity": "not_established",
+        "timings_fitted": false
+      },
+      "hccl_composed_condition": {
+        "parent": {
+          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/glm53flash-a5-tp8-c3.json",
+          "sha256": "61e2115e74fb61872b74d3cf8e37fa0283cfc297b1cf0076e4baabfe3c8f4338"
+        },
+        "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "components": [
+          "explicit AICPU_TS Mesh1D OneShot TP AllReduce",
+          "6-slot convolution state gather/scatter",
+          "EP1 MoEInitRoutingV3 MXFP8",
+          "preserved accepted-state KDA and fused MXFP8 gate-up"
+        ],
+        "conditions": [
+          "captured AICPU operator name does not prove OneShot template or source binary",
+          "original EP1 is preserved; local MoE routing is not EP transport",
+          "state slots are an explicit source-compatible caller extent",
+          "source parent accepted-state and rope0 assumptions are retained"
+        ],
+        "unpriced_services": [
+          "HCCL notify/wait and task issue latency"
+        ],
+        "timings_fitted": false,
+        "service_assumption": "hbm_only"
+      }
+    },
+    "routing": {
+      "policy": "balanced"
+    },
+    "kernels": {
+      "programs": {
+        "indexed_attention": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        }
+      },
+      "recipes": {
+        "balanced_grouped_down": {
+          "kind": "ascend_mxfp8_grouped_nz"
+        }
+      },
+      "lowerings": {
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch35",
+          "options": {
+            "safe_gate": true,
+            "use_beta_sigmoid": true,
+            "state_selection": {
+              "kind": "symbolic_valid_selection",
+              "index_layout": "speculative",
+              "index_row_stride": 4,
+              "validity": {
+                "prefix": true,
+                "state_indices": true,
+                "accepted_tokens": true,
+                "independent_sequences": true
+              }
+            }
+          }
+        },
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "grouped_gate_up_activation_quant"
+            ],
+            "program_profiles": {
+              "grouped_gate_up_activation_quant": "ascend_mxfp8_grouped_swiglu_quant"
+            },
+            "program_options": {
+              "grouped_gate_up_activation_quant": {
+                "l1_k": 512
+              }
+            }
+          }
+        },
+        "conv_state_copy": {
+          "implementation": "triton_noncontiguous_conv_state_copy",
+          "options": {
+            "state_slots": 6
+          }
+        },
+        "moe_init_routing": "ascend_moe_init_routing_v3_mxfp8"
+      },
+      "hccl": {
+        "allreduce": {
+          "expansion": "AICPU_TS",
+          "template": "mesh_oneshot",
+          "axes": [
+            "tp"
+          ]
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4104,
+        "output_tokens": 1280
+      }
+    ]
+  }
+}

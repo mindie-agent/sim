@@ -1,0 +1,11 @@
+	NPU ID                         : 0
+	Memory Usage Rate(%)           : 0
+	HBM Usage Rate(%)              : 4
+	Aicore Usage Rate(%)           : 0
+	Aicore Freq(MHZ)               : 1650
+	Aicore curFreq(MHZ)            : 100
+	Aicore Count                   : 32
+	Temperature(C)                 : 50
+	NPU Real-time Power(W)         : 398.1
+
+Authorized users only. All activities may be monitored and reported.

@@ -1,0 +1,219 @@
+{
+  "summary": {
+    "current_body_compared": 1,
+    "current_body_passed": 1,
+    "latest_body_attempt_count": 1,
+    "latest_body_attempt_completed": 0,
+    "latest_body_attempt_failed": 1,
+    "latest_body_attempt_passed": 0
+  },
+  "current_selection_policy": "last compared input receipt per source and measured geometry; prior arms retained",
+  "coverage_status": "partial",
+  "limitations": [
+    "Rows retain their own source/runtime/geometry; independently produced receipts are not merged into a synthetic run.",
+    "Per-forward kernel activity residual ranks work to investigate; overlap prevents interpreting its sum as body wall-clock error.",
+    "Unscored activity is a matching/model-boundary coverage gap, not proof that Sim omitted the corresponding work.",
+    "Layer median-of-call-P50 and exact pooled P50 are distinct populations."
+  ],
+  "current_body_comparisons": [
+    {
+      "model_group": "GLM-5.3",
+      "case_id": "glm53flash-a5-tp8-c96:q4_b96_m384",
+      "variant_id": "runtime67-glm",
+      "receipt": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-runtime67/decode-forward-glm-replay.json",
+        "sha256": "ad9dfb1967f6e3cc6f24cad1825eee8a225f2a350d1335881c8ab0abd33d4c4c"
+      },
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+        "size_bytes": 30453739,
+        "mtime_ns": 1793298698000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "b7e8198893748ef14b12d4bb6c51098f16c86e90a40c56403e7d15b69bcbf89d"
+      },
+      "runtime_identity": {
+        "package_path": "/Volumes/data-tmp/tmp/mindie-sim-cohort-wave6-20261029/mindie_sim",
+        "version": "0.8.0",
+        "package_sha256": "f2810bee7993d859560eaea1d264035ce35f75329b8e9468bbea0e5f6d95432c",
+        "file_count": 240,
+        "algorithm": "sha256(sorted relative-path to file-sha256 JSON)",
+        "sources_unchanged": true
+      },
+      "geometry": {
+        "query_rows": 384,
+        "sequences_per_replica": 96,
+        "tokens_per_sequence": 4,
+        "context_tokens": 4104,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "declared_runtime": {
+        "tp": 8,
+        "dp": 1,
+        "ep": 1,
+        "pp": 1,
+        "graph_mode": "none",
+        "graph_capture_mode": "full",
+        "captured_execution_mode": "not_established",
+        "captured_mode_basis": "source_bound_case_metadata"
+      },
+      "display_status": "compared",
+      "body_activity_ms": {
+        "count": 27,
+        "mean": 57.35487214814815,
+        "p50": 57.337193,
+        "p90": 57.500434,
+        "min": 57.204312,
+        "max": 57.520796
+      },
+      "body_internal_gap_ms": {
+        "count": 27,
+        "mean": 0.2348072962962963,
+        "p50": 0.234604,
+        "p90": 0.236421,
+        "min": 0.233271,
+        "max": 0.237287
+      },
+      "error": null,
+      "prediction_failure": null,
+      "comparison": {
+        "status": "compared",
+        "metric_boundary": "target_body_device_graph",
+        "reasons": [],
+        "observed_forward_count": 27,
+        "observed_ms": {
+          "count": 27,
+          "mean": 57.58967944444444,
+          "p50": 57.572611,
+          "p90": 57.734379,
+          "min": 57.438995,
+          "max": 57.755382
+        },
+        "predicted_ms": 54.55375612727049,
+        "relative_error": -0.05271644757291356,
+        "per_forward_diff_ms": -3.0359233171739533,
+        "passed": true,
+        "tolerance": {
+          "kind": "relative",
+          "limit": 0.15,
+          "scope": "whole_body_forward_not_single_kernel_launch"
+        },
+        "comparison_scope": {},
+        "comparison_basis": "conditional_single_rank_topology_alignment",
+        "assumptions": [
+          "Context basis: explicit_case_geometry; active KV increments during this capture are not established.",
+          "Forced load balance, acceptance=0.8/DSpark and prefix-hit=100% are not assumed to be captured facts.",
+          "Captured rank represents the declared balanced, exchange-symmetric cohort; this is conditional, not measured all-rank coverage."
+        ],
+        "endpoints": {
+          "observed": "first_retained_device_event_start_to_last_retained_device_event_end",
+          "predicted": "first_kernel_invocation_ready_to_body_complete_including_startup",
+          "input_ready_to_first_kernel_ms": 0,
+          "kernel_startup_included": true
+        }
+      },
+      "signed_gap_ms": -3.0359233171739533,
+      "absolute_gap_ms": 3.0359233171739533,
+      "relative_error": -0.05271644757291356,
+      "strict_body_15pct": true
+    }
+  ],
+  "latest_body_attempts": [
+    {
+      "model_group": "GLM-5.3",
+      "case_id": "glm53flash-a5-tp8-c96:q4_b96_m384",
+      "variant_id": "runtime-c226-timeout-retry",
+      "receipt": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-matrix-fix/decode-forward-timeout-retry-replay.json",
+        "sha256": "e2ec07749a9689ffd210f71fff75d1414c1a28e9790373ef468c58aab468f8c1"
+      },
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+        "size_bytes": 30453739,
+        "mtime_ns": 1793298698000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "b7e8198893748ef14b12d4bb6c51098f16c86e90a40c56403e7d15b69bcbf89d"
+      },
+      "runtime_identity": {
+        "package_path": "/Volumes/data-tmp/tmp/mindie-sim-cohort-wave6-20261029/mindie_sim",
+        "version": "0.8.0",
+        "package_sha256": "80be1bb5d6e2bfe5f69fd6b1ac1119a335799550d114a90f4d4237ecb4983844",
+        "file_count": 243,
+        "algorithm": "sha256(sorted relative-path to file-sha256 JSON)"
+      },
+      "geometry": {
+        "query_rows": 384,
+        "sequences_per_replica": 96,
+        "tokens_per_sequence": 4,
+        "context_tokens": 4104,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "declared_runtime": {
+        "tp": 8,
+        "dp": 1,
+        "ep": 1,
+        "pp": 1,
+        "graph_mode": "none",
+        "graph_capture_mode": "full",
+        "captured_execution_mode": "not_established",
+        "captured_mode_basis": "source_bound_case_metadata"
+      },
+      "display_status": "failed",
+      "body_activity_ms": {
+        "count": 27,
+        "mean": 57.35487214814815,
+        "p50": 57.337193,
+        "p90": 57.500434,
+        "min": 57.204312,
+        "max": 57.520796
+      },
+      "body_internal_gap_ms": {
+        "count": 27,
+        "mean": 0.2348072962962963,
+        "p50": 0.234604,
+        "p90": 0.236421,
+        "min": 0.233271,
+        "max": 0.237287
+      },
+      "error": null,
+      "prediction_failure": {
+        "status": "failed",
+        "reason": "body_prediction_timeout",
+        "timeout_s": 90.0,
+        "runtime_identity": {
+          "package_path": "/Volumes/data-tmp/tmp/mindie-sim-cohort-wave6-20261029/mindie_sim",
+          "version": "0.8.0",
+          "package_sha256": "80be1bb5d6e2bfe5f69fd6b1ac1119a335799550d114a90f4d4237ecb4983844",
+          "file_count": 243,
+          "algorithm": "sha256(sorted relative-path to file-sha256 JSON)"
+        }
+      },
+      "comparison": {
+        "status": "failed",
+        "reasons": [
+          "body_prediction_timeout"
+        ],
+        "observed_forward_count": 27,
+        "observed_ms": {
+          "count": 27,
+          "mean": 57.58967944444444,
+          "p50": 57.572611,
+          "p90": 57.734379,
+          "min": 57.438995,
+          "max": 57.755382
+        },
+        "predicted_ms": null,
+        "relative_error": null,
+        "per_forward_diff_ms": null,
+        "passed": null
+      }
+    }
+  ],
+  "fixture_provenance": {
+    "source": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-priority/priority-three-level-scoreboard.json",
+    "selection": "One exact completed/failed GLM c96 pair; compact fields, population counts recomputed for subset"
+  }
+}

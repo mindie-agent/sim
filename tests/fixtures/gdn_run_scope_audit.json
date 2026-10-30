@@ -1,0 +1,88 @@
+{
+ "cases": [
+  {
+   "batch": 10,
+   "context": 16384,
+   "decode_runs": 19,
+   "decode_state_tasks": 24780,
+   "runs": 286,
+   "state_runs": 30,
+   "state_tasks_per_run": {
+    "48": 30
+   },
+   "tasks_per_decode_step": 1304.2105263157894,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 256
+  },
+  {
+   "batch": 10,
+   "context": 65536,
+   "decode_runs": 19,
+   "decode_state_tasks": 24700,
+   "runs": 108,
+   "state_runs": 60,
+   "state_tasks_per_run": {
+    "48": 60
+   },
+   "tasks_per_decode_step": 1300.0,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 48
+  },
+  {
+   "batch": 16,
+   "context": 16384,
+   "decode_runs": 19,
+   "decode_state_tasks": 24780,
+   "runs": 388,
+   "state_runs": 36,
+   "state_tasks_per_run": {
+    "48": 36
+   },
+   "tasks_per_decode_step": 1304.2105263157894,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 352
+  },
+  {
+   "batch": 16,
+   "context": 65536,
+   "decode_runs": 19,
+   "decode_state_tasks": 24700,
+   "runs": 132,
+   "state_runs": 84,
+   "state_tasks_per_run": {
+    "48": 84
+   },
+   "tasks_per_decode_step": 1300.0,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 48
+  },
+  {
+   "batch": 32,
+   "context": 16384,
+   "decode_runs": 19,
+   "decode_state_tasks": 24780,
+   "runs": 420,
+   "state_runs": 52,
+   "state_tasks_per_run": {
+    "48": 52
+   },
+   "tasks_per_decode_step": 1304.2105263157894,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 368
+  },
+  {
+   "batch": 32,
+   "context": 65536,
+   "decode_runs": 19,
+   "decode_state_tasks": 24700,
+   "runs": 196,
+   "state_runs": 148,
+   "state_tasks_per_run": {
+    "48": 148
+   },
+   "tasks_per_decode_step": 1300.0,
+   "within_run_duplicate_ids": 0,
+   "zero_state_runs": 48
+  }
+ ]
+}

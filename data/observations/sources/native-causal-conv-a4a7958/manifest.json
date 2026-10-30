@@ -1,0 +1,119 @@
+{
+  "repo": "flashserve/flash-linear-attention-npu",
+  "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+  "files": [
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_tiling_data.h",
+      "relative_path": "op_kernel/causal_conv1d_tiling_data.h",
+      "sha256": "d14363c7ad45b6522632e089270fa2dc7365a091d4565b976cb18b3c555467cb",
+      "bytes": 2237,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_tiling_data.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d.cpp",
+      "relative_path": "op_kernel/causal_conv1d.cpp",
+      "sha256": "73835f0d1ec7e7ddc0aca92c3e55821b312440e964dfad4e5aeb8b448f50f281",
+      "bytes": 3271,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d.cpp",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d.cpp",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_fn_tasks.h",
+      "relative_path": "op_kernel/causal_conv1d_fn_tasks.h",
+      "sha256": "c65ab9cd60492580fce6063dbf6eb511ba97dd3636a4f00854108919f112dd18",
+      "bytes": 12945,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_fn_tasks.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d.h",
+      "relative_path": "op_kernel/causal_conv1d.h",
+      "sha256": "040d8fbc70e68710633dd33427c1d1888f47beb6c1f26bed6140db601295f554",
+      "bytes": 57111,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_tiling_key.h",
+      "relative_path": "op_kernel/causal_conv1d_tiling_key.h",
+      "sha256": "c0bb9ace833d13f45a992f72b2c6dfb9174bb79bf4499f02a7121da459119fb0",
+      "bytes": 3603,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_tiling_key.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_tiling_key.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_update.h",
+      "relative_path": "op_kernel/causal_conv1d_update.h",
+      "sha256": "d3857bc00e44bdf174c72ceeeda8d8e2e2db2fb480a561ecba5c88ae7d07c2b9",
+      "bytes": 3765,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_update.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_update.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_fn.h",
+      "relative_path": "op_kernel/causal_conv1d_fn.h",
+      "sha256": "6889b93c74a5a293cc954a3c6ba862794b9e1f7fb2618ee585f11a609701fae4",
+      "bytes": 4180,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_fn.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_fn.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/causal_conv1d_common.h",
+      "relative_path": "op_kernel/causal_conv1d_common.h",
+      "sha256": "d2155e287cad145128f0cf8a0847278d3b264133531f47daaeade8933e7de688",
+      "bytes": 1932,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_common.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_common.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_kernel/arch35/causal_conv1d_regbase.h",
+      "relative_path": "op_kernel/arch35/causal_conv1d_regbase.h",
+      "sha256": "c47a785a92926fc38d53eaf726d51807b1f702729fc85fcde1442c1e728601a5",
+      "bytes": 16666,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/arch35/causal_conv1d_regbase.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/arch35/causal_conv1d_regbase.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_host/causal_conv1d_tiling.cpp",
+      "relative_path": "op_host/causal_conv1d_tiling.cpp",
+      "sha256": "5a34e7e4df90816faddc26ca4037d1064806495319631ac72a1fc9cd8d7f0128",
+      "bytes": 9545,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling.cpp",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_host/causal_conv1d_tiling_planner.h",
+      "relative_path": "op_host/causal_conv1d_tiling_planner.h",
+      "sha256": "8dfcfba40075364b583f0bf60d50889965975d769677151a6ce10bbdb454e6a5",
+      "bytes": 12757,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_planner.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_host/causal_conv1d_tiling_utils.h",
+      "relative_path": "op_host/causal_conv1d_tiling_utils.h",
+      "sha256": "ee4a98db1d2ae65fef76961db29ffe63aa962cad07d0529563cf68ea737bff36",
+      "bytes": 5857,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_utils.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/tmp/review-causal-conv-native-a4a7958-20261028/op_host/causal_conv1d_tiling_validation.h",
+      "relative_path": "op_host/causal_conv1d_tiling_validation.h",
+      "sha256": "91f6cd899bba5e06ae664a8fc7df4900f2c5fa74c461f1693640541cd3bf945e",
+      "bytes": 35305,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_validation.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    }
+  ]
+}

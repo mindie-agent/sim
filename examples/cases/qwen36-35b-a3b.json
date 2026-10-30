@@ -1,0 +1,70 @@
+{
+  "machine": {
+    "arch_family": "A3",
+    "dies_per_package": 2,
+    "hardware_key": "Ascend910_9362",
+    "name": "a3-9362-4die-tp4",
+    "note": "one A3 host (192.168.13.165), dies 4-7 = cards 2+3 = two two-die packages, one rank per die (ASCEND_RT_VISIBLE_DEVICES=4,5,6,7); the SKU profile materializes the two SIO intra-package links (448 GB/s) and the 4-die HCCS_SW intra-node fabric (196 GB/s). Dies 0-3 carried a live foreign measurement during the campaign and were never in this case's visible set.",
+    "num_devices": 4,
+    "ranks_per_node": 4,
+    "sku": "Ascend910_9362",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.6-35b-a3b",
+    "quantization": "W8A8_DYNAMIC"
+  },
+  "name": "catalog-full-model-qwen36-35b-a3b-a3-tp4",
+  "runtime": {
+    "dp": 1,
+    "enable_chunked_prefill": true,
+    "ep": 1,
+    "gpu_memory_utilization": 0.9,
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32
+    ],
+    "graph_mode": "auto",
+    "kv_block_size": 128,
+    "max_model_len": 131072,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "metadata": {
+      "draft_architecture": "Qwen3_5MoeMTP",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "enable_prefix_caching": "false",
+      "graph": "FULL_DECODE_ONLY: decode replayed from the engine's captured buckets [1,2,4,8,16,24,32], prefill eager; engine init 110.69 s of which compilation 39.02 s",
+      "grid": "8 measured cells: p4096/p16384/p65536/p126976 at c1/c4, o4096, 4 requests per cell, APC off. No latency is stored in this case or in the cells manifest; the measured comparison lives in the campaign model report and in the test's separate measured table.",
+      "host": "192.168.13.165 (A3, openEuler), 8 NPU packages x 2 dies = 16 dies of 65,536 MB; only dies 4-7 exposed to torch as ranks 0-3; dies 0-3 (live foreign measurement) and 8-15 never visible",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...), vLLM 0.30.0 / vllm-ascend 0.30.0rc2.dev200+g8fd0bc488, torch 2.10.0+cpu / torch_npu 2.10.0.post7, CANN 9.2.1",
+      "kv_cache": "kv block 128; engine pool 3,891,086 tokens / 43.26 GiB per die = 29.69x a 131,072-token request; group sizes [640, 131072, 131072, 131072]; peak pool usage 13.48 % (524,518 tokens = four 131k sequences) at 126976 c4; 0 preemptions",
+      "measured_baseline": ".workstreams/hp-serving/qwen36-35b-a3b/report.md (host window 2026-10-24 08:07:41Z-08:32:03Z, i.e. 16:07-16:32 CST); raw /Volumes/data/mindie-sim-data/a3/2026-10-24/qwen36-35b/",
+      "mtp": "MTP3: qwen3_5_mtp resolves to the engine mtp method and the Qwen3_5MoeMTP draft class (one MoE MTP layer, draft stays bf16); num_speculative_tokens=3, draft enforce_eager. The target forward's query length is 1 + 3 = 4 tokens per sequence and the step runs the MTP draft three times (once grouped with the target forward, twice standalone). Declared session acceptance 92.6 % of drafted tokens -> 1 + 3 x 0.926 = 3.778 committed tokens per engine step.",
+      "note": "the task brief says hidden 5120; the served checkpoint config and the 9.7025 GB/die weight load both say hidden 2048 (a 5120-hidden 256-expert body would need ~80 GB of int8 expert weights, ~20 GB/die). The 5120 figure belongs to the dense Qwen3.6-27B row. This case follows the measured checkpoint and records the correction.",
+      "recipe": "docker run -d --name hp-qwen36-35b-a3b-tp4 --privileged --ipc=host --network=host -v /dev:/dev -v /home/hp-qwen36-35b-a3b-tp4:/home/hp-qwen36-35b-a3b-tp4 -v /mnt/share:/mnt/share:ro -v /usr/local/Ascend/driver:/usr/local/Ascend/driver -v /usr/local/dcmi:/usr/local/dcmi -v /usr/local/bin/npu-smi:/usr/local/bin/npu-smi -v /etc/ascend_install.info:/etc/ascend_install.info --shm-size=64g -e ASCEND_RT_VISIBLE_DEVICES=4,5,6,7 <image> sleep infinity; vllm serve /mnt/share/weight/Qwen3.6-35B-A3B-W8A8 --host 0.0.0.0 --port 18233 --served-model-name qwen36-35b --trust-remote-code --distributed-executor-backend mp --data-parallel-size 1 --tensor-parallel-size 4 --quantization ascend --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 8192 --no-enable-prefix-caching --gpu-memory-utilization 0.90 --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3, \"enforce_eager\": true}' --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' --additional-config '{\"enable_cpu_binding\": true}'",
+      "row_policy": "no target-campaign latency row exists or is bound. TTFT comes from the same-geometry measured A3 Qwen3.5-35B-A3B prefill row (MTP-independent); the decode step is composed from the measured MTP1 attention/GDN/body rows with a declared structural MTP3 transform. Every source row is hash-pinned in the cells manifest and refused on a foreign hardware key, a foreign geometry or an unmeasured band.",
+      "transfer_model": "mindie_sim/a3_qwen36_moe_transfer.py: q_len 2->4 scales attention and GDN by 2; the body's M-dependent device classes scale by sqrt(measured b4/b1 body device growth) = the 2x-M factor; two extra MTP draft calls are priced from the measured MTP-head device share plus launch/(layers+1); TPOT = step / declared acceptance. No coefficient is fitted to the eight target cells.",
+      "weights": "/mnt/share/weight/Qwen3.6-35B-A3B-W8A8 (ModelScope Eco-Tech/Qwen3.6-35B-A3B-w8a8): W8A8_DYNAMIC int8 body, 10 shards, 37.08 GiB (39,810,882,153 B); measured per-die weight load 9.7025 GB at TP4; config.json sha256 93a4693fa9d8392fbfccd4b3c9873f4bfdcb14fdede978b123d07d19675efe99 (byte-identical to the bf16 base checkpoint); index sha256 375cade0403985c0d95be2225cde65e6c71770734254345de1d918e9c68da038. The checkpoint publishes Qwen3_5MoeForConditionalGeneration / qwen3_5_moe, 40 layers (30 linear-attention + 10 full-attention GDN hybrid), hidden 2048 (not 5120: this is the MoE body, the dense 27B is the 5120-hidden model), 256 experts top-8, moe_intermediate_size 512, shared_expert_intermediate_size 512, 16 Q / 2 KV heads, head_dim 256, vocab 248,320, max_position_embeddings 262,144, mtp_num_hidden_layers 1 (MoE draft)."
+    },
+    "mtp_acceptance_by_output_tokens": {
+      "4096": 3.778
+    },
+    "pp": 1,
+    "tp": 4
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "output_tokens": 1,
+        "prompt_tokens": 8
+      }
+    ]
+  }
+}

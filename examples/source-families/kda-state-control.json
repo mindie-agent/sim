@@ -1,0 +1,63 @@
+{
+  "machine": {
+    "name": "synthetic-kda-state-source-control",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_units": 2,
+      "compute_peaks": {"bf16": 200000000000000, "fp32": 50000000000000},
+      "rates": {
+        "memory": 1000000000000,
+        "vector": 2000000000000,
+        "mte1": 1000000000000,
+        "mte2_aic": 1000000000000,
+        "mte2_aiv": 2000000000000,
+        "mte3": 1000000000000,
+        "fixpipe": 1000000000000
+      },
+      "resource_units": {"vector": 4, "mte2_aic": 2, "mte2_aiv": 4}
+    }
+  },
+  "model": {
+    "name": "two-head-kda-geometry",
+    "layers": 1,
+    "hidden_size": 256,
+    "num_heads": 2,
+    "num_kv_heads": 2,
+    "head_dim": 128,
+    "intermediate_size": 512,
+    "vocab_size": 256,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "layer_plans": [{
+      "index": 0,
+      "attention": "kda",
+      "architecture": "kda",
+      "ffn": "dense",
+      "intermediate_size": 512,
+      "linear_heads": 2,
+      "linear_head_dim": 128,
+      "linear_key_heads": 2,
+      "linear_key_head_dim": 128,
+      "linear_value_heads": 2,
+      "conv_kernel": 4,
+      "state_bytes": 131072
+    }]
+  },
+  "workload": {
+    "requests": [{"id": "r", "prompt_tokens": 128, "output_tokens": 1}]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "kernels": {
+      "programs": {"matmul": {"kind": "steady_matmul"}},
+      "lowerings": {"kda": "vllm_ascend_kda_chunk_state"}
+    },
+    "metadata": {
+      "parameter_basis": "Synthetic physical rates for source-contract verification, not device calibration.",
+      "implementation_scope": "Only the prefill FWD_H phase is source-selected; the other KDA phases retain semantic models."
+    }
+  }
+}

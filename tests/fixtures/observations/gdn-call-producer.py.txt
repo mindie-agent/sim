@@ -1,0 +1,633 @@
+"""Measure the GDN kernels the A5 vLLM-Ascend stack actually dispatches.
+
+[Role]
+  Produce per-call device-event observations for the five GDN operators the
+  served Qwen3.8-27B / Qwen3.5-35B-A3B layer calls on Ascend950DT 9582:
+  ``fla_npu.ops.ascendc.causal_conv1d_fn`` (prefill conv),
+  ``...causal_conv1d_update`` (decode conv),
+  ``...chunk_gated_delta_rule_fwd`` (prefill chunked scan),
+  ``...recurrent_gated_delta_rule`` (decode scan) and the Triton
+  ``fused_gdn_gating_kernel``.
+[Invariants]
+  * Rows are emitted through the same wrapper the model calls, with the same
+    kwargs the layer passes (varlen conv, TND scan, BSND layout, chunk 64).
+  * 2 trials x 20 per-call device events and 10 warm-up calls per condition; a
+    condition whose warm-up exceeds 1 s/sample keeps 2 x 5 and is marked
+    ``samples_reduced``.
+  * A row carries a canary only when the operator output reproduces a CPU fp32
+    reference of the same math; the observed relative error is kept verbatim.
+  * The fused ``torch_npu.npu_chunk_gated_delta_rule`` path the A5 layer
+    explicitly disables is smoke-called once and its refusal recorded.
+[Timeouts & Locks]
+  One process, one die.  A failing condition closes itself only.
+[Side-Effect Policy]
+  Reads the device; writes only the JSON path on argv.
+"""
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+import time
+import traceback
+
+import torch
+import torch_npu  # noqa: F401
+
+OUT = sys.argv[1] if len(sys.argv) > 1 else "/tmp/gdn-measure.json"
+SAMPLES = 20
+TRIALS = 2
+WARMUP = 10
+SLOW_SAMPLE_S = 1000.0  # milliseconds; a sample above this keeps 2x5
+SLOW_SAMPLES = 5
+SEED = 20261022
+
+GEOM = {
+    "qwen3.8-27b": {"hidden": 5120, "k_heads": 16, "v_heads": 48,
+                    "k_dim": 128, "v_dim": 128, "conv_kernel": 4,
+                    "conv_width": 2 * 16 * 128 + 48 * 128, "gdn_layers": 48,
+                    "full_layers": 16, "layers": 64},
+    "qwen3.5-35b-a3b": {"hidden": 2048, "k_heads": 16, "v_heads": 32,
+                        "k_dim": 128, "v_dim": 128, "conv_kernel": 4,
+                        "conv_width": 2 * 16 * 128 + 32 * 128, "gdn_layers": 30,
+                        "full_layers": 10, "layers": 40},
+}
+
+report: dict = {
+    "schema": "a5-gdn-measure/1",
+    "out": OUT,
+    "samples_per_condition": SAMPLES,
+    "trials": TRIALS,
+    "warmup": WARMUP,
+    "seed": SEED,
+    "geometry": GEOM,
+    "rows": [],
+    "verdicts": {},
+    "refusals": [],
+    "canaries": {},
+    "env": {},
+}
+torch.manual_seed(SEED)
+
+
+def first_line(exc: BaseException) -> str:
+    text = str(exc).strip().splitlines()
+    return text[0] if text else ""
+
+
+def clock_mhz() -> float | None:
+    for args in (["npu-smi", "info", "-t", "clock", "-i", "0"],
+                 ["npu-smi", "info", "-t", "usages", "-i", "0"]):
+        try:
+            out = subprocess.run(args, capture_output=True, text=True, timeout=30)
+        except Exception:  # noqa: BLE001
+            continue
+        for line in out.stdout.splitlines():
+            low = line.lower()
+            if "aicore" in low or "aicpu" in low:
+                digits = "".join(ch for ch in line if ch.isdigit())
+                if digits:
+                    return float(digits)
+    return None
+
+
+def nanosleep_clock() -> dict:
+    """Device clock from ``torch.npu`` if the runtime exposes it."""
+    out: dict = {}
+    try:
+        out["clock_rate"] = torch.npu.clock_rate(0)
+    except Exception as exc:  # noqa: BLE001
+        out["clock_rate_error"] = first_line(exc)
+    return out
+
+
+# --- backend identity and disabled paths -----------------------------------
+def verdicts() -> dict:
+    import fla_npu.ops.ascendc as fla
+    import torch_npu as tn
+
+    out: dict = {"fla_npu_file": fla.__file__}
+    for name in ("npu_causal_conv1d_fn", "npu_causal_conv1d_update",
+                 "npu_recurrent_gated_delta_rule",
+                 "npu_chunk_gated_delta_rule_fwd"):
+        try:
+            op = fla._get_direct_op(name)
+            out[name] = {"resolved": True,
+                         "module": getattr(op, "__module__", None),
+                         "qualname": getattr(op, "__qualname__", None),
+                         "file": getattr(sys.modules.get(getattr(op, "__module__", ""),
+                                                         None), "__file__", None)}
+        except Exception as exc:  # noqa: BLE001
+            out[name] = {"resolved": False, "error_type": type(exc).__name__,
+                         "error_first_line": first_line(exc)}
+    # The A5 layer disables torch_npu.npu_chunk_gated_delta_rule: repeat the
+    # exact smoke call from AscendGatedDeltaNetAttention._probe_fused_chunk.
+    smoke: dict = {"op_present": hasattr(tn, "npu_chunk_gated_delta_rule")}
+    try:
+        device = torch.npu.current_device()
+        dk = dv = 128
+        seqlen = 64
+        q = torch.zeros((seqlen, 1, dk), dtype=torch.bfloat16, device=device)
+        k = torch.zeros((seqlen, 1, dk), dtype=torch.bfloat16, device=device)
+        v = torch.zeros((seqlen, 1, dv), dtype=torch.bfloat16, device=device)
+        beta = torch.full((seqlen, 1), 0.5, dtype=torch.bfloat16, device=device)
+        g = torch.full((seqlen, 1), -0.1, dtype=torch.float32, device=device)
+        initial_state = torch.zeros((1, 1, dv, dk), dtype=torch.bfloat16,
+                                    device=device)
+        actual_seq_lengths = torch.tensor([seqlen], dtype=torch.int32,
+                                          device=device)
+        tn.npu_chunk_gated_delta_rule(
+            q, k, v, beta=beta, initial_state=initial_state,
+            actual_seq_lengths=actual_seq_lengths, scale=dk ** -0.5, g=g)
+        torch.npu.synchronize()
+        smoke.update({"ok": True})
+    except Exception as exc:  # noqa: BLE001
+        smoke.update({"ok": False, "error_type": type(exc).__name__,
+                      "error_first_line": first_line(exc),
+                      "trace_tail": traceback.format_exc().strip().splitlines()[-2:]})
+    out["torch_npu_npu_chunk_gated_delta_rule_smoke"] = smoke
+    out["torch_npu_fused_causal_conv1d_present"] = hasattr(
+        tn, "npu_fused_causal_conv1d")
+    try:
+        import vllm_ascend
+        from vllm_ascend.device.hardware_profile import (
+            HardwareCapability, get_current_hardware_profile,
+        )
+        profile = get_current_hardware_profile()
+        out["hardware_profile"] = {
+            "device_type": str(getattr(profile, "device_type", None)),
+            "fla_gdn_prefill": profile.supports(
+                HardwareCapability.FLA_GDN_PREFILL),
+        }
+        out["vllm_ascend_file"] = vllm_ascend.__file__
+    except Exception as exc:  # noqa: BLE001
+        out["profile_error"] = f"{type(exc).__name__}: {first_line(exc)}"
+    return out
+
+
+# --- dispatch resolution ---------------------------------------------------
+def resolve() -> dict:
+    import fla_npu.ops.ascendc as fla
+    import torch.nn.functional as F
+
+    out: dict = {}
+    out["conv_prefill"] = ("fla_npu.ops.ascendc.causal_conv1d_fn",
+                           fla.causal_conv1d_fn)
+    out["conv_update"] = ("fla_npu.ops.ascendc.causal_conv1d_update",
+                          fla.causal_conv1d_update)
+    out["scan_prefill"] = ("fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd",
+                           fla.chunk_gated_delta_rule_fwd)
+    out["scan_decode"] = ("fla_npu.ops.ascendc.recurrent_gated_delta_rule",
+                          fla.recurrent_gated_delta_rule)
+
+    def gating_vllm():
+        from vllm_ascend.ops.triton.fused_gdn_gating import (
+            fused_gdn_gating_patch,
+        )
+        return fused_gdn_gating_patch
+
+    try:
+        out["gating"] = ("vllm_ascend.ops.triton.fused_gdn_gating."
+                         "fused_gdn_gating_patch", gating_vllm())
+    except Exception as exc:  # noqa: BLE001
+        report["refusals"].append({"role": "gating",
+                                   "error_type": type(exc).__name__,
+                                   "error_first_line": first_line(exc)})
+
+        def gating_torch(A_log, a, b, dt_bias, beta=1.0, threshold=20.0):
+            x = a.float() + dt_bias.float()
+            softplus = torch.where(beta * x <= threshold,
+                                   (1.0 / beta) * torch.log1p(torch.exp(beta * x)),
+                                   x)
+            g = -torch.exp(A_log.float()) * softplus
+            return (g.unsqueeze(0).to(torch.float32),
+                    torch.sigmoid(b.float()).unsqueeze(0).to(b.dtype))
+
+        out["gating"] = ("torch softplus/sigmoid (reference)", gating_torch)
+        _ = F
+    return out
+
+
+def timed(fn, samples: int) -> list[float]:
+    out: list[float] = []
+    for _ in range(TRIALS):
+        for _ in range(samples):
+            start = torch.npu.Event(enable_timing=True)
+            end = torch.npu.Event(enable_timing=True)
+            start.record()
+            fn()
+            end.record()
+            end.synchronize()
+            out.append(float(start.elapsed_time(end)))
+    return out
+
+
+def stats(samples: list[float]) -> dict:
+    ordered = sorted(samples)
+    n = len(ordered)
+    return {"n": n, "median": ordered[n // 2], "mean": sum(ordered) / n,
+            "min": ordered[0], "max": ordered[-1],
+            "p10": ordered[max(0, int(0.1 * n) - 1)],
+            "p90": ordered[min(n - 1, int(0.9 * n))]}
+
+
+# --- references ------------------------------------------------------------
+def ref_conv(x: torch.Tensor, weight_packed: torch.Tensor, bias: torch.Tensor,
+             kernel: int) -> torch.Tensor:
+    """Causal depthwise conv + silu in fp32 from the packed [W, D] weight."""
+    weight = weight_packed.float()  # [kernel, D]
+    xf = x.float()  # [T, D]
+    padded = torch.nn.functional.pad(xf, (0, 0, kernel - 1, 0))  # [T+k-1, D]
+    out = torch.zeros_like(xf)
+    for tap in range(kernel):
+        out = out + padded[tap:tap + xf.shape[0]] * weight[tap]
+    return torch.nn.functional.silu(out + bias.float())
+
+
+def ref_gating(A_log, a, b, dt_bias):
+    x = a.float() + dt_bias.float()
+    g = -torch.exp(A_log.float()) * torch.log1p(torch.exp(x))
+    return g, torch.sigmoid(b.float())
+
+
+def l2norm(x: torch.Tensor) -> torch.Tensor:
+    """L2-normalise over the head dim, preserving the input dtype."""
+    return (x.float() / x.float().norm(dim=-1, keepdim=True).clamp_min(1e-6)
+            ).to(x.dtype)
+
+
+def ref_scan(q, k, v, g, beta, state, scale, rep, mapping="interleave"):
+    """Naive delta-rule recurrence in fp32 (state layout [Nv, Dv, Dk])."""
+    qn, kn = l2norm(q).float(), l2norm(k).float()
+    s = state.float().clone()
+    outs = []
+    steps, nv = q.shape[0], v.shape[1]
+    nk = q.shape[1]
+    src_of = [(h // rep if mapping == "interleave" else h % nk) for h in range(nv)]
+    for step in range(steps):
+        s = s * torch.exp(g[step].float())[:, None, None]
+        for head in range(nv):
+            src = src_of[head]
+            s[head] = s[head] + (beta[step, head].float()
+                                 * v[step, head].float()[:, None]
+                                 * kn[step, src].float()[None, :])
+        outs.append(torch.stack([torch.mv(s[head], qn[step, src_of[head]])
+                                 for head in range(nv)]) * scale)
+    return torch.stack(outs), s
+
+
+def canaries(res: dict) -> dict:
+    out: dict = {}
+    # --- conv prefill (varlen) -------------------------------------------
+    width, kernel = 1024, 4
+    x = torch.randn(64, width, dtype=torch.bfloat16)  # one 64-token sequence
+    w = torch.randn(kernel, width, dtype=torch.bfloat16)
+    bias = torch.randn(width, dtype=torch.bfloat16)
+    ref = ref_conv(x, w, bias, kernel)
+    try:
+        conv_states = torch.zeros(2, kernel - 1, width, dtype=torch.bfloat16).npu()
+        got = res["conv_prefill"][1](
+            x.npu(), w.npu(), bias.npu(), conv_states=conv_states,
+            query_start_loc=torch.tensor([0, 64], dtype=torch.int32).npu(),
+            cache_indices=torch.tensor([1], dtype=torch.int32).npu(),
+            has_initial_state=torch.tensor([False]).npu(),
+            activation="silu")
+        diff = (got.float().cpu() - ref).abs()
+        out["conv_prefill"] = {
+            "abs_max": diff.max().item(),
+            "rel_max": (diff / ref.abs().clamp_min(1e-2)).max().item(),
+            "ok": diff.max().item() < 5e-2,
+            "shape": list(got.shape)}
+    except Exception as exc:  # noqa: BLE001
+        out["conv_prefill"] = {"ok": False, "error": first_line(exc),
+                               "trace": traceback.format_exc().strip().splitlines()[-3:]}
+    # --- conv update ------------------------------------------------------
+    x1 = torch.randn(4, width, dtype=torch.bfloat16)
+    state = torch.randn(5, kernel - 1, width, dtype=torch.bfloat16)
+    full = torch.cat([state[1:].float(), x1.float().unsqueeze(1)], dim=1)
+    ref_oldest = torch.nn.functional.silu(
+        (full * w.float().unsqueeze(0)).sum(1) + bias.float())
+    ref_newest = torch.nn.functional.silu(
+        (full * w.float().flip(0).unsqueeze(0)).sum(1) + bias.float())
+    try:
+        got = res["conv_update"][1](
+            x1.npu(), state.npu(), w.npu(), bias=bias.npu(), activation="silu",
+            conv_state_indices=torch.arange(1, 5, dtype=torch.int32).npu(),
+            query_start_loc=torch.arange(0, 5, dtype=torch.int32).npu(),
+            max_query_len=1,
+            out=torch.zeros(4, width, dtype=torch.bfloat16).npu())
+        got_cpu = got.float().cpu()
+        best = None
+        for label, refx in (("state_oldest_first", ref_oldest),
+                            ("state_newest_first", ref_newest)):
+            diff = (got_cpu - refx).abs()
+            entry = {"state_order": label, "abs_max": diff.max().item(),
+                     "rel_max": (diff / refx.abs().clamp_min(1e-2)).max().item()}
+            if best is None or entry["abs_max"] < best["abs_max"]:
+                best = entry
+        best["ok"] = best["abs_max"] < 5e-2
+        out["conv_update"] = best
+    except Exception as exc:  # noqa: BLE001
+        out["conv_update"] = {"ok": False, "error": first_line(exc),
+                              "trace": traceback.format_exc().strip().splitlines()[-3:]}
+    # --- gating -----------------------------------------------------------
+    heads, tokens = 48, 257
+    a = torch.randn(tokens, heads)
+    gb = torch.randn(tokens, heads)
+    a_log = torch.randn(heads)
+    dt_bias = torch.randn(heads)
+    ref_g, ref_beta = ref_gating(a_log, a, gb, dt_bias)
+    try:
+        g, beta = res["gating"][1](a_log.npu(), a.npu().to(torch.float32),
+                                   gb.npu(), dt_bias.npu())
+        g = g.float().cpu().reshape(tokens, heads)
+        beta = beta.float().cpu().reshape(tokens, heads)
+        rel_g = ((g - ref_g).abs() / ref_g.abs().clamp_min(1e-3)).max().item()
+        rel_b = ((beta - ref_beta).abs() / ref_beta.abs().clamp_min(1e-3)).max().item()
+        out["gating"] = {"rel_max_g": rel_g, "rel_max_beta": rel_b,
+                         "ok": max(rel_g, rel_b) < 5e-2}
+    except Exception as exc:  # noqa: BLE001
+        out["gating"] = {"ok": False, "error": first_line(exc),
+                         "trace": traceback.format_exc().strip().splitlines()[-3:]}
+    # --- scan decode (recurrent, 4 sequential single-token steps) ---------
+    nk, nv, dk, dv, batch = 2, 4, 128, 128, 4
+    rep = nv // nk
+    qs = [l2norm(torch.randn(batch, nk, dk, dtype=torch.bfloat16))
+          for _ in range(4)]
+    ks = [l2norm(torch.randn(batch, nk, dk, dtype=torch.bfloat16))
+          for _ in range(4)]
+    vs = [torch.randn(batch, nv, dv, dtype=torch.bfloat16) for _ in range(4)]
+    gs = [-torch.rand(batch, nv) for _ in range(4)]
+    bs = [torch.rand(batch, nv, dtype=torch.bfloat16) for _ in range(4)]
+    state = torch.randn(batch, nv, dv, dk) * 0.05
+    ref_state = state.clone()
+    ref_outs = []
+    for step in range(4):
+        for h in range(nv):
+            src = h // rep
+            ref_state[:, h] = (ref_state[:, h] * torch.exp(gs[step])[:, h][:, None, None]
+                               + bs[step][:, h][:, None, None]
+                               * vs[step][:, h].float()[:, :, None]
+                               * ks[step][:, src].float()[:, None, :])
+        ref_outs.append(torch.stack(
+            [torch.bmm(ref_state[:, h], qs[step][:, h // rep].float()[:, :, None])[:, :, 0]
+             for h in range(nv)], dim=1) * dk ** -0.5)
+    try:
+        live = state.npu().clone()
+        idx = torch.arange(batch, dtype=torch.int32).npu()
+        lens = torch.tensor([0] + [1] * batch, dtype=torch.int32).npu()
+        got = []
+        for step in range(4):
+            res_t = res["scan_decode"][1](
+                qs[step].npu(), ks[step].npu(), vs[step].npu(), live,
+                beta=bs[step].npu(), g=gs[step].npu(), scale=dk ** -0.5,
+                actual_seq_lengths=lens, ssm_state_indices=idx)
+            torch.npu.synchronize()
+            got.append(res_t.float().cpu())
+        ref_o = torch.stack(ref_outs, dim=0)
+        diff = (torch.stack(got, 0) - ref_o).abs()
+        out["scan_decode"] = {
+            "abs_max": diff.max().item(),
+            "rel_max": (diff / ref_o.abs().clamp_min(5e-2)).max().item(),
+            "ref_abs_max": ref_o.abs().max().item(),
+            "steps": 4, "ok": diff.max().item() < 0.15}
+    except Exception as exc:  # noqa: BLE001
+        out["scan_decode"] = {"ok": False, "error": first_line(exc),
+                              "trace": traceback.format_exc().strip().splitlines()[-3:]}
+    # --- scan prefill (chunk 64) -----------------------------------------
+    steps, nk, nv = 64, 1, 2
+    rep = nv // nk
+    q = torch.randn(steps, nk, dk, dtype=torch.bfloat16)
+    k = torch.randn(steps, nk, dk, dtype=torch.bfloat16)
+    v = torch.randn(steps, nv, dv, dtype=torch.bfloat16)
+    g = -torch.rand(steps, nv)
+    beta = torch.rand(steps, nv)
+    state = torch.randn(nv, dv, dk) * 0.05
+    try:
+        res_chunk = res["scan_prefill"][1](
+            q.npu().unsqueeze(0), k.npu().unsqueeze(0), v.npu().unsqueeze(0),
+            g.npu().unsqueeze(0), beta.to(torch.bfloat16).npu().unsqueeze(0),
+            initial_state=state.npu().unsqueeze(0), output_final_state=True,
+            chunk_size=64, cu_seqlens=[0, steps], chunk_indices=[0, 0],
+            scale=dk ** -0.5, layout="BSND", use_exp2=True,
+            use_qk_l2norm_in_kernel=True, allow_neg_eigval=False,
+            disable_recompute=True, state_v_first=True)
+        got = res_chunk[0] if isinstance(res_chunk, (tuple, list)) else res_chunk
+        final = (res_chunk[1] if isinstance(res_chunk, (tuple, list))
+                 and len(res_chunk) > 1 else None)
+        got_cpu = got.float().cpu().reshape(steps, nv, dv)
+        best = None
+        for mapping in ("interleave", "tile"):
+            ref_o, ref_s = ref_scan(q, k, v, g, beta, state, dk ** -0.5, rep,
+                                    mapping=mapping)
+            diff = (got_cpu - ref_o).abs()
+            entry = {"mapping": mapping, "abs_max": diff.max().item(),
+                     "rel_max": (diff / ref_o.abs().clamp_min(5e-2)).max().item(),
+                     "ref_abs_max": ref_o.abs().max().item()}
+            if best is None or entry["abs_max"] < best["abs_max"]:
+                if final is not None:
+                    sdiff = (final.float().cpu() - ref_s.unsqueeze(0)).abs()
+                    entry["state_abs_max"] = sdiff.max().item()
+                    entry["state_rel_max"] = (sdiff / ref_s.abs().clamp_min(5e-2)).max().item()
+                best = entry
+        best["ok"] = best["abs_max"] < 0.15
+        out["scan_prefill"] = best
+    except Exception as exc:  # noqa: BLE001
+        out["scan_prefill"] = {"ok": False, "error": first_line(exc),
+                               "trace": traceback.format_exc().strip().splitlines()[-3:]}
+    return out
+
+
+def main() -> None:
+    report["env"] = {
+        "torch": torch.__version__,
+        "torch_npu": getattr(__import__("torch_npu"), "__version__", None),
+        "device": torch.npu.get_device_name(0),
+        "clock_mhz_start": clock_mhz(),
+        "clock_api": nanosleep_clock(),
+        "started_unix_s": time.time(),
+        "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+    }
+    report["verdicts"] = verdicts()
+    print("verdicts:", json.dumps(report["verdicts"])[:800])
+    try:
+        from vllm_ascend.ops.triton.triton_utils import (
+            init_device_properties_triton,
+        )
+        init_device_properties_triton()
+        report["verdicts"]["init_device_properties_triton"] = "ok"
+    except Exception as exc:  # noqa: BLE001
+        report["verdicts"]["init_device_properties_triton"] = (
+            f"{type(exc).__name__}: {first_line(exc)}")
+    res = resolve()
+    report["resolved"] = {role: label for role, (label, _) in res.items()}
+    print("resolved:", report["resolved"])
+    report["canaries"] = canaries(res)
+    print("canaries:", json.dumps(report["canaries"])[:900])
+    if os.environ.get("GDN_CANARY_ONLY"):
+        with open(OUT, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=1, sort_keys=True)
+        print(f"canary-only wrote {OUT}")
+        return
+
+    def emit(role: str, geom_key: str, phase: str, batch: int, tokens: int,
+             fn, extra: dict | None = None) -> None:
+        try:
+            for _ in range(WARMUP):
+                fn()
+            torch.npu.synchronize()
+        except Exception as exc:  # noqa: BLE001
+            report["rows"].append({
+                "role": role, "impl": res[role][0], "model_geometry": geom_key,
+                "phase": phase, "batch": batch, "tokens": tokens,
+                "status": "failed", "error_type": type(exc).__name__,
+                "error_first_line": first_line(exc),
+                "trace_tail": traceback.format_exc().strip().splitlines()[-3:],
+                **(extra or {})})
+            print(f"  {role:12s} {geom_key:16s} {phase:7s} b{batch} t{tokens:6d} "
+                  f"FAILED {first_line(exc)[:90]}")
+            return
+        probe = timed(fn, 2)
+        samples_n = SAMPLES
+        slow = min(probe) > SLOW_SAMPLE_S
+        if slow:
+            samples_n = SLOW_SAMPLES
+        samples = timed(fn, samples_n)
+        st = stats(samples)
+        row = {"role": role, "impl": res[role][0], "model_geometry": geom_key,
+               "phase": phase, "batch": batch, "tokens": tokens,
+               "status": "measured",
+               "samples_ms": samples, **{f"stat_{k}": v for k, v in st.items()},
+               "canary": report["canaries"].get(role, {}),
+               "samples_reduced": slow, **(extra or {})}
+        report["rows"].append(row)
+        print(f"  {role:12s} {geom_key:16s} {phase:7s} b{batch} t{tokens:6d} "
+              f"median {st['median']:.4f} ms n={st['n']}{' SLOW' if slow else ''}")
+
+    prompts = (4096, 8192, 16384, 32768)
+    for geom_key, geom in GEOM.items():
+        width = geom["conv_width"]
+        hk, hv, dk, dv = (geom["k_heads"], geom["v_heads"], geom["k_dim"],
+                          geom["v_dim"])
+        kernel = geom["conv_kernel"]
+        weight = torch.randn(kernel, width, dtype=torch.bfloat16).npu()
+        bias = torch.randn(width, dtype=torch.bfloat16).npu()
+        # ---- conv prefill (varlen) --------------------------------------
+        for batch in (1, 4):
+            for tokens in prompts:
+                total = batch * tokens
+                x = torch.randn(total, width, dtype=torch.bfloat16).npu()
+                qsl = torch.tensor([tokens * i for i in range(batch + 1)],
+                                   dtype=torch.int32).npu()
+                cache = torch.arange(1, batch + 1, dtype=torch.int32).npu()
+                has_init = torch.zeros(batch, dtype=torch.bool).npu()
+                cs = torch.zeros(batch + 1, kernel - 1, width,
+                                 dtype=torch.bfloat16).npu()
+                emit("conv_prefill", geom_key, "prefill", batch, tokens,
+                     lambda: res["conv_prefill"][1](
+                         x, weight, bias, conv_states=cs, query_start_loc=qsl,
+                         cache_indices=cache, has_initial_state=has_init,
+                         activation="silu"),
+                     {"conv_width": width, "kernel": kernel, "dtype": "bf16",
+                      "layout": "x[T_total,width] varlen",
+                      "in_bytes": total * width * 2,
+                      "out_bytes": total * width * 2})
+                del x, cs
+                torch.npu.empty_cache()
+        # ---- conv update (decode) ---------------------------------------
+        for batch in (1, 4):
+            x = torch.randn(batch, width, dtype=torch.bfloat16).npu()
+            cs = torch.zeros(batch + 1, kernel - 1, width,
+                             dtype=torch.bfloat16).npu()
+            idx = torch.arange(1, batch + 1, dtype=torch.int32).npu()
+            qsl = torch.arange(0, batch + 1, dtype=torch.int32).npu()
+            out = torch.zeros(batch, width, dtype=torch.bfloat16).npu()
+            emit("conv_update", geom_key, "decode", batch, 1,
+                 lambda: res["conv_update"][1](
+                     x, cs, weight, bias=bias, activation="silu",
+                     conv_state_indices=idx, query_start_loc=qsl,
+                     max_query_len=1, out=out),
+                 {"conv_width": width, "kernel": kernel, "dtype": "bf16",
+                  "state_bytes": batch * width * (kernel - 1) * 2})
+        # ---- scan prefill (chunked, TND) --------------------------------
+        for batch in (1, 4):
+            for tokens in prompts:
+                total = batch * tokens
+                q = torch.randn(total, hk, dk, dtype=torch.bfloat16).npu()
+                k = torch.randn(total, hk, dk, dtype=torch.bfloat16).npu()
+                v = torch.randn(total, hv, dv, dtype=torch.bfloat16).npu()
+                g = -torch.rand(total, hv).npu()
+                beta = torch.rand(total, hv, dtype=torch.bfloat16).npu()
+                st = torch.zeros(batch, hv, dv, dk).npu()
+                cu = [tokens * i for i in range(batch + 1)]
+                chunk_indices = []
+                for seq in range(batch):
+                    for local in range((tokens + 63) // 64):
+                        chunk_indices.extend((seq, local))
+                emit("scan_prefill", geom_key, "prefill", batch, tokens,
+                     lambda: res["scan_prefill"][1](
+                         q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0),
+                         g.unsqueeze(0), beta.unsqueeze(0), initial_state=st,
+                         output_final_state=True, chunk_size=64,
+                         cu_seqlens=cu, chunk_indices=chunk_indices,
+                         scale=dk ** -0.5, layout="BSND", use_exp2=True,
+                         use_qk_l2norm_in_kernel=True, allow_neg_eigval=False,
+                         disable_recompute=True, state_v_first=True),
+                     {"k_heads": hk, "v_heads": hv, "k_dim": dk, "v_dim": dv,
+                      "chunk": 64, "chunks": (total + 63) // 64,
+                      "state_bytes": batch * hv * dv * dk * 4})
+                del q, k, v, g, beta, st
+                torch.npu.empty_cache()
+        # ---- scan decode (recurrent) -----------------------------------
+        for batch in (1, 4):
+            q = torch.randn(batch, hk, dk, dtype=torch.bfloat16).npu()
+            k = torch.randn(batch, hk, dk, dtype=torch.bfloat16).npu()
+            v = torch.randn(batch, hv, dv, dtype=torch.bfloat16).npu()
+            g = -torch.rand(batch, hv).npu()
+            beta = torch.rand(batch, hv, dtype=torch.bfloat16).npu()
+            st = torch.zeros(batch, hv, dv, dk).npu()
+            idx = torch.arange(batch, dtype=torch.int32).npu()
+            emit("scan_decode", geom_key, "decode", batch, 1,
+                 lambda: res["scan_decode"][1](
+                     l2norm(q), l2norm(k), v, st, beta=beta, g=g,
+                     scale=dk ** -0.5,
+                     actual_seq_lengths=torch.tensor(
+                         [0] + [1] * batch, dtype=torch.int32).npu(),
+                     ssm_state_indices=idx),
+                 {"k_heads": hk, "v_heads": hv, "k_dim": dk, "v_dim": dv,
+                  "state_bytes": batch * hv * dv * dk * 4})
+        # ---- gating -----------------------------------------------------
+        for batch in (1, 4):
+            for tokens in prompts + (1,):
+                total = batch * tokens
+                a = torch.randn(total, hv).npu()
+                b = torch.randn(total, hv).npu()
+                a_log = torch.randn(hv).npu()
+                dt_bias = torch.randn(hv).npu()
+                phase = "decode" if tokens == 1 else "prefill"
+                emit("gating", geom_key, phase, batch, tokens,
+                     lambda: res["gating"][1](a_log, a, b, dt_bias),
+                     {"heads": hv, "dtype": "a fp32 / b fp32",
+                      "in_bytes": total * hv * 4 * 2})
+                del a, b
+                torch.npu.empty_cache()
+
+    report["env"]["clock_mhz_end"] = clock_mhz()
+    report["env"]["finished_unix_s"] = time.time()
+    report["env"]["duration_s"] = (report["env"]["finished_unix_s"]
+                                   - report["env"]["started_unix_s"])
+    with open(OUT, "w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=1, sort_keys=True)
+    print(f"\nwrote {OUT} rows={len(report['rows'])} "
+          f"duration={report['env']['duration_s']:.1f}s")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+        with open(OUT, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, indent=1, sort_keys=True)
+        raise SystemExit(2)

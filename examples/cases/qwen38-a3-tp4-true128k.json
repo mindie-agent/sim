@@ -1,0 +1,67 @@
+{
+  "name": "catalog-full-model-qwen38-a3-tp4-true128k",
+  "machine": {
+    "name": "a3-9362-4die-tp4",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 4,
+    "ranks_per_node": 4,
+    "note": "one A3 host, 4 dies of 65,536 MB (Ascend910_9362, 20 AIC / 40 AIV, 168 MiB L2, 1.2 TB/s declared HBM peak); the SKU profile materializes the SIO intra-package and HCCS_SW intra-node fabrics",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.8-27b",
+    "quantization": "w8a8_dynamic"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 131072,
+        "output_tokens": 4096
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "max_model_len": 135168,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "kv_block_size": 896,
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "mtp_acceptance_by_output_tokens": {
+      "4096": 3.941
+    },
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/Qwen3.8-27B-w8a8 --host 0.0.0.0 --port 18234 --data-parallel-size 1 --distributed-executor-backend mp --tensor-parallel-size 4 --quantization ascend --served-model-name qwen3.8 --max-num-seqs 32 --max-model-len 131072 --max-num-batched-tokens 8192 --trust-remote-code --no-enable-prefix-caching --gpu-memory-utilization 0.9 --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3, \"enforce_eager\": true}' --compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}' --additional-config '{\"enable_cpu_binding\":true}'",
+      "weights": "/mnt/weight/Qwen3.8-27B-w8a8: W8A8_DYNAMIC int8 body (10 shards, 30 GB); measured per-rank weight load 8.21 GiB",
+      "host": "192.168.13.156 (dies 12-15), A3, 8 packages x 2 dies = 16 dies; only the measured dies were allocated",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...), CANN 9.2.1, vLLM 0.30.0 / vllm-ascend 0.30.0rc2",
+      "measured_baseline": ".workstreams/hp-serving/qwen38-a3-tp4/report.md (2026-10-23); raw /Volumes/data/mindie-sim-data/a3/2026-10-23/qwen38-tp4/",
+      "mtp": "MTP3: qwen3_5_mtp with num_speculative_tokens=3, enforce_eager; the served streams committed 3.94-3.99 tokens per step at o4096, declared per cell from the measured acceptance",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "tp_decode_allreduce": "a3-tp-hierarchical-tier",
+      "enable_prefix_caching": "false",
+      "graph": "FULL_DECODE_ONLY: decode replayed from captured buckets [1,2,4,8,16,32], prefill eager",
+      "kv_cache": "attention block 896; measured KV pool 1,025,494 tokens (TP2) / 2,539,829 tokens (TP4), maximum concurrency 7.82x / 19.38x at 131,072",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted",
+      "true_128k": "prompt 131072 + output 4096; model max_position=262144; deployment recipe maxlen 131072"
+    }
+  }
+}

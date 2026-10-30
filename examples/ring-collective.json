@@ -1,0 +1,51 @@
+{
+  "machine": {
+    "name": "illustrative-asymmetric-ring",
+    "architecture": "generic-gpu",
+    "num_devices": 4,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_units": 4,
+      "compute_peaks": {"bf16": 1000000000, "fp32": 1000000000},
+      "rates": {"memory": 1000000000, "vector": 1000000000}
+    },
+    "links": [
+      {"name": "edge0", "members": [0, 1], "semantics": "per_pair",
+       "capacity_bytes_per_ms": 1000, "latency_us": 10000},
+      {"name": "edge1", "members": [1, 2], "semantics": "per_pair",
+       "capacity_bytes_per_ms": 1000, "latency_us": 0},
+      {"name": "edge2", "members": [2, 3], "semantics": "per_pair",
+       "capacity_bytes_per_ms": 1000, "latency_us": 0},
+      {"name": "edge3", "members": [3, 0], "semantics": "per_pair",
+       "capacity_bytes_per_ms": 1000, "latency_us": 0}
+    ],
+    "assumptions": {
+      "parameters": "Synthetic causal control, not a device specification.",
+      "collective": "Explicit uniform-chunk transport-only direct ring; no local reduction cost is inferred."
+    }
+  },
+  "model": {
+    "name": "ring-workflow-control",
+    "layers": 2,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128
+  },
+  "workload": {
+    "requests": [{"id": "r", "prompt_tokens": 4, "output_tokens": 1}]
+  },
+  "runtime": {
+    "tp": 4,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "families": {
+        "allreduce": {"kind": "ring_collective"},
+        "allgather": {"kind": "ring_collective"},
+        "reduce_scatter": {"kind": "ring_collective"}
+      }
+    }
+  }
+}

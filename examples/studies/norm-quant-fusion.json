@@ -1,0 +1,46 @@
+{
+  "candidates": [
+    {
+      "id": "separate-norm-quant-residual",
+      "case": "../cases/qwen38-a5.json",
+      "overrides": {
+        "runtime": {
+          "lowering_passes": [
+            "activation_quantization"
+          ]
+        }
+      }
+    },
+    {
+      "id": "declared-norm-quant-residual-fusion",
+      "case": "../cases/qwen38-a5.json",
+      "overrides": {
+        "runtime": {
+          "lowering_passes": [
+            "activation_quantization",
+            "norm_quant",
+            "residual_norm"
+          ]
+        }
+      }
+    }
+  ],
+  "probes": [
+    {
+      "id": "prefill256",
+      "phase": "prefill",
+      "tokens": 256,
+      "scope": "model"
+    },
+    {
+      "id": "decode1-context2048",
+      "phase": "decode",
+      "tokens": 1,
+      "context": 2048,
+      "scope": "model"
+    }
+  ],
+  "level": "operators",
+  "serving": false,
+  "max_evaluations": 4
+}

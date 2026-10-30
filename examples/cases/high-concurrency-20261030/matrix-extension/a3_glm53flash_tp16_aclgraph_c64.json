@@ -1,0 +1,178 @@
+{
+  "name": "a3_glm53flash_tp16_aclgraph_c64-body-input",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 16,
+    "ranks_per_node": 16
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "int8",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "INT8 native sparse attention cache scale/packing path"
+      ],
+      "degraded_submodules": [
+        "native_int8_sparse_attention"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_num_seqs": 64,
+    "max_model_len": 131072,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.92,
+    "enable_chunked_prefill": true,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_buckets": [
+      6,
+      12,
+      24,
+      36,
+      48,
+      72,
+      96,
+      144,
+      192,
+      288,
+      384
+    ],
+    "multistream_overlap_shared_expert": true,
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      }
+    },
+    "metadata": {
+      "input_boundary": "full 45-layer target body; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030",
+      "client_summary": {
+        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/benchmark_summary.json",
+        "bytes": 139849,
+        "sha256": "6509330850a82e02a82225b6fe0b17a584c2ab4f5787dcbcde5f862240185251"
+      },
+      "profile_cell": {
+        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/profile_cell.json",
+        "bytes": 5164,
+        "sha256": "341258f771a0c571499e3fc234457ef4af94349858e433aa3d3f4f3a1a5813c9"
+      },
+      "launch_source": {
+        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_glm53f_w8a8.sh",
+        "bytes": 3046,
+        "sha256": "796b4709dc31226e62c562c3a7718d9f2d09b190fa2fe87a4ae9814ec3d18538"
+      },
+      "checkpoint": "/mnt/weight/GLM-5.3-Flash-w8a8",
+      "source_configuration_status": "retained launch script plus campaign report graph-capture excerpt; full resolved startup not located",
+      "force_eplb": {
+        "configured": true,
+        "actual_resolved_startup": null
+      },
+      "prefix_cache": {
+        "configured": true,
+        "observed_hit_rate": 0.9375,
+        "metrics": {
+          "vllm:prefix_cache_hits_created": 0.0,
+          "vllm:prefix_cache_hits_total": 491520.0,
+          "vllm:external_prefix_cache_queries_created": 0.0,
+          "vllm:external_prefix_cache_hits_total": 0.0,
+          "vllm:external_prefix_cache_hits_created": 0.0,
+          "vllm:external_prefix_cache_queries_total": 0.0,
+          "vllm:prefix_cache_queries_created": 0.0,
+          "vllm:prefix_cache_queries_total": 524288.0
+        }
+      },
+      "graph_native_mode": "FULL_DECODE_ONLY; buckets count query tokens, not requests",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 5,
+      "speculative": {
+        "draft_len": 5,
+        "acceptance": [
+          0.8,
+          0.64,
+          0.512,
+          0.4096,
+          0.32768
+        ],
+        "acceptance_mode": "marginal",
+        "label": "configured synthetic marginal rates, not observed acceptance"
+      },
+      "client": {
+        "concurrency": 64,
+        "prompt_lengths": [
+          4096
+        ],
+        "median_tpot_ms": 301.64318977422994,
+        "metric_boundary": "client token TPOT"
+      },
+      "geometry_policy": "declared q6/B client concurrency; exact active context and accepted-state indices await profiler",
+      "kernel_policy": "analytic INT8 cache; do not bind BF16-only native indexed MLA",
+      "unresolved_capture_contracts": [
+        "current checkpoint config bytes",
+        "native INT8 KV scale and packing",
+        "resolved force-EPLB startup",
+        "per-forward geometry and group_list"
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,319 @@
+"""Reduce one served Qwen3.5 TP4 decode trace to the grouped-int8 MoE cost per step.
+
+[Role]
+  Turn a torch_npu ``kernel_details.csv`` from a profiled vLLM decode cell into (a) the served
+  grouped-int8 cost per decode step (gate_up + down, the 40 main layers and the MTP layer), (b)
+  the per-call distributions the artifact fits are supposed to price, and (c) the full kernel
+  composition of the step (activation/quant, dense GEMM, attention, GDN, collectives, MoE
+  routing/permute) so the grouped term is attributed inside a measured step rather than assumed.
+
+[Invariants]
+  * Decode steps are the intervals between consecutive speculative-rejection sampler starts
+    (``_probabilistic_rejection_kernel``).  Everything before the first sampler is prefill/cold
+    start and is excluded; n_steps = n_markers - 1.
+  * Per-class numbers are per-step totals (sum over the interval) reduced with the **median**
+    across steps, so a cold or gapped interval cannot move them.
+  * No imputation: a class that never appears is reported with 0 calls, and a marker that never
+    appears is an error (rc 3), never a silently empty reduction.
+  * Grouped calls are split by the trace's own op identity:
+      ``aclnnGroupedMatmulWeightNz_*`` = NZ int8 weights (the 40 main layers)
+      ``aclnnGroupedMatmulV5_*``       = ND int8 weights (the MTP layer, verify + 2 drafts)
+    and by projection from the activation's own second dimension (k=2048 gate_up, k=128 down),
+    never by position.
+  * ``AivKernel`` is the HCCL collective's own AI-core worker: its duration equals the paired
+    ``hcom_*`` row (verified per trace), so it is reported as ``collective_mirror`` and is NOT
+    added into the collective total (double counting is refused visibly).
+  * Batch is read from the verify attention call's q shape (q_tokens / 4 = batch, MTP3), not
+    inferred from the cell name.
+
+[Timeouts & Locks] Pure CSV reduction; no locks.
+[Side-Effect Policy] Reads the CSV named on argv; writes only with --out.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import re
+import statistics
+import sys
+
+import pandas as pd
+
+COLS = ["Name", "Start Time(us)", "Duration(us)", "Input Shapes", "Output Shapes",
+        "Accelerator Core", "Wait Time(us)"]
+MARKER = "_probabilistic_rejection_kernel"
+GMM_NZ = "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul"
+GMM_V5 = "aclnnGroupedMatmulV5_GroupedMatmul_GroupedMatmul"
+ATTN = "FusedInferAttentionScore"
+
+CLASSES = [
+    ("grouped_nz", re.compile(r"^aclnnGroupedMatmulWeightNz_")),
+    ("grouped_v5", re.compile(r"^aclnnGroupedMatmulV5_")),
+    ("activation_quant", re.compile(r"^SwiGlu$|^aclnnDynamicQuantV2_", re.I)),
+    ("moe_dispatch_combine", re.compile(r"MoeInitRouting|MoeFinalizeRouting|MoeTokenUnpermute", re.I)),
+    ("moe_routing", re.compile(r"MoeGatingTopK|MoeGating|^aclnnTopK", re.I)),
+    ("dense_gemm", re.compile(r"QuantBatchMatmulV3|MatMulV3|MatmulV3|aclnnMatmul_|aclnnMm_", re.I)),
+    ("attention", re.compile(r"^FusedInferAttentionScore")),
+    ("gdn", re.compile(r"GatedDeltaRule|CausalConv1d|conv1d|GDN|gdn|_layer_norm_fwd|l2norm", re.I)),
+    ("collective", re.compile(r"^hcom_")),
+    ("collective_mirror", re.compile(r"^AivKernel$")),
+    ("moe_comm", re.compile(r"alltoall|AllToAll|dispatch_v|combine_v|MoeDistribute", re.I)),
+]
+
+
+def describe(vals: list[float], nd: int = 4) -> dict:
+    if not vals:
+        return {}
+    s = sorted(vals)
+    return {"n": len(s), "median": round(statistics.median(s), nd),
+            "mean": round(statistics.fmean(s), nd), "min": round(s[0], nd),
+            "max": round(s[-1], nd),
+            "p90": round(s[min(len(s) - 1, int(round(0.9 * (len(s) - 1))))], nd)}
+
+
+def parts(shapes) -> list[str]:
+    if not isinstance(shapes, str) or not shapes:
+        return []
+    return [p.strip().strip('"') for p in shapes.split(";")]
+
+
+def classify(name: str) -> str:
+    for cls, pat in CLASSES:
+        if pat.search(name):
+            return cls
+    return "other"
+
+
+def gmm_key(name: str, shapes: str) -> tuple[str, int | None, str]:
+    """(op/projection key, M, projection) from the grouped call's own activation shape."""
+    p = parts(shapes)
+    m = k = None
+    if p and p[0].count(",") >= 1:
+        bits = p[0].split(",")
+        try:
+            m, k = int(bits[0]), int(bits[1])
+        except ValueError:
+            m = k = None
+    proj = "gate_up" if k == 2048 else ("down" if k == 128 else f"k{k}")
+    op = "grouped_nz" if name.startswith(GMM_NZ.split("_")[0]) else "grouped_v5"
+    return f"{op}/{proj}", m, proj
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("kernel_details")
+    ap.add_argument("--cell", required=True)
+    ap.add_argument("--out", required=True)
+    args = ap.parse_args()
+
+    df = pd.read_csv(args.kernel_details, low_memory=False, usecols=COLS)
+    df.columns = [c.strip() for c in df.columns]
+    df["start"] = pd.to_numeric(df["Start Time(us)"].astype(str).str.strip(), errors="coerce")
+    df["dur"] = pd.to_numeric(df["Duration(us)"].astype(str).str.strip(), errors="coerce")
+    df["name"] = df["Name"].astype(str).str.strip()
+    df = df.dropna(subset=["start", "dur"]).sort_values("start").reset_index(drop=True)
+
+    markers = df.loc[df["name"] == MARKER, "start"].tolist()
+    if len(markers) < 3:
+        print(json.dumps({"cell": args.cell, "error": "marker_missing",
+                          "markers": len(markers)}))
+        return 3
+    steps = []
+    for a, b in zip(markers[:-1], markers[1:]):
+        steps.append((a, b, df[(df["start"] >= a) & (df["start"] < b)]))
+    n_steps = len(steps)
+
+    # batch from the verify attention calls (q_tokens = 4 * batch under MTP3).  Prefill
+    # attention carries thousands of q tokens, so only q <= 4*MAX_SEQS can be a decode call.
+    MAX_SEQS = 32
+    batch = 0
+    for _, _, seg in steps:
+        for shp in seg.loc[seg["name"] == ATTN, "Input Shapes"]:
+            p = parts(shp)
+            if p and p[0].count(",") >= 2:
+                try:
+                    q = int(p[0].split(",")[0])
+                except ValueError:
+                    continue
+                if 4 <= q <= 4 * MAX_SEQS:
+                    batch = max(batch, q // 4)
+    periods = [round((b - a) / 1000.0, 4) for a, b, _ in steps]
+
+    # A step is decode-only when no prefill kernel landed in its interval (a c4 admission is
+    # opened mid-stream, so an interval can carry another request's prefill).  Contaminated
+    # steps are counted and excluded from the medians, never silently averaged in.
+    def contaminated(seg) -> bool:
+        g = seg[seg["name"].isin([GMM_NZ, GMM_V5])]
+        for shp in g["Input Shapes"]:
+            p = parts(shp)
+            if p and p[0].count(",") >= 1:
+                try:
+                    if int(p[0].split(",")[0]) > 128:
+                        return True
+                except ValueError:
+                    pass
+        for shp in seg.loc[seg["name"] == ATTN, "Input Shapes"]:
+            p = parts(shp)
+            if p and p[0].count(",") >= 2:
+                try:
+                    if int(p[0].split(",")[0]) > 4 * MAX_SEQS:
+                        return True
+                except ValueError:
+                    pass
+        return False
+
+    clean = [not contaminated(seg) for _, _, seg in steps]
+    n_clean = sum(clean)
+    idx = [i for i, ok in enumerate(clean) if ok] or list(range(len(steps)))
+    periods_clean = [periods[i] for i in idx]
+
+    # Decode batch from the grouped activation's own M: the verify call is 4 tokens/seq and
+    # 8 experts/token, so M = 32 * batch (draft calls carry M = 8 * batch).
+    m_per_step = {}
+    for i in idx:
+        _, _, seg = steps[i]
+        ms = []
+        for shp in seg.loc[seg["name"].isin([GMM_NZ, GMM_V5]), "Input Shapes"]:
+            p = parts(shp)
+            if p and p[0].count(",") >= 1:
+                try:
+                    ms.append(int(p[0].split(",")[0]))
+                except ValueError:
+                    pass
+        if ms:
+            m_per_step[i] = max(ms)
+    batch = 0
+    if m_per_step:
+        bvals = [m // 32 for m in m_per_step.values() if m >= 32]
+        if bvals:
+            batch = max(bvals)
+
+    class_tot = {c: [] for c, _ in CLASSES}
+    class_tot["other"] = []
+    class_cnt = {c: [] for c, _ in CLASSES}
+    class_cnt["other"] = []
+    per_step_total = []
+    per_step_hcom = []
+    per_step_mirror = []
+    n_prefill_g = 0
+    gstep = {}
+    gstep_by_m = {}
+    gstep_all = []
+    gcall = {}
+    for i in idx:
+        a, b, seg = steps[i]
+        cls = seg["name"].map(classify)
+        tot = {c: 0.0 for c in class_tot}
+        cnt = {c: 0 for c in class_tot}
+        for k, v in seg.groupby(cls)["dur"]:
+            tot[k] = float(v.sum()) / 1000.0
+            cnt[k] = int(v.size)
+        for c in class_tot:
+            class_tot[c].append(tot[c])
+            class_cnt[c].append(cnt[c])
+        per_step_total.append(float(seg["dur"].sum()) / 1000.0)
+        per_step_hcom.append(tot["collective"])
+        per_step_mirror.append(tot["collective_mirror"])
+        step_g = {}
+        gseg = seg[seg["name"].isin([GMM_NZ, GMM_V5])]
+        for _, r in gseg.iterrows():
+            key, m, proj = gmm_key(r["name"], r["Input Shapes"])
+            if m is not None and m > 128:
+                n_prefill_g += 1
+                continue
+            step_g[key] = step_g.get(key, 0.0) + float(r["dur"]) / 1000.0
+            gcall.setdefault(key, []).append(float(r["dur"]) / 1000.0)
+        for k, v in step_g.items():
+            gstep.setdefault(k, []).append(v)
+        gstep_all.append(sum(step_g.values()))
+        if m_per_step.get(i) is not None:
+            gstep_by_m.setdefault(m_per_step[i], []).append(sum(step_g.values()))
+
+    group_step = {k: round(statistics.median(v), 4) for k, v in gstep.items()}
+    proj_step = {}
+    for k, v in gstep.items():
+        proj_step.setdefault(k.split("/")[-1], []).append(statistics.median(v))
+    op_step = {}
+    for k, v in gstep.items():
+        op_step.setdefault(k.split("/")[0], []).append(statistics.median(v))
+
+    # AivKernel mirrors the hcom row; check the equality rather than assume it.
+    hcom = class_tot["collective"]
+    mirror = class_tot["collective_mirror"]
+    paired = sum(1 for x, y in zip(hcom, mirror) if abs(x - y) < 1e-3)
+
+    classes_ms = {c: round(statistics.median(v), 4) for c, v in class_tot.items()}
+    classes_cnt = {c: round(statistics.median(v), 2) for c, v in class_cnt.items()}
+    step_med = max(statistics.median(per_step_total), 1e-9)
+    moe_block = (classes_ms["grouped_nz"] + classes_ms["grouped_v5"] +
+                 classes_ms["activation_quant"] + classes_ms["moe_dispatch_combine"] +
+                 classes_ms["moe_routing"])
+
+    out = {
+        "schema": "a5-qwen35-grouped-trace-reduction/1",
+        "cell": args.cell,
+        "source": args.kernel_details,
+        "marker": MARKER,
+        "n_steps": n_steps,
+        "n_decode_only_steps": n_clean,
+        "n_steps_excluded_prefill_contaminated": n_steps - n_clean,
+        "prefill_grouped_calls_excluded": n_prefill_g,
+        "batch_from_q": batch,
+        "step_period_ms": describe(periods_clean, 4),
+        "kernel_time_per_step_ms": round(statistics.median(
+            [t - h - m for t, h, m in zip(per_step_total, per_step_hcom, per_step_mirror)]), 4),
+        "total_kernel_rows_ms_per_step": round(statistics.median(per_step_total), 4),
+        "collective_hcom_ms_per_step": round(statistics.median(per_step_hcom), 4),
+        "collective_mirror_ms_per_step": round(statistics.median(per_step_mirror), 4),
+        "kernel_share_of_period_pct": round(100.0 * step_med /
+                                           max(statistics.median(periods_clean), 1e-9), 2),
+        "grouped": {
+            "per_step_ms": round(statistics.median(gstep_all), 4),
+            "per_step_ms_by_projection": {k: round(sum(v), 4) for k, v in proj_step.items()},
+            "per_step_ms_by_op": {k: round(sum(v), 4) for k, v in op_step.items()},
+            "calls_per_step_by_op_proj": {k: round(len(v) / n_clean, 2) for k, v in gcall.items()},
+            "calls_per_step_total": round(sum(len(v) for v in gcall.values()) / n_clean, 2),
+            "per_call_ms_by_op_proj": {k: describe(v) for k, v in gcall.items()},
+            "m_per_clean_step": {str(k): v for k, v in sorted(m_per_step.items())},
+            "per_step_ms_by_m": {str(k): round(statistics.median(v), 4)
+                                 for k, v in sorted(gstep_by_m.items())},
+            "m_values": sorted({int(r) for i, (_, _, seg) in enumerate(steps) if i in idx
+                                for r in [gmm_key(n, s)[1] for n, s in
+                                          zip(seg.loc[seg["name"].isin([GMM_NZ, GMM_V5]), "name"],
+                                              seg.loc[seg["name"].isin([GMM_NZ, GMM_V5]),
+                                                      "Input Shapes"])]
+                                if r is not None}),
+        },
+        "classes": {
+            "per_step_ms": classes_ms,
+            "calls_per_step": classes_cnt,
+            "share_pct": {c: round(100.0 * v / step_med, 2) for c, v in classes_ms.items()},
+            "collective_mirror_check": {
+                "aivkernel_equals_hcom_steps": paired, "n_steps": n_steps,
+                "note": "AivKernel is the hcom row's AI-core worker; not added to collective",
+            },
+        },
+        "moe_block_ms": round(moe_block, 4),
+        "moe_block_share_pct": round(100.0 * moe_block / step_med, 2),
+        "other_top": [],
+    }
+    # Top unclassified kernels by per-step median (auditability of the 'other' bucket).
+    names = sorted(set(df.loc[df["name"].map(classify) == "other", "name"]))
+    rows = []
+    for nm in names:
+        per = [float(seg.loc[seg["name"] == nm, "dur"].sum()) / 1000.0 for _, _, seg in steps]
+        cnt = [int((seg["name"] == nm).sum()) for _, _, seg in steps]
+        rows.append({"name": nm[:90], "ms_per_step": round(statistics.median(per), 4),
+                     "calls_per_step": round(statistics.median(cnt), 2)})
+    rows.sort(key=lambda r: r["ms_per_step"], reverse=True)
+    out["other_top"] = rows[:15]
+    with open(args.out, "w") as fh:
+        json.dump(out, fh, indent=1)
+    print(json.dumps({k: out[k] for k in ("cell", "n_steps", "batch_from_q", "step_period_ms",
+                                         "kernel_time_per_step_ms", "grouped", "classes",
+                                         "moe_block_ms")}, indent=1))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

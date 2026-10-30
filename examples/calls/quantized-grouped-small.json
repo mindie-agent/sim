@@ -1,0 +1,28 @@
+{
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "hardware_key": "Ascend950DT_9582",
+    "num_devices": 1
+  },
+  "model": {
+    "name": "standalone-quantized-grouped-call-context",
+    "layers": 1,
+    "hidden_size": 16,
+    "num_heads": 1,
+    "num_kv_heads": 1,
+    "head_dim": 16,
+    "intermediate_size": 64,
+    "vocab_size": 16
+  },
+  "runtime": {},
+  "workload": {
+    "requests": [
+      {
+        "id": "unused-by-call-analysis",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

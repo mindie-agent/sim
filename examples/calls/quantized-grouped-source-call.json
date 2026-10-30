@@ -1,0 +1,18 @@
+{
+  "builder": "quantized_grouped_source",
+  "arguments": {
+    "expert_rows": [3, 0, 3, 0],
+    "k": 64,
+    "n": 256,
+    "tiling": {
+      "base_m": 16,
+      "base_n": 128,
+      "base_k": 32,
+      "used_cores": 32
+    }
+  },
+  "protocol": {
+    "mode": "graph",
+    "invocations": 2
+  }
+}

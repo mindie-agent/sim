@@ -1,0 +1,122 @@
+{
+  "machine": {
+    "name": "synthetic-moe-routing-source-control",
+    "architecture": "declared",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0
+      },
+      "compute_units": 4
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [
+          0
+        ],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "ffn": "moe",
+    "num_experts": 4,
+    "top_k": 2,
+    "moe_intermediate_size": 32,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "kv_dtype": "bf16"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 4,
+        "output_tokens": 2
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "routing": {
+      "realizations": [
+        {
+          "scope": "body",
+          "layer": 0,
+          "phase": "prefill",
+          "tokens": 4,
+          "expert_rows": [
+            3,
+            3,
+            2,
+            0
+          ],
+          "topk_ids": [
+            [0, 1],
+            [0, 2],
+            [1, 2],
+            [0, 1]
+          ]
+        },
+        {
+          "scope": "body",
+          "layer": 0,
+          "phase": "decode",
+          "tokens": 1,
+          "expert_rows": [
+            1,
+            1,
+            0,
+            0
+          ],
+          "topk_ids": [
+            [1, 0]
+          ]
+        }
+      ]
+    },
+    "kernels": {
+      "lowerings": {
+        "route_pack": {
+          "implementation": "cuda_moe_align_block_size",
+          "options": {
+            "block_size": 16,
+            "pad_sorted_ids": true
+          }
+        },
+        "route_unpack": {
+          "implementation": "triton_moe_fused_mul_sum",
+          "options": {
+            "compute_capability": 89,
+            "weight_dtype": "bf16"
+          }
+        }
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not accelerator specifications or calibration",
+      "implementation_scope": "explicit token mappings through CUDA alignment and SM89 Triton weighted combination with the declared BF16 router weights"
+    }
+  }
+}

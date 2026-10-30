@@ -1,0 +1,18 @@
+{
+  "scope": "declared_source_not_captured_toolchain",
+  "vllm_revision": "752a3a504485790a2e8491cacbb35c137339ad34",
+  "files": [
+    {
+      "path": "triton_unified_attention.py",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/ops/triton_unified_attention.py",
+      "sha256": "a653bd1e1c200be4189804956f680bb462ca80e582b418d279b5afc6ff855311",
+      "bytes": 44519
+    },
+    {
+      "path": "triton_attention_helpers.py",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/ops/triton_attention_helpers.py",
+      "sha256": "8c730611e7b3c5fb7579ec7846d56a2ab7e348ce06b39136da22072ecc363c95",
+      "bytes": 15788
+    }
+  ]
+}

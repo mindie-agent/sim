@@ -1,0 +1,198 @@
+{
+  "name": "a3_glm53_w4a8_tp16_tpot88_c8-body-input",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 16,
+    "ranks_per_node": 16,
+    "dies_per_package": 2
+  },
+  "model": {
+    "catalog_key": "glm-5.3",
+    "quantization": "w4a8_dynamic",
+    "quant": {
+      "name": "W4A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int4",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "int8",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "activation_scheme": "dynamic",
+        "checkpoint": "GLM-5.3-W4A8-INT",
+        "expert_weight_scale": "per_channel_fp32",
+        "linear_weight_scale": "per_channel_fp32",
+        "quant_method": "w4a8_dynamic"
+      },
+      "notes": [
+        "measured A3 recipe: W4A8_DYNAMIC routed experts (packed int4, per-channel fp32 scale) + W8A8_DYNAMIC attention/shared/dense",
+        "MTP, norms, router, embedding and LM head stay BF16/FP32"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 64,
+    "max_model_len": 131072,
+    "gpu_memory_utilization": 0.95,
+    "enable_chunked_prefill": true,
+    "routing": {
+      "policy": "balanced"
+    },
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      48,
+      64
+    ],
+    "multistream_overlap_shared_expert": true,
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      }
+    },
+    "metadata": {
+      "input_boundary": "full 78-layer body template; placeholder requests are not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/glm5_3_w4a8_int_high_conc_decode_tpot88_c8_20261030",
+      "selected_kernel_source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/glm5_3_w4a8_int_high_conc_decode_tpot88_c8_20261030/kernel_details.csv",
+        "sha256": "59f5666d6709695fad7e1f8502a656de699a200932199f2344c44aaa07662ee8",
+        "size_bytes": 75781277
+      },
+      "selected_rank": "tp0",
+      "capture_manifest": {
+        "path": "/Volumes/data/mindie-sim-data/a3/glm5_3_w4a8_int_high_conc_decode_tpot88_c8_20261030/manifest.json",
+        "sha256": "c4b8a072b2ebd6f1dd31c526778eb0056ef9d2e3ddd4984ff1e0c28604659b6f",
+        "size_bytes": 5190
+      },
+      "checkpoint": {
+        "value": "/mnt/weight/GLM-5.3-W4A8-INT",
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/glm5_3_w4a8_int_high_conc_decode_tpot88_c8_20261030/cell.json",
+          "sha256": "862372563c4d11622dfd4d77c26d150e1367dfcb1df4ee88e1da61928a122fc1",
+          "size_bytes": 13748
+        },
+        "field": "tokenizer; models.data[].root",
+        "architecture": "GLM-5.3 old 78-layer declaration; not Glm5Next Flash 45"
+      },
+      "launch_declaration": {
+        "source": {
+          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+          "sha256": "3642c774841205a58d18951e41c5338989858a35ece0c9c5c3c33c71a404373d",
+          "size_bytes": 2199
+        },
+        "tp": 16,
+        "dp": 1,
+        "ep": 16,
+        "kv_cache_dtype": "int8",
+        "num_speculative_tokens": 5,
+        "rejection_sample_method": "synthetic",
+        "synthetic_acceptance_rates": [
+          0.8,
+          0.64,
+          0.512,
+          0.4096,
+          0.32768
+        ],
+        "force_eplb": true,
+        "cudagraph_mode": "FULL_DECODE_ONLY",
+        "basis": "retained launch script, not a retained resolved startup log"
+      },
+      "configuration_basis": "retained launch script; resolved startup log not retained",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 5,
+      "speculative": {
+        "draft_len": 5,
+        "acceptance": [
+          0.8,
+          0.64,
+          0.512,
+          0.4096,
+          0.32768
+        ],
+        "acceptance_mode": "marginal",
+        "source": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+        "label": "configured synthetic acceptance; not observed acceptance"
+      },
+      "profiled_client": {
+        "source": {
+          "path": "/Volumes/data/mindie-sim-data/a3/glm5_3_w4a8_int_high_conc_decode_tpot88_c8_20261030/benchmark_summary.json",
+          "sha256": "e19a13583189ca8a3c029020c8da5d83ae384d28b3bd5db48530cb3ce65cc22e",
+          "size_bytes": 18696
+        },
+        "input_len": 4096,
+        "output_len": 96,
+        "concurrency": 8,
+        "tpot_ms": {
+          "n": 16,
+          "mean": 94.44360591678327,
+          "median": 89.44187430664897,
+          "std": 13.776907770196152,
+          "min": 88.4430892407321,
+          "max": 134.49352361261845,
+          "p50": 89.44187430664897,
+          "p90": 108.6384085248466,
+          "p99": 133.34546312731172
+        },
+        "metric_scope": "client streaming chunks; not device forward"
+      },
+      "force_eplb_basis": "retained launch script --additional-config enable_force_eplb=true",
+      "prefix_cache_basis": "launch enabled; per-forward hit ratio not established",
+      "kernel_policy": "analytic INT8 sparse KV; no BF16-cache-only source kernel binding",
+      "geometry_policy": "profiler supplies q/B/context from native tensors and body segmentation",
+      "unresolved_capture_contracts": [
+        "active_batch_and_context_per_body",
+        "graph_padding_per_captured_body",
+        "INT8_KV_scale_packing_and_native_sparse_attention_kernel",
+        "checkpoint_config_bytes_not_delivered; retained_78_layer_catalog_mapping",
+        "launch_configuration_not_independently_confirmed_by_startup_log"
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

@@ -1,0 +1,228 @@
+{
+  "schema": "mindie-sim.release-acceptance/1",
+  "version": "0.8.0",
+  "runtime_revision": "439779a7e2ead9fd149d9202e45f9c2ccda73c49",
+  "scope": "Local acceptance of the cleaned runtime; exact release-tag CI is published with the GitHub Release.",
+  "maintained_tests": {
+    "command": "PYTHONPATH=.:/Users/maoxx241/code/profiler .venv/bin/python -m pytest -q -m 'not live_npu'",
+    "passed": 3301,
+    "failed": 0,
+    "seconds": 366.92,
+    "profiler_revision": "92fd522049f45bdae942e8c5b35fd18671d096f3"
+  },
+  "installed_wheel": {
+    "passed": 144,
+    "sha256": "898d798749bb6142f5507678e1ed19ad6be4c5a4aa2b5f13ff1e9d2a498207e0",
+    "source_files_byte_equal": 293,
+    "receipt": "installed-wheel-0.8.0.json"
+  },
+  "benchmarks": {
+    "revision": "439779a7e2ead9fd149d9202e45f9c2ccda73c49",
+    "dirty": false,
+    "cases": [
+      {
+        "case": "pipeline",
+        "result": {
+          "status": "pass",
+          "scope": "local_cpu_microbenchmark",
+          "metrics": [
+            {
+              "name": "pipeline",
+              "unit": "us/op",
+              "iterations": 20,
+              "value": 1593.4125
+            }
+          ]
+        }
+      },
+      {
+        "case": "serving",
+        "result": {
+          "status": "pass",
+          "scope": "local_cpu_microbenchmark",
+          "metrics": [
+            {
+              "name": "serving",
+              "unit": "us/op",
+              "iterations": 3,
+              "value": 252829.75
+            }
+          ]
+        }
+      },
+      {
+        "case": "pd-serving",
+        "result": {
+          "status": "pass",
+          "scope": "local_cpu_microbenchmark",
+          "metrics": [
+            {
+              "name": "pd-serving",
+              "unit": "us/op",
+              "iterations": 3,
+              "value": 469407.1386666667
+            }
+          ]
+        }
+      }
+    ]
+  },
+  "memory": {
+    "cases": [
+      {
+        "baseline": {
+          "duration_exactly_unchanged": true,
+          "duration_ms": 13.748800118792664,
+          "revision": "90b89a3d",
+          "rss_bytes": 550043648,
+          "wall_seconds": 60.96103433298413
+        },
+        "case": "c16",
+        "duration_ms": 13.748800118792664,
+        "elapsed_pass": true,
+        "input": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c16_p2k.json",
+          "sha256": "e54cc728c4373ee976db2260af6fa6172261fc7f0a176f64a930eba9d717bffb"
+        },
+        "live_programs": 0,
+        "live_tasks": 0,
+        "memory_pass": true,
+        "rss_bytes": 371752960,
+        "sequences": 2,
+        "serviced_sha256": "dd13f21c606f048fd71093d34c31a04f88af250b7aea5c428fd35c20ba73cdbf",
+        "shape": {
+          "context_tokens": 2048,
+          "dp": 8,
+          "ep": 8,
+          "phase": "decode",
+          "sequences_per_replica": 2,
+          "tokens_per_sequence": 1,
+          "tp": 1
+        },
+        "timeline_sha256": "7d74b896b104c187245d51a679ca5368315793a99cf7cb62c4dcf3ae9a6ac496",
+        "wall_seconds": 49.16209154203534,
+        "work": {
+          "flops": 4637420814336.0,
+          "hbm_bytes": 135742414720.0,
+          "link_bytes": 61931520.0,
+          "vector_ops": 2605383680.384169
+        }
+      },
+      {
+        "baseline": {
+          "duration_ms": 24.81157756185846,
+          "exactly_unchanged": {
+            "duration_ms": true,
+            "serviced_sha256": true,
+            "timeline_sha256": true,
+            "work": true
+          },
+          "rss_bytes": 608534528,
+          "scope": "after_stage_sharing_before_mc2_templates",
+          "wall_seconds": 64.79619162494782
+        },
+        "case": "c64",
+        "duration_ms": 24.81157756185846,
+        "elapsed_pass": true,
+        "input": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64.json",
+          "sha256": "486eb5a50ec7d99b6cc079409d44246f22e3ccbb3d54a32ee6d5454a4c546379"
+        },
+        "live_programs": 0,
+        "live_tasks": 0,
+        "memory_pass": true,
+        "rss_bytes": 374833152,
+        "sequences": 8,
+        "serviced_sha256": "20610a664a8c21210f0649577e0e833a39f9b46db99c87fff6144e9845386730",
+        "shape": {
+          "context_tokens": 2048,
+          "dp": 8,
+          "ep": 8,
+          "phase": "decode",
+          "sequences_per_replica": 8,
+          "tokens_per_sequence": 1,
+          "tp": 1
+        },
+        "timeline_sha256": "1d70d96467cf9842b9e14729ed04e6c8efeddbd334ce1efb5e80f1d878ab0ef6",
+        "wall_seconds": 69.6012756669661,
+        "work": {
+          "flops": 18509417938944.0,
+          "hbm_bytes": 358814783488.0,
+          "link_bytes": 237404160.0,
+          "vector_ops": 10378906881.536676
+        }
+      },
+      {
+        "baseline": {
+          "full_before_run": "not_collected",
+          "scope": "new_larger_geometry_control"
+        },
+        "case": "c128",
+        "duration_ms": 25.539779191201085,
+        "elapsed_pass": true,
+        "input": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c128_p2k.json",
+          "sha256": "3eafc97dc5f21e0a1b3b03a71ae30f0041d0a5b00abeb434741a19e4e6118e96"
+        },
+        "live_programs": 0,
+        "live_tasks": 0,
+        "memory_pass": true,
+        "rss_bytes": 377176064,
+        "sequences": 16,
+        "serviced_sha256": "39f20c8faaff4349a71e0a70e360e00b7b388a0f2b9402c1b940475dd7505c9e",
+        "shape": {
+          "context_tokens": 2048,
+          "dp": 8,
+          "ep": 8,
+          "phase": "decode",
+          "sequences_per_replica": 16,
+          "tokens_per_sequence": 1,
+          "tp": 1
+        },
+        "timeline_sha256": "1a20420fe4966903df548334c2d545b1ff43ee0e5f1a1966f8fbf7df234a29e2",
+        "wall_seconds": 88.22561833297368,
+        "work": {
+          "flops": 19610796556288.0,
+          "hbm_bytes": 367466778112.0,
+          "link_bytes": 471367680.0,
+          "vector_ops": 20748140803.073353
+        }
+      }
+    ],
+    "complete_dp_cohort": true,
+    "entrypoint": "mindie_sim.predict(scope=body, phase=decode, tokens=1, context=2048, sequences=N, event_limit=0)",
+    "fix_commits": [
+      "f7b94479",
+      "439779a7"
+    ],
+    "limitations": [
+      "Wall times include concurrent release tests and another bounded prediction process.",
+      "The seq16 control has no separately collected full before-run; source phase mathematical equivalence is covered by focused tests."
+    ],
+    "limits": {
+      "peak_rss_bytes": 536870912,
+      "wall_seconds": 90
+    },
+    "no_hardware_workloads": true,
+    "python": "3.13.12",
+    "runtime_file_sha256": {
+      "mindie_sim/prediction/execution.py": "690456ec2208a51093f19ba8288fb181fcf6d7f6b1ae3795af88bbb47677af52",
+      "mindie_sim/prediction/mc2_phase.py": "55803e2753050158878fd3c9ec39bed90bd6cf6b65e33b1c6917fd8bc1faa934"
+    },
+    "schema": "mindie-sim.memory-acceptance/1",
+    "source_revision": "439779a7e2ead9fd149d9202e45f9c2ccda73c49",
+    "status": "passed"
+  },
+  "repository_checks": {
+    "lf": "passed",
+    "tracked_files_over_10_mib": [],
+    "core_modules_at_or_over_800_lines": [],
+    "missing_core_invariant_headers": [],
+    "retired_roots_present": []
+  },
+  "boundaries": [
+    "Decode scoreboard is selected multi-revision comparison evidence, not this release tag replay.",
+    "Retained selected scoreboard is 65/66; Qwen3.5-397B c48 remains outside 15%.",
+    "Prefill and full client-serving accuracy remain separate work; no live hardware test was launched."
+  ]
+}

@@ -1,0 +1,768 @@
+{
+  "name": "a5_glm53flash_tp8_c32_p4k:observable-service",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "device": {
+      "rates": {
+        "hccl_copy": 1400000000000.0,
+        "hccl_reduce": 900000000000.0
+      },
+      "resource_units": {
+        "hccl_copy": 1,
+        "hccl_reduce": 1
+      },
+      "work_units": {
+        "hccl_copy": "bytes",
+        "hccl_reduce": "bytes"
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_mxfp8",
+    "quant": {
+      "name": "W8A8_MXFP8",
+      "weight_format": "fp8_e4m3",
+      "native_format": "bf16",
+      "activation_format": "fp8_e4m3",
+      "expert_weight_format": "fp8_e4m3",
+      "weight_block": [
+        1,
+        32
+      ],
+      "expert_block": 32,
+      "scale_format": "fp8_e8m0",
+      "scale_bytes": 1.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "gdn",
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 32,
+      "activation_scale_format": "fp8_e8m0",
+      "activation_scale_pack": 2,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_contract",
+        "checkpoint": "/mnt/weight/GLM-5.3-Flash-w8a8-mxfp8",
+        "basis": "resolved ascend loader plus sampled FP8/E8M0 matrix operands; source BF16 KDA/MLA exclusions"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 16384,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 8192,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64,
+      72,
+      80,
+      88,
+      96,
+      104,
+      112,
+      120,
+      128,
+      136,
+      144,
+      152,
+      160,
+      168,
+      176,
+      184,
+      192,
+      200,
+      208,
+      216,
+      224,
+      232,
+      240,
+      248,
+      256,
+      272,
+      288,
+      304,
+      320,
+      336,
+      352,
+      368,
+      384,
+      400,
+      416,
+      432,
+      448,
+      464,
+      480,
+      496,
+      512
+    ],
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        },
+        "indexed_attention": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        }
+      },
+      "recipes": {
+        "balanced_grouped_down": {
+          "kind": "ascend_mxfp8_grouped_nz"
+        }
+      },
+      "lowerings": {
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch35",
+          "options": {
+            "safe_gate": true,
+            "use_beta_sigmoid": true,
+            "state_selection": {
+              "kind": "symbolic_valid_selection",
+              "index_layout": "speculative",
+              "index_row_stride": 4,
+              "validity": {
+                "prefix": true,
+                "state_indices": true,
+                "accepted_tokens": true,
+                "independent_sequences": true
+              }
+            }
+          }
+        },
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "grouped_gate_up_activation_quant"
+            ],
+            "program_profiles": {
+              "grouped_gate_up_activation_quant": "ascend_mxfp8_grouped_swiglu_quant"
+            },
+            "program_options": {
+              "grouped_gate_up_activation_quant": {
+                "l1_k": 512
+              }
+            }
+          }
+        },
+        "conv_state_copy": {
+          "implementation": "triton_noncontiguous_conv_state_copy",
+          "options": {
+            "state_slots": 6
+          }
+        },
+        "moe_init_routing": "ascend_moe_init_routing_v3_mxfp8"
+      },
+      "hccl": {
+        "allreduce": {
+          "expansion": "AICPU_TS",
+          "template": "mesh_oneshot",
+          "axes": [
+            "tp"
+          ]
+        }
+      },
+      "service_regimes": [
+        {
+          "id": "a5-strided-state-gather",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "recipe": "triton_noncontiguous_conv_state_copy",
+            "dtype": "bf16",
+            "metadata.direction": "gather",
+            "local_shape.1": 6,
+            "local_shape.2": 3072,
+            "resource_units.vector": 64
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0"
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 16,
+              "max": 64
+            }
+          },
+          "response": {
+            "fixed_us": 3.5797064937803116,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.3628009421779463,
+                "scale_with": {
+                  "resource": "mte2_aiv",
+                  "reference_rate": 4224000000000.0
+                }
+              }
+            ]
+          },
+          "provenance": {
+            "basis": "observed_native_call_affine_service",
+            "original_split": "unassigned",
+            "assignment_batches": [
+              16,
+              64
+            ],
+            "validation_batch": 32,
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "observed_mean_us": {
+              "16": 9.384521568627452,
+              "32": 15.043888994307407,
+              "64": 26.798966793168873
+            },
+            "sources": [
+              {
+                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+              }
+            ],
+            "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+          }
+        },
+        {
+          "id": "a5-strided-state-scatter",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "recipe": "triton_noncontiguous_conv_state_copy",
+            "dtype": "bf16",
+            "metadata.direction": "scatter",
+            "local_shape.1": 6,
+            "local_shape.2": 3072,
+            "resource_units.vector": 64
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0"
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 16,
+              "max": 64
+            }
+          },
+          "response": {
+            "fixed_us": 4.138592325532352,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.19713528357579593,
+                "scale_with": {
+                  "resource": "mte3",
+                  "reference_rate": 13516800000000.0
+                }
+              }
+            ]
+          },
+          "provenance": {
+            "basis": "observed_native_call_affine_service",
+            "original_split": "unassigned",
+            "assignment_batches": [
+              16,
+              64
+            ],
+            "validation_batch": 32,
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "observed_mean_us": {
+              "16": 7.292756862745087,
+              "32": 10.747849146110058,
+              "64": 16.755250474383292
+            },
+            "sources": [
+              {
+                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+              }
+            ],
+            "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+          }
+        },
+        {
+          "id": "a5-mxfp8-routing-count",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "recipe": "ascend_moe_init_routing_v3_mxfp8",
+            "dtype": "bf16",
+            "metadata.moe_init_config.experts": 288,
+            "metadata.moe_init_config.topk": 8,
+            "metadata.moe_init_config.width": 4096
+          },
+          "coordinates": {
+            "rows": {
+              "path": "metadata.moe_init_config.tokens",
+              "scale": 0.25
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 16,
+              "max": 64
+            }
+          },
+          "response": {
+            "fixed_us": 21.091916350913127,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.11993761894094564,
+                "scale_with": {
+                  "resource": "vector",
+                  "reference_rate": 6758400000000.0
+                }
+              }
+            ]
+          },
+          "provenance": {
+            "basis": "observed_native_call_affine_service",
+            "original_split": "unassigned",
+            "assignment_batches": [
+              16,
+              64
+            ],
+            "validation_batch": 32,
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "observed_mean_us": {
+              "16": 23.010918253968256,
+              "32": 24.68482411674347,
+              "64": 28.767923963133647
+            },
+            "sources": [
+              {
+                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+              }
+            ],
+            "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+          }
+        },
+        {
+          "id": "a5-aicpu-mesh-oneshot-payload",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "kernel": "HCCL_AICPU_TS_allreduce_mesh_oneshot",
+            "metadata.hccl_selection.ranks": 8,
+            "metadata.hccl_selection.dtype_bytes": 2
+          },
+          "coordinates": {
+            "rows": {
+              "path": "metadata.hccl_selection.payload_bytes",
+              "scale": 3.0517578125e-05
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 16,
+              "max": 64
+            }
+          },
+          "response": {
+            "fixed_us": 31.665457108721633,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.17175268070489835
+              }
+            ]
+          },
+          "provenance": {
+            "basis": "observed_native_call_affine_service",
+            "original_split": "unassigned",
+            "assignment_batches": [
+              16,
+              64
+            ],
+            "validation_batch": 32,
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "observed_mean_us": {
+              "16": 34.413500000000006,
+              "32": 36.277049820788534,
+              "64": 42.65762867383513
+            },
+            "sources": [
+              {
+                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+              }
+            ],
+            "rate_interpretation": "fixed_protocol_response_in_declared_hardware_regime"
+          }
+        },
+        {
+          "id": "a5-mxfp8-grouped-swiglu-small-banks",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "recipe": "ascend_mxfp8_grouped_swiglu_quant",
+            "metadata.mxfp8_swiglu_config.k": 4096,
+            "metadata.mxfp8_swiglu_config.width": 256
+          },
+          "coordinates": {
+            "rows": {
+              "path": "local_shape.0",
+              "scale": 0.03125
+            },
+            "groups": {
+              "path": "metadata.mxfp8_swiglu_config.rows",
+              "reduce": "len"
+            }
+          },
+          "domain": {
+            "rows": {
+              "min": 16,
+              "max": 64
+            },
+            "groups": {
+              "min": 288,
+              "max": 288
+            }
+          },
+          "response": {
+            "fixed_us": 204.60682679638163,
+            "terms": [
+              {
+                "coordinate": "rows",
+                "us_per_unit": 0.10127997205154553,
+                "scale_with": {
+                  "resource": "vector",
+                  "reference_rate": 6758400000000.0
+                }
+              }
+            ]
+          },
+          "provenance": {
+            "basis": "observed_native_call_affine_service",
+            "original_split": "unassigned",
+            "assignment_batches": [
+              16,
+              64
+            ],
+            "validation_batch": 32,
+            "validation_history": "previously_examined_not_pristine_holdout",
+            "observed_mean_us": {
+              "16": 206.22730634920634,
+              "32": 207.86539861751152,
+              "64": 211.08874500768053
+            },
+            "sources": [
+              {
+                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+              },
+              {
+                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+              }
+            ],
+            "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+          }
+        }
+      ]
+    },
+    "metadata": {
+      "input_boundary": "complete 45-layer target-body template; placeholder request is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p4k_20261030",
+      "client_summary": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p4k_20261030/benchmark_summary.json",
+        "bytes": 19415,
+        "sha256": "d37c0832db3698a2a4d361a1bc053e4e9580e50ce49a1823297daae91023cab9"
+      },
+      "startup": {
+        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "bytes": 335341,
+        "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
+      },
+      "resolved_configuration_lines": [
+        25,
+        67
+      ],
+      "checkpoint": "/mnt/weight/GLM-5.3-Flash-w8a8-mxfp8",
+      "force_eplb": {
+        "enabled": true,
+        "basis": "startup line25"
+      },
+      "expert_parallel": {
+        "enabled": false,
+        "basis": "resolved TP8/DP1 with no enable_expert_parallel flag"
+      },
+      "graph_native_mode": "FULL_AND_PIECEWISE",
+      "prefix_cache": {
+        "enabled": true,
+        "basis": "startup lines25/67",
+        "observed_metrics": {
+          "prefix_cache_hits": 0.0,
+          "prefix_cache_queries": 0.0,
+          "prefix_cache_hit_ratio": null
+        },
+        "caution": "zero metric queries do not prove a zero hit rate"
+      },
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "speculative": {
+        "draft_len": 3,
+        "acceptance": [
+          0.8,
+          0.64,
+          0.512
+        ],
+        "acceptance_mode": "marginal",
+        "label": "configured synthetic acceptance, not observed ratio"
+      },
+      "observed_accept_ratio": 0.6603224953740418,
+      "client": {
+        "concurrency": 32,
+        "prompt_lengths": [
+          4104
+        ],
+        "completion_lengths": [
+          256
+        ],
+        "median_tpot_ms": 20.3333948172775,
+        "metric_boundary": "client token TPOT; not target forward or SSE chunk step"
+      },
+      "geometry_policy": "q4 is the declared target verification width; profiler must resolve active batch/context and graph padding",
+      "unresolved_capture_contracts": [
+        "current checkpoint config bytes not independently captured",
+        "per-body active context and accepted-state indices",
+        "all layer projection exceptions beyond native source defaults"
+      ],
+      "compatible_variant": {
+        "variant": "attention-plus-down",
+        "not_observed_dispatch": true,
+        "scope": "conditional body declaration; unchanged precision and routing",
+        "indexed": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        },
+        "source_down": true,
+        "KDA": "explicit symbolic accepted-state source reference; captured values and flags unobserved",
+        "evidence_assumptions": {
+          "indexed_captured_schedule_and_valid_mask_identity": "not_established",
+          "indexed_geometry_extension": "BF16_rope0_is_not_retained_native_rope64_kernel",
+          "MXFP8_down_captured_dispatch_identity": "not_established",
+          "scope": "evidence limitations, not model structural coverage"
+        },
+        "validation": "mechanism execution only; no claimed body or kernel accuracy"
+      },
+      "accepted_state_scenario": {
+        "id": "a5_glm53flash_tp8_c32_p4k",
+        "baseline": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c32_p4k--attention-plus-down.json",
+          "sha256": "9917c673b5ae07c5bc3827ff5ad73c4b2e96110c7c8bd397b07da702c4faea3b",
+          "size_bytes": 7374
+        },
+        "prototype": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
+          "size_bytes": 9296
+        },
+        "tokens_per_sequence": 4,
+        "sequences_per_replica": 32,
+        "context_tokens": 4104,
+        "scope": "body",
+        "source_architecture": "arch35",
+        "value_identity": "not_established",
+        "acceptance_changes_query_work": false,
+        "sigmoid_placement": "explicit in-kernel scenario, not inferred from BF16 beta",
+        "private_external_fp32_sigmoid_boundary": "not_matched_by_this_conditional_native_program",
+        "observed_geometry_identity": {
+          "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-glm-flash-ws9/auto-forward-a5_glm53flash_tp8_c32_p4k.json",
+          "sha256": "f256626bb5c3e1d0eeb3e559095f3f86ffc73b3c2cc9a3075b4b23e0ae6e3370",
+          "size_bytes": 1881599
+        }
+      },
+      "mxfp8_gate_up_condition": {
+        "parent": {
+          "path": "examples/cases/high-concurrency-20261030/glm-source-accepted-26/a5_glm53flash_tp8_c32_p4k.json",
+          "sha256": "244c077efc8eb4b76c81ff084f3f3f36fe2a5df2c6050e40dd3192eba3646e4d"
+        },
+        "boundary": "two_FP32_UB_products_then_SwiGLU_MX",
+        "l1_k": "explicit512; captured_host_tiling_not_established",
+        "capture_binary_identity": "not_established",
+        "timings_fitted": false
+      },
+      "hccl_composed_condition": {
+        "parent": {
+          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c32_p4k.json",
+          "sha256": "72c436f30bbaf16751c56da722367abf23d6064afacc3d261fd110f2f5b66152"
+        },
+        "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "components": [
+          "explicit AICPU_TS Mesh1D OneShot TP AllReduce",
+          "6-slot convolution state gather/scatter",
+          "EP1 MoEInitRoutingV3 MXFP8",
+          "preserved accepted-state KDA and fused MXFP8 gate-up"
+        ],
+        "conditions": [
+          "captured AICPU operator name does not prove OneShot template or source binary",
+          "original EP1 is preserved; local MoE routing is not EP transport",
+          "state slots are an explicit source-compatible caller extent",
+          "source parent accepted-state and rope0 assumptions are retained"
+        ],
+        "unpriced_services": [
+          "HCCL notify/wait and task issue latency"
+        ],
+        "timings_fitted": false,
+        "service_assumption": "source_heuristic_services",
+        "service_provenance": {
+          "kind": "source-selector heuristic, not A3/A5 measured calibration",
+          "source": "src/ops/op_common/selector/cost_model.cc:115-128,561-583",
+          "rates_bytes_per_second": {
+            "hccl_copy": 1400000000000.0,
+            "hccl_reduce": 900000000000.0
+          },
+          "work_unit": "payload bytes; HBM endpoint bytes remain separate",
+          "control": "kernel/task coefficients do not identify notify service rates"
+        }
+      },
+      "moe_output_reduction": {
+        "selection": "shared+routed token output then one TP reduction",
+        "source_revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        "model": "vllm_ascend/models/glm5next/model.py:197-231",
+        "runner": "vllm_ascend/ops/fused_moe/fused_moe.py:199-237,269-349",
+        "runtime_guard": "vllm_ascend/ops/register_custom_ops.py:127-155",
+        "parent": {
+          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/a5_glm53flash_tp8_c32_p4k.json",
+          "sha256": "b9d4eb433abc56a4f672f491b75a79e3b4a0d45a8cfae6704a593080d76d2504"
+        },
+        "source_audit": {
+          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
+          "sha256": "61f3b6426f2805fdee225975cb48dfa8c189c253b0bf6ca7f8a40d8599ab7b95"
+        },
+        "parallel_condition": "EP=DP=CP=PCP=1; no SP/latent output transform; TP-sharded shared weights",
+        "capture_support": "TP8/DP1 startup; no EP flag; FlashComm1 explicitly disabled; all288 expert banks and local FFN256",
+        "binary_identity": "pinned source is not asserted byte-identical to captured release",
+        "timings_fitted": false
+      },
+      "observable_service_parameters": "data/observations/a5-local-service-regimes-20261030/parameters.json"
+    },
+    "moe_recipe": "tp_join_reduce"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

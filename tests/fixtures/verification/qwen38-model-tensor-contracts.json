@@ -1,0 +1,6781 @@
+{
+  "schema": "mindie-sim.operators/1",
+  "boundary": "sum_of_isolated_device_programs",
+  "operator_occurrences": 1956,
+  "operator_sum_ms": 1556.1359879658207,
+  "operators": [
+    {
+      "operator": {
+        "op_id": "embedding",
+        "family": "embedding",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": -1,
+        "requests": [],
+        "semantic_shape": [
+          83886080
+        ],
+        "local_shape": [
+          83886080
+        ],
+        "padded_shape": [
+          83886080
+        ],
+        "launch_shape": [
+          83886080
+        ],
+        "recipe": "embedding",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "embedding",
+          "input_format": "bf16",
+          "output_format": "bf16"
+        },
+        "flops": 0.0,
+        "hbm_bytes": 335544320.0,
+        "mte2_bytes": 167772160.0,
+        "mte3_bytes": 167772160.0,
+        "vector_ops": 83886080.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 1,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 83886080.0,
+        "memory@r0:s0": 335544320.0,
+        "mte2@r0:s0": 167772160.0,
+        "mte3@r0:s0": 167772160.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.08388608,
+      "total_ms": 0.08388608,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 335544320.0,
+        "mte2@r0:s0": 167772160.0,
+        "mte3@r0:s0": 167772160.0,
+        "vector@r0:s0": 83886080.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.norm1",
+        "family": "rmsnorm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          5120
+        ],
+        "padded_shape": [
+          83886080
+        ],
+        "launch_shape": [
+          83886080
+        ],
+        "recipe": "rmsnorm",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "reduction_width": 5120,
+          "norm_eps": 1e-06,
+          "semantic_family": "rmsnorm",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 167782400.0,
+          "write_bytes": 167772160.0
+        },
+        "flops": 0.0,
+        "hbm_bytes": 335554560.0,
+        "mte2_bytes": 167782400.0,
+        "mte3_bytes": 167772160.0,
+        "vector_ops": 419430400.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 1,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 419430400.0,
+        "memory@r0:s0": 335554560.0,
+        "mte2@r0:s0": 167782400.0,
+        "mte3@r0:s0": 167772160.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.08388864,
+      "total_ms": 0.08388864,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 335554560.0,
+        "mte2@r0:s0": 167782400.0,
+        "mte3@r0:s0": 167772160.0,
+        "vector@r0:s0": 419430400.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.linear_qkvz",
+        "family": "gemm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          16384,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          16384,
+          5120
+        ],
+        "padded_shape": [
+          16384,
+          16384,
+          5120
+        ],
+        "launch_shape": [
+          16384,
+          16384,
+          5120
+        ],
+        "recipe": "linear_qkvz",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "caller_branch": "qkvz_ba_noninterleaved_non_spec",
+          "semantic_family": "gemm",
+          "weight_format": "bf16",
+          "weight_dtype": "bf16",
+          "activation_format": "bf16",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "compute_format": "bf16",
+          "quant_category": "gdn",
+          "catalog_category": "gdn",
+          "packed_weight_bytes": 167772160.0,
+          "weight_representation": "bf16",
+          "dequant_before_compute": false,
+          "program_kind": "matmul"
+        },
+        "flops": 2748779069440.0,
+        "hbm_bytes": 872415232.0,
+        "mte2_bytes": 335544320.0,
+        "mte3_bytes": 536870912.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 6.355006060606061,
+        "memory@r0:s0": 872415232.0,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 536870912.0
+      },
+      "service_delta": {
+        "matrix@r0:s0": -9.22417697779565e-11,
+        "memory@r0:s0": -7.152557373046875e-07
+      },
+      "duration_ms": 6.355272300604267,
+      "total_ms": 305.05307042900483,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 872415231.9999993,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 536870912.0,
+        "matrix@r0:s0": 6.355006060513819
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 131072.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 131072.0,
+        "l1@r0:s0:unit1": 131072.0,
+        "l1@r0:s0:unit2": 131072.0,
+        "l1@r0:s0:unit3": 131072.0,
+        "l1@r0:s0:unit4": 131072.0,
+        "l1@r0:s0:unit5": 131072.0,
+        "l1@r0:s0:unit6": 131072.0,
+        "l1@r0:s0:unit7": 131072.0,
+        "l1@r0:s0:unit8": 131072.0,
+        "l1@r0:s0:unit9": 131072.0,
+        "l1@r0:s0:unit10": 131072.0,
+        "l1@r0:s0:unit11": 131072.0,
+        "l1@r0:s0:unit12": 131072.0,
+        "l1@r0:s0:unit13": 131072.0,
+        "l1@r0:s0:unit14": 131072.0,
+        "l1@r0:s0:unit15": 131072.0,
+        "l1@r0:s0:unit16": 131072.0,
+        "l1@r0:s0:unit17": 131072.0,
+        "l1@r0:s0:unit18": 131072.0,
+        "l1@r0:s0:unit19": 131072.0,
+        "l1@r0:s0:unit20": 131072.0,
+        "l1@r0:s0:unit21": 131072.0,
+        "l1@r0:s0:unit22": 131072.0,
+        "l1@r0:s0:unit23": 131072.0,
+        "l1@r0:s0:unit24": 131072.0,
+        "l1@r0:s0:unit25": 131072.0,
+        "l1@r0:s0:unit26": 131072.0,
+        "l1@r0:s0:unit27": 131072.0,
+        "l1@r0:s0:unit28": 131072.0,
+        "l1@r0:s0:unit29": 131072.0,
+        "l1@r0:s0:unit30": 131072.0,
+        "l1@r0:s0:unit31": 131072.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.linear_beta_alpha",
+        "family": "gemm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          96,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          96,
+          5120
+        ],
+        "padded_shape": [
+          16384,
+          96,
+          5120
+        ],
+        "launch_shape": [
+          16384,
+          96,
+          5120
+        ],
+        "recipe": "linear_beta_alpha",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "caller_branch": "qkvz_ba_noninterleaved_non_spec",
+          "semantic_family": "gemm",
+          "weight_format": "bf16",
+          "weight_dtype": "bf16",
+          "activation_format": "bf16",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "compute_format": "bf16",
+          "quant_category": "gdn",
+          "catalog_category": "gdn",
+          "packed_weight_bytes": 983040.0,
+          "weight_representation": "bf16",
+          "dequant_before_compute": false,
+          "program_kind": "matmul"
+        },
+        "flops": 16106127360.0,
+        "hbm_bytes": 171900928.0,
+        "mte2_bytes": 168755200.0,
+        "mte3_bytes": 3145728.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 0.03723636363636364,
+        "memory@r0:s0": 171900928.0,
+        "mte2@r0:s0": 168755200.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": 8.940696716308594e-08,
+        "matrix@r0:s0": -2.761679773755077e-15,
+        "memory@r0:s0": 8.940696716308594e-08,
+        "mte3@r0:s0": -4.656612873077393e-10
+      },
+      "duration_ms": 0.043207959272727504,
+      "total_ms": 2.0739820450909203,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 171900928.0000001,
+        "mte2@r0:s0": 168755200.0000001,
+        "mte3@r0:s0": 3145727.9999999995,
+        "matrix@r0:s0": 0.037236363636360875
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 98304,
+        "l1@r0:s0": 114688.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 114688.0,
+        "l1@r0:s0:unit1": 114688.0,
+        "l1@r0:s0:unit2": 114688.0,
+        "l1@r0:s0:unit3": 114688.0,
+        "l1@r0:s0:unit4": 114688.0,
+        "l1@r0:s0:unit5": 114688.0,
+        "l1@r0:s0:unit6": 114688.0,
+        "l1@r0:s0:unit7": 114688.0,
+        "l1@r0:s0:unit8": 114688.0,
+        "l1@r0:s0:unit9": 114688.0,
+        "l1@r0:s0:unit10": 114688.0,
+        "l1@r0:s0:unit11": 114688.0,
+        "l1@r0:s0:unit12": 114688.0,
+        "l1@r0:s0:unit13": 114688.0,
+        "l1@r0:s0:unit14": 114688.0,
+        "l1@r0:s0:unit15": 114688.0,
+        "l1@r0:s0:unit16": 114688.0,
+        "l1@r0:s0:unit17": 114688.0,
+        "l1@r0:s0:unit18": 114688.0,
+        "l1@r0:s0:unit19": 114688.0,
+        "l1@r0:s0:unit20": 114688.0,
+        "l1@r0:s0:unit21": 114688.0,
+        "l1@r0:s0:unit22": 114688.0,
+        "l1@r0:s0:unit23": 114688.0,
+        "l1@r0:s0:unit24": 114688.0,
+        "l1@r0:s0:unit25": 114688.0,
+        "l1@r0:s0:unit26": 114688.0,
+        "l1@r0:s0:unit27": 114688.0,
+        "l1@r0:s0:unit28": 114688.0,
+        "l1@r0:s0:unit29": 114688.0,
+        "l1@r0:s0:unit30": 114688.0,
+        "l1@r0:s0:unit31": 114688.0,
+        "l0c@r0:s0:unit0": 98304,
+        "l0c@r0:s0:unit1": 98304,
+        "l0c@r0:s0:unit2": 98304,
+        "l0c@r0:s0:unit3": 98304,
+        "l0c@r0:s0:unit4": 98304,
+        "l0c@r0:s0:unit5": 98304,
+        "l0c@r0:s0:unit6": 98304,
+        "l0c@r0:s0:unit7": 98304,
+        "l0c@r0:s0:unit8": 98304,
+        "l0c@r0:s0:unit9": 98304,
+        "l0c@r0:s0:unit10": 98304,
+        "l0c@r0:s0:unit11": 98304,
+        "l0c@r0:s0:unit12": 98304,
+        "l0c@r0:s0:unit13": 98304,
+        "l0c@r0:s0:unit14": 98304,
+        "l0c@r0:s0:unit15": 98304,
+        "l0c@r0:s0:unit16": 98304,
+        "l0c@r0:s0:unit17": 98304,
+        "l0c@r0:s0:unit18": 98304,
+        "l0c@r0:s0:unit19": 98304,
+        "l0c@r0:s0:unit20": 98304,
+        "l0c@r0:s0:unit21": 98304,
+        "l0c@r0:s0:unit22": 98304,
+        "l0c@r0:s0:unit23": 98304,
+        "l0c@r0:s0:unit24": 98304,
+        "l0c@r0:s0:unit25": 98304,
+        "l0c@r0:s0:unit26": 98304,
+        "l0c@r0:s0:unit27": 98304,
+        "l0c@r0:s0:unit28": 98304,
+        "l0c@r0:s0:unit29": 98304,
+        "l0c@r0:s0:unit30": 98304,
+        "l0c@r0:s0:unit31": 98304
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.beta_contiguous",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          48
+        ],
+        "local_shape": [
+          16384,
+          48
+        ],
+        "padded_shape": [
+          16384,
+          48
+        ],
+        "launch_shape": [
+          16384,
+          48
+        ],
+        "recipe": "beta_contiguous",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              48
+            ],
+            "strides": [
+              96,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              96
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              48
+            ],
+            "strides": [
+              48,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              48
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "gdn_split_ba.contiguous"
+        },
+        "flops": 0,
+        "hbm_bytes": 3145728.0,
+        "mte2_bytes": 1572864.0,
+        "mte3_bytes": 1572864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 3145728.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 1572864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.000786432,
+      "total_ms": 0.037748736,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 3145728.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 1572864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.alpha_contiguous",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          48
+        ],
+        "local_shape": [
+          16384,
+          48
+        ],
+        "padded_shape": [
+          16384,
+          48
+        ],
+        "launch_shape": [
+          16384,
+          48
+        ],
+        "recipe": "alpha_contiguous",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              48
+            ],
+            "strides": [
+              96,
+              1
+            ],
+            "offset": 48,
+            "storage_shape": [
+              16384,
+              96
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              48
+            ],
+            "strides": [
+              48,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              48
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "gdn_split_ba.contiguous"
+        },
+        "flops": 0,
+        "hbm_bytes": 3145728.0,
+        "mte2_bytes": 1572864.0,
+        "mte3_bytes": 1572864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 3145728.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 1572864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.000786432,
+      "total_ms": 0.037748736,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 3145728.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 1572864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.core_output_zero",
+        "family": "tensor_fill",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          48,
+          128
+        ],
+        "local_shape": [
+          16384,
+          48,
+          128
+        ],
+        "padded_shape": [
+          16384,
+          48,
+          128
+        ],
+        "launch_shape": [
+          16384,
+          48,
+          128
+        ],
+        "recipe": "core_output_zero",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {},
+        "flops": 0,
+        "hbm_bytes": 201326592,
+        "mte2_bytes": 0,
+        "mte3_bytes": 201326592,
+        "vector_ops": 100663296,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 100663296.0,
+        "memory@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.050331648,
+      "total_ms": 2.415919104,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0,
+        "vector@r0:s0": 100663296.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.convolution_input_contiguous",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          10240
+        ],
+        "local_shape": [
+          16384,
+          10240
+        ],
+        "padded_shape": [
+          16384,
+          10240
+        ],
+        "launch_shape": [
+          16384,
+          10240
+        ],
+        "recipe": "convolution_input_contiguous",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              10240
+            ],
+            "strides": [
+              16384,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              16384
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              10240
+            ],
+            "strides": [
+              10240,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              10240
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "causal_conv1d_fn.contiguous"
+        },
+        "flops": 0,
+        "hbm_bytes": 671088640.0,
+        "mte2_bytes": 335544320.0,
+        "mte3_bytes": 335544320.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 671088640.0,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 335544320.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.16777216,
+      "total_ms": 8.053063680000001,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 671088640.0,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 335544320.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.short_convolution",
+        "family": "causal_conv1d_fn",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          10240
+        ],
+        "local_shape": [
+          16384,
+          10240
+        ],
+        "padded_shape": [
+          16384,
+          10240
+        ],
+        "launch_shape": [
+          16384,
+          10240
+        ],
+        "recipe": "causal_conv1d_arch35_fn",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "TN",
+        "coverage": "decomposed",
+        "notes": [
+          "source-selected arch35 runMode=0 varlen FN"
+        ],
+        "metadata": {
+          "activation": "silu",
+          "activation_mode": 1,
+          "bias": false,
+          "cache_indices": [
+            1
+          ],
+          "default_core_num": 64,
+          "default_ub_bytes": 253952,
+          "dim": 10240,
+          "dispatch": {
+            "implementation": "causal_conv1d_arch35_fn",
+            "source_branch": "arch35_fn_varlen",
+            "activation": "silu",
+            "activation_mode": 1,
+            "bias": false,
+            "has_bias": false,
+            "run_mode": 0,
+            "input_mode": "varlen",
+            "execution_plan": "CUTBSD",
+            "fn_plan_key": 2,
+            "width": 4,
+            "width_key": 3,
+            "dtype": "bf16",
+            "metadata_placement": "device",
+            "has_cache_indices": true,
+            "has_initial_state": true,
+            "has_init_state_workspace": true,
+            "has_explicit_token_seq_ranges": false,
+            "has_num_accepted_tokens": false,
+            "head_num": 0,
+            "has_conv_states": true,
+            "state_history_slots": 6,
+            "state_rows": 2,
+            "rolling_fast_path": true,
+            "generic_run_seq": false,
+            "null_block_id": 0,
+            "pad_slot_id": -1,
+            "sync_all": true,
+            "one_native_launch": true
+          },
+          "dtype": "bf16",
+          "has_bias": false,
+          "has_initial_state": [
+            false
+          ],
+          "head_num": 0,
+          "host_tiling": {
+            "valid": true,
+            "execution_plan": "CUTBSD",
+            "base_dim": 2560,
+            "base_dim_count": 4,
+            "token_core_budget": 16,
+            "token_block_size": 1024,
+            "token_block_count": 16,
+            "token_blocks_per_core": 1,
+            "token_core_tail_count": 16,
+            "block_dim": 64,
+            "grid_size": 64,
+            "effective_grid_size": 64,
+            "ub_limited_base_dim": 4096,
+            "core_count": 64,
+            "ub_bytes": 253952,
+            "has_initial_state": 1,
+            "has_init_state_workspace": 1,
+            "sync_workspace_bytes": 2048,
+            "snapshot_workspace_bytes": 61440,
+            "workspace_bytes": 16840704,
+            "has_explicit_token_seq_ranges": 0
+          },
+          "implementation": "causal_conv1d_arch35_fn",
+          "lengths": [
+            16384
+          ],
+          "metadata_dtypes": {
+            "query_start_loc": "int32",
+            "cache_indices": "int32",
+            "has_initial_state": "bool"
+          },
+          "metadata_placement": "device",
+          "null_block_id": 0,
+          "pad_slot_id": -1,
+          "reserved_workspace_bytes": 16777216,
+          "resource_work": {
+            "mte2_aic": 0,
+            "mte2_aiv": 337839172.0
+          },
+          "run_mode": 0,
+          "snapshot_workspace_bytes": 61440,
+          "source_image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+          "source_kernel_launches": 1,
+          "source_revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+          "state_history_slots": 6,
+          "state_rows": 2,
+          "state_update": "sequence_tail",
+          "sync_workspace_bytes": 2048,
+          "width": 4,
+          "workspace_bytes": 16840704,
+          "workspace_enabled": true
+        },
+        "source_boundary": "kernel",
+        "flops": 0,
+        "hbm_bytes": 673446980.0,
+        "mte2_bytes": 0,
+        "mte3_bytes": 335605760.0,
+        "vector_ops": 4198594560.0,
+        "link_bytes": 0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "OperatorPlan",
+      "declared_service": {
+        "vector@r0:s0": 4198594560.0,
+        "memory@r0:s0": 673446980.0,
+        "mte3@r0:s0": 335605760.0,
+        "mte2_aiv@r0:s0": 337839172.0
+      },
+      "service_delta": {
+        "vector@r0:s0": -0.005736351013183594,
+        "mte2_aiv@r0:s0": 4.76837158203125e-07,
+        "memory@r0:s0": 4.887580871582031e-06,
+        "mte3@r0:s0": -6.079673767089844e-06
+      },
+      "duration_ms": 0.6222594173344596,
+      "total_ms": 29.86845203205406,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 673446980.0000049,
+        "mte2_aiv@r0:s0": 337839172.0000005,
+        "mte3@r0:s0": 335605759.9999939,
+        "vector@r0:s0": 4198594559.9942636
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 188416
+      },
+      "peak_buffers_per_unit": {
+        "ub@r0:s0:unit0": 188416,
+        "ub@r0:s0:unit1": 188416,
+        "ub@r0:s0:unit2": 188416,
+        "ub@r0:s0:unit3": 188416,
+        "ub@r0:s0:unit4": 188416,
+        "ub@r0:s0:unit5": 188416,
+        "ub@r0:s0:unit6": 188416,
+        "ub@r0:s0:unit7": 188416,
+        "ub@r0:s0:unit8": 188416,
+        "ub@r0:s0:unit9": 188416,
+        "ub@r0:s0:unit10": 188416,
+        "ub@r0:s0:unit11": 188416,
+        "ub@r0:s0:unit12": 188416,
+        "ub@r0:s0:unit13": 188416,
+        "ub@r0:s0:unit14": 188416,
+        "ub@r0:s0:unit15": 188416,
+        "ub@r0:s0:unit16": 188416,
+        "ub@r0:s0:unit17": 188416,
+        "ub@r0:s0:unit18": 188416,
+        "ub@r0:s0:unit19": 188416,
+        "ub@r0:s0:unit20": 188416,
+        "ub@r0:s0:unit21": 188416,
+        "ub@r0:s0:unit22": 188416,
+        "ub@r0:s0:unit23": 188416,
+        "ub@r0:s0:unit24": 188416,
+        "ub@r0:s0:unit25": 188416,
+        "ub@r0:s0:unit26": 188416,
+        "ub@r0:s0:unit27": 188416,
+        "ub@r0:s0:unit28": 188416,
+        "ub@r0:s0:unit29": 188416,
+        "ub@r0:s0:unit30": 188416,
+        "ub@r0:s0:unit31": 188416,
+        "ub@r0:s0:unit32": 188416,
+        "ub@r0:s0:unit33": 188416,
+        "ub@r0:s0:unit34": 188416,
+        "ub@r0:s0:unit35": 188416,
+        "ub@r0:s0:unit36": 188416,
+        "ub@r0:s0:unit37": 188416,
+        "ub@r0:s0:unit38": 188416,
+        "ub@r0:s0:unit39": 188416,
+        "ub@r0:s0:unit40": 188416,
+        "ub@r0:s0:unit41": 188416,
+        "ub@r0:s0:unit42": 188416,
+        "ub@r0:s0:unit43": 188416,
+        "ub@r0:s0:unit44": 188416,
+        "ub@r0:s0:unit45": 188416,
+        "ub@r0:s0:unit46": 188416,
+        "ub@r0:s0:unit47": 188416,
+        "ub@r0:s0:unit48": 188416,
+        "ub@r0:s0:unit49": 188416,
+        "ub@r0:s0:unit50": 188416,
+        "ub@r0:s0:unit51": 188416,
+        "ub@r0:s0:unit52": 188416,
+        "ub@r0:s0:unit53": 188416,
+        "ub@r0:s0:unit54": 188416,
+        "ub@r0:s0:unit55": 188416,
+        "ub@r0:s0:unit56": 188416,
+        "ub@r0:s0:unit57": 188416,
+        "ub@r0:s0:unit58": 188416,
+        "ub@r0:s0:unit59": 188416,
+        "ub@r0:s0:unit60": 188416,
+        "ub@r0:s0:unit61": 188416,
+        "ub@r0:s0:unit62": 188416,
+        "ub@r0:s0:unit63": 188416
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.delta_gates",
+        "family": "gdn_gating",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          48
+        ],
+        "local_shape": [
+          16384,
+          48
+        ],
+        "padded_shape": [
+          786432
+        ],
+        "launch_shape": [
+          786432
+        ],
+        "recipe": "delta_gates",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "outputs": [
+            "fp32_decay",
+            "activation_beta"
+          ],
+          "input_layouts": [
+            {
+              "shape": [
+                16384,
+                48
+              ],
+              "strides": [
+                48,
+                1
+              ],
+              "offset": 0,
+              "storage_shape": [
+                16384,
+                48
+              ]
+            },
+            {
+              "shape": [
+                16384,
+                48
+              ],
+              "strides": [
+                48,
+                1
+              ],
+              "offset": 0,
+              "storage_shape": [
+                16384,
+                48
+              ]
+            }
+          ],
+          "semantic_family": "gdn_gating",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 3146112.0,
+          "write_bytes": 4718592.0
+        },
+        "flops": 0.0,
+        "hbm_bytes": 7864704.0,
+        "mte2_bytes": 3146112.0,
+        "mte3_bytes": 4718592.0,
+        "vector_ops": 9437184.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "TiledPointwise",
+      "declared_service": {
+        "vector@r0:s0": 9437184.0,
+        "memory@r0:s0": 7864704.0,
+        "mte2@r0:s0": 3146112.0,
+        "mte3@r0:s0": 4718592.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": 97920.0,
+        "scalar_store_issue@r0:s0": 786431.9999999966,
+        "memory@r0:s0": 97920.0,
+        "mte3@r0:s0": -1572864.0
+      },
+      "duration_ms": 0.583985303636312,
+      "total_ms": 28.031294574542976,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 7962624.0,
+        "mte2@r0:s0": 3244032.0,
+        "mte3@r0:s0": 3145728.0,
+        "scalar_store_issue@r0:s0": 786431.9999999966,
+        "vector@r0:s0": 9437184.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.q_flat",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          2048
+        ],
+        "local_shape": [
+          16384,
+          2048
+        ],
+        "padded_shape": [
+          16384,
+          2048
+        ],
+        "launch_shape": [
+          16384,
+          2048
+        ],
+        "recipe": "q_flat",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              2048
+            ],
+            "strides": [
+              10240,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              10240
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              2048
+            ],
+            "strides": [
+              2048,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              2048
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "reshape_crosses_storage_gap"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.k_flat",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          2048
+        ],
+        "local_shape": [
+          16384,
+          2048
+        ],
+        "padded_shape": [
+          16384,
+          2048
+        ],
+        "launch_shape": [
+          16384,
+          2048
+        ],
+        "recipe": "k_flat",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              2048
+            ],
+            "strides": [
+              10240,
+              1
+            ],
+            "offset": 2048,
+            "storage_shape": [
+              16384,
+              10240
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              2048
+            ],
+            "strides": [
+              2048,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              2048
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "reshape_crosses_storage_gap"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.v_flat",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          6144
+        ],
+        "local_shape": [
+          16384,
+          6144
+        ],
+        "padded_shape": [
+          16384,
+          6144
+        ],
+        "launch_shape": [
+          16384,
+          6144
+        ],
+        "recipe": "v_flat",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              6144
+            ],
+            "strides": [
+              10240,
+              1
+            ],
+            "offset": 4096,
+            "storage_shape": [
+              16384,
+              10240
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              6144
+            ],
+            "strides": [
+              6144,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              6144
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "reshape_crosses_storage_gap"
+        },
+        "flops": 0,
+        "hbm_bytes": 402653184.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.100663296,
+      "total_ms": 4.831838208,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.qkv_concatenate",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          167772160
+        ],
+        "local_shape": [
+          167772160
+        ],
+        "padded_shape": [
+          167772160
+        ],
+        "launch_shape": [
+          167772160
+        ],
+        "recipe": "qkv_concatenate",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "materialization_reason": "concatenate",
+          "source_outputs": [
+            0,
+            0,
+            0
+          ],
+          "source_layouts": [
+            {
+              "shape": [
+                33554432
+              ],
+              "strides": [
+                1
+              ],
+              "offset": 0,
+              "storage_shape": [
+                16384,
+                2048
+              ]
+            },
+            {
+              "shape": [
+                33554432
+              ],
+              "strides": [
+                1
+              ],
+              "offset": 0,
+              "storage_shape": [
+                16384,
+                2048
+              ]
+            },
+            {
+              "shape": [
+                100663296
+              ],
+              "strides": [
+                1
+              ],
+              "offset": 0,
+              "storage_shape": [
+                16384,
+                6144
+              ]
+            }
+          ]
+        },
+        "flops": 0,
+        "hbm_bytes": 671088640.0,
+        "mte2_bytes": 335544320.0,
+        "mte3_bytes": 335544320.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 671088640.0,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 335544320.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.16777216,
+      "total_ms": 8.053063680000001,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 671088640.0,
+        "mte2@r0:s0": 335544320.0,
+        "mte3@r0:s0": 335544320.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gather_recurrent_state",
+        "family": "state_gather",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "local_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "padded_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "launch_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "recipe": "gather_recurrent_state",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "state_layout": "V,K",
+          "has_initial_state": [
+            false
+          ],
+          "index_dtype": "int32",
+          "metadata_cache_reuse": false
+        },
+        "flops": 0,
+        "hbm_bytes": 3146496,
+        "mte2_bytes": 768,
+        "mte3_bytes": 3145728,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 3146496.0,
+        "mte2@r0:s0": 768.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.000786624,
+      "total_ms": 0.037757952,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 3146496.0,
+        "mte2@r0:s0": 768.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.beta_fp32",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16384,
+          48
+        ],
+        "local_shape": [
+          1,
+          16384,
+          48
+        ],
+        "padded_shape": [
+          1,
+          16384,
+          48
+        ],
+        "launch_shape": [
+          1,
+          16384,
+          48
+        ],
+        "recipe": "beta_fp32",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16384,
+              48
+            ],
+            "strides": [
+              786432,
+              48,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              48
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16384,
+              48
+            ],
+            "strides": [
+              786432,
+              48,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              48
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "fp32",
+          "source_output": "beta",
+          "materialization_reason": "fla_common_gate_precision"
+        },
+        "flops": 0,
+        "hbm_bytes": 4718592.0,
+        "mte2_bytes": 1572864.0,
+        "mte3_bytes": 3145728.0,
+        "vector_ops": 786432,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 786432.0,
+        "memory@r0:s0": 4718592.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.0011796480000000002,
+      "total_ms": 0.05662310400000001,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 4718592.0,
+        "mte2@r0:s0": 1572864.0,
+        "mte3@r0:s0": 3145728.0,
+        "vector@r0:s0": 786432.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.g_head_first",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          16384
+        ],
+        "local_shape": [
+          1,
+          48,
+          16384
+        ],
+        "padded_shape": [
+          1,
+          48,
+          16384
+        ],
+        "launch_shape": [
+          1,
+          48,
+          16384
+        ],
+        "recipe": "g_head_first",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              48,
+              16384
+            ],
+            "strides": [
+              786432,
+              1,
+              48
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              48
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              48,
+              16384
+            ],
+            "strides": [
+              786432,
+              16384,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              48,
+              16384
+            ]
+          },
+          "input_format": "fp32",
+          "output_format": "fp32",
+          "source_output": "decay",
+          "materialization_reason": "fla_BSN_to_BNS"
+        },
+        "flops": 0,
+        "hbm_bytes": 6291456.0,
+        "mte2_bytes": 3145728.0,
+        "mte3_bytes": 3145728.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.001572864,
+      "total_ms": 0.075497472,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.beta_head_first",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          16384
+        ],
+        "local_shape": [
+          1,
+          48,
+          16384
+        ],
+        "padded_shape": [
+          1,
+          48,
+          16384
+        ],
+        "launch_shape": [
+          1,
+          48,
+          16384
+        ],
+        "recipe": "beta_head_first",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              48,
+              16384
+            ],
+            "strides": [
+              786432,
+              1,
+              48
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              48
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              48,
+              16384
+            ],
+            "strides": [
+              786432,
+              16384,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              48,
+              16384
+            ]
+          },
+          "input_format": "fp32",
+          "output_format": "fp32",
+          "source_output": 0,
+          "materialization_reason": "fla_BSN_to_BNS"
+        },
+        "flops": 0,
+        "hbm_bytes": 6291456.0,
+        "mte2_bytes": 3145728.0,
+        "mte3_bytes": 3145728.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.001572864,
+      "total_ms": 0.075497472,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.q_head_first",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "local_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "padded_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "launch_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "recipe": "q_head_first",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16,
+              16384,
+              128
+            ],
+            "strides": [
+              33554432,
+              128,
+              2048,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              167772160
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16,
+              16384,
+              128
+            ],
+            "strides": [
+              33554432,
+              2097152,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16,
+              16384,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "fla_BSND_to_BNSD"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.k_head_first",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "local_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "padded_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "launch_shape": [
+          1,
+          16,
+          16384,
+          128
+        ],
+        "recipe": "k_head_first",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16,
+              16384,
+              128
+            ],
+            "strides": [
+              33554432,
+              128,
+              2048,
+              1
+            ],
+            "offset": 33554432,
+            "storage_shape": [
+              167772160
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16,
+              16384,
+              128
+            ],
+            "strides": [
+              33554432,
+              2097152,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16,
+              16384,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "fla_BSND_to_BNSD"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.v_head_first",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "local_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "padded_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "launch_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "recipe": "v_head_first",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              48,
+              16384,
+              128
+            ],
+            "strides": [
+              100663296,
+              128,
+              6144,
+              1
+            ],
+            "offset": 67108864,
+            "storage_shape": [
+              167772160
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              48,
+              16384,
+              128
+            ],
+            "strides": [
+              100663296,
+              2097152,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              48,
+              16384,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "fla_BSND_to_BNSD"
+        },
+        "flops": 0,
+        "hbm_bytes": 402653184.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.100663296,
+      "total_ms": 4.831838208,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gdn_prepare",
+        "family": "gdn_prepare",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "local_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "padded_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "launch_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "recipe": "gdn_prepare_arch35_mix_aic_aiv_1_2",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "allow_neg_eigval": false,
+          "chunk": 64,
+          "compiler_ftz": true,
+          "dispatch": {
+            "implementation": "gdn_prepare_arch35_mix_aic_aiv_1_2",
+            "gate_dtype": "fp32",
+            "use_exp2": true,
+            "use_qk_l2norm_in_kernel": true,
+            "use_beta_sigmoid_in_kernel": false,
+            "use_gate_in_kernel": false,
+            "output_a": true,
+            "fp32_mmad_mode": "fp32",
+            "compiler_ftz": true
+          },
+          "dtype": "bf16",
+          "fp32_mmad_mode": "fp32",
+          "gate_dtype": "fp32",
+          "gqa_ratio": 3,
+          "has_a_log": false,
+          "has_dt_bias": false,
+          "head_dim_k": 128,
+          "head_dim_v": 128,
+          "heads": 48,
+          "implementation": "gdn_prepare_arch35_mix_aic_aiv_1_2",
+          "key_heads": 16,
+          "lengths": [
+            16384
+          ],
+          "output_a": true,
+          "output_beta": true,
+          "register_service": "typed_capacity_envelope; masked_service_and_latency_uncharacterized",
+          "resource_work": {
+            "ub_copy": 201326592.0,
+            "reg_shuffle_lanes": 40894464,
+            "reg_special_lanes": 1048576,
+            "mte1": 2080374784.0,
+            "reg_alu_lanes": 344334336,
+            "reg_data_writes": 9969664,
+            "reg_issue_slots": 13840384,
+            "reg_ub_stores": 1609728,
+            "reg_reduce_lanes": 33554432,
+            "fixpipe": 838860800.0,
+            "reg_ub_accesses": 2707456,
+            "mte2_aic": 301989888,
+            "mte2_aiv": 543162368.0
+          },
+          "tasks_per_pack": 3,
+          "use_beta_sigmoid_in_kernel": false,
+          "use_exp2": true,
+          "use_gate_in_kernel": false,
+          "use_qk_l2norm_in_kernel": true
+        },
+        "source_boundary": "kernel",
+        "flops": 55834574848.0,
+        "hbm_bytes": 1692401664.0,
+        "mte2_bytes": 0,
+        "mte3_bytes": 1321730048.0,
+        "vector_ops": 2177368064.0,
+        "link_bytes": 0,
+        "link_scope": "d2d",
+        "matrix_flops": {
+          "bf16": 30064771072.0,
+          "fp32": 25769803776.0
+        }
+      },
+      "occurrences": 48,
+      "program": "OperatorPlan",
+      "declared_service": {
+        "matrix@r0:s0": 1.0227587878787878,
+        "vector@r0:s0": 2670592000.0,
+        "memory@r0:s0": 1692401664.0,
+        "mte3@r0:s0": 1321730048.0,
+        "reg_shuffle_lanes@r0:s0": 40894464.0,
+        "reg_special_lanes@r0:s0": 1048576.0,
+        "mte1@r0:s0": 2080374784.0,
+        "reg_alu_lanes@r0:s0": 344334336.0,
+        "reg_data_writes@r0:s0": 9969664.0,
+        "reg_ub_stores@r0:s0": 1609728.0,
+        "reg_reduce_lanes@r0:s0": 33554432.0,
+        "fixpipe@r0:s0": 838860800.0,
+        "reg_ub_accesses@r0:s0": 2707456.0,
+        "mte2_aic@r0:s0": 301989888.0,
+        "mte2_aiv@r0:s0": 543162368.0
+      },
+      "service_delta": {
+        "matrix@r0:s0": -1.014077710692618e-12,
+        "vector@r0:s0": 0.0004978179931640625,
+        "mte2_aiv@r0:s0": 0.0002665519714355469,
+        "mte2_aic@r0:s0": -2.187490463256836e-05,
+        "memory@r0:s0": -5.745887756347656e-05,
+        "mte3@r0:s0": 0.00016689300537109375
+      },
+      "duration_ms": 1.228873098666895,
+      "total_ms": 58.985908736010956,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "fixpipe@r0:s0": 838860800.0,
+        "memory@r0:s0": 1692401663.9999425,
+        "mte1@r0:s0": 2080374784.0,
+        "mte2_aic@r0:s0": 301989887.9999781,
+        "mte2_aiv@r0:s0": 543162368.0002666,
+        "mte3@r0:s0": 1321730048.000167,
+        "reg_alu_lanes@r0:s0": 344334336.0,
+        "reg_data_writes@r0:s0": 9969664.0,
+        "reg_reduce_lanes@r0:s0": 33554432.0,
+        "reg_shuffle_lanes@r0:s0": 40894464.0,
+        "reg_special_lanes@r0:s0": 1048576.0,
+        "reg_ub_accesses@r0:s0": 2707456.0,
+        "reg_ub_stores@r0:s0": 1609728.0,
+        "vector@r0:s0": 2670592000.000498,
+        "matrix@r0:s0": 1.0227587878777737
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 65536,
+        "l0b@r0:s0": 65536,
+        "l0c@r0:s0": 262144,
+        "l1@r0:s0": 507904,
+        "ub@r0:s0": 241664
+      },
+      "peak_buffers_per_unit": {
+        "ub@r0:s0:unit0": 241664,
+        "ub@r0:s0:unit1": 241664,
+        "l1@r0:s0:unit0": 507904,
+        "l0a@r0:s0:unit0": 65536,
+        "l0b@r0:s0:unit0": 65536,
+        "l0c@r0:s0:unit0": 262144,
+        "ub@r0:s0:unit2": 241664,
+        "ub@r0:s0:unit3": 241664,
+        "l1@r0:s0:unit1": 507904,
+        "l0a@r0:s0:unit1": 65536,
+        "l0b@r0:s0:unit1": 65536,
+        "l0c@r0:s0:unit1": 262144,
+        "ub@r0:s0:unit4": 241664,
+        "ub@r0:s0:unit5": 241664,
+        "l1@r0:s0:unit2": 507904,
+        "l0a@r0:s0:unit2": 65536,
+        "l0b@r0:s0:unit2": 65536,
+        "l0c@r0:s0:unit2": 262144,
+        "ub@r0:s0:unit6": 241664,
+        "ub@r0:s0:unit7": 241664,
+        "l1@r0:s0:unit3": 507904,
+        "l0a@r0:s0:unit3": 65536,
+        "l0b@r0:s0:unit3": 65536,
+        "l0c@r0:s0:unit3": 262144,
+        "ub@r0:s0:unit8": 241664,
+        "ub@r0:s0:unit9": 241664,
+        "l1@r0:s0:unit4": 507904,
+        "l0a@r0:s0:unit4": 65536,
+        "l0b@r0:s0:unit4": 65536,
+        "l0c@r0:s0:unit4": 262144,
+        "ub@r0:s0:unit10": 241664,
+        "ub@r0:s0:unit11": 241664,
+        "l1@r0:s0:unit5": 507904,
+        "l0a@r0:s0:unit5": 65536,
+        "l0b@r0:s0:unit5": 65536,
+        "l0c@r0:s0:unit5": 262144,
+        "ub@r0:s0:unit12": 241664,
+        "ub@r0:s0:unit13": 241664,
+        "l1@r0:s0:unit6": 507904,
+        "l0a@r0:s0:unit6": 65536,
+        "l0b@r0:s0:unit6": 65536,
+        "l0c@r0:s0:unit6": 262144,
+        "ub@r0:s0:unit14": 241664,
+        "ub@r0:s0:unit15": 241664,
+        "l1@r0:s0:unit7": 507904,
+        "l0a@r0:s0:unit7": 65536,
+        "l0b@r0:s0:unit7": 65536,
+        "l0c@r0:s0:unit7": 262144,
+        "ub@r0:s0:unit16": 241664,
+        "ub@r0:s0:unit17": 241664,
+        "l1@r0:s0:unit8": 507904,
+        "l0a@r0:s0:unit8": 65536,
+        "l0b@r0:s0:unit8": 65536,
+        "l0c@r0:s0:unit8": 262144,
+        "ub@r0:s0:unit18": 241664,
+        "ub@r0:s0:unit19": 241664,
+        "l1@r0:s0:unit9": 507904,
+        "l0a@r0:s0:unit9": 65536,
+        "l0b@r0:s0:unit9": 65536,
+        "l0c@r0:s0:unit9": 262144,
+        "ub@r0:s0:unit20": 241664,
+        "ub@r0:s0:unit21": 241664,
+        "l1@r0:s0:unit10": 507904,
+        "l0a@r0:s0:unit10": 65536,
+        "l0b@r0:s0:unit10": 65536,
+        "l0c@r0:s0:unit10": 262144,
+        "ub@r0:s0:unit22": 241664,
+        "ub@r0:s0:unit23": 241664,
+        "l1@r0:s0:unit11": 507904,
+        "l0a@r0:s0:unit11": 65536,
+        "l0b@r0:s0:unit11": 65536,
+        "l0c@r0:s0:unit11": 262144,
+        "ub@r0:s0:unit24": 241664,
+        "ub@r0:s0:unit25": 241664,
+        "l1@r0:s0:unit12": 507904,
+        "l0a@r0:s0:unit12": 65536,
+        "l0b@r0:s0:unit12": 65536,
+        "l0c@r0:s0:unit12": 262144,
+        "ub@r0:s0:unit26": 241664,
+        "ub@r0:s0:unit27": 241664,
+        "l1@r0:s0:unit13": 507904,
+        "l0a@r0:s0:unit13": 65536,
+        "l0b@r0:s0:unit13": 65536,
+        "l0c@r0:s0:unit13": 262144,
+        "ub@r0:s0:unit28": 241664,
+        "ub@r0:s0:unit29": 241664,
+        "l1@r0:s0:unit14": 507904,
+        "l0a@r0:s0:unit14": 65536,
+        "l0b@r0:s0:unit14": 65536,
+        "l0c@r0:s0:unit14": 262144,
+        "ub@r0:s0:unit30": 241664,
+        "ub@r0:s0:unit31": 241664,
+        "l1@r0:s0:unit15": 507904,
+        "l0a@r0:s0:unit15": 65536,
+        "l0b@r0:s0:unit15": 65536,
+        "l0c@r0:s0:unit15": 262144,
+        "ub@r0:s0:unit32": 241664,
+        "ub@r0:s0:unit33": 241664,
+        "l1@r0:s0:unit16": 507904,
+        "l0a@r0:s0:unit16": 65536,
+        "l0b@r0:s0:unit16": 65536,
+        "l0c@r0:s0:unit16": 262144,
+        "ub@r0:s0:unit34": 241664,
+        "ub@r0:s0:unit35": 241664,
+        "l1@r0:s0:unit17": 507904,
+        "l0a@r0:s0:unit17": 65536,
+        "l0b@r0:s0:unit17": 65536,
+        "l0c@r0:s0:unit17": 262144,
+        "ub@r0:s0:unit36": 241664,
+        "ub@r0:s0:unit37": 241664,
+        "l1@r0:s0:unit18": 507904,
+        "l0a@r0:s0:unit18": 65536,
+        "l0b@r0:s0:unit18": 65536,
+        "l0c@r0:s0:unit18": 262144,
+        "ub@r0:s0:unit38": 241664,
+        "ub@r0:s0:unit39": 241664,
+        "l1@r0:s0:unit19": 507904,
+        "l0a@r0:s0:unit19": 65536,
+        "l0b@r0:s0:unit19": 65536,
+        "l0c@r0:s0:unit19": 262144,
+        "ub@r0:s0:unit40": 241664,
+        "ub@r0:s0:unit41": 241664,
+        "l1@r0:s0:unit20": 507904,
+        "l0a@r0:s0:unit20": 65536,
+        "l0b@r0:s0:unit20": 65536,
+        "l0c@r0:s0:unit20": 262144,
+        "ub@r0:s0:unit42": 241664,
+        "ub@r0:s0:unit43": 241664,
+        "l1@r0:s0:unit21": 507904,
+        "l0a@r0:s0:unit21": 65536,
+        "l0b@r0:s0:unit21": 65536,
+        "l0c@r0:s0:unit21": 262144,
+        "ub@r0:s0:unit44": 241664,
+        "ub@r0:s0:unit45": 241664,
+        "l1@r0:s0:unit22": 507904,
+        "l0a@r0:s0:unit22": 65536,
+        "l0b@r0:s0:unit22": 65536,
+        "l0c@r0:s0:unit22": 262144,
+        "ub@r0:s0:unit46": 241664,
+        "ub@r0:s0:unit47": 241664,
+        "l1@r0:s0:unit23": 507904,
+        "l0a@r0:s0:unit23": 65536,
+        "l0b@r0:s0:unit23": 65536,
+        "l0c@r0:s0:unit23": 262144,
+        "ub@r0:s0:unit48": 241664,
+        "ub@r0:s0:unit49": 241664,
+        "l1@r0:s0:unit24": 507904,
+        "l0a@r0:s0:unit24": 65536,
+        "l0b@r0:s0:unit24": 65536,
+        "l0c@r0:s0:unit24": 262144,
+        "ub@r0:s0:unit50": 241664,
+        "ub@r0:s0:unit51": 241664,
+        "l1@r0:s0:unit25": 507904,
+        "l0a@r0:s0:unit25": 65536,
+        "l0b@r0:s0:unit25": 65536,
+        "l0c@r0:s0:unit25": 262144,
+        "ub@r0:s0:unit52": 241664,
+        "ub@r0:s0:unit53": 241664,
+        "l1@r0:s0:unit26": 507904,
+        "l0a@r0:s0:unit26": 65536,
+        "l0b@r0:s0:unit26": 65536,
+        "l0c@r0:s0:unit26": 262144,
+        "ub@r0:s0:unit54": 241664,
+        "ub@r0:s0:unit55": 241664,
+        "l1@r0:s0:unit27": 507904,
+        "l0a@r0:s0:unit27": 65536,
+        "l0b@r0:s0:unit27": 65536,
+        "l0c@r0:s0:unit27": 262144,
+        "ub@r0:s0:unit56": 241664,
+        "ub@r0:s0:unit57": 241664,
+        "l1@r0:s0:unit28": 507904,
+        "l0a@r0:s0:unit28": 65536,
+        "l0b@r0:s0:unit28": 65536,
+        "l0c@r0:s0:unit28": 262144,
+        "ub@r0:s0:unit58": 241664,
+        "ub@r0:s0:unit59": 241664,
+        "l1@r0:s0:unit29": 507904,
+        "l0a@r0:s0:unit29": 65536,
+        "l0b@r0:s0:unit29": 65536,
+        "l0c@r0:s0:unit29": 262144,
+        "ub@r0:s0:unit60": 241664,
+        "ub@r0:s0:unit61": 241664,
+        "l1@r0:s0:unit30": 507904,
+        "l0a@r0:s0:unit30": 65536,
+        "l0b@r0:s0:unit30": 65536,
+        "l0c@r0:s0:unit30": 262144,
+        "ub@r0:s0:unit62": 241664,
+        "ub@r0:s0:unit63": 241664,
+        "l1@r0:s0:unit31": 507904,
+        "l0a@r0:s0:unit31": 65536,
+        "l0b@r0:s0:unit31": 65536,
+        "l0c@r0:s0:unit31": 262144
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gdn_state",
+        "family": "gdn_state",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "local_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "padded_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "launch_shape": [
+          1,
+          48,
+          16384,
+          128
+        ],
+        "recipe": "chunk_fwd_h",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "BNSD",
+        "coverage": "decomposed",
+        "notes": [
+          "variable-length packed BNSD call; chunk-level row padding is in plan work",
+          "arch35 FP32 resident state; physical state layout is in dispatch"
+        ],
+        "metadata": {
+          "aic_head_slots": 4,
+          "aiv_per_aic": 2,
+          "chunk": 64,
+          "chunks_per_sequence": [
+            256
+          ],
+          "dispatch": {
+            "implementation": "chunk_fwd_h/arch35/state_fp32/resident/scalar_g",
+            "state_v_first": true,
+            "use_exp2": true,
+            "gate_dtype": "fp32",
+            "use_initial_state": true,
+            "output_final_state": true
+          },
+          "dk": 128,
+          "dtype": "bf16",
+          "dv": 128,
+          "gate_dtype": "fp32",
+          "gate_mode": "scalar_g",
+          "group_size": 3,
+          "h_semantic_strides": [
+            1,
+            128
+          ],
+          "h_snapshot_dtype": "bf16",
+          "head_tasks": 48,
+          "heads": 48,
+          "implementation": "chunk_fwd_h/arch35/state_fp32/resident/scalar_g",
+          "key_heads": 16,
+          "lengths": [
+            16384
+          ],
+          "output_final_state": true,
+          "resource_work": {
+            "mte1": 1006632960.0,
+            "fixpipe": 1207959552.0,
+            "mte2_aic": 939524096.0,
+            "mte2_aiv": 210763776.0
+          },
+          "right_workspace": "gm",
+          "save_new_value": true,
+          "state_layout": "V,K",
+          "state_precision": "fp32",
+          "state_resident": true,
+          "state_v_first": true,
+          "state_workspace_bytes_per_chunk": 0,
+          "total_tokens": 16384,
+          "update_operands": [
+            "right_transposed",
+            "kg"
+          ],
+          "use_exp2": true,
+          "use_initial_state": true
+        },
+        "source_boundary": "kernel",
+        "flops": 51539607552.0,
+        "hbm_bytes": 1958739968.0,
+        "mte2_bytes": 0,
+        "mte3_bytes": 808452096.0,
+        "vector_ops": 1009029120.0,
+        "link_bytes": 0,
+        "link_scope": "d2d",
+        "matrix_flops": {
+          "bf16": 51539607552.0
+        }
+      },
+      "occurrences": 48,
+      "program": "OperatorPlan",
+      "declared_service": {
+        "matrix@r0:s0": 0.11915636363636363,
+        "vector@r0:s0": 1009029120.0,
+        "memory@r0:s0": 1958739968.0,
+        "mte3@r0:s0": 808452096.0,
+        "mte1@r0:s0": 1006632960.0,
+        "fixpipe@r0:s0": 1207959552.0,
+        "mte2_aic@r0:s0": 939524096.0,
+        "mte2_aiv@r0:s0": 210763776.0
+      },
+      "service_delta": {
+        "matrix@r0:s0": -4.5172199314436057e-14,
+        "vector@r0:s0": -0.0003248453140258789,
+        "mte2_aiv@r0:s0": -4.303455352783203e-05,
+        "fixpipe@r0:s0": 6.103515625e-05,
+        "mte2_aic@r0:s0": -0.0007776021957397461,
+        "mte1@r0:s0": -0.0003184080123901367,
+        "memory@r0:s0": -0.0013394355773925781,
+        "mte3@r0:s0": -0.0003209114074707031
+      },
+      "duration_ms": 0.6831744955866843,
+      "total_ms": 32.79237578816085,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "fixpipe@r0:s0": 1207959552.000061,
+        "memory@r0:s0": 1958739967.9986606,
+        "mte1@r0:s0": 1006632959.9996816,
+        "mte2_aic@r0:s0": 939524095.9992224,
+        "mte2_aiv@r0:s0": 210763775.99995697,
+        "mte3@r0:s0": 808452095.9996791,
+        "vector@r0:s0": 1009029119.9996752,
+        "matrix@r0:s0": 0.11915636363631846
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 32768,
+        "l0b@r0:s0": 65536,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 327680,
+        "ub@r0:s0": 231424
+      },
+      "peak_buffers_per_unit": {
+        "ub@r0:s0:unit0": 231424,
+        "ub@r0:s0:unit1": 231424,
+        "l1@r0:s0:unit0": 327680,
+        "l0a@r0:s0:unit0": 32768,
+        "l0b@r0:s0:unit0": 65536,
+        "l0c@r0:s0:unit0": 131072,
+        "ub@r0:s0:unit2": 231424,
+        "ub@r0:s0:unit3": 231424,
+        "l1@r0:s0:unit1": 327680,
+        "l0a@r0:s0:unit1": 32768,
+        "l0b@r0:s0:unit1": 65536,
+        "l0c@r0:s0:unit1": 131072,
+        "ub@r0:s0:unit4": 231424,
+        "ub@r0:s0:unit5": 231424,
+        "l1@r0:s0:unit2": 327680,
+        "l0a@r0:s0:unit2": 32768,
+        "l0b@r0:s0:unit2": 65536,
+        "l0c@r0:s0:unit2": 131072,
+        "ub@r0:s0:unit6": 231424,
+        "ub@r0:s0:unit7": 231424,
+        "l1@r0:s0:unit3": 327680,
+        "l0a@r0:s0:unit3": 32768,
+        "l0b@r0:s0:unit3": 65536,
+        "l0c@r0:s0:unit3": 131072,
+        "ub@r0:s0:unit8": 231424,
+        "ub@r0:s0:unit9": 231424,
+        "l1@r0:s0:unit4": 327680,
+        "l0a@r0:s0:unit4": 32768,
+        "l0b@r0:s0:unit4": 65536,
+        "l0c@r0:s0:unit4": 131072,
+        "ub@r0:s0:unit10": 231424,
+        "ub@r0:s0:unit11": 231424,
+        "l1@r0:s0:unit5": 327680,
+        "l0a@r0:s0:unit5": 32768,
+        "l0b@r0:s0:unit5": 65536,
+        "l0c@r0:s0:unit5": 131072,
+        "ub@r0:s0:unit12": 231424,
+        "ub@r0:s0:unit13": 231424,
+        "l1@r0:s0:unit6": 327680,
+        "l0a@r0:s0:unit6": 32768,
+        "l0b@r0:s0:unit6": 65536,
+        "l0c@r0:s0:unit6": 131072,
+        "ub@r0:s0:unit14": 231424,
+        "ub@r0:s0:unit15": 231424,
+        "l1@r0:s0:unit7": 327680,
+        "l0a@r0:s0:unit7": 32768,
+        "l0b@r0:s0:unit7": 65536,
+        "l0c@r0:s0:unit7": 131072,
+        "ub@r0:s0:unit16": 231424,
+        "ub@r0:s0:unit17": 231424,
+        "l1@r0:s0:unit8": 327680,
+        "l0a@r0:s0:unit8": 32768,
+        "l0b@r0:s0:unit8": 65536,
+        "l0c@r0:s0:unit8": 131072,
+        "ub@r0:s0:unit18": 231424,
+        "ub@r0:s0:unit19": 231424,
+        "l1@r0:s0:unit9": 327680,
+        "l0a@r0:s0:unit9": 32768,
+        "l0b@r0:s0:unit9": 65536,
+        "l0c@r0:s0:unit9": 131072,
+        "ub@r0:s0:unit20": 231424,
+        "ub@r0:s0:unit21": 231424,
+        "l1@r0:s0:unit10": 327680,
+        "l0a@r0:s0:unit10": 32768,
+        "l0b@r0:s0:unit10": 65536,
+        "l0c@r0:s0:unit10": 131072,
+        "ub@r0:s0:unit22": 231424,
+        "ub@r0:s0:unit23": 231424,
+        "l1@r0:s0:unit11": 327680,
+        "l0a@r0:s0:unit11": 32768,
+        "l0b@r0:s0:unit11": 65536,
+        "l0c@r0:s0:unit11": 131072,
+        "ub@r0:s0:unit24": 231424,
+        "ub@r0:s0:unit25": 231424,
+        "l1@r0:s0:unit12": 327680,
+        "l0a@r0:s0:unit12": 32768,
+        "l0b@r0:s0:unit12": 65536,
+        "l0c@r0:s0:unit12": 131072,
+        "ub@r0:s0:unit26": 231424,
+        "ub@r0:s0:unit27": 231424,
+        "l1@r0:s0:unit13": 327680,
+        "l0a@r0:s0:unit13": 32768,
+        "l0b@r0:s0:unit13": 65536,
+        "l0c@r0:s0:unit13": 131072,
+        "ub@r0:s0:unit28": 231424,
+        "ub@r0:s0:unit29": 231424,
+        "l1@r0:s0:unit14": 327680,
+        "l0a@r0:s0:unit14": 32768,
+        "l0b@r0:s0:unit14": 65536,
+        "l0c@r0:s0:unit14": 131072,
+        "ub@r0:s0:unit30": 231424,
+        "ub@r0:s0:unit31": 231424,
+        "l1@r0:s0:unit15": 327680,
+        "l0a@r0:s0:unit15": 32768,
+        "l0b@r0:s0:unit15": 65536,
+        "l0c@r0:s0:unit15": 131072,
+        "ub@r0:s0:unit32": 231424,
+        "ub@r0:s0:unit33": 231424,
+        "l1@r0:s0:unit16": 327680,
+        "l0a@r0:s0:unit16": 32768,
+        "l0b@r0:s0:unit16": 65536,
+        "l0c@r0:s0:unit16": 131072,
+        "ub@r0:s0:unit34": 231424,
+        "ub@r0:s0:unit35": 231424,
+        "l1@r0:s0:unit17": 327680,
+        "l0a@r0:s0:unit17": 32768,
+        "l0b@r0:s0:unit17": 65536,
+        "l0c@r0:s0:unit17": 131072,
+        "ub@r0:s0:unit36": 231424,
+        "ub@r0:s0:unit37": 231424,
+        "l1@r0:s0:unit18": 327680,
+        "l0a@r0:s0:unit18": 32768,
+        "l0b@r0:s0:unit18": 65536,
+        "l0c@r0:s0:unit18": 131072,
+        "ub@r0:s0:unit38": 231424,
+        "ub@r0:s0:unit39": 231424,
+        "l1@r0:s0:unit19": 327680,
+        "l0a@r0:s0:unit19": 32768,
+        "l0b@r0:s0:unit19": 65536,
+        "l0c@r0:s0:unit19": 131072,
+        "ub@r0:s0:unit40": 231424,
+        "ub@r0:s0:unit41": 231424,
+        "l1@r0:s0:unit20": 327680,
+        "l0a@r0:s0:unit20": 32768,
+        "l0b@r0:s0:unit20": 65536,
+        "l0c@r0:s0:unit20": 131072,
+        "ub@r0:s0:unit42": 231424,
+        "ub@r0:s0:unit43": 231424,
+        "l1@r0:s0:unit21": 327680,
+        "l0a@r0:s0:unit21": 32768,
+        "l0b@r0:s0:unit21": 65536,
+        "l0c@r0:s0:unit21": 131072,
+        "ub@r0:s0:unit44": 231424,
+        "ub@r0:s0:unit45": 231424,
+        "l1@r0:s0:unit22": 327680,
+        "l0a@r0:s0:unit22": 32768,
+        "l0b@r0:s0:unit22": 65536,
+        "l0c@r0:s0:unit22": 131072,
+        "ub@r0:s0:unit46": 231424,
+        "ub@r0:s0:unit47": 231424,
+        "l1@r0:s0:unit23": 327680,
+        "l0a@r0:s0:unit23": 32768,
+        "l0b@r0:s0:unit23": 65536,
+        "l0c@r0:s0:unit23": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gdn_output",
+        "family": "gdn_output",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16384,
+          48,
+          128
+        ],
+        "local_shape": [
+          1,
+          16384,
+          48,
+          128
+        ],
+        "padded_shape": [
+          1,
+          16384,
+          48,
+          128
+        ],
+        "launch_shape": [
+          1,
+          16384,
+          48,
+          128
+        ],
+        "recipe": "gdn_output_arch35_token_first",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "BSND",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "a_prime_transfer": "ub_to_l1",
+          "dispatch": {
+            "implementation": "gdn_output_arch35_token_first",
+            "output_token_first": true,
+            "use_exp2": true,
+            "state_v_first": true,
+            "gate_dtype": "fp32",
+            "task_group_size": 3
+          },
+          "gate_dtype": "fp32",
+          "h_semantic_strides": [
+            1,
+            128
+          ],
+          "heads": 48,
+          "key_heads": 16,
+          "lengths": [
+            16384
+          ],
+          "matrix_instruction_tile": [
+            16,
+            16,
+            16
+          ],
+          "requested_matrix_flops": 51539607552,
+          "resource_work": {
+            "mte1": 1308622848,
+            "fixpipe": 1006632960,
+            "mte2_aic": 738197504,
+            "mte2_aiv": 3145728
+          },
+          "source_kernel_launches": 1,
+          "state_v_first": true,
+          "task_group_size": 3,
+          "use_exp2": true
+        },
+        "source_boundary": "kernel",
+        "flops": 51539607552,
+        "hbm_bytes": 942669824,
+        "mte2_bytes": 0,
+        "mte3_bytes": 301989888,
+        "vector_ops": 808452096,
+        "link_bytes": 0,
+        "link_scope": "d2d",
+        "matrix_flops": {
+          "bf16": 51539607552
+        }
+      },
+      "occurrences": 48,
+      "program": "OperatorPlan",
+      "declared_service": {
+        "matrix@r0:s0": 0.11915636363636363,
+        "vector@r0:s0": 808452096.0,
+        "memory@r0:s0": 942669824.0,
+        "mte3@r0:s0": 301989888.0,
+        "mte1@r0:s0": 1308622848.0,
+        "fixpipe@r0:s0": 1006632960.0,
+        "mte2_aic@r0:s0": 738197504.0,
+        "mte2_aiv@r0:s0": 3145728.0
+      },
+      "service_delta": {
+        "matrix@r0:s0": 3.8843928074072664e-14,
+        "vector@r0:s0": 0.0002497434616088867,
+        "mte2_aic@r0:s0": 0.00022721290588378906,
+        "mte1@r0:s0": -2.8133392333984375e-05,
+        "memory@r0:s0": 0.0009065866470336914,
+        "mte3@r0:s0": -4.172325134277344e-07
+      },
+      "duration_ms": 0.35669950836362935,
+      "total_ms": 17.12157640145421,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "fixpipe@r0:s0": 1006632960.0,
+        "memory@r0:s0": 942669824.0009066,
+        "mte1@r0:s0": 1308622847.9999719,
+        "mte2_aic@r0:s0": 738197504.0002272,
+        "mte2_aiv@r0:s0": 3145728.0,
+        "mte3@r0:s0": 301989887.9999996,
+        "vector@r0:s0": 808452096.0002497,
+        "matrix@r0:s0": 0.11915636363640247
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 65536,
+        "l0b@r0:s0": 65536,
+        "l0c@r0:s0": 262144,
+        "l1@r0:s0": 360448,
+        "ub@r0:s0": 253952
+      },
+      "peak_buffers_per_unit": {
+        "ub@r0:s0:unit0": 253952,
+        "ub@r0:s0:unit1": 253952,
+        "l1@r0:s0:unit0": 360448,
+        "l0a@r0:s0:unit0": 65536,
+        "l0b@r0:s0:unit0": 65536,
+        "l0c@r0:s0:unit0": 262144,
+        "ub@r0:s0:unit2": 253952,
+        "ub@r0:s0:unit3": 253952,
+        "l1@r0:s0:unit1": 360448,
+        "l0a@r0:s0:unit1": 65536,
+        "l0b@r0:s0:unit1": 65536,
+        "l0c@r0:s0:unit1": 262144,
+        "ub@r0:s0:unit4": 253952,
+        "ub@r0:s0:unit5": 253952,
+        "l1@r0:s0:unit2": 360448,
+        "l0a@r0:s0:unit2": 65536,
+        "l0b@r0:s0:unit2": 65536,
+        "l0c@r0:s0:unit2": 262144,
+        "ub@r0:s0:unit6": 253952,
+        "ub@r0:s0:unit7": 253952,
+        "l1@r0:s0:unit3": 360448,
+        "l0a@r0:s0:unit3": 65536,
+        "l0b@r0:s0:unit3": 65536,
+        "l0c@r0:s0:unit3": 262144,
+        "ub@r0:s0:unit8": 253952,
+        "ub@r0:s0:unit9": 253952,
+        "l1@r0:s0:unit4": 360448,
+        "l0a@r0:s0:unit4": 65536,
+        "l0b@r0:s0:unit4": 65536,
+        "l0c@r0:s0:unit4": 262144,
+        "ub@r0:s0:unit10": 253952,
+        "ub@r0:s0:unit11": 253952,
+        "l1@r0:s0:unit5": 360448,
+        "l0a@r0:s0:unit5": 65536,
+        "l0b@r0:s0:unit5": 65536,
+        "l0c@r0:s0:unit5": 262144,
+        "ub@r0:s0:unit12": 253952,
+        "ub@r0:s0:unit13": 253952,
+        "l1@r0:s0:unit6": 360448,
+        "l0a@r0:s0:unit6": 65536,
+        "l0b@r0:s0:unit6": 65536,
+        "l0c@r0:s0:unit6": 262144,
+        "ub@r0:s0:unit14": 253952,
+        "ub@r0:s0:unit15": 253952,
+        "l1@r0:s0:unit7": 360448,
+        "l0a@r0:s0:unit7": 65536,
+        "l0b@r0:s0:unit7": 65536,
+        "l0c@r0:s0:unit7": 262144,
+        "ub@r0:s0:unit16": 253952,
+        "ub@r0:s0:unit17": 253952,
+        "l1@r0:s0:unit8": 360448,
+        "l0a@r0:s0:unit8": 65536,
+        "l0b@r0:s0:unit8": 65536,
+        "l0c@r0:s0:unit8": 262144,
+        "ub@r0:s0:unit18": 253952,
+        "ub@r0:s0:unit19": 253952,
+        "l1@r0:s0:unit9": 360448,
+        "l0a@r0:s0:unit9": 65536,
+        "l0b@r0:s0:unit9": 65536,
+        "l0c@r0:s0:unit9": 262144,
+        "ub@r0:s0:unit20": 253952,
+        "ub@r0:s0:unit21": 253952,
+        "l1@r0:s0:unit10": 360448,
+        "l0a@r0:s0:unit10": 65536,
+        "l0b@r0:s0:unit10": 65536,
+        "l0c@r0:s0:unit10": 262144,
+        "ub@r0:s0:unit22": 253952,
+        "ub@r0:s0:unit23": 253952,
+        "l1@r0:s0:unit11": 360448,
+        "l0a@r0:s0:unit11": 65536,
+        "l0b@r0:s0:unit11": 65536,
+        "l0c@r0:s0:unit11": 262144,
+        "ub@r0:s0:unit24": 253952,
+        "ub@r0:s0:unit25": 253952,
+        "l1@r0:s0:unit12": 360448,
+        "l0a@r0:s0:unit12": 65536,
+        "l0b@r0:s0:unit12": 65536,
+        "l0c@r0:s0:unit12": 262144,
+        "ub@r0:s0:unit26": 253952,
+        "ub@r0:s0:unit27": 253952,
+        "l1@r0:s0:unit13": 360448,
+        "l0a@r0:s0:unit13": 65536,
+        "l0b@r0:s0:unit13": 65536,
+        "l0c@r0:s0:unit13": 262144,
+        "ub@r0:s0:unit28": 253952,
+        "ub@r0:s0:unit29": 253952,
+        "l1@r0:s0:unit14": 360448,
+        "l0a@r0:s0:unit14": 65536,
+        "l0b@r0:s0:unit14": 65536,
+        "l0c@r0:s0:unit14": 262144,
+        "ub@r0:s0:unit30": 253952,
+        "ub@r0:s0:unit31": 253952,
+        "l1@r0:s0:unit15": 360448,
+        "l0a@r0:s0:unit15": 65536,
+        "l0b@r0:s0:unit15": 65536,
+        "l0c@r0:s0:unit15": 262144,
+        "ub@r0:s0:unit32": 253952,
+        "ub@r0:s0:unit33": 253952,
+        "l1@r0:s0:unit16": 360448,
+        "l0a@r0:s0:unit16": 65536,
+        "l0b@r0:s0:unit16": 65536,
+        "l0c@r0:s0:unit16": 262144,
+        "ub@r0:s0:unit34": 253952,
+        "ub@r0:s0:unit35": 253952,
+        "l1@r0:s0:unit17": 360448,
+        "l0a@r0:s0:unit17": 65536,
+        "l0b@r0:s0:unit17": 65536,
+        "l0c@r0:s0:unit17": 262144,
+        "ub@r0:s0:unit36": 253952,
+        "ub@r0:s0:unit37": 253952,
+        "l1@r0:s0:unit18": 360448,
+        "l0a@r0:s0:unit18": 65536,
+        "l0b@r0:s0:unit18": 65536,
+        "l0c@r0:s0:unit18": 262144,
+        "ub@r0:s0:unit38": 253952,
+        "ub@r0:s0:unit39": 253952,
+        "l1@r0:s0:unit19": 360448,
+        "l0a@r0:s0:unit19": 65536,
+        "l0b@r0:s0:unit19": 65536,
+        "l0c@r0:s0:unit19": 262144,
+        "ub@r0:s0:unit40": 253952,
+        "ub@r0:s0:unit41": 253952,
+        "l1@r0:s0:unit20": 360448,
+        "l0a@r0:s0:unit20": 65536,
+        "l0b@r0:s0:unit20": 65536,
+        "l0c@r0:s0:unit20": 262144,
+        "ub@r0:s0:unit42": 253952,
+        "ub@r0:s0:unit43": 253952,
+        "l1@r0:s0:unit21": 360448,
+        "l0a@r0:s0:unit21": 65536,
+        "l0b@r0:s0:unit21": 65536,
+        "l0c@r0:s0:unit21": 262144,
+        "ub@r0:s0:unit44": 253952,
+        "ub@r0:s0:unit45": 253952,
+        "l1@r0:s0:unit22": 360448,
+        "l0a@r0:s0:unit22": 65536,
+        "l0b@r0:s0:unit22": 65536,
+        "l0c@r0:s0:unit22": 262144,
+        "ub@r0:s0:unit46": 253952,
+        "ub@r0:s0:unit47": 253952,
+        "l1@r0:s0:unit23": 360448,
+        "l0a@r0:s0:unit23": 65536,
+        "l0b@r0:s0:unit23": 65536,
+        "l0c@r0:s0:unit23": 262144,
+        "ub@r0:s0:unit48": 253952,
+        "ub@r0:s0:unit49": 253952,
+        "l1@r0:s0:unit24": 360448,
+        "l0a@r0:s0:unit24": 65536,
+        "l0b@r0:s0:unit24": 65536,
+        "l0c@r0:s0:unit24": 262144,
+        "ub@r0:s0:unit50": 253952,
+        "ub@r0:s0:unit51": 253952,
+        "l1@r0:s0:unit25": 360448,
+        "l0a@r0:s0:unit25": 65536,
+        "l0b@r0:s0:unit25": 65536,
+        "l0c@r0:s0:unit25": 262144,
+        "ub@r0:s0:unit52": 253952,
+        "ub@r0:s0:unit53": 253952,
+        "l1@r0:s0:unit26": 360448,
+        "l0a@r0:s0:unit26": 65536,
+        "l0b@r0:s0:unit26": 65536,
+        "l0c@r0:s0:unit26": 262144,
+        "ub@r0:s0:unit54": 253952,
+        "ub@r0:s0:unit55": 253952,
+        "l1@r0:s0:unit27": 360448,
+        "l0a@r0:s0:unit27": 65536,
+        "l0b@r0:s0:unit27": 65536,
+        "l0c@r0:s0:unit27": 262144,
+        "ub@r0:s0:unit56": 253952,
+        "ub@r0:s0:unit57": 253952,
+        "l1@r0:s0:unit28": 360448,
+        "l0a@r0:s0:unit28": 65536,
+        "l0b@r0:s0:unit28": 65536,
+        "l0c@r0:s0:unit28": 262144,
+        "ub@r0:s0:unit58": 253952,
+        "ub@r0:s0:unit59": 253952,
+        "l1@r0:s0:unit29": 360448,
+        "l0a@r0:s0:unit29": 65536,
+        "l0b@r0:s0:unit29": 65536,
+        "l0c@r0:s0:unit29": 262144,
+        "ub@r0:s0:unit60": 253952,
+        "ub@r0:s0:unit61": 253952,
+        "l1@r0:s0:unit30": 360448,
+        "l0a@r0:s0:unit30": 65536,
+        "l0b@r0:s0:unit30": 65536,
+        "l0c@r0:s0:unit30": 262144,
+        "ub@r0:s0:unit62": 253952,
+        "ub@r0:s0:unit63": 253952,
+        "l1@r0:s0:unit31": 360448,
+        "l0a@r0:s0:unit31": 65536,
+        "l0b@r0:s0:unit31": 65536,
+        "l0c@r0:s0:unit31": 262144
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.q_hat_export",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "local_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "padded_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "launch_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "recipe": "q_hat_export",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16384,
+              16,
+              128
+            ],
+            "strides": [
+              33554432,
+              128,
+              2097152,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16,
+              16384,
+              128
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16384,
+              16,
+              128
+            ],
+            "strides": [
+              33554432,
+              2048,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              16,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": "q_hat",
+          "materialization_reason": "fla_requested_normalized_output"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.k_hat_export",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "local_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "padded_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "launch_shape": [
+          1,
+          16384,
+          16,
+          128
+        ],
+        "recipe": "k_hat_export",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16384,
+              16,
+              128
+            ],
+            "strides": [
+              33554432,
+              128,
+              2097152,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16,
+              16384,
+              128
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16384,
+              16,
+              128
+            ],
+            "strides": [
+              33554432,
+              2048,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              16,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": "k_hat",
+          "materialization_reason": "fla_requested_normalized_output"
+        },
+        "flops": 0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.g_cumsum_export",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          16384,
+          48
+        ],
+        "local_shape": [
+          1,
+          16384,
+          48
+        ],
+        "padded_shape": [
+          1,
+          16384,
+          48
+        ],
+        "launch_shape": [
+          1,
+          16384,
+          48
+        ],
+        "recipe": "g_cumsum_export",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              1,
+              16384,
+              48
+            ],
+            "strides": [
+              786432,
+              1,
+              16384
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              48,
+              16384
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              1,
+              16384,
+              48
+            ],
+            "strides": [
+              786432,
+              48,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              1,
+              16384,
+              48
+            ]
+          },
+          "input_format": "fp32",
+          "output_format": "fp32",
+          "source_output": "g_cumsum",
+          "materialization_reason": "fla_requested_cumsum_output"
+        },
+        "flops": 0,
+        "hbm_bytes": 6291456.0,
+        "mte2_bytes": 3145728.0,
+        "mte3_bytes": 3145728.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.001572864,
+      "total_ms": 0.075497472,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 6291456.0,
+        "mte2@r0:s0": 3145728.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.scatter_recurrent_state",
+        "family": "state_scatter",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "local_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "padded_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "launch_shape": [
+          1,
+          48,
+          128,
+          128
+        ],
+        "recipe": "scatter_recurrent_state",
+        "deps": [],
+        "dtype": "fp32",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "state_layout": "V,K",
+          "index_dtype": "int32",
+          "metadata_cache_reuse": false
+        },
+        "flops": 0,
+        "hbm_bytes": 6294528,
+        "mte2_bytes": 3148800,
+        "mte3_bytes": 3145728,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 6294528.0,
+        "mte2@r0:s0": 3148800.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.001573632,
+      "total_ms": 0.075534336,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 6294528.0,
+        "mte2@r0:s0": 3148800.0,
+        "mte3@r0:s0": 3145728.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.core_output_copy",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          48,
+          128
+        ],
+        "local_shape": [
+          16384,
+          48,
+          128
+        ],
+        "padded_shape": [
+          16384,
+          48,
+          128
+        ],
+        "launch_shape": [
+          16384,
+          48,
+          128
+        ],
+        "recipe": "core_output_copy",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              48,
+              128
+            ],
+            "strides": [
+              6144,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              48,
+              128
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              48,
+              128
+            ],
+            "strides": [
+              6144,
+              128,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              48,
+              128
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "target_output": 0,
+          "materialization_reason": "caller_owned_output"
+        },
+        "flops": 0,
+        "hbm_bytes": 402653184.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.100663296,
+      "total_ms": 4.831838208,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.output_gate_reshape",
+        "family": "tensor_copy",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          6144
+        ],
+        "local_shape": [
+          16384,
+          6144
+        ],
+        "padded_shape": [
+          16384,
+          6144
+        ],
+        "launch_shape": [
+          16384,
+          6144
+        ],
+        "recipe": "output_gate_reshape",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "source_layout": {
+            "shape": [
+              16384,
+              6144
+            ],
+            "strides": [
+              16384,
+              1
+            ],
+            "offset": 10240,
+            "storage_shape": [
+              16384,
+              16384
+            ]
+          },
+          "target_layout": {
+            "shape": [
+              16384,
+              6144
+            ],
+            "strides": [
+              6144,
+              1
+            ],
+            "offset": 0,
+            "storage_shape": [
+              16384,
+              6144
+            ]
+          },
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "source_output": 0,
+          "materialization_reason": "reshape_crosses_storage_gap"
+        },
+        "flops": 0,
+        "hbm_bytes": 402653184.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.100663296,
+      "total_ms": 4.831838208,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.linear_output_norm_gate",
+        "family": "elementwise",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          786432,
+          128
+        ],
+        "local_shape": [
+          786432,
+          128
+        ],
+        "padded_shape": [
+          100663296
+        ],
+        "launch_shape": [
+          100663296
+        ],
+        "recipe": "linear_output_norm_gate",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "elementwise",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 402653440.0,
+          "write_bytes": 201326592.0
+        },
+        "flops": 0.0,
+        "hbm_bytes": 603980032.0,
+        "mte2_bytes": 402653440.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 905969664.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 905969664.0,
+        "memory@r0:s0": 603980032.0,
+        "mte2@r0:s0": 402653440.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.15099500800000001,
+      "total_ms": 7.247760384000001,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 603980032.0,
+        "mte2@r0:s0": 402653440.0,
+        "mte3@r0:s0": 201326592.0,
+        "vector@r0:s0": 905969664.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.linear_output",
+        "family": "gemm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "local_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "padded_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "launch_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "recipe": "linear_output",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "gemm",
+          "weight_format": "bf16",
+          "weight_dtype": "bf16",
+          "activation_format": "bf16",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "compute_format": "bf16",
+          "quant_category": "gdn",
+          "catalog_category": "gdn",
+          "packed_weight_bytes": 62914560.0,
+          "weight_representation": "bf16",
+          "dequant_before_compute": false,
+          "program_kind": "matmul"
+        },
+        "flops": 1030792151040.0,
+        "hbm_bytes": 432013312.0,
+        "mte2_bytes": 264241152.0,
+        "mte3_bytes": 167772160.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 2.3831272727272728,
+        "memory@r0:s0": 432013312.0,
+        "mte2@r0:s0": 264241152.0,
+        "mte3@r0:s0": 167772160.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": -0.0011789798736572266,
+        "matrix@r0:s0": 3.2644997816078103e-12,
+        "memory@r0:s0": -0.0018532276153564453
+      },
+      "duration_ms": 2.3833980183274037,
+      "total_ms": 114.40310487971539,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 432013311.9981468,
+        "mte2@r0:s0": 264241151.99882102,
+        "mte3@r0:s0": 167772160.0,
+        "matrix@r0:s0": 2.3831272727305373
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 131072.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 131072.0,
+        "l1@r0:s0:unit1": 131072.0,
+        "l1@r0:s0:unit2": 131072.0,
+        "l1@r0:s0:unit3": 131072.0,
+        "l1@r0:s0:unit4": 131072.0,
+        "l1@r0:s0:unit5": 131072.0,
+        "l1@r0:s0:unit6": 131072.0,
+        "l1@r0:s0:unit7": 131072.0,
+        "l1@r0:s0:unit8": 131072.0,
+        "l1@r0:s0:unit9": 131072.0,
+        "l1@r0:s0:unit10": 131072.0,
+        "l1@r0:s0:unit11": 131072.0,
+        "l1@r0:s0:unit12": 131072.0,
+        "l1@r0:s0:unit13": 131072.0,
+        "l1@r0:s0:unit14": 131072.0,
+        "l1@r0:s0:unit15": 131072.0,
+        "l1@r0:s0:unit16": 131072.0,
+        "l1@r0:s0:unit17": 131072.0,
+        "l1@r0:s0:unit18": 131072.0,
+        "l1@r0:s0:unit19": 131072.0,
+        "l1@r0:s0:unit20": 131072.0,
+        "l1@r0:s0:unit21": 131072.0,
+        "l1@r0:s0:unit22": 131072.0,
+        "l1@r0:s0:unit23": 131072.0,
+        "l1@r0:s0:unit24": 131072.0,
+        "l1@r0:s0:unit25": 131072.0,
+        "l1@r0:s0:unit26": 131072.0,
+        "l1@r0:s0:unit27": 131072.0,
+        "l1@r0:s0:unit28": 131072.0,
+        "l1@r0:s0:unit29": 131072.0,
+        "l1@r0:s0:unit30": 131072.0,
+        "l1@r0:s0:unit31": 131072.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gate_up.quantize",
+        "family": "add_rmsnorm_quant",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          5120
+        ],
+        "padded_shape": [
+          83886080
+        ],
+        "launch_shape": [
+          83886080
+        ],
+        "recipe": "add_rmsnorm_quantize",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "reduction_width": 5120,
+          "norm_eps": 1e-06,
+          "semantic_family": "quantize",
+          "input_format": "bf16",
+          "output_format": "fp8_e4m3",
+          "read_bytes": 167772160.0,
+          "write_bytes": 86507520.0,
+          "activation_group_size": 32,
+          "activation_scale_shape": [
+            16384,
+            80,
+            2
+          ],
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_bytes": 2621440.0,
+          "fused_from": [
+            "residual_add",
+            "rmsnorm",
+            "quantize"
+          ]
+        },
+        "returns": [
+          "activation_scales",
+          "residual"
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 589834240.0,
+        "mte2_bytes": 335554560.0,
+        "mte3_bytes": 254279680.0,
+        "vector_ops": 844103680.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 80,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 844103680.0,
+        "memory@r0:s0": 589834240.0,
+        "mte2@r0:s0": 335554560.0,
+        "mte3@r0:s0": 254279680.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.14745856,
+      "total_ms": 11.7966848,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 589834240.0,
+        "mte2@r0:s0": 335554560.0,
+        "mte3@r0:s0": 254279680.0,
+        "vector@r0:s0": 844103680.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.gate_up",
+        "family": "gate_up_projection",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          34816,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          34816,
+          5120
+        ],
+        "padded_shape": [
+          16384,
+          34816,
+          5120
+        ],
+        "launch_shape": [
+          16384,
+          34816,
+          5120
+        ],
+        "recipe": "dense_gate_up",
+        "deps": [],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "gate_up_projection",
+          "weight_format": "fp8_e4m3",
+          "weight_dtype": "fp8_e4m3",
+          "activation_format": "fp8_e4m3",
+          "input_format": "fp8_e4m3",
+          "output_format": "bf16",
+          "compute_format": "fp8_e4m3",
+          "quant_category": "dense_mlp",
+          "catalog_category": "dense_mlp",
+          "packed_weight_bytes": 183828480.0,
+          "weight_representation": "fp8_block1x32_fp8_e8m0",
+          "dequant_before_compute": false,
+          "activation_group_size": 32,
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_shape": [
+            16384,
+            80,
+            2
+          ],
+          "activation_scale_bytes": 2621440.0,
+          "activation_scale_in_mte2": true,
+          "dequant": "none",
+          "dequant_traffic": 0.0,
+          "weight_bytes": 183828480.0,
+          "implementation_assumption": "declared_matrix_operand_formats",
+          "program_kind": "matmul",
+          "activation_producer": "explicit_quantization"
+        },
+        "flops": 5841155522560.0,
+        "hbm_bytes": 1411186688.0,
+        "mte2_bytes": 270336000.0,
+        "mte3_bytes": 1140850688.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 64,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 6.75219393939394,
+        "memory@r0:s0": 1411186688.0,
+        "mte2@r0:s0": 270336000.0,
+        "mte3@r0:s0": 1140850688.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": -0.007199883460998535,
+        "matrix@r0:s0": -2.0152590707311901e-10,
+        "memory@r0:s0": 0.030791282653808594
+      },
+      "duration_ms": 6.870446514431119,
+      "total_ms": 439.70857692359164,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 1411186688.0307913,
+        "mte2@r0:s0": 270335999.9928001,
+        "mte3@r0:s0": 1140850688.0,
+        "matrix@r0:s0": 6.752193939192414
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 65536.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 65536.0,
+        "l1@r0:s0:unit1": 65536.0,
+        "l1@r0:s0:unit2": 65536.0,
+        "l1@r0:s0:unit3": 65536.0,
+        "l1@r0:s0:unit4": 65536.0,
+        "l1@r0:s0:unit5": 65536.0,
+        "l1@r0:s0:unit6": 65536.0,
+        "l1@r0:s0:unit7": 65536.0,
+        "l1@r0:s0:unit8": 65536.0,
+        "l1@r0:s0:unit9": 65536.0,
+        "l1@r0:s0:unit10": 65536.0,
+        "l1@r0:s0:unit11": 65536.0,
+        "l1@r0:s0:unit12": 65536.0,
+        "l1@r0:s0:unit13": 65536.0,
+        "l1@r0:s0:unit14": 65536.0,
+        "l1@r0:s0:unit15": 65536.0,
+        "l1@r0:s0:unit16": 65536.0,
+        "l1@r0:s0:unit17": 65536.0,
+        "l1@r0:s0:unit18": 65536.0,
+        "l1@r0:s0:unit19": 65536.0,
+        "l1@r0:s0:unit20": 65536.0,
+        "l1@r0:s0:unit21": 65536.0,
+        "l1@r0:s0:unit22": 65536.0,
+        "l1@r0:s0:unit23": 65536.0,
+        "l1@r0:s0:unit24": 65536.0,
+        "l1@r0:s0:unit25": 65536.0,
+        "l1@r0:s0:unit26": 65536.0,
+        "l1@r0:s0:unit27": 65536.0,
+        "l1@r0:s0:unit28": 65536.0,
+        "l1@r0:s0:unit29": 65536.0,
+        "l1@r0:s0:unit30": 65536.0,
+        "l1@r0:s0:unit31": 65536.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.swiglu",
+        "family": "swiglu",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          17408
+        ],
+        "local_shape": [
+          16384,
+          17408
+        ],
+        "padded_shape": [
+          285212672
+        ],
+        "launch_shape": [
+          285212672
+        ],
+        "recipe": "swiglu",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "swiglu",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 1140850688.0,
+          "write_bytes": 570425344.0
+        },
+        "flops": 0.0,
+        "hbm_bytes": 1711276032.0,
+        "mte2_bytes": 1140850688.0,
+        "mte3_bytes": 570425344.0,
+        "vector_ops": 1140850688.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 64,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 1140850688.0,
+        "memory@r0:s0": 1711276032.0,
+        "mte2@r0:s0": 1140850688.0,
+        "mte3@r0:s0": 570425344.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.427819008,
+      "total_ms": 27.380416512,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 1711276032.0,
+        "mte2@r0:s0": 1140850688.0,
+        "mte3@r0:s0": 570425344.0,
+        "vector@r0:s0": 1140850688.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.down.quantize",
+        "family": "quantize",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          17408
+        ],
+        "local_shape": [
+          16384,
+          17408
+        ],
+        "padded_shape": [
+          285212672
+        ],
+        "launch_shape": [
+          285212672
+        ],
+        "recipe": "dynamic_quantize",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "output_format": "fp8_e4m3",
+          "activation_group_size": 32,
+          "activation_scale_shape": [
+            16384,
+            272,
+            2
+          ],
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_bytes": 8912896.0,
+          "semantic_family": "quantize",
+          "input_format": "bf16",
+          "read_bytes": 570425344.0,
+          "write_bytes": 294125568.0
+        },
+        "returns": [
+          "activation_scales"
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 864550912.0,
+        "mte2_bytes": 570425344.0,
+        "mte3_bytes": 294125568.0,
+        "vector_ops": 1158676480.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 64,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 1158676480.0,
+        "memory@r0:s0": 864550912.0,
+        "mte2@r0:s0": 570425344.0,
+        "mte3@r0:s0": 294125568.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.216137728,
+      "total_ms": 13.832814592,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 864550912.0,
+        "mte2@r0:s0": 570425344.0,
+        "mte3@r0:s0": 294125568.0,
+        "vector@r0:s0": 1158676480.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l0.down",
+        "family": "down_projection",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 0,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120,
+          17408
+        ],
+        "local_shape": [
+          16384,
+          5120,
+          17408
+        ],
+        "padded_shape": [
+          16384,
+          5120,
+          17408
+        ],
+        "launch_shape": [
+          16384,
+          5120,
+          17408
+        ],
+        "recipe": "dense_down",
+        "deps": [],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "down_projection",
+          "weight_format": "fp8_e4m3",
+          "weight_dtype": "fp8_e4m3",
+          "activation_format": "fp8_e4m3",
+          "input_format": "fp8_e4m3",
+          "output_format": "bf16",
+          "compute_format": "fp8_e4m3",
+          "quant_category": "dense_mlp",
+          "catalog_category": "dense_mlp",
+          "packed_weight_bytes": 91914240.0,
+          "weight_representation": "fp8_block1x32_fp8_e8m0",
+          "dequant_before_compute": false,
+          "activation_group_size": 32,
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_shape": [
+            16384,
+            272,
+            2
+          ],
+          "activation_scale_bytes": 8912896.0,
+          "activation_scale_in_mte2": true,
+          "dequant": "none",
+          "dequant_traffic": 0.0,
+          "weight_bytes": 91914240.0,
+          "implementation_assumption": "declared_matrix_operand_formats",
+          "program_kind": "matmul",
+          "activation_producer": "explicit_quantization"
+        },
+        "flops": 2920577761280.0,
+        "hbm_bytes": 553811968.0,
+        "mte2_bytes": 386039808.0,
+        "mte3_bytes": 167772160.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 64,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 3.37609696969697,
+        "memory@r0:s0": 553811968.0,
+        "mte2@r0:s0": 386039808.0,
+        "mte3@r0:s0": 167772160.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": -0.0030204057693481445,
+        "matrix@r0:s0": -5.829292604175862e-11,
+        "memory@r0:s0": -0.006959080696105957
+      },
+      "duration_ms": 3.394080550790832,
+      "total_ms": 217.22115525061324,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 553811967.9930409,
+        "mte2@r0:s0": 386039807.9969796,
+        "mte3@r0:s0": 167772160.0,
+        "matrix@r0:s0": 3.376096969638677
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 65536.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 65536.0,
+        "l1@r0:s0:unit1": 65536.0,
+        "l1@r0:s0:unit2": 65536.0,
+        "l1@r0:s0:unit3": 65536.0,
+        "l1@r0:s0:unit4": 65536.0,
+        "l1@r0:s0:unit5": 65536.0,
+        "l1@r0:s0:unit6": 65536.0,
+        "l1@r0:s0:unit7": 65536.0,
+        "l1@r0:s0:unit8": 65536.0,
+        "l1@r0:s0:unit9": 65536.0,
+        "l1@r0:s0:unit10": 65536.0,
+        "l1@r0:s0:unit11": 65536.0,
+        "l1@r0:s0:unit12": 65536.0,
+        "l1@r0:s0:unit13": 65536.0,
+        "l1@r0:s0:unit14": 65536.0,
+        "l1@r0:s0:unit15": 65536.0,
+        "l1@r0:s0:unit16": 65536.0,
+        "l1@r0:s0:unit17": 65536.0,
+        "l1@r0:s0:unit18": 65536.0,
+        "l1@r0:s0:unit19": 65536.0,
+        "l1@r0:s0:unit20": 65536.0,
+        "l1@r0:s0:unit21": 65536.0,
+        "l1@r0:s0:unit22": 65536.0,
+        "l1@r0:s0:unit23": 65536.0,
+        "l1@r0:s0:unit24": 65536.0,
+        "l1@r0:s0:unit25": 65536.0,
+        "l1@r0:s0:unit26": 65536.0,
+        "l1@r0:s0:unit27": 65536.0,
+        "l1@r0:s0:unit28": 65536.0,
+        "l1@r0:s0:unit29": 65536.0,
+        "l1@r0:s0:unit30": 65536.0,
+        "l1@r0:s0:unit31": 65536.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l1.norm1",
+        "family": "add_rmsnorm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 1,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          5120
+        ],
+        "padded_shape": [
+          83886080
+        ],
+        "launch_shape": [
+          83886080
+        ],
+        "recipe": "add_rmsnorm",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "reduction_width": 5120,
+          "norm_eps": 1e-06,
+          "semantic_family": "rmsnorm",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 167782400.0,
+          "write_bytes": 167772160.0,
+          "fused_from": [
+            "residual_add",
+            "rmsnorm"
+          ]
+        },
+        "returns": [
+          "residual"
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 671098880.0,
+        "mte2_bytes": 335554560.0,
+        "mte3_bytes": 335544320.0,
+        "vector_ops": 503316480.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 48,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 503316480.0,
+        "memory@r0:s0": 671098880.0,
+        "mte2@r0:s0": 335554560.0,
+        "mte3@r0:s0": 335544320.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.16777472,
+      "total_ms": 8.05318656,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 671098880.0,
+        "mte2@r0:s0": 335554560.0,
+        "mte3@r0:s0": 335544320.0,
+        "vector@r0:s0": 503316480.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.qkv",
+        "family": "qkv_projection",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          14336,
+          5120
+        ],
+        "local_shape": [
+          16384,
+          14336,
+          5120
+        ],
+        "padded_shape": [
+          16384,
+          14336,
+          5120
+        ],
+        "launch_shape": [
+          16384,
+          14336,
+          5120
+        ],
+        "recipe": "qkv_projection",
+        "deps": [],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "qkv_projection",
+          "weight_format": "fp8_e4m3",
+          "weight_dtype": "fp8_e4m3",
+          "activation_format": "fp8_e4m3",
+          "input_format": "fp8_e4m3",
+          "output_format": "bf16",
+          "compute_format": "fp8_e4m3",
+          "quant_category": "attn",
+          "catalog_category": "attn",
+          "packed_weight_bytes": 75694080.0,
+          "weight_representation": "fp8_block1x32_fp8_e8m0",
+          "dequant_before_compute": false,
+          "activation_group_size": 32,
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_shape": [
+            16384,
+            80,
+            2
+          ],
+          "activation_scale_bytes": 2621440.0,
+          "activation_scale_in_mte2": true,
+          "dequant": "none",
+          "dequant_traffic": 0.0,
+          "weight_bytes": 75694080.0,
+          "implementation_assumption": "declared_matrix_operand_formats",
+          "program_kind": "matmul",
+          "activation_producer": "explicit_quantization"
+        },
+        "flops": 2405181685760.0,
+        "hbm_bytes": 631963648.0,
+        "mte2_bytes": 162201600.0,
+        "mte3_bytes": 469762048.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 2.7803151515151514,
+        "memory@r0:s0": 631963648.0,
+        "mte2@r0:s0": 162201600.0,
+        "mte3@r0:s0": 469762048.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": -0.0005044043064117432,
+        "matrix@r0:s0": -3.127187397922171e-11,
+        "memory@r0:s0": -0.0012519359588623047
+      },
+      "duration_ms": 2.829416696241748,
+      "total_ms": 45.27066713986797,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 631963647.9987481,
+        "mte2@r0:s0": 162201599.9994956,
+        "mte3@r0:s0": 469762048.0,
+        "matrix@r0:s0": 2.7803151514838795
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 65536.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 65536.0,
+        "l1@r0:s0:unit1": 65536.0,
+        "l1@r0:s0:unit2": 65536.0,
+        "l1@r0:s0:unit3": 65536.0,
+        "l1@r0:s0:unit4": 65536.0,
+        "l1@r0:s0:unit5": 65536.0,
+        "l1@r0:s0:unit6": 65536.0,
+        "l1@r0:s0:unit7": 65536.0,
+        "l1@r0:s0:unit8": 65536.0,
+        "l1@r0:s0:unit9": 65536.0,
+        "l1@r0:s0:unit10": 65536.0,
+        "l1@r0:s0:unit11": 65536.0,
+        "l1@r0:s0:unit12": 65536.0,
+        "l1@r0:s0:unit13": 65536.0,
+        "l1@r0:s0:unit14": 65536.0,
+        "l1@r0:s0:unit15": 65536.0,
+        "l1@r0:s0:unit16": 65536.0,
+        "l1@r0:s0:unit17": 65536.0,
+        "l1@r0:s0:unit18": 65536.0,
+        "l1@r0:s0:unit19": 65536.0,
+        "l1@r0:s0:unit20": 65536.0,
+        "l1@r0:s0:unit21": 65536.0,
+        "l1@r0:s0:unit22": 65536.0,
+        "l1@r0:s0:unit23": 65536.0,
+        "l1@r0:s0:unit24": 65536.0,
+        "l1@r0:s0:unit25": 65536.0,
+        "l1@r0:s0:unit26": 65536.0,
+        "l1@r0:s0:unit27": 65536.0,
+        "l1@r0:s0:unit28": 65536.0,
+        "l1@r0:s0:unit29": 65536.0,
+        "l1@r0:s0:unit30": 65536.0,
+        "l1@r0:s0:unit31": 65536.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.qk_norm",
+        "family": "rmsnorm",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          28,
+          256
+        ],
+        "local_shape": [
+          16384,
+          28,
+          256
+        ],
+        "padded_shape": [
+          117440512
+        ],
+        "launch_shape": [
+          117440512
+        ],
+        "recipe": "qk_norm",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "rmsnorm",
+          "input_format": "bf16",
+          "output_format": "bf16"
+        },
+        "flops": 0.0,
+        "hbm_bytes": 469762048.0,
+        "mte2_bytes": 234881024.0,
+        "mte3_bytes": 234881024.0,
+        "vector_ops": 587202560.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 587202560.0,
+        "memory@r0:s0": 469762048.0,
+        "mte2@r0:s0": 234881024.0,
+        "mte3@r0:s0": 234881024.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.117440512,
+      "total_ms": 1.879048192,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 469762048.0,
+        "mte2@r0:s0": 234881024.0,
+        "mte3@r0:s0": 234881024.0,
+        "vector@r0:s0": 587202560.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.rope",
+        "family": "rotary",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          28,
+          256
+        ],
+        "local_shape": [
+          16384,
+          28,
+          256
+        ],
+        "padded_shape": [
+          117440512
+        ],
+        "launch_shape": [
+          117440512
+        ],
+        "recipe": "rotary",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "rotary",
+          "input_format": "bf16",
+          "output_format": "bf16"
+        },
+        "flops": 0.0,
+        "hbm_bytes": 469762048.0,
+        "mte2_bytes": 234881024.0,
+        "mte3_bytes": 234881024.0,
+        "vector_ops": 704643072.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 704643072.0,
+        "memory@r0:s0": 469762048.0,
+        "mte2@r0:s0": 234881024.0,
+        "mte3@r0:s0": 234881024.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.117440512,
+      "total_ms": 1.879048192,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 469762048.0,
+        "mte2@r0:s0": 234881024.0,
+        "mte3@r0:s0": 234881024.0,
+        "vector@r0:s0": 704643072.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.cache",
+        "family": "cache_store",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          4096
+        ],
+        "local_shape": [
+          16384,
+          4096
+        ],
+        "padded_shape": [
+          16384,
+          4096
+        ],
+        "launch_shape": [
+          16384,
+          4096
+        ],
+        "recipe": "kv_store",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "cache_store_is_a_real_dependency"
+        ],
+        "metadata": {
+          "cache_kind": "gqa",
+          "cache_visible": true,
+          "shared_owner": false
+        },
+        "flops": 0.0,
+        "hbm_bytes": 134217728.0,
+        "mte2_bytes": 67108864.0,
+        "mte3_bytes": 67108864.0,
+        "vector_ops": 67108864.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 67108864.0,
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.033554432,
+      "total_ms": 0.536870912,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 134217728.0,
+        "mte2@r0:s0": 67108864.0,
+        "mte3@r0:s0": 67108864.0,
+        "vector@r0:s0": 67108864.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.attention",
+        "family": "attention",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          16384,
+          24,
+          256
+        ],
+        "local_shape": [
+          16384,
+          16384,
+          24,
+          256
+        ],
+        "padded_shape": [
+          16384,
+          16384,
+          24,
+          256
+        ],
+        "launch_shape": [
+          16384,
+          16384,
+          24,
+          256
+        ],
+        "recipe": "flash_attention",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [],
+        "metadata": {
+          "request_shapes": [
+            [
+              16384,
+              0
+            ]
+          ],
+          "query_tile": 128,
+          "kv_streams": 4
+        },
+        "flops": 3298736209920.0,
+        "hbm_bytes": 4731174912.0,
+        "mte2_bytes": 4529848320.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 16107110400.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "matrix@r0:s0": 7.626472727272727,
+        "vector@r0:s0": 16107110400.0,
+        "memory@r0:s0": 4731174912.0,
+        "mte2@r0:s0": 4529848320.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 7.626472727272727,
+      "total_ms": 122.02356363636363,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 4731174912.0,
+        "mte2@r0:s0": 4529848320.0,
+        "mte3@r0:s0": 201326592.0,
+        "vector@r0:s0": 16107110400.0,
+        "matrix@r0:s0": 7.626472727272727
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.output_gate",
+        "family": "elementwise",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          100663296
+        ],
+        "local_shape": [
+          100663296
+        ],
+        "padded_shape": [
+          100663296
+        ],
+        "launch_shape": [
+          100663296
+        ],
+        "recipe": "attention_gate",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "semantic_family": "elementwise",
+          "input_format": "bf16",
+          "output_format": "bf16"
+        },
+        "flops": 0.0,
+        "hbm_bytes": 402653184.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 201326592.0,
+        "vector_ops": 503316480.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 503316480.0,
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.10066329600000001,
+      "total_ms": 1.6106127360000002,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 402653184.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 201326592.0,
+        "vector@r0:s0": 503316480.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.output.quantize",
+        "family": "quantize",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          6144
+        ],
+        "local_shape": [
+          16384,
+          6144
+        ],
+        "padded_shape": [
+          100663296
+        ],
+        "launch_shape": [
+          100663296
+        ],
+        "recipe": "dynamic_quantize",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "output_format": "fp8_e4m3",
+          "activation_group_size": 32,
+          "activation_scale_shape": [
+            16384,
+            96,
+            2
+          ],
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_bytes": 3145728.0,
+          "semantic_family": "quantize",
+          "input_format": "bf16",
+          "read_bytes": 201326592.0,
+          "write_bytes": 103809024.0
+        },
+        "returns": [
+          "activation_scales"
+        ],
+        "flops": 0.0,
+        "hbm_bytes": 305135616.0,
+        "mte2_bytes": 201326592.0,
+        "mte3_bytes": 103809024.0,
+        "vector_ops": 408944640.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "vector@r0:s0": 408944640.0,
+        "memory@r0:s0": 305135616.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 103809024.0
+      },
+      "service_delta": {},
+      "duration_ms": 0.076283904,
+      "total_ms": 1.220542464,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 305135616.0,
+        "mte2@r0:s0": 201326592.0,
+        "mte3@r0:s0": 103809024.0,
+        "vector@r0:s0": 408944640.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "s0.l3.output",
+        "family": "output_projection",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": 3,
+        "requests": [],
+        "semantic_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "local_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "padded_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "launch_shape": [
+          16384,
+          5120,
+          6144
+        ],
+        "recipe": "attention_output",
+        "deps": [],
+        "dtype": "fp8_e4m3",
+        "layout": "fp8_block1x32_fp8_e8m0",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "output_projection",
+          "weight_format": "fp8_e4m3",
+          "weight_dtype": "fp8_e4m3",
+          "activation_format": "fp8_e4m3",
+          "input_format": "fp8_e4m3",
+          "output_format": "bf16",
+          "compute_format": "fp8_e4m3",
+          "quant_category": "attn",
+          "catalog_category": "attn",
+          "packed_weight_bytes": 32440320.0,
+          "weight_representation": "fp8_block1x32_fp8_e8m0",
+          "dequant_before_compute": false,
+          "activation_group_size": 32,
+          "activation_scale_format": "fp8_e8m0",
+          "activation_scale_shape": [
+            16384,
+            96,
+            2
+          ],
+          "activation_scale_bytes": 3145728.0,
+          "activation_scale_in_mte2": true,
+          "dequant": "none",
+          "dequant_traffic": 0.0,
+          "weight_bytes": 32440320.0,
+          "implementation_assumption": "declared_matrix_operand_formats",
+          "program_kind": "matmul",
+          "activation_producer": "explicit_quantization"
+        },
+        "flops": 1030792151040.0,
+        "hbm_bytes": 304021504.0,
+        "mte2_bytes": 136249344.0,
+        "mte3_bytes": 167772160.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 16,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 1.1915636363636364,
+        "memory@r0:s0": 304021504.0,
+        "mte2@r0:s0": 136249344.0,
+        "mte3@r0:s0": 167772160.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": 0.0006160140037536621,
+        "matrix@r0:s0": -2.928768338961163e-13,
+        "memory@r0:s0": 0.00027251243591308594
+      },
+      "duration_ms": 1.2095472174545367,
+      "total_ms": 19.352755479272588,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 304021504.0002725,
+        "mte2@r0:s0": 136249344.000616,
+        "mte3@r0:s0": 167772160.0,
+        "matrix@r0:s0": 1.1915636363633435
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 131072,
+        "l1@r0:s0": 65536.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 65536.0,
+        "l1@r0:s0:unit1": 65536.0,
+        "l1@r0:s0:unit2": 65536.0,
+        "l1@r0:s0:unit3": 65536.0,
+        "l1@r0:s0:unit4": 65536.0,
+        "l1@r0:s0:unit5": 65536.0,
+        "l1@r0:s0:unit6": 65536.0,
+        "l1@r0:s0:unit7": 65536.0,
+        "l1@r0:s0:unit8": 65536.0,
+        "l1@r0:s0:unit9": 65536.0,
+        "l1@r0:s0:unit10": 65536.0,
+        "l1@r0:s0:unit11": 65536.0,
+        "l1@r0:s0:unit12": 65536.0,
+        "l1@r0:s0:unit13": 65536.0,
+        "l1@r0:s0:unit14": 65536.0,
+        "l1@r0:s0:unit15": 65536.0,
+        "l1@r0:s0:unit16": 65536.0,
+        "l1@r0:s0:unit17": 65536.0,
+        "l1@r0:s0:unit18": 65536.0,
+        "l1@r0:s0:unit19": 65536.0,
+        "l1@r0:s0:unit20": 65536.0,
+        "l1@r0:s0:unit21": 65536.0,
+        "l1@r0:s0:unit22": 65536.0,
+        "l1@r0:s0:unit23": 65536.0,
+        "l1@r0:s0:unit24": 65536.0,
+        "l1@r0:s0:unit25": 65536.0,
+        "l1@r0:s0:unit26": 65536.0,
+        "l1@r0:s0:unit27": 65536.0,
+        "l1@r0:s0:unit28": 65536.0,
+        "l1@r0:s0:unit29": 65536.0,
+        "l1@r0:s0:unit30": 65536.0,
+        "l1@r0:s0:unit31": 65536.0,
+        "l0c@r0:s0:unit0": 131072,
+        "l0c@r0:s0:unit1": 131072,
+        "l0c@r0:s0:unit2": 131072,
+        "l0c@r0:s0:unit3": 131072,
+        "l0c@r0:s0:unit4": 131072,
+        "l0c@r0:s0:unit5": 131072,
+        "l0c@r0:s0:unit6": 131072,
+        "l0c@r0:s0:unit7": 131072,
+        "l0c@r0:s0:unit8": 131072,
+        "l0c@r0:s0:unit9": 131072,
+        "l0c@r0:s0:unit10": 131072,
+        "l0c@r0:s0:unit11": 131072,
+        "l0c@r0:s0:unit12": 131072,
+        "l0c@r0:s0:unit13": 131072,
+        "l0c@r0:s0:unit14": 131072,
+        "l0c@r0:s0:unit15": 131072,
+        "l0c@r0:s0:unit16": 131072,
+        "l0c@r0:s0:unit17": 131072,
+        "l0c@r0:s0:unit18": 131072,
+        "l0c@r0:s0:unit19": 131072,
+        "l0c@r0:s0:unit20": 131072,
+        "l0c@r0:s0:unit21": 131072,
+        "l0c@r0:s0:unit22": 131072,
+        "l0c@r0:s0:unit23": 131072,
+        "l0c@r0:s0:unit24": 131072,
+        "l0c@r0:s0:unit25": 131072,
+        "l0c@r0:s0:unit26": 131072,
+        "l0c@r0:s0:unit27": 131072,
+        "l0c@r0:s0:unit28": 131072,
+        "l0c@r0:s0:unit29": 131072,
+        "l0c@r0:s0:unit30": 131072,
+        "l0c@r0:s0:unit31": 131072
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "select_hidden",
+        "family": "tensor_select",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": -1,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          5120
+        ],
+        "local_shape": [
+          1,
+          5120
+        ],
+        "padded_shape": [
+          5120
+        ],
+        "launch_shape": [
+          5120
+        ],
+        "recipe": "select_hidden",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "contiguous",
+        "coverage": "decomposed",
+        "notes": [
+          "vector_work=elements*ops_per_element"
+        ],
+        "metadata": {
+          "selection": "all_verify_rows_or_last_prefill_row",
+          "semantic_family": "tensor_select",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "read_bytes": 10248.0,
+          "write_bytes": 10240.0
+        },
+        "flops": 0.0,
+        "hbm_bytes": 20488.0,
+        "mte2_bytes": 10248.0,
+        "mte3_bytes": 10240.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 1,
+      "program": "ResourceEnvelope",
+      "declared_service": {
+        "memory@r0:s0": 20488.0,
+        "mte2@r0:s0": 10248.0,
+        "mte3@r0:s0": 10240.0
+      },
+      "service_delta": {},
+      "duration_ms": 5.121999999999999e-06,
+      "total_ms": 5.121999999999999e-06,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 20488.0,
+        "mte2@r0:s0": 10248.0,
+        "mte3@r0:s0": 10240.0
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {},
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    },
+    {
+      "operator": {
+        "op_id": "logits",
+        "family": "logits",
+        "phase": "prefill",
+        "stage": 0,
+        "layer": -1,
+        "requests": [],
+        "semantic_shape": [
+          1,
+          248320,
+          5120
+        ],
+        "local_shape": [
+          1,
+          248320,
+          5120
+        ],
+        "padded_shape": [
+          16,
+          248320,
+          5120
+        ],
+        "launch_shape": [
+          1,
+          248320,
+          5120
+        ],
+        "recipe": "vocab_logits",
+        "deps": [],
+        "dtype": "bf16",
+        "layout": "bf16",
+        "coverage": "decomposed",
+        "notes": [
+          "gemm_formula=2*M*N*K",
+          "weight_bytes_use_declared_packing"
+        ],
+        "metadata": {
+          "semantic_family": "logits",
+          "weight_format": "bf16",
+          "weight_dtype": "bf16",
+          "activation_format": "bf16",
+          "input_format": "bf16",
+          "output_format": "bf16",
+          "compute_format": "bf16",
+          "quant_category": "lm_head",
+          "catalog_category": "lm_head",
+          "packed_weight_bytes": 2542796800.0,
+          "weight_representation": "bf16",
+          "dequant_before_compute": false,
+          "program_kind": "matmul"
+        },
+        "flops": 2542796800.0,
+        "hbm_bytes": 2543303680.0,
+        "mte2_bytes": 2542807040.0,
+        "mte3_bytes": 496640.0,
+        "vector_ops": 0.0,
+        "link_bytes": 0.0,
+        "link_scope": "d2d"
+      },
+      "occurrences": 1,
+      "program": "TiledMatmul",
+      "declared_service": {
+        "matrix@r0:s0": 0.005878787878787879,
+        "memory@r0:s0": 2543303680.0,
+        "mte2@r0:s0": 2542807040.0,
+        "mte3@r0:s0": 496640.0
+      },
+      "service_delta": {
+        "mte2@r0:s0": 8.0108642578125e-05,
+        "matrix@r0:s0": 8.726526445901328e-15,
+        "memory@r0:s0": 8.296966552734375e-05
+      },
+      "duration_ms": 0.6397584720775089,
+      "total_ms": 0.6397584720775089,
+      "input_ready_ms": 0,
+      "service_before_input": {},
+      "serviced": {
+        "memory@r0:s0": 2543303680.000083,
+        "mte2@r0:s0": 2542807040.00008,
+        "mte3@r0:s0": 496640.0,
+        "matrix@r0:s0": 0.005878787878796606
+      },
+      "peak_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 512,
+        "l1@r0:s0": 66048.0,
+        "ub@r0:s0": 0.0
+      },
+      "peak_buffers_per_unit": {
+        "l1@r0:s0:unit0": 66048.0,
+        "l1@r0:s0:unit1": 66048.0,
+        "l1@r0:s0:unit2": 66048.0,
+        "l1@r0:s0:unit3": 66048.0,
+        "l1@r0:s0:unit4": 66048.0,
+        "l1@r0:s0:unit5": 66048.0,
+        "l1@r0:s0:unit6": 66048.0,
+        "l1@r0:s0:unit7": 66048.0,
+        "l1@r0:s0:unit8": 66048.0,
+        "l1@r0:s0:unit9": 66048.0,
+        "l1@r0:s0:unit10": 66048.0,
+        "l1@r0:s0:unit11": 66048.0,
+        "l1@r0:s0:unit12": 66048.0,
+        "l1@r0:s0:unit13": 66048.0,
+        "l1@r0:s0:unit14": 66048.0,
+        "l1@r0:s0:unit15": 66048.0,
+        "l1@r0:s0:unit16": 66048.0,
+        "l1@r0:s0:unit17": 66048.0,
+        "l1@r0:s0:unit18": 66048.0,
+        "l1@r0:s0:unit19": 66048.0,
+        "l1@r0:s0:unit20": 66048.0,
+        "l1@r0:s0:unit21": 66048.0,
+        "l1@r0:s0:unit22": 66048.0,
+        "l1@r0:s0:unit23": 66048.0,
+        "l1@r0:s0:unit24": 66048.0,
+        "l1@r0:s0:unit25": 66048.0,
+        "l1@r0:s0:unit26": 66048.0,
+        "l1@r0:s0:unit27": 66048.0,
+        "l1@r0:s0:unit28": 66048.0,
+        "l1@r0:s0:unit29": 66048.0,
+        "l1@r0:s0:unit30": 66048.0,
+        "l1@r0:s0:unit31": 66048.0,
+        "l0c@r0:s0:unit0": 512,
+        "l0c@r0:s0:unit1": 512,
+        "l0c@r0:s0:unit2": 512,
+        "l0c@r0:s0:unit3": 512,
+        "l0c@r0:s0:unit4": 512,
+        "l0c@r0:s0:unit5": 512,
+        "l0c@r0:s0:unit6": 512,
+        "l0c@r0:s0:unit7": 512,
+        "l0c@r0:s0:unit8": 512,
+        "l0c@r0:s0:unit9": 512,
+        "l0c@r0:s0:unit10": 512,
+        "l0c@r0:s0:unit11": 512,
+        "l0c@r0:s0:unit12": 512,
+        "l0c@r0:s0:unit13": 512,
+        "l0c@r0:s0:unit14": 512,
+        "l0c@r0:s0:unit15": 512,
+        "l0c@r0:s0:unit16": 512,
+        "l0c@r0:s0:unit17": 512,
+        "l0c@r0:s0:unit18": 512,
+        "l0c@r0:s0:unit19": 512,
+        "l0c@r0:s0:unit20": 512,
+        "l0c@r0:s0:unit21": 512,
+        "l0c@r0:s0:unit22": 512,
+        "l0c@r0:s0:unit23": 512,
+        "l0c@r0:s0:unit24": 512,
+        "l0c@r0:s0:unit25": 512,
+        "l0c@r0:s0:unit26": 512,
+        "l0c@r0:s0:unit27": 512,
+        "l0c@r0:s0:unit28": 512,
+        "l0c@r0:s0:unit29": 512,
+        "l0c@r0:s0:unit30": 512,
+        "l0c@r0:s0:unit31": 512
+      },
+      "remaining_buffers": {
+        "l0a@r0:s0": 0.0,
+        "l0b@r0:s0": 0.0,
+        "l0c@r0:s0": 0.0,
+        "l1@r0:s0": 0.0,
+        "ub@r0:s0": 0.0
+      },
+      "live_tasks": 0,
+      "basis": {
+        "operator_occurrences": {
+          "measured_primitive": 0,
+          "analytic_work": 1
+        },
+        "calibration": "declared_primitive_service_parameters",
+        "declared_parameter_sources": [
+          "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+        ]
+      }
+    }
+  ],
+  "graph_scope": "model",
+  "tokens_per_sequence": 16384,
+  "sequences": 1,
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/qwen38-native-20261028-model-source-boundaries.json",
+    "sha256": "23640f966998d266b7ca9b5e4ca6670f01221efa9f5516da06f89778e02c0955",
+    "size_bytes": 185302
+  }
+}

@@ -1,0 +1,81 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "cuda_norm-0",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-1",
+      "split": "development",
+      "params": {
+        "rows": 4,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-2",
+      "split": "development",
+      "params": {
+        "rows": 65,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-3",
+      "split": "heldout_geometry",
+      "params": {
+        "rows": 17,
+        "width": 10240,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-4",
+      "split": "heldout_geometry",
+      "params": {
+        "rows": 129,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-counterexample-0",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 8,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_norm-counterexample-1",
+      "split": "development",
+      "params": {
+        "rows": 255,
+        "width": 513,
+        "dtype": "fp32",
+        "kernel": "fused_add_rms_norm",
+        "aligned": false
+      }
+    },
+    {
+      "id": "cuda_norm-counterexample-2",
+      "split": "development",
+      "params": {
+        "rows": 256,
+        "width": 512,
+        "dtype": "bf16",
+        "kernel": "fused_add_rms_norm",
+        "batch_invariant": true
+      }
+    }
+  ]
+}

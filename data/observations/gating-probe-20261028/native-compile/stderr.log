@@ -1,0 +1,9 @@
+
+Authorized users only. All activities may be monitored and reported.
+/scratch/native_kernel_probe.cpp: In function 'int main(int, char**)':
+/scratch/native_kernel_probe.cpp:130:38: error: 'aclrtBinaryUnload' was not declared in this scope; did you mean 'aclrtBinaryUnLoad'?
+  130 |         ACL(aclrtFree(storage)); ACL(aclrtBinaryUnload(binary));
+      |                                      ^~~~~~~~~~~~~~~~~
+/scratch/native_kernel_probe.cpp:22:26: note: in definition of macro 'ACL'
+   22 | #define ACL(call) check((call), #call)
+      |                          ^~~~

@@ -1,0 +1,47 @@
+{
+  "candidates": [
+    {
+      "id": "declared-baseline",
+      "case": "../quickstart.json"
+    },
+    {
+      "id": "twice-memory-bandwidth",
+      "case": "../quickstart.json",
+      "overrides": {
+        "machine": {
+          "device": {
+            "rates": {
+              "memory": 1600000000000
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "twice-matrix-throughput",
+      "case": "../quickstart.json",
+      "overrides": {
+        "machine": {
+          "device": {
+            "compute_peaks": {
+              "bf16": 200000000000000,
+              "fp32": 40000000000000
+            }
+          }
+        }
+      }
+    }
+  ],
+  "probes": [
+    {"id": "prefill32", "phase": "prefill", "tokens": 32},
+    {"id": "prefill256", "phase": "prefill", "tokens": 256},
+    {"id": "decode1k", "phase": "decode", "tokens": 1, "context": 1024},
+    {"id": "decode8k", "phase": "decode", "tokens": 1, "context": 8192}
+  ],
+  "options": {
+    "level": "graph",
+    "serving": true,
+    "top_families": 8,
+    "max_evaluations": 16
+  }
+}

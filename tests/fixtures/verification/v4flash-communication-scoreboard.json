@@ -1,0 +1,2988 @@
+{
+  "models": [
+    {
+      "id": "v4flash_a3",
+      "label": "DeepSeek V4 Flash A3 W8A8 TP8 EP8 MTP1",
+      "role": "authorized_model",
+      "observed": {
+        "conditions": {
+          "model": "deepseek-v4-flash-0731",
+          "hardware": {
+            "family": "A3",
+            "memory_bytes_per_device": [
+              68719476736
+            ],
+            "devices": 8,
+            "dies_per_package": 2
+          },
+          "parallel": {
+            "dp": 1,
+            "tp": 8,
+            "ep": 8,
+            "pp": 1,
+            "cp": 1,
+            "pcp": 1,
+            "cp_plan": "none"
+          },
+          "phase": "prefill",
+          "tokens": 4096,
+          "context": 0,
+          "sequences": 1,
+          "precision": {
+            "weight_format": "int8",
+            "activation_format": "int8",
+            "expert_weight_format": "int8",
+            "kv_dtype": "bf16",
+            "model_activation": "bf16"
+          },
+          "branch": "target_plus_mtp_prefill"
+        },
+        "capture": {
+          "source_identity": {
+            "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "size_bytes": 1391917,
+            "mtime_ns": 1792795906356307712,
+            "schema_version": "kernel_details_csv_46col",
+            "sha256": "b56b7439213cc9f76eaae63347393d4add6ae5c985bf28a6a7737f5783c81788"
+          },
+          "raw_rows": 4064,
+          "positive_event_count": 4064,
+          "bounds_ns": [
+            1792794320387224094,
+            1792794320962459501
+          ],
+          "span_ms": 575.235407,
+          "boundary": "first_positive_device_event_start_to_last_positive_device_event_end",
+          "rank_scope": "one_retained_device_rank",
+          "source_hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
+        },
+        "step": {
+          "boundary": "single_request_full_capture_device_span",
+          "sample_count": 1,
+          "scope": "one_prefill_request_one_retained_rank_target_plus_mtp_and_device_helpers",
+          "statistic": "raw_first_start_to_last_end",
+          "duration_ms": 575.235407,
+          "phase": "prefill",
+          "tokens": 4096,
+          "context": 0,
+          "sequences": 1,
+          "activity_sum_ms": 609.513832,
+          "comparison_qualification": "conditional_full_call; target-only 43-layer graph omits checkpoint MTP work",
+          "comparison_scope": "single_prefill_target_plus_mtp_preparation"
+        },
+        "groups": [
+          {
+            "name": "SparseAttnSharedkv",
+            "count": 44,
+            "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+            "scope": "complete_4064_event_device_rank_capture",
+            "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+            "duration_ms": 98.896984,
+            "boundary": "device_activity_durations",
+            "occurrences": 44,
+            "aggregation": "sum"
+          },
+          {
+            "name": "hcom_alltoallv_",
+            "count": 132,
+            "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+            "scope": "complete_4064_event_device_rank_capture",
+            "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+            "duration_ms": 32.391611,
+            "boundary": "device_activity_durations",
+            "occurrences": 132,
+            "aggregation": "sum",
+            "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+          },
+          {
+            "name": "hcom_allReduce_",
+            "count": 90,
+            "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+            "scope": "complete_4064_event_device_rank_capture",
+            "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+            "duration_ms": 57.195819,
+            "boundary": "device_activity_durations",
+            "occurrences": 90,
+            "aggregation": "sum",
+            "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+          },
+          {
+            "name": "allreduceAicpuKernel",
+            "count": 90,
+            "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+            "scope": "complete_4064_event_device_rank_capture",
+            "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+            "duration_ms": 38.761846,
+            "boundary": "device_activity_durations",
+            "occurrences": 90,
+            "aggregation": "sum",
+            "activity_domain": "wrapper/control activity; not physical communication cost"
+          },
+          {
+            "name": "HcPre",
+            "count": 88,
+            "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+            "scope": "complete_4064_event_device_rank_capture",
+            "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+            "duration_ms": 37.974984,
+            "boundary": "device_activity_durations",
+            "occurrences": 88,
+            "aggregation": "sum"
+          }
+        ],
+        "independent_conditions": {
+          "hardware": "A3 serving recipe on 192.168.13.165; dies8-15; same-model/day npu-smi topology corroborates dual-die64GiB",
+          "hardware_basis": "same-model same-day npu-smi and separate profiler recipe; not embedded in CSV",
+          "model_path": "/mnt/weight/DeepSeek-V4-Flash-w8a8-mtp",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "precision": "W8A8 checkpoint / ascend quantization",
+          "prompt_tokens": 4096,
+          "output_tokens": 1,
+          "concurrency": 1,
+          "num_prompts": 1,
+          "seed": 711,
+          "max_num_batched_tokens": 8192,
+          "prefix_caching": false,
+          "num_speculative_tokens": 1,
+          "speculative_method": "mtp",
+          "draft_enforce_eager": true,
+          "graph_mode": "FULL_DECODE_ONLY",
+          "target_layers": 43,
+          "served_attention_calls": 44,
+          "served_scope_evidence": "retained producer declares checkpoint MTP layer plus 43 body layers; raw 44 SparseAttnSharedkv events corroborate count"
+        },
+        "unavailable_reasons": [],
+        "condition_basis": "Serving/checkpoint recipe fixes model, TP8/EP8, prompt4096, MTP1 and A3. Catalog/profile normalization supplies complete geometry/precision detail as explicit assumptions; binary identity is not established.",
+        "family_groups": [
+          {
+            "name": "vector",
+            "duration_ms": 210.88587,
+            "occurrences": 2773,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "Add",
+                "duration_ms": 0.367291,
+                "occurrences": 7
+              },
+              {
+                "native_type": "ArgMaxV2",
+                "duration_ms": 0.035639,
+                "occurrences": 2
+              },
+              {
+                "native_type": "BroadcastTo",
+                "duration_ms": 0.02008,
+                "occurrences": 12
+              },
+              {
+                "native_type": "Cast",
+                "duration_ms": 1.137095,
+                "occurrences": 339
+              },
+              {
+                "native_type": "ClipByValueV2",
+                "duration_ms": 0.00862,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Compressor",
+                "duration_ms": 27.361114,
+                "occurrences": 62
+              },
+              {
+                "native_type": "CompressorMetadata",
+                "duration_ms": 0.01972,
+                "occurrences": 3
+              },
+              {
+                "native_type": "DynamicQuant",
+                "duration_ms": 16.163001,
+                "occurrences": 239
+              },
+              {
+                "native_type": "Equal",
+                "duration_ms": 0.01006,
+                "occurrences": 4
+              },
+              {
+                "native_type": "Fill",
+                "duration_ms": 0.04692,
+                "occurrences": 29
+              },
+              {
+                "native_type": "FloorDiv",
+                "duration_ms": 0.07498,
+                "occurrences": 8
+              },
+              {
+                "native_type": "FloorMod",
+                "duration_ms": 0.028539,
+                "occurrences": 8
+              },
+              {
+                "native_type": "ForeachAddList",
+                "duration_ms": 4.342272,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GatherElementsV2",
+                "duration_ms": 0.00422,
+                "occurrences": 1
+              },
+              {
+                "native_type": "GatherV2",
+                "duration_ms": 0.286734,
+                "occurrences": 2
+              },
+              {
+                "native_type": "GreaterEqual",
+                "duration_ms": 0.030858,
+                "occurrences": 8
+              },
+              {
+                "native_type": "HcPost",
+                "duration_ms": 36.816986,
+                "occurrences": 88
+              },
+              {
+                "native_type": "HcPre",
+                "duration_ms": 37.974984,
+                "occurrences": 88
+              },
+              {
+                "native_type": "HistogramV2",
+                "duration_ms": 0.941603,
+                "occurrences": 44
+              },
+              {
+                "native_type": "Index",
+                "duration_ms": 0.421351,
+                "occurrences": 12
+              },
+              {
+                "native_type": "IndexCheck",
+                "duration_ms": 0.109418,
+                "occurrences": 14
+              },
+              {
+                "native_type": "IndexPutV2",
+                "duration_ms": 0.01614,
+                "occurrences": 2
+              },
+              {
+                "native_type": "InplacePartialRotaryMul",
+                "duration_ms": 7.442471,
+                "occurrences": 153
+              },
+              {
+                "native_type": "Less",
+                "duration_ms": 0.01178,
+                "occurrences": 3
+              },
+              {
+                "native_type": "LogicalAnd",
+                "duration_ms": 0.00534,
+                "occurrences": 3
+              },
+              {
+                "native_type": "LogicalNot",
+                "duration_ms": 0.0033,
+                "occurrences": 2
+              },
+              {
+                "native_type": "MaskedFill",
+                "duration_ms": 0.353313,
+                "occurrences": 2
+              },
+              {
+                "native_type": "MemSet",
+                "duration_ms": 0.50397,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeGatingTopKHash",
+                "duration_ms": 1.097676,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeInitRoutingV3",
+                "duration_ms": 5.02252,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeTokenPermute",
+                "duration_ms": 1.694262,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeTokenUnpermute",
+                "duration_ms": 2.588424,
+                "occurrences": 88
+              },
+              {
+                "native_type": "Mul",
+                "duration_ms": 0.389793,
+                "occurrences": 8
+              },
+              {
+                "native_type": "Muls",
+                "duration_ms": 1.974418,
+                "occurrences": 63
+              },
+              {
+                "native_type": "NotEqual",
+                "duration_ms": 0.00438,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Pack",
+                "duration_ms": 0.013499,
+                "occurrences": 6
+              },
+              {
+                "native_type": "ReduceSum",
+                "duration_ms": 1.116639,
+                "occurrences": 179
+              },
+              {
+                "native_type": "RepeatInterleave",
+                "duration_ms": 0.63325,
+                "occurrences": 44
+              },
+              {
+                "native_type": "RmsNorm",
+                "duration_ms": 26.286777,
+                "occurrences": 182
+              },
+              {
+                "native_type": "RmsNormCast",
+                "duration_ms": 6.692807,
+                "occurrences": 44
+              },
+              {
+                "native_type": "ScatterNdUpdateSk",
+                "duration_ms": 9.996456,
+                "occurrences": 127
+              },
+              {
+                "native_type": "SelectV2",
+                "duration_ms": 0.211937,
+                "occurrences": 17
+              },
+              {
+                "native_type": "Sigmoid",
+                "duration_ms": 0.00556,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Slice",
+                "duration_ms": 0.375335,
+                "occurrences": 132
+              },
+              {
+                "native_type": "Sub",
+                "duration_ms": 0.018459,
+                "occurrences": 9
+              },
+              {
+                "native_type": "TensorMove",
+                "duration_ms": 8.913569,
+                "occurrences": 446
+              },
+              {
+                "native_type": "Tile",
+                "duration_ms": 0.102758,
+                "occurrences": 1
+              },
+              {
+                "native_type": "VllmAscendQuantLightningIndexerV2",
+                "duration_ms": 8.379632,
+                "occurrences": 21
+              },
+              {
+                "native_type": "ZerosLike",
+                "duration_ms": 0.803161,
+                "occurrences": 44
+              },
+              {
+                "native_type": "_compute_slot_mapping_fused_groups_kernel",
+                "duration_ms": 0.026759,
+                "occurrences": 1
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          {
+            "name": "control_wrapper",
+            "duration_ms": 54.3241,
+            "occurrences": 183,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "Cumsum",
+                "duration_ms": 2.823946,
+                "occurrences": 44
+              },
+              {
+                "native_type": "SparseAttnSharedkvMetadata",
+                "duration_ms": 2.103938,
+                "occurrences": 4
+              },
+              {
+                "native_type": "VllmAscendQuantLightningIndexerV2Metadata",
+                "duration_ms": 0.193056,
+                "occurrences": 1
+              },
+              {
+                "native_type": "allgatherAicpuKernel",
+                "duration_ms": 10.441314,
+                "occurrences": 44
+              },
+              {
+                "native_type": "allreduceAicpuKernel",
+                "duration_ms": 38.761846,
+                "occurrences": 90
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ],
+            "comparable": false,
+            "reason": "wrapper_control_not_physical_service",
+            "activity_domain": "AICPU wrapper/control activity"
+          },
+          {
+            "name": "collective",
+            "duration_ms": 111.032451,
+            "occurrences": 312,
+            "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "hcom_allReduce_",
+                "duration_ms": 57.195819,
+                "occurrences": 90
+              },
+              {
+                "native_type": "hcom_allGather_",
+                "duration_ms": 21.445021,
+                "occurrences": 90
+              },
+              {
+                "native_type": "hcom_alltoallv_",
+                "duration_ms": 32.391611,
+                "occurrences": 132
+              }
+            ],
+            "assumptions": [
+              "Explicit Name=hcom_* population on Device8; original Type=hcom_* population remains in communication_population_views.",
+              "All 178 AivKernel candidates match named intervals one-to-one, but physical identity is not proven. Named-HCCL sum and all-typed-HCCL union coincide here; neither is a critical path."
+            ],
+            "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+          },
+          {
+            "name": "matmul",
+            "duration_ms": 57.791353,
+            "occurrences": 442,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "MatMulV2",
+                "duration_ms": 12.384499,
+                "occurrences": 110
+              },
+              {
+                "native_type": "MatMulV3",
+                "duration_ms": 9.758106,
+                "occurrences": 47
+              },
+              {
+                "native_type": "QuantBatchMatmulV3",
+                "duration_ms": 28.176036,
+                "occurrences": 241
+              },
+              {
+                "native_type": "TransposeBatchMatMul",
+                "duration_ms": 7.472712,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          {
+            "name": "attention",
+            "duration_ms": 98.896984,
+            "occurrences": 44,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "SparseAttnSharedkv",
+                "duration_ms": 98.896984,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          {
+            "name": "grouped_gemm",
+            "duration_ms": 38.344874,
+            "occurrences": 132,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "DequantSwigluQuant",
+                "duration_ms": 1.449709,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GroupedMatmul",
+                "duration_ms": 10.988484,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GroupedMatmulSwigluQuant",
+                "duration_ms": 25.906681,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          }
+        ],
+        "communication_population_views": {
+          "original_typed_hccl": {
+            "name": "collective",
+            "duration_ms": 149.270651,
+            "occurrences": 490,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "hcom_allGather_",
+                "duration_ms": 27.29161,
+                "occurrences": 136
+              },
+              {
+                "native_type": "hcom_allReduce_",
+                "duration_ms": 57.195819,
+                "occurrences": 90
+              },
+              {
+                "native_type": "hcom_alltoallv_",
+                "duration_ms": 64.783222,
+                "occurrences": 264
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them.",
+              "Raw native communication spans are retained without deduplicating by names or intervals; missing exported correlations limit logical-call attribution."
+            ]
+          },
+          "audit": {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
+            "sha256": "9755b6465df9de20d57cf5bb5919d5e94e0adc81af9e947a18365bbf5665f385",
+            "size_bytes": 22724
+          },
+          "projection_candidate_sum_ms": 38.2382,
+          "named_hccl_union_ms": 111.032451,
+          "producer_identity": "unproven: no exported producer/correlation join",
+          "interpretation": "Named-HCCL subset is the selected activity population. No raw event deleted; interval union is occupancy, not critical path."
+        }
+      },
+      "predicted": {
+        "status": "modeled",
+        "conditions": {
+          "model": "deepseek-v4-flash-0731",
+          "hardware": {
+            "family": "A3",
+            "memory_bytes_per_device": [
+              68719476736
+            ],
+            "devices": 8,
+            "dies_per_package": 2
+          },
+          "parallel": {
+            "dp": 1,
+            "tp": 8,
+            "ep": 8,
+            "pp": 1,
+            "cp": 1,
+            "pcp": 1,
+            "cp_plan": "none"
+          },
+          "phase": "prefill",
+          "tokens": 4096,
+          "context": 0,
+          "sequences": 1,
+          "precision": {
+            "weight_format": "int8",
+            "activation_format": "int8",
+            "expert_weight_format": "int8",
+            "kv_dtype": "bf16",
+            "model_activation": "bf16"
+          },
+          "branch": "target_plus_mtp_prefill"
+        },
+        "claimed_conditions": {
+          "model": "deepseek-v4-flash-0731",
+          "hardware": {
+            "family": "A3",
+            "memory_bytes_per_device": [
+              68719476736
+            ],
+            "devices": 8,
+            "dies_per_package": 2
+          },
+          "parallel": {
+            "dp": 1,
+            "tp": 8,
+            "ep": 8,
+            "pp": 1,
+            "cp": 1,
+            "pcp": 1,
+            "cp_plan": "none"
+          },
+          "phase": "prefill",
+          "tokens": 4096,
+          "context": 0,
+          "sequences": 1,
+          "precision": {
+            "weight_format": "int8",
+            "activation_format": "int8",
+            "expert_weight_format": "int8",
+            "kv_dtype": "bf16",
+            "model_activation": "bf16"
+          },
+          "branch": "target_plus_mtp_prefill"
+        },
+        "execution_identity": {
+          "effective_case_key": "116c0f7416355dd3b80ff91ad7cc21048ab75bb8f79f9515d189a18ed49be2cb",
+          "input_case_sha256": "c92dcc4b14ab3da72ec80a3e109f9a47dd7d0fc2f26eaf8e0d8b07bdcc767f8f",
+          "geometry": {
+            "context": 0,
+            "sequences": 1,
+            "scope": "model",
+            "phase": "prefill",
+            "tokens": 4096
+          },
+          "conditions": {
+            "model": "deepseek-v4-flash-0731",
+            "hardware": {
+              "family": "A3",
+              "memory_bytes_per_device": [
+                68719476736
+              ],
+              "devices": 8,
+              "dies_per_package": 2
+            },
+            "parallel": {
+              "dp": 1,
+              "tp": 8,
+              "ep": 8,
+              "pp": 1,
+              "cp": 1,
+              "pcp": 1,
+              "cp_plan": "none"
+            },
+            "phase": "prefill",
+            "tokens": 4096,
+            "context": 0,
+            "sequences": 1,
+            "precision": {
+              "weight_format": "int8",
+              "activation_format": "int8",
+              "expert_weight_format": "int8",
+              "kv_dtype": "bf16",
+              "model_activation": "bf16"
+            },
+            "branch": "target_plus_mtp_prefill"
+          },
+          "frontend": "Frontend(IterationPlan)",
+          "hardware_profile": "Ascend910_9362",
+          "proposal_tokens": 0,
+          "draft_preparation": true,
+          "draft_structure": {
+            "kind": "mtp",
+            "layers": 1,
+            "weight_format": "bf16",
+            "noncausal_query_block": false,
+            "markov_rank": 0
+          },
+          "excluded_from_graph": [],
+          "worker_sources": [
+            {
+              "path": "/Users/maoxx241/code/sim-rewrite-20261027/tools/model_scoreboard.py",
+              "sha256": "40cde56e161ec0b902e2274e0d3f91a30ab2e12177b7423112edd4e1e0e9825e",
+              "size_bytes": 16109
+            },
+            {
+              "path": "/Users/maoxx241/code/sim-rewrite-20261027/tools/model_convergence.py",
+              "sha256": "00f65e3bfdca0b844c3c9c5bb82255be816c8bcf8c7ed31c4c15ee8a85185dc0",
+              "size_bytes": 29854
+            }
+          ]
+        },
+        "identity_issues": [],
+        "runtime": {
+          "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+          "version": "0.8.0",
+          "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
+          "hashed_files": 213,
+          "matrix_sha256": "8ddf2da71fd6d89632599bacc2076ec919df00ecd8b1dd3c89496e341f9d6469"
+        },
+        "runtime_integrity": {
+          "status": "unchanged",
+          "before": {
+            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "version": "0.8.0",
+            "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
+            "hashed_files": 213,
+            "matrix_sha256": "8ddf2da71fd6d89632599bacc2076ec919df00ecd8b1dd3c89496e341f9d6469"
+          },
+          "after": {
+            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "version": "0.8.0",
+            "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
+            "hashed_files": 213,
+            "matrix_sha256": "8ddf2da71fd6d89632599bacc2076ec919df00ecd8b1dd3c89496e341f9d6469"
+          }
+        },
+        "assumptions": [],
+        "case_key": "116c0f7416355dd3b80ff91ad7cc21048ab75bb8f79f9515d189a18ed49be2cb",
+        "step": {
+          "duration_ms": 303.9818977712207,
+          "boundary": "device_iteration",
+          "comparison_scope": "single_prefill_target_plus_mtp_preparation",
+          "statistic": "deterministic_prediction"
+        },
+        "isolated_sum_ms": 303.981897770932,
+        "groups": [
+          {
+            "name": "declared_native_fusion",
+            "family": "native_fusion",
+            "duration_ms": 87.62384184276478,
+            "occurrences": 172,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "latent_attention0",
+            "family": "attention",
+            "duration_ms": 31.390961260606066,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "balanced_grouped_gate_up",
+            "family": "grouped_gemm",
+            "duration_ms": 21.852814136760603,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "output_reduce",
+            "family": "allreduce",
+            "duration_ms": 14.722098285714287,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "ring_allreduce",
+            "family": "allreduce",
+            "duration_ms": 14.722098285714287,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "balanced_grouped_down",
+            "family": "grouped_gemm",
+            "duration_ms": 11.413678507941935,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "route_pack",
+            "family": "routing",
+            "duration_ms": 8.619513173333337,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "route_unpack",
+            "family": "routing",
+            "duration_ms": 8.615908693333331,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "dynamic_quantize",
+            "family": "quantize",
+            "duration_ms": 8.345238186666649,
+            "occurrences": 301,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compress_values",
+            "family": "gemm",
+            "duration_ms": 6.666326884848486,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compress_gates",
+            "family": "gemm",
+            "duration_ms": 6.666326884848486,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "q_b",
+            "family": "gemm",
+            "duration_ms": 5.570069100606062,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "grouped_output_b",
+            "family": "gemm",
+            "duration_ms": 5.570069100606062,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_q",
+            "family": "gemm",
+            "duration_ms": 5.223386763636364,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "router",
+            "family": "router",
+            "duration_ms": 5.048923229090909,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "expert_combine",
+            "family": "alltoall",
+            "duration_ms": 5.007103020408164,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "rmsnorm",
+            "family": "rmsnorm",
+            "duration_ms": 4.9778483200000005,
+            "occurrences": 89,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_scores",
+            "family": "indexer",
+            "duration_ms": 4.915420159999999,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "q_a",
+            "family": "gemm",
+            "duration_ms": 4.806046254545456,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "grouped_output_a",
+            "family": "gemm",
+            "duration_ms": 4.806046254545456,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "router_input_cast",
+            "family": "cast",
+            "duration_ms": 3.60710144,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_query_hadamard",
+            "family": "gemm",
+            "duration_ms": 3.114306109090911,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "dense_down",
+            "family": "down_projection",
+            "duration_ms": 2.9822190933333315,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "expert_quantized_dispatch",
+            "family": "alltoall",
+            "duration_ms": 2.822902612244898,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "dense_gate_up",
+            "family": "gate_up_projection",
+            "duration_ms": 2.78434290909091,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "kv_a",
+            "family": "gemm",
+            "duration_ms": 2.746639825454545,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "expert_add",
+            "family": "elementwise",
+            "duration_ms": 2.460658346666667,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_query_basis_scale",
+            "family": "elementwise",
+            "duration_ms": 2.34881024,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_query_quantize",
+            "family": "quantize",
+            "duration_ms": 1.7707827200000001,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "grouped_swiglu",
+            "family": "swiglu",
+            "duration_ms": 1.3841203199999998,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_compress_values",
+            "family": "gemm",
+            "duration_ms": 1.2357110690909099,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_compress_gates",
+            "family": "gemm",
+            "duration_ms": 1.2357110690909099,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_query_rotary",
+            "family": "rotary",
+            "duration_ms": 1.17440512,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compress_pool",
+            "family": "elementwise",
+            "duration_ms": 0.9002598399999995,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "ring_allgather",
+            "family": "allgather",
+            "duration_ms": 0.7742994285714287,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "expert_scale_dispatch",
+            "family": "alltoall",
+            "duration_ms": 0.7545218775510205,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_weights",
+            "family": "gemm",
+            "duration_ms": 0.6646836425948851,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "q_norm",
+            "family": "rmsnorm",
+            "duration_ms": 0.6151645866666667,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "ascend_shared_dequant_swiglu_quant",
+            "family": "dequant_swiglu_quant",
+            "duration_ms": 0.4356499393939394,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "rotary",
+            "family": "elementwise",
+            "duration_ms": 0.34603007999999996,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "kv_store",
+            "family": "cache_store",
+            "duration_ms": 0.3084561066666667,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "kv_norm",
+            "family": "rmsnorm",
+            "duration_ms": 0.30758229333333337,
+            "occurrences": 44,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_topk",
+            "family": "topk",
+            "duration_ms": 0.2935296,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "draft_features",
+            "family": "gemm",
+            "duration_ms": 0.22947529696969698,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "residual_add",
+            "family": "elementwise",
+            "duration_ms": 0.16777216,
+            "occurrences": 2,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "draft_features_gather",
+            "family": "allgather",
+            "duration_ms": 0.16729657142857143,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_compress_pool",
+            "family": "elementwise",
+            "duration_ms": 0.15174655999999995,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "router_topk",
+            "family": "topk",
+            "duration_ms": 0.1488637333333334,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "v_expand",
+            "family": "gemm",
+            "duration_ms": 0.1266135660606061,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "vocab_logits",
+            "family": "logits",
+            "duration_ms": 0.11385767422796664,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "expert_dispatch",
+            "family": "alltoall",
+            "duration_ms": 0.11379779591836735,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "q_absorb",
+            "family": "gemm",
+            "duration_ms": 0.11338224484848486,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "moe_expert_count_histogram",
+            "family": "histogram",
+            "duration_ms": 0.10750000000000005,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "route_normalize",
+            "family": "elementwise",
+            "duration_ms": 0.1075,
+            "occurrences": 43,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_key_hadamard",
+            "family": "gemm",
+            "duration_ms": 0.105,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compress_norm",
+            "family": "rmsnorm",
+            "duration_ms": 0.10250000000000005,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compress_rotary",
+            "family": "rotary",
+            "duration_ms": 0.10250000000000005,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "compressed_store",
+            "family": "cache_store",
+            "duration_ms": 0.10250000000000001,
+            "occurrences": 41,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "embedding",
+            "family": "embedding",
+            "duration_ms": 0.055924053333333335,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_compress_norm",
+            "family": "rmsnorm",
+            "duration_ms": 0.05250000000000001,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_compress_rotary",
+            "family": "rotary",
+            "duration_ms": 0.05250000000000001,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_store",
+            "family": "cache_store",
+            "duration_ms": 0.0525,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_weights_fp16",
+            "family": "cast",
+            "duration_ms": 0.0525,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_key_basis_scale",
+            "family": "elementwise",
+            "duration_ms": 0.0525,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "index_key_quantize",
+            "family": "quantize",
+            "duration_ms": 0.0525,
+            "occurrences": 21,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "hash_routing",
+            "family": "topk",
+            "duration_ms": 0.011304960000000001,
+            "occurrences": 3,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "swiglu",
+            "family": "swiglu",
+            "duration_ms": 0.00524288,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "sample_logits",
+            "family": "sampling",
+            "duration_ms": 0.0025,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "select_hidden",
+            "family": "tensor_select",
+            "duration_ms": 1.3660000000000001e-05,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          },
+          {
+            "name": "token_commit",
+            "family": "token_commit",
+            "duration_ms": 0.0,
+            "occurrences": 1,
+            "boundary": "sum_of_isolated_device_programs",
+            "statistic": "sum",
+            "aggregation": "sum",
+            "scope": "declared_model_probe"
+          }
+        ],
+        "execution": {
+          "live_tasks": 0,
+          "live_programs": 0
+        },
+        "unavailable_reasons": []
+      },
+      "step_comparison": {
+        "status": "conditional",
+        "observed_ms": 575.235407,
+        "predicted_ms": 303.9818977712207,
+        "observed_boundary": "single_request_full_capture_device_span",
+        "predicted_boundary": "device_iteration",
+        "signed_gap_ms": -271.2535092287793,
+        "absolute_gap_ms": 271.2535092287793,
+        "signed_gap_percent": -47.15521783393616,
+        "absolute_gap_percent": 47.15521783393616,
+        "formal_accuracy": "not_assessed",
+        "reasons": [],
+        "comparison_scope": "single_prefill_target_plus_mtp_preparation",
+        "assumptions": [
+          "Explicit balanced routing assigns4096*6/256=96 token-expert rows to every expert, including the one-layer MTP preparation; no observed expert histogram is claimed.",
+          "The workload is DeepSeek V4 Flash, not DeepSeek V4.1. The latter remains a distinct unavailable row.",
+          "43 target plus1 checkpoint MTP attention calls are included; fixed declared hardware rates and steady mapping are independent of observed timings.",
+          "The catalog default auxiliary is a three-layer DSpark declaration and produced46 attention calls; it is not used for this comparison. The case explicitly declares one BF16 MTP layer with no Markov/confidence/noncausal query block.",
+          "Generic dual-normalized MTP input projection is an approximation of the native hyper-connection input path; exact feature expansion, native fusion and native binary are not established.",
+          "HcPre/HcPost explicitly select the inspected175ef4d4 source profiles. The40MiB cast ring retains all GM/HBM traffic; no cache-hit inference. Native ABI/binary identity and exact HF32 supply remain unresolved.",
+          "Explicit source-selected shared INT32 producer and separate dequant/SwiGLU/quant consumer. Source compatibility does not establish captured CANN dispatch.",
+          "Quantized MoE transport is explicitly scoped to the INT8 body; BF16 MTP retains its distinct payload protocol.",
+          "Observed first-device-start to last-device-end includes runtime helpers. The simulation executes target body, sampling/commit and full MTP prefill preparation through final graph completion, excluding host launch gaps."
+        ],
+        "step_accuracy_tolerance": {
+          "unit": "ratio",
+          "value": 0.15
+        },
+        "step_accuracy_scope": "conditional_whole_step_not_heldout_validation",
+        "step_accuracy_pass": false,
+        "step_accuracy_status": "outside_tolerance"
+      },
+      "observed_top": [
+        {
+          "name": "SparseAttnSharedkv",
+          "count": 44,
+          "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+          "scope": "complete_4064_event_device_rank_capture",
+          "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+          "duration_ms": 98.896984,
+          "boundary": "device_activity_durations",
+          "occurrences": 44,
+          "aggregation": "sum"
+        },
+        {
+          "name": "hcom_allReduce_",
+          "count": 90,
+          "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+          "scope": "complete_4064_event_device_rank_capture",
+          "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+          "duration_ms": 57.195819,
+          "boundary": "device_activity_durations",
+          "occurrences": 90,
+          "aggregation": "sum",
+          "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+        },
+        {
+          "name": "allreduceAicpuKernel",
+          "count": 90,
+          "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+          "scope": "complete_4064_event_device_rank_capture",
+          "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+          "duration_ms": 38.761846,
+          "boundary": "device_activity_durations",
+          "occurrences": 90,
+          "aggregation": "sum",
+          "activity_domain": "wrapper/control activity; not physical communication cost"
+        },
+        {
+          "name": "HcPre",
+          "count": 88,
+          "statistic": "sum_of_original_positive_duration_us_divided_by_1000",
+          "scope": "complete_4064_event_device_rank_capture",
+          "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+          "duration_ms": 37.974984,
+          "boundary": "device_activity_durations",
+          "occurrences": 88,
+          "aggregation": "sum"
+        },
+        {
+          "name": "hcom_alltoallv_",
+          "count": 132,
+          "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+          "scope": "complete_4064_event_device_rank_capture",
+          "source_path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "audit_method": "2026-10-29 csv.DictReader streaming of 4064 rows using Decimal; no model-name classification",
+          "duration_ms": 32.391611,
+          "boundary": "device_activity_durations",
+          "occurrences": 132,
+          "aggregation": "sum",
+          "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+        }
+      ],
+      "predicted_top": [
+        {
+          "name": "declared_native_fusion",
+          "family": "native_fusion",
+          "duration_ms": 87.62384184276478,
+          "occurrences": 172,
+          "boundary": "sum_of_isolated_device_programs",
+          "statistic": "sum",
+          "aggregation": "sum",
+          "scope": "declared_model_probe"
+        },
+        {
+          "name": "latent_attention0",
+          "family": "attention",
+          "duration_ms": 31.390961260606066,
+          "occurrences": 44,
+          "boundary": "sum_of_isolated_device_programs",
+          "statistic": "sum",
+          "aggregation": "sum",
+          "scope": "declared_model_probe"
+        },
+        {
+          "name": "balanced_grouped_gate_up",
+          "family": "grouped_gemm",
+          "duration_ms": 21.852814136760603,
+          "occurrences": 44,
+          "boundary": "sum_of_isolated_device_programs",
+          "statistic": "sum",
+          "aggregation": "sum",
+          "scope": "declared_model_probe"
+        },
+        {
+          "name": "output_reduce",
+          "family": "allreduce",
+          "duration_ms": 14.722098285714287,
+          "occurrences": 44,
+          "boundary": "sum_of_isolated_device_programs",
+          "statistic": "sum",
+          "aggregation": "sum",
+          "scope": "declared_model_probe"
+        },
+        {
+          "name": "ring_allreduce",
+          "family": "allreduce",
+          "duration_ms": 14.722098285714287,
+          "occurrences": 44,
+          "boundary": "sum_of_isolated_device_programs",
+          "statistic": "sum",
+          "aggregation": "sum",
+          "scope": "declared_model_probe"
+        }
+      ],
+      "group_comparisons": [
+        {
+          "comparison_key": "vector",
+          "comparison_level": "coarse_semantic_family",
+          "status": "conditional",
+          "formal_accuracy": "not_assessed",
+          "observed_ms": 210.88587,
+          "predicted_ms": 132.690647585189,
+          "signed_gap_ms": -78.19522241481101,
+          "absolute_gap_ms": 78.19522241481101,
+          "observed": {
+            "name": "vector",
+            "duration_ms": 210.88587,
+            "occurrences": 2773,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "Add",
+                "duration_ms": 0.367291,
+                "occurrences": 7
+              },
+              {
+                "native_type": "ArgMaxV2",
+                "duration_ms": 0.035639,
+                "occurrences": 2
+              },
+              {
+                "native_type": "BroadcastTo",
+                "duration_ms": 0.02008,
+                "occurrences": 12
+              },
+              {
+                "native_type": "Cast",
+                "duration_ms": 1.137095,
+                "occurrences": 339
+              },
+              {
+                "native_type": "ClipByValueV2",
+                "duration_ms": 0.00862,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Compressor",
+                "duration_ms": 27.361114,
+                "occurrences": 62
+              },
+              {
+                "native_type": "CompressorMetadata",
+                "duration_ms": 0.01972,
+                "occurrences": 3
+              },
+              {
+                "native_type": "DynamicQuant",
+                "duration_ms": 16.163001,
+                "occurrences": 239
+              },
+              {
+                "native_type": "Equal",
+                "duration_ms": 0.01006,
+                "occurrences": 4
+              },
+              {
+                "native_type": "Fill",
+                "duration_ms": 0.04692,
+                "occurrences": 29
+              },
+              {
+                "native_type": "FloorDiv",
+                "duration_ms": 0.07498,
+                "occurrences": 8
+              },
+              {
+                "native_type": "FloorMod",
+                "duration_ms": 0.028539,
+                "occurrences": 8
+              },
+              {
+                "native_type": "ForeachAddList",
+                "duration_ms": 4.342272,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GatherElementsV2",
+                "duration_ms": 0.00422,
+                "occurrences": 1
+              },
+              {
+                "native_type": "GatherV2",
+                "duration_ms": 0.286734,
+                "occurrences": 2
+              },
+              {
+                "native_type": "GreaterEqual",
+                "duration_ms": 0.030858,
+                "occurrences": 8
+              },
+              {
+                "native_type": "HcPost",
+                "duration_ms": 36.816986,
+                "occurrences": 88
+              },
+              {
+                "native_type": "HcPre",
+                "duration_ms": 37.974984,
+                "occurrences": 88
+              },
+              {
+                "native_type": "HistogramV2",
+                "duration_ms": 0.941603,
+                "occurrences": 44
+              },
+              {
+                "native_type": "Index",
+                "duration_ms": 0.421351,
+                "occurrences": 12
+              },
+              {
+                "native_type": "IndexCheck",
+                "duration_ms": 0.109418,
+                "occurrences": 14
+              },
+              {
+                "native_type": "IndexPutV2",
+                "duration_ms": 0.01614,
+                "occurrences": 2
+              },
+              {
+                "native_type": "InplacePartialRotaryMul",
+                "duration_ms": 7.442471,
+                "occurrences": 153
+              },
+              {
+                "native_type": "Less",
+                "duration_ms": 0.01178,
+                "occurrences": 3
+              },
+              {
+                "native_type": "LogicalAnd",
+                "duration_ms": 0.00534,
+                "occurrences": 3
+              },
+              {
+                "native_type": "LogicalNot",
+                "duration_ms": 0.0033,
+                "occurrences": 2
+              },
+              {
+                "native_type": "MaskedFill",
+                "duration_ms": 0.353313,
+                "occurrences": 2
+              },
+              {
+                "native_type": "MemSet",
+                "duration_ms": 0.50397,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeGatingTopKHash",
+                "duration_ms": 1.097676,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeInitRoutingV3",
+                "duration_ms": 5.02252,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeTokenPermute",
+                "duration_ms": 1.694262,
+                "occurrences": 44
+              },
+              {
+                "native_type": "MoeTokenUnpermute",
+                "duration_ms": 2.588424,
+                "occurrences": 88
+              },
+              {
+                "native_type": "Mul",
+                "duration_ms": 0.389793,
+                "occurrences": 8
+              },
+              {
+                "native_type": "Muls",
+                "duration_ms": 1.974418,
+                "occurrences": 63
+              },
+              {
+                "native_type": "NotEqual",
+                "duration_ms": 0.00438,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Pack",
+                "duration_ms": 0.013499,
+                "occurrences": 6
+              },
+              {
+                "native_type": "ReduceSum",
+                "duration_ms": 1.116639,
+                "occurrences": 179
+              },
+              {
+                "native_type": "RepeatInterleave",
+                "duration_ms": 0.63325,
+                "occurrences": 44
+              },
+              {
+                "native_type": "RmsNorm",
+                "duration_ms": 26.286777,
+                "occurrences": 182
+              },
+              {
+                "native_type": "RmsNormCast",
+                "duration_ms": 6.692807,
+                "occurrences": 44
+              },
+              {
+                "native_type": "ScatterNdUpdateSk",
+                "duration_ms": 9.996456,
+                "occurrences": 127
+              },
+              {
+                "native_type": "SelectV2",
+                "duration_ms": 0.211937,
+                "occurrences": 17
+              },
+              {
+                "native_type": "Sigmoid",
+                "duration_ms": 0.00556,
+                "occurrences": 2
+              },
+              {
+                "native_type": "Slice",
+                "duration_ms": 0.375335,
+                "occurrences": 132
+              },
+              {
+                "native_type": "Sub",
+                "duration_ms": 0.018459,
+                "occurrences": 9
+              },
+              {
+                "native_type": "TensorMove",
+                "duration_ms": 8.913569,
+                "occurrences": 446
+              },
+              {
+                "native_type": "Tile",
+                "duration_ms": 0.102758,
+                "occurrences": 1
+              },
+              {
+                "native_type": "VllmAscendQuantLightningIndexerV2",
+                "duration_ms": 8.379632,
+                "occurrences": 21
+              },
+              {
+                "native_type": "ZerosLike",
+                "duration_ms": 0.803161,
+                "occurrences": 44
+              },
+              {
+                "native_type": "_compute_slot_mapping_fused_groups_kernel",
+                "duration_ms": 0.026759,
+                "occurrences": 1
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          "predicted_groups": [
+            "compress_norm",
+            "compress_pool",
+            "compress_rotary",
+            "compressed_store",
+            "declared_native_fusion",
+            "dynamic_quantize",
+            "embedding",
+            "expert_add",
+            "hash_routing",
+            "kv_norm",
+            "kv_store",
+            "moe_expert_count_histogram",
+            "q_norm",
+            "residual_add",
+            "rmsnorm",
+            "rotary",
+            "route_normalize",
+            "route_pack",
+            "route_unpack",
+            "router",
+            "router_input_cast",
+            "router_topk",
+            "sample_logits",
+            "select_hidden",
+            "swiglu"
+          ],
+          "assumptions": [
+            "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them.",
+            "This is a coarse declared semantic association; native and analytic tensor/lowering equivalence has not been established.",
+            "Observed values are native activity-duration statistics from the declared full step; predicted values sum isolated device programs, so neither is an additive critical-path decomposition.",
+            "Native fusion and program call boundaries differ; occurrence counts are diagnostic, not a one-to-one admission requirement. No tolerance or accuracy pass is claimed."
+          ],
+          "prediction_scenarios": [
+            {
+              "context": 0,
+              "duration_ms": 132.690647585189,
+              "missing_groups": [],
+              "groups": [
+                {
+                  "name": "declared_native_fusion",
+                  "family": "native_fusion",
+                  "duration_ms": 87.62384184276478,
+                  "occurrences": 172,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "route_pack",
+                  "family": "routing",
+                  "duration_ms": 8.619513173333337,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "route_unpack",
+                  "family": "routing",
+                  "duration_ms": 8.615908693333331,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "dynamic_quantize",
+                  "family": "quantize",
+                  "duration_ms": 8.345238186666649,
+                  "occurrences": 301,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "router",
+                  "family": "router",
+                  "duration_ms": 5.048923229090909,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "rmsnorm",
+                  "family": "rmsnorm",
+                  "duration_ms": 4.9778483200000005,
+                  "occurrences": 89,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "router_input_cast",
+                  "family": "cast",
+                  "duration_ms": 3.60710144,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "expert_add",
+                  "family": "elementwise",
+                  "duration_ms": 2.460658346666667,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "compress_pool",
+                  "family": "elementwise",
+                  "duration_ms": 0.9002598399999995,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "q_norm",
+                  "family": "rmsnorm",
+                  "duration_ms": 0.6151645866666667,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "rotary",
+                  "family": "elementwise",
+                  "duration_ms": 0.34603007999999996,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "kv_store",
+                  "family": "cache_store",
+                  "duration_ms": 0.3084561066666667,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "kv_norm",
+                  "family": "rmsnorm",
+                  "duration_ms": 0.30758229333333337,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "residual_add",
+                  "family": "elementwise",
+                  "duration_ms": 0.16777216,
+                  "occurrences": 2,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "router_topk",
+                  "family": "topk",
+                  "duration_ms": 0.1488637333333334,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "moe_expert_count_histogram",
+                  "family": "histogram",
+                  "duration_ms": 0.10750000000000005,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "route_normalize",
+                  "family": "elementwise",
+                  "duration_ms": 0.1075,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "compress_norm",
+                  "family": "rmsnorm",
+                  "duration_ms": 0.10250000000000005,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "compress_rotary",
+                  "family": "rotary",
+                  "duration_ms": 0.10250000000000005,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "compressed_store",
+                  "family": "cache_store",
+                  "duration_ms": 0.10250000000000001,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "embedding",
+                  "family": "embedding",
+                  "duration_ms": 0.055924053333333335,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "hash_routing",
+                  "family": "topk",
+                  "duration_ms": 0.011304960000000001,
+                  "occurrences": 3,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "swiglu",
+                  "family": "swiglu",
+                  "duration_ms": 0.00524288,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "sample_logits",
+                  "family": "sampling",
+                  "duration_ms": 0.0025,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "select_hidden",
+                  "family": "tensor_select",
+                  "duration_ms": 1.3660000000000001e-05,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                }
+              ]
+            }
+          ],
+          "signed_gap_percent": -37.07940338288716,
+          "absolute_gap_percent": 37.07940338288716,
+          "observed_per_call_us": null,
+          "predicted_per_call_us": null,
+          "per_call_diff_us": null,
+          "abs_error_per_call_us": null,
+          "accuracy_tier": "reference_only",
+          "accuracy_status": "reference_only",
+          "accuracy_pass": null,
+          "accuracy_tolerance": null,
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "accuracy_scope": "conditional_diagnostic_excluded_from_scored_cohort_denominator",
+          "descriptive_tier": null,
+          "per_call_ineligible_reason": "native_and_program_grouping_not_equivalent"
+        },
+        {
+          "comparison_key": "collective",
+          "comparison_level": "coarse_semantic_family",
+          "status": "conditional",
+          "formal_accuracy": "not_assessed",
+          "observed_ms": 111.032451,
+          "predicted_ms": 39.08411787755102,
+          "signed_gap_ms": -71.94833312244897,
+          "absolute_gap_ms": 71.94833312244897,
+          "observed": {
+            "name": "collective",
+            "duration_ms": 111.032451,
+            "occurrences": 312,
+            "statistic": "sum_positive_duration_ns_of_named_hcom_rows",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "hcom_allReduce_",
+                "duration_ms": 57.195819,
+                "occurrences": 90
+              },
+              {
+                "native_type": "hcom_allGather_",
+                "duration_ms": 21.445021,
+                "occurrences": 90
+              },
+              {
+                "native_type": "hcom_alltoallv_",
+                "duration_ms": 32.391611,
+                "occurrences": 132
+              }
+            ],
+            "assumptions": [
+              "Explicit Name=hcom_* population on Device8; original Type=hcom_* population remains in communication_population_views.",
+              "All 178 AivKernel candidates match named intervals one-to-one, but physical identity is not proven. Named-HCCL sum and all-typed-HCCL union coincide here; neither is a critical path."
+            ],
+            "activity_domain": "named HCCL activity; AivKernel projection candidates and AICPU wrappers excluded"
+          },
+          "predicted_groups": [
+            "draft_features_gather",
+            "expert_combine",
+            "expert_dispatch",
+            "expert_quantized_dispatch",
+            "expert_scale_dispatch",
+            "output_reduce",
+            "ring_allgather",
+            "ring_allreduce"
+          ],
+          "assumptions": [
+            "Explicit Name=hcom_* population on Device8; original Type=hcom_* population remains in communication_population_views.",
+            "All 178 AivKernel candidates match named intervals one-to-one, but physical identity is not proven. Named-HCCL sum and all-typed-HCCL union coincide here; neither is a critical path.",
+            "Declared semantic association, not tensor-exact accuracy.",
+            "Observed values are native activity-duration statistics from the declared full step; predicted values sum isolated device programs, so neither is an additive critical-path decomposition.",
+            "Native fusion and program call boundaries differ; occurrence counts are diagnostic, not a one-to-one admission requirement. No tolerance or accuracy pass is claimed."
+          ],
+          "prediction_scenarios": [
+            {
+              "context": 0,
+              "duration_ms": 39.08411787755102,
+              "missing_groups": [],
+              "groups": [
+                {
+                  "name": "output_reduce",
+                  "family": "allreduce",
+                  "duration_ms": 14.722098285714287,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "ring_allreduce",
+                  "family": "allreduce",
+                  "duration_ms": 14.722098285714287,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "expert_combine",
+                  "family": "alltoall",
+                  "duration_ms": 5.007103020408164,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "expert_quantized_dispatch",
+                  "family": "alltoall",
+                  "duration_ms": 2.822902612244898,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "ring_allgather",
+                  "family": "allgather",
+                  "duration_ms": 0.7742994285714287,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "expert_scale_dispatch",
+                  "family": "alltoall",
+                  "duration_ms": 0.7545218775510205,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "draft_features_gather",
+                  "family": "allgather",
+                  "duration_ms": 0.16729657142857143,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "expert_dispatch",
+                  "family": "alltoall",
+                  "duration_ms": 0.11379779591836735,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                }
+              ]
+            }
+          ],
+          "signed_gap_percent": -64.79937394379323,
+          "absolute_gap_percent": 64.79937394379323,
+          "observed_per_call_us": null,
+          "predicted_per_call_us": null,
+          "per_call_diff_us": null,
+          "abs_error_per_call_us": null,
+          "accuracy_tier": "reference_only",
+          "accuracy_status": "reference_only",
+          "accuracy_pass": null,
+          "accuracy_tolerance": null,
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "accuracy_scope": "conditional_diagnostic_excluded_from_scored_cohort_denominator",
+          "descriptive_tier": null,
+          "per_call_ineligible_reason": "native_and_program_grouping_not_equivalent"
+        },
+        {
+          "comparison_key": "attention",
+          "comparison_level": "coarse_semantic_family",
+          "status": "conditional",
+          "formal_accuracy": "not_assessed",
+          "observed_ms": 98.896984,
+          "predicted_ms": 31.390961260606066,
+          "signed_gap_ms": -67.50602273939394,
+          "absolute_gap_ms": 67.50602273939394,
+          "observed": {
+            "name": "attention",
+            "duration_ms": 98.896984,
+            "occurrences": 44,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "SparseAttnSharedkv",
+                "duration_ms": 98.896984,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          "predicted_groups": [
+            "latent_attention0"
+          ],
+          "assumptions": [
+            "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them.",
+            "This is a coarse declared semantic association; native and analytic tensor/lowering equivalence has not been established.",
+            "Observed values are native activity-duration statistics from the declared full step; predicted values sum isolated device programs, so neither is an additive critical-path decomposition.",
+            "Native fusion and program call boundaries differ; occurrence counts are diagnostic, not a one-to-one admission requirement. No tolerance or accuracy pass is claimed."
+          ],
+          "prediction_scenarios": [
+            {
+              "context": 0,
+              "duration_ms": 31.390961260606066,
+              "missing_groups": [],
+              "groups": [
+                {
+                  "name": "latent_attention0",
+                  "family": "attention",
+                  "duration_ms": 31.390961260606066,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                }
+              ]
+            }
+          ],
+          "signed_gap_percent": -68.25892965491641,
+          "absolute_gap_percent": 68.25892965491641,
+          "observed_per_call_us": null,
+          "predicted_per_call_us": null,
+          "per_call_diff_us": null,
+          "abs_error_per_call_us": null,
+          "accuracy_tier": "reference_only",
+          "accuracy_status": "reference_only",
+          "accuracy_pass": null,
+          "accuracy_tolerance": null,
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "accuracy_scope": "conditional_diagnostic_excluded_from_scored_cohort_denominator",
+          "descriptive_tier": null,
+          "per_call_ineligible_reason": "native_and_program_grouping_not_equivalent"
+        },
+        {
+          "comparison_key": "grouped_gemm",
+          "comparison_level": "coarse_semantic_family",
+          "status": "conditional",
+          "formal_accuracy": "not_assessed",
+          "observed_ms": 38.344874,
+          "predicted_ms": 35.08626290409648,
+          "signed_gap_ms": -3.258611095903518,
+          "absolute_gap_ms": 3.258611095903518,
+          "observed": {
+            "name": "grouped_gemm",
+            "duration_ms": 38.344874,
+            "occurrences": 132,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "DequantSwigluQuant",
+                "duration_ms": 1.449709,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GroupedMatmul",
+                "duration_ms": 10.988484,
+                "occurrences": 44
+              },
+              {
+                "native_type": "GroupedMatmulSwigluQuant",
+                "duration_ms": 25.906681,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          "predicted_groups": [
+            "ascend_shared_dequant_swiglu_quant",
+            "balanced_grouped_down",
+            "balanced_grouped_gate_up",
+            "grouped_swiglu"
+          ],
+          "assumptions": [
+            "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them.",
+            "This is a coarse declared semantic association; native and analytic tensor/lowering equivalence has not been established.",
+            "Observed values are native activity-duration statistics from the declared full step; predicted values sum isolated device programs, so neither is an additive critical-path decomposition.",
+            "Native fusion and program call boundaries differ; occurrence counts are diagnostic, not a one-to-one admission requirement. No tolerance or accuracy pass is claimed."
+          ],
+          "prediction_scenarios": [
+            {
+              "context": 0,
+              "duration_ms": 35.08626290409648,
+              "missing_groups": [],
+              "groups": [
+                {
+                  "name": "balanced_grouped_gate_up",
+                  "family": "grouped_gemm",
+                  "duration_ms": 21.852814136760603,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "balanced_grouped_down",
+                  "family": "grouped_gemm",
+                  "duration_ms": 11.413678507941935,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "grouped_swiglu",
+                  "family": "swiglu",
+                  "duration_ms": 1.3841203199999998,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "ascend_shared_dequant_swiglu_quant",
+                  "family": "dequant_swiglu_quant",
+                  "duration_ms": 0.4356499393939394,
+                  "occurrences": 43,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                }
+              ]
+            }
+          ],
+          "signed_gap_percent": -8.49816613272355,
+          "absolute_gap_percent": 8.49816613272355,
+          "observed_per_call_us": null,
+          "predicted_per_call_us": null,
+          "per_call_diff_us": null,
+          "abs_error_per_call_us": null,
+          "accuracy_tier": "reference_only",
+          "accuracy_status": "reference_only",
+          "accuracy_pass": null,
+          "accuracy_tolerance": null,
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "accuracy_scope": "conditional_diagnostic_excluded_from_scored_cohort_denominator",
+          "descriptive_tier": null,
+          "per_call_ineligible_reason": "native_and_program_grouping_not_equivalent"
+        },
+        {
+          "comparison_key": "matmul",
+          "comparison_level": "coarse_semantic_family",
+          "status": "conditional",
+          "formal_accuracy": "not_assessed",
+          "observed_ms": 57.791353,
+          "predicted_ms": 54.76021374348953,
+          "signed_gap_ms": -3.031139256510471,
+          "absolute_gap_ms": 3.031139256510471,
+          "observed": {
+            "name": "matmul",
+            "duration_ms": 57.791353,
+            "occurrences": 442,
+            "statistic": "sum_of_original_positive_duration_ns",
+            "aggregation": "sum",
+            "boundary": "device_activity_durations",
+            "scope": "complete_one_request_one_retained_rank_capture",
+            "source": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+            "members": [
+              {
+                "native_type": "MatMulV2",
+                "duration_ms": 12.384499,
+                "occurrences": 110
+              },
+              {
+                "native_type": "MatMulV3",
+                "duration_ms": 9.758106,
+                "occurrences": 47
+              },
+              {
+                "native_type": "QuantBatchMatmulV3",
+                "duration_ms": 28.176036,
+                "occurrences": 241
+              },
+              {
+                "native_type": "TransposeBatchMatMul",
+                "duration_ms": 7.472712,
+                "occurrences": 44
+              }
+            ],
+            "assumptions": [
+              "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them."
+            ]
+          },
+          "predicted_groups": [
+            "compress_gates",
+            "compress_values",
+            "dense_down",
+            "dense_gate_up",
+            "draft_features",
+            "grouped_output_a",
+            "grouped_output_b",
+            "index_compress_gates",
+            "index_compress_values",
+            "index_key_hadamard",
+            "index_q",
+            "index_query_hadamard",
+            "index_weights",
+            "kv_a",
+            "q_a",
+            "q_absorb",
+            "q_b",
+            "v_expand",
+            "vocab_logits"
+          ],
+          "assumptions": [
+            "Native type membership is explicit. Fused MlaProlog includes vector/cache work within the matrix-associated group; routing and normalization remain vector-associated where native exports separate them.",
+            "This is a coarse declared semantic association; native and analytic tensor/lowering equivalence has not been established.",
+            "Observed values are native activity-duration statistics from the declared full step; predicted values sum isolated device programs, so neither is an additive critical-path decomposition.",
+            "Native fusion and program call boundaries differ; occurrence counts are diagnostic, not a one-to-one admission requirement. No tolerance or accuracy pass is claimed."
+          ],
+          "prediction_scenarios": [
+            {
+              "context": 0,
+              "duration_ms": 54.76021374348953,
+              "missing_groups": [],
+              "groups": [
+                {
+                  "name": "compress_values",
+                  "family": "gemm",
+                  "duration_ms": 6.666326884848486,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "compress_gates",
+                  "family": "gemm",
+                  "duration_ms": 6.666326884848486,
+                  "occurrences": 41,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "q_b",
+                  "family": "gemm",
+                  "duration_ms": 5.570069100606062,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "grouped_output_b",
+                  "family": "gemm",
+                  "duration_ms": 5.570069100606062,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_q",
+                  "family": "gemm",
+                  "duration_ms": 5.223386763636364,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "q_a",
+                  "family": "gemm",
+                  "duration_ms": 4.806046254545456,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "grouped_output_a",
+                  "family": "gemm",
+                  "duration_ms": 4.806046254545456,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_query_hadamard",
+                  "family": "gemm",
+                  "duration_ms": 3.114306109090911,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "dense_down",
+                  "family": "down_projection",
+                  "duration_ms": 2.9822190933333315,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "dense_gate_up",
+                  "family": "gate_up_projection",
+                  "duration_ms": 2.78434290909091,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "kv_a",
+                  "family": "gemm",
+                  "duration_ms": 2.746639825454545,
+                  "occurrences": 44,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_compress_values",
+                  "family": "gemm",
+                  "duration_ms": 1.2357110690909099,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_compress_gates",
+                  "family": "gemm",
+                  "duration_ms": 1.2357110690909099,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_weights",
+                  "family": "gemm",
+                  "duration_ms": 0.6646836425948851,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "draft_features",
+                  "family": "gemm",
+                  "duration_ms": 0.22947529696969698,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "v_expand",
+                  "family": "gemm",
+                  "duration_ms": 0.1266135660606061,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "vocab_logits",
+                  "family": "logits",
+                  "duration_ms": 0.11385767422796664,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "q_absorb",
+                  "family": "gemm",
+                  "duration_ms": 0.11338224484848486,
+                  "occurrences": 1,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                },
+                {
+                  "name": "index_key_hadamard",
+                  "family": "gemm",
+                  "duration_ms": 0.105,
+                  "occurrences": 21,
+                  "boundary": "sum_of_isolated_device_programs",
+                  "statistic": "sum",
+                  "aggregation": "sum",
+                  "scope": "declared_model_probe"
+                }
+              ]
+            }
+          ],
+          "signed_gap_percent": -5.244970223331631,
+          "absolute_gap_percent": 5.244970223331631,
+          "observed_per_call_us": null,
+          "predicted_per_call_us": null,
+          "per_call_diff_us": null,
+          "abs_error_per_call_us": null,
+          "accuracy_tier": "reference_only",
+          "accuracy_status": "reference_only",
+          "accuracy_pass": null,
+          "accuracy_tolerance": null,
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "accuracy_scope": "conditional_diagnostic_excluded_from_scored_cohort_denominator",
+          "descriptive_tier": null,
+          "per_call_ineligible_reason": "native_and_program_grouping_not_equivalent"
+        }
+      ],
+      "call_comparisons": [],
+      "sources": [
+        {
+          "role": "structure_replay",
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_v4f.json",
+          "size_bytes": 55551,
+          "sha256": "3db36f2642a1a24da3faed92ab696fec0d04e9fb895f01ec2feb0667ff96ef2a",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "original_prediction_case_seed",
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/v4f-a3-w8a8-tp8.json",
+          "size_bytes": 6587,
+          "sha256": "2445cf26fce3d99f00de416dc3c79539183c33d328aecde973f1b1500dc1fce3",
+          "hash_basis": "computed_from_current_small_source_2026-10-29",
+          "scope": "Retained seed provenance; actual executed case is recorded separately."
+        },
+        {
+          "role": "observed_summary",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/analysis/pre4096.json",
+          "size_bytes": 2507,
+          "sha256": "7dd5d6313c294249d13d5befa2589fb04f1d4743e10f321f9f6bd9a8d658ba9b",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "independent_request_receipt",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.json",
+          "size_bytes": 1249,
+          "sha256": "68c689744d4869fe73f535d4390a2fcdd74ed145f42251317d131785f5e43859",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "summary_producer",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/cfg/extract_prefill.py",
+          "size_bytes": 8601,
+          "sha256": "0e64b1a0ef30146108fdcf5577c4c28b54149333a74bdde284c43747cbfdbca9",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "independent_serving_recipe",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/cfg/serve_prefill.sh",
+          "size_bytes": 2319,
+          "sha256": "2481f5c6ba073041e32f6b41cc3db72f6aab0c834e68e08e3dcc15b9b17817b7",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "corroborating_hardware_log",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-w8a8-tp8/logs/npu-smi-series.txt",
+          "size_bytes": 759976,
+          "sha256": "0fde04f169b1327c10fece5283a8e8cc1bbd639dc8f46f910be9f82b850488b3",
+          "hash_basis": "computed_from_current_small_source_2026-10-29"
+        },
+        {
+          "role": "raw_capture",
+          "path": "/Volumes/data/mindie-sim-data/a3/2026-10-23/v4f-prefill/raw/pre4096.kernel_details.csv",
+          "sha256": "b56b7439213cc9f76eaae63347393d4add6ae5c985bf28a6a7737f5783c81788",
+          "size_bytes": 1391917,
+          "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-v4flash_a3-mechanisms-case.json",
+          "sha256": "ea1b832f03bb6b1a06667ba3507524d23be6e962d66d23610ddf5b0f2e1a52e7",
+          "size_bytes": 9030,
+          "role": "prediction_case_executed",
+          "source_revision": "239f443c25b640d8545416ef115cafd64b26d031"
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-device-floor/v4flash_a3-0-prediction.json",
+          "sha256": "dee17204083d4b55cbb85c468a477d21a35aca22641f49e518326981e90c582a",
+          "size_bytes": 145541,
+          "role": "prediction_report_refreshed",
+          "scenario": 0,
+          "source_revision": "239f443c25b640d8545416ef115cafd64b26d031"
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
+          "sha256": "9755b6465df9de20d57cf5bb5919d5e94e0adc81af9e947a18365bbf5665f385",
+          "size_bytes": 22724,
+          "role": "communication_population_audit"
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
+          "sha256": "068a8f901370c662b90c74dd1aa1da4573c35e8dca2e2e1091399222f829743e",
+          "size_bytes": 150833,
+          "role": "current_prediction_report",
+          "scenario": 0,
+          "source_revision": "26f5adb48dd418584cd18c79d6a63ca8ab42afd7"
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
+          "sha256": "068a8f901370c662b90c74dd1aa1da4573c35e8dca2e2e1091399222f829743e",
+          "size_bytes": 150833
+        }
+      ],
+      "limitations": [
+        "Captured source build/binary identity and current analytic implementation identity are not fully established.",
+        "No model-module occurrence evidence is retained; this does not invalidate capture totals, but limits layer attribution.",
+        "Activity sums and per-family statistics are not additive critical-path costs and must not be weighted by wall-span share.",
+        "No standalone independent checkpoint config.json was found in the audited campaign; model path and source/catalog declarations are retained.",
+        "AICPU and device communication activity overlap; observed sum609.513832ms is not the575.235407ms span.",
+        "Historical per-chunk boundaries use attention-call indices; only the one-chunk p4096 case avoids that multi-chunk attribution assumption.",
+        "The original probability-routing graph timed out after40s; that attempt is retained separately. Balanced routing is an explicit modeling assumption.",
+        "Source prefill target and MTP catalog geometry remains conditional; no independently extracted full checkpoint config is in this capture.",
+        "The superseded46-attention-call catalog-draft3 result232.993985ms is retained as a mismatched-work diagnostic, not a paired prediction.",
+        "Selected HC source plans cover172 calls from43 target layers. Native HcPre has88 calls (44 layer-equivalents); the generic one-layer MTP adapter does not yet reproduce its complete HC caller boundary. Target attention plus MTP remains44 calls."
+      ]
+    }
+  ],
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/model-scoreboard-20261029-final.json",
+    "sha256": "d81e789decc356610c74f0f2d8a067d46e567d4fb39ea7b3fae74f1f20d24374",
+    "size_bytes": 1175291
+  }
+}

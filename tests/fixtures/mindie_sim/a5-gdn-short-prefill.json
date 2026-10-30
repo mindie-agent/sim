@@ -1,0 +1,199 @@
+{
+ "arch_family": "A5",
+ "calibration_scope": "a5/rack06os8/die0/qwen38-27b-w8a8-mxfp8/prefill-8-128",
+ "derivation": {
+  "correction_ms_at_p128": -14.085862494921484,
+  "forms": {
+   "conv_prefill": {
+    "isolated_ms_at_p128": 0.031071029109565378,
+    "isolated_ms_at_p8": 0.025781192661098042,
+    "stream_ms_at_p128": 0.01206077083333333,
+    "stream_ms_at_p8": 0.007538479166666667
+   },
+   "gating": {
+    "isolated_ms_at_p128": 0.06554616121558098,
+    "isolated_ms_at_p8": 0.06545096982437783,
+    "stream_ms_at_p128": 0.16881514583333337,
+    "stream_ms_at_p8": 0.032612125000000006
+   },
+   "scan_prefill": {
+    "isolated_ms_at_p128": 0.46968852831905117,
+    "isolated_ms_at_p8": 0.4489512371887647,
+    "stream_ms_at_p128": 0.09197433333333326,
+    "stream_ms_at_p8": 0.06972904166666667
+   }
+  },
+  "isolated_per_layer_ms_at_p128": 0.5663057186441975,
+  "layers": 48,
+  "local_geometry": {
+   "conv_width": 10240,
+   "k_heads": 16,
+   "key_width": 2048,
+   "v_heads": 48,
+   "value_width": 6144
+  },
+  "per_layer_intercept_rule": "intercept_ms = mean over measured points of (measured_per_call_ms - slope_ms_per_unit * work)",
+  "slope_rule": "slope_ms_per_unit is the exact line through the two measured served-prefill points (p8, p128) of this artifact; the frozen GDN artifact's long-prompt slope is not substituted",
+  "stream_per_layer_ms_at_p128": 0.27285024999999996,
+  "tp": 1
+ },
+ "geometry": {
+  "conv_kernel": 4,
+  "conv_width": 10240,
+  "full_layers": 16,
+  "gdn_layers": 48,
+  "hidden": 5120,
+  "k_dim": 128,
+  "k_heads": 16,
+  "layers": 64,
+  "v_dim": 128,
+  "v_heads": 48
+ },
+ "hardware_key": "Ascend950DT_9582",
+ "kind": "a5_gdn_short_prefill_stream",
+ "label": "a5-gdn-short-prefill-rack06os8",
+ "machine": {
+  "die": 0,
+  "host": "rack06os8",
+  "host_ip": "177.25.28.1",
+  "image_id": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "npu": "Ascend950DT 9582",
+  "port": 18217,
+  "recipe": "vllm-ascend v0.30.0rc2-a5 DP1xTP1 W8A8-MXFP8 MTP3 FULL_DECODE_ONLY gmu0.85 131072"
+ },
+ "prefill_decomposition_ms": {
+  "p128_attention_ms": 0.6204499999999998,
+  "p128_comm_ms": 0.0,
+  "p128_gdn_conv_ms": 0.5789169999999998,
+  "p128_gdn_gating_ms": 8.103127000000002,
+  "p128_gdn_scan_ms": 4.414767999999996,
+  "p128_gdn_total_ms": 13.096812000000021,
+  "p128_gemm_ms": 17.710928,
+  "p128_non_gdn_total_ms": 24.576102999999996,
+  "p128_vector_ms": 6.244724999999998,
+  "p128_window_total_ms": 37.67291500000002,
+  "p8_attention_ms": 0.43674,
+  "p8_comm_ms": 0.0,
+  "p8_gdn_conv_ms": 0.36184700000000003,
+  "p8_gdn_gating_ms": 1.5653820000000003,
+  "p8_gdn_scan_ms": 3.346994,
+  "p8_gdn_total_ms": 5.2742229999999966,
+  "p8_gemm_ms": 14.169675,
+  "p8_non_gdn_total_ms": 18.799419999999994,
+  "p8_vector_ms": 4.193004999999993,
+  "p8_window_total_ms": 24.07364299999999
+ },
+ "provenance": {
+  "analyser": "analysis/analyze_prefill_trace.py",
+  "builder": "analysis/build_short_prefill_artifact.py",
+  "cross_check_p128_stream_ms": {
+   "o1_prefill_capture": 13.096812000000021
+  },
+  "measured_utc": "2026-10-22T12:54:35Z",
+  "note": "torch_npu kernel_details.csv of one served p8 and one served p128 request on the frozen recipe; the prefill window is every kernel before the first decode marker",
+  "source_gdn_artifact_sha256": "839a03777fc42bd3d22ae05a61c44d62e9255affc7d06861b2cae9c811a5e35f",
+  "source_trace_p128_sha256": "e67eeb979b578595e331264cac6885200264f3b1dec50fd3eb9ea26522bf6f22",
+  "source_trace_p8_sha256": "c83cfeef0c61030e17ea3c7b0570413a540f7b8440e79886d7b5d4d7ae44fee0"
+ },
+ "rows": {
+  "conv_prefill": {
+   "family": "linear_conv/npu_causal_conv1d_fn",
+   "intercept_ms": 0.007236993055555556,
+   "kernels": [
+    "CausalConv1d"
+   ],
+   "measured_points": [
+    {
+     "calls": 48,
+     "kernel": "CausalConv1d",
+     "measured_per_call_ms": 0.007538479166666667,
+     "tokens": 8,
+     "trace_sha256": "c83cfeef0c61030e17ea3c7b0570413a540f7b8440e79886d7b5d4d7ae44fee0",
+     "work": 81920.0
+    },
+    {
+     "calls": 48,
+     "kernel": "CausalConv1d",
+     "measured_per_call_ms": 0.01206077083333333,
+     "tokens": 128,
+     "trace_sha256": "e67eeb979b578595e331264cac6885200264f3b1dec50fd3eb9ea26522bf6f22",
+     "work": 1310720.0
+    }
+   ],
+   "slope_ms_per_unit": 3.680250379774302e-09,
+   "slope_source": "exact line through the two measured served-prefill points (p8, p128) of this artifact",
+   "work_unit": "tokens_x_width"
+  },
+  "gating": {
+   "family": "linear_gate/fused_gdn_gating_kernel",
+   "intercept_ms": 0.023531923611111116,
+   "kernels": [
+    "fused_gdn_gating_kernel"
+   ],
+   "measured_points": [
+    {
+     "calls": 48,
+     "kernel": "fused_gdn_gating_kernel",
+     "measured_per_call_ms": 0.032612125000000006,
+     "tokens": 8,
+     "trace_sha256": "c83cfeef0c61030e17ea3c7b0570413a540f7b8440e79886d7b5d4d7ae44fee0",
+     "work": 384.0
+    },
+    {
+     "calls": 48,
+     "kernel": "fused_gdn_gating_kernel",
+     "measured_per_call_ms": 0.16881514583333337,
+     "tokens": 128,
+     "trace_sha256": "e67eeb979b578595e331264cac6885200264f3b1dec50fd3eb9ea26522bf6f22",
+     "work": 6144.0
+    }
+   ],
+   "slope_ms_per_unit": 2.364635778356482e-05,
+   "slope_source": "exact line through the two measured served-prefill points (p8, p128) of this artifact",
+   "work_unit": "tokens_x_heads"
+  },
+  "scan_prefill": {
+   "family": "recurrent_scan/npu_chunk_gated_delta_rule_fwd",
+   "intercept_ms": 0.06824602222222223,
+   "kernels": [
+    "aclnnChunkGatedDeltaRuleFwd_CastAiCore_Cast"
+   ],
+   "measured_points": [
+    {
+     "calls": 48,
+     "kernel": "aclnnChunkGatedDeltaRuleFwd_CastAiCore_Cast",
+     "measured_per_call_ms": 0.06972904166666667,
+     "tokens": 8,
+     "trace_sha256": "c83cfeef0c61030e17ea3c7b0570413a540f7b8440e79886d7b5d4d7ae44fee0",
+     "work": 49152.0
+    },
+    {
+     "calls": 48,
+     "kernel": "aclnnChunkGatedDeltaRuleFwd_CastAiCore_Cast",
+     "measured_per_call_ms": 0.09197433333333326,
+     "tokens": 128,
+     "trace_sha256": "e67eeb979b578595e331264cac6885200264f3b1dec50fd3eb9ea26522bf6f22",
+     "work": 786432.0
+    }
+   ],
+   "slope_ms_per_unit": 3.017210783781817e-08,
+   "slope_source": "exact line through the two measured served-prefill points (p8, p128) of this artifact",
+   "work_unit": "tokens_x_state"
+  }
+ },
+ "schema_version": "mindie-sim.physical-calibration/1",
+ "scope": {
+  "applies_to": [
+   "prefill_first_token"
+  ],
+  "beyond_scope": "the isolated per-call GDN rows keep applying; the served stream was measured at p8 and p128 only",
+  "geometry_model": "qwen3.8-27b",
+  "layers": 48,
+  "max_prompt_tokens": 128,
+  "measured_prompt_tokens": [
+   8,
+   128
+  ],
+  "reason": "at short prompts the isolated per-call launch intercept dominates the fitted GDN prefill row, but a served prefill launches one call per layer back to back and pays device kernel time, not the isolated enqueue gap"
+ }
+}

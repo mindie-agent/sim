@@ -1,0 +1,216 @@
+{
+  "name": "catalog-full-model-v4f-a3-w8a8-mtp-tp8",
+  "machine": {
+    "name": "a3-9362-8die-tp8",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "note": "one A3 host (192.168.13.165), 4 two-die packages = 8 dies 8-15, one rank per die; links are omitted so the machine's declared transfer channels materialize four SIO intra-package pairs at 448 GB/s and one 8-die HCCS_SW intra-node link at 196 GB/s; fixpipe (L0C->GM) write bandwidth declared for the V4 quant lightning indexer: 3.70 TB/s, identified from the hp-serving/v4f-a3-prefill c1 torch_npu trace (raw effective 3.68 TB/s at q4096; 3.678-4.011 TB/s (q8192 chunks steady ~4.00, q4096 3.68; the earlier 7.17/6.66/6.15 numbers were an arithmetic error and are retracted)); identified domain: one s2 block per s1 group, int8 index kernel, A3/arch32. A fused-op fixpipe use outside that domain must report unknown capacity, never reuse this number. Not declared for A5/arch35.",
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 270336000000000.0,
+      "vector_ops_per_s": 8448000000000.0,
+      "hbm_bw_bytes_per_s": 1200000000000.0,
+      "mte_bw_bytes_per_s": 2400000000000.0,
+      "launch_us": 20.0,
+      "l2_bytes": 176160768,
+      "aic_count": 20,
+      "aiv_count": 40
+    },
+    "compute_peaks": {
+      "bf16": 270336000000000.0,
+      "int8": 540672000000000.0
+    },
+    "fixpipe_bw_bytes_per_s": 3700000000000.0,
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "deepseek-v4-flash-0731",
+    "quantization": "w8a8_dynamic",
+    "auxiliary": {
+      "mtp": {
+        "kind": "mtp",
+        "layers": 1,
+        "hidden_size": 4096,
+        "intermediate_size": 2048,
+        "attention_kind": "mla",
+        "num_heads": 64,
+        "num_kv_heads": 1,
+        "head_dim": 512,
+        "q_width": 32768,
+        "kv_width": 512,
+        "q_lora_rank": 1024,
+        "kv_lora_rank": 512,
+        "qk_nope_head_dim": 448,
+        "qk_rope_head_dim": 64,
+        "v_head_dim": 512,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "num_experts": 256,
+        "top_k": 6,
+        "expert_intermediate_size": 2048,
+        "num_shared_experts": 1,
+        "target_layer_ids": [
+          42
+        ],
+        "block_size": 1,
+        "markov_rank": 0,
+        "confidence_enabled": false,
+        "confidence_executes": false,
+        "confidence_input_width": 0,
+        "target_shared_embedding": true,
+        "target_shared_lm_head": true,
+        "base_logits": true,
+        "markov_replicated": true,
+        "noncausal_query_block": false,
+        "pp_capability": [
+          1
+        ],
+        "vocab_size": 129280,
+        "activation_dtype": "bf16",
+        "source": [
+          [
+            "kind",
+            "explicit_capture_mtp1_geometry_declaration"
+          ],
+          [
+            "basis",
+            "retained serving recipe+44 attention calls; target dimensions conditional"
+          ]
+        ],
+        "notes": [
+          "One historical checkpoint MTP layer, not catalog DSpark3.",
+          "Native hyper-connection input projection details are approximated by the generic draft adapter; no exact native boundary equivalence is claimed."
+        ],
+        "input_projection_category": "mtp",
+        "weight_category": "mtp"
+      },
+      "dspark": null,
+      "external_draft_key": "",
+      "standalone_draft": false,
+      "include_vision_weights": true,
+      "notes": [
+        "Historical DeepSeekV4 MTP1 explicit declaration; no Markov or confidence branch."
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 8,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "max_model_len": 131072,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "kv_block_size": 128,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64
+    ],
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1,
+    "mtp_acceptance_length": 2.0,
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/DeepSeek-V4-Flash-w8a8-mtp --max-model-len 131072 --max-num-batched-tokens 8192 --served-model-name dsv4 --gpu-memory-utilization 0.9 --api-server-count 1 --max-num-seqs 32 --data-parallel-size 1 --tensor-parallel-size 8 --enable-expert-parallel --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4 --no-enable-prefix-caching --model-loader-extra-config '{\"enable_multithread_load\": true, \"num_threads\": 128}' --quantization ascend --port 18235 --block-size 128 --attention_config.indexer_kv_dtype int8 --speculative-config '{\"num_speculative_tokens\": 1,\"method\": \"mtp\",\"enforce_eager\": true}' --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}'",
+      "topology": "DP1 x TP8 + EP8 on one engine, dies 8-15",
+      "quantization": "W8A8_DYNAMIC int8 body (attention projections + routed expert gate/up/down); norms, embedding, router, LM head and the MTP layer stay BF16/FP32",
+      "weights": "DeepSeek-V4-Flash-w8a8-mtp (287 GB, w8a8, deepseek_v4, 43 layers, hidden 4096, 64 Q / 1 KV, head_dim 512, 256 routed experts top-6, moe_intermediate 2048, MTP1); measured per-die weight load 37.31 GiB (37.3122 GB on all 8 ranks)",
+      "mtp": "Explicit one-layer BF16 MTP preparation, target43+draft1. No measured timing or acceptance discount supplies cost.",
+      "mtp_acceptance_source": ".workstreams/hp-serving/v4f-a3-w8a8/report.md section 7: Mean acceptance length 2.00 in every cell (1,020/1,020 drafts on p4096/c4). This is a workload artefact (100% draft acceptance on degenerate greedy continuations); the natural-prompt family value is 79.1% (1.79).",
+      "enable_prefix_caching": "false (--no-enable-prefix-caching)",
+      "indexer_kv_dtype": "int8 (--attention_config.indexer_kv_dtype int8)",
+      "graph": "cudagraph_mode=FULL_DECODE_ONLY; capture sizes [1,2,4,8,16,24,32,40,48,56,64]; 18 s capture / 0.73 GiB",
+      "chunked_prefill": "enabled, max_num_batched_tokens=8192; a 126,976-token prompt is 16 chunks",
+      "kv_cache": "measured engine line: Available KV cache memory 13.49 GiB -> NPU KV cache size 180,642 tokens (78.4 KB/token/die), Maximum concurrency for 131,072 tokens per request 1.38x. The analytic compressed-row model prices 6.35 KB/token (3.28M tokens); the two capacity statements are not comparable and the analytic number is never substituted for the engine's line.",
+      "measured_baseline": ".workstreams/hp-serving/v4f-a3-w8a8/report.md (2026-10-23, 192.168.13.165 dies 8-15, image vllm-ascend v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21)",
+      "row_policy": "measured rows are declared by the cells manifest; a row is applied only for its exact hardware/geometry. The A3 attention rows are Qwen2.5 GQA, the grouped int8 rows are 12/16/256 local experts, and the communication rows are 2/4-rank; none matches this TP8 32-local-expert MLA/DSA geometry, so those paths stay analytic and the missing rows are declared.",
+      "package": "sim 88a1989 + feat/v4f-a3-tp8",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21",
+      "image_digest": "sha256:5bdd40411c1abda875996cb83cdd6c0ca1a5251240aa19755ae6aab539ce1bdc",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 1
+    },
+    "vllm_impl": "sha256:5bdd40411c1abda875996cb83cdd6c0ca1a5251240aa19755ae6aab539ce1bdc",
+    "vllm_version": "0.30.0rc2.dev200+g8fd0bc488",
+    "kernel_format": "w8a8_dynamic",
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      },
+      "recipes": {
+        "balanced_grouped_gate_up": {
+          "kind": "steady_matmul"
+        },
+        "balanced_grouped_down": {
+          "kind": "steady_matmul"
+        }
+      },
+      "lowerings": {
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "hc_pre",
+              "hc_post"
+            ],
+            "traffic_profile": {
+              "hc_pre": "hc_pre_m_k_split_175ef4d4",
+              "hc_post": "hc_post_d_split_175ef4d4"
+            }
+          }
+        }
+      },
+      "moe_transport": {
+        "kind": "separate_quantized_payload",
+        "payload_dtype": "int8",
+        "scale_dtype": "fp32",
+        "scale_granularity": "row",
+        "histogram_dtype": "int64"
+      }
+    },
+    "routing": {
+      "policy": "balanced"
+    }
+  },
+  "migration": {
+    "retired_parameters": {
+      "mtp_overhead_ms": {
+        "value": 0.0,
+        "reason": "draft operators are derived from draft structure"
+      },
+      "mtp_small_prefill_ms": {
+        "value": 0.0,
+        "reason": "draft operators are derived from draft structure"
+      },
+      "timing_boundary": {
+        "value": "kernel_details",
+        "reason": "prediction reports device token commitment"
+      }
+    },
+    "source_version": "0.7"
+  }
+}

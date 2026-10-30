@@ -1,0 +1,126 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "grouped_gemm-0",
+      "split": "development",
+      "params": {
+        "expert_rows": [
+          1,
+          0,
+          3
+        ],
+        "n": 128,
+        "k": 64,
+        "dtype": "bf16",
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      },
+      "expected_dispatch": {
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      }
+    },
+    {
+      "id": "grouped_gemm-1",
+      "split": "development",
+      "params": {
+        "expert_rows": [
+          4,
+          4,
+          4
+        ],
+        "n": 256,
+        "k": 128,
+        "dtype": "bf16",
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      },
+      "expected_dispatch": {
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      }
+    },
+    {
+      "id": "grouped_gemm-2",
+      "split": "development",
+      "params": {
+        "expert_rows": [
+          64,
+          1,
+          0
+        ],
+        "n": 128,
+        "k": 128,
+        "dtype": "bf16",
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      },
+      "expected_dispatch": {
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      }
+    },
+    {
+      "id": "grouped_gemm-3",
+      "split": "heldout_geometry",
+      "params": {
+        "expert_rows": [
+          17,
+          0,
+          2,
+          65
+        ],
+        "n": 256,
+        "k": 64,
+        "dtype": "bf16",
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      },
+      "expected_dispatch": {
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      }
+    },
+    {
+      "id": "grouped_gemm-4",
+      "split": "heldout_geometry",
+      "params": {
+        "expert_rows": [
+          129,
+          0,
+          7
+        ],
+        "n": 128,
+        "k": 128,
+        "dtype": "bf16",
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      },
+      "expected_dispatch": {
+        "implementation": "ascendc_grouped_nd_bf16",
+        "transpose_weight": false,
+        "weight_layout": "ND",
+        "tiling_key": 10
+      }
+    }
+  ]
+}

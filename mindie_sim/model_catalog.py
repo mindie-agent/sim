@@ -1,4 +1,5 @@
-"""Catalog loader for the nine se-tools models and extended architecture presets.
+"""Catalog loader for the nine se-tools models, measured A5 served checkpoints
+and extended architecture presets.
 
 [Role]
   Load the checked-in actual configs and expose independent identities for all
@@ -14,7 +15,7 @@
     becomes a body layer and never runs on a plain forward.
   * Recurrent/conv state (GDN/KDA/Mamba) is an O(1)-in-seq_len per-sequence
     endpoint; cross-layer KV allocation counts only ``kv_owner_layers``.
-  * Missing or invalid dimensions raise ``A3InputError``; zero placeholders are
+  * Missing or invalid dimensions raise ``ModelingError``; zero placeholders are
     not returned for weights.
 
 [Timeouts & Locks]
@@ -31,10 +32,12 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from .a3_model_types import LayerPlan, ModelSpec
-from .a3_types import A3InputError, ParallelSpec, dtype_bytes
-from .a3_catalog_specs import build_model_spec as _build_model_spec
-from .a3_catalog_weights import (
+from mindie_sim.schema.model import LayerPlan, ModelSpec
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.parallel import ParallelSpec
+from mindie_sim.coverage import model_coverage
+from mindie_sim.catalog.specs import build_model_spec as _build_model_spec
+from mindie_sim.catalog.weights import (
     body_parameter_count, body_weight_bytes, sharded_weight_bytes as _sharded,
     stage_weight_bytes, stage_weight_terms, weight_breakdown,
 )
@@ -46,22 +49,62 @@ CATALOG: dict[str, str] = {
     "deepseek-v4-pro-0813": "deepseek-v4-pro-0813.json",
     "deepseek-v4.1-flash": "deepseek-v4.1-flash.json",
     "glm-5.3": "glm-5.3.json",
+    # The measured A5 GLM-5.3-Flash-BF16 served checkpoint is a distinct
+    # 45-layer hybrid (11 DSA + 34 KDA) release, not a rewrite of the 78-layer
+    # GLM-5.3 catalog entry.  It gets its own config so neither model is
+    # misrepresented by the other's geometry.
+    "glm-5.3-flash": "glm-5.3-flash.json",
     "kimi-k3": "kimi-k3.json",
     "kimi-k3-dspark": "kimi-k3-dspark.json",
     "qwen3.8-2.4t-a95b": "qwen3.8-2.4t-a95b.json",
     "qwen3.8-27b": "qwen3.8-27b.json",
+    # Qwen3.6-27B-W8A8 publishes the same body geometry as qwen3.8-27b but is
+    # a distinct measured checkpoint/identity; keep a separate config so the
+    # true128k row8 case cannot silently resolve to the Qwen3.8 model.
+    "qwen3.6-27b": "qwen3.6-27b.json",
+    "qwen3.5-35b-a3b": "qwen3.5-35b-a3b.json",
 }
 
 MODEL_ALIASES = {
+    "deepseek-v4-flash": "deepseek-v4-flash-0731",
+    "deepseek-v4-pro": "deepseek-v4-pro-0813",
+    "deepseek-v4.1": "deepseek-v4.1-flash",
+    "qwen3.8": "qwen3.8-27b",
     "DeepSeek-V4-10T": "deepseek-v4-10t",
     "DeepSeek-V4-Flash-0731": "deepseek-v4-flash-0731",
     "DeepSeek-V4-Pro-0813": "deepseek-v4-pro-0813",
     "DeepSeek-V4.1-Flash": "deepseek-v4.1-flash",
     "GLM-5.3": "glm-5.3",
+    "GLM-5.3-Flash": "glm-5.3-flash",
+    "glm53-flash": "glm-5.3-flash",
+    # The measured A3 GLM-5.3-W4A8-INT checkpoint publishes the same 78-layer
+    # / hidden 6144 / 256-expert top-8 / MLA 512-2048 / index_topk 2048 body
+    # as the `glm-5.3` catalog entry, so the A3 case binds that config by
+    # identity instead of forking a byte-identical model file.  Only the
+    # quantization preset differs: the checkpoint is W4A8_DYNAMIC routed
+    # experts + W8A8_DYNAMIC attention/shared/dense, declared by the case.
+    "GLM-5.3-W4A8": "glm-5.3",
+    "GLM-5.3-W4A8-INT": "glm-5.3",
+    "glm-5.3-w4a8": "glm-5.3",
     "Kimi-K3": "kimi-k3",
     "Kimi-K3-DSpark": "kimi-k3-dspark",
     "Qwen3.8-2.4T-A95B": "qwen3.8-2.4t-a95b",
     "Qwen3.8-27B": "qwen3.8-27b",
+    # Qwen3.6-27B-W8A8 has the same body dimensions but a distinct measured
+    # identity; the row8 case must not resolve to qwen3.8-27b.
+    "Qwen3.6-27B": "qwen3.6-27b",
+    "qwen3.6-27b": "qwen3.6-27b",
+    "Qwen3.5-35B-A3B": "qwen3.5-35b-a3b",
+    "qwen3.5-35b-a3b": "qwen3.5-35b-a3b",
+    "qwen3_5_moe_a3b": "qwen3.5-35b-a3b",
+    # The measured Qwen3.6-35B-A3B-W8A8 checkpoint publishes the same
+    # 40-layer / 30-GDN + 10-GQA / 256-expert-top-8 / hidden-2048 MoE config
+    # as the Qwen3.5-35B-A3B entry (byte-identical geometry; only the weights
+    # and the MTP recipe differ).  The A3 case binds that config by identity
+    # instead of forking a byte-identical model file; the 5120-hidden body
+    # belongs to the dense 27B model, not this MoE checkpoint.
+    "Qwen3.6-35B-A3B": "qwen3.5-35b-a3b",
+    "qwen3.6-35b-a3b": "qwen3.5-35b-a3b",
 }
 
 ARCHITECTURE_PRESET_CATALOG: dict[str, str] = {
@@ -93,6 +136,19 @@ _RECURRENT_KINDS = {"gdn", "kda", "mamba"}
 _TOKEN_KV_KINDS = {"gqa", "mla", "gqa_sparse_indexer"}
 _DIT_ACTIVE_CACHE_METHODS = {"teacache", "fbcache", "taylorseer"}
 _DIT_ACTIVE_SPARSE_METHODS = {"topk", "svg"}
+
+
+def _catalog_key(key: str) -> str:
+    """Normalize declared catalog labels while preserving local path spelling."""
+    aliases = {**MODEL_ALIASES, **ARCHITECTURE_PRESET_ALIASES}
+    if key in aliases:
+        return aliases[key]
+    normalized = str(key).strip().lower()
+    if normalized in aliases:
+        return aliases[normalized]
+    if normalized in CATALOG or normalized in ARCHITECTURE_PRESET_CATALOG:
+        return normalized
+    return key
 
 
 @dataclass(frozen=True)
@@ -162,14 +218,14 @@ class ModelArchitectureProfile:
 
     def validate_tp(self, tp_size: int) -> None:
         if tp_size <= 0:
-            raise A3InputError(f"tp_size_invalid:{tp_size}")
+            raise ModelingError(f"tp_size_invalid:{tp_size}")
         if self.recurrent_layer_indices and self.recurrent_variant == "gdn" and tp_size > 1:
             if self.recurrent_num_k_heads % tp_size != 0:
-                raise A3InputError(
+                raise ModelingError(
                     f"gdn_tp_inexact_k_heads:{self.recurrent_num_k_heads}%{tp_size}"
                 )
             if self.recurrent_num_v_heads % tp_size != 0:
-                raise A3InputError(
+                raise ModelingError(
                     f"gdn_tp_inexact_v_heads:{self.recurrent_num_v_heads}%{tp_size}"
                 )
 
@@ -221,13 +277,16 @@ class ModelArchitectureProfile:
         )
         if owner_kind == "mla" or self.kv_lora_rank > 0:
             # MLA caches compressed latent kv_lora_rank + qk_rope_head_dim
-            row_bytes = float((self.kv_lora_rank + self.qk_rope_head_dim) * kv_b)
+            kv_row_bytes = float((self.kv_lora_rank + self.qk_rope_head_dim) * kv_b)
         else:
             local_kv = max(1, math.ceil(self.num_key_value_heads / tp))
-            row_bytes = float(2 * local_kv * self.head_dim * kv_b)
-        if self.index_head_dim > 0:
-            row_bytes += float(self.index_head_dim * kv_b)
-        return row_bytes / dcp
+            kv_row_bytes = float(2 * local_kv * self.head_dim * kv_b)
+        # Context-addressed KV is DCP-sharded; the DSA indexer plane is
+        # replicated on every CP rank (global TopK), so it is never divided.
+        index_row_bytes = (
+            float(self.index_head_dim * kv_b) if self.index_head_dim > 0 else 0.0
+        )
+        return kv_row_bytes / dcp + index_row_bytes
 
     def kv_bytes_per_token_per_rank(
         self, tp_size: int = 1, dcp_size: int = 1, pp_size: int = 1,
@@ -265,7 +324,7 @@ class ModelArchitectureProfile:
 
 def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = None) -> ModelArchitectureProfile:
     if not isinstance(config, Mapping):
-        raise A3InputError("architecture_profile_config_invalid")
+        raise ModelingError("architecture_profile_config_invalid")
     model_key = str(key or config.get("model_key") or config.get("name") or "custom").strip()
     name = str(config.get("name") or model_key)
     model_type = str(config.get("model_type") or config.get("family") or "custom")
@@ -277,13 +336,13 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
     num_kv_heads = int(config.get("num_key_value_heads") or num_heads)
     head_dim = int(config.get("head_dim") or (hidden_size // max(1, num_heads) if num_heads else 0))
     if num_layers <= 0 or hidden_size <= 0 or num_heads <= 0 or head_dim <= 0:
-        raise A3InputError(f"architecture_profile_dimensions_invalid:{model_key}")
+        raise ModelingError(f"architecture_profile_dimensions_invalid:{model_key}")
 
     attn_type = str(config.get("attention_type") or "gqa").strip().lower()
     raw_schedule = config.get("layer_attention_schedule")
     if isinstance(raw_schedule, (list, tuple)) and raw_schedule:
         if len(raw_schedule) != num_layers:
-            raise A3InputError(
+            raise ModelingError(
                 f"layer_attention_schedule_length_mismatch:{len(raw_schedule)}!={num_layers}"
             )
         schedule = tuple(str(item).strip().lower() for item in raw_schedule)
@@ -305,14 +364,14 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
     rec_v_dim = int(lin_map.get("head_v_dim") or head_dim)
     conv_kernel = int(lin_map.get("conv_kernel_size") or (4 if recurrent_indices else 0))
     if recurrent_indices and rec_variant == "gdn" and rec_k_dim != rec_v_dim:
-        raise A3InputError(f"gdn_head_k_v_dim_mismatch:{rec_k_dim}!={rec_v_dim}")
+        raise ModelingError(f"gdn_head_k_v_dim_mismatch:{rec_k_dim}!={rec_v_dim}")
 
     raw_owners = config.get("kv_owner_layers")
     if raw_owners is None:
         owners = list(token_kv_indices)
     else:
         if not isinstance(raw_owners, (list, tuple)):
-            raise A3InputError("kv_owner_layers_invalid")
+            raise ModelingError("kv_owner_layers_invalid")
         owners = [int(idx) for idx in raw_owners]
 
     owner_set: set[int] = set()
@@ -320,9 +379,9 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
     token_kv_set = set(token_kv_indices)
     for idx in owners:
         if idx < 0 or idx >= num_layers:
-            raise A3InputError(f"kv_owner_layer_out_of_range:{idx}")
+            raise ModelingError(f"kv_owner_layer_out_of_range:{idx}")
         if idx in recurrent_indices or idx not in token_kv_set:
-            raise A3InputError(f"kv_owner_layer_is_recurrent_or_non_kv:{idx}")
+            raise ModelingError(f"kv_owner_layer_is_recurrent_or_non_kv:{idx}")
         if idx not in owner_set:
             owner_set.add(idx)
             ordered_owners.append(idx)
@@ -342,11 +401,11 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
         if idx in explicit_consumer_map:
             target_owner = explicit_consumer_map[idx]
             if target_owner not in owner_set or target_owner >= idx:
-                raise A3InputError(f"kv_consumer_owner_invalid:{idx}->{target_owner}")
+                raise ModelingError(f"kv_consumer_owner_invalid:{idx}->{target_owner}")
         else:
             earlier_owners = [o for o in ordered_owners if o < idx]
             if not earlier_owners:
-                raise A3InputError(f"kv_consumer_missing_earlier_owner:{idx}")
+                raise ModelingError(f"kv_consumer_missing_earlier_owner:{idx}")
             target_owner = earlier_owners[-1]
         consumer_pairs.append((idx, target_owner))
 
@@ -355,7 +414,7 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
     if latent_moe_raw is not None:
         latent_moe = int(latent_moe_raw)
         if latent_moe <= 0 or latent_moe > hidden_size:
-            raise A3InputError(f"latent_moe_hidden_size_invalid:{latent_moe}")
+            raise ModelingError(f"latent_moe_hidden_size_invalid:{latent_moe}")
 
     dit_raw = config.get("dit_config")
     dit_map = dict(dit_raw) if isinstance(dit_raw, Mapping) else {}
@@ -375,14 +434,14 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
         vae_s = int(dit_map.get("vae_spatial_stride") or 8)
         patch = list(dit_map.get("patch_size") or (1, 2, 2))
         if len(patch) != 3 or any(int(p) <= 0 for p in patch) or vid_h <= 0 or vid_w <= 0 or vid_f <= 0:
-            raise A3InputError("dit_video_dimensions_invalid")
+            raise ModelingError("dit_video_dimensions_invalid")
         pt, ph, pw = int(patch[0]), int(patch[1]), int(patch[2])
         latent_t = ((vid_f - 1) // vae_t + 1) if vid_f > 1 else 1
         grid_t = latent_t // pt
         grid_h = vid_h // (vae_s * ph)
         grid_w = vid_w // (vae_s * pw)
         if grid_t <= 0 or grid_h <= 0 or grid_w <= 0:
-            raise A3InputError("dit_patch_grid_invalid")
+            raise ModelingError("dit_patch_grid_invalid")
         visual_tokens = grid_t * grid_h * grid_w
         text_tokens = max(0, int(dit_map.get("text_sequence_len") or 0))
         total_dit_tokens = visual_tokens + text_tokens
@@ -390,17 +449,17 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
             dit_cache_method.strip().lower() in _DIT_ACTIVE_CACHE_METHODS
             and sparse_method.strip().lower() in _DIT_ACTIVE_SPARSE_METHODS
         ):
-            raise A3InputError("dit_cache_and_sparse_attention_mutually_exclusive")
+            raise ModelingError("dit_cache_and_sparse_attention_mutually_exclusive")
         if ulysses_deg <= 0 or ring_deg <= 0:
-            raise A3InputError("dit_sp_degree_invalid")
+            raise ModelingError("dit_sp_degree_invalid")
         if ulysses_any and ring_deg > 1:
-            raise A3InputError("uaa_does_not_support_hybrid_ring_sp")
+            raise ModelingError("uaa_does_not_support_hybrid_ring_sp")
         sp_world = ulysses_deg * ring_deg
         if not ulysses_any:
             if num_heads % ulysses_deg != 0:
-                raise A3InputError(f"dit_sp_head_divisibility_invalid:{num_heads}%{ulysses_deg}")
+                raise ModelingError(f"dit_sp_head_divisibility_invalid:{num_heads}%{ulysses_deg}")
             if (grid_h % sp_world != 0) and (grid_w % sp_world != 0):
-                raise A3InputError(f"dit_sp_spatial_divisibility_invalid:{grid_h}x{grid_w}%{sp_world}")
+                raise ModelingError(f"dit_sp_spatial_divisibility_invalid:{grid_h}x{grid_w}%{sp_world}")
 
     ffn_type = str(config.get("ffn_type") or "dense").strip().lower()
     ffn_hidden = int(config.get("ffn_hidden_size") or (4 * hidden_size))
@@ -503,14 +562,14 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
 def load_architecture_profile(
     key: str, *, config_root: str | Path | None = None,
 ) -> ModelArchitectureProfile:
-    resolved = ARCHITECTURE_PRESET_ALIASES.get(key, MODEL_ALIASES.get(key, key))
+    resolved = _catalog_key(key)
     root = Path(config_root) if config_root is not None else CONFIG_DIR
     if resolved in ARCHITECTURE_PRESET_CATALOG:
         path = root / ARCHITECTURE_PRESET_CATALOG[resolved]
         try:
             config = json.loads(path.read_text(encoding="utf-8"))
         except OSError as exc:
-            raise A3InputError(f"architecture_preset_unreadable:{resolved}:{type(exc).__name__}") from exc
+            raise ModelingError(f"architecture_preset_unreadable:{resolved}:{type(exc).__name__}") from exc
         return build_architecture_profile(config, key=resolved)
     if resolved in CATALOG:
         model = load_model(resolved, config_root=config_root)
@@ -544,7 +603,7 @@ def load_architecture_profile(
             },
             key=resolved,
         )
-    raise A3InputError(f"architecture_preset_unknown:{key}")
+    raise ModelingError(f"architecture_preset_unknown:{key}")
 
 
 def list_architecture_profiles() -> list[dict[str, Any]]:
@@ -555,16 +614,43 @@ def build_model_spec(key: str, config: dict[str, Any]) -> ModelSpec:
     return _build_model_spec(key, config)
 
 
+def derive_expert_pruned(base_key: str, *, num_experts: int, top_k: int,
+                         moe_intermediate_size: int) -> ModelSpec:
+    """Immutable per-layer expert-prune of a catalog model.
+
+    Attention family, compress_ratio, indexer and KV geometry are preserved layer by
+    layer; only the routed-expert shape changes, so a pruned checkpoint keeps the
+    original 43-layer swa/csa/hca split instead of collapsing to a uniform plan.
+    """
+    from dataclasses import replace
+
+    base = load_model(base_key)
+    plans = tuple(
+        replace(plan, num_experts=int(num_experts), top_k=int(top_k),
+                moe_intermediate_size=int(moe_intermediate_size))
+        for plan in base.layer_plans
+    )
+    derived = replace(base, layer_plans=plans, num_experts=int(num_experts),
+                      top_k=int(top_k), moe_intermediate_size=int(moe_intermediate_size))
+    return derived
+
+
 def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
-    key = MODEL_ALIASES.get(key, key)
-    if key not in CATALOG:
-        raise A3InputError(f"model_catalog_unknown:{key}")
+    key = str(key)
+    key = _catalog_key(key)
     root = Path(config_root) if config_root is not None else CONFIG_DIR
-    path = root / CATALOG[key]
+    entries = {**CATALOG, **ARCHITECTURE_PRESET_CATALOG}
+    path = root / entries[key] if key in entries else Path(key).expanduser()
+    if path.is_dir():
+        path = path / "config.json"
+    if key not in entries and not path.is_file():
+        raise ModelingError(f"model_catalog_unknown:{key}")
+    if path.stat().st_size > 50 * 1024 * 1024:
+        raise ModelingError(f"model_config_size_exceeds_metadata_limit:{key}")
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
     except OSError as exc:
-        raise A3InputError(f"model_config_unreadable:{key}:{type(exc).__name__}") from exc
+        raise ModelingError(f"model_config_unreadable:{key}:{type(exc).__name__}") from exc
     return _build_model_spec(key, config)
 
 
@@ -574,10 +660,8 @@ def sharded_weight_bytes(
 ) -> float:
     """Largest actual PP-stage per-rank weight footprint."""
     parallel.validate(model)
-    if model.quant is None:
-        wb = 1.0
-        per_stage = model.weight_bytes_per_layer(parallel) * model.layers_per_stage(parallel.pp)
-        return float(model.vocab_size * model.hidden_size * wb / max(1, parallel.tp) + per_stage)
+    from mindie_sim.prediction.structure import normalize_model
+    model = normalize_model(model)
     return _sharded(
         model, parallel, node_ranks, include_draft=include_draft,
         include_engram=include_engram,
@@ -606,7 +690,7 @@ def model_weight_detail(
 
 def list_models() -> list[dict[str, Any]]:
     rows = []
-    for key in CATALOG:
+    for key in {**CATALOG, **ARCHITECTURE_PRESET_CATALOG}:
         model = load_model(key)
         facts = dict(model.catalog_facts)
         rows.append({
@@ -615,13 +699,14 @@ def list_models() -> list[dict[str, Any]]:
             "hidden_size": model.hidden_size, "heads": model.num_heads,
             "experts": model.num_experts, "top_k": model.top_k,
             "parameter_count": model.parameter_count(),
-            "resident_weight_bytes": model.resident_weight_bytes_override,
+            "resident_weight_bytes": body_weight_bytes(model),
             "attention_types": facts.get("attention_types", {}),
             "ffn_types": facts.get("ffn_types", {}),
             "has_optional_draft": model.has_optional_draft,
             "has_vision": model.vision is not None,
             "engram_tables": facts.get("engram_tables", 0),
             "facts": facts,
+            **model_coverage(model),
         })
     return rows
 

@@ -1,0 +1,64 @@
+{
+  "sources": [
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/common/buildcfg/__init__.py",
+      "relative": "asc_op_compile_base/common/buildcfg/__init__.py",
+      "sha256": "8a6d966dd97eedfd57b26550018ecd1553e1f103d1a03f648be5bce0dbced058",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/common/buildcfg/__init__.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/common/buildcfg/buildcfg.py",
+      "relative": "asc_op_compile_base/common/buildcfg/buildcfg.py",
+      "sha256": "eb83538353cd9b69b62493037ff7305856b889e84bc7bbbad30a1465ec4c4e47",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/common/buildcfg/buildcfg.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/debug_compile/debug_compilation.py",
+      "relative": "op_compile_tool/debug_compile/debug_compilation.py",
+      "sha256": "3cf0e8b43f721e1873ad4274d1487f67aebd67a540317433b4feb51e8ac4735c",
+      "local": "/tmp/review-native-conv-compiler-20261028/op_compile_tool/debug_compile/debug_compilation.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/op_compiler_parse_args.py",
+      "relative": "op_compile_tool/op_compiler_parse_args.py",
+      "sha256": "8189b613019baf78ee30d3869ee7b05485b704b2ba588672c26c072318024188",
+      "local": "/tmp/review-native-conv-compiler-20261028/op_compile_tool/op_compiler_parse_args.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/static_compile/static_compilation.py",
+      "relative": "op_compile_tool/static_compile/static_compilation.py",
+      "sha256": "8745d2a1f20d5f5368970978808f543bda947b54e489e2e66f87cdf0732d7fa4",
+      "local": "/tmp/review-native-conv-compiler-20261028/op_compile_tool/static_compile/static_compilation.py"
+    }
+  ],
+  "kernel_hashes": [
+    {
+      "path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/causal_conv1d/causal_conv1d.cpp",
+      "relative": "causal_conv1d.cpp",
+      "sha256": "73835f0d1ec7e7ddc0aca92c3e55821b312440e964dfad4e5aeb8b448f50f281",
+      "retained_sha256": "73835f0d1ec7e7ddc0aca92c3e55821b312440e964dfad4e5aeb8b448f50f281",
+      "matches_retained": true
+    },
+    {
+      "path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/causal_conv1d/causal_conv1d.h",
+      "relative": "causal_conv1d.h",
+      "sha256": "040d8fbc70e68710633dd33427c1d1888f47beb6c1f26bed6140db601295f554",
+      "retained_sha256": "040d8fbc70e68710633dd33427c1d1888f47beb6c1f26bed6140db601295f554",
+      "matches_retained": true
+    },
+    {
+      "path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/causal_conv1d/causal_conv1d_tiling_key.h",
+      "relative": "causal_conv1d_tiling_key.h",
+      "sha256": "c0bb9ace833d13f45a992f72b2c6dfb9174bb79bf4499f02a7121da459119fb0",
+      "retained_sha256": "c0bb9ace833d13f45a992f72b2c6dfb9174bb79bf4499f02a7121da459119fb0",
+      "matches_retained": true
+    },
+    {
+      "path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/causal_conv1d/arch35/causal_conv1d_regbase.h",
+      "relative": "arch35/causal_conv1d_regbase.h",
+      "sha256": "c47a785a92926fc38d53eaf726d51807b1f702729fc85fcde1442c1e728601a5",
+      "retained_sha256": "c47a785a92926fc38d53eaf726d51807b1f702729fc85fcde1442c1e728601a5",
+      "matches_retained": true
+    }
+  ]
+}

@@ -1,0 +1,308 @@
+"""Graph-replayed served-shape int8 grouped-MoE probe for Qwen3.5-35B-A3B TP4 on A5.
+
+[Role]
+  Measure ``npu_grouped_matmul`` int8 (W8A8 dynamic) at the *served* decode shape and at the
+  artifact campaigns' padded shapes, both eager (per-call device events, the artifact scope) and
+  inside a ``torch.npu`` graph replay (the served scope, FULL_DECODE_ONLY).  Served geometry:
+  E=256 local experts, top-8 active per token, TP4-local intermediate 128, hidden 2048, so
+  gate_up is k=2048 -> n=256 and down is k=128 -> n=2048, with 4 tokens (c1 verify) or 16 tokens
+  (c4 verify) routed to 8 non-empty experts.
+
+[Invariants]
+  * 2 trials x 20 device-event samples per (shape, mode); every timed region wraps exactly one
+    kernel call (eager) or one graph replay of a fixed number of calls (graph).
+  * A shape is emitted only if its output matches the dequantized fp32 reference within 2 %
+    relative max; the canary samples three active experts and never the whole tensor.
+  * The activation quant is pre-done and is not inside any timed region (matches the artifact
+    recipe ``device_event_warm_operator_per_call``); a separate row times it for context.
+  * Graph capture never changes tensor addresses: the captured call closes over static tensors.
+  * AICore clock is sampled before/after; a dropped clock is reported, never hidden.
+
+[Timeouts & Locks] One process, one die; a row fails closed and the rest continue.
+[Side-Effect Policy] Reads the device; writes only the JSON path on argv.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+import torch
+import torch_npu
+
+TRIALS = 2
+SAMPLES = 20
+WARMUP = 10
+TOL = 2.0e-2
+SEED = 20261023
+NZ = 29  # ACL_FORMAT_FRACTAL_NZ
+HIDDEN = 2048
+I_LOCAL = 128          # moe_intermediate_size 512 / TP4
+E = 256                # local experts (EP1)
+ACTIVE = 8             # num_experts_per_tok
+
+
+def smi() -> dict:
+    text = ""
+    for cmd in (["npu-smi", "info", "-t", "common", "-i", "0"],
+                ["/usr/local/Ascend/driver/tools/npu-smi", "info", "-t", "common", "-i", "0"]):
+        try:
+            done = subprocess.run(cmd, capture_output=True, text=True, timeout=20)
+            if done.returncode == 0:
+                text = done.stdout
+                break
+        except Exception:
+            continue
+    f = re.search(r"Aicore Freq\(MHZ\)\s*:\s*([0-9.]+)", text)
+    c = re.search(r"Aicore curFreq\(MHZ\)\s*:\s*([0-9.]+)", text)
+    n = re.search(r"Aicore Count\s*:\s*([0-9]+)", text)
+    return {"aicore_freq_mhz": float(f.group(1)) if f else None,
+            "aicore_cur_freq_mhz": float(c.group(1)) if c else None,
+            "aicore_count": int(n.group(1)) if n else None,
+            "raw_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+
+
+def tiled_int8(total: int, gen: torch.Generator) -> torch.Tensor:
+    block = torch.randint(-127, 128, (min(total, 4_000_000),), generator=gen,
+                          dtype=torch.int8)
+    if total <= block.numel():
+        return block[:total]
+    reps = (total + block.numel() - 1) // block.numel()
+    return block.repeat(reps)[:total]
+
+
+def int8_weights(experts: int, k: int, n: int, gen: torch.Generator) -> dict:
+    total = experts * k * n
+    wq = tiled_int8(total, gen).view(experts, k, n)
+    ws = (torch.rand(experts, n, generator=gen, dtype=torch.float32) * 0.002
+          + 0.0005)
+    return {"wq": wq, "ws": ws}
+
+
+def to_nz(t):
+    return torch_npu.npu_format_cast(t, NZ)
+
+
+def canary(out, qx, ps, wq, ws, experts, tpe, label) -> dict:
+    rel_max, abs_max, ref_abs, per = 0.0, 0.0, 0.0, []
+    for ex in experts:
+        rows = slice(ex * tpe, (ex + 1) * tpe)
+        xd = (qx[rows].float() * ps[rows].float().reshape(-1, 1)).cpu()
+        wd = wq[ex].float() * ws[ex].float().reshape(1, -1)
+        ref = xd @ wd
+        o = out[rows].float().cpu()
+        if o.shape != ref.shape:
+            return {"label": label, "ok": False,
+                    "error": f"shape {tuple(o.shape)} != {tuple(ref.shape)}"}
+        rel = float((o - ref).abs().max() / ref.abs().max().clamp_min(1e-9))
+        per.append({"expert": int(ex), "relative_max": rel})
+        rel_max = max(rel_max, rel)
+        abs_max = max(abs_max, float(o.abs().max()))
+        ref_abs = max(ref_abs, float(ref.abs().max()))
+    ok = bool(math.isfinite(rel_max) and rel_max <= TOL)
+    return {"label": label, "ok": ok, "relative_max": rel_max, "tolerance": TOL,
+            "reference_abs_max": ref_abs, "absolute_max": abs_max,
+            "experts_sampled": [int(e) for e in experts], "per_expert": per}
+
+
+def time_call(kernel) -> dict:
+    for _ in range(WARMUP):
+        kernel()
+    torch.npu.synchronize()
+    durations, medians = [], []
+    for _ in range(TRIALS):
+        starts = [torch.npu.Event(enable_timing=True) for _ in range(SAMPLES)]
+        ends = [torch.npu.Event(enable_timing=True) for _ in range(SAMPLES)]
+        for s, e in zip(starts, ends):
+            s.record()
+            kernel()
+            e.record()
+        torch.npu.synchronize()
+        vals = [s.elapsed_time(e) for s, e in zip(starts, ends)]
+        durations.extend(vals)
+        medians.append(sorted(vals)[len(vals) // 2])
+    ordered = sorted(durations)
+    return {"raw_samples_ms": durations, "trial_medians_ms": medians,
+            "duration_ms": sum(medians) / len(medians),
+            "median_ms": ordered[len(ordered) // 2],
+            "p90_ms": ordered[min(len(ordered) - 1, int(round(0.9 * (len(ordered) - 1))))],
+            "sample_count": len(durations)}
+
+
+def capture_graph(call, n_calls: int):
+    """Capture n_calls invocations of ``call`` into one npu graph; return (graph, out)."""
+    pool = torch.npu.graph_pool_handle()
+    side = torch.npu.Stream()
+    side.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(side):
+        for _ in range(3):
+            out = call()
+    torch.npu.current_stream().wait_stream(side)
+    torch.npu.synchronize()
+    g = torch.npu.NPUGraph()
+    with torch.npu.graph(g, pool=pool):
+        for _ in range(n_calls):
+            out = call()
+    torch.npu.synchronize()
+    return g, out
+
+
+def build_plan(tokens: int, groups: int) -> dict:
+    """Return {'gmm-*': ...} counts for a routed-token layout."""
+    tpe = tokens // groups
+    assert tpe * groups == tokens
+    active = list(range(groups))  # first `groups` experts non-empty
+    counts = [tpe if e in active else 0 for e in range(E)]
+    return {"tokens": tokens, "groups": groups, "tokens_per_expert": tpe,
+            "active_experts": active, "counts": counts}
+
+
+def run_row(label: str, proj: str, plan: dict, gen: torch.Generator,
+            act_quant_ms: dict | None = None) -> dict:
+    n, k = (2 * I_LOCAL, HIDDEN) if proj == "gate_up" else (HIDDEN, I_LOCAL)
+    tokens = plan["tokens"]
+    started = time.time()
+    try:
+        w = int8_weights(E, k, n, gen)
+        wq_nz = to_nz(w["wq"].npu())
+        ws = w["ws"].npu()
+        x = torch.randn(tokens, k, dtype=torch.bfloat16).npu()
+        qx, ps = torch_npu.npu_dynamic_quant(x, dst_type=torch.int8)
+        counts = torch.tensor(plan["counts"], dtype=torch.int64).npu()
+
+        def call():
+            return torch_npu.npu_grouped_matmul(
+                x=[qx], weight=[wq_nz], scale=[ws], bias=None, per_token_scale=[ps],
+                split_item=2, group_type=0, group_list=counts, group_list_type=1,
+                output_dtype=torch.bfloat16)[0]
+
+        out = call()
+        experts = plan["active_experts"][:3] if len(plan["active_experts"]) >= 3 else \
+            plan["active_experts"]
+        chk = canary(out, qx, ps, w["wq"], w["ws"], experts,
+                     plan["tokens_per_expert"], label)
+        if not chk["ok"]:
+            return {"label": label, "status": "failed", "error": "canary_rejected",
+                    "canary": chk}
+        eager = time_call(call)
+        graph1 = graph8 = graph8_per_call = None
+        graph_error = None
+        try:
+            g1, _ = capture_graph(call, 1)
+            graph1 = time_call(g1.replay)
+            g8, _ = capture_graph(call, 8)
+            graph8 = time_call(g8.replay)
+            graph8_per_call = {"median_ms": graph8["median_ms"] / 8.0,
+                               "duration_ms": graph8["duration_ms"] / 8.0,
+                               "p90_ms": graph8["p90_ms"] / 8.0,
+                               "sample_count": graph8["sample_count"],
+                               "note": "one replay of an 8-call graph divided by 8"}
+        except Exception as exc:  # noqa: BLE001 - graph scope may be unavailable; eager stays
+            graph_error = str(exc).splitlines()[0][:800]
+        return {
+            "label": label, "status": "measured", "projection": proj,
+            "shape": {"n": n, "k": k, "tokens": tokens,
+                      "groups": plan["groups"],
+                      "tokens_per_expert": plan["tokens_per_expert"],
+                      "active_experts": len(plan["active_experts"]),
+                      "experts": E},
+            "canary": chk,
+            "eager_per_call": eager,
+            "graph_replay_1call": graph1,
+            "graph_replay_8calls": graph8,
+            "graph_replay_8calls_per_call": graph8_per_call,
+            "graph_error": graph_error,
+            "activation_quant_ms": act_quant_ms,
+            "wall_seconds": round(time.time() - started, 2),
+            "contract": {
+                "api": "torch_npu.npu_grouped_matmul",
+                "x": "int8 [tokens, k]", "weight": "int8 [E, k, n] FRACTAL_NZ",
+                "scale": "float32 [E, n] per-channel",
+                "per_token_scale": "float32 [tokens]",
+                "split_item": 2, "group_type": 0, "group_list_type": 1,
+                "group_list": "int64 counts over E=256 groups",
+                "out_dtype": "bfloat16",
+            },
+        }
+    except Exception as exc:  # noqa: BLE001 - failure must stay visible
+        return {"label": label, "status": "failed",
+                "error": str(exc).splitlines()[0][:800],
+                "projection": proj, "shape": {"tokens": tokens,
+                                              "groups": plan["groups"]}}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--out", required=True)
+    ap.add_argument("--max-seconds", type=float, default=1800.0)
+    args = ap.parse_args()
+    out_path = Path(args.out)
+    clock_before = smi()
+    started = time.time()
+    gen = torch.Generator(device="cpu").manual_seed(SEED)
+
+    # Activation-quant context row (not part of any grouped row).
+    xq = torch.randn(128, HIDDEN, dtype=torch.bfloat16).npu()
+    aq = time_call(lambda: torch_npu.npu_dynamic_quant(xq, dst_type=torch.int8))
+
+    rows = []
+    # Served shape: 4 tokens c1 / 16 tokens c4 routed to 8 active experts out of 256.
+    plans = [
+        ("c1_served_m32", build_plan(32, ACTIVE)),
+        ("c4_served_m128", build_plan(128, ACTIVE)),
+    ]
+    # Group-count sensitivity at fixed M: same routed rows spread over more experts.
+    plans += [
+        ("m32_g32x1", build_plan(32, 32)),
+        ("m128_g32x4", build_plan(128, 32)),
+        # The artifact campaigns' padded shape: every local expert gets one token (M=256).
+        ("m256_g256x1", build_plan(256, 256)),
+    ]
+    for proj in ("gate_up", "down"):
+        for name, plan in plans:
+            left = args.max_seconds - (time.time() - started)
+            if left <= 0:
+                print(json.dumps({"stopped": "max_seconds", "rows": len(rows)}))
+                break
+            rec = run_row(f"gmm-int8-qwen35-{proj}-{name}", proj, plan, gen, aq)
+            rows.append(rec)
+            print(json.dumps({"row": rec["label"], "status": rec["status"],
+                              "eager_ms": round((rec.get("eager_per_call") or {}).get("median_ms", 0), 5),
+                              "graph1_ms": round((rec.get("graph_replay_1call") or {}).get("median_ms", 0), 5),
+                              "graph8_per_call_ms": round((rec.get("graph_replay_8calls_per_call") or {}).get("median_ms", 0), 5)}),
+                  flush=True)
+            out_path.write_text(json.dumps({
+                "schema": "a5-qwen35-grouped-graph-probe/1",
+                "campaign": "qwen35-grouped-20261023",
+                "host": os.uname().nodename,
+                "device": torch.npu.get_device_name(0),
+                "visible_devices": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+                "torch": torch.__version__, "torch_npu": torch_npu.__version__,
+                "cann": os.environ.get("ASCEND_TOOLKIT_HOME", ""),
+                "geometry": {"hidden": HIDDEN, "moe_intermediate": 512,
+                             "tp": 4, "local_intermediate": I_LOCAL,
+                             "experts": E, "active_experts": ACTIVE},
+                "timing": {"warmup": WARMUP, "trials": TRIALS,
+                           "samples_per_trial": SAMPLES,
+                           "timing_scope": "device_event_warm_operator_per_call"},
+                "activation_quant_ms": aq,
+                "clock_before": clock_before, "clock_after": None,
+                "rows": rows,
+                "seconds": round(time.time() - started, 2),
+            }, indent=1) + "\n")
+    doc = json.loads(out_path.read_text())
+    doc["clock_after"] = smi()
+    out_path.write_text(json.dumps(doc, indent=1) + "\n")
+    print(json.dumps({"done": True, "rows": len(rows),
+                      "seconds": round(time.time() - started, 2)}))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

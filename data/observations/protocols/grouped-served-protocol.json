@@ -1,0 +1,58 @@
+{
+  "schema": "mindie-sim.capture-protocol/1",
+  "adapter": "served_grouped_kernels",
+  "producer": {
+    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/analyze_grouped.py",
+    "sha256": "4422de3370d03fba25f22bbd9464fd8dbc1c62ecc4b53e4602686fb2b3b6bc89"
+  },
+  "supporting_sources": [
+    {
+      "path": "examples/artifacts/a5-qwen35-grouped-served.json",
+      "sha256": "ac63a7078310a4599b0d178ac159d37901b9732046788cf3beddec4ef6187f89"
+    },
+    {
+      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/serve_qwen35_grouped.sh",
+      "sha256": "aeb753fb4856b848694c3cf5bae603d5ad665b1d10b53226f512221b5742c2e5"
+    }
+  ],
+  "captures": [
+    {
+      "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-grouped/prof/p4096_c1_o32/kernel_details.csv",
+      "sha256": "41bfbc42a2f2812d07165273b3bfd45d15dfbf0f736b671b872fd9cb52c1ceb7",
+      "label": "p4096_c1_o32"
+    },
+    {
+      "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-grouped/prof/p4096_c4_o32/kernel_details.csv",
+      "sha256": "e8303d8e6e27cc9734ed5888db5e1c722bbf72aa05011c3879c94a86d1a6419c",
+      "label": "p4096_c4_o32"
+    }
+  ],
+  "hardware": {
+    "host": "rack08os8",
+    "device": "Ascend950DT_9582"
+  },
+  "runtime": {
+    "image": "75dd914da79d",
+    "parallel": {
+      "tp": 4,
+      "ep": 1
+    },
+    "quantization": "W8A8",
+    "speculative_tokens": 3
+  },
+  "marker": "_probabilistic_rejection_kernel",
+  "kernels": [
+    "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+    "aclnnGroupedMatmulV5_GroupedMatmul_GroupedMatmul"
+  ],
+  "attention_kernel": "FusedInferAttentionScore",
+  "max_grouped_tokens": 128,
+  "max_attention_query_tokens": 128,
+  "limitations": [
+    "Selected c1/c4 captures only; the decode/prefill size separator is not applicable to arbitrary batches or c8.",
+    "A sample is a sum of selected kernel durations between sampler markers, never a whole-graph elapsed duration or wall-step interval.",
+    "Input group_list tensor values and loaded kernel binary identity are not recorded; no exact routed-program comparison is established.",
+    "Original captures have no current train/heldout assignment. Artifact decomposition scaling and step residuals are not imported.",
+    "Intervals with prefill-sized grouped or attention calls are retained as excluded conditions, never silently included when no clean step exists."
+  ]
+}

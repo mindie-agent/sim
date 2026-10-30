@@ -1,0 +1,117 @@
+{
+  "machine": {
+    "name": "declared-two-level-control",
+    "architecture": "cuda",
+    "num_devices": 8,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000000.0,
+        "fp32": 1000000000000.0
+      },
+      "rates": {
+        "memory": 1000000000000.0,
+        "vector": 1000000000000.0
+      },
+      "resource_units": {},
+      "work_units": {},
+      "compute_units": 4
+    },
+    "links": [
+      {
+        "name": "level0_0",
+        "members": [
+          0,
+          1
+        ],
+        "capacity_bytes_per_ms": 1000000,
+        "latency_us": 1
+      },
+      {
+        "name": "level0_1",
+        "members": [
+          2,
+          3
+        ],
+        "capacity_bytes_per_ms": 1000000,
+        "latency_us": 1
+      },
+      {
+        "name": "level0_2",
+        "members": [
+          4,
+          5
+        ],
+        "capacity_bytes_per_ms": 1000000,
+        "latency_us": 1
+      },
+      {
+        "name": "level0_3",
+        "members": [
+          6,
+          7
+        ],
+        "capacity_bytes_per_ms": 1000000,
+        "latency_us": 1
+      },
+      {
+        "name": "level1",
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "capacity_bytes_per_ms": 1000,
+        "semantics": "per_pair",
+        "latency_us": 2
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 2,
+    "hidden_size": 32,
+    "num_heads": 8,
+    "num_kv_heads": 8,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 4,
+        "output_tokens": 3
+      }
+    ]
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "hccl": {
+        "allreduce": {
+          "expansion": "AICPU_TS",
+          "template": "parallel_mesh_nhr_route0",
+          "topology_levels": 2,
+          "level0_size": 2,
+          "max_loop_bytes": 1048576
+        }
+      }
+    }
+  },
+  "metadata": {
+    "boundary": "source-compatible synthetic control; not an observed device/run",
+    "hierarchy": "contiguous level0 pairs; strided level1 groups; explicit source route0 split=100%",
+    "signal_frame": "unknown bytes: propagate directed remote notify events with zero wire payload"
+  }
+}

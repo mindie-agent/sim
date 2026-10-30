@@ -1,0 +1,347 @@
+{
+  "boundary": "public predict_pd serving with synthetic three-token prefill and two decode steps",
+  "evidence_kind": "structural_and_capacity_controls_not_hardware_calibration",
+  "connector_endpoints": {
+    "0": "prefill_pool",
+    "1": "decode_pool"
+  },
+  "source_sha256": {
+    "mindie_sim/prediction/pd_connector.py": "f942e55799971974f38c900772746cf188c2331af448a93bbf96986bfb2aa54a",
+    "mindie_sim/prediction/disaggregated.py": "bef625095870c4e5dbba18ff9390c5be72e67f89e6e63c7f6ad11da066c343a5"
+  },
+  "scans": [
+    {
+      "scan": "bandwidth",
+      "factor": 0.5,
+      "finish_ms": 11.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "bandwidth",
+      "factor": 1,
+      "finish_ms": 8.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "bandwidth",
+      "factor": 2,
+      "finish_ms": 6.5,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "framing",
+      "factor": 0.5,
+      "finish_ms": 9.5,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 576.0,
+      "transactions": 2,
+      "serviced": {
+        "pd:link:handoff": 576.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "framing",
+      "factor": 1,
+      "finish_ms": 10.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 640.0,
+      "transactions": 2,
+      "serviced": {
+        "pd:link:handoff": 640.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "framing",
+      "factor": 2,
+      "finish_ms": 11.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 768.0,
+      "transactions": 2,
+      "serviced": {
+        "pd:link:handoff": 768.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_propagation",
+      "factor": 0.5,
+      "finish_ms": 8.5,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_propagation",
+      "factor": 1,
+      "finish_ms": 9.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_propagation",
+      "factor": 2,
+      "finish_ms": 10.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_capacity",
+      "factor": 0.5,
+      "finish_ms": 29.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "pd:link:handoff:switch_plane": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_capacity",
+      "factor": 1,
+      "finish_ms": 17.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "pd:link:handoff:switch_plane": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "switch_capacity",
+      "factor": 2,
+      "finish_ms": 11.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "pd:link:handoff:switch_plane": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "hbm",
+      "factor": 0.5,
+      "finish_ms": 29.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "hbm",
+      "factor": 1,
+      "finish_ms": 17.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    },
+    {
+      "scan": "hbm",
+      "factor": 2,
+      "finish_ms": 11.0,
+      "handoff_bytes": 384.0,
+      "wire_bytes": 384.0,
+      "transactions": null,
+      "serviced": {
+        "pd:link:handoff": 384.0,
+        "prefill:scheduler@r0": 0,
+        "prefill:memory@r0:s0": 384.0,
+        "prefill:vector@r0:s0": 0,
+        "prefill:matrix@r0:s0": 3.0,
+        "prefill:host@r0:s0": 0,
+        "decode:scheduler@r0": 0,
+        "decode:memory@r0:s0": 384.0,
+        "decode:vector@r0:s0": 0,
+        "decode:matrix@r0:s0": 2.0,
+        "decode:host@r0:s0": 0
+      },
+      "live_tasks": 0
+    }
+  ]
+}

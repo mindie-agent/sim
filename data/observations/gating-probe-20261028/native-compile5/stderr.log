@@ -1,0 +1,25 @@
+
+Authorized users only. All activities may be monitored and reported.
+[INFO] Using merged native A5 regbase pipeline
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+PLEASE submit a bug report to https://github.com/llvm/llvm-project/issues/ and include the crash backtrace.
+Stack dump:
+0.	Program arguments: /usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile /scratch/strided_store.mlir --target=Ascend950DT_9582 --enable-auto-bind-sub-block=false -o /scratch/store-kernel
+ #0 0x0000aaaab71cd0f4 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x75cd0f4)
+ #1 0x0000aaaab71cac68 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x75cac68)
+ #2 0x0000aaaab71cd8bc (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x75cd8bc)
+ #3 0x0000ffff8caaa7e0 (linux-vdso.so.1+0x7e0)
+ #4 0x0000aaaab33482d4 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x37482d4)
+ #5 0x0000aaaab1595ebc (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x1995ebc)
+ #6 0x0000aaaab1595ebc (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x1995ebc)
+ #7 0x0000aaaab1595ebc (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x1995ebc)
+ #8 0x0000aaaab33480d4 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x37480d4)
+ #9 0x0000aaaab62e8bb8 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x66e8bb8)
+#10 0x0000aaaab169f460 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x1a9f460)
+#11 0x0000aaaab70fa5a0 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x74fa5a0)
+#12 0x0000aaaab62e8b28 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x66e8b28)
+#13 0x0000aaaab62e39e8 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x66e39e8)
+#14 0x0000aaaab62e3e90 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x66e3e90)
+#15 0x0000aaaab62e5b60 (/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/bishengir/bin/bishengir-compile+0x66e5b60)
+/scratch/compile_native_probe.sh: line 14:    72 Segmentation fault      (core dumped) "$compiler_dir/bishengir-compile" "$probe_dir/strided_store.mlir" --target=Ascend950DT_9582 --enable-auto-bind-sub-block=false -o "$probe_dir/store-kernel"

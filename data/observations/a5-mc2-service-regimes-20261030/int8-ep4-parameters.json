@@ -1,0 +1,159 @@
+{
+  "schema": "mindie-sim.observable-kernel-regimes/1",
+  "service_regimes": [
+    {
+      "id": "a5-fullmesh-per-token-int8-e256-w2048-ep4-dispatch-response-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeDispatchV3",
+        "dtype": "bf16",
+        "implementation": "arch35_fullmesh_per_token_int8",
+        "metadata.mc2_phase.ep": 4,
+        "metadata.mc2_phase.experts": 256,
+        "metadata.mc2_phase.width": 2048,
+        "metadata.mc2_phase.top_k": 8
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 15360.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 4,
+          "max": 128
+        }
+      },
+      "response": {
+        "fixed_us": 16.47394901972674,
+        "terms": [
+          {
+            "coordinate": "external_framed_bytes",
+            "us_per_unit": 1.2565362324636144e-05
+          }
+        ]
+      },
+      "provenance": {
+        "source_receipt": {
+          "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+          "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+          "size_bytes": 49365
+        },
+        "assignment_captures": [
+          {
+            "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+            "size_bytes": 70137504,
+            "mtime_ns": 1793299592000000000,
+            "schema_version": "kernel_details_csv_48col",
+            "sha256": "9b8a87bfd6252204ab077e331ed97976ff9f5256935cb153677ac619dd96aac1"
+          },
+          {
+            "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+            "size_bytes": 88444963,
+            "mtime_ns": 1793299565000000000,
+            "schema_version": "kernel_details_csv_48col",
+            "sha256": "bf35b8b21c078d6fc7223918b280158fda5ee7c1f83009c70c98b16f27b08df5"
+          }
+        ],
+        "withheld_capture": {
+          "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+          "size_bytes": 79462851,
+          "mtime_ns": 1793299528000000000,
+          "schema_version": "kernel_details_csv_48col",
+          "sha256": "5612e7cccfb3878cf27b22b1e89c5d186cd100633a44748973349f1bf03872f3"
+        },
+        "assignment_tokens": [
+          4,
+          128
+        ],
+        "validation_tokens": 64,
+        "boundary": "inclusive native device-call elapsed; max with existing source program once per native kernel group",
+        "measurement_identity": "complete-forward native-call means, overlapping PMU components not added",
+        "resource_identifiability": "effective framed-payload response at the retained physical configuration; no guessed HBM/AIV/link scale factor",
+        "peer_scope": "EP4, explicit all-3-peer window; parent ideal integer routing scenario unchanged; captured IDs/readiness not reconstructed",
+        "holdout_scope": "M64 excluded from MC2 coefficient assignment; not a blind experiment and not a whole-body holdout of parent grouped parameters"
+      }
+    },
+    {
+      "id": "a5-fullmesh-per-token-int8-e256-w2048-ep4-combine-response-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeCombineV3",
+        "dtype": "bf16",
+        "implementation": "arch35_fullmesh_unquantized_rows",
+        "metadata.mc2_phase.ep": 4,
+        "metadata.mc2_phase.experts": 256,
+        "metadata.mc2_phase.width": 2048,
+        "metadata.mc2_phase.top_k": 8
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 27648.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 4,
+          "max": 128
+        }
+      },
+      "response": {
+        "fixed_us": 10.663717596915676,
+        "terms": [
+          {
+            "coordinate": "external_framed_bytes",
+            "us_per_unit": 9.168093711579413e-06
+          }
+        ]
+      },
+      "provenance": {
+        "source_receipt": {
+          "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+          "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+          "size_bytes": 49365
+        },
+        "assignment_captures": [
+          {
+            "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+            "size_bytes": 70137504,
+            "mtime_ns": 1793299592000000000,
+            "schema_version": "kernel_details_csv_48col",
+            "sha256": "9b8a87bfd6252204ab077e331ed97976ff9f5256935cb153677ac619dd96aac1"
+          },
+          {
+            "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+            "size_bytes": 88444963,
+            "mtime_ns": 1793299565000000000,
+            "schema_version": "kernel_details_csv_48col",
+            "sha256": "bf35b8b21c078d6fc7223918b280158fda5ee7c1f83009c70c98b16f27b08df5"
+          }
+        ],
+        "withheld_capture": {
+          "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+          "size_bytes": 79462851,
+          "mtime_ns": 1793299528000000000,
+          "schema_version": "kernel_details_csv_48col",
+          "sha256": "5612e7cccfb3878cf27b22b1e89c5d186cd100633a44748973349f1bf03872f3"
+        },
+        "assignment_tokens": [
+          4,
+          128
+        ],
+        "validation_tokens": 64,
+        "boundary": "inclusive native device-call elapsed; max with existing source program once per native kernel group",
+        "measurement_identity": "complete-forward native-call means, overlapping PMU components not added",
+        "resource_identifiability": "effective framed-payload response at the retained physical configuration; no guessed HBM/AIV/link scale factor",
+        "peer_scope": "EP4, explicit all-3-peer window; parent ideal integer routing scenario unchanged; captured IDs/readiness not reconstructed",
+        "holdout_scope": "M64 excluded from MC2 coefficient assignment; not a blind experiment and not a whole-body holdout of parent grouped parameters"
+      }
+    }
+  ]
+}

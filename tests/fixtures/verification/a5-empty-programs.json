@@ -1,0 +1,557 @@
+{
+  "schema": 2,
+  "status": "hardware_collected",
+  "not_historical": true,
+  "question": "actual empty AIV-only and AIC-only kernel device duration on available A5",
+  "endpoint": {
+    "host": "rack06os1",
+    "addr": "177.25.21.1",
+    "npu": 0,
+    "device": "Ascend950DT 9582",
+    "npu_smi": "25.1.rc3.1",
+    "cann": "9.2.0",
+    "free_hbm_bytes_before": 97783992320,
+    "total_hbm_bytes": 98515812352
+  },
+  "method": {
+    "kernel": "body-immediate AscendC kernels with KERNEL_TASK_TYPE_DEFAULT AIV_ONLY/AIC_ONLY; no compute, no copy, no global memory access",
+    "compile": "bisheng --cce-aicore-arch=dav-c310-vec|-cube --cce-aicore-only -O2 -D__DAV_C310__",
+    "launch": "ACL aclrtBinaryLoadFromData + aclrtLaunchKernelWithHostArgs, block 1/8/64, 50 warmup + 5x100 launches",
+    "primary": "msprof3 op_summary Task Duration(us); first 50 chronological launches per kernel/block condition excluded from steady statistics",
+    "device_event": "ACL event span of 100 launches / 100, reported separately for unprofiled run2 and profiled msprof3; includes host/queue spacing"
+  },
+  "launch_elimination": {
+    "symbols": {
+      "empty_aiv": "T empty_aiv .AIV_Kernel_Type_empty_aiv",
+      "empty_aic": "T empty_aic .AIV_Kernel_Type_empty_aic"
+    },
+    "profiler_rows": 3300,
+    "unique_task_ids": 3300,
+    "verdict": "launch not eliminated: 3300 distinct profiled kernel rows"
+  },
+  "kernel_rows": {
+    "empty_aiv": {
+      "task_type": "AI_VECTOR_CORE",
+      "rows": 1650,
+      "by_blocks": {
+        "1": {
+          "n": 550,
+          "min_us": 0.443,
+          "p10_us": 0.457,
+          "p50_us": 0.482,
+          "p90_us": 0.518,
+          "max_us": 2.835,
+          "mean_us": 0.4932
+        },
+        "8": {
+          "n": 550,
+          "min_us": 0.552,
+          "p10_us": 0.5659,
+          "p50_us": 0.5915,
+          "p90_us": 0.628,
+          "max_us": 2.366,
+          "mean_us": 0.6025
+        },
+        "64": {
+          "n": 550,
+          "min_us": 0.951,
+          "p10_us": 0.965,
+          "p50_us": 0.987,
+          "p90_us": 1.025,
+          "max_us": 1.971,
+          "mean_us": 0.9975
+        }
+      },
+      "all": {
+        "n": 1650,
+        "min_us": 0.443,
+        "p10_us": 0.469,
+        "p50_us": 0.597,
+        "p90_us": 1.0071,
+        "max_us": 2.835,
+        "mean_us": 0.6978
+      },
+      "all_excluding_first": {
+        "n": 1649,
+        "min_us": 0.443,
+        "p10_us": 0.469,
+        "p50_us": 0.597,
+        "p90_us": 1.007,
+        "max_us": 2.366,
+        "mean_us": 0.6965
+      }
+    },
+    "empty_aic": {
+      "task_type": "AI_CORE",
+      "rows": 1650,
+      "by_blocks": {
+        "1": {
+          "n": 550,
+          "min_us": 0.439,
+          "p10_us": 0.453,
+          "p50_us": 0.4765,
+          "p90_us": 0.514,
+          "max_us": 1.102,
+          "mean_us": 0.4868
+        },
+        "8": {
+          "n": 550,
+          "min_us": 0.545,
+          "p10_us": 0.56,
+          "p50_us": 0.583,
+          "p90_us": 0.62,
+          "max_us": 1.805,
+          "mean_us": 0.5933
+        },
+        "64": {
+          "n": 550,
+          "min_us": 1.115,
+          "p10_us": 1.131,
+          "p50_us": 1.1585,
+          "p90_us": 1.195,
+          "max_us": 1.748,
+          "mean_us": 1.1653
+        }
+      },
+      "all": {
+        "n": 1650,
+        "min_us": 0.439,
+        "p10_us": 0.463,
+        "p50_us": 0.587,
+        "p90_us": 1.176,
+        "max_us": 1.805,
+        "mean_us": 0.7484
+      },
+      "all_excluding_first": {
+        "n": 1649,
+        "min_us": 0.439,
+        "p10_us": 0.463,
+        "p50_us": 0.587,
+        "p90_us": 1.176,
+        "max_us": 1.805,
+        "mean_us": 0.7482
+      }
+    }
+  },
+  "event_batches_us": {
+    "unprofiled_run2": {
+      "empty_aiv": {
+        "1": [
+          4.25423,
+          4.1531,
+          4.167,
+          4.22109,
+          4.18061
+        ],
+        "8": [
+          4.21976,
+          4.2066,
+          4.20503,
+          4.22685,
+          4.21781
+        ],
+        "64": [
+          4.27864,
+          4.26736,
+          4.23822,
+          4.22721,
+          4.21192
+        ]
+      },
+      "empty_aic": {
+        "1": [
+          4.21141,
+          4.15579,
+          4.15666,
+          4.1808,
+          4.19827
+        ],
+        "8": [
+          4.21453,
+          4.24369,
+          4.21543,
+          4.16522,
+          4.21349
+        ],
+        "64": [
+          3.99549,
+          3.9908,
+          4.02325,
+          4.02981,
+          4.0387
+        ]
+      }
+    },
+    "profiled_msprof3": {
+      "empty_aiv": {
+        "1": [
+          4.08216,
+          4.0667,
+          4.08402,
+          4.0736,
+          4.08022
+        ],
+        "8": [
+          4.02327,
+          4.00919,
+          4.02619,
+          4.00521,
+          4.00893
+        ],
+        "64": [
+          4.12668,
+          4.01689,
+          4.03768,
+          4.01787,
+          4.04004
+        ]
+      },
+      "empty_aic": {
+        "1": [
+          4.16248,
+          4.12791,
+          4.03671,
+          4.05418,
+          4.0523
+        ],
+        "8": [
+          4.00308,
+          4.00859,
+          4.01194,
+          4.00464,
+          4.00162
+        ],
+        "64": [
+          4.12819,
+          4.12947,
+          4.11431,
+          4.14016,
+          4.13839
+        ]
+      }
+    }
+  },
+  "notes": [
+    "All primitive measurements remain unassigned; no parameter fit or runtime default changed.",
+    "Primary steady results exclude 50 warmup rows per block/core condition; original all-row statistics remain under kernel_rows.",
+    "AIC and AIV task labels were checked against positive matching core cycles and zero other-core cycles for every row.",
+    "The first row of some conditions is longer; this alone does not identify a hardware startup component.",
+    "Event batches include host/queue spacing and are not kernel durations; unprofiled and profiled events are distinct runs.",
+    "No host submit-only timer, graph replay, or nonempty controls were collected in the empty-kernel run.",
+    "Empty-kernel task duration is conditional on hardware, CANN/compiler, core type and block count; it is not a universal real-op floor.",
+    "The archived build.log is an early failed compile attempt; final build success is evidenced by source/binary hashes and actual profiler launches.",
+    "Post-run inventory lists no NPU processes; the pgrep line is its own inspection shell, not a leftover probe."
+  ],
+  "split": "unassigned",
+  "profiler_export_utc": "2026-10-29T12:39:58Z",
+  "profiler_collection_local": "2026-10-29T20:39:49.975825+08:00",
+  "provenance": {
+    "profiler_run": "PROF_000001_20261029203948164_02376823RNMREREK",
+    "remote_dir": "/tmp/sim-a5-invocation-20261029T1238Z",
+    "source_sha256": {
+      "empty_launch.cpp": "9c9cdc74bb7b530079dff8dd96e3f462948899093a17b76c98c173c024751064",
+      "empty_aic.cpp": "9e461396b741876d63bafed4db58f583e27ae5caab686e030a4b1d89dee6b2ea",
+      "empty_aiv.cpp": "db72b94c14901231c4bb5ff17246d292d00c03f1e3543367dacd0f281619dd24"
+    },
+    "binary_sha256": {
+      "empty_aiv.o": "4f3968a5632433b1eba523f9f552ab75a43f6dda90ad86948b0ebcafe22145d3",
+      "empty_aic.o": "521440a40f83ef583463bcb8c0cc26d59fa7d619c64bb96bc36faef9ac248cbd",
+      "empty_launch": "fc2e2fde8d2c47cd7a08cc59f2c57cc811fcb6c184df4eecbeadcf360074d567"
+    },
+    "readback": {
+      "path": "data/verification/a5-invocation-20261029/raw/corrected-run-and-review-readback.txt",
+      "sha256": "978b2c28c4cd485fd7816b8a9f79726a139d42a9534eb9452ba36f3ac385074e",
+      "read_only_utc": "2026-10-29T12:44:48Z"
+    },
+    "rejected_aic_capture": {
+      "path": "data/verification/a5-invocation-20261029/raw/op_summary-rack06os1-20261029T203908.csv",
+      "reason": "AIC symbol loaded with VECTOR_CORE magic; actual task type and counters are AIV"
+    }
+  },
+  "independent_review": {
+    "boundary": "profiler_device_task_duration",
+    "path": "data/verification/a5-invocation-20261029/raw/op_summary-cube-magic-20261029T203958.csv",
+    "sha256": "8c41ddea14c9847d64d03631979b773964edecb9c29e7bacfbd6c7250d9d2415",
+    "unique_physical_rows": 3300,
+    "split": "unassigned",
+    "warmup_rule": "first 50 chronological launches per kernel/block condition",
+    "conditions": [
+      {
+        "kernel": "empty_aic",
+        "blocks": 1,
+        "task_type": "AI_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 0.439,
+          "p10_us": 0.45299999999999996,
+          "p50_us": 0.4765,
+          "p90_us": 0.514,
+          "p99_us": 0.65808,
+          "max_us": 1.102,
+          "mean_us": 0.4868
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 0.439,
+          "p10_us": 0.45289999999999997,
+          "p50_us": 0.4765,
+          "p90_us": 0.514,
+          "p99_us": 0.6540799999999999,
+          "max_us": 0.813,
+          "mean_us": 0.485972
+        },
+        "steady_batch_medians_us": [
+          0.4765,
+          0.4745,
+          0.479,
+          0.478,
+          0.4765
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.23,
+          "p10_us": 0.23,
+          "p50_us": 0.23,
+          "p90_us": 0.23,
+          "p99_us": 0.23,
+          "max_us": 0.23,
+          "mean_us": 0.23
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      },
+      {
+        "kernel": "empty_aic",
+        "blocks": 8,
+        "task_type": "AI_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 0.545,
+          "p10_us": 0.56,
+          "p50_us": 0.583,
+          "p90_us": 0.6200000000000001,
+          "p99_us": 0.75951,
+          "max_us": 1.805,
+          "mean_us": 0.5932636363636363
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 0.545,
+          "p10_us": 0.559,
+          "p50_us": 0.583,
+          "p90_us": 0.6200000000000001,
+          "p99_us": 0.75901,
+          "max_us": 0.996,
+          "mean_us": 0.590808
+        },
+        "steady_batch_medians_us": [
+          0.578,
+          0.584,
+          0.582,
+          0.5854999999999999,
+          0.591
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.32,
+          "p10_us": 0.32,
+          "p50_us": 0.32,
+          "p90_us": 0.32,
+          "p99_us": 0.32,
+          "max_us": 0.32,
+          "mean_us": 0.32
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      },
+      {
+        "kernel": "empty_aic",
+        "blocks": 64,
+        "task_type": "AI_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 1.115,
+          "p10_us": 1.131,
+          "p50_us": 1.1585,
+          "p90_us": 1.195,
+          "p99_us": 1.312,
+          "max_us": 1.748,
+          "mean_us": 1.1652745454545455
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 1.115,
+          "p10_us": 1.132,
+          "p50_us": 1.1585,
+          "p90_us": 1.193,
+          "p99_us": 1.2930099999999998,
+          "max_us": 1.478,
+          "mean_us": 1.164054
+        },
+        "steady_batch_medians_us": [
+          1.1595,
+          1.1560000000000001,
+          1.162,
+          1.1585,
+          1.1575
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.9,
+          "p10_us": 0.91,
+          "p50_us": 0.91,
+          "p90_us": 0.91,
+          "p99_us": 0.92,
+          "max_us": 0.93,
+          "mean_us": 0.9093600000000001
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      },
+      {
+        "kernel": "empty_aiv",
+        "blocks": 1,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 0.443,
+          "p10_us": 0.457,
+          "p50_us": 0.482,
+          "p90_us": 0.518,
+          "p99_us": 0.6275299999999999,
+          "max_us": 2.835,
+          "mean_us": 0.4932381818181818
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 0.443,
+          "p10_us": 0.457,
+          "p50_us": 0.482,
+          "p90_us": 0.519,
+          "p99_us": 0.62603,
+          "max_us": 0.816,
+          "mean_us": 0.48924
+        },
+        "steady_batch_medians_us": [
+          0.481,
+          0.4845,
+          0.4825,
+          0.4815,
+          0.4805
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.23,
+          "p10_us": 0.23,
+          "p50_us": 0.23,
+          "p90_us": 0.23,
+          "p99_us": 0.23,
+          "max_us": 0.24,
+          "mean_us": 0.23006000000000001
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      },
+      {
+        "kernel": "empty_aiv",
+        "blocks": 8,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 0.552,
+          "p10_us": 0.5659,
+          "p50_us": 0.5914999999999999,
+          "p90_us": 0.628,
+          "p99_us": 0.777,
+          "max_us": 2.366,
+          "mean_us": 0.6025090909090909
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 0.552,
+          "p10_us": 0.566,
+          "p50_us": 0.591,
+          "p90_us": 0.628,
+          "p99_us": 0.777,
+          "max_us": 0.941,
+          "mean_us": 0.599376
+        },
+        "steady_batch_medians_us": [
+          0.592,
+          0.5914999999999999,
+          0.5974999999999999,
+          0.587,
+          0.591
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.32,
+          "p10_us": 0.32,
+          "p50_us": 0.33,
+          "p90_us": 0.33,
+          "p99_us": 0.33,
+          "max_us": 0.33,
+          "mean_us": 0.32694
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      },
+      {
+        "kernel": "empty_aiv",
+        "blocks": 64,
+        "task_type": "AI_VECTOR_CORE",
+        "all_launches": {
+          "n": 550,
+          "min_us": 0.951,
+          "p10_us": 0.965,
+          "p50_us": 0.987,
+          "p90_us": 1.025,
+          "p99_us": 1.1555299999999997,
+          "max_us": 1.971,
+          "mean_us": 0.99752
+        },
+        "warmup_launches": 50,
+        "steady_launches": {
+          "n": 500,
+          "min_us": 0.951,
+          "p10_us": 0.965,
+          "p50_us": 0.986,
+          "p90_us": 1.025,
+          "p99_us": 1.15403,
+          "max_us": 1.339,
+          "mean_us": 0.995622
+        },
+        "steady_batch_medians_us": [
+          0.9944999999999999,
+          0.9895,
+          0.9855,
+          0.9855,
+          0.9835
+        ],
+        "steady_core_time": {
+          "n": 500,
+          "min_us": 0.72,
+          "p10_us": 0.72,
+          "p50_us": 0.73,
+          "p90_us": 0.73,
+          "p99_us": 0.73,
+          "max_us": 0.73,
+          "mean_us": 0.72672
+        },
+        "positive_active_core_cycles": 550,
+        "zero_other_core_cycles": 550
+      }
+    ]
+  },
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/a5-invocation-20261029/summary.json",
+    "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae",
+    "size_bytes": 15139
+  }
+}

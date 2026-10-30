@@ -1,0 +1,621 @@
+{
+  "name": "a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-conditional-source-body-dynamic-buffer4",
+  "model": {
+    "name": "deepseek-v4.1-flash-1017-dp8",
+    "hf_config": {
+      "architectures": [
+        "DeepseekV41ForCausalLM"
+      ],
+      "model_type": "deepseek_v41",
+      "dtype": "bfloat16",
+      "transformers_version": "5.6.0",
+      "bos_token_id": 0,
+      "eos_token_id": 1,
+      "pad_token_id": 2,
+      "image_token_id": 129264,
+      "quantization_config": {
+        "quant_method": "fp8",
+        "activation_scheme": "dynamic",
+        "weight_block_size": [
+          32,
+          32
+        ],
+        "scale_fmt": "ue8m0",
+        "expert_dtype": "fp4"
+      },
+      "text_config": {
+        "model_type": "deepseek_v41_text",
+        "vocab_size": 129280,
+        "hidden_size": 5120,
+        "moe_intermediate_size": 2304,
+        "num_hidden_layers": 40,
+        "num_attention_heads": 64,
+        "num_key_value_heads": 1,
+        "head_dim": 512,
+        "qk_rope_head_dim": 64,
+        "q_lora_rank": 1280,
+        "o_lora_rank": 1024,
+        "o_groups": 8,
+        "hidden_act": "silu",
+        "swiglu_limit": 10.0,
+        "rms_norm_eps": 1e-20,
+        "attention_bias": false,
+        "attention_dropout": 0.0,
+        "initializer_range": 0.02,
+        "use_cache": true,
+        "tie_word_embeddings": false,
+        "max_position_embeddings": 1048576,
+        "rope_theta": 10000,
+        "rope_scaling": {
+          "rope_type": "yarn",
+          "factor": 16,
+          "beta_fast": 32,
+          "beta_slow": 1,
+          "original_max_position_embeddings": 65536
+        },
+        "n_routed_experts": 384,
+        "n_shared_experts": 1,
+        "num_experts_per_tok": 6,
+        "scoring_func": "sqrtsoftplus",
+        "topk_method": "noaux_tc",
+        "norm_topk_prob": true,
+        "routed_scaling_factor": 1.5,
+        "sliding_window": 128,
+        "compress_ratios": [
+          0,
+          0,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          2,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          0
+        ],
+        "compress_rope_theta": 160000,
+        "kv_source_layer_ids": [
+          2,
+          8,
+          14,
+          20
+        ],
+        "index_source_layer_ids": [
+          2,
+          8,
+          14,
+          20,
+          24,
+          28,
+          32,
+          36
+        ],
+        "index_n_heads": 32,
+        "index_head_dim": 128,
+        "index_topk": 512,
+        "candidate_source_layer_id": 20,
+        "candidate_topk_blocks": 2048,
+        "candidate_block_size": 8,
+        "hc_mult": 4,
+        "hc_sinkhorn_iters": 20,
+        "hc_eps": 1e-06,
+        "engram_layer_ids": [
+          1,
+          14
+        ],
+        "engram_num_embeddings": [
+          384006168,
+          384016682
+        ],
+        "engram_max_ngram_size": 4,
+        "engram_vocab_size": 16000000,
+        "engram_n_heads": 8,
+        "engram_head_dim": 256,
+        "engram_pad_token_id": 2,
+        "engram_compressed_vocab_size": 99092,
+        "num_nextn_predict_layers": 3,
+        "dspark_block_size": 5,
+        "dspark_noise_token_id": 128799,
+        "dspark_target_layer_ids": [
+          37,
+          38,
+          39
+        ],
+        "dspark_markov_rank": 256,
+        "dspark_n_routed_experts": 128,
+        "dspark_num_experts_per_tok": 3,
+        "engram_storage_mode": "host_fp8_e8m0"
+      },
+      "vision_config": {
+        "model_type": "deepseek_v41_vision",
+        "num_hidden_layers": 32,
+        "hidden_size": 1024,
+        "num_attention_heads": 16,
+        "intermediate_size": 2816,
+        "patch_size": 14,
+        "rope_theta": 10000,
+        "downsample_ratio": 3,
+        "max_image_tokens": 1024,
+        "min_pixels": 295936,
+        "max_wh_ratio": null
+      }
+    },
+    "metadata": {
+      "cache_representations": {
+        "window": {
+          "dtype": "fp8_e4m3",
+          "group_size": 32,
+          "scale_dtype": "bf16"
+        },
+        "compressed_kv": {
+          "dtype": "fp4_e2m1",
+          "group_size": 16,
+          "scale_dtype": "bf16"
+        }
+      },
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "mqsmla_aicpu_metadata_and_original_sparse_index_producer"
+      ],
+      "source_assumptions": [
+        "capture_mqsmla_and_grouped_binary_tensor_ABI_unverified"
+      ]
+    }
+  },
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "device": {
+      "hbm_gib": 96,
+      "rates": {
+        "host_memory": 64000000000.0,
+        "host_vector": 50000000000.0,
+        "h2d": 32000000000.0
+      }
+    },
+    "assumptions": {
+      "host_path": "example nominal host memory 64GB/s, vector 50Gops/s, H2D 32GB/s; replace with host parameters"
+    }
+  },
+  "runtime": {
+    "tp": 1,
+    "dp": 8,
+    "ep": 8,
+    "pp": 1,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 16,
+    "max_model_len": 16384,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.94,
+    "kv_block_size": 128,
+    "engram_cpu_offload": true,
+    "routing": {
+      "policy": "balanced"
+    },
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      },
+      "families": {
+        "grouped_gemm": {
+          "kind": "ascend_mxa8w4_nznk",
+          "compact": true,
+          "mte1_mode": "base",
+          "producer_mode": "dynamic_buffer4",
+          "compact_panels": true
+        }
+      },
+      "lowerings": {
+        "mqsmla_attention": {
+          "implementation": "cannbot_mixed_quant_sparse_flash_mla",
+          "options": {
+            "metadata_support_fd": false,
+            "addressing": "scalar",
+            "return_softmax_lse": false
+          }
+        },
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "hc_pre",
+              "hc_post"
+            ],
+            "traffic_profile": {
+              "hc_pre": "hc_pre_arch35_mk_175ef4d4",
+              "hc_post": "hc_post_arch35_bf16_175ef4d4"
+            }
+          }
+        },
+        "v41_rotary": "v41_partial_rotary",
+        "mx_matrix": {
+          "implementation": "ascend_prepared_mx32_matrix",
+          "options": {
+            "projection_recipes": [
+              "q_b",
+              "grouped_output_a",
+              "grouped_output_b"
+            ],
+            "scale_storage": "replace_checkpoint_scales"
+          }
+        }
+      },
+      "native_moe_protocol": {
+        "kind": "arch35_fullmesh",
+        "max_inflight_per_rank": 8,
+        "dispatch_quant": "mx"
+      }
+    },
+    "metadata": {
+      "input_boundary": "target body input template; placeholder request is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/deepseek_v4_1_flash_fp8_high_conc_decode_tpot10ms_c8_20261030",
+      "selected_rank": "dp0_pp0_tp0_dcp0_ep0_rank0",
+      "kernel_source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/deepseek_v4_1_flash_fp8_high_conc_decode_tpot10ms_c8_20261030/kernel_details.csv",
+        "sha256": "17b7ed9ee87a8449f1c92d04a0e0f2eebd5aecd6edd39e4073d8787976974866",
+        "size_bytes": 96044757
+      },
+      "startup": {
+        "path": "/Volumes/data/mindie-sim-data/a5/dsv41_dp8ep8_sweep_20261030/serve.log",
+        "sha256": "6e621f4bbc3f65caa89b3f5b800fed8ab193bf3ebb73121c1fdd5f09e0990d6f",
+        "size_bytes": 268539
+      },
+      "startup_contract_lines": [
+        23,
+        198
+      ],
+      "launch": {
+        "path": "/Volumes/data/mindie-sim-data/a5/dsv41_dp8ep8_sweep_20261030/cfg/hc_serve_dp8.sh",
+        "sha256": "ab844d20c271a3c37fc008bc6756080bd04656133866550cdb98311c8d033e2e",
+        "size_bytes": 3248
+      },
+      "engine_config": {
+        "checkpoint": "/mnt/weight/DeepSeek-V4.1-Flash-1017",
+        "image": "9e869e814846 (vllm-ascend v0.30.0-a5-cann9.2.0-r31)",
+        "topology": "TP1/DP8/EP8",
+        "tensor_parallel_size": 1,
+        "data_parallel_size": 8,
+        "enable_expert_parallel": true,
+        "enable_force_eplb": true,
+        "enable_prefix_caching": false,
+        "quantization": "deepseek_v4_fp8",
+        "max_model_len": 16384,
+        "max_num_seqs_per_die": 16,
+        "max_num_batched_tokens": 8192,
+        "gpu_memory_utilization": 0.94,
+        "profiler": "torch (torch_npu text export, Level1, aic PipeUtilization)"
+      },
+      "graph_native_mode": "FULL_AND_PIECEWISE; decode full graph bucket 1/2/4/8/16",
+      "speculation": {
+        "enabled": false,
+        "basis": "startup line198 speculative_config=None"
+      },
+      "prefix_cache": {
+        "enabled": false,
+        "basis": "startup lines23/198"
+      },
+      "force_eplb": {
+        "enabled": true,
+        "basis": "startup line23 enable_force_eplb=True"
+      },
+      "engram": {
+        "cpu_offload": true,
+        "dp_shared_memory": true,
+        "embedding_across_dp": false,
+        "basis": "startup line23",
+        "storage_representation": "retained same-checkpoint FP8+E8M0 header declaration",
+        "host_supply": "nominal assumptions retained; not calibrated to this capture"
+      },
+      "structure_basis": {
+        "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
+        "bytes": 3311,
+        "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
+      },
+      "checkpoint_headers": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-23/v41-flash-a5/env/checkpoint-structure.json",
+        "bytes": 2607,
+        "sha256": "c9328a7a7d03ece026939aab03f3bfe0ee5519e7dc926c695ff6d3b31c05da44"
+      },
+      "structure_reuse_condition": "same DeepSeek-V4.1-Flash-1017 checkpoint path; current deployment config bytes not independently delivered",
+      "target_layers": 40,
+      "sampled_body_geometry": {
+        "phase": "decode",
+        "q": 1,
+        "rank0_rows": 1,
+        "tensor_source": {
+          "csv_line": 45,
+          "Type": "HcPre",
+          "Name": "HcPre",
+          "Model ID": "59",
+          "Device_id": "0",
+          "Stream ID": "10",
+          "Input Shapes": "\"1,4,5120;24,20480;3;24;1,4\"",
+          "Output Shapes": "\"1,5120;1,4;1,4,4;1,4\"",
+          "Input Data Types": "DT_BF16;FLOAT;FLOAT;FLOAT;FLOAT",
+          "Output Data Types": "DT_BF16;FLOAT;FLOAT;FLOAT"
+        },
+        "context": "not inferred from N/A attention ABI; initial prompt is 2048",
+        "peer_replica_rows": "unknown; client concurrency does not prove peer geometry"
+      },
+      "profiled_client": {
+        "concurrency": 8,
+        "prompt_tokens": 2048,
+        "output_tokens": 768,
+        "tpot_ms": {
+          "n": 8,
+          "mean": 14.879683559322094,
+          "median": 14.880035352021851,
+          "std": 0.15465007221370322,
+          "min": 14.724322737939952,
+          "max": 15.034758344197797,
+          "p50": 14.880035352021851,
+          "p90": 15.03456879660977,
+          "p99": 15.034739389438995
+        },
+        "metric_boundary": "client token TPOT, not body/device graph span"
+      },
+      "native_attention": {
+        "dsl": {
+          "path": "/Users/maoxx241/code/refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+          "bytes": 111124,
+          "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f",
+          "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
+          "definition_lines": [
+            897,
+            938
+          ],
+          "layout_lines": [
+            100,
+            118
+          ],
+          "wrapper_lines": [
+            2142,
+            2233
+          ]
+        },
+        "operator_documentation": {
+          "path": "/Users/maoxx241/code/refs/ops-transformer/torch_extension/cann_ops_transformer/docs/zh/mixed_quant_sparse_flash_mla.md",
+          "bytes": 53292,
+          "sha256": "05a69a227d2c253eec1b609f6a68e194a4bdec1a5ff5bfbee3d98c7bba049deb",
+          "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
+        },
+        "historical_caller_stack": {
+          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/v41-flash-a5/kvzero-patch.md",
+          "bytes": 15961,
+          "sha256": "dfd5f79dabeef1377180eb5bd0a4842faca71d51ce9f54c3c1587b788138acbe",
+          "lines": [
+            108,
+            121
+          ]
+        },
+        "binary_identity": "source symbol matches; r31 binary/source identity not established",
+        "role": "mixed-quant paged shared-KV attention core, conditional on matching source",
+        "included": [
+          "address preparation",
+          "FP8/FP4 KV gather and dequantization",
+          "QK",
+          "softmax",
+          "PV",
+          "metadata-selected split partial reduction",
+          "attention output write"
+        ],
+        "excluded": [
+          "query/latent projections",
+          "index top-k producer",
+          "KV compressor update",
+          "attention output projection",
+          "host metadata producer",
+          "HcPre",
+          "HcPost"
+        ],
+        "source_geometry": {
+          "query_heads": 64,
+          "kv_heads": 1,
+          "head_dim": 512,
+          "nope_dim": 448,
+          "rope_dim": 64,
+          "key_tile": 128,
+          "original_row_bytes": 544,
+          "compressed_row_bytes": 320
+        },
+        "capture_tensor_abi": "unavailable; no fake tensor shapes or exact source binding"
+      },
+      "unresolved_capture_contracts": [
+        "exact active rows and context on every DP peer",
+        "r31 packaged MQSMLA source/binary identity and tensor ABI",
+        "mixed FP8/FP4 KV resident/traffic ABI is not the current analytic BF16-cache envelope",
+        "Engram gate wkv quantized checkpoint representation is not yet a separate execution role",
+        "host lookup/UVA path and shared host owner supply across replicas"
+      ],
+      "comparison_coverage": "conditional analytic structure; native mixed-quant attention boundary remains unmodeled",
+      "source_scenario": {
+        "base_case": {
+          "path": "/Users/maoxx241/code/sim-v41-body-source-cases-20261030/examples/cases/high-concurrency-20261030/v41-dp8/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8.json",
+          "sha256": "ecf2a6a2550b59acd682044fd24a74e31db0938bf45dfa69f37a094f7d08df69",
+          "bytes": 12777
+        },
+        "rank0_geometry_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-09811dad/body-operator-a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-v41-dp8.actual.json",
+          "sha256": "0150875fae46728125a70bf80220635f792b5669fea7926c003ef68bfa1aac69",
+          "bytes": 2444252
+        },
+        "observed_rank0_geometry": {
+          "query_rows": 1,
+          "sequences_per_replica": 1,
+          "tokens_per_sequence": 1,
+          "context_tokens": null,
+          "batch_basis": "measured_hidden_rows_divided_by_source_declared_decode_query",
+          "context_basis": "not_observed_from_cache_capacity"
+        },
+        "conditions": {
+          "single_active_rank0": {
+            "phase": "decode",
+            "tokens": 1,
+            "sequences": [
+              1,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0,
+              0
+            ],
+            "context": 2048,
+            "scope": "body"
+          },
+          "symmetric_declared": {
+            "phase": "decode",
+            "tokens": 1,
+            "sequences": [
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "context": 2048,
+            "scope": "body"
+          }
+        },
+        "cohort_basis": "explicit alternatives; neither unobserved peer distribution is inferred from client concurrency",
+        "padding_basis": "preserve original graph mode and buckets; source rejects unsupported padded rows",
+        "context_basis": "explicit 2048-token condition, not live context reconstructed from N/A ABI",
+        "source": {
+          "attention": {
+            "repository": "cannbot-dsl",
+            "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
+            "kernel": {
+              "path": "samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+              "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f"
+            },
+            "metadata": {
+              "path": "samples/mixed_quant_sparse_flash_mla_metadata/mixed_quant_sparse_flash_mla_metadata.py",
+              "sha256": "a62295be0fdf6acc7c0c606e60424e3fbc03310bee4e1effa2a384ccd6415b65"
+            },
+            "capture_binary_identity": "not_established"
+          },
+          "grouped": {
+            "repository": "https://gitcode.com/cann/ops-transformer",
+            "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+            "selector": "MXA8W4_NZNK/VECTOR_ANTIQUANT/N_FIRST_TAIL_RESPLIT/DYNAMIC_BUFFER4",
+            "files": [
+              "gmm/grouped_matmul/op_kernel/grouped_matmul_apt.cpp:425-432",
+              "gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp:850-884,1757-1820",
+              "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/grouped_matmul_weight_quant_resplit_controller.h:136-251",
+              "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_basic_block.h:267-393",
+              "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_vec_compute.h:285-318,735-831",
+              "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/basic_api/weight_quant_basic_api_v1.h:111-242"
+            ],
+            "capture_binary_identity": "unverified"
+          }
+        },
+        "coverage": "conditional source program; neither exact captured kernel ABI nor heldout body accuracy",
+        "capacity_boundary": "body probe bypasses admission; packed cache producers and Memory use same ABI",
+        "producer_revision": {
+          "mode": "dynamic_buffer4",
+          "source_case": "examples/cases/high-concurrency-20261030/v41-source-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-source.json",
+          "source_case_sha256": "3ef3966875471c63eadfba7aa57f648abadb4024a20020c171685c15dfdd28b8",
+          "basis": "retained DYNAMIC_BUFFER4 pipe events; not a fitted duration or measured peer token count",
+          "slots": {
+            "input_ub": 4,
+            "widened_ub": 4,
+            "scale_transpose_ub": 2,
+            "weight_l1": 2,
+            "operand_l0": 2
+          },
+          "compact_contention": "fluid; finite source dependencies retained in nominal cycle"
+        },
+        "partial_rotary_revision": {
+          "source_input": {
+            "path": "examples/cases/high-concurrency-20261030/v41-dynamic-buffer4-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-dynamic-source.json",
+            "sha256": "4a63fc9226f3fb6306afc1231f21b9838caed79502dfcd1217794a56d852d8b0"
+          },
+          "selection": "v41_partial_rotary",
+          "boundary": "replace combined Q/KV; inverse before output activation quantization",
+          "timing": "explicit partial-slice resource envelope; native owner schedule not selected",
+          "evidence": "source caller semantics; capture binary identity not established"
+        }
+      },
+      "composed_arch35": {
+        "parent": {
+          "path": "/Users/maoxx241/code/sim-v41-source-composed-20261030/examples/cases/high-concurrency-20261030/v41-dynamic-rotary-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-dynamic-rotary-source.json",
+          "sha256": "b3b118ff098c31520ff0a47054406ce89bea7595c6adfde4b6b9aa98b342efa4"
+        },
+        "runtime_revision": "96b4a043",
+        "components": [
+          "dynamic_buffer4 MXA8W4 grouped",
+          "partial Q/KV/inverse rotary",
+          "MC2 fullmesh MX32 dispatch and BF16 combine",
+          "arch35 HcPre/HcPost",
+          "explicit prepared MX32 matrix scales and AIC Fixpipe outputs"
+        ],
+        "conditions": [
+          "peer batches are declared symmetric, not all-rank capture evidence",
+          "HC B4 ABI remains a conditional source selection",
+          "checkpoint32 preparation binary and scale replacement not verified; explicit post-load declaration",
+          "source ABI compatibility does not establish captured binary/host dispatch"
+        ],
+        "scope": "complete40-layer body under explicit source and workload assumptions; not serving TPOT"
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

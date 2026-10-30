@@ -1,0 +1,1703 @@
+{
+  "cases": [
+    {
+      "case_id": "qwen35-35b-a5-tp4-c4-graph",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+        "size_bytes": 70137504,
+        "mtime_ns": 1793299592000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "9b8a87bfd6252204ab077e331ed97976ff9f5256935cb153677ac619dd96aac1"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c4-graph.json",
+        "sha256": "8c158cae5304a1e5267a7845d2130cea453e16eaef1b5e2be28132af36e7e1a1",
+        "size_bytes": 2110162
+      },
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 84,
+      "source_forward_count": 91,
+      "selected_forward_id": "auto:1",
+      "selected_body_start_ns": 1793299061261773422,
+      "selected_body_end_ns": 1793299061273791434,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 7577,
+            "csv_line": 7579,
+            "task_id": "348045",
+            "stream_id": "371",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  16,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  10340,
+                  6,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  5
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  4
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  4
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299061261807645,
+          "end_ns": 1793299061261815788
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 7581,
+            "csv_line": 7583,
+            "task_id": "348049",
+            "stream_id": "371",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793299061261822524,
+          "end_ns": 1793299061261828627
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot5ms_c4_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 7584,
+            "csv_line": 7586,
+            "task_id": "348052",
+            "stream_id": "371",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  16,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  8
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  5
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  16
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  8
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  4
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  16,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299061261833643,
+          "end_ns": 1793299061261844402
+        }
+      ],
+      "scanned_prefix_rows": 7585,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen35-35b-a5-tp4-c4-graph.json",
+        "sha256": "0e0a5575f51d4a58f305475384ef5c34c5546d3fc830e5714c9bad708bf8095c",
+        "size_bytes": 3525
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen35-35b-a5-tp4-c4-graph-source-gdn-native.json",
+        "sha256": "c737422cc45ffa9fc1b5b305900623610915df58e61221bebd025ab07caac797",
+        "size_bytes": 7336
+      }
+    },
+    {
+      "case_id": "qwen35-35b-a5-tp4-c64-graph",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+        "size_bytes": 79462851,
+        "mtime_ns": 1793299528000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "5612e7cccfb3878cf27b22b1e89c5d186cd100633a44748973349f1bf03872f3"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c64-graph.json",
+        "sha256": "1e4b2377fc30d82e8c07bc870d223d6f9543d8f766217bc2b50fbe5f2adfda3f",
+        "size_bytes": 3552771
+      },
+      "geometry": {
+        "query_rows": 256,
+        "sequences_per_replica": 64,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 79,
+      "source_forward_count": 96,
+      "selected_forward_id": "auto:1",
+      "selected_body_start_ns": 1793299074270431825,
+      "selected_body_end_ns": 1793299074292452570,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 16492,
+            "csv_line": 16494,
+            "task_id": "128425",
+            "stream_id": "136",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  256,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  10340,
+                  6,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  65
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  64
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  64
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  256,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299074270478772,
+          "end_ns": 1793299074270490133
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 16496,
+            "csv_line": 16498,
+            "task_id": "128429",
+            "stream_id": "136",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793299074270500895,
+          "end_ns": 1793299074270507218
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 16499,
+            "csv_line": 16501,
+            "task_id": "128432",
+            "stream_id": "136",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  256,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  256,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  256,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  256,
+                  8
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  65
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  256
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  256,
+                  8
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  64
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  256,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299074270513145,
+          "end_ns": 1793299074270570208
+        }
+      ],
+      "scanned_prefix_rows": 16500,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen35-35b-a5-tp4-c64-graph.json",
+        "sha256": "fcd7c235d50ca62a16edfd9c102fcd492379a5eb52db12efa4f3cd34e8d2c1fe",
+        "size_bytes": 3529
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen35-35b-a5-tp4-c64-graph-source-gdn-native.json",
+        "sha256": "45af9b4b530a72d55925e70f1100fc76d4af044d5c7b718d5c837e8c4012d3f7",
+        "size_bytes": 7343
+      }
+    },
+    {
+      "case_id": "qwen35-35b-a5-tp4-c128-graph",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+        "size_bytes": 88444963,
+        "mtime_ns": 1793299565000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "bf35b8b21c078d6fc7223918b280158fda5ee7c1f83009c70c98b16f27b08df5"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c128-graph.json",
+        "sha256": "c1ca06ada60530c17cc7df146d7a2768d3712bb938c948148605fcd3435c6288",
+        "size_bytes": 4111917
+      },
+      "geometry": {
+        "query_rows": 512,
+        "sequences_per_replica": 128,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 76,
+      "source_forward_count": 99,
+      "selected_forward_id": "auto:1",
+      "selected_body_start_ns": 1793299089173134675,
+      "selected_body_end_ns": 1793299089201838459,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 22529,
+            "csv_line": 22531,
+            "task_id": "11165",
+            "stream_id": "24",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  512,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  10340,
+                  6,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  129
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  128
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  128
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  512,
+                  2048
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299089173189691,
+          "end_ns": 1793299089173206487
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 22533,
+            "csv_line": 22535,
+            "task_id": "11169",
+            "stream_id": "24",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793299089173217937,
+          "end_ns": 1793299089173224689
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot30ms_c128_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 22536,
+            "csv_line": 22538,
+            "task_id": "11172",
+            "stream_id": "24",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  512,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  512,
+                  4,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  512,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  512,
+                  8
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  129
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  512
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  512,
+                  8
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  128
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  512,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  10340,
+                  8,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793299089173232586,
+          "end_ns": 1793299089173359724
+        }
+      ],
+      "scanned_prefix_rows": 22537,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen35-35b-a5-tp4-c128-graph.json",
+        "sha256": "5458702a97018637526c916b6db2ec27e36ca3d73d525b4f48e2b58656318b09",
+        "size_bytes": 3532
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen35-35b-a5-tp4-c128-graph-source-gdn-native.json",
+        "sha256": "6caa42b4950405c43a17f920a4ed71dd423b8a0097661642c167f22b7f9e5cfa",
+        "size_bytes": 7348
+      }
+    },
+    {
+      "case_id": "qwen36-a5-tp2-c1",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+        "size_bytes": 65019355,
+        "mtime_ns": 1793298450000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "7e0e459dec657f249ebbf82da9a7ceccf904aa3eff2e161cd8e312d1b04e6d2d"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c1.json",
+        "sha256": "b57c8e353712643b2d0735d42df9b53545f9389578b8baf8935a86c12ecdb3ca",
+        "size_bytes": 2401116
+      },
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 85,
+      "source_forward_count": 85,
+      "selected_forward_id": "auto:0",
+      "selected_body_start_ns": 1793298371951843158,
+      "selected_body_end_ns": 1793298371965517145,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 99,
+            "csv_line": 101,
+            "task_id": "594678",
+            "stream_id": "7085",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  4,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  2188,
+                  6,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  1
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  1
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  4,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298371951882453,
+          "end_ns": 1793298371951890150
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 104,
+            "csv_line": 106,
+            "task_id": "594683",
+            "stream_id": "7085",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793298371951900719,
+          "end_ns": 1793298371951916631
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 107,
+            "csv_line": 109,
+            "task_id": "594686",
+            "stream_id": "7085",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  4,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  24
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  2
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  4
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  24
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  1
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  4,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298371951921499,
+          "end_ns": 1793298371951931068
+        }
+      ],
+      "scanned_prefix_rows": 108,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen36-a5-tp2-c1.json",
+        "sha256": "0ca0c5e9538108bf5d02da8c394709938ff73780409215971f0ed228e2649721",
+        "size_bytes": 2978
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen36-a5-tp2-c1-source-gdn-native.json",
+        "sha256": "3903255d1afbb090889ba5d0cfcf310badfb5221b16619e997b638b6b0dda206",
+        "size_bytes": 6778
+      }
+    },
+    {
+      "case_id": "qwen36-a5-tp2-c12",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot10ms_c12_20261030/kernel_details.csv",
+        "size_bytes": 43475364,
+        "mtime_ns": 1793298518000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "adada115f0f1c6cddaee97dbfed2aba8c5c0e9f1ade856ad2cc4dbd1f4f11841"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c12.json",
+        "sha256": "dc5eb494c0e16b3ca584fd6d408ad772fbd27125beb0b264a751b9c0856cc39a",
+        "size_bytes": 2207695
+      },
+      "geometry": {
+        "query_rows": 48,
+        "sequences_per_replica": 12,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 55,
+      "source_forward_count": 55,
+      "selected_forward_id": "auto:0",
+      "selected_body_start_ns": 1793298460337469983,
+      "selected_body_end_ns": 1793298460362706047,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot10ms_c12_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 104,
+            "csv_line": 106,
+            "task_id": "552822",
+            "stream_id": "7056",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  48,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  2188,
+                  6,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  13
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  12
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  12
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  48,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298460337524785,
+          "end_ns": 1793298460337538367
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot10ms_c12_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 109,
+            "csv_line": 111,
+            "task_id": "552827",
+            "stream_id": "7056",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793298460337554516,
+          "end_ns": 1793298460337630603
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot10ms_c12_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 112,
+            "csv_line": 114,
+            "task_id": "552830",
+            "stream_id": "7056",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  48,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  48,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  48,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  48,
+                  24
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  13
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  48
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  48,
+                  24
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  12
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  48,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298460337636240,
+          "end_ns": 1793298460337668816
+        }
+      ],
+      "scanned_prefix_rows": 113,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen36-a5-tp2-c12.json",
+        "sha256": "bb70ee96cbef14aa43b22c7acd0688d3be43b396517ec952a83575838302cfc9",
+        "size_bytes": 2984
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen36-a5-tp2-c12-source-gdn-native.json",
+        "sha256": "5a7613f0d1948735dd5e1f5d313efebd47ae454b2c791001fe5e40eaf5ccdf2c",
+        "size_bytes": 6787
+      }
+    },
+    {
+      "case_id": "qwen36-a5-tp2-c96",
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+        "size_bytes": 19928533,
+        "mtime_ns": 1793298564000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "bd178d03944f57ad7586ee2a7bfae85f18aab7e457dd36c788fb8573bb0ed896"
+      },
+      "body_extraction_identity": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c96.json",
+        "sha256": "963d6dae9d6f6638886b3e3354cb1b2d5c328fc3d49c06de72bea4f78a5b5e79",
+        "size_bytes": 1816541
+      },
+      "geometry": {
+        "query_rows": 384,
+        "sequences_per_replica": 96,
+        "tokens_per_sequence": 4,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "geometry_forward_count": 24,
+      "source_forward_count": 24,
+      "selected_forward_id": "auto:0",
+      "selected_body_start_ns": 1793298527398135266,
+      "selected_body_end_ns": 1793298527463723561,
+      "samples": [
+        {
+          "kind": "CausalConv1d",
+          "name": "CausalConv1d",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 104,
+            "csv_line": 106,
+            "task_id": "314531",
+            "stream_id": "6886",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "CausalConv1d",
+            [
+              [
+                [
+                  384,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  4,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  2188,
+                  6,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  97
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  96
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [
+                  96
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ],
+              [
+                [],
+                null,
+                null
+              ]
+            ],
+            [
+              [
+                [
+                  384,
+                  5120
+                ],
+                "bf16",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298527398228985,
+          "end_ns": 1793298527398265481
+        },
+        {
+          "kind": "fused_gdn_gating_kernel",
+          "name": "fused_gdn_gating_kernel",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 109,
+            "csv_line": 111,
+            "task_id": "314536",
+            "stream_id": "6886",
+            "device_id": "0"
+          },
+          "native_abi": null,
+          "start_ns": 1793298527398283809,
+          "end_ns": 1793298527398403845
+        },
+        {
+          "kind": "RecurrentGatedDeltaRule",
+          "name": "aclnnRecurrentGatedDeltaRule_RecurrentGatedDeltaRule_RecurrentGatedDeltaRule",
+          "locator": {
+            "source": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot30ms_c96_20261030/kernel_details.csv",
+            "table": "kernel_details.csv",
+            "row_index": 112,
+            "csv_line": 114,
+            "task_id": "314539",
+            "stream_id": "6886",
+            "device_id": "0"
+          },
+          "native_abi": [
+            "native_tensor_abi",
+            "RecurrentGatedDeltaRule",
+            [
+              [
+                [
+                  384,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  384,
+                  8,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  384,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  384,
+                  24
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  97
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  384
+                ],
+                "int32",
+                "ND"
+              ],
+              [
+                [
+                  384,
+                  24
+                ],
+                "fp32",
+                "ND"
+              ],
+              [
+                [
+                  96
+                ],
+                "int32",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  384,
+                  24,
+                  128
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  2188,
+                  24,
+                  128,
+                  128
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ],
+          "start_ns": 1793298527398412353,
+          "end_ns": 1793298527398690920
+        }
+      ],
+      "scanned_prefix_rows": 113,
+      "scope": "Bounded first accepted complete body in the largest retained geometry bucket; samples establish representative tensor ABI only, not full-family population or capture-binary source identity.",
+      "source_unchanged_during_probe": true,
+      "base_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/new9/qwen36-a5-tp2-c96.json",
+        "sha256": "06d1ae9e123d3e6f11addc2257dbb0f90014ab511ca414da7a9fb5d0fd4eea50",
+        "size_bytes": 2985
+      },
+      "selected_case_identity": {
+        "path": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen36-a5-tp2-c96-source-gdn-native.json",
+        "sha256": "88c3fd09101c83d663fc67038b43510ffc002b3b23610af66c9f11180884a89e",
+        "size_bytes": 6789
+      }
+    }
+  ],
+  "input_contract": "Conditional explicit source selection, representative raw tensor ABI only; no new timing fit or cost prediction.",
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/qwen-source-gdn-native-new6-20261030.json",
+    "sha256": "9ada6e110bcf4eb83a594486fecc3649d3879986f8dfc42835a9f1dd9af35cbf",
+    "size_bytes": 47119
+  }
+}

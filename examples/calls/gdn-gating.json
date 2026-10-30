@@ -1,0 +1,13 @@
+{
+  "builder": "gdn",
+  "arguments": {
+    "role": "gating",
+    "rows": 128,
+    "heads": 48,
+    "phase": "prefill"
+  },
+  "protocol": {
+    "invocations": 1,
+    "mode": "eager"
+  }
+}

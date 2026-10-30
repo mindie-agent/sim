@@ -1,0 +1,26 @@
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:13: FutureWarning: triton.language.extra.cann.extension.atan2 is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.atan2 instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.atan2")
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:35: FutureWarning: triton.language.extra.cann.extension.isfinited is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.isfinited instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.isfinited")
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:49: FutureWarning: triton.language.extra.cann.extension.finitef is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.finitef instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.finitef")
+Traceback (most recent call last):
+  File "/scratch/probe.py", line 85, in <module>
+    main(parser.parse_args().output)
+  File "/scratch/probe.py", line 24, in main
+    torch.npu.set_device(0)
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/utils.py", line 94, in set_device
+    torch_npu._C._npu_setDevice(device_id)
+RuntimeError: ExchangeDevice:../torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.cpp:318 NPU function error: c10_npu::SetDevice(device), error code is 507033
+[ERROR] 2026-10-27-18:42:48 (PID:71, Device:0, RankID:-1) ERR00100 PTA call acl api failed
+[Error]: Failed to start the device. 
+        Rectify the fault based on the error information in the ascend log.
+[PID: 71] 2026-10-27-18:42:48.587.396 Invalid_Argument_API_Call_Sequence(EE1018): Context validation failed. Reason: No valid context is bound to the current thread. Call aclrtSetDevice or aclrtSetCurrentContext to bind a valid context to the current thread before calling this API.
+TraceBack (most recent call last):
+        TsdOpen failed. devId=0, tdt error=1.[FUNC:PrintfTsdError][FILE:runtime.cc][LINE:2174]
+        Check param failed, dev can not be NULL![FUNC:DeviceRetain][FILE:runtime.cc][LINE:3218]
+        rtSetDevice execution failed, reason=device retain error[FUNC:FuncErrorReason][FILE:error_message_manage.cc][LINE:76]
+        Context validation failed. Reason: No valid context is bound to the current thread. Call aclrtSetDevice or aclrtSetCurrentContext to bind a valid context to the current thread before calling this API.
+        The argument is invalid. Reason: rtGetDevMsg execution failed, the context is a null pointer.
+        The argument is invalid. Reason: rtGetFaultEvent execution failed, the context is a null pointer.
+

@@ -1,0 +1,78 @@
+{
+  "schema": "mindie-sim.capture-protocol/1",
+  "adapter": "activation_calls",
+  "producer": {
+    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/bench_activation.py",
+    "sha256": "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136"
+  },
+  "supporting_sources": [
+    {
+      "path": "examples/artifacts/a3-activation-rows.json",
+      "sha256": "621375c098f47ecd5ede0802cf44938ac42376076dd50622aa5bb205660c8198"
+    },
+    {
+      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/build_activation_artifact.py",
+      "sha256": "e5ceca2e82f37eb75fa6825fd94f399b728271ce18d9ac56bfd45e16b45c0fc3"
+    }
+  ],
+  "captures": [
+    {
+      "path": "/Volumes/data/mindie-sim-data/a3/2026-10-24/activation/cells_a.json",
+      "sha256": "d30ff68c81c780222035208bd49e0c5d631602b6d7c17cb6e7b28a654811c810"
+    },
+    {
+      "path": "/Volumes/data/mindie-sim-data/a3/2026-10-24/activation/cells_b.json",
+      "sha256": "15785219d4fc92290e172299f5c4f6a7d69e0ba4d873b731eb905c466326aadf"
+    }
+  ],
+  "hardware": {
+    "host": "192.168.13.165",
+    "visible_device": "3"
+  },
+  "variants": {
+    "swiglu_fused": {
+      "level": "operator",
+      "api": [
+        "torch_npu.npu_swiglu(dim=-1)"
+      ],
+      "layout": "contiguous_gate_first"
+    },
+    "swiglu_separate": {
+      "level": "subgraph",
+      "api": [
+        "torch.nn.functional.silu",
+        "Tensor.mul"
+      ],
+      "layout": "separate_contiguous_gate_up"
+    },
+    "geglu_separate": {
+      "level": "subgraph",
+      "api": [
+        "torch.nn.functional.gelu(approximate=tanh)",
+        "Tensor.mul"
+      ],
+      "layout": "separate_contiguous_gate_up"
+    },
+    "silu_standalone": {
+      "level": "operator",
+      "api": [
+        "torch.nn.functional.silu"
+      ],
+      "layout": "contiguous"
+    },
+    "gelu_standalone": {
+      "level": "operator",
+      "api": [
+        "torch.nn.functional.gelu(approximate=tanh)"
+      ],
+      "layout": "contiguous"
+    }
+  },
+  "limitations": [
+    "Original captures do not assign train/heldout roles for the current predictor. The historical builder fitted activation timing from these rows.",
+    "Producer and software versions identify the timed API; loaded kernel binary hashes were not recorded.",
+    "Device events enclose the Python API call, including possible launch gaps; they are not isolated profiler kernel durations.",
+    "Burst samples were recorded as per-call averages rounded to 1e-6 ms; reconstructed batch times retain that rounding.",
+    "Hidden size is an experiment context label, not an operand dimension."
+  ]
+}

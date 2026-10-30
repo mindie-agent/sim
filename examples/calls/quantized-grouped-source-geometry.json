@@ -1,0 +1,48 @@
+{
+  "kind": "quantized_grouped_source_geometry",
+  "source": {
+    "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
+    "implementation": "arch35_gqmm_mix_nz",
+    "branch": "V310_GMM_QUANT_MIX / GMM_DEQUANT_VECTOR / no transpose / GQmmMixRegbaseKernel"
+  },
+  "adapter": {
+    "module": "mindie_sim.prediction.operators.quant_grouped_schedule",
+    "entry": "plan_quant_grouped"
+  },
+  "geometry": {
+    "expert_rows": [64],
+    "n": 64,
+    "k": 16,
+    "tiling": {
+      "base_m": 32,
+      "base_n": 32,
+      "base_k": 32,
+      "used_cores": 8
+    }
+  },
+  "expected": {
+    "total_m": 64,
+    "tile_count": 8,
+    "owner_tiles": {
+      "0": [[0, 0, 0, 0, 16, 32, 16, 0, 0, 0, 0, 0]],
+      "1": [[0, 0, 16, 0, 16, 32, 16, 256, 0, 2048, 64, 0]],
+      "2": [[0, 0, 32, 0, 16, 32, 16, 512, 0, 4096, 128, 0]],
+      "3": [[0, 0, 48, 0, 16, 32, 16, 768, 0, 6144, 192, 0]],
+      "4": [[0, 0, 0, 32, 16, 32, 16, 0, 512, 64, 0, 128]],
+      "5": [[0, 0, 16, 32, 16, 32, 16, 256, 512, 2112, 64, 128]],
+      "6": [[0, 0, 32, 32, 16, 32, 16, 512, 512, 4160, 128, 128]],
+      "7": [[0, 0, 48, 32, 16, 32, 16, 768, 512, 6208, 192, 128]]
+    }
+  },
+  "field_order": [
+    "group", "ordinal", "m_offset", "n_offset", "m", "n", "k",
+    "x_offset", "weight_offset", "output_offset",
+    "row_scale_offset", "column_scale_offset"
+  ],
+  "notes": [
+    "This is adapter geometry only; it is not a CLI call declaration or a full-call integration.",
+    "Global offsets are bytes into INT8 X, INT8 FRACTAL_NZ W, BF16 Y, FP32 row scale and FP32 column scale.",
+    "The final base tile is split in M across two owners by the original last-group tail path.",
+    "Reproduce with tests/test_quant_grouped_schedule.py::test_example_geometry_matches_literal_owner_tile_declaration."
+  ]
+}

@@ -1,0 +1,1319 @@
+{
+  "schema": "onchip-rates-source-review.v1",
+  "date": "2026-10-28",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "hardware": "Ascend950DT_9582 / NpuArch3510",
+  "status": "exact_gdn_copy_instruction_chain_and_onchip_mode_rates_confirmed;fixpipe_gm_nominal_rate_unresolved",
+  "exact_image_config": {
+    "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+    "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+    "bytes": 20397,
+    "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/data/platform_config/Ascend950DT_9582.ini",
+    "lines": [
+      [
+        13,
+        22
+      ],
+      [
+        43,
+        46
+      ],
+      [
+        73,
+        86
+      ]
+    ]
+  },
+  "nominal_rates": [
+    {
+      "path": "L1->L0A",
+      "value": 256,
+      "unit": "Byte/cycle",
+      "owner": "AIC MTE1 pipeline",
+      "source_mode": "LoadData2DParamsV2: ifTranspose=false or true; both use load_cbuf_to_ca/cb intrinsic with a transpose flag",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              85,
+              99
+            ],
+            [
+              125,
+              141
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              124,
+              131
+            ],
+            [
+              247,
+              254
+            ]
+          ]
+        }
+      ],
+      "limitation": "LoadDataWithTranspose is a separate API/intrinsic. Its L0B 128 Byte/cycle entry does not apply to H/O LoadData2DParamsV2 calls."
+    },
+    {
+      "path": "L1->L0B",
+      "value": 256,
+      "unit": "Byte/cycle",
+      "owner": "AIC MTE1 pipeline",
+      "source_mode": "LoadData2DParamsV2: ifTranspose=false or true; both use load_cbuf_to_ca/cb intrinsic with a transpose flag",
+      "limitation": "LoadDataWithTranspose is a separate API/intrinsic. Its L0B 128 Byte/cycle entry does not apply to H/O LoadData2DParamsV2 calls.",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              125,
+              141
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "UB->L1",
+      "value": 128,
+      "unit": "Byte/cycle",
+      "owner": "AIV MTE3 pipeline",
+      "source_mode": "local source UB to associated L1 path",
+      "ownership_status": "Architecture explicitly places MTE3 in AIV; per-source-AIV stage ownership supported. Shared simultaneous ingress limit at one L1 is not explicitly specified by these docs.",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              7,
+              7
+            ],
+            [
+              124,
+              131
+            ],
+            [
+              181,
+              183
+            ],
+            [
+              247,
+              254
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_storage_access.cpp",
+          "sha256": "cc0da05fe1e9dcf28031269672294e8cd40ed9d8267579c2b66f6d65493cae69",
+          "bytes": 101861,
+          "lines": [
+            [
+              873,
+              879
+            ],
+            [
+              1614,
+              1617
+            ],
+            [
+              1653,
+              1667
+            ],
+            [
+              1706,
+              1730
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->BF16, F322BF16, NZ2NZ or NZ2ND",
+      "elements_per_cycle": 64,
+      "counting_basis": "destination byte count = elements*2, not FP32 source bytes and not source+destination sum",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              260
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_roofline.py",
+          "sha256": "2452cb929b69c1d05bad3d2884d21a65a868022ec01965d65f0a37cd74b1fe60",
+          "bytes": 20437,
+          "lines": [
+            [
+              11,
+              15
+            ],
+            [
+              38,
+              42
+            ],
+            [
+              130,
+              138
+            ],
+            [
+              156,
+              161
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_README.md",
+          "sha256": "55740b2c538affdb5794235c29867cdca42144d12c5cc31b585b228f5d4b0709",
+          "bytes": 12694,
+          "lines": [
+            [
+              193,
+              195
+            ],
+            [
+              259,
+              267
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              205,
+              207
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->FP32 NoQuant, ordinary single-target NZ2ND/NZ2NZ",
+      "elements_per_cycle": 32,
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              252
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB0 and UB1",
+      "value": [
+        128,
+        128
+      ],
+      "unit": "destination Byte/cycle per target",
+      "owner": "AIC Fixpipe with explicit dual-target mode",
+      "source_mode": "FP32 NoQuant NZ2ND/NZ2NZ dual target",
+      "elements_per_cycle": [
+        32,
+        32
+      ],
+      "limitation": "Only use when exact selected Fixpipe parameters enable dual-target mode; not a generic doubling for all casts.",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              247
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "review_id": "fixpipe_l1_f32_nz2nd",
+      "path": "L0C->L1",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->FP32 NoQuant, NZ2ND or NZ2NZ",
+      "elements_per_cycle": 32,
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              205,
+              213
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              124,
+              131
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "review_id": "fixpipe_l1_bf16_nz2nd",
+      "path": "L0C->L1",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->BF16 F322BF16, NZ2ND or NZ2NZ",
+      "elements_per_cycle": 64,
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              218,
+              221
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              124,
+              131
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "review_id": "fixpipe_l1_dn_stride_gt_1",
+      "path": "L0C->L1",
+      "value": 32,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "NZ2DN with srcNzC0Stride > 1; FP32 or BF16 output",
+      "elements_per_cycle": {
+        "float": 8,
+        "bfloat16_t": 16
+      },
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              209,
+              221
+            ]
+          ]
+        }
+      ],
+      "selected_by_gdn_h_o": false
+    },
+    {
+      "review_id": "load_data_with_transpose_l0b",
+      "path": "L1->L0B",
+      "value": 128,
+      "unit": "Byte/cycle",
+      "owner": "AIC MTE1",
+      "source_mode": "LoadDataWithTranspose(LoadData2dTransposeParamsV2), load_cbuf_to_cb_transpose intrinsic",
+      "selected_by_gdn_h_o": false,
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              125,
+              137
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+          "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+          "bytes": 83067,
+          "lines": [
+            [
+              296,
+              306
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/LoadDataWithTranspose.md",
+          "sha256": "95270d09d03309882d7e249bdc4396ccf72d4069ede68f3d40e3740e1136a790",
+          "bytes": 39891,
+          "lines": [
+            [
+              38,
+              60
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "review_id": "ub_to_ub_datacopy",
+      "path": "UB->UB",
+      "value": 256,
+      "unit": "copied payload Byte/cycle",
+      "owner": "AIV PIPE_V",
+      "source_mode": "DataCopy(DataCopyParams), copy_ubuf_to_ubuf",
+      "payload_formula": "blockCount * blockLen * 32",
+      "conservation": "A copied payload of B bytes reads B and writes B in the memory ledger. The instruction service uses B/256 cycles, not 2B/256.",
+      "startup": "Excluded from the theoretical body rate; not fitted.",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/vector_instruction_theoretical_perf_summary.md",
+          "sha256": "0d68bf9fb2584e21ca64bc3f4ab6643241186cedbf6d5e93a6f07901900c6600",
+          "bytes": 12745,
+          "lines": [
+            [
+              5,
+              6
+            ],
+            [
+              19,
+              23
+            ],
+            [
+              45,
+              49
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/api_pipeline_type_summary.md",
+          "sha256": "04904132d7f803ab82a1c87297b6c9616fc6618f252ed08d92e7595872b82b02",
+          "bytes": 9091,
+          "lines": [
+            [
+              113,
+              118
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+          "sha256": "6fbe664ed6e0d846549b425a6b0d60e697a24fda1e0b6829f11a33f4ae7a41d9",
+          "bytes": 85819,
+          "lines": [
+            [
+              172,
+              181
+            ],
+            [
+              608,
+              612
+            ],
+            [
+              1429,
+              1437
+            ]
+          ]
+        }
+      ],
+      "discriminating_example": {
+        "payload_bytes": 8192,
+        "theoretical_body_cycles": 32,
+        "ledger_read_bytes": 8192,
+        "ledger_write_bytes": 8192,
+        "must_share_resource_with": "Other PIPE_V work on the same AIV",
+        "must_not_charge_as": "AIV MTE3 UB->L1 service"
+      }
+    }
+  ],
+  "field_semantics_evidence": [
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/GetCoreMemBw.md",
+      "sha256": "cda9193b5a2f6c318f5939217808023e37b0ef061cec45cb68e29bc2a4486f0f",
+      "bytes": 5185,
+      "limitation": "The API documents Byte/cycle but marks L0/L1/UB query enum values reserved. Use direct architecture/mode docs above for on-chip path proof.",
+      "lines": [
+        [
+          45,
+          48
+        ]
+      ]
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/conv2d_backprop_filter_schedule.py",
+      "sha256": "686e5c3c7a81c93a63693b3e5b3f6a959cc8714d11fa028dc1ad361bfc39f81e",
+      "bytes": 150416,
+      "image_path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/dsl/static_schedule/conv2d_backprop_filter_schedule.py",
+      "exact_image_sha_verified": true,
+      "interpretation": "Actual installed consumer divides tensor byte counts by l1_to_l0_a/b_rate in movement service cost.",
+      "lines": [
+        [
+          1881,
+          1893
+        ]
+      ]
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/exact-image-rate-consumers.json",
+      "sha256": "f5ffe361d83bdf90038b24846e993037fd367bc1e3e698d90424a3b2dff53e32",
+      "bytes": 3848
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/exact-image-rate-declarations.json",
+      "sha256": "369547a6140a489dc499f56e13abb46af132516b78b20e916839df98cdf63895",
+      "bytes": 9543
+    }
+  ],
+  "public_source_manifest": "/tmp/review-gdn-python-image-20261028/platform-units/a5-primary-doc-manifest.json",
+  "clock": {
+    "configured_cube_freq": 1650,
+    "configured_vec_freq": 1650,
+    "unit": "MHz per published CANN source convention",
+    "provenance": "exact-image INI, not run sustained clock measurement",
+    "do_not": "Do not treat this as the capture sustained clock or a calibrated effective service rate."
+  },
+  "remaining_unknowns": [
+    "Simultaneous UB0/UB1->oneL1 aggregate destination port/bank arbitration is not explicitly guaranteed by these sources.",
+    "Actual DeltaT startup and mode-dependent instruction overhead need instruction-specific source or calibration, not bulk HBM substitution.",
+    "Profiler maxBwRateOf950_958X is a separate empirical/implementation reference and was not substituted for nominal config rates.",
+    "Exact selected operator copy mode and target splitting must be bound at lowering; path name alone is insufficient.",
+    "L0C->GM internal Fixpipe nominal service rate is not established.",
+    "UB->UB 256 copied Byte/cycle is a body rate; startup and dependencies remain separate."
+  ],
+  "no_device_execution": true,
+  "gdn_selected_mte1_modes": {
+    "dtype": "bfloat16_t",
+    "source_status": "Catlass headers verified against exact image offline and installed FLA OPP copies. FLA common files match pinned a4a7958 and exact image.",
+    "layout_resolution": {
+      "row_major_to_l1": "zN",
+      "column_major_to_l1": "nZ",
+      "l0a_ascend950": "zN",
+      "l0b": "nZ",
+      "sources": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/helper.hpp",
+          "sha256": "85e48a3184939beabade25817397199f1705b6b4f2e9ed201a09a5d5bbeec3f3",
+          "bytes": 15761,
+          "lines": [
+            [
+              153,
+              175
+            ],
+            [
+              199,
+              221
+            ],
+            [
+              270,
+              272
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/tile_copy.hpp",
+          "sha256": "1300e4ad135759504233bcd47c9a877624df6b1a32f0ffd050b357594ca9aef0",
+          "bytes": 23929,
+          "lines": [
+            [
+              314,
+              340
+            ],
+            [
+              396,
+              397
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/fla-common-a4a7958/kernel_utils/tile/copy_l0c_to_ub.hpp",
+          "sha256": "35b6706df83d4de8708056fae04c5f87b451f7d0afa90203d14fdf6629b663fc",
+          "bytes": 19055,
+          "lines": [
+            [
+              69,
+              82
+            ],
+            [
+              138,
+              145
+            ],
+            [
+              386,
+              405
+            ]
+          ]
+        }
+      ]
+    },
+    "modes": [
+      {
+        "operation": "H.WH",
+        "source_layout_a": "RowMajor",
+        "source_layout_b": "RowMajor",
+        "a_if_transpose": false,
+        "b_if_transpose": true,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/sim-gdn-composite-20261028/chunk_gated_delta_rule_fwd/internal/operators/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp",
+          "sha256": "54264cce8b2244256f2730912c427ca1e8fc2211857cbfbbbfe2fe4d6834b9f6",
+          "bytes": 66261,
+          "lines": [
+            [
+              125,
+              129
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                24,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                24,
+                73
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "operation": "H.KV",
+        "source_layout_a": "ColumnMajor",
+        "source_layout_b": "zN",
+        "a_if_transpose": true,
+        "b_if_transpose": true,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/sim-gdn-composite-20261028/chunk_gated_delta_rule_fwd/internal/operators/chunk_gated_delta_rule_fwd_h/op_kernel/arch35/gemm/kernel/gdn_fwd_h_kernel.hpp",
+          "sha256": "54264cce8b2244256f2730912c427ca1e8fc2211857cbfbbbfe2fe4d6834b9f6",
+          "bytes": 66261,
+          "lines": [
+            [
+              154,
+              158
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                96,
+                145
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                24,
+                73
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "operation": "O.QK",
+        "source_layout_a": "RowMajor",
+        "source_layout_b": "ColumnMajor",
+        "a_if_transpose": false,
+        "b_if_transpose": false,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+          "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+          "bytes": 29511,
+          "lines": [
+            [
+              36,
+              40
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                24,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                240,
+                281
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "operation": "O.AV",
+        "source_layout_a": "RowMajor",
+        "source_layout_b": "RowMajor",
+        "a_if_transpose": false,
+        "b_if_transpose": true,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+          "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+          "bytes": 29511,
+          "lines": [
+            [
+              41,
+              42
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                24,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                24,
+                73
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "operation": "O.QH[state_v_first=true]",
+        "source_layout_a": "RowMajor",
+        "source_layout_b": "ColumnMajor",
+        "a_if_transpose": false,
+        "b_if_transpose": false,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+          "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+          "bytes": 29511,
+          "lines": [
+            [
+              307,
+              315
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                24,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                240,
+                281
+              ]
+            ]
+          }
+        ]
+      },
+      {
+        "operation": "O.QH[state_v_first=false]",
+        "source_layout_a": "RowMajor",
+        "source_layout_b": "RowMajor",
+        "a_if_transpose": false,
+        "b_if_transpose": true,
+        "api": "LoadData2DParamsV2",
+        "a_nominal_bytes_per_cycle": 256,
+        "b_nominal_bytes_per_cycle": 256,
+        "physical_resource": "same owning AIC MTE1 pipeline",
+        "source": {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+          "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+          "bytes": 29511,
+          "lines": [
+            [
+              307,
+              315
+            ]
+          ]
+        },
+        "copy_sources": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+            "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+            "bytes": 26190,
+            "lines": [
+              [
+                24,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+            "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+            "bytes": 24663,
+            "lines": [
+              [
+                24,
+                73
+              ]
+            ]
+          }
+        ]
+      }
+    ],
+    "intrinsic_chain": [
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_intf_impl.h",
+        "sha256": "23fedd925a3474b44cf9fd61a1e89b9cad8a2777151b9e420c84d5ff3d69ca31",
+        "bytes": 34232,
+        "lines": [
+          [
+            102,
+            110
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+        "sha256": "5eed2f9d39c398317de9b82f5b15211442e8bec4fbd35bcb75b84833eb52b632",
+        "bytes": 13406,
+        "lines": [
+          [
+            188,
+            201
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+        "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+        "bytes": 83067,
+        "lines": [
+          [
+            207,
+            237
+          ],
+          [
+            240,
+            270
+          ],
+          [
+            296,
+            306
+          ]
+        ]
+      }
+    ],
+    "theoretical_rate_source": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+      "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+      "bytes": 21427,
+      "lines": [
+        [
+          125,
+          137
+        ]
+      ]
+    },
+    "physical_transfer_granule": {
+      "bytes_per_fractal": 512,
+      "bf16_fractal_elements": [
+        16,
+        16
+      ],
+      "tail_copy_extent": "Catlass CeilDiv converts actual matrix dimensions to full fractal counts. Logical valid elements remain distinct.",
+      "source": {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/LoadData_2D_V2.md",
+        "sha256": "c177936138dd16fc889f147abfe757ac59df588419476b0582ffffe5058303bd",
+        "bytes": 9849,
+        "lines": [
+          [
+            38,
+            40
+          ],
+          [
+            76,
+            82
+          ]
+        ]
+      }
+    },
+    "do_not": [
+      "Do not map ifTranspose=true to the separate LoadDataWithTranspose API.",
+      "Do not make L1->L0A and L1->L0B independent MTE1 resources.",
+      "Do not make different instruction service_modes independent resources."
+    ]
+  },
+  "gdn_o_fixpipe_selection": {
+    "operations": [
+      "QK->A_raw_UB",
+      "QH->O_s_raw_UB",
+      "AV->O_l_UB"
+    ],
+    "dtype": "FP32->FP32",
+    "quantization": "NoQuant",
+    "format": "NZ2ND",
+    "dualDstCtl": 0,
+    "subBlockId": "ownerSubBlock",
+    "destinations_per_call": 1,
+    "nominal_destination_bytes_per_cycle": 128,
+    "source": {
+      "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+      "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+      "bytes": 29511,
+      "lines": [
+        [
+          289,
+          304
+        ],
+        [
+          424,
+          437
+        ],
+        [
+          489,
+          502
+        ]
+      ]
+    },
+    "selected_common_overload": {
+      "path": "/tmp/review-gdn-python-image-20261028/fla-common-a4a7958/kernel_utils/tile/copy_l0c_to_ub.hpp",
+      "sha256": "35b6706df83d4de8708056fae04c5f87b451f7d0afa90203d14fdf6629b663fc",
+      "bytes": 19055,
+      "lines": [
+        [
+          244,
+          274
+        ]
+      ]
+    },
+    "rate_source": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+      "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+      "bytes": 21427,
+      "lines": [
+        [
+          246,
+          252
+        ]
+      ]
+    },
+    "do_not": "Do not select the dual-destination 32+32 elements/cycle mode."
+  },
+  "fixpipe_gm": {
+    "status": "nominal_rate_not_established_from_collected_primary_sources",
+    "value": null,
+    "owner": "owning AIC PIPE_FIX, plus shared external memory path",
+    "source_mode": "DataCopyCO12DstParams, NZ2ND, NoQuant/F322BF16 as selected",
+    "intrinsic": "copy_matrix_cc_to_gm",
+    "sources": [
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l0c_to_gm.hpp",
+        "sha256": "4a61bad15a97a65fb18dd0a5038b3f8d5fdc87bfc3dd42840cf13d4065232137",
+        "bytes": 21816,
+        "lines": [
+          [
+            21,
+            60
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l0c_to_dst.hpp",
+        "sha256": "3a1f039c068a3559caf8769b74b2adfb60d2b266f02c343e63d01b0052686ac8",
+        "bytes": 7256,
+        "lines": [
+          [
+            39,
+            67
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+        "sha256": "6fbe664ed6e0d846549b425a6b0d60e697a24fda1e0b6829f11a33f4ae7a41d9",
+        "bytes": 85819,
+        "lines": [
+          [
+            1375,
+            1407
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/api_pipeline_type_summary.md",
+        "sha256": "04904132d7f803ab82a1c87297b6c9616fc6618f252ed08d92e7595872b82b02",
+        "bytes": 9091,
+        "lines": [
+          [
+            148,
+            149
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/Fixpipe_L0CToGM.md",
+        "sha256": "1f55a31fe89adbed8b4eca9e8eb8c8ef8b2e6668d8a3fe35b23401e50ddacf35",
+        "bytes": 34002,
+        "lines": [
+          [
+            5,
+            6
+          ],
+          [
+            34,
+            42
+          ]
+        ]
+      }
+    ],
+    "searched_sources_and_limits": [
+      {
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              205,
+              285
+            ]
+          ]
+        },
+        "finding": "3510 output performance table gives L0C->L1 and L0C->UB modes, but no L0C->GM rate."
+      },
+      {
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              124,
+              131
+            ]
+          ]
+        },
+        "finding": "On-chip path table contains no L0C->GM rate."
+      },
+      {
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+          "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+          "bytes": 20397,
+          "lines": [
+            [
+              73,
+              86
+            ]
+          ]
+        },
+        "finding": "DDR/L2 and UB path rates exist, but no l0c_to_gm/fixpipe_gm field establishes this instruction's nominal service."
+      }
+    ],
+    "do_not": [
+      "Do not substitute L0C->UB/L1 128 destination Byte/cycle.",
+      "Do not use ddr_write_rate as a proven internal Fixpipe instruction rate.",
+      "Do not claim zero work merely because a public nominal rate is absent."
+    ]
+  },
+  "mte2_topology": {
+    "status": "independent_core_pipeline_ownership_confirmed_shared_memory_paths_retained",
+    "counts": {
+      "aic": 32,
+      "aiv": 64
+    },
+    "aic_path": "L2/global memory -> L1 through the owning AIC MTE2",
+    "aiv_path": "L2/global memory -> UB through the owning AIV MTE2",
+    "instruction_queue_depth": {
+      "aic_mte2": 16,
+      "aiv_mte2": 16
+    },
+    "shared_resources": [
+      "L2",
+      "global memory/HBM"
+    ],
+    "sources": [
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+        "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+        "bytes": 20397,
+        "lines": [
+          [
+            19,
+            35
+          ],
+          [
+            73,
+            86
+          ],
+          [
+            234,
+            242
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+        "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+        "bytes": 23771,
+        "lines": [
+          [
+            7,
+            9
+          ],
+          [
+            243,
+            254
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_3510_hw_arch.png",
+        "sha256": "b763517e689afc2d7dbafce20ed5c1816e63e2d36cdd0cd755daf4b79115ae60",
+        "bytes": 394810
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/api_pipeline_type_summary.md",
+        "sha256": "04904132d7f803ab82a1c87297b6c9616fc6618f252ed08d92e7595872b82b02",
+        "bytes": 9091,
+        "lines": [
+          [
+            113,
+            117
+          ],
+          [
+            126,
+            127
+          ]
+        ]
+      }
+    ],
+    "diagram_observation": "The official architecture diagram places separate MTE2 paths in AIC and AIV boxes and connects both to common L2/global memory.",
+    "do_not": [
+      "Do not grant full-device HBM bandwidth independently to every MTE2.",
+      "Do not infer multiple independent pipelines from repeated MTE2 labels within one AIV.",
+      "Do not use AICoreMemoryRates as VectorCoreMemoryRates or vice versa."
+    ]
+  },
+  "copy_source_manifests": {
+    "catlass": "/tmp/review-gdn-python-image-20261028/catlass/manifest.json",
+    "cann": "/tmp/review-gdn-python-image-20261028/cann/manifest.json",
+    "fla_common": "/tmp/review-gdn-python-image-20261028/fla-common-a4a7958/manifest.json",
+    "public_docs": "/tmp/review-gdn-python-image-20261028/platform-units/a5-primary-doc-manifest.json"
+  },
+  "exact_image_common": [
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/fla-common-a4a7958/kernel_utils/tile/copy_l0c_to_ub.hpp",
+      "repo": "flashserve/flash-linear-attention-npu",
+      "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+      "relative_path": "fla/ops/ascendc/common/kernel_utils/tile/copy_l0c_to_ub.hpp",
+      "url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/common/kernel_utils/tile/copy_l0c_to_ub.hpp",
+      "sha256": "35b6706df83d4de8708056fae04c5f87b451f7d0afa90203d14fdf6629b663fc",
+      "bytes": 19055,
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/common/kernel_utils/tile/copy_l0c_to_ub.hpp",
+      "exact_image_sha_verified": true
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/fla-common-a4a7958/kernel_utils/block/block_mmad_pingpong_tla.hpp",
+      "repo": "flashserve/flash-linear-attention-npu",
+      "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+      "relative_path": "fla/ops/ascendc/common/kernel_utils/block/block_mmad_pingpong_tla.hpp",
+      "url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/common/kernel_utils/block/block_mmad_pingpong_tla.hpp",
+      "sha256": "81f9ae90f981d42c09619ecd0a38045eed07baf3a17d7b7c46ef2a767840fc09",
+      "bytes": 57509,
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/common/kernel_utils/block/block_mmad_pingpong_tla.hpp",
+      "exact_image_sha_verified": true
+    }
+  ],
+  "external_memory_rate_parameters": {
+    "status": "exact_config_values_confirmed; CANN memory_bandwidth_contract_is_Byte/cycle;independent_mte2_instruction_peaks_and_shared_l2_total_not_established",
+    "config": {
+      "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+      "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+      "bytes": 20397,
+      "lines": [
+        [
+          73,
+          86
+        ],
+        [
+          234,
+          242
+        ]
+      ]
+    },
+    "aicore_memory_rates": {
+      "ddr_rate": 80,
+      "ddr_read_rate": 80,
+      "ddr_write_rate": 80,
+      "l2_rate": 100,
+      "l2_read_rate": 100,
+      "l2_write_rate": 100
+    },
+    "vector_core_memory_rates": {
+      "ddr_rate": 40,
+      "ddr_read_rate": 40,
+      "ddr_write_rate": 40,
+      "l2_rate": 100,
+      "l2_read_rate": 100,
+      "l2_write_rate": 100
+    },
+    "unit_contract": {
+      "unit": "Byte/cycle",
+      "evidence": {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/GetCoreMemBw.md",
+        "sha256": "cda9193b5a2f6c318f5939217808023e37b0ef061cec45cb68e29bc2a4486f0f",
+        "bytes": 5185,
+        "lines": [
+          [
+            5,
+            16
+          ],
+          [
+            45,
+            48
+          ]
+        ]
+      },
+      "scope_limit": "The public bandwidth API documents Byte/cycle. The inspected runtime consumer resolves its L2/HBM query to AICoreMemoryRates. It does not independently document a VectorCoreMemoryRates instruction-rate query or an MTE2 peak."
+    },
+    "public_runtime_consumer": {
+      "source": {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_infos_def.cpp",
+        "sha256": "b433a9320ebbaff6ea0fec753f248792bd6e02fcde6c42265c8abd812ccd514c",
+        "bytes": 18763,
+        "lines": [
+          [
+            289,
+            302
+          ]
+        ]
+      },
+      "revision": "93b7ec22fb1141fa30c9c746b7dfa9cab5f53e55",
+      "exact_image_sha_verified": false,
+      "behavior": "GetLocalMemBw(L2) returns AICoreMemoryRates.l2_rate; HBM returns AICoreMemoryRates.ddr_rate. It applies no core-count multiplier and does not select the vector memory group."
+    },
+    "literal_mte2_rate_in_config": null,
+    "shared_l2_nominal_total_bytes_per_cycle": null,
+    "aic_mte2_instruction_peak_bytes_per_cycle": null,
+    "aiv_mte2_instruction_peak_bytes_per_cycle": null,
+    "distinctions": [
+      "The core-class memory parameter values are known; a fixed per-instruction MTE2 hardware peak is a separate claim.",
+      "L2 capacity 134217728 bytes is not an L2 throughput parameter.",
+      "The identical l2_rate=100 in two classes does not establish either a 100 chip-total cap or a sum over 96 cores.",
+      "Configuration memory rates must not be mistaken for measured sustained rates of the retained capture.",
+      "The ownership topology can be fixed independently of unresolved rate calibration."
+    ],
+    "bounded_lookup": {
+      "exact_image_tbe_python_files_scanned": 1752,
+      "matching_consumer_result": "Only op_util_conv2d.py:1169-1170 forwards DDR/L2 field names into the platform dictionary; no instruction-rate arithmetic found.",
+      "raw_log": "/Users/maoxx241/.local/share/mindie-remote-dev/runtime/01a1802e-afce-7092-8b08-cc98f9ca58bb/endpoints/8016de4fba91fbc1/jobs/1793157486735394000.stdout.log"
+    }
+  }
+}

@@ -1,0 +1,20 @@
+
+Authorized users only. All activities may be monitored and reported.
+[INFO] Using merged native A5 regbase pipeline
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+bisheng: warning: the flag '--cce-aicore-input-parameter-size=1536' has been deprecated and will be ignored [-Wunused-command-line-argument]
+ld.lld: error: undefined symbol: _mlir_ciface_broadcast_scalar_bfloat16_t_to_2d
+>>> referenced by LLVMDialectModule
+>>>               /scratch/store-kernel.o:(broadcast_scalar_bfloat16_t_to_2d)
+[ERROR] Executing: /usr/local/Ascend/cann-9.2.0/bin/ld.lld -m aicorelinux -Ttext 0 /scratch/store-kernel.o -q -static -o /scratch/store-kernel.o
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+bisheng: warning: the flag '--cce-aicore-input-parameter-size=1536' has been deprecated and will be ignored [-Wunused-command-line-argument]
+ld.lld: error: undefined symbol: _mlir_ciface_broadcast_scalar_bfloat16_t_to_2d
+>>> referenced by LLVMDialectModule
+>>>               /scratch/store-kernel.o:(broadcast_scalar_bfloat16_t_to_2d)
+[ERROR] Executing: /usr/local/Ascend/cann-9.2.0/bin/ld.lld -m aicorelinux -Ttext 0 /scratch/store-kernel.o -q -static -o /scratch/store-kernel.o
+loc("/scratch/strided_store.mlir":6:1): error: Failed to compile BiShengLIR for device
+loc("/scratch/strided_store.mlir":6:1): error: Failed to compile BiShengLIR for device
+[ERROR] Failed to run BiShengIR regbase pipeline

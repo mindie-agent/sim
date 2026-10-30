@@ -1,0 +1,3826 @@
+{
+  "Ascend910B1": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 727449600000000.0,
+        "bf16": 363724800000000.0,
+        "fp16": 363724800000000.0,
+        "fp32": 181862400000000.0
+      },
+      "rates": {
+        "hbm": 1800000000000.0,
+        "vector": 2841600000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 24,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 48
+      },
+      "buffer_units": {
+        "l1": 24,
+        "l0a": 24,
+        "l0b": 24,
+        "l0c": 24,
+        "ub": 48
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 24,
+        "aiv_count_per_die": 48,
+        "configured_clock_mhz": 1850.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1800.0
+      }
+    }
+  },
+  "Ascend910B2": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 707788800000000.0,
+        "bf16": 353894400000000.0,
+        "fp16": 353894400000000.0,
+        "fp32": 176947200000000.0
+      },
+      "rates": {
+        "hbm": 1800000000000.0,
+        "vector": 2764800000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 24,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 48
+      },
+      "buffer_units": {
+        "l1": 24,
+        "l0a": 24,
+        "l0b": 24,
+        "l0c": 24,
+        "ub": 48
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 24,
+        "aiv_count_per_die": 48,
+        "configured_clock_mhz": 1800.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1800.0
+      }
+    }
+  },
+  "Ascend910B2C": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 707788800000000.0,
+        "bf16": 353894400000000.0,
+        "fp16": 353894400000000.0,
+        "fp32": 176947200000000.0
+      },
+      "rates": {
+        "hbm": 1800000000000.0,
+        "vector": 2764800000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 24,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 48
+      },
+      "buffer_units": {
+        "l1": 24,
+        "l0a": 24,
+        "l0b": 24,
+        "l0c": 24,
+        "ub": 48
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 24,
+        "aiv_count_per_die": 48,
+        "configured_clock_mhz": 1800.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1800.0
+      }
+    }
+  },
+  "Ascend910B3": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 589824000000000.0,
+        "bf16": 294912000000000.0,
+        "fp16": 294912000000000.0,
+        "fp32": 147456000000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 2304000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1800.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1600.0
+      }
+    }
+  },
+  "Ascend910B4": {
+    "device": {
+      "memory_bytes": 34359738368,
+      "compute_peaks": {
+        "int8": 491520000000000.0,
+        "bf16": 245760000000000.0,
+        "fp16": 245760000000000.0,
+        "fp32": 122880000000000.0
+      },
+      "rates": {
+        "hbm": 800000000000.0,
+        "vector": 1920000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1500.0,
+        "platform_config_hbm_mib": 32768.0,
+        "l2_capacity_mib": 96.0,
+        "hbm_peak_bw_gbps": 800.0,
+        "hbm_peak_bw_verified": false
+      }
+    }
+  },
+  "Ascend910B4-1": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 135168000000000.0
+      },
+      "rates": {
+        "hbm": 1200000000000.0,
+        "vector": 2112000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      }
+    },
+    "architecture": "A2",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS",
+        "uni_peak_bw_gbps": 168.0,
+        "bi_peak_bw_gbps": 310.8,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 168.0,
+        "effective_bi_bw_gbps": 310.8,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "mesh",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A2",
+        "short_soc_version": "Ascend910B",
+        "dies_per_package": 1,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 96.0,
+        "hbm_peak_bw_gbps": 1200.0
+      }
+    }
+  },
+  "Ascend910_9391": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 727449600000000.0,
+        "bf16": 363724800000000.0,
+        "fp16": 363724800000000.0,
+        "fp32": 90931200000000.0,
+        "hf32": 181862400000000.0,
+        "int4": 1454899200000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 2841600000000.0,
+        "mte2_aic": 1420800000000.0,
+        "mte2_aiv": 2841600000000.0,
+        "mte3": 5683200000000.0,
+        "fixpipe": 5683200000000.0,
+        "mte1": 5683200000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 24,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 48,
+        "mte1": 24,
+        "mte2_aic": 24,
+        "mte2_aiv": 48,
+        "mte3": 48,
+        "fixpipe": 24
+      },
+      "buffer_units": {
+        "l1": 24,
+        "l0a": 24,
+        "l0b": 24,
+        "l0c": 24,
+        "ub": 48
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 11366400000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 5683200000000.0
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1850 MHz and 24 AIC/48 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
+      "mte1": "one physical MTE1 resource with 24 AIC owners; generic aggregate supply 128 B/cycle*24*1.85 GHz=5.6832e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*24=1.13664e+13 B/s and L1->L0B 128 B/cycle*24=5.6832e+12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*24*1.85 GHz=1.4208e+12 B/s; AIV read 32 B/cycle*48*1.85 GHz=2.8416e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*48*1.85 GHz=5.6832e+12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*24*1.85 GHz=5.6832e+12 B/s. Generic use for GM destinations is an explicit analytical assumption inherited from Ascend910_9362; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "source.declaration configured_clock_mhz 1850 retained; no platform ini clock substitution or SKU measurement is implied",
+      "pipeline_provenance": "A3 npu_arch_2201 architecture inference, not a measurement of this SKU. Field semantics and owner topology are inherited from the existing Ascend910_9362 pipeline declaration; this SKU's clock and AIC/AIV are read from its source.declaration, and its own rates are recomputed by the documented byte/cycle formulas. No SKU-specific pipeline measurement exists. npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994; cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 24,
+        "aiv_count_per_die": 48,
+        "configured_clock_mhz": 1850.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1600.0,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1850000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 11366400000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 5683200000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1420800000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2841600000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1600000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A3 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend910_9392": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 707788800000000.0,
+        "bf16": 353894400000000.0,
+        "fp16": 353894400000000.0,
+        "fp32": 88473600000000.0,
+        "hf32": 176947200000000.0,
+        "int4": 1415577600000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 2764800000000.0,
+        "mte2_aic": 1382400000000.0,
+        "mte2_aiv": 2764800000000.0,
+        "mte3": 5529600000000.0,
+        "fixpipe": 5529600000000.0,
+        "mte1": 5529600000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 24,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 48,
+        "mte1": 24,
+        "mte2_aic": 24,
+        "mte2_aiv": 48,
+        "mte3": 48,
+        "fixpipe": 24
+      },
+      "buffer_units": {
+        "l1": 24,
+        "l0a": 24,
+        "l0b": 24,
+        "l0c": 24,
+        "ub": 48
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 11059200000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 5529600000000.0
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1800 MHz and 24 AIC/48 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
+      "mte1": "one physical MTE1 resource with 24 AIC owners; generic aggregate supply 128 B/cycle*24*1.80 GHz=5.5296e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*24=1.10592e+13 B/s and L1->L0B 128 B/cycle*24=5.5296e+12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*24*1.80 GHz=1.3824e+12 B/s; AIV read 32 B/cycle*48*1.80 GHz=2.7648e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*48*1.80 GHz=5.5296e+12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*24*1.80 GHz=5.5296e+12 B/s. Generic use for GM destinations is an explicit analytical assumption inherited from Ascend910_9362; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "source.declaration configured_clock_mhz 1800 retained; no platform ini clock substitution or SKU measurement is implied",
+      "pipeline_provenance": "A3 npu_arch_2201 architecture inference, not a measurement of this SKU. Field semantics and owner topology are inherited from the existing Ascend910_9362 pipeline declaration; this SKU's clock and AIC/AIV are read from its source.declaration, and its own rates are recomputed by the documented byte/cycle formulas. No SKU-specific pipeline measurement exists. npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994; cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 24,
+        "aiv_count_per_die": 48,
+        "configured_clock_mhz": 1800.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1600.0,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1800000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 11059200000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 5529600000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1382400000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2764800000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1600000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A3 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend910_9381": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 589824000000000.0,
+        "bf16": 294912000000000.0,
+        "fp16": 294912000000000.0,
+        "fp32": 73728000000000.0,
+        "hf32": 147456000000000.0,
+        "int4": 1179648000000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 2304000000000.0,
+        "mte2_aic": 1152000000000.0,
+        "mte2_aiv": 2304000000000.0,
+        "mte3": 4608000000000.0,
+        "fixpipe": 4608000000000.0,
+        "mte1": 4608000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 9216000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4608000000000.0
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1800 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
+      "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.80 GHz=4.608e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=9.216e+12 B/s and L1->L0B 128 B/cycle*20=4.608e+12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*20*1.80 GHz=1.152e+12 B/s; AIV read 32 B/cycle*40*1.80 GHz=2.304e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.80 GHz=4.608e+12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*20*1.80 GHz=4.608e+12 B/s. Generic use for GM destinations is an explicit analytical assumption inherited from Ascend910_9362; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "source.declaration configured_clock_mhz 1800 retained; no platform ini clock substitution or SKU measurement is implied",
+      "pipeline_provenance": "A3 npu_arch_2201 architecture inference, not a measurement of this SKU. Field semantics and owner topology are inherited from the existing Ascend910_9362 pipeline declaration; this SKU's clock and AIC/AIV are read from its source.declaration, and its own rates are recomputed by the documented byte/cycle formulas. No SKU-specific pipeline measurement exists. npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994; cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1800.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1600.0,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1800000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 9216000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4608000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1152000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2304000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1600000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A3 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend910_9382": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 2112000000000.0,
+        "mte2_aic": 1056000000000.0,
+        "mte2_aiv": 2112000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0,
+        "mte1": 4224000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 8448000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4224000000000.0
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1650 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
+      "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e+12 B/s and L1->L0B 128 B/cycle*20=4.224e+12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e+12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.65 GHz=4.224e+12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*20*1.65 GHz=4.224e+12 B/s. Generic use for GM destinations is an explicit analytical assumption inherited from Ascend910_9362; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "source.declaration configured_clock_mhz 1650 retained; no platform ini clock substitution or SKU measurement is implied",
+      "pipeline_provenance": "A3 npu_arch_2201 architecture inference, not a measurement of this SKU. Field semantics and owner topology are inherited from the existing Ascend910_9362 pipeline declaration; this SKU's clock and AIC/AIV are read from its source.declaration, and its own rates are recomputed by the documented byte/cycle formulas. No SKU-specific pipeline measurement exists. npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994; cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1600.0,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 8448000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4224000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1056000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2112000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1600000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A3 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend910_9372": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
+      },
+      "rates": {
+        "hbm": 1400000000000.0,
+        "vector": 2112000000000.0,
+        "mte2_aic": 1056000000000.0,
+        "mte2_aiv": 2112000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0,
+        "mte1": 4224000000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 8448000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4224000000000.0
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.4e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1650 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
+      "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e+12 B/s and L1->L0B 128 B/cycle*20=4.224e+12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e+12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.65 GHz=4.224e+12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*20*1.65 GHz=4.224e+12 B/s. Generic use for GM destinations is an explicit analytical assumption inherited from Ascend910_9362; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "source.declaration configured_clock_mhz 1650 retained; no platform ini clock substitution or SKU measurement is implied",
+      "pipeline_provenance": "A3 npu_arch_2201 architecture inference, not a measurement of this SKU. Field semantics and owner topology are inherited from the existing Ascend910_9362 pipeline declaration; this SKU's clock and AIC/AIV are read from its source.declaration, and its own rates are recomputed by the documented byte/cycle formulas. No SKU-specific pipeline measurement exists. npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994; cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 192.0,
+        "hbm_peak_bw_gbps": 1400.0,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 8448000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4224000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1056000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2112000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1400000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A3 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend910_9362": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "int8": 540672000000000.0,
+        "bf16": 270336000000000.0,
+        "fp16": 270336000000000.0,
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
+      },
+      "rates": {
+        "hbm": 1200000000000.0,
+        "vector": 2112000000000.0,
+        "mte1": 4224000000000.0,
+        "mte2_aic": 1056000000000.0,
+        "mte2_aiv": 2112000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 8448000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4224000000000.0
+        }
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 131072,
+        "ub": 196608
+      },
+      "compute_units": 20,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
+      },
+      "buffer_units": {
+        "l1": 20,
+        "l0a": 20,
+        "l0b": 20,
+        "l0c": 20,
+        "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "user_reported_experience",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "ordinary_work_kernel_class; not measured empty-kernel dispatch",
+            "selection": "reported approximate value"
+          }
+        }
+      }
+    },
+    "architecture": "A3",
+    "dies_per_package": 2,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "one shared HBM at 1.2e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
+      "pipeline_rates": "nominal analytical supply from the configured 1.65 GHz clock and pinned public instruction tables; these are not measured peaks, do not replace the configured clock with the platform ini 1500 MHz, and are not fitted from observed model gaps",
+      "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e12 B/s and L1->L0B 128 B/cycle*20=4.224e12 B/s. No independent mte1_a/mte1_b resources.",
+      "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping of the platform memory-path ddr_read_rate scalar, not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
+      "mte3": "AIV-owned UB->GM 64 B/cycle*40*1.65 GHz=4.224e12 B/s. No additional AIC MTE3 pipe is fabricated.",
+      "fixpipe": "128 B/cycle*20*1.65 GHz=4.224e12 B/s. Generic use for GM destinations is an explicit analytical assumption; the pinned instruction table directly establishes L0C->L1 BF16/FP16 at 128 B/cycle and INT8 output at 64 B/cycle, not universal 128 B/cycle.",
+      "clock_provenance": "configured 1650 MHz is retained; the read-only CANN 9.2.0 platform ini cube_freq 1500 MHz is not substituted.",
+      "source_discrepancy": "the read-only CANN 9.2.0 ini reports only AICoreMemoryRates l1_to_l0_a/l1_to_l0_b at 512/256 B/cycle, while the pinned public instruction table documents 256/128 B/cycle. The profile chooses the documented instruction 256/128 and preserves this discrepancy; no measurement is implied.",
+      "pipeline_provenance": "asc-devkit pinned revision 56500ea0dc219380f50f4a17ce73ef5264f830fc: npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994 (AIC:AIV 1:2, independent cores, GM communication, PIPE_MTE1 256/128 B/cycle); cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728 (table 3 direction rates, table 7 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 64 B/cycle). The read-only sim-runner CANN 9.2.0 ini SHA ffd0e8d061db7fa8b3877bcbaf8151edac77abcf3a50df95b42b21e2332a9ca3 confirms 20 AIC/40 AIV, 64 GiB, ddr_read 32, ub_to_ddr 64, cube_freq 1500 and has only AICoreMemoryRates, with no AIV-specific rates; the retained CANN 9.1beta1 ini SHA 5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c is preserved in data/verification/a3-9362-platform-metadata-20261029.json.",
+      "accuracy": "nominal analytical resource profile; no accuracy claim",
+      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch"
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "SIO",
+        "uni_peak_bw_gbps": 448.0,
+        "bi_peak_bw_gbps": 828.8000000000001,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 448.0,
+        "effective_bi_bw_gbps": 828.8000000000001,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.8,
+        "transport_mode": "sio_die_to_die",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "HCCS_SW",
+        "uni_peak_bw_gbps": 196.0,
+        "bi_peak_bw_gbps": 362.6,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 196.0,
+        "effective_bi_bw_gbps": 362.6,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 2.5,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_200G",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 45.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 45.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 87.5,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 87.5,
+        "pageable_uni_bw_gbps": 14.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 25.0,
+        "bi_peak_bw_gbps": 40.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 25.0,
+        "effective_bi_bw_gbps": 40.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A3",
+        "short_soc_version": "Ascend910_93",
+        "npu_arch": "2201",
+        "dies_per_package": 2,
+        "aic_count_per_die": 20,
+        "aiv_count_per_die": 40,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 168.0,
+        "hbm_peak_bw_gbps": 1200.0,
+        "hbm_peak_bw_verified": false,
+        "intra_package_die_bw_gbps": 448.0
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * 20 AIC * 1.65 GHz; conservative undifferentiated A/B supply, not exact mixed-operand timing"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 8448000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 instruction table 256 B/cycle * 20 AIC * 1.65 GHz; shares the physical mte1 resource and owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4224000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 instruction table 128 B/cycle * 20 AIC * 1.65 GHz; shares the physical mte1 resource and owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1056000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * 20 AIC * 1.65 GHz; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2112000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * 40 AIV * 1.65 GHz; explicit analytical per-owner mapping of the platform memory-path ddr_read_rate scalar, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * 40 AIV * 1.65 GHz; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * 20 AIC * 1.65 GHz; generic GM destination is an explicit assumption. Direct source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle, not universal 128 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1200000000000.0,
+            "basis": "existing single shared HBM rate retained; split AIC/AIV read paths do not create independent global memory"
+          }
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 3 lines 99-109 same direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          },
+          "cann_9_2_ini": {
+            "path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/data/platform_config/Ascend910_9362.ini",
+            "sha256": "ffd0e8d061db7fa8b3877bcbaf8151edac77abcf3a50df95b42b21e2332a9ca3",
+            "access": "read-only sim-runner",
+            "asserts": "20 AIC/40 AIV, 64 GiB, ddr_read 32, ub_to_ddr 64, cube_freq 1500; AICoreMemoryRates only, no AIV-specific rates"
+          },
+          "cann_9_1_ini": {
+            "sha256": "5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c",
+            "preserved_in": "data/verification/a3-9362-platform-metadata-20261029.json",
+            "asserts": "retained platform metadata used by the existing profile"
+          }
+        },
+        "conflicts": {
+          "mte1_ini_vs_instruction": "INI l1_to_l0_a/l1_to_l0_b 512/256 B/cycle contradicts the public instruction table 256/128 B/cycle. The profile chooses documented instruction 256/128 and preserves the discrepancy.",
+          "clock": "configured 1650 MHz retained; INI cube_freq 1500 MHz not substituted."
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
+      }
+    }
+  },
+  "Ascend950DT_9581": {
+    "device": {
+      "memory_bytes": 154618822656,
+      "compute_peaks": {
+        "fp8_e4m3": 865075200000000.0,
+        "fp8_e5m2": 865075200000000.0,
+        "int8": 865075200000000.0,
+        "bf16": 432537600000000.0,
+        "fp16": 432537600000000.0,
+        "fp32": 27033600000000.0,
+        "hf32": 216268800000000.0
+      },
+      "rates": {
+        "hbm": 4000000000000.0,
+        "vector": 6758400000000.0,
+        "mte1": 13516800000000.0,
+        "mte2_aic": 4224000000000.0,
+        "mte2_aiv": 4224000000000.0,
+        "fixpipe": 6758400000000.0,
+        "mte3": 13516800000000.0,
+        "reg_data_writes": 211200000000.0,
+        "reg_ub_accesses": 211200000000.0,
+        "reg_ub_stores": 105600000000.0,
+        "reg_alu_lanes": 13516800000000.0,
+        "reg_special_lanes": 3379200000000.0,
+        "reg_reduce_lanes": 6758400000000.0,
+        "reg_shuffle_lanes": 6758400000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 262144,
+        "ub": 253952
+      },
+      "compute_units": 32,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 64,
+        "mte1": 32,
+        "mte2_aic": 32,
+        "mte2_aiv": 64,
+        "fixpipe": 32,
+        "mte3": 64,
+        "reg_data_writes": 64,
+        "reg_ub_accesses": 64,
+        "reg_ub_stores": 64,
+        "reg_alu_lanes": 64,
+        "reg_special_lanes": 64,
+        "reg_reduce_lanes": 64,
+        "reg_shuffle_lanes": 64
+      },
+      "buffer_units": {
+        "l1": 32,
+        "l0a": 32,
+        "l0b": 32,
+        "l0c": 32,
+        "ub": 64
+      },
+      "service_modes": {
+        "ub_copy": {
+          "resource": "vector",
+          "rate": 27033600000000.0
+        },
+        "reg_issue_slots": {
+          "resource": "vector",
+          "rate": 211200000000.0
+        }
+      }
+    },
+    "architecture": "A5",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "matrix_precision": "arch3510 ordinary FP32 MMAD has 16x16x1 parallelism; HF32 has 16x16x8. Both use storage k0=8. The caller declares inherited CTRL.HF32; nominal clock is 1.65 GHz.",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "shared HBM; independent AIC/AIV read owners use nominal INI ddr_read_rate 80/40 B/cycle per core. These memory-path supply declarations are not measured MTE2 instruction rates. Shared L2 capacity and cache behavior are not characterized.",
+      "onchip_transfer": "arch3510 nominal instruction bandwidth: MTE1 LoadData2DV2 256 B/cycle/AIC, Fixpipe local destination128 B/cycle/AIC, MTE3 UB-to-L1 128 B/cycle/AIV; UB-to-UB DataCopy uses PIPE_V at 256 payload B/cycle/AIV. Startup and shared L1 ingress are not characterized; Fixpipe-to-GM issue rate remains a declared nominal assumption.",
+      "register_capacity": "Pinned arch3510 Reg tables: at most two issue slots, two data-register writes, two UB accesses and one UB store per cycle. Single-issue calls occupy both slots. ALU/special lane capacity assumes ideal dual issue; reduce/shuffle single issue. Active masked lanes impose capacity bounds only; masked instruction service, dependency latency, compiler pairing and predicate-write ports remain uncharacterized. This is not a cycle-accurate instruction schedule."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "UB_MESH",
+        "uni_peak_bw_gbps": 392.0,
+        "bi_peak_bw_gbps": 725.2,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 392.0,
+        "effective_bi_bw_gbps": 725.2,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 1.8,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "unknown",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_400G",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 90.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 90.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A5",
+        "short_soc_version": "Ascend950",
+        "npu_arch": "3510",
+        "dies_per_package": 1,
+        "aic_count_per_die": 32,
+        "aiv_count_per_die": 64,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 147456.0,
+        "l2_capacity_mib": 128.0,
+        "hbm_peak_bw_gbps": 4000.0
+      },
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+    }
+  },
+  "Ascend950DT_9582": {
+    "device": {
+      "memory_bytes": 103079215104,
+      "compute_peaks": {
+        "fp8_e4m3": 865075200000000.0,
+        "fp8_e5m2": 865075200000000.0,
+        "int8": 865075200000000.0,
+        "bf16": 432537600000000.0,
+        "fp16": 432537600000000.0,
+        "fp32": 27033600000000.0,
+        "hf32": 216268800000000.0
+      },
+      "rates": {
+        "hbm": 4000000000000.0,
+        "vector": 6758400000000.0,
+        "mte1": 13516800000000.0,
+        "mte2_aic": 4224000000000.0,
+        "mte2_aiv": 4224000000000.0,
+        "fixpipe": 6758400000000.0,
+        "mte3": 13516800000000.0,
+        "reg_data_writes": 211200000000.0,
+        "reg_ub_accesses": 211200000000.0,
+        "reg_ub_stores": 105600000000.0,
+        "reg_alu_lanes": 13516800000000.0,
+        "reg_special_lanes": 3379200000000.0,
+        "reg_reduce_lanes": 6758400000000.0,
+        "reg_shuffle_lanes": 6758400000000.0,
+        "scalar_store_issue": 5657458563.535912
+      },
+      "service_modes": {
+        "ub_copy": {
+          "resource": "vector",
+          "rate": 27033600000000.0
+        },
+        "reg_issue_slots": {
+          "resource": "vector",
+          "rate": 211200000000.0
+        }
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 262144,
+        "ub": 253952
+      },
+      "compute_units": 32,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 64,
+        "mte1": 32,
+        "mte2_aic": 32,
+        "mte2_aiv": 64,
+        "fixpipe": 32,
+        "mte3": 64,
+        "reg_data_writes": 64,
+        "reg_ub_accesses": 64,
+        "reg_ub_stores": 64,
+        "reg_alu_lanes": 64,
+        "reg_special_lanes": 64,
+        "reg_reduce_lanes": 64,
+        "reg_shuffle_lanes": 64,
+        "scalar_store_issue": 64
+      },
+      "buffer_units": {
+        "l1": 32,
+        "l0a": 32,
+        "l0b": 32,
+        "l0c": 32,
+        "ub": 64
+      },
+      "kernel_invocations": {
+        "vector": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001312,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
+            "observed_us": 1.312,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
+            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+            "excludes": [
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        },
+        "cube": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001578,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
+            "observed_us": 1.578,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
+            "excludes": [
+              "empty_aic",
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "6_to_7us_matrix_residual"
+            ]
+          }
+        },
+        "empty_aic": {
+          "startup_ms": 0,
+          "minimum_ms": 0.000439,
+          "provenance": {
+            "basis": "conservative_empty_task_envelope",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582",
+            "observed_us": 0.439,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "inclusive conservative completion envelope; no inference of useful-work setup or block-count dependence",
+            "excludes": [
+              "32MiB_weight_matmul_latency",
+              "host_submission",
+              "6_to_7us_matrix_residual",
+              "additive_startup"
+            ]
+          }
+        },
+        "w8a8_nd_bf16": {
+          "startup_ms": 0,
+          "minimum_ms": 0.003037,
+          "provenance": {
+            "basis": "declared_execution_class",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582",
+            "observed_us": 3.037,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "explicit w8a8_nd_bf16 invocation class; ordinary format metadata alone does not establish ND dispatch",
+            "excludes": [
+              "NZ",
+              "W4A8",
+              "MXFP8",
+              "grouped_gemm",
+              "INT32_output",
+              "other_SKUs",
+              "host_submission",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        }
+      },
+      "work_units": {
+        "scalar_store_issue": "stores"
+      },
+      "store_queues": {
+        "scalar_store_issue": {
+          "element_bytes": 2,
+          "outstanding": 8,
+          "granule_bytes": 128,
+          "response_ms": 9.125e-05,
+          "row_control_ms": 7e-06
+        }
+      }
+    },
+    "architecture": "A5",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "matrix_precision": "arch3510 ordinary FP32 MMAD has 16x16x1 parallelism; HF32 has 16x16x8. Both use storage k0=8. The caller declares inherited CTRL.HF32; nominal clock is 1.65 GHz.",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "shared HBM; independent AIC/AIV read owners use nominal INI ddr_read_rate 80/40 B/cycle per core. These memory-path supply declarations are not measured MTE2 instruction rates. Shared L2 capacity and cache behavior are not characterized.",
+      "onchip_transfer": "arch3510 nominal instruction bandwidth: MTE1 LoadData2DV2 256 B/cycle/AIC, Fixpipe local destination128 B/cycle/AIC, MTE3 UB-to-L1 128 B/cycle/AIV; UB-to-UB DataCopy uses PIPE_V at 256 payload B/cycle/AIV. Startup and shared L1 ingress are not characterized; Fixpipe-to-GM issue rate remains a declared nominal assumption.",
+      "register_capacity": "Pinned arch3510 Reg tables: at most two issue slots, two data-register writes, two UB accesses and one UB store per cycle. Single-issue calls occupy both slots. ALU/special lane capacity assumes ideal dual issue; reduce/shuffle single issue. Active masked lanes impose capacity bounds only; masked instruction service, dependency latency, compiler pairing and predicate-write ports remain uncharacterized. This is not a cycle-accurate instruction schedule.",
+      "kernel_invocations": "A5 9582 ordinary vector1.312us and Cube1.578us are engineering class extrapolations from nonempty BF16 library controls. Explicit empty_aic retains0.439us; explicit w8a8_nd_bf16 carries3.037us for the declared INT8 ND row/channel-scale BF16 MIX_AIC boundary, never inferred for NZ/W4/MXFP8/grouped kernels. Inclusive completion minima, zero startup; runtime rules and explicit classes override defaults.",
+      "scalar_store_queue": "BF16 UB-to-GM store issue and finite queue, independently identified on Ascend950DT_9582 image c3d00a196905; data/observations/gating-probe-20261028/native-queue-holdout/parameters.json SHA256 6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb. Train first24 address-isolation rows; heldout retained separately. This is a primitive calibration, not kernel startup or model latency. Not inherited by other SKUs or A3."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "UB_MESH",
+        "uni_peak_bw_gbps": 392.0,
+        "bi_peak_bw_gbps": 725.2,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 392.0,
+        "effective_bi_bw_gbps": 725.2,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 1.8,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "unknown",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_400G",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 90.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 90.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A5",
+        "short_soc_version": "Ascend950",
+        "npu_arch": "3510",
+        "dies_per_package": 1,
+        "aic_count_per_die": 32,
+        "aiv_count_per_die": 64,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 98304.0,
+        "l2_capacity_mib": 128.0,
+        "hbm_peak_bw_gbps": 4000.0
+      },
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+    }
+  },
+  "Ascend950PR_9579": {
+    "device": {
+      "memory_bytes": 68719476736,
+      "compute_peaks": {
+        "fp8_e4m3": 865075200000000.0,
+        "fp8_e5m2": 865075200000000.0,
+        "int8": 865075200000000.0,
+        "bf16": 432537600000000.0,
+        "fp16": 432537600000000.0,
+        "fp32": 27033600000000.0,
+        "hf32": 216268800000000.0
+      },
+      "rates": {
+        "hbm": 1600000000000.0,
+        "vector": 6758400000000.0,
+        "mte1": 13516800000000.0,
+        "mte2_aic": 4224000000000.0,
+        "mte2_aiv": 4224000000000.0,
+        "fixpipe": 6758400000000.0,
+        "mte3": 13516800000000.0,
+        "reg_data_writes": 211200000000.0,
+        "reg_ub_accesses": 211200000000.0,
+        "reg_ub_stores": 105600000000.0,
+        "reg_alu_lanes": 13516800000000.0,
+        "reg_special_lanes": 3379200000000.0,
+        "reg_reduce_lanes": 6758400000000.0,
+        "reg_shuffle_lanes": 6758400000000.0
+      },
+      "buffers": {
+        "l1": 524288,
+        "l0a": 65536,
+        "l0b": 65536,
+        "l0c": 262144,
+        "ub": 253952
+      },
+      "compute_units": 32,
+      "launch_us": 0,
+      "resource_units": {
+        "vector": 64,
+        "mte1": 32,
+        "mte2_aic": 32,
+        "mte2_aiv": 64,
+        "fixpipe": 32,
+        "mte3": 64,
+        "reg_data_writes": 64,
+        "reg_ub_accesses": 64,
+        "reg_ub_stores": 64,
+        "reg_alu_lanes": 64,
+        "reg_special_lanes": 64,
+        "reg_reduce_lanes": 64,
+        "reg_shuffle_lanes": 64
+      },
+      "buffer_units": {
+        "l1": 32,
+        "l0a": 32,
+        "l0b": 32,
+        "l0c": 32,
+        "ub": 64
+      },
+      "service_modes": {
+        "ub_copy": {
+          "resource": "vector",
+          "rate": 27033600000000.0
+        },
+        "reg_issue_slots": {
+          "resource": "vector",
+          "rate": 211200000000.0
+        }
+      }
+    },
+    "architecture": "A5",
+    "dies_per_package": 1,
+    "assumptions": {
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "matrix_precision": "arch3510 ordinary FP32 MMAD has 16x16x1 parallelism; HF32 has 16x16x8. Both use storage k0=8. The caller declares inherited CTRL.HF32; nominal clock is 1.65 GHz.",
+      "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
+      "memory_path": "shared HBM; independent AIC/AIV read owners use nominal INI ddr_read_rate 80/40 B/cycle per core. These memory-path supply declarations are not measured MTE2 instruction rates. Shared L2 capacity and cache behavior are not characterized.",
+      "onchip_transfer": "arch3510 nominal instruction bandwidth: MTE1 LoadData2DV2 256 B/cycle/AIC, Fixpipe local destination128 B/cycle/AIC, MTE3 UB-to-L1 128 B/cycle/AIV; UB-to-UB DataCopy uses PIPE_V at 256 payload B/cycle/AIV. Startup and shared L1 ingress are not characterized; Fixpipe-to-GM issue rate remains a declared nominal assumption.",
+      "register_capacity": "Pinned arch3510 Reg tables: at most two issue slots, two data-register writes, two UB accesses and one UB store per cycle. Single-issue calls occupy both slots. ALU/special lane capacity assumes ideal dual issue; reduce/shuffle single issue. Active masked lanes impose capacity bounds only; masked instruction service, dependency latency, compiler pairing and predicate-write ports remain uncharacterized. This is not a cycle-accurate instruction schedule."
+    },
+    "transfer_channels": {
+      "d2d_intra_package": {
+        "channel": "d2d_intra_package",
+        "protocol": "NONE_SINGLE_DIE",
+        "uni_peak_bw_gbps": null,
+        "bi_peak_bw_gbps": null,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": null,
+        "effective_bi_bw_gbps": null,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 0.0,
+        "transport_mode": "unavailable_single_die",
+        "channel_semantics": "none",
+        "notes": null
+      },
+      "d2d_intra_node": {
+        "channel": "d2d_intra_node",
+        "protocol": "UB_MESH",
+        "uni_peak_bw_gbps": 392.0,
+        "bi_peak_bw_gbps": 725.2,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 392.0,
+        "effective_bi_bw_gbps": 725.2,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 1.8,
+        "transport_mode": "direct_fabric",
+        "channel_semantics": "unknown",
+        "notes": null
+      },
+      "d2d_inter_node": {
+        "channel": "d2d_inter_node",
+        "protocol": "RoCEv2_400G",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 90.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 90.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 5.0,
+        "transport_mode": "roce_rdma",
+        "channel_semantics": "switched",
+        "notes": null
+      },
+      "h2d": {
+        "channel": "h2d",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "d2h": {
+        "channel": "d2h",
+        "protocol": "PCIe",
+        "uni_peak_bw_gbps": 64.0,
+        "bi_peak_bw_gbps": 112.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 64.0,
+        "effective_bi_bw_gbps": 112.0,
+        "pageable_uni_bw_gbps": 20.0,
+        "alpha_us": 2.0,
+        "transport_mode": "pcie_dma",
+        "channel_semantics": "direct",
+        "notes": null
+      },
+      "rh2d": {
+        "channel": "rh2d",
+        "protocol": "RemoteHost_to_NPU",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (RNIC->RoCE->NPU) or host_staged (Network->LocalHost->PCIe H2D)"
+      },
+      "rd2h": {
+        "channel": "rd2h",
+        "protocol": "NPU_to_RemoteHost",
+        "uni_peak_bw_gbps": 50.0,
+        "bi_peak_bw_gbps": 80.0,
+        "calibrated_uni_bw_gbps": null,
+        "calibrated_bi_bw_gbps": null,
+        "derived_uni_bw_gbps": null,
+        "derived_bi_bw_gbps": null,
+        "bandwidth_provenance": "declared_peak",
+        "effective_uni_bw_gbps": 50.0,
+        "effective_bi_bw_gbps": 80.0,
+        "pageable_uni_bw_gbps": null,
+        "alpha_us": 6.5,
+        "transport_mode": "auto",
+        "channel_semantics": "switched",
+        "notes": "Supports direct_rdma (NPU->RoCE->RNIC) or host_staged (PCIe D2H->LocalHost->Network)"
+      }
+    },
+    "source": {
+      "revision": "d141b68",
+      "module": "mindie_sim/sku_profile.py",
+      "declaration": {
+        "arch_family": "A5",
+        "short_soc_version": "Ascend950",
+        "npu_arch": "3510",
+        "dies_per_package": 1,
+        "aic_count_per_die": 32,
+        "aiv_count_per_die": 64,
+        "configured_clock_mhz": 1650.0,
+        "platform_config_hbm_mib": 65536.0,
+        "l2_capacity_mib": 128.0,
+        "hbm_peak_bw_gbps": 1600.0
+      },
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+    }
+  }
+}

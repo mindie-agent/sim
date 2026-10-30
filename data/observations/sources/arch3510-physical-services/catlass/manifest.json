@@ -1,0 +1,75 @@
+{
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "sources": [
+    {
+      "relative_path": "gemm/tile/tile_copy.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/tile_copy.hpp",
+      "sha256": "1300e4ad135759504233bcd47c9a877624df6b1a32f0ffd050b357594ca9aef0",
+      "bytes": 23929,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/tile_copy.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/copy_l1_to_l0a.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/copy_l1_to_l0a.hpp",
+      "sha256": "0a8efe150a05fe439058a93a74b43d49370ba0066f2cf8fddee2628bb161530c",
+      "bytes": 985,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/copy_l1_to_l0a.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/copy_l1_to_l0b.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/copy_l1_to_l0b.hpp",
+      "sha256": "6a910fee9c5528d4d9a3be446fcffca86cb80d3998fc7c942f53c9f8ed7d9277",
+      "bytes": 985,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/copy_l1_to_l0b.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+      "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+      "bytes": 26190,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+      "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+      "bytes": 24663,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/ascend950/copy_l0c_to_gm.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/ascend950/copy_l0c_to_gm.hpp",
+      "sha256": "4a61bad15a97a65fb18dd0a5038b3f8d5fdc87bfc3dd42840cf13d4065232137",
+      "bytes": 21816,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l0c_to_gm.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/ascend950/copy_l0c_to_ub.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/ascend950/copy_l0c_to_ub.hpp",
+      "sha256": "adf47d15aa590b62ea35c9e4c15e6d9709fa0772f7ef1cd6c4d0a926b5b23219",
+      "bytes": 7919,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l0c_to_ub.hpp"
+    },
+    {
+      "relative_path": "gemm/tile/ascend950/copy_l0c_to_dst.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/tile/ascend950/copy_l0c_to_dst.hpp",
+      "sha256": "3a1f039c068a3559caf8769b74b2adfb60d2b266f02c343e63d01b0052686ac8",
+      "bytes": 7256,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/tile/ascend950/copy_l0c_to_dst.hpp"
+    },
+    {
+      "relative_path": "gemm/helper.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/gemm/helper.hpp",
+      "sha256": "85e48a3184939beabade25817397199f1705b6b4f2e9ed201a09a5d5bbeec3f3",
+      "bytes": 15761,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/gemm/helper.hpp"
+    },
+    {
+      "relative_path": "detail/tag_to_layout.hpp",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/offline/third_party/catlass/include/catlass/detail/tag_to_layout.hpp",
+      "sha256": "c845eea8962e7f5c63d7b8e547fcc81341d79a71bc6166c3e36d26f85e8dc588",
+      "bytes": 3949,
+      "path": "/tmp/review-gdn-python-image-20261028/catlass/detail/tag_to_layout.hpp"
+    }
+  ]
+}

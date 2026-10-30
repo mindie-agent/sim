@@ -1,0 +1,13 @@
+{
+  "builder": "quantized_grouped",
+  "arguments": {
+    "expert_rows": [2, 0, 2, 0, 2],
+    "k": 32,
+    "n": 64
+  },
+  "protocol": {
+    "mode": "graph",
+    "invocations": 8,
+    "trace_limit": 128
+  }
+}

@@ -1,0 +1,591 @@
+{
+  "status": "passed",
+  "environment": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/sim-wheel-7o4gtnru/env",
+  "import_path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/sim-wheel-7o4gtnru/env/lib/python3.13/site-packages/mindie_sim/__init__.py",
+  "wheel": "/Volumes/data-tmp/tmp/sim-v0.8.0-release-build/mindie_sim-0.8.0-py3-none-any.whl",
+  "wheel_sha256": "898d798749bb6142f5507678e1ed19ad6be4c5a4aa2b5f13ff1e9d2a498207e0",
+  "companion_profiler": {
+    "wheel": "/Volumes/data-tmp/tmp/sim-integrated-wheels-20261029/mindie_profiler-0.5.0-py3-none-any.whl",
+    "sha256": "9aba163f05f05dd8487fcd8675b60b66bc59426be91df77fe5dc32ae8ebc3576"
+  },
+  "checks": [
+    {
+      "command": "installed-entrypoint",
+      "exit_code": 0
+    },
+    {
+      "command": "help",
+      "exit_code": 0
+    },
+    {
+      "command": "catalog",
+      "exit_code": 0
+    },
+    {
+      "command": "predict",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-body",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-pd-body",
+      "exit_code": 0
+    },
+    {
+      "command": "body-integer-banks-and-pipes-Ascend910_9362",
+      "exit_code": 0
+    },
+    {
+      "command": "body-integer-banks-and-pipes-Ascend950DT_9582",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-qwen2-7b",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-qwen3-30b-a3b",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-deepseek-v3",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-glm4-0414",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-glm45",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-kimi-k2-instruct",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-partial-minimax-m1-80k",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-hf-partial-minimax-m1-80k",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-partial-step3",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-hf-partial-step3",
+      "exit_code": 0
+    },
+    {
+      "command": "study-hf-overrides-and-coverage",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-hardware-kernel-minimum",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hardware-kernel-minimum",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-kda-prepare-compact",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-shared-int32-and-typed-transport",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-scfa-boundary",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-indexed-mla-a3",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-indexed-mla-a3-decode",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-sequence-parallel-complete-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-staged-gqa-prefill",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-attnres-prefix",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-situ-mx",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-kda-decode-arch22",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-kda-decode-arch35",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-indexed-attention-batch",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-packed-int8-indexed-batch",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-expected-expert-banks-direct-peer-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-bf16-grouped-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-mxfp8-grouped-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-native-mc2-complete-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hf-wrapper-explicit-int8",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-mixed-quant-cache-and-grouped-source",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-mixed-quant-dynamic-producer",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-shared-kv-rotary-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-rope0-and-mxfp8-down-body",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-kimi-source-body-contract",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-dense-paged-mla-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-grouped-int32-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-mc2-mx32-producer",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-prepared-mx32-matrix",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hc-arch35-mixed-and-vector",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-glm-state-routing-q1-b1",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-glm-state-routing-q4-b4",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-allreduce-mesh_oneshot",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-allgather-mesh",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-reduce_scatter-mesh",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aiv-allreduce-mesh_oneshot",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aiv-allreduce-mesh_twoshot",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aiv-allgather-mesh",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-allreduce-nhr",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-allgather-nhr",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-aicpu_ts-reduce_scatter-nhr",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-ccu_ms-allreduce-mesh_oneshot_v1",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-ccu_ms-allreduce-mesh_oneshot_v2",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-ccu_sched-allgather-mesh_mem2mem_v1",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-hccl-ccu_sched-allgather-mesh_mem2mem_v2",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-mc2-tp-int8-grouped-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-body-source-mc2-tp-int8-grouped-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "body-observable-service-analytic",
+      "exit_code": 0
+    },
+    {
+      "command": "body-observable-service-vector-1",
+      "exit_code": 0
+    },
+    {
+      "command": "body-observable-service-vector-2",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-dsq-arch35-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "structure-source-dsq-arch35-allocated-abi",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-ccu-two-endpoint-allgather",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-ccu-two-endpoint-allgather",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-owner-source-scalar-service",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-hccl-two-level-switch-and-signals",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-pd-physical-framing-and-switch",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-arch22-native-mc2-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-arch22-native-mc2-caller",
+      "exit_code": 0
+    },
+    {
+      "command": "body-sparse-metadata-controller",
+      "exit_code": 0
+    },
+    {
+      "command": "body-joint-native-service",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-analytic-three-level-hierarchy",
+      "exit_code": 0
+    },
+    {
+      "command": "installed-sort32-owner-capacity-controls",
+      "exit_code": 0
+    },
+    {
+      "command": "body-gdn-Ascend910_9362-False",
+      "exit_code": 0
+    },
+    {
+      "command": "body-gdn-Ascend950DT_9582-False",
+      "exit_code": 0
+    },
+    {
+      "command": "body-gdn-Ascend950DT_9582-True",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-pd",
+      "exit_code": 0
+    },
+    {
+      "command": "inspect",
+      "exit_code": 0
+    },
+    {
+      "command": "operators",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-body",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-model",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-source-families",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-attention",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-quantize",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-kda-state-source",
+      "exit_code": 0
+    },
+    {
+      "command": "call-kda-state-source-installed",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-moe-align-combine",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-moe-align-combine",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-ascend_w4a8_msd",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-ascend_w4a8_msd",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-ascend_w4a8_msd_grouped_down",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-ascend_w4a8_msd_grouped_down",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-staged-gqa-decode",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-indexed-attention-pipeline",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-mapped-matrix",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-mapped-matrix",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-phase-matrix",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-steady-matrix",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-device-invocation",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-integer-output",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-explicit-mtp1",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-balanced-expert-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-balanced-expert-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-joint-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "study-joint-cohort",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-balanced-experts",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-balanced-experts-body-default",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-tp-expert-output-reduction",
+      "exit_code": 0
+    },
+    {
+      "command": "call-swiglu-separate.json",
+      "exit_code": 0
+    },
+    {
+      "command": "call-gdn-gating.json",
+      "exit_code": 0
+    },
+    {
+      "command": "call-quantized-grouped",
+      "exit_code": 0
+    },
+    {
+      "command": "call-quantized-grouped-source",
+      "exit_code": 0
+    },
+    {
+      "command": "call-gdn-scan-prefill",
+      "exit_code": 0
+    },
+    {
+      "command": "graph-ring",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-ring",
+      "exit_code": 0
+    },
+    {
+      "command": "study",
+      "exit_code": 0
+    },
+    {
+      "command": "study-finite-communication",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-independent-pages",
+      "exit_code": 0
+    },
+    {
+      "command": "operators-queued-store",
+      "exit_code": 0
+    },
+    {
+      "command": "install-companion-profiler-wheel",
+      "exit_code": 0
+    },
+    {
+      "command": "profiler-csv",
+      "exit_code": 0
+    },
+    {
+      "command": "profiler-sqlite",
+      "exit_code": 0
+    },
+    {
+      "command": "bind-profiler",
+      "exit_code": 0
+    },
+    {
+      "command": "calibrate",
+      "exit_code": 0
+    },
+    {
+      "command": "predict-with-heldout-only",
+      "exit_code": 0
+    },
+    {
+      "command": "validate",
+      "exit_code": 0
+    },
+    {
+      "command": "observations",
+      "exit_code": 0
+    },
+    {
+      "command": "observations-find",
+      "exit_code": 0
+    },
+    {
+      "command": "fit-rate",
+      "exit_code": 0
+    },
+    {
+      "command": "fit-service",
+      "exit_code": 0
+    },
+    {
+      "command": "accuracy",
+      "exit_code": 0
+    },
+    {
+      "command": "compare-calls-quantized-grouped",
+      "exit_code": 0
+    },
+    {
+      "command": "compare-calls-activation",
+      "exit_code": 0
+    },
+    {
+      "command": "compare-calls-gdn-partial",
+      "exit_code": 2
+    },
+    {
+      "command": "installed-scoreboard-retained-observations",
+      "exit_code": 0
+    }
+  ],
+  "scope": "Isolated installed wheel outside checkout; fixture imports check identity translation and heldout separation, not serving calibration accuracy.",
+  "source_revision": "439779a7e2ead9fd149d9202e45f9c2ccda73c49"
+}

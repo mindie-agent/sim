@@ -1,0 +1,28 @@
+{
+  "builder": "gdn",
+  "arguments": {
+    "role": "scan_prefill",
+    "batch": 1,
+    "tokens": 4096,
+    "k_heads": 16,
+    "v_heads": 48,
+    "k_dim": 128,
+    "v_dim": 128,
+    "chunk": 64,
+    "input_dtype": "bf16",
+    "gate_dtype": "fp32",
+    "beta_dtype": "bf16",
+    "state_dtype": "fp32",
+    "layout": "BSND",
+    "use_qk_l2norm_in_kernel": true,
+    "use_exp2": true,
+    "allow_neg_eigval": false,
+    "disable_recompute": true,
+    "state_v_first": true,
+    "output_final_state": true
+  },
+  "protocol": {
+    "invocations": 1,
+    "mode": "eager"
+  }
+}

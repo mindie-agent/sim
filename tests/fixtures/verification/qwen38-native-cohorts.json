@@ -1,0 +1,1745 @@
+{
+  "graph_id": "sha256:a44cbc501a50d09a27fa8547954b84b956b6a1ab903413243956f4d410dd7d34",
+  "accuracy_policy": {
+    "version": "mindie-sim.cohort-accuracy/1",
+    "observed_statistic": "complete_event_mean",
+    "time_unit": "us",
+    "eligible_status": "compared",
+    "relative_15pct": {
+      "observed_us_gt": 50.0,
+      "tolerance": {
+        "unit": "ratio",
+        "value": 0.15
+      },
+      "pass_status": "within_relative_tolerance"
+    },
+    "absolute_15us": {
+      "observed_us_lte": 50.0,
+      "tolerance": {
+        "unit": "us",
+        "value": 15.0
+      },
+      "pass_status": "within_launch_floor_tolerance"
+    },
+    "fail_status": "outside_tolerance",
+    "tolerance_inclusive": true,
+    "prediction_adjustment": "none",
+    "interpretation": "conditional_per_call_comparison; not_native_dispatch_certification"
+  },
+  "declared_execution": {
+    "phase": "prefill",
+    "tokens": 16384,
+    "context": 0,
+    "sequences": 1,
+    "scope": "model",
+    "software": {
+      "parallel": {
+        "dp": 1,
+        "tp": 1,
+        "ep": 1,
+        "pp": 1,
+        "cp": 1,
+        "pcp": 1,
+        "cp_plan": "none"
+      },
+      "pp_layer_partition": [
+        64
+      ],
+      "pipeline_microbatches": 1,
+      "graph_mode": "auto",
+      "graph_capture_mode": "full",
+      "graph_buckets": [
+        1,
+        2,
+        4,
+        8,
+        16,
+        32
+      ],
+      "graph_capture_keys": [],
+      "piecewise_capture_keys": [],
+      "mixed_mode": "none",
+      "splitting_ops": null,
+      "kv_block_size": 128,
+      "moe_recipe": "alltoall",
+      "mc2_chunks": 4,
+      "multistream_overlap_shared_expert": false,
+      "vllm_impl": "vllm-ascend",
+      "vllm_version": "0.30.0rc2",
+      "kernel_format": "",
+      "attention_policy": {},
+      "routing": {},
+      "tensor_layouts": {
+        "short_convolution": {
+          "input": "contiguous"
+        },
+        "gdn_gating": {
+          "beta": "contiguous",
+          "alpha": "contiguous"
+        },
+        "linear_output_norm_gate": {
+          "gate": "contiguous"
+        }
+      },
+      "final_norm_scope": "all",
+      "lowering_passes": [
+        "activation_quantization",
+        "norm_quant",
+        "residual_norm"
+      ],
+      "kernels": {
+        "families": {
+          "gdn_gating": {
+            "kind": "tiled_pointwise",
+            "tile_rows": 64,
+            "tile_cols": 8,
+            "input_bytes_per_element": 4,
+            "parameter_bytes_per_col": 8,
+            "outputs": [
+              {
+                "bytes_per_element": 4
+              },
+              {
+                "bytes_per_element": 2,
+                "resource": "scalar_store_issue",
+                "queue": {
+                  "outstanding": 8,
+                  "granule_bytes": 128,
+                  "response_ms": 9.125e-05,
+                  "row_control_ms": 7e-06
+                }
+              }
+            ]
+          }
+        },
+        "lowerings": {
+          "gdn_prefill": "gdn_prefill_arch35"
+        },
+        "programs": {
+          "matmul": {
+            "kind": "steady_matmul"
+          }
+        }
+      }
+    },
+    "replica_scope": "first_independent_dp_cohort",
+    "replica_axis": "data_parallel",
+    "shard_scope": "representative_tp_pcp_shard",
+    "stage_scope": "all_pipeline_stages",
+    "expand_calls": true,
+    "replicas": [
+      0
+    ],
+    "kernel_bindings": {
+      "families": {
+        "gdn_gating": {
+          "kind": "tiled_pointwise",
+          "tile_rows": 64,
+          "tile_cols": 8,
+          "input_bytes_per_element": 4,
+          "parameter_bytes_per_col": 8,
+          "outputs": [
+            {
+              "bytes_per_element": 4
+            },
+            {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            }
+          ]
+        }
+      },
+      "lowerings": {
+        "gdn_prefill": "gdn_prefill_arch35"
+      },
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      }
+    }
+  },
+  "hardware_declaration": {
+    "name": "a5-950dt-9582-1die",
+    "architecture": "A5",
+    "hardware_key": "Ascend950DT_9582",
+    "sku": "Ascend950DT_9582",
+    "devices": [
+      {
+        "rank": 0,
+        "memory_bytes": 103079215104,
+        "compute_peaks": {
+          "bf16": 432537600000000.0,
+          "fp16": 432537600000000.0,
+          "fp32": 27033600000000.0,
+          "fp8_e4m3": 865075200000000.0,
+          "fp8_e5m2": 865075200000000.0,
+          "hf32": 216268800000000.0,
+          "int8": 865075200000000.0
+        },
+        "rates": {
+          "fixpipe": 6758400000000.0,
+          "hbm": 4000000000000.0,
+          "mte1": 13516800000000.0,
+          "mte2": 4000000000000.0,
+          "mte2_aic": 4224000000000.0,
+          "mte2_aiv": 4224000000000.0,
+          "mte3": 4000000000000.0,
+          "reg_alu_lanes": 13516800000000.0,
+          "reg_data_writes": 211200000000.0,
+          "reg_reduce_lanes": 6758400000000.0,
+          "reg_shuffle_lanes": 6758400000000.0,
+          "reg_special_lanes": 3379200000000.0,
+          "reg_ub_accesses": 211200000000.0,
+          "reg_ub_stores": 105600000000.0,
+          "scalar_store_issue": 5657458563.535912,
+          "vector": 6758400000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 262144,
+          "l1": 524288,
+          "ub": 253952
+        },
+        "compute_units": 32,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 0,
+        "resource_units": {
+          "fixpipe": 32,
+          "mte1": 32,
+          "mte2_aic": 32,
+          "mte2_aiv": 64,
+          "mte3": 64,
+          "reg_alu_lanes": 64,
+          "reg_data_writes": 64,
+          "reg_reduce_lanes": 64,
+          "reg_shuffle_lanes": 64,
+          "reg_special_lanes": 64,
+          "reg_ub_accesses": 64,
+          "reg_ub_stores": 64,
+          "scalar_store_issue": 64,
+          "vector": 64
+        },
+        "buffer_units": {
+          "l0a": 32,
+          "l0b": 32,
+          "l0c": 32,
+          "l1": 32,
+          "ub": 64
+        },
+        "service_modes": {
+          "reg_issue_slots": {
+            "resource": "vector",
+            "rate": 211200000000.0
+          },
+          "ub_copy": {
+            "resource": "vector",
+            "rate": 27033600000000.0
+          }
+        }
+      }
+    ],
+    "links": [
+      {
+        "name": "d2d",
+        "capacity_bytes_per_ms": 392000000.0,
+        "members": [
+          0
+        ],
+        "latency_us": 2.5,
+        "channel": "d2d_intra_node",
+        "semantics": "shared"
+      }
+    ],
+    "ranks_per_node": 8,
+    "dies_per_package": 2,
+    "assumptions": {
+      "launch_us": "20 nominal unless explicitly overridden",
+      "matrix_precision": "arch3510 ordinary FP32 MMAD has 16x16x1 parallelism; HF32 has 16x16x8. Both use storage k0=8. The caller declares inherited CTRL.HF32; nominal clock is 1.65 GHz.",
+      "memory_path": "shared HBM; independent AIC/AIV read owners use nominal INI ddr_read_rate 80/40 B/cycle per core. These memory-path supply declarations are not measured MTE2 instruction rates. Shared L2 capacity and cache behavior are not characterized.",
+      "onchip_transfer": "arch3510 nominal instruction bandwidth: MTE1 LoadData2DV2 256 B/cycle/AIC, Fixpipe local destination128 B/cycle/AIC, MTE3 UB-to-L1 128 B/cycle/AIV; UB-to-UB DataCopy uses PIPE_V at 256 payload B/cycle/AIV. Startup and shared L1 ingress are not characterized; Fixpipe-to-GM issue rate remains a declared nominal assumption.",
+      "profile": "registered SKU geometry and nominal rates",
+      "register_capacity": "Pinned arch3510 Reg tables: at most two issue slots, two data-register writes, two UB accesses and one UB store per cycle. Single-issue calls occupy both slots. ALU/special lane capacity assumes ideal dual issue; reduce/shuffle single issue. Active masked lanes impose capacity bounds only; masked instruction service, dependency latency, compiler pairing and predicate-write ports remain uncharacterized. This is not a cycle-accurate instruction schedule.",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden"
+    }
+  },
+  "declared_kernel_bindings": {
+    "families": {
+      "gdn_gating": {
+        "kind": "tiled_pointwise",
+        "tile_rows": 64,
+        "tile_cols": 8,
+        "input_bytes_per_element": 4,
+        "parameter_bytes_per_col": 8,
+        "outputs": [
+          {
+            "bytes_per_element": 4
+          },
+          {
+            "bytes_per_element": 2,
+            "resource": "scalar_store_issue",
+            "queue": {
+              "outstanding": 8,
+              "granule_bytes": 128,
+              "response_ms": 9.125e-05,
+              "row_control_ms": 7e-06
+            }
+          }
+        ]
+      }
+    },
+    "lowerings": {
+      "gdn_prefill": "gdn_prefill_arch35"
+    },
+    "programs": {
+      "matmul": {
+        "kind": "steady_matmul"
+      }
+    }
+  },
+  "structure_source": {
+    "case_path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/fusion-cohort-a5_qwen38-reference.case.json",
+    "case_sha256": "9048fa43435e5c36ba04e915a8faac8e09bf27c8eb1838e0e551fe58c40bc5cc",
+    "recipe_change": {
+      "programs.matmul": {
+        "kind": "steady_matmul"
+      }
+    },
+    "native_dispatch_identity_verified": false
+  },
+  "mapping_coverage": {
+    "event_window_count": 22486,
+    "status_counts": {
+      "unmapped": 21305,
+      "ambiguous": 1144,
+      "candidate": 37
+    },
+    "cohort_event_window_count": 989,
+    "cohort_status": "aggregated",
+    "cohort_event_fraction": 0.04398292270746242
+  },
+  "status_counts": {
+    "compared": 8
+  },
+  "distinct_priced_programs": 8,
+  "semantics": {
+    "join": "same_tensor_contract_and_physical_work_candidate_set; no_layer_choice",
+    "multiplicity": "window_counts_are_not_steps; repeated_windows_are_not_independent_runs",
+    "timing": "per_call_device_program_and_activity_sum; never_wall_time_or_busy_union_error",
+    "subgraphs": "unfused_multiple_programs_are_references_until_a_fused_resource_boundary_is_selected",
+    "aggregation": "no_cross_rank_window_or_overlapping_declaration_totals",
+    "calibration": "observations_never_change_case_parameters_or_enter_primitive_training"
+  },
+  "kind": "historical_fusion_cohort_comparison_projection",
+  "report_schema_version": "mindie-sim.cohort-comparison/1",
+  "windows": [
+    {
+      "rank_id": "rank_0",
+      "step": null,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen38-c4-16k/raw/prof/p16384_c1_o32/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+        "size_bytes": 7978835,
+        "mtime_ns": 1792684761000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "ec7fbcff6138d06fd7d0ed20497d8d4af2f78a179372db976090d4206a3d17ca"
+      },
+      "window": {
+        "start_ns": 1792684744869450742,
+        "end_ns": 1792684746995752723,
+        "label": "complete_capture_mixed_phase_possible"
+      },
+      "rank_scope": {
+        "replica": null,
+        "stage": null,
+        "basis": "unspecified"
+      },
+      "cohort_excluded_event_counts": {
+        "no_tensor_candidates": 21305,
+        "candidate_physical_work_differs": 192
+      },
+      "cohorts": [
+        {
+          "cohort_id": "sha256:929e63b7f719db6eb640eb83bbda2144e1df9b8f4e13f8f59b8bbfdcf9f0f244",
+          "target_kind": "node",
+          "native_operator_type": "MatMulV3",
+          "physical_signature": "sha256:7f1bce920ff97c1566f536219a131d2fc1bd496f93754c8f1d5cd809b59a8653",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              16384,
+              5120
+            ],
+            "bf16",
+            "bf16",
+            "bf16",
+            [],
+            ""
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof"
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "attention",
+              "role": "body",
+              "structure": {
+                "attention_kind": "gdn",
+                "attention_architecture": "gdn",
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 48,
+          "declared_candidate_instance_count": 48,
+          "declared_layer_count": 48,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 48,
+            "complete_event_count": 48,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 6375719.229166667,
+              "p50": 6375468.0,
+              "min": 6373695,
+              "max": 6381070,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 306034523,
+            "complete_activity_sum_ns": 306034523,
+            "busy_union_ns": 306034523,
+            "status_counts": {
+              "ambiguous": 48
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 48,
+            "declared_instances": 48,
+            "declared_candidate_instances": 48,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.2675816813787879,
+              "absolute_residual_ms": 0.2675816813787879,
+              "relative_error": 0.041968862141026575
+            },
+            "activity_sum": {
+              "signed_residual_ms": 12.843920706181848,
+              "absolute_residual_ms": 12.843920706181848,
+              "relative_error": 0.041968862141026575
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.2678329105454553,
+              "absolute_residual_ms": 0.2678329105454553,
+              "relative_error": 0.042009921553281426
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 6375.719229166667,
+          "predicted_per_call_us": 6643.300910545455,
+          "per_call_diff_us": 267.58168137878783,
+          "abs_error_per_call_us": 267.58168137878783,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 48,
+          "target_examples": [
+            "rank:0/s0.l0.linear_qkvz",
+            "rank:0/s0.l1.linear_qkvz",
+            "rank:0/s0.l10.linear_qkvz",
+            "rank:0/s0.l12.linear_qkvz"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l0.linear_qkvz",
+            "representative_operator_ids": [
+              "rank:0/s0.l0.linear_qkvz"
+            ],
+            "per_call_ms": 6.643300910545455,
+            "physical_work_per_instance": {
+              "flops": 2748779069440.0,
+              "hbm_bytes": 872415232.0,
+              "mte2_bytes": 335544320.0,
+              "mte3_bytes": 536870912.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 872415232.0,
+              "mte1@r0:s0": 42949672960.0,
+              "mte2@r0:s0": 21474836480.0,
+              "mte3@r0:s0": 536870912.0,
+              "matrix@r0:s0": 6.355006060606059
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 318.8784437061818,
+            "per_declared_step_ms": 318.8784437061818,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:ad8c2ebf98f66b1bee50ddaf6f9c413f36cf53e2bcf87535ecc84f1fb7da8df9",
+          "target_kind": "node",
+          "native_operator_type": "MatMulV3",
+          "physical_signature": "sha256:d00d75d1dd7892e48c26045d26f8114c3e28c8c2bc3402764763c2fef6f151c7",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              96,
+              5120
+            ],
+            "bf16",
+            "bf16",
+            "bf16",
+            [],
+            ""
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof"
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "attention",
+              "role": "body",
+              "structure": {
+                "attention_kind": "gdn",
+                "attention_architecture": "gdn",
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 48,
+          "declared_candidate_instance_count": 48,
+          "declared_layer_count": 48,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 48,
+            "complete_event_count": 48,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 63095.3125,
+              "p50": 62894.0,
+              "min": 62357,
+              "max": 70858,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 3028575,
+            "complete_activity_sum_ns": 3028575,
+            "busy_union_ns": 3028575,
+            "status_counts": {
+              "ambiguous": 48
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 48,
+            "declared_instances": 48,
+            "declared_candidate_instances": 48,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": -0.00343477625757576,
+              "absolute_residual_ms": 0.00343477625757576,
+              "relative_error": -0.05443789913198005
+            },
+            "activity_sum": {
+              "signed_residual_ms": -0.16486926036363636,
+              "absolute_residual_ms": 0.16486926036363636,
+              "relative_error": -0.05443789913198005
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": -0.003233463757575765,
+              "absolute_residual_ms": 0.003233463757575765,
+              "relative_error": -0.051411323140136855
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 63.0953125,
+          "predicted_per_call_us": 59.66053624242424,
+          "per_call_diff_us": -3.4347762575757557,
+          "abs_error_per_call_us": 3.4347762575757557,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 48,
+          "target_examples": [
+            "rank:0/s0.l0.linear_beta_alpha",
+            "rank:0/s0.l1.linear_beta_alpha",
+            "rank:0/s0.l10.linear_beta_alpha",
+            "rank:0/s0.l12.linear_beta_alpha"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l0.linear_beta_alpha",
+            "representative_operator_ids": [
+              "rank:0/s0.l0.linear_beta_alpha"
+            ],
+            "per_call_ms": 0.05966053624242424,
+            "physical_work_per_instance": {
+              "flops": 16106127360.0,
+              "hbm_bytes": 171900928.0,
+              "mte2_bytes": 168755200.0,
+              "mte3_bytes": 3145728.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 171900928.0,
+              "mte1@r0:s0": 293601280.0,
+              "mte2@r0:s0": 230686720.0,
+              "mte3@r0:s0": 3145728.0,
+              "matrix@r0:s0": 0.037236363636363644
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 2.8637057396363637,
+            "per_declared_step_ms": 2.8637057396363637,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:6c216f7d79a6cbe02160dcbfeb010fea1a9c67eac1af3e9946b9e7ba2d09bb1d",
+          "target_kind": "node",
+          "native_operator_type": "MatMulV3",
+          "physical_signature": "sha256:f033df11da36200cdabcd2f6c596c35d13c99eb25e0f920057eaf84fbe2d10da",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              5120,
+              6144
+            ],
+            "bf16",
+            "bf16",
+            "bf16",
+            [],
+            ""
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof"
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "attention",
+              "role": "body",
+              "structure": {
+                "attention_kind": "gdn",
+                "attention_architecture": "gdn",
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 48,
+          "declared_candidate_instance_count": 48,
+          "declared_layer_count": 48,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 51,
+            "complete_event_count": 51,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 2394718.3529411764,
+              "p50": 2394683.0,
+              "min": 2393452,
+              "max": 2396080,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 122130636,
+            "complete_activity_sum_ns": 122130636,
+            "busy_union_ns": 122130636,
+            "status_counts": {
+              "ambiguous": 51
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 51,
+            "declared_instances": 48,
+            "declared_candidate_instances": 48,
+            "calls_per_declared_instance": 1.0625,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.07850106039215676,
+              "absolute_residual_ms": 0.07850106039215676,
+              "relative_error": 0.03278091567458952
+            },
+            "activity_sum": {
+              "signed_residual_ms": 4.003554080000001,
+              "absolute_residual_ms": 4.003554080000001,
+              "relative_error": 0.03278091567458974
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.07853641333333305,
+              "absolute_residual_ms": 0.07853641333333305,
+              "relative_error": 0.03279616272105046
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 2394.7183529411764,
+          "predicted_per_call_us": 2473.2194133333333,
+          "per_call_diff_us": 78.50106039215689,
+          "abs_error_per_call_us": 78.50106039215689,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 48,
+          "target_examples": [
+            "rank:0/s0.l0.linear_output",
+            "rank:0/s0.l1.linear_output",
+            "rank:0/s0.l10.linear_output",
+            "rank:0/s0.l12.linear_output"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l0.linear_output",
+            "representative_operator_ids": [
+              "rank:0/s0.l0.linear_output"
+            ],
+            "per_call_ms": 2.473219413333333,
+            "physical_work_per_instance": {
+              "flops": 1030792151040.0,
+              "hbm_bytes": 432013312.0,
+              "mte2_bytes": 264241152.0,
+              "mte3_bytes": 167772160.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 432013311.99999976,
+              "mte1@r0:s0": 16106127360.0,
+              "mte2@r0:s0": 8053063680.0,
+              "mte3@r0:s0": 167772160.0,
+              "matrix@r0:s0": 2.383127272727273
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 126.13419008,
+            "per_declared_step_ms": 118.71453183999999,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:b1af61014ec22c2cffc8a09ec06dfbdcfd817d84594491348d6000bf6dbd29bc",
+          "target_kind": "node",
+          "native_operator_type": "QuantBatchMatmulV3",
+          "physical_signature": "sha256:f4bab9cd78e2fdce582411e648b7c3056364fe587ec31ae59c62d508e06b5e09",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              34816,
+              5120
+            ],
+            "fp8_e4m3",
+            "fp8_e4m3",
+            "bf16",
+            [
+              16384,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof",
+            "mx_execution_assumption": "Declared matrix compute-format work and operand-scale traffic; MX scale application and native instruction scheduling are not separately resolved. This does not infer an additional output epilogue from tensor descriptors."
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "ffn",
+              "role": "body",
+              "structure": {
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 64,
+          "declared_candidate_instance_count": 64,
+          "declared_layer_count": 64,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 64,
+            "complete_event_count": 64,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 6770419.15625,
+              "p50": 6770202.0,
+              "min": 6764327,
+              "max": 6779572,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 433306826,
+            "complete_activity_sum_ns": 433306826,
+            "busy_union_ns": 433306826,
+            "status_counts": {
+              "ambiguous": 64
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 64,
+            "declared_instances": 64,
+            "declared_candidate_instances": 64,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.4361510139318199,
+              "absolute_residual_ms": 0.4361510139318199,
+              "relative_error": 0.0644200903764125
+            },
+            "activity_sum": {
+              "signed_residual_ms": 27.913664891636472,
+              "absolute_residual_ms": 27.913664891636472,
+              "relative_error": 0.0644200903764125
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.4363681701818196,
+              "absolute_residual_ms": 0.4363681701818196,
+              "relative_error": 0.06445423196853195
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 6770.41915625,
+          "predicted_per_call_us": 7206.57017018182,
+          "per_call_diff_us": 436.15101393181976,
+          "abs_error_per_call_us": 436.15101393181976,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 64,
+          "target_examples": [
+            "rank:0/s0.l0.gate_up",
+            "rank:0/s0.l1.gate_up",
+            "rank:0/s0.l10.gate_up",
+            "rank:0/s0.l11.gate_up"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l0.gate_up",
+            "representative_operator_ids": [
+              "rank:0/s0.l0.gate_up"
+            ],
+            "per_call_ms": 7.20657017018182,
+            "physical_work_per_instance": {
+              "flops": 5841155522560.0,
+              "hbm_bytes": 1411186688.0,
+              "mte2_bytes": 270336000.0,
+              "mte3_bytes": 1140850688.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 1411186688.0000007,
+              "mte1@r0:s0": 47060090880.0,
+              "mte2@r0:s0": 23530045440.0,
+              "mte3@r0:s0": 1140850688.0,
+              "matrix@r0:s0": 6.752193939393945
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 461.2204908916365,
+            "per_declared_step_ms": 461.2204908916365,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:ab44bb93c1c642d59bbfe1810131487988542116726b5bf0f78b32add5916d12",
+          "target_kind": "node",
+          "native_operator_type": "QuantBatchMatmulV3",
+          "physical_signature": "sha256:6f30da3baeff9699c41afdf26d29c7e19dc59ae6d6a88269edaa0f166b515d8c",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              5120,
+              17408
+            ],
+            "fp8_e4m3",
+            "fp8_e4m3",
+            "bf16",
+            [
+              16384,
+              272,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof",
+            "mx_execution_assumption": "Declared matrix compute-format work and operand-scale traffic; MX scale application and native instruction scheduling are not separately resolved. This does not infer an additional output epilogue from tensor descriptors."
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "ffn",
+              "role": "body",
+              "structure": {
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 64,
+          "declared_candidate_instance_count": 64,
+          "declared_layer_count": 64,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 64,
+            "complete_event_count": 64,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 3392825.25,
+              "p50": 3392483.0,
+              "min": 3390088,
+              "max": 3398847,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 217140816,
+            "complete_activity_sum_ns": 217140816,
+            "busy_union_ns": 217140816,
+            "status_counts": {
+              "ambiguous": 64
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 64,
+            "declared_instances": 64,
+            "declared_candidate_instances": 64,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.050218357272727054,
+              "absolute_residual_ms": 0.050218357272727054,
+              "relative_error": 0.01480133917086568
+            },
+            "activity_sum": {
+              "signed_residual_ms": 3.2139748654545315,
+              "absolute_residual_ms": 3.2139748654545315,
+              "relative_error": 0.01480133917086568
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.050560607272727154,
+              "absolute_residual_ms": 0.050560607272727154,
+              "relative_error": 0.014903717210293266
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 3392.82525,
+          "predicted_per_call_us": 3443.043607272727,
+          "per_call_diff_us": 50.21835727272719,
+          "abs_error_per_call_us": 50.21835727272719,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 64,
+          "target_examples": [
+            "rank:0/s0.l0.down",
+            "rank:0/s0.l1.down",
+            "rank:0/s0.l10.down",
+            "rank:0/s0.l11.down"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l0.down",
+            "representative_operator_ids": [
+              "rank:0/s0.l0.down"
+            ],
+            "per_call_ms": 3.443043607272727,
+            "physical_work_per_instance": {
+              "flops": 2920577761280.0,
+              "hbm_bytes": 553811968.0,
+              "mte2_bytes": 386039808.0,
+              "mte3_bytes": 167772160.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 553811967.9999996,
+              "mte1@r0:s0": 23530045440.0,
+              "mte2@r0:s0": 11765022720.0,
+              "mte3@r0:s0": 167772160.0,
+              "matrix@r0:s0": 3.3760969696969725
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 220.35479086545453,
+            "per_declared_step_ms": 220.35479086545453,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:0282b3955119682b89557c9ab18fdf99f105b4532a6d29a674e04adc8f73e290",
+          "target_kind": "node",
+          "native_operator_type": "QuantBatchMatmulV3",
+          "physical_signature": "sha256:be8a9ef1391f7c8dbf1e021c9b39bb663e65c72167ad56350086aea4d2dc2620",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              14336,
+              5120
+            ],
+            "fp8_e4m3",
+            "fp8_e4m3",
+            "bf16",
+            [
+              16384,
+              80,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof",
+            "mx_execution_assumption": "Declared matrix compute-format work and operand-scale traffic; MX scale application and native instruction scheduling are not separately resolved. This does not infer an additional output epilogue from tensor descriptors."
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "attention",
+              "role": "body",
+              "structure": {
+                "attention_kind": "gqa",
+                "attention_architecture": "gated_gqa",
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 16,
+          "declared_candidate_instance_count": 16,
+          "declared_layer_count": 16,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 16,
+            "complete_event_count": 16,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 2790927.1875,
+              "p50": 2790525.0,
+              "min": 2788360,
+              "max": 2793723,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 44654835,
+            "complete_activity_sum_ns": 44654835,
+            "busy_union_ns": 44654835,
+            "status_counts": {
+              "ambiguous": 16
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 16,
+            "declared_instances": 16,
+            "declared_candidate_instances": 16,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.17648405904545506,
+              "absolute_residual_ms": 0.17648405904545506,
+              "relative_error": 0.06323492057975977
+            },
+            "activity_sum": {
+              "signed_residual_ms": 2.823744944727281,
+              "absolute_residual_ms": 2.823744944727281,
+              "relative_error": 0.06323492057975977
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.17688624654545482,
+              "absolute_residual_ms": 0.17688624654545482,
+              "relative_error": 0.06338816048788476
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 2790.9271875,
+          "predicted_per_call_us": 2967.411246545455,
+          "per_call_diff_us": 176.48405904545507,
+          "abs_error_per_call_us": 176.48405904545507,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 16,
+          "target_examples": [
+            "rank:0/s0.l11.qkv",
+            "rank:0/s0.l15.qkv",
+            "rank:0/s0.l19.qkv",
+            "rank:0/s0.l23.qkv"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l11.qkv",
+            "representative_operator_ids": [
+              "rank:0/s0.l11.qkv"
+            ],
+            "per_call_ms": 2.967411246545455,
+            "physical_work_per_instance": {
+              "flops": 2405181685760.0,
+              "hbm_bytes": 631963648.0,
+              "mte2_bytes": 162201600.0,
+              "mte3_bytes": 469762048.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 631963648.0000001,
+              "mte1@r0:s0": 19377684480.0,
+              "mte2@r0:s0": 9688842240.0,
+              "mte3@r0:s0": 469762048.0,
+              "matrix@r0:s0": 2.7803151515151527
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 47.47857994472728,
+            "per_declared_step_ms": 47.47857994472728,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:e8a08aa05d072f954ddecaee8633f9a19d155a1aef5a05183fdd6b0d24205ed6",
+          "target_kind": "node",
+          "native_operator_type": "QuantBatchMatmulV3",
+          "physical_signature": "sha256:b833470fd1311d91f44e08bb5a01cb547f5e623e9ff368f571fa0907e38b5c1d",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              16384,
+              5120,
+              6144
+            ],
+            "fp8_e4m3",
+            "fp8_e4m3",
+            "bf16",
+            [
+              16384,
+              96,
+              2
+            ],
+            "fp8_e8m0"
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof",
+            "mx_execution_assumption": "Declared matrix compute-format work and operand-scale traffic; MX scale application and native instruction scheduling are not separately resolved. This does not infer an additional output epilogue from tensor descriptors."
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "attention",
+              "role": "body",
+              "structure": {
+                "attention_kind": "gqa",
+                "attention_architecture": "gated_gqa",
+                "ffn_kind": "dense",
+                "residual_kind": "residual",
+                "cache_kind": "dense",
+                "compress_ratio": 0,
+                "window": 0,
+                "indexer": false,
+                "owns_topk": false,
+                "index_query_per_layer": false,
+                "topk_owner_layer_id": -1
+              }
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 16,
+          "declared_candidate_instance_count": 16,
+          "declared_layer_count": 16,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 16,
+            "complete_event_count": 16,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 1200286.75,
+              "p50": 1200208.0,
+              "min": 1198674,
+              "max": 1202791,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 19204588,
+            "complete_activity_sum_ns": 19204588,
+            "busy_union_ns": 19204588,
+            "status_counts": {
+              "ambiguous": 16
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 16,
+            "declared_instances": 16,
+            "declared_candidate_instances": 16,
+            "calls_per_declared_instance": 1.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": 0.058107470606060696,
+              "absolute_residual_ms": 0.058107470606060696,
+              "relative_error": 0.04841132388244773
+            },
+            "activity_sum": {
+              "signed_residual_ms": 0.9297195296969711,
+              "absolute_residual_ms": 0.9297195296969711,
+              "relative_error": 0.04841132388244773
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": 0.05818622060606082,
+              "absolute_residual_ms": 0.05818622060606082,
+              "relative_error": 0.04848011395196572
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 1200.28675,
+          "predicted_per_call_us": 1258.3942206060608,
+          "per_call_diff_us": 58.107470606060815,
+          "abs_error_per_call_us": 58.107470606060815,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 16,
+          "target_examples": [
+            "rank:0/s0.l11.output",
+            "rank:0/s0.l15.output",
+            "rank:0/s0.l19.output",
+            "rank:0/s0.l23.output"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/s0.l11.output",
+            "representative_operator_ids": [
+              "rank:0/s0.l11.output"
+            ],
+            "per_call_ms": 1.2583942206060608,
+            "physical_work_per_instance": {
+              "flops": 1030792151040.0,
+              "hbm_bytes": 304021504.0,
+              "mte2_bytes": 136249344.0,
+              "mte3_bytes": 167772160.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 304021504.0,
+              "mte1@r0:s0": 8304721920.0,
+              "mte2@r0:s0": 4152360960.0,
+              "mte3@r0:s0": 167772160.0,
+              "matrix@r0:s0": 1.1915636363636366
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 20.134307529696972,
+            "per_declared_step_ms": 20.134307529696972,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        },
+        {
+          "cohort_id": "sha256:0af85359afa3857dd121f43fb27ac7bf29a17b5c0284d179aacb0b4f5b45c01b",
+          "target_kind": "node",
+          "native_operator_type": "MatMulV3",
+          "physical_signature": "sha256:ad41b701544769860ee6040926807d1c97ea05ccf4647bdbb890c87073411786",
+          "replica": 0,
+          "stage": 0,
+          "phase": "prefill",
+          "rank_id": "rank_0",
+          "device_id": "0",
+          "contract": [
+            "matrix",
+            [
+              1,
+              248320,
+              5120
+            ],
+            "bf16",
+            "bf16",
+            "bf16",
+            [],
+            ""
+          ],
+          "contract_scope": {
+            "kind": "matrix_active_geometry",
+            "compared": [
+              "logical_M_N_K",
+              "activation_weight_output_precision",
+              "activation_scale_shape_dtype"
+            ],
+            "not_compared": [
+              "weight_scale_storage_representation",
+              "scale_values",
+              "native_dispatch",
+              "tiling"
+            ],
+            "basis": "independently_declared_tensor_geometry; no_occurrence_or_workload_realization_proof"
+          },
+          "structural_classification": {
+            "basis": "common_to_all_declared_tensor_candidates",
+            "common": {
+              "block": "logits"
+            },
+            "occurrence_binding_implied": false
+          },
+          "declared_instance_count": 1,
+          "declared_candidate_instance_count": 1,
+          "declared_layer_count": 0,
+          "placement": {
+            "basis": "single_declared_replica",
+            "replica_candidates": [
+              0
+            ],
+            "replica_binding_implied": false
+          },
+          "observed": {
+            "event_count": 37,
+            "complete_event_count": 37,
+            "clipped_event_count": 0,
+            "duration_ns": {
+              "mean": 734803.8108108108,
+              "p50": 734463.0,
+              "min": 730957,
+              "max": 739741,
+              "basis": "complete_events_only"
+            },
+            "activity_sum_ns": 27187741,
+            "complete_activity_sum_ns": 27187741,
+            "busy_union_ns": 27187741,
+            "status_counts": {
+              "candidate": 37
+            }
+          },
+          "multiplicity": {
+            "observed_calls": 37,
+            "declared_instances": 1,
+            "declared_candidate_instances": 1,
+            "calls_per_declared_instance": 37.0,
+            "steps_in_window": null,
+            "basis": "window_counts_not_layer_binding; step_label_is_not_completeness_evidence",
+            "instance_scope": "single_declared_replica"
+          },
+          "occurrence_binding_implied": false,
+          "comparison": {
+            "per_call_mean": {
+              "signed_residual_ms": -0.08513343311384092,
+              "absolute_residual_ms": 0.08513343311384092,
+              "relative_error": -0.1158587256371213
+            },
+            "activity_sum": {
+              "signed_residual_ms": -3.1499370252121146,
+              "absolute_residual_ms": 3.1499370252121146,
+              "relative_error": -0.1158587256371213
+            },
+            "interpretation": "conditional_descriptive_comparison; no_occurrence_or_accuracy_certification",
+            "per_call_p50": {
+              "signed_residual_ms": -0.08479262230303009,
+              "absolute_residual_ms": 0.08479262230303009,
+              "relative_error": -0.11544846003546816
+            }
+          },
+          "status": "compared",
+          "reason": "same_declared_single_program_boundary",
+          "observed_per_call_us": 734.8038108108108,
+          "predicted_per_call_us": 649.6703776969699,
+          "per_call_diff_us": -85.13343311384085,
+          "abs_error_per_call_us": 85.13343311384085,
+          "accuracy_tier": "relative_15pct",
+          "accuracy_status": "within_relative_tolerance",
+          "accuracy_pass": true,
+          "accuracy_tolerance": {
+            "unit": "ratio",
+            "value": 0.15
+          },
+          "accuracy_policy": "mindie-sim.cohort-accuracy/1",
+          "target_count": 1,
+          "target_examples": [
+            "rank:0/logits"
+          ],
+          "prediction": {
+            "boundary": "semantic_device_program",
+            "representative_target_id": "rank:0/logits",
+            "representative_operator_ids": [
+              "rank:0/logits"
+            ],
+            "per_call_ms": 0.6496703776969699,
+            "physical_work_per_instance": {
+              "flops": 2542796800.0,
+              "hbm_bytes": 2543303680.0,
+              "mte2_bytes": 2542807040.0,
+              "mte3_bytes": 496640.0,
+              "vector_ops": 0.0,
+              "link_bytes": 0.0,
+              "matrix_flops": {},
+              "launches": 1
+            },
+            "serviced": {
+              "memory@r0:s0": 2543303679.9999948,
+              "mte1@r0:s0": 2562662400.000001,
+              "mte2@r0:s0": 2562662400.0000057,
+              "mte3@r0:s0": 496639.999999999,
+              "matrix@r0:s0": 0.005878787878787878
+            },
+            "single_device_program": true,
+            "observed_call_count_total_ms": 24.037803974787884,
+            "per_declared_step_ms": 0.6496703776969699,
+            "step_total_basis": "one_invocation_per_declared_instance; not_observed_step_count",
+            "assumptions": [
+              "External inputs are ready; no host submission or unrelated graph contention is simulated.",
+              "The case supplies work, precision, layout and resource bindings independently of measurements.",
+              "Unobserved fields excluded by the tensor contract remain declared conditions."
+            ]
+          }
+        }
+      ]
+    }
+  ],
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/matrix-cohort-wave4-20261029/a5_qwen38-steady.comparison.json",
+    "sha256": "809fb6afe82a349b2cf52b78e78226c44b707c4d867a2c2c763ea2c18662e761",
+    "size_bytes": 63879
+  }
+}

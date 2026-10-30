@@ -1,0 +1,30 @@
+.version 7.0
+.target sm_70
+.address_size 64
+
+.visible .entry stream_copy(
+    .param .u64 dst,
+    .param .u64 src,
+    .param .u32 count
+)
+{
+    .reg .pred %p;
+    .reg .b32 %r<6>;
+    .reg .b64 %d<6>;
+    ld.param.u64 %d0, [dst];
+    ld.param.u64 %d1, [src];
+    ld.param.u32 %r0, [count];
+    mov.u32 %r1, %ctaid.x;
+    mov.u32 %r2, %ntid.x;
+    mov.u32 %r3, %tid.x;
+    mad.lo.u32 %r1, %r1, %r2, %r3;
+    setp.ge.u32 %p, %r1, %r0;
+    @%p bra DONE;
+    mul.wide.u32 %d2, %r1, 4;
+    add.u64 %d3, %d1, %d2;
+    add.u64 %d4, %d0, %d2;
+    ld.global.cg.u32 %r4, [%d3];
+    st.global.wb.u32 [%d4], %r4;
+DONE:
+    ret;
+}

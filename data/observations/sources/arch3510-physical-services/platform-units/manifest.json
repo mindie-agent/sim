@@ -1,0 +1,20 @@
+[
+  {
+    "path": "GetCoreMemBw.md",
+    "url": "https://raw.githubusercontent.com/ckorikov/asc-devkit/6493221b731e87a12651d0977bf3e244ce7b7d42/docs/api/context/GetCoreMemBw.md",
+    "sha256": "cda9193b5a2f6c318f5939217808023e37b0ef061cec45cb68e29bc2a4486f0f",
+    "bytes": 5185
+  },
+  {
+    "path": "conv2d_backprop_filter_schedule.py",
+    "url": "https://raw.githubusercontent.com/leideng/CANN-8.1.RC1/551ed27c29284929bbdc2239e929ddfedfdf0b8b/Ascend/ascend-toolkit/8.1.RC1/python/site-packages/tbe/dsl/static_schedule/conv2d_backprop_filter_schedule.py",
+    "sha256": "686e5c3c7a81c93a63693b3e5b3f6a959cc8714d11fa028dc1ad361bfc39f81e",
+    "bytes": 150416
+  },
+  {
+    "path": "asc-devkit-README.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/README.md",
+    "sha256": "5592af0f28db6efc95317624457455765f2b9fd0700ea52fa21ba3c30d5ae185",
+    "bytes": 19569
+  }
+]

@@ -1,0 +1,40 @@
+{
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "sources": [
+    {
+      "relative_path": "impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+      "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+      "bytes": 83067,
+      "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h"
+    },
+    {
+      "relative_path": "impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "sha256": "23fedd925a3474b44cf9fd61a1e89b9cad8a2777151b9e420c84d5ff3d69ca31",
+      "bytes": 34232,
+      "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_intf_impl.h"
+    },
+    {
+      "relative_path": "impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "sha256": "5eed2f9d39c398317de9b82f5b15211442e8bec4fbd35bcb75b84833eb52b632",
+      "bytes": 13406,
+      "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h"
+    },
+    {
+      "relative_path": "impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "sha256": "ef7598e2db5e2839a08a1eb88fc849dd9f28154f9733a9dfcfce1b1a8e63cf7d",
+      "bytes": 41240,
+      "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h"
+    },
+    {
+      "relative_path": "impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "sha256": "6fbe664ed6e0d846549b425a6b0d60e697a24fda1e0b6829f11a33f4ae7a41d9",
+      "bytes": 85819,
+      "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h"
+    }
+  ]
+}

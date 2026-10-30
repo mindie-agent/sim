@@ -1,0 +1,14 @@
+{
+  "split": "heldout",
+  "recorded_before_measurement": true,
+  "candidate": {
+    "outstanding": 8,
+    "granule_bytes": 128,
+    "response_ns": 91.25,
+    "issue_ns": 11.3125,
+    "row_control_ns": 7,
+    "setup_ns": 0
+  },
+  "fit_source": "../native-address-sweep/stdout.jsonl:first 24 cases",
+  "qualification": "independent shapes and tails; candidate queue model under investigation; not runtime calibration"
+}

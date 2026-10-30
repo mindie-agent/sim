@@ -1,0 +1,220 @@
+{
+  "service_regimes": [
+    {
+      "id": "a5_bf16_matmul_small_m_n3584_k7168_out_bf16",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "dtype": "bf16",
+        "metadata.program_kind": "matmul",
+        "metadata.weight_dtype": "bf16",
+        "metadata.input_format": "bf16",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_groups": 1,
+        "local_shape.1": 3584,
+        "local_shape.2": 7168
+      },
+      "coordinates": {
+        "m": {
+          "path": "local_shape.0"
+        },
+        "weight_bytes": {
+          "path": "local_shape.1",
+          "scale": 14336
+        }
+      },
+      "domain": {
+        "m": {
+          "min": 1,
+          "max": 4
+        }
+      },
+      "response": {
+        "terms": [
+          {
+            "coordinate": "weight_bytes",
+            "us_per_unit": 5.28140943877551e-07,
+            "scale_with": {
+              "resource": "hbm",
+              "reference_rate": 4000000000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native MatMulV3 device-call service, inclusive",
+        "fit_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
+          "size_bytes": 48779
+        },
+        "fit_cohort": "sha256:b5ef2e7af01904d388b568f9cba945855b1ce4addafc019837ec17cecd2fe5dd",
+        "fit_contract": [
+          "matrix",
+          [
+            4,
+            3584,
+            7168
+          ],
+          "bf16",
+          "bf16",
+          "bf16",
+          [],
+          ""
+        ],
+        "fit_call_count": 4232,
+        "fit_statistic": "median",
+        "fit_population": "c32 p4k operator calls only",
+        "historical_split": "unassigned",
+        "runtime_selector": "hardware, dtype, N/K, output dtype and M domain only",
+        "model": "small-M weight-dominated effective call service; no separately identified pipe bandwidth or row slope",
+        "rate_scaling": "declared HBM scaling assumption for effective weight service; not an independent hardware bandwidth measurement",
+        "M1_to_M4": "explicit small-M approximation validated on other observed geometries, not captured tiling identity",
+        "body_total_used": false
+      }
+    },
+    {
+      "id": "a5_bf16_matmul_small_m_n7168_k3584_out_bf16",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "dtype": "bf16",
+        "metadata.program_kind": "matmul",
+        "metadata.weight_dtype": "bf16",
+        "metadata.input_format": "bf16",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_groups": 1,
+        "local_shape.1": 7168,
+        "local_shape.2": 3584
+      },
+      "coordinates": {
+        "m": {
+          "path": "local_shape.0"
+        },
+        "weight_bytes": {
+          "path": "local_shape.1",
+          "scale": 7168
+        }
+      },
+      "domain": {
+        "m": {
+          "min": 1,
+          "max": 4
+        }
+      },
+      "response": {
+        "terms": [
+          {
+            "coordinate": "weight_bytes",
+            "us_per_unit": 4.4079216159119895e-07,
+            "scale_with": {
+              "resource": "hbm",
+              "reference_rate": 4000000000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native MatMulV3 device-call service, inclusive",
+        "fit_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
+          "size_bytes": 48779
+        },
+        "fit_cohort": "sha256:849af0349e3b00259cd8f3926e5abb1f5d3f37d5baf900ba671185ccda216714",
+        "fit_contract": [
+          "matrix",
+          [
+            4,
+            7168,
+            3584
+          ],
+          "bf16",
+          "bf16",
+          "bf16",
+          [],
+          ""
+        ],
+        "fit_call_count": 4232,
+        "fit_statistic": "median",
+        "fit_population": "c32 p4k operator calls only",
+        "historical_split": "unassigned",
+        "runtime_selector": "hardware, dtype, N/K, output dtype and M domain only",
+        "model": "small-M weight-dominated effective call service; no separately identified pipe bandwidth or row slope",
+        "rate_scaling": "declared HBM scaling assumption for effective weight service; not an independent hardware bandwidth measurement",
+        "M1_to_M4": "explicit small-M approximation validated on other observed geometries, not captured tiling identity",
+        "body_total_used": false
+      }
+    },
+    {
+      "id": "a5_bf16_matmul_small_m_n16_k7168_out_fp32",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "dtype": "bf16",
+        "metadata.program_kind": "matmul",
+        "metadata.weight_dtype": "bf16",
+        "metadata.input_format": "bf16",
+        "metadata.output_format": "fp32",
+        "metadata.matrix_groups": 1,
+        "local_shape.1": 16,
+        "local_shape.2": 7168
+      },
+      "coordinates": {
+        "m": {
+          "path": "local_shape.0"
+        },
+        "weight_bytes": {
+          "path": "local_shape.1",
+          "scale": 14336
+        }
+      },
+      "domain": {
+        "m": {
+          "min": 1,
+          "max": 4
+        }
+      },
+      "response": {
+        "terms": [
+          {
+            "coordinate": "weight_bytes",
+            "us_per_unit": 3.272138323102678e-05,
+            "scale_with": {
+              "resource": "hbm",
+              "reference_rate": 4000000000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native MatMulV3 device-call service, inclusive",
+        "fit_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
+          "size_bytes": 48779
+        },
+        "fit_cohort": "sha256:1b8466eb41f9c3040733e840add6e292e151357f330fbd36b85d5b5b7d236ccd",
+        "fit_contract": [
+          "matrix",
+          [
+            4,
+            16,
+            7168
+          ],
+          "bf16",
+          "bf16",
+          "fp32",
+          [],
+          ""
+        ],
+        "fit_call_count": 4232,
+        "fit_statistic": "median",
+        "fit_population": "c32 p4k operator calls only",
+        "historical_split": "unassigned",
+        "runtime_selector": "hardware, dtype, N/K, output dtype and M domain only",
+        "model": "small-M weight-dominated effective call service; no separately identified pipe bandwidth or row slope",
+        "rate_scaling": "declared HBM scaling assumption for effective weight service; not an independent hardware bandwidth measurement",
+        "M1_to_M4": "explicit small-M approximation validated on other observed geometries, not captured tiling identity",
+        "body_total_used": false
+      }
+    }
+  ]
+}

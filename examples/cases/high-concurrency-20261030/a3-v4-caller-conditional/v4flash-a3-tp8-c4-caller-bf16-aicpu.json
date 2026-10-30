@@ -1,0 +1,142 @@
+{
+  "name": "v4flash-a3-tp8-c4-caller-bf16-aicpu",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 8,
+    "ranks_per_node": 16
+  },
+  "model": {
+    "catalog_key": "deepseek-v4-flash-0731",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "mla.o_a": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        }
+      },
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/deepseek_v4_flash_w8a8_mtp_high_conc_decode_tpot30_c4_20261030",
+      "client_concurrency": 4,
+      "captured_execution_mode": "not_established",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "SparseAttnSharedkv",
+          "tensor_batch_slots": 1,
+          "query_rows_per_slot": 4096,
+          "tensor_query_rows": 4096,
+          "first_csv_row": 140,
+          "sample_count": 44,
+          "phase": "not_classified_by_shape_only"
+        },
+        {
+          "operator": "SparseAttnSharedkv",
+          "tensor_batch_slots": 1,
+          "query_rows_per_slot": 2,
+          "tensor_query_rows": 2,
+          "first_csv_row": 4247,
+          "sample_count": 44,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "force_eplb_not_established; do_not_enable_balanced_routing",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "compatible_caller_variant": {
+        "parent_case": "examples/cases/high-concurrency-20261030/new17/v4flash-a3-tp8-c4.json",
+        "parent_sha256": "a20b7c039fda8928c308d45b5cff9bfac94eaa33e272bc1b97b723f718106dde",
+        "arm": "caller-bf16-aicpu",
+        "geometry": {
+          "phase": "decode",
+          "tokens": 2,
+          "sequences": 4,
+          "context": 4096
+        },
+        "source_semantics": "vllm_ascend MC2 TP prepare/finalize; 43 observed local-source calls followed by AG",
+        "source_protocol": "captured V2; generic transport retained, no arch35 V3 binding",
+        "quant_contract": "BF16 TransposeBatchMatMul G1/N1024/K4096; only mla.o_a changed",
+        "assumptions": [
+          "Context4096 is declared, not inferred from cache capacity",
+          "Actual expert group_list values and route matrix are unresolved; parent routing unchanged",
+          "AICPU Mesh AG is an explicit conditional algorithm, not captured dispatch identity"
+        ]
+      }
+    },
+    "kernels": {
+      "moe_token_partition": {
+        "kind": "vllm_ascend_mc2_tp_slice"
+      },
+      "hccl": {
+        "allgather": {
+          "expansion": "AICPU_TS",
+          "template": "mesh",
+          "axes": [
+            "tp"
+          ]
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4096,
+        "output_tokens": 96
+      }
+    ]
+  }
+}

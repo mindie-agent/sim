@@ -1,0 +1,86 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "cuda_quant-0",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-1",
+      "split": "development",
+      "params": {
+        "rows": 4,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-2",
+      "split": "development",
+      "params": {
+        "rows": 65,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-3",
+      "split": "heldout_geometry",
+      "params": {
+        "rows": 17,
+        "width": 10240,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-4",
+      "split": "heldout_geometry",
+      "params": {
+        "rows": 129,
+        "width": 5120,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-counterexample-0",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 32,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "cuda_quant-counterexample-1",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 32,
+        "dtype": "fp16"
+      }
+    },
+    {
+      "id": "cuda_quant-counterexample-2",
+      "split": "development",
+      "params": {
+        "rows": 1,
+        "width": 32,
+        "dtype": "fp32"
+      }
+    },
+    {
+      "id": "cuda_quant-counterexample-3",
+      "split": "development",
+      "params": {
+        "rows": 3,
+        "width": 273,
+        "dtype": "bf16"
+      }
+    }
+  ]
+}

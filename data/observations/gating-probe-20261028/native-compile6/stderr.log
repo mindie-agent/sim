@@ -1,0 +1,72 @@
+
+Authorized users only. All activities may be monitored and reported.
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:13: FutureWarning: triton.language.extra.cann.extension.atan2 is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.atan2 instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.atan2")
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:35: FutureWarning: triton.language.extra.cann.extension.isfinited is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.isfinited instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.isfinited")
+/usr/local/python3.12.13/lib/python3.12/site-packages/triton/language/extra/cann/extension/math_ops.py:49: FutureWarning: triton.language.extra.cann.extension.finitef is deprecated and will be removed in the next release; use triton.language.extra.cann.libdevice.finitef instead.
+  @_deprecated(replacement="triton.language.extra.cann.libdevice.finitef")
+Traceback (most recent call last):
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/compiler/compiler.py", line 326, in compile
+    next_module = compile_ir(module, metadata)
+                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/compiler.py", line 277, in stage
+    artifact = npubin_stage(src, metadata)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/compiler.py", line 1586, in <lambda>
+    lambda src, metadata: linalg_to_bin_enable_npu_compile_910_95(src, metadata, options))
+                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/compiler.py", line 740, in linalg_to_bin_enable_npu_compile_910_95
+    if npu_utils.has_device_limit():
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/driver.py", line 180, in has_device_limit
+    num_aic, num_aiv = self.get_device_core()
+                       ^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/backends/ascend/driver.py", line 174, in get_device_core
+    device = torch.npu.current_device()
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/utils.py", line 98, in current_device
+    torch_npu.npu._lazy_init()
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/npu/__init__.py", line 321, in _lazy_init
+    torch_npu._C._npu_init()
+RuntimeError: Initialize:../torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.cpp:198 NPU function error: aclInit, error code is 507008
+[ERROR] 2026-10-27-19:08:25 (PID:71, Device:0, RankID:-1) ERR00100 PTA call acl api failed
+[Error]: Failed to obtain the SOC version. 
+        Rectify the fault based on the error information in the ascend log.
+[PID: 71] 2026-10-27-19:08:25.105.857 Invalid_Argument(EE1001): The argument is invalid. Reason: rtGetDevMsg execution failed, the feature is not supported.
+        Solution: 1. Check the input parameter range of the function. 2. Check the function invocation relationship.
+TraceBack (most recent call last):
+        [Init][Version]init SoC version failed.[FUNC:ReportInnerError][FILE:log_inner.cpp][LINE:133]
+        chipType=CHIP_MINI(0) does not support get device msg feature.[FUNC:GetDevMsg][FILE:api_impl_standard_soc.cc][LINE:883]
+        The argument is invalid. Reason: rtGetDevMsg execution failed, the feature is not supported.
+
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "/scratch/strided_store.py", line 54, in <module>
+    compile_probe(parser.parse_args().output)
+  File "/scratch/strided_store.py", line 38, in compile_probe
+    compiled = triton.compile(
+               ^^^^^^^^^^^^^^^
+  File "/usr/local/python3.12.13/lib/python3.12/site-packages/triton/compiler/compiler.py", line 347, in compile
+    raise MLIRCompilationError(stage_name, error_detail) from e
+triton.compiler.errors.MLIRCompilationError: 
+///------------------[ERROR][Triton][BEG]------------------
+[ConvertLinalgIRToBinary] encounters error:
+Initialize:../torch_npu/csrc/core/npu/sys_ctrl/npu_sys_ctrl.cpp:198 NPU function error: aclInit, error code is 507008
+[ERROR] 2026-10-27-19:08:25 (PID:71, Device:0, RankID:-1) ERR00100 PTA call acl api failed
+[Error]: Failed to obtain the SOC version. 
+        Rectify the fault based on the error information in the ascend log.
+[PID: 71] 2026-10-27-19:08:25.105.857 Invalid_Argument(EE1001): The argument is invalid. Reason: rtGetDevMsg execution failed, the feature is not supported.
+        Solution: 1. Check the input parameter range of the function. 2. Check the function invocation relationship.
+TraceBack (most recent call last):
+        [Init][Version]init SoC version failed.[FUNC:ReportInnerError][FILE:log_inner.cpp][LINE:133]
+        chipType=CHIP_MINI(0) does not support get device msg feature.[FUNC:GetDevMsg][FILE:api_impl_standard_soc.cc][LINE:883]
+        The argument is invalid. Reason: rtGetDevMsg execution failed, the feature is not supported.
+
+
+[INFO]: The compiled kernel cache is in /scratch/cache/EQP2TYU2SBBF5NXIGESBFFP6NLUMGAEQRNBEDMKSPLRQUOIMTD4Q
+
+///------------------[ERROR][Triton][END]------------------
+

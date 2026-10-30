@@ -1,0 +1,156 @@
+{
+  "service_regimes": [
+    {
+      "id": "a5_bf16_grouped_two_bank_n6144_k3584_rows8to16",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_dtype": "bf16",
+        "metadata.input_format": "bf16",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_groups": 2,
+        "metadata.matrix_weight_bank_groups": 2,
+        "local_shape.1": 6144,
+        "local_shape.2": 3584
+      },
+      "coordinates": {
+        "min_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "min"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        }
+      },
+      "domain": {
+        "min_rows": {
+          "min": 8,
+          "max": 16
+        },
+        "max_rows": {
+          "min": 8,
+          "max": 16
+        }
+      },
+      "response": {
+        "fixed_us": 47.053,
+        "terms": []
+      },
+      "provenance": {
+        "boundary": "native GroupedMatmul BF16 device call, inclusive",
+        "fit_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+          "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
+          "size_bytes": 2367458
+        },
+        "raw_source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/kimi_k3_tp8_high_conc_decode_c32_p4k_20261030/kernel_details.csv",
+          "size_bytes": 83732721,
+          "mtime_ns": 1793304365000000000,
+          "schema_version": "kernel_details_csv_48col",
+          "sha256": "d734e9ec764b0f1baf35589d4886f6b9e2cd9254c660721f3ad6a86b0602c504"
+        },
+        "fit_statistic": "p50",
+        "fit_calls": 4232,
+        "fit_native_tensor": {
+          "capacity_rows": 64,
+          "weight_banks": 2,
+          "n": 6144,
+          "k": 3584,
+          "input_dtype": "bf16",
+          "weight_layout": "NCL",
+          "output_dtype": "bf16",
+          "block_num": 32
+        },
+        "fit_declared_active_rows": [
+          16,
+          16
+        ],
+        "row_identity": "forced-balanced caller declaration; raw group_list contents not captured",
+        "historical_split": "unassigned",
+        "this_analysis_role": "c32 p4k operator calibration",
+        "response_model": "stable two-bank small-row call plateau; no per-row interpolation or inferred HBM rate",
+        "excluded_domain": "min_rows<8: same-capacity populations have unresolved differing native timings",
+        "body_total_used": false
+      }
+    },
+    {
+      "id": "a5_bf16_grouped_two_bank_n3584_k3072_rows8to16",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_dtype": "bf16",
+        "metadata.input_format": "bf16",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_groups": 2,
+        "metadata.matrix_weight_bank_groups": 2,
+        "local_shape.1": 3584,
+        "local_shape.2": 3072
+      },
+      "coordinates": {
+        "min_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "min"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        }
+      },
+      "domain": {
+        "min_rows": {
+          "min": 8,
+          "max": 16
+        },
+        "max_rows": {
+          "min": 8,
+          "max": 16
+        }
+      },
+      "response": {
+        "fixed_us": 22.11,
+        "terms": []
+      },
+      "provenance": {
+        "boundary": "native GroupedMatmul BF16 device call, inclusive",
+        "fit_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+          "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
+          "size_bytes": 2367458
+        },
+        "raw_source_identity": {
+          "path": "/Volumes/data/mindie-sim-data/a5/kimi_k3_tp8_high_conc_decode_c32_p4k_20261030/kernel_details.csv",
+          "size_bytes": 83732721,
+          "mtime_ns": 1793304365000000000,
+          "schema_version": "kernel_details_csv_48col",
+          "sha256": "d734e9ec764b0f1baf35589d4886f6b9e2cd9254c660721f3ad6a86b0602c504"
+        },
+        "fit_statistic": "p50",
+        "fit_calls": 4232,
+        "fit_native_tensor": {
+          "capacity_rows": 64,
+          "weight_banks": 2,
+          "n": 3584,
+          "k": 3072,
+          "input_dtype": "bf16",
+          "weight_layout": "NCL",
+          "output_dtype": "bf16",
+          "block_num": 32
+        },
+        "fit_declared_active_rows": [
+          16,
+          16
+        ],
+        "row_identity": "forced-balanced caller declaration; raw group_list contents not captured",
+        "historical_split": "unassigned",
+        "this_analysis_role": "c32 p4k operator calibration",
+        "response_model": "stable two-bank small-row call plateau; no per-row interpolation or inferred HBM rate",
+        "excluded_domain": "min_rows<8: same-capacity populations have unresolved differing native timings",
+        "body_total_used": false
+      }
+    }
+  ]
+}

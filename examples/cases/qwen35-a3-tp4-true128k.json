@@ -1,0 +1,69 @@
+{
+  "name": "catalog-full-model-qwen35-a3-tp4-true128k",
+  "machine": {
+    "name": "a3-9362-4die-tp4",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 4,
+    "ranks_per_node": 4,
+    "note": "one A3 host (192.168.13.165), dies 0-3 = two two-die packages, one rank per die; the SKU profile materializes the two SIO intra-package links (448 GB/s) and the 4-die HCCS_SW intra-node fabric (196 GB/s)",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.5-35b-a3b",
+    "quantization": "W8A8_DYNAMIC"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 131072,
+        "output_tokens": 4096
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "max_model_len": 135168,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "kv_block_size": 128,
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "mtp_acceptance_by_output_tokens": {
+      "4096": 1.9882
+    },
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/Qwen3.5-35B-A3B-w8a8-mtp --host 0.0.0.0 --port 18232 --served-model-name qwen3.5 --trust-remote-code --distributed-executor-backend mp --data-parallel-size 1 --tensor-parallel-size 4 --quantization ascend --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 8192 --no-enable-prefix-caching --gpu-memory-utilization 0.90 --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 1}' --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' --additional-config '{\"enable_cpu_binding\": true}'",
+      "weights": "/mnt/weight/Qwen3.5-35B-A3B-w8a8-mtp: W8A8_DYNAMIC int8 body (10 shards, ~40 GB); measured per-die weight load 9.70 GB",
+      "host": "192.168.13.165 (A3, openEuler), 8 NPU packages x 2 dies = 16 dies of 65,536 MB; only dies 0-3 exposed to torch as ranks 0-3",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...), CANN 9.2.1, vLLM 0.30.0 / vllm-ascend 0.30.0rc2.dev200+g8fd0bc488",
+      "measured_baseline": ".workstreams/hp-serving/qwen35-a3-tp4/report.md (2026-10-24 01:22-02:00 CST, 192.168.13.165 dies 0-3); raw /Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-moe-tp4/; supplement .workstreams/hp-serving/qwen35-a3-tp4/supplement.md (2026-10-23 22:10-22:34 UTC, same host dies 0-3, max-num-seqs 16); raw /Volumes/data/mindie-sim-data/a3/2026-10-23/qwen35-moe-8k32k/",
+      "grid": "16 measured cells: p4096/p16384/p65536/p126976 at c1/c4 plus the 8k/32k supplement at c1/c2/c4/c8. The supplement cells materialize max_num_seqs 16 (their measured serving cap) through the cells manifest's per-cell runtime override; the original eight cells keep the base 8. No latency is stored here.",
+      "max_num_seqs_note": "runtime.max_num_seqs 8 is the original 4k/16k/64k/127k recipe. The 8k/32k supplement ran 16 (the only recipe delta; the KV pool was unchanged) and each supplement cell declares that cap per cell; the profile row binds only a case whose max_num_seqs equals the row's measured cap.",
+      "mtp": "MTP n=1: qwen3_5_mtp with num_speculative_tokens=1; the served streams committed 1.962-2.003 tokens per step at o4096 (mean 1.9882), declared from the measured acceptance",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 1,
+      "enable_prefix_caching": "false",
+      "scheduler_admission": "prefill_drain",
+      "scheduler_evidence": "served 127k c4 trace: 62 full 8,192-token chunk forwards + one 188-token forward precede the first decode attention call; the o4096 client stream mixes prefill and decode only in a short prefix, and its steady tail is the pure-decode interval declared here; under head_then_defer the simulator emitted 16 prefill / 47 mixed / 17 decode iterations and charged other requests' prompt chunks to r0's inter-token interval",
+      "graph": "FULL_DECODE_ONLY: decode replayed from captured buckets [1,2,4,8,16], prefill eager; graph capture 11 s / 0.27 GiB",
+      "kv_cache": "kv block 128 (CUSTOM backend); attention block 640 tokens so the mamba page is <= attention page (21.21% attention padding); measured pool 4,002,354 tokens / 43.26 GiB per die = 30.54x at 131,072",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted",
+      "true_128k": "prompt 131072 + output 4096; model max_position=262144; deployment recipe maxlen 131072"
+    }
+  }
+}

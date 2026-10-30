@@ -1,0 +1,59 @@
+{
+  "source_kind": "independent_clean_local_source; not_capture_installed_binary",
+  "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
+  "sources": [
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/quant_parser.py",
+      "sha256": "be06d3ee915671401c31ccb183312c0b2e177dc082b459a37497cf60f2a5d247"
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
+      "sha256": "eb6a3ce767619638eee74451267529233aa81fee67b229bd168c16b42e16926a"
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py",
+      "sha256": "9f01afd72f299e3617d4e89059840102fd7df93358f82f372daede7a723aaa16"
+    }
+  ],
+  "schemes": {
+    "W8A8_MXFP8": {
+      "activation": "fp8_e4m3",
+      "weight": "fp8_e4m3",
+      "scales": "fp8_e8m0",
+      "group_size_from_checkpoint": 32
+    },
+    "W4A8_MXFP": {
+      "activation": "fp8_e4m3",
+      "weight": "packed_fp4_e2m1",
+      "scales": "fp8_e8m0",
+      "group_size_from_checkpoint": 32
+    }
+  },
+  "evidence_lines": {
+    "quant_parser.py": [
+      7,
+      23
+    ],
+    "w4a8_mxfp4.py": [
+      64,
+      111
+    ],
+    "w8a8_mxfp8.py": [
+      45,
+      79
+    ]
+  },
+  "limitations": [
+    "FLOAT does not mean FP32; sampled checkpoint headers independently show BF16 for floating matrix weights.",
+    "Safetensors U8 FP4 payload and E8M0 scales require loader interpretation; do not use U8 storage dtype as compute INT8.",
+    "Checkpoint scheme is independent configuration evidence; it does not establish historical installed binary source identity."
+  ],
+  "metadata_report": {
+    "path": "/tmp/kimi-checkpoint-module-quant-20261029.json",
+    "sha256": "f4942357bcd4d8baae034d4f344e488a0281e7448af03ca54b3a3c3dd2494394"
+  },
+  "extractor": {
+    "path": "/tmp/kimi_checkpoint_metadata_audit_20261029.py",
+    "sha256": "85936753e7cf8363f421123e07c3e489e3df522e3e5d44586889164e862cd1ee"
+  }
+}

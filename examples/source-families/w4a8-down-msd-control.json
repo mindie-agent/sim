@@ -1,0 +1,159 @@
+{
+  "machine": {
+    "name": "synthetic-w4a8-down-msd-source-control",
+    "architecture": "declared",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0,
+        "int8": 1000000000.0,
+        "int4": 500000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0
+      },
+      "compute_units": 4,
+      "resource_units": {
+        "vector": 8
+      }
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [
+          0
+        ],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "w4a8-down-msd-geometry",
+    "layers": 1,
+    "hidden_size": 64,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "ffn": "moe",
+    "num_experts": 4,
+    "top_k": 2,
+    "moe_intermediate_size": 64,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "quant": {
+      "name": "declared_w4a8_msd",
+      "weight_format": "int4",
+      "activation_format": "int8",
+      "expert_weight_format": "int4",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "source": [],
+      "notes": [],
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 4,
+        "output_tokens": 3
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "routing": {
+      "realizations": [
+        {
+          "scope": "body",
+          "layer": 0,
+          "phase": "prefill",
+          "tokens": 4,
+          "expert_rows": [
+            3,
+            0,
+            3,
+            2
+          ]
+        },
+        {
+          "scope": "body",
+          "layer": 0,
+          "phase": "decode",
+          "tokens": 1,
+          "expert_rows": [
+            1,
+            0,
+            1,
+            0
+          ]
+        }
+      ]
+    },
+    "kernels": {
+      "lowerings": {
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "grouped_gate_up_activation_quant"
+            ],
+            "program_profiles": {
+              "grouped_gate_up_activation_quant": "ascend_w4a8_msd"
+            }
+          }
+        },
+        "grouped_gemm": {
+          "implementation": "ascend_w4a8_msd_grouped_down",
+          "recipes": [
+            "grouped_down",
+            "balanced_grouped_down"
+          ]
+        }
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not accelerator specifications or calibration",
+      "implementation_scope": "declared ordinary A8W4 MSD grouped-down INT8 x INT4 -> BF16 source domain; separate input dynamic quantization producer retained",
+      "routing": "explicit integer expert_rows; no probability histogram",
+      "implementation_binding": "grouped_gemm recipe filter selects only grouped_down/balanced_grouped_down; the gate/MSD native-fusion profile remains a separate declaration"
+    },
+    "lowering_passes": [
+      "activation_quantization"
+    ]
+  }
+}

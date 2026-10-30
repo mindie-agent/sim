@@ -1,0 +1,55 @@
+{
+  "c1": {
+    "counts": {
+      "attention_fused": 16
+    },
+    "hbm_gb": {
+      "attention_fused": 81.651433472
+    },
+    "total_hbm_gb": 81.651433472
+  },
+  "c4": {
+    "counts": {
+      "attention_fused": 16,
+      "attention_pv": 48,
+      "attention_qk": 48,
+      "attention_softmax": 48
+    },
+    "hbm_gb": {
+      "attention_fused": 219.249967104,
+      "attention_pv": 108.66398656,
+      "attention_qk": 108.66398656,
+      "attention_softmax": 5.034436096
+    },
+    "total_hbm_gb": 441.61237632
+  },
+  "checks": [
+    {
+      "check": "c4_fused_count",
+      "detail": "16 != 16",
+      "ok": true
+    },
+    {
+      "check": "c4_component_ops_zero",
+      "detail": "qk/pv/softmax=144, expected 0",
+      "ok": false
+    },
+    {
+      "check": "c4_attention_hbm",
+      "detail": "441.612 GB not in [214.865,223.635]",
+      "ok": false
+    },
+    {
+      "check": "c4_c1_hbm_ratio",
+      "detail": "5.409 > 2.82",
+      "ok": false
+    },
+    {
+      "check": "c4_tasks",
+      "detail": "49434 > 35000",
+      "ok": false
+    }
+  ],
+  "status": "FAIL",
+  "tasks": 49434
+}

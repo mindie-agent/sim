@@ -1,0 +1,129 @@
+{
+ "cases": [
+  {
+   "batch": 1,
+   "context": 16384,
+   "decode_runs": 19,
+   "k1_tasks_per_run": [
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80,
+    80
+   ],
+   "task_count_histogram": {
+    "1380": 19
+   },
+   "tasks_per_decode_step": 1380.0,
+   "unique_task_ids_within_run": true
+  },
+  {
+   "batch": 4,
+   "context": 16384,
+   "decode_runs": 19,
+   "k1_tasks_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    80
+   ],
+   "task_count_histogram": {
+    "1300": 18,
+    "1380": 1
+   },
+   "tasks_per_decode_step": 1304.2105263157894,
+   "unique_task_ids_within_run": true
+  },
+  {
+   "batch": 1,
+   "context": 65536,
+   "decode_runs": 19,
+   "k1_tasks_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "task_count_histogram": {
+    "1300": 19
+   },
+   "tasks_per_decode_step": 1300.0,
+   "unique_task_ids_within_run": true
+  },
+  {
+   "batch": 4,
+   "context": 65536,
+   "decode_runs": 19,
+   "k1_tasks_per_run": [
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0,
+    0
+   ],
+   "task_count_histogram": {
+    "1300": 19
+   },
+   "tasks_per_decode_step": 1300.0,
+   "unique_task_ids_within_run": true
+  }
+ ]
+}

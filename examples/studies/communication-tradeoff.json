@@ -1,0 +1,107 @@
+{
+  "candidates": [
+    {
+      "id": "one-credit",
+      "case": "../quickstart.json",
+      "overrides": {
+        "machine": {
+          "num_devices": 2,
+          "links": [{
+            "name": "fabric",
+            "members": [0, 1],
+            "capacity_bytes_per_ms": 1000000,
+            "latency_us": 0,
+            "semantics": "shared",
+            "transaction_bytes": 384,
+            "alignment_bytes": 128,
+            "protocol_overhead_bytes": 16
+          }]
+        },
+        "runtime": {
+          "tp": 2,
+          "kernels": {
+            "families": {
+              "allreduce": {
+                "kind": "transfer",
+                "outstanding": 1,
+                "response_ms": 0.002
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "twice-link-bandwidth",
+      "case": "../quickstart.json",
+      "overrides": {
+        "machine": {
+          "num_devices": 2,
+          "links": [{
+            "name": "fabric",
+            "members": [0, 1],
+            "capacity_bytes_per_ms": 2000000,
+            "latency_us": 0,
+            "semantics": "shared",
+            "transaction_bytes": 384,
+            "alignment_bytes": 128,
+            "protocol_overhead_bytes": 16
+          }]
+        },
+        "runtime": {
+          "tp": 2,
+          "kernels": {
+            "families": {
+              "allreduce": {
+                "kind": "transfer",
+                "outstanding": 1,
+                "response_ms": 0.002
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "id": "eight-credits",
+      "case": "../quickstart.json",
+      "overrides": {
+        "machine": {
+          "num_devices": 2,
+          "links": [{
+            "name": "fabric",
+            "members": [0, 1],
+            "capacity_bytes_per_ms": 1000000,
+            "latency_us": 0,
+            "semantics": "shared",
+            "transaction_bytes": 384,
+            "alignment_bytes": 128,
+            "protocol_overhead_bytes": 16
+          }]
+        },
+        "runtime": {
+          "tp": 2,
+          "kernels": {
+            "families": {
+              "allreduce": {
+                "kind": "transfer",
+                "outstanding": 8,
+                "response_ms": 0.002
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "probes": [
+    {"id": "decode1k", "phase": "decode", "tokens": 1, "context": 1024},
+    {"id": "prefill17", "phase": "prefill", "tokens": 17}
+  ],
+  "options": {
+    "level": "graph",
+    "serving": false,
+    "top_families": 6,
+    "max_evaluations": 6
+  }
+}

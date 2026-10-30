@@ -1,0 +1,146 @@
+{
+  "name": "glm53flash-a3-tp16-c16-livepre-body-input:attention-only",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 16,
+    "ranks_per_node": 16
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "int8",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "KDA_nonempty_accepted_token_state_ABI_not_source_bound",
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "KDA_analytic_state_boundary",
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/glm5_3_flash_w8a8_high_conc_decode_livepre_tpot50_c16_20261030",
+      "client_concurrency": 16,
+      "captured_execution_mode": "not_established",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentKda",
+          "tensor_batch_slots": 1,
+          "query_rows_per_slot": 6,
+          "tensor_query_rows": 6,
+          "first_csv_row": 4012,
+          "sample_count": 38,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "manifest_contains_repeated_rank_from_distinct_windows; physical_ranks_counted_once",
+        "force_eplb_not_established; do_not_enable_balanced_routing",
+        "INT8_KV_payload_proven_but_scale_packing_and_sparse_KV_kernel_not_bound",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "compatible_variant": {
+        "variant": "attention-only",
+        "not_observed_dispatch": true,
+        "scope": "conditional body declaration; unchanged precision and routing",
+        "indexed": {
+          "kind": "indexed_attention_packed_int8",
+          "scratch_policy": "offchip",
+          "operand_modes": true
+        },
+        "source_down": false,
+        "KDA": "existing analytic decomposition retained; accepted-state ABI unbound",
+        "evidence_assumptions": {
+          "indexed_captured_schedule_and_valid_mask_identity": "not_established",
+          "indexed_geometry_extension": "packed_INT8_528_is_not_retained_native_672_kernel",
+          "MXFP8_down_captured_dispatch_identity": "not_selected",
+          "scope": "evidence limitations, not model structural coverage"
+        },
+        "validation": "mechanism execution only; no claimed body or kernel accuracy"
+      }
+    },
+    "kernels": {
+      "programs": {
+        "indexed_attention": {
+          "kind": "indexed_attention_packed_int8",
+          "scratch_policy": "offchip",
+          "operand_modes": true
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4096,
+        "output_tokens": 96
+      }
+    ]
+  }
+}

@@ -1,0 +1,369 @@
+{
+  "elapsed": 1.2884146600000008,
+  "files_scanned": 11846,
+  "results": [
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/include/platform/platform_infos_def.h",
+      "resolved": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_infos_def.h",
+      "sha256": "4d5ff628b606cb161c88a96558a57c60e71b088f8be25437b076b2d1dcf0e5f2",
+      "lines": [
+        [
+          34,
+          "    bool GetPlatformResWithLock(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          35,
+          "    bool GetPlatformResWithLock(std::map<std::string, std::map<std::string, std::string>>& res);"
+        ],
+        [
+          36,
+          "    uint32_t GetCoreNum() const;"
+        ],
+        [
+          37,
+          "    uint32_t GetCoreNumWithLock() const;"
+        ],
+        [
+          38,
+          "    void GetLocalMemSize(const LocalMemType& mem_type, uint64_t& size);"
+        ],
+        [
+          39,
+          "    void GetLocalMemBw(const LocalMemType& mem_type, uint64_t& bw_size);"
+        ],
+        [
+          40,
+          ""
+        ],
+        [
+          41,
+          "    void SetAICoreIntrinsicDtype(std::map<std::string, std::vector<std::string>>& intrinsic_dtypes);"
+        ],
+        [
+          42,
+          "    void SetVectorCoreIntrinsicDtype(std::map<std::string, std::vector<std::string>>& intrinsic_dtypes);"
+        ],
+        [
+          43,
+          "    void SetPlatformRes(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          44,
+          "    void SetPlatformResWithLock(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          45,
+          "    std::map<std::string, std::vector<std::string>> GetFixPipeDtypeMap();"
+        ],
+        [
+          46,
+          "    void SetFixPipeDtypeMap(const std::map<std::string, std::vector<std::string>>& fixpipe_dtype_map);"
+        ],
+        [
+          47,
+          "    void SetCoreNumByCoreType(const std::string& core_type);"
+        ],
+        [
+          48,
+          "    void SetCoreNum(const uint32_t& core_num);"
+        ]
+      ]
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/include/platform/platform_info_def.h",
+      "resolved": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_info_def.h",
+      "sha256": "5ffeb4a8debcedc30d19cba6075c0f4601d2434fc2e52620a22423c58f5af9ad",
+      "lines": [
+        [
+          92,
+          "    double l2_read_rate;"
+        ],
+        [
+          93,
+          "    double l2_write_rate;"
+        ],
+        [
+          94,
+          "    double l1_to_l0_a_rate;"
+        ],
+        [
+          95,
+          "    double l1_to_l0_b_rate;"
+        ],
+        [
+          96,
+          "    double l1_to_ub_rate;"
+        ],
+        [
+          97,
+          "    double l0_c_to_ub_rate;"
+        ],
+        [
+          98,
+          "    double ub_to_l2_rate;"
+        ],
+        [
+          99,
+          "    double ub_to_ddr_rate;"
+        ],
+        [
+          100,
+          "    double ub_to_l1_rate;"
+        ],
+        [
+          101,
+          "} AiCoreMemoryRates;"
+        ],
+        [
+          102,
+          ""
+        ],
+        [
+          103,
+          "typedef struct tag_vector_core_spec {"
+        ],
+        [
+          104,
+          "    double vec_freq;"
+        ],
+        [
+          105,
+          "    uint64_t vec_calc_size;"
+        ],
+        [
+          106,
+          "    uint64_t smask_buffer;"
+        ],
+        [
+          107,
+          "    uint64_t ub_size;"
+        ],
+        [
+          108,
+          "    uint64_t ubblock_size;"
+        ],
+        [
+          109,
+          "    uint64_t ubbank_size;"
+        ]
+      ]
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_infos_def.h",
+      "resolved": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_infos_def.h",
+      "sha256": "4d5ff628b606cb161c88a96558a57c60e71b088f8be25437b076b2d1dcf0e5f2",
+      "lines": [
+        [
+          34,
+          "    bool GetPlatformResWithLock(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          35,
+          "    bool GetPlatformResWithLock(std::map<std::string, std::map<std::string, std::string>>& res);"
+        ],
+        [
+          36,
+          "    uint32_t GetCoreNum() const;"
+        ],
+        [
+          37,
+          "    uint32_t GetCoreNumWithLock() const;"
+        ],
+        [
+          38,
+          "    void GetLocalMemSize(const LocalMemType& mem_type, uint64_t& size);"
+        ],
+        [
+          39,
+          "    void GetLocalMemBw(const LocalMemType& mem_type, uint64_t& bw_size);"
+        ],
+        [
+          40,
+          ""
+        ],
+        [
+          41,
+          "    void SetAICoreIntrinsicDtype(std::map<std::string, std::vector<std::string>>& intrinsic_dtypes);"
+        ],
+        [
+          42,
+          "    void SetVectorCoreIntrinsicDtype(std::map<std::string, std::vector<std::string>>& intrinsic_dtypes);"
+        ],
+        [
+          43,
+          "    void SetPlatformRes(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          44,
+          "    void SetPlatformResWithLock(const std::string& label, std::map<std::string, std::string>& res);"
+        ],
+        [
+          45,
+          "    std::map<std::string, std::vector<std::string>> GetFixPipeDtypeMap();"
+        ],
+        [
+          46,
+          "    void SetFixPipeDtypeMap(const std::map<std::string, std::vector<std::string>>& fixpipe_dtype_map);"
+        ],
+        [
+          47,
+          "    void SetCoreNumByCoreType(const std::string& core_type);"
+        ],
+        [
+          48,
+          "    void SetCoreNum(const uint32_t& core_num);"
+        ]
+      ]
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_info_def.h",
+      "resolved": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/include/platform/platform_info_def.h",
+      "sha256": "5ffeb4a8debcedc30d19cba6075c0f4601d2434fc2e52620a22423c58f5af9ad",
+      "lines": [
+        [
+          92,
+          "    double l2_read_rate;"
+        ],
+        [
+          93,
+          "    double l2_write_rate;"
+        ],
+        [
+          94,
+          "    double l1_to_l0_a_rate;"
+        ],
+        [
+          95,
+          "    double l1_to_l0_b_rate;"
+        ],
+        [
+          96,
+          "    double l1_to_ub_rate;"
+        ],
+        [
+          97,
+          "    double l0_c_to_ub_rate;"
+        ],
+        [
+          98,
+          "    double ub_to_l2_rate;"
+        ],
+        [
+          99,
+          "    double ub_to_ddr_rate;"
+        ],
+        [
+          100,
+          "    double ub_to_l1_rate;"
+        ],
+        [
+          101,
+          "} AiCoreMemoryRates;"
+        ],
+        [
+          102,
+          ""
+        ],
+        [
+          103,
+          "typedef struct tag_vector_core_spec {"
+        ],
+        [
+          104,
+          "    double vec_freq;"
+        ],
+        [
+          105,
+          "    uint64_t vec_calc_size;"
+        ],
+        [
+          106,
+          "    uint64_t smask_buffer;"
+        ],
+        [
+          107,
+          "    uint64_t ub_size;"
+        ],
+        [
+          108,
+          "    uint64_t ubblock_size;"
+        ],
+        [
+          109,
+          "    uint64_t ubbank_size;"
+        ]
+      ]
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/common/utils/op_util/op_util_conv2d.py",
+      "resolved": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/common/utils/op_util/op_util_conv2d.py",
+      "sha256": "829b25f0e8488f37f54f313f06112b153352b18b61b56802c41529a48bb41553",
+      "lines": [
+        [
+          1168,
+          "                              \"ub_size\", \"bt_size\","
+        ],
+        [
+          1169,
+          "                              \"ddr_read_rate\", \"ddr_write_rate\","
+        ],
+        [
+          1170,
+          "                              \"l2_rate\", \"l2_read_rate\","
+        ],
+        [
+          1171,
+          "                              \"l2_write_rate\", \"l1_to_l0_a_rate\","
+        ],
+        [
+          1172,
+          "                              \"l1_to_l0_b_rate\", \"l1_to_ub_rate\","
+        ],
+        [
+          1173,
+          "                              \"l0_c_to_ub_rate\", \"ub_to_l2_rate\","
+        ],
+        [
+          1174,
+          "                              \"ub_to_ddr_rate\", \"ub_to_l1_rate\"]"
+        ],
+        [
+          1175,
+          "    for platform_key in platform_info_name_int:"
+        ],
+        [
+          1176,
+          "        if platform.platform_info.get_soc_spec(platform_key) is None:"
+        ],
+        [
+          1177,
+          "            raise RuntimeError(\"get_soc_spec {} failed!\".format(platform_key))"
+        ],
+        [
+          1178,
+          ""
+        ],
+        [
+          1179,
+          "        if platform.platform_info.get_soc_spec(platform_key) == \"unknown\":"
+        ],
+        [
+          1180,
+          "            hardware_info_dict[platform_key] = 0"
+        ],
+        [
+          1181,
+          "            continue"
+        ],
+        [
+          1182,
+          ""
+        ],
+        [
+          1183,
+          "        if platform_key == \"ai_core_cnt\":"
+        ]
+      ]
+    }
+  ]
+}

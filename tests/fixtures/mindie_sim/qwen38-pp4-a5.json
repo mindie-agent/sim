@@ -1,0 +1,351 @@
+{
+  "schema_version": "mindie-sim.pp-measurement/1",
+  "kind": "a5_qwen38_pp4_prefill_ttft",
+  "label": "a5-qwen38-27b-tp8-pp4-prefill",
+  "source": ".workstreams/hp-serving/qwen38-pp4/report.md",
+  "measured_utc": "2026-10-22",
+  "machine": {
+    "arch_family": "A5",
+    "hosts": 4,
+    "dies_per_host": 8,
+    "total_dies": 32,
+    "clock_caveat": "the four device clocks are not aligned; only durations and per-stage unions are used"
+  },
+  "model": {
+    "key": "qwen3.8-27b",
+    "num_hidden_layers": 64,
+    "hidden_size": 5120,
+    "num_attention_heads": 24,
+    "num_kv_heads": 4,
+    "head_dim": 256,
+    "kv_dtype_bytes": 2,
+    "full_attention_interval": 4,
+    "full_attention_layers": 16,
+    "kv_bytes_per_token": 65536,
+    "mtp_layers": 1,
+    "tp": 8
+  },
+  "protocol": {
+    "workload": "prefill-only P node (no D node, no KV transfer)",
+    "metric": "TTFT at output_tokens=1, median over 4 requests",
+    "units": "ms",
+    "max_num_batched_tokens": 16384,
+    "chunk_sweep": [
+      16384,
+      8192,
+      4096
+    ],
+    "partition": [
+      16,
+      16,
+      16,
+      16
+    ],
+    "partition_source": "vLLM default get_pp_indices(64, rank, 4)",
+    "c4_note": "c4 TTFT is engine-serialised; at p64k the ordering flips and big chunks win",
+    "chunk_note": "batch 16384 gives exactly one chunk for a 16k prompt (serial 4-stage pipe) and four chunks for 64k"
+  },
+  "cells": [
+    {
+      "prompt_tokens": 4096,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 154.2,
+        "pp2": 157.9,
+        "pp4": 157.1
+      },
+      "per_request_ms": [
+        228.0,
+        159.83,
+        153.66,
+        154.32
+      ],
+      "median_all_ms": 157.07,
+      "median_usable_ms": 157.1,
+      "usable_samples": 4,
+      "note": ""
+    },
+    {
+      "prompt_tokens": 16384,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 556.7,
+        "pp2": 452.8,
+        "pp4": 542.3
+      },
+      "per_request_ms": [
+        2156.77,
+        542.34,
+        539.45,
+        544.11
+      ],
+      "median_all_ms": 543.23,
+      "median_usable_ms": 542.3,
+      "usable_samples": 3,
+      "note": ""
+    },
+    {
+      "prompt_tokens": 65536,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 2500.7,
+        "pp2": 1629.0,
+        "pp4": 1288.3
+      },
+      "per_request_ms": [
+        1296.73,
+        1282.07,
+        1284.32,
+        1292.35
+      ],
+      "median_all_ms": 1288.34,
+      "median_usable_ms": 1288.3,
+      "usable_samples": 4,
+      "note": ""
+    },
+    {
+      "prompt_tokens": 4096,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 385.5,
+        "pp2": 388.9,
+        "pp4": 491.4
+      },
+      "per_request_ms": [
+        492.09,
+        491.72,
+        491.12,
+        168.96
+      ],
+      "median_all_ms": 491.42,
+      "median_usable_ms": 491.4,
+      "usable_samples": 4,
+      "note": ""
+    },
+    {
+      "prompt_tokens": 16384,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 1265.0,
+        "pp2": 863.1,
+        "pp4": 1081.6
+      },
+      "per_request_ms": [
+        1150.99,
+        1012.23,
+        1289.68,
+        556.33
+      ],
+      "median_all_ms": 1081.61,
+      "median_usable_ms": 1081.6,
+      "usable_samples": 4,
+      "note": ""
+    },
+    {
+      "prompt_tokens": 65536,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 5824.3,
+        "pp2": 3467.7,
+        "pp4": 1973.9
+      },
+      "per_request_ms": [
+        2625.6,
+        1318.99,
+        3265.58,
+        1973.93
+      ],
+      "median_all_ms": 2299.76,
+      "median_usable_ms": 1973.9,
+      "usable_samples": 3,
+      "note": "one request returned its token as an empty SSE delta; its e2e bounds TTFT and is used for the all-request median"
+    }
+  ],
+  "chunk_sweep": [
+    {
+      "max_num_batched_tokens": 8192,
+      "prompt_tokens": 16384,
+      "concurrency": 1,
+      "ttft_ms": 397.4,
+      "median_all_ms": 399.52,
+      "per_request_ms": [
+        428.0,
+        401.64,
+        397.4,
+        397.09
+      ],
+      "usable_samples": 3
+    },
+    {
+      "max_num_batched_tokens": 8192,
+      "prompt_tokens": 65536,
+      "concurrency": 1,
+      "ttft_ms": 1171.2,
+      "median_all_ms": 1171.18,
+      "per_request_ms": [
+        1192.62,
+        1173.13,
+        1165.72,
+        1169.23
+      ],
+      "usable_samples": 4
+    },
+    {
+      "max_num_batched_tokens": 8192,
+      "prompt_tokens": 16384,
+      "concurrency": 4,
+      "ttft_ms": 736.4,
+      "median_all_ms": 736.38,
+      "per_request_ms": [
+        413.19,
+        963.49,
+        811.59,
+        661.18
+      ],
+      "usable_samples": 4
+    },
+    {
+      "max_num_batched_tokens": 8192,
+      "prompt_tokens": 65536,
+      "concurrency": 4,
+      "ttft_ms": 2249.1,
+      "median_all_ms": 2249.06,
+      "per_request_ms": [
+        1898.53,
+        2599.59,
+        3289.68,
+        1205.77
+      ],
+      "usable_samples": 4
+    },
+    {
+      "max_num_batched_tokens": 4096,
+      "prompt_tokens": 16384,
+      "concurrency": 1,
+      "ttft_ms": 346.4,
+      "median_all_ms": 350.18,
+      "per_request_ms": [
+        418.98,
+        345.55,
+        346.4,
+        353.96
+      ],
+      "usable_samples": 3
+    },
+    {
+      "max_num_batched_tokens": 4096,
+      "prompt_tokens": 65536,
+      "concurrency": 1,
+      "ttft_ms": 1204.7,
+      "median_all_ms": 1204.74,
+      "per_request_ms": [
+        1225.08,
+        1204.93,
+        1199.98,
+        1204.54
+      ],
+      "usable_samples": 4
+    },
+    {
+      "max_num_batched_tokens": 4096,
+      "prompt_tokens": 16384,
+      "concurrency": 4,
+      "ttft_ms": 630.2,
+      "median_all_ms": 630.16,
+      "per_request_ms": [
+        542.13,
+        365.64,
+        892.32,
+        718.19
+      ],
+      "usable_samples": 4
+    },
+    {
+      "max_num_batched_tokens": 4096,
+      "prompt_tokens": 65536,
+      "concurrency": 4,
+      "ttft_ms": 2429.0,
+      "median_all_ms": 2429.01,
+      "per_request_ms": [
+        2826.24,
+        2031.79,
+        3621.05,
+        1229.73
+      ],
+      "usable_samples": 4
+    }
+  ],
+  "trace": {
+    "prompt_tokens": 16384,
+    "concurrency": 1,
+    "max_num_batched_tokens": 16384,
+    "partition": [
+      16,
+      16,
+      16,
+      16
+    ],
+    "chunks_per_step": 1,
+    "stage_compute_ms": [
+      73.53,
+      73.51,
+      73.53,
+      94.91
+    ],
+    "stage_wall_ms": [
+      464.19,
+      416.58,
+      370.32,
+      324.26
+    ],
+    "stage_hccl_ms": [
+      45.49,
+      110.89,
+      170.25,
+      255.14
+    ],
+    "wait_union_ms": [
+      105.13,
+      171.65,
+      230.89,
+      319.36
+    ],
+    "stage_rows": [
+      16088,
+      16034,
+      16034,
+      20578
+    ],
+    "one_chunk_ttft_ms": 542.3,
+    "four_chunk_ttft_ms": 346.4
+  },
+  "per_die_efficiency_vs_tp1": {
+    "prompt_tokens": [
+      4096,
+      16384,
+      65536
+    ],
+    "pp1": [
+      0.38,
+      0.43,
+      0.52
+    ],
+    "pp2": [
+      0.19,
+      0.27,
+      0.4
+    ],
+    "pp4": [
+      0.094,
+      0.111,
+      0.25
+    ],
+    "derivation": "speedup over the same single-die TP1 run (472.4/1934.9/10320.5 ms) divided by 32 dies",
+    "note": "at p16k 32 dies are 3% faster than 8 dies: a 4-stage pipe with one chunk is serial"
+  },
+  "notes": [
+    "P-node prefill only; no D node, no KV transfer, no decode claim",
+    "one traced step at one length is not a distribution",
+    "the last stage carries MTP + final norm + lm_head and is 29.1% slower than stages 0-2"
+  ]
+}

@@ -1,0 +1,42 @@
+{
+  "machine": {
+    "name": "activation-call-declared-nominal-resources",
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 1,
+    "device": {
+      "launch_us": 20
+    },
+    "assumptions": {
+      "profile": "Existing registered SKU geometry and nominal rates; not measured on the retained capture's acquisition run.",
+      "launch_us": "20 microseconds is an explicit nominal API-node submission scenario, not a fitted host gap or an identified native-kernel launch count.",
+      "comparison": "Retained event durations are independent observations. Unknown Python, allocator, event and backend dispatch behavior remains unresolved."
+    }
+  },
+  "model": {
+    "name": "unused-call-context",
+    "layers": 1,
+    "hidden_size": 8,
+    "num_heads": 1,
+    "num_kv_heads": 1,
+    "head_dim": 8,
+    "intermediate_size": 8,
+    "vocab_size": 8
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "unused-by-call-analysis",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "graph_mode": "none"
+  }
+}

@@ -1,0 +1,485 @@
+{
+  "name": "catalog-full-model-glm53-a3-w4a8-reduced",
+  "machine": {
+    "name": "a3-9362-8die-tp8",
+    "architecture": "A3",
+    "hardware_key": "Ascend910_9362",
+    "sku": "Ascend910_9362",
+    "devices": [
+      {
+        "rank": 0,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 0,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 1,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 0,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 2,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 1,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 3,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 1,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 4,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 2,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 5,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 2,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 6,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 3,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      },
+      {
+        "rank": 7,
+        "memory_bytes": 68719476736,
+        "compute_peaks": {
+          "bf16": 270336000000000.0,
+          "fp16": 270336000000000.0,
+          "fp32": 135168000000000.0,
+          "int8": 540672000000000.0,
+          "int4": 1081344000000000.0
+        },
+        "rates": {
+          "hbm": 1200000000000.0,
+          "vector": 2112000000000.0
+        },
+        "buffers": {
+          "l0a": 65536,
+          "l0b": 65536,
+          "l0c": 131072,
+          "l1": 524288,
+          "ub": 196608
+        },
+        "compute_units": 20,
+        "launch_us": 20.0,
+        "node": 0,
+        "package": 3,
+        "resource_units": {
+          "vector": 40
+        },
+        "buffer_units": {
+          "l0a": 20,
+          "l0b": 20,
+          "l0c": 20,
+          "l1": 20,
+          "ub": 40
+        },
+        "service_modes": {}
+      }
+    ],
+    "links": [
+      {
+        "name": "d2d_intra_package:0",
+        "capacity_bytes_per_ms": 448000000.0,
+        "members": [
+          0,
+          1
+        ],
+        "latency_us": 0.8,
+        "channel": "d2d_intra_package",
+        "semantics": "per_port"
+      },
+      {
+        "name": "d2d_intra_package:2",
+        "capacity_bytes_per_ms": 448000000.0,
+        "members": [
+          2,
+          3
+        ],
+        "latency_us": 0.8,
+        "channel": "d2d_intra_package",
+        "semantics": "per_port"
+      },
+      {
+        "name": "d2d_intra_package:4",
+        "capacity_bytes_per_ms": 448000000.0,
+        "members": [
+          4,
+          5
+        ],
+        "latency_us": 0.8,
+        "channel": "d2d_intra_package",
+        "semantics": "per_port"
+      },
+      {
+        "name": "d2d_intra_package:6",
+        "capacity_bytes_per_ms": 448000000.0,
+        "members": [
+          6,
+          7
+        ],
+        "latency_us": 0.8,
+        "channel": "d2d_intra_package",
+        "semantics": "per_port"
+      },
+      {
+        "name": "d2d_intra_node:0",
+        "capacity_bytes_per_ms": 196000000.0,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "latency_us": 2.5,
+        "channel": "d2d_intra_node",
+        "semantics": "per_port"
+      }
+    ],
+    "ranks_per_node": 8,
+    "dies_per_package": 2,
+    "assumptions": {
+      "launch_us": "20 nominal unless explicitly overridden",
+      "memory_path": "aggregate memory service; internal copy engines require explicit rates",
+      "profile": "registered SKU geometry and nominal rates",
+      "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
+      "int4_peak_basis": "Explicit AIC-C-220 DT_INT4=16,64,16 versus DT_INT8=16,32,16: 2x nominal matrix block work at the unchanged existing case 1650MHz basis. Current-host toolkit is not capture binary identity; no timing fit, no other profile replacement."
+    }
+  },
+  "model": {
+    "catalog_key": "GLM-5.3-W4A8",
+    "quantization": "w4a8_dynamic"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 4096,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 16,
+    "max_model_len": 73728,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.97,
+    "graph_mode": "auto",
+    "vllm_impl": "vllm-ascend-0.30.0rc2.dev200+g8fd0bc488",
+    "vllm_version": "0.30.0rc2.dev200+g8fd0bc488",
+    "kernel_format": "bf16",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "kv_block_size": 128,
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/GLM-5.3-W4A8-INT --served-model-name glm53-w4a8 --host 0.0.0.0 --port 18236 --tensor-parallel-size 8 --distributed-executor-backend mp --quantization ascend --trust-remote-code --max-model-len 73728 --max-num-seqs 16 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.97 --enable-chunked-prefill --no-enable-prefix-caching --model-loader-extra-config '{\"enable_multithread_load\": true, \"num_threads\": 128}'",
+      "weights": "GLM-5.3-W4A8-INT (378 GiB, 99 shards); 78 body layers, hidden 6144, 256 routed experts top-8 + 1 shared, MLA kv_lora_rank 512 / q_lora_rank 2048, qk 192+64 rope, v 256, DSA index_topk 2048, vocab 154 880; measured per-rank weight load 49.6497 GB (x8 = 397 GB); W4A8_DYNAMIC routed experts + W8A8_DYNAMIC attention/shared/dense + FLOAT norms/gates/embedding/LM head; served expert layout is TP8 (expert_parallel 1): 256 expert groups resident on every rank at 1/8 intermediate width (gate/up n=512, down k=256 per rank), 45.30 GB of expert weights per rank, zero dispatch/combine/all-to-all kernels",
+      "host": "192.168.13.165 (A3, openEuler), 8 NPU packages x 2 dies = 16 dies of 65 536 MB; only dies 8-15 exposed to torch as ranks 0-7",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...)",
+      "fabric": "4 SIO intra-package die pairs (448 GB/s, direct) + one 8-die HCCS_SW switched intra-node fabric (196 GB/s declared default); TP8 all-reduce spans four packages (measured 8-rank hcom_allReduce: attention alpha 24.75 us / 93.66 GB/s payload, expert-MLP alpha 31.37 us / 101.90 GB/s payload); the served trace carries 157 all-reduces per forward and zero all-to-all",
+      "measured_baseline": ".workstreams/hp-serving/glm53-a3-w4a8/report.md (2026-10-23, 192.168.13.165 dies 8-15)",
+      "mtp": "none: speculative_config=None in the measured serve log; the checkpoint's one num_nextn_predict_layers layer is loaded but never run, so one token per sequence per step",
+      "reduced_config": true,
+      "reduced_config_reason": "the briefed 131 072 @ gmu 0.90 recipe fails engine init on 64 GiB dies (11.62 GiB KV needed vs 3.68 GiB available; estimated max model length 41 472). The measured recipe is max-model-len 73 728 @ gmu 0.97 (KV 7.98 GiB / 89 856 tokens / 1.22x). Every measured cell is reduced_config and the 126 976 row cannot exist at this max_model_len.",
+      "unsupported_context": "131072 (and any prompt+output above 73728) is unsupported on this TP8/64 GiB configuration; it is refused, never extrapolated",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted",
+      "expert_parallel": "the served recipe does not pass --enable-expert-parallel: the trace shows 256 expert groups resident on every rank at 1/8 intermediate width and zero dispatch/combine/all-to-all kernels, so the case declares ep=1 (TP8 expert sharding). The EP8 32-local-expert layout in the original case was a modeling error; an EP8 dispatch/combine row was never measured and is declared missing.",
+      "enable_prefix_caching": false,
+      "graph": "cudagraph_mode=FULL_AND_PIECEWISE (decode-FULL + piecewise prefill); cudagraph_capture_sizes=[1,2,4,8,16]; Graph capturing finished in 18 secs, took 0.21 GiB; no --compilation-config flag was passed, this is the image default",
+      "kv_cache": "Setting kv cache block size to 128 for ASCEND_SFA_INDEXER backend; Available KV cache memory: 7.98 GiB -> NPU KV cache size: 89,856 tokens, Maximum concurrency for 73,728 tokens per request: 1.22x",
+      "engine_config": "Initializing a V1 LLM engine (v0.30.0): max_seq_len=73728, speculative_config=None, tensor_parallel_size=8, pipeline_parallel_size=1, data_parallel_size=1, enable_prefix_caching=False, enable_chunked_prefill=True",
+      "w4a8_source_scenario": {
+        "routing": "forced balanced integer counts from model workload and experts, not observed histogram",
+        "gate": "exact vllm-ascend8fd0bc4885cb52e58791aaa8efacc571b9bd115d A8W4_MSD key2 semantics",
+        "down": "independent ops-transformer a3925fd49cd256ad478d2faf983bf2961b8ae2c8 MSD_API_DEQUANT source candidate; capture binary unconfirmed",
+        "mla": "existing declared MLAprolog BF16 UK/UV operand contract; arch22 INT32 workspace path not yet modeled",
+        "program": "coarse sequential source phases; global workspace traffic charged to existing memory resource with no inferred cache reuse",
+        "int4_peak_source": "data/verification/a3-9362-platform-metadata-20261029.json; platform SHA256 5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c",
+        "attention": "original gather envelope retained; no derived copy rates or L2 chip multiplier enabled"
+      }
+    },
+    "routing": {
+      "policy": "balanced"
+    },
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      },
+      "recipes": {
+        "balanced_grouped_gate_up": {
+          "kind": "steady_matmul"
+        },
+        "balanced_grouped_down": {
+          "kind": "steady_matmul"
+        }
+      },
+      "lowerings": {
+        "mla_prolog": "vllm_ascend_mla_prolog_v3",
+        "native_fusion": {
+          "implementation": "declared_native_fusion",
+          "options": {
+            "roles": [
+              "grouped_gate_up_activation_quant"
+            ],
+            "program_profiles": {
+              "grouped_gate_up_activation_quant": "ascend_w4a8_msd"
+            }
+          }
+        },
+        "grouped_gemm": {
+          "implementation": "ascend_w4a8_msd_grouped_down",
+          "recipes": [
+            "grouped_down",
+            "balanced_grouped_down"
+          ]
+        }
+      }
+    },
+    "moe_recipe": "tp_join_reduce",
+    "lowering_passes": [
+      "activation_quantization"
+    ]
+  }
+}

@@ -1,0 +1,43 @@
+{
+  "cases": [
+    {
+      "case": "examples/cases/high-concurrency-20261030/glm-observable-service/a5_glm53flash_tp8_c16_p4k.json",
+      "geometry": {
+        "tokens": 4,
+        "sequences": 16,
+        "context": 4096
+      },
+      "observed_body_ms": 33.0309177,
+      "observation_receipt": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-runtime40e4300e/decode-forward-glm-join-reduce-replay.json",
+        "sha256": "25e6ecbf8c40f7162f4a7f4e549e412629d9142e8e1e3a070a881e4db543879f"
+      }
+    },
+    {
+      "case": "examples/cases/high-concurrency-20261030/glm-observable-service/a5_glm53flash_tp8_c32_p4k.json",
+      "geometry": {
+        "tokens": 4,
+        "sequences": 32,
+        "context": 4096
+      },
+      "observed_body_ms": 37.66896412903226,
+      "observation_receipt": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-runtime40e4300e/decode-forward-glm-join-reduce-replay.json",
+        "sha256": "25e6ecbf8c40f7162f4a7f4e549e412629d9142e8e1e3a070a881e4db543879f"
+      }
+    },
+    {
+      "case": "examples/cases/high-concurrency-20261030/glm-observable-service/a5_glm53flash_tp8_c64_p4k.json",
+      "geometry": {
+        "tokens": 4,
+        "sequences": 64,
+        "context": 4096
+      },
+      "observed_body_ms": 46.528232967741936,
+      "observation_receipt": {
+        "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-runtime40e4300e/decode-forward-glm-join-reduce-replay.json",
+        "sha256": "25e6ecbf8c40f7162f4a7f4e549e412629d9142e8e1e3a070a881e4db543879f"
+      }
+    }
+  ]
+}

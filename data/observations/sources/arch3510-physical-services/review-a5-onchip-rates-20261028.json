@@ -1,0 +1,318 @@
+{
+  "schema": "onchip-rates-source-review.v1",
+  "date": "2026-10-28",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "hardware": "Ascend950DT_9582 / NpuArch3510",
+  "status": "units_and_nominal_path_rates_confirmed_with_scoped_contention_limitations",
+  "exact_image_config": {
+    "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/Ascend950DT_9582.ini",
+    "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+    "bytes": 20397,
+    "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/data/platform_config/Ascend950DT_9582.ini",
+    "lines": [
+      [
+        13,
+        22
+      ],
+      [
+        43,
+        46
+      ],
+      [
+        73,
+        86
+      ]
+    ]
+  },
+  "nominal_rates": [
+    {
+      "path": "L1->L0A",
+      "value": 256,
+      "unit": "Byte/cycle",
+      "owner": "AIC MTE1 pipeline",
+      "source_mode": "LoadData 2D V2 normal path",
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              85,
+              99
+            ],
+            [
+              125,
+              141
+            ]
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              124,
+              131
+            ],
+            [
+              247,
+              254
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L1->L0B",
+      "value": 256,
+      "unit": "Byte/cycle",
+      "owner": "AIC MTE1 pipeline",
+      "source_mode": "LoadData 2D V2 normal path",
+      "limitation": "LoadDataWithTranspose L1->L0B is listed as128 Byte/cycle in theoretical reference; select instruction mode before applying rate. A/B are directions of same owner MTE1 pipeline, not proof of512 simultaneous throughput.",
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              125,
+              141
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "UB->L1",
+      "value": 128,
+      "unit": "Byte/cycle",
+      "owner": "AIV MTE3 pipeline",
+      "source_mode": "local source UB to associated L1 path",
+      "ownership_status": "Architecture explicitly places MTE3 in AIV; per-source-AIV stage ownership supported. Shared simultaneous ingress limit at one L1 is not explicitly specified by these docs.",
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              7,
+              7
+            ],
+            [
+              124,
+              131
+            ],
+            [
+              181,
+              183
+            ],
+            [
+              247,
+              254
+            ]
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/profiler_storage_access.cpp",
+          "sha256": "cc0da05fe1e9dcf28031269672294e8cd40ed9d8267579c2b66f6d65493cae69",
+          "bytes": 101861,
+          "lines": [
+            [
+              873,
+              879
+            ],
+            [
+              1614,
+              1617
+            ],
+            [
+              1653,
+              1667
+            ],
+            [
+              1706,
+              1730
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->BF16, F322BF16, NZ2NZ or NZ2ND",
+      "elements_per_cycle": 64,
+      "counting_basis": "destination byte count = elements*2, not FP32 source bytes and not source+destination sum",
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              260
+            ]
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/fixpipe_perf_roofline.py",
+          "sha256": "2452cb929b69c1d05bad3d2884d21a65a868022ec01965d65f0a37cd74b1fe60",
+          "bytes": 20437,
+          "lines": [
+            [
+              11,
+              15
+            ],
+            [
+              38,
+              42
+            ],
+            [
+              130,
+              138
+            ],
+            [
+              156,
+              161
+            ]
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/fixpipe_perf_README.md",
+          "sha256": "55740b2c538affdb5794235c29867cdca42144d12c5cc31b585b228f5d4b0709",
+          "bytes": 12694,
+          "lines": [
+            [
+              193,
+              195
+            ],
+            [
+              259,
+              267
+            ]
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/npu_arch_3510.md",
+          "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+          "bytes": 23771,
+          "lines": [
+            [
+              205,
+              207
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB",
+      "value": 128,
+      "unit": "destination Byte/cycle",
+      "owner": "AIC Fixpipe",
+      "source_mode": "FP32->FP32 NoQuant, ordinary single-target NZ2ND/NZ2NZ",
+      "elements_per_cycle": 32,
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              252
+            ]
+          ]
+        }
+      ]
+    },
+    {
+      "path": "L0C->UB0 and UB1",
+      "value": [
+        128,
+        128
+      ],
+      "unit": "destination Byte/cycle per target",
+      "owner": "AIC Fixpipe with explicit dual-target mode",
+      "source_mode": "FP32 NoQuant NZ2ND/NZ2NZ dual target",
+      "elements_per_cycle": [
+        32,
+        32
+      ],
+      "limitation": "Only use when exact selected Fixpipe parameters enable dual-target mode; not a generic doubling for all casts.",
+      "sources": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+          "bytes": 21427,
+          "lines": [
+            [
+              246,
+              247
+            ]
+          ]
+        }
+      ]
+    }
+  ],
+  "field_semantics_evidence": [
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/GetCoreMemBw.md",
+      "sha256": "cda9193b5a2f6c318f5939217808023e37b0ef061cec45cb68e29bc2a4486f0f",
+      "bytes": 5185,
+      "limitation": "The API documents Byte/cycle but marks L0/L1/UB query enum values reserved. Use direct architecture/mode docs above for on-chip path proof.",
+      "lines": [
+        [
+          45,
+          48
+        ]
+      ]
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/conv2d_backprop_filter_schedule.py",
+      "sha256": "686e5c3c7a81c93a63693b3e5b3f6a959cc8714d11fa028dc1ad361bfc39f81e",
+      "bytes": 150416,
+      "image_path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/dsl/static_schedule/conv2d_backprop_filter_schedule.py",
+      "exact_image_sha_verified": true,
+      "interpretation": "Actual installed consumer divides tensor byte counts by l1_to_l0_a/b_rate in movement service cost.",
+      "lines": [
+        [
+          1881,
+          1893
+        ]
+      ]
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/exact-image-rate-consumers.json",
+      "sha256": "f5ffe361d83bdf90038b24846e993037fd367bc1e3e698d90424a3b2dff53e32",
+      "bytes": 3848
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/exact-image-rate-declarations.json",
+      "sha256": "369547a6140a489dc499f56e13abb46af132516b78b20e916839df98cdf63895",
+      "bytes": 9543
+    }
+  ],
+  "public_source_manifest": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/a5-primary-doc-manifest.json",
+  "clock": {
+    "configured_cube_freq": 1650,
+    "configured_vec_freq": 1650,
+    "unit": "MHz per published CANN source convention",
+    "provenance": "exact-image INI, not run sustained clock measurement",
+    "do_not": "Do not treat this as the capture sustained clock or a calibrated effective service rate."
+  },
+  "remaining_unknowns": [
+    "Simultaneous UB0/UB1->oneL1 aggregate destination port/bank arbitration is not explicitly guaranteed by these sources.",
+    "Actual DeltaT startup and mode-dependent instruction overhead need instruction-specific source or calibration, not bulk HBM substitution.",
+    "Profiler maxBwRateOf950_958X is a separate empirical/implementation reference and was not substituted for nominal config rates.",
+    "Exact selected operator copy mode and target splitting must be bound at lowering; path name alone is insufficient."
+  ],
+  "no_device_execution": true
+}

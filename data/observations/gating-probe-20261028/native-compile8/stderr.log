@@ -1,0 +1,6 @@
+
+Authorized users only. All activities may be monitored and reported.
+[INFO] Using merged native A5 regbase pipeline
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+warning: warning: --enable-preload=true overrides --enablecv-pipeline-mode; forcing 'Skew'.
+bisheng: warning: the flag '--cce-aicore-input-parameter-size=1536' has been deprecated and will be ignored [-Wunused-command-line-argument]

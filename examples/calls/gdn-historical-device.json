@@ -1,0 +1,28 @@
+{
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "hardware_key": "Ascend950DT_9582",
+    "num_devices": 1
+  },
+  "model": {
+    "name": "standalone-gdn-call-context",
+    "layers": 1,
+    "hidden_size": 8,
+    "num_heads": 1,
+    "num_kv_heads": 1,
+    "head_dim": 8,
+    "intermediate_size": 16,
+    "vocab_size": 16
+  },
+  "runtime": {},
+  "workload": {
+    "requests": [
+      {
+        "id": "unused-serving-context",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

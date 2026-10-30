@@ -1,0 +1,82 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "gdn_output-0",
+      "split": "development",
+      "params": {
+        "lengths": [
+          64
+        ],
+        "heads": 48,
+        "key_heads": 16,
+        "dk": 128,
+        "dv": 128,
+        "chunk": 64,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "gdn_output-1",
+      "split": "development",
+      "params": {
+        "lengths": [
+          65
+        ],
+        "heads": 48,
+        "key_heads": 16,
+        "dk": 128,
+        "dv": 128,
+        "chunk": 64,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "gdn_output-2",
+      "split": "development",
+      "params": {
+        "lengths": [
+          128
+        ],
+        "heads": 48,
+        "key_heads": 16,
+        "dk": 128,
+        "dv": 128,
+        "chunk": 64,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "gdn_output-3",
+      "split": "heldout_geometry",
+      "params": {
+        "lengths": [
+          63,
+          1,
+          65
+        ],
+        "heads": 32,
+        "key_heads": 8,
+        "dk": 128,
+        "dv": 128,
+        "chunk": 64,
+        "dtype": "bf16"
+      }
+    },
+    {
+      "id": "gdn_output-4",
+      "split": "heldout_geometry",
+      "params": {
+        "lengths": [
+          193
+        ],
+        "heads": 48,
+        "key_heads": 16,
+        "dk": 128,
+        "dv": 128,
+        "chunk": 64,
+        "dtype": "bf16"
+      }
+    }
+  ]
+}

@@ -1,0 +1,34 @@
+{
+  "name": "arch22-indexed-mla-single-layer-control",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 8,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "GLM-5.3-W4A8",
+    "quantization": "w4a8_dynamic",
+    "layers": 1
+  },
+  "runtime": {
+    "tp": 8,
+    "ep": 1,
+    "max_num_batched_tokens": 32,
+    "graph_mode": "none",
+    "kernels": {
+      "programs": {
+        "matmul": {"kind": "steady_matmul"}
+      },
+      "lowerings": {
+        "indexed_attention": {
+          "implementation": "ascend_sparse_flash_attention_arch22",
+          "options": {"scratch_policy": "offchip"}
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [{"id": "control", "prompt_tokens": 4, "output_tokens": 2}]
+  }
+}

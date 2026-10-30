@@ -1,0 +1,1776 @@
+{
+  "schema": "kimi-kda-call-blocks/1",
+  "source": {
+    "path": "/Volumes/data-tmp/tmp/mindie-body-profiling-kimi-op-summary.csv",
+    "size_bytes": 110031770,
+    "sha256": "ab1d44d3613ecb92d71af6d790ab9dfc72be5aabfe92bf4f99d584fbd0f9e648"
+  },
+  "activity": {
+    "count": 1104,
+    "sum_ms": 881.997838,
+    "mean_ms": 0.7989110851449276,
+    "p50_ms": 0.6204855,
+    "min_ms": 0.071183,
+    "max_ms": 1.892735
+  },
+  "closed_run_activity": {
+    "count": 276,
+    "sum_ms": 881.997838,
+    "mean_ms": 3.1956443405797104,
+    "p50_ms": 3.196041,
+    "min_ms": 3.174887,
+    "max_ms": 3.215973
+  },
+  "descriptors": {
+    "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb": {
+      "input_shapes": [
+        [
+          1,
+          8192,
+          12,
+          128
+        ],
+        [
+          1,
+          8192,
+          12,
+          128
+        ],
+        [
+          1,
+          8192,
+          12,
+          128
+        ],
+        [
+          1,
+          8192,
+          12,
+          128
+        ],
+        [
+          1,
+          12,
+          8192
+        ],
+        [
+          12
+        ],
+        [
+          1536
+        ],
+        [
+          1,
+          12,
+          128,
+          128
+        ],
+        [
+          2
+        ],
+        [
+          256
+        ]
+      ],
+      "output_shapes": [
+        [
+          12582912
+        ],
+        [
+          1,
+          12,
+          128,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          6291456
+        ],
+        [
+          6291456
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          128,
+          12,
+          128,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ],
+        [
+          1,
+          12,
+          8192,
+          128
+        ]
+      ],
+      "input_dtypes": [
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "FLOAT",
+        "FLOAT",
+        "FLOAT",
+        "FLOAT",
+        "INT64",
+        "INT64"
+      ],
+      "output_dtypes": [
+        "DT_BF16",
+        "FLOAT",
+        "FLOAT",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16",
+        "DT_BF16"
+      ],
+      "input_formats": [
+        "NCHW",
+        "NCHW",
+        "NCHW",
+        "NCHW",
+        "ND",
+        "ND",
+        "ND",
+        "NCHW",
+        "ND",
+        "ND"
+      ],
+      "output_formats": [
+        "NCHW",
+        "ND",
+        "ND",
+        "NCHW",
+        "NCHW",
+        "ND",
+        "ND",
+        "ND",
+        "ND",
+        "ND",
+        "ND",
+        "ND",
+        "ND"
+      ]
+    }
+  },
+  "runs": [
+    {
+      "id": "run0",
+      "global_before": [
+        {
+          "line": 64,
+          "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+          "kind": "Transpose",
+          "stream": "61"
+        },
+        {
+          "line": 65,
+          "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+          "kind": "Transpose",
+          "stream": "61"
+        }
+      ],
+      "events": [
+        {
+          "line": 66,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198462",
+          "stream": "61",
+          "start_ns": 1792733126765729952,
+          "end_ns": 1792733126767591315,
+          "duration_ms": 1.861363,
+          "wait_ns": 29,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 0,
+          "source_conditioned_stage": "GATE_PREPARE"
+        },
+        {
+          "line": 67,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198463",
+          "stream": "61",
+          "start_ns": 1792733126767591337,
+          "end_ns": 1792733126767665182,
+          "duration_ms": 0.073845,
+          "wait_ns": 0,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 1,
+          "source_conditioned_stage": "POST_WU"
+        },
+        {
+          "line": 68,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198464",
+          "stream": "61",
+          "start_ns": 1792733126767665204,
+          "end_ns": 1792733126768750332,
+          "duration_ms": 1.085128,
+          "wait_ns": 155,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 2,
+          "source_conditioned_stage": "FWD_H"
+        },
+        {
+          "line": 69,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198465",
+          "stream": "61",
+          "start_ns": 1792733126768750354,
+          "end_ns": 1792733126768915504,
+          "duration_ms": 0.16515,
+          "wait_ns": 0,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 3,
+          "source_conditioned_stage": "FINALIZE"
+        }
+      ],
+      "observed_run_length": 4,
+      "closed_by_non_kda_events": true,
+      "internal_time_ordered_nonoverlapping": true,
+      "descriptor_uniform": true,
+      "source_split_geometry_compatible": true,
+      "semantic_boundary_anchors": {
+        "preceding_short_convolution": true,
+        "preceding_qk_normalization": true,
+        "following_gated_normalization": true,
+        "following_output_projection": true
+      },
+      "preceding_names": [
+        "aclnnMul_MulAiCore_Mul",
+        "aclnnBitwiseNot_LogicalNotAiCore_LogicalNot",
+        "aclnnEmbedding_GatherV2AiCore_GatherV2",
+        "aclnnInplaceMaskedFillScalar_MaskedFillAiCore_MaskedFill",
+        "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+        "aclnnInplaceFillScalar_FillAiCore_Fill",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "aclnnInplaceCopy_BroadcastToAiCore_BroadcastTo",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "aclnnInplaceFillScalar_FillAiCore_Fill",
+        "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+        "DynamicMxQuant",
+        "aclnnInplaceFillScalar_FillAiCore_Fill",
+        "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+        "CausalConv1d",
+        "_kda_state_copy_kernel",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "l2norm_fwd_kernel2",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "l2norm_fwd_kernel2",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "aclnnInplaceCopy_AsStridedAiCore_AsStrided",
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose"
+      ],
+      "following_names": [
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "_kda_state_copy_kernel",
+        "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+        "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+        "layer_norm_gated_fwd_kernel",
+        "MatmulReduceScatterV2",
+        "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+        "DynamicMxQuant",
+        "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "aclnnDivs_Muls_Muls",
+        "aclnnTanh_Tanh_Tanh",
+        "aclnnMuls_MulAiCore_Mul",
+        "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+        "aclnnMul_MulAiCore_Mul",
+        "aclnnDivs_Muls_Muls",
+        "aclnnTanh_Tanh_Tanh",
+        "aclnnMuls_MulAiCore_Mul",
+        "aclnnMul_MulAiCore_Mul",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "DynamicMxQuant"
+      ],
+      "nearest_before": {
+        "line": 65,
+        "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "kind": "Transpose",
+        "task_id": "6198461",
+        "stream": "61",
+        "start_ns": 1792733126765722959,
+        "end_ns": 1792733126765729930,
+        "duration_ms": 0.006971,
+        "wait_ns": 28,
+        "wait_status": "bound"
+      },
+      "nearest_after": {
+        "line": 70,
+        "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "kind": "Transpose",
+        "task_id": "6198466",
+        "stream": "61",
+        "start_ns": 1792733126768915526,
+        "end_ns": 1792733126768923321,
+        "duration_ms": 0.007795,
+        "wait_ns": 100,
+        "wait_status": "bound"
+      },
+      "status": "source_compatible_conditional",
+      "activity_ms": 3.185486,
+      "span_ms": 3.185552,
+      "boundary_event_examples": {
+        "before": [
+          {
+            "line": 35,
+            "name": "aclnnMul_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198411",
+            "stream": "61",
+            "start_ns": 1792733126759615168,
+            "end_ns": 1792733126759617456,
+            "duration_ms": 0.002288,
+            "wait_ns": 1580,
+            "wait_status": "bound"
+          },
+          {
+            "line": 36,
+            "name": "aclnnBitwiseNot_LogicalNotAiCore_LogicalNot",
+            "kind": "LogicalNot",
+            "task_id": "6198412",
+            "stream": "61",
+            "start_ns": 1792733126759627210,
+            "end_ns": 1792733126759629570,
+            "duration_ms": 0.00236,
+            "wait_ns": 9712,
+            "wait_status": "bound"
+          },
+          {
+            "line": 37,
+            "name": "aclnnEmbedding_GatherV2AiCore_GatherV2",
+            "kind": "GatherV2",
+            "task_id": "6198413",
+            "stream": "61",
+            "start_ns": 1792733126759641130,
+            "end_ns": 1792733126759695487,
+            "duration_ms": 0.054357,
+            "wait_ns": 11640,
+            "wait_status": "bound"
+          },
+          {
+            "line": 38,
+            "name": "aclnnInplaceMaskedFillScalar_MaskedFillAiCore_MaskedFill",
+            "kind": "MaskedFill",
+            "task_id": "6198414",
+            "stream": "61",
+            "start_ns": 1792733126759695509,
+            "end_ns": 1792733126759773435,
+            "duration_ms": 0.077926,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 41,
+            "name": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+            "kind": "TensorMove",
+            "task_id": "6198423",
+            "stream": "61",
+            "start_ns": 1792733126763493183,
+            "end_ns": 1792733126763551344,
+            "duration_ms": 0.058161,
+            "wait_ns": 2385774,
+            "wait_status": "bound"
+          },
+          {
+            "line": 42,
+            "name": "aclnnInplaceFillScalar_FillAiCore_Fill",
+            "kind": "Fill",
+            "task_id": "6198424",
+            "stream": "61",
+            "start_ns": 1792733126763551366,
+            "end_ns": 1792733126763553257,
+            "duration_ms": 0.001891,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 43,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198425",
+            "stream": "61",
+            "start_ns": 1792733126763553279,
+            "end_ns": 1792733126763554858,
+            "duration_ms": 0.001579,
+            "wait_ns": 109,
+            "wait_status": "bound"
+          },
+          {
+            "line": 44,
+            "name": "aclnnInplaceCopy_BroadcastToAiCore_BroadcastTo",
+            "kind": "BroadcastTo",
+            "task_id": "6198426",
+            "stream": "61",
+            "start_ns": 1792733126763554880,
+            "end_ns": 1792733126763557117,
+            "duration_ms": 0.002237,
+            "wait_ns": 171,
+            "wait_status": "bound"
+          },
+          {
+            "line": 45,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198427",
+            "stream": "61",
+            "start_ns": 1792733126763557139,
+            "end_ns": 1792733126763559918,
+            "duration_ms": 0.002779,
+            "wait_ns": 13,
+            "wait_status": "bound"
+          },
+          {
+            "line": 46,
+            "name": "aclnnInplaceFillScalar_FillAiCore_Fill",
+            "kind": "Fill",
+            "task_id": "6198428",
+            "stream": "61",
+            "start_ns": 1792733126763559940,
+            "end_ns": 1792733126763560993,
+            "duration_ms": 0.001053,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 47,
+            "name": "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+            "kind": "AttnResFwd",
+            "task_id": "6198429",
+            "stream": "61",
+            "start_ns": 1792733126763561015,
+            "end_ns": 1792733126763588610,
+            "duration_ms": 0.027595,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 49,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198441",
+            "stream": "61",
+            "start_ns": 1792733126763907662,
+            "end_ns": 1792733126763981958,
+            "duration_ms": 0.074296,
+            "wait_ns": 948,
+            "wait_status": "bound"
+          },
+          {
+            "line": 52,
+            "name": "aclnnInplaceFillScalar_FillAiCore_Fill",
+            "kind": "Fill",
+            "task_id": "6198444",
+            "stream": "61",
+            "start_ns": 1792733126764834373,
+            "end_ns": 1792733126764836096,
+            "duration_ms": 0.001723,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 53,
+            "name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "kind": "GroupedMatmul",
+            "task_id": "6198445",
+            "stream": "61",
+            "start_ns": 1792733126764836118,
+            "end_ns": 1792733126765473443,
+            "duration_ms": 0.637325,
+            "wait_ns": 27,
+            "wait_status": "bound"
+          },
+          {
+            "line": 56,
+            "name": "CausalConv1d",
+            "kind": "CausalConv1d",
+            "task_id": "6198452",
+            "stream": "61",
+            "start_ns": 1792733126765473513,
+            "end_ns": 1792733126765597070,
+            "duration_ms": 0.123557,
+            "wait_ns": 625534,
+            "wait_status": "bound"
+          },
+          {
+            "line": 57,
+            "name": "_kda_state_copy_kernel",
+            "kind": "_kda_state_copy_kernel",
+            "task_id": "6198453",
+            "stream": "61",
+            "start_ns": 1792733126765597092,
+            "end_ns": 1792733126765599953,
+            "duration_ms": 0.002861,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 58,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198454",
+            "stream": "61",
+            "start_ns": 1792733126765599975,
+            "end_ns": 1792733126765611786,
+            "duration_ms": 0.011811,
+            "wait_ns": 139,
+            "wait_status": "bound"
+          },
+          {
+            "line": 59,
+            "name": "l2norm_fwd_kernel2",
+            "kind": "l2norm_fwd_kernel2",
+            "task_id": "6198455",
+            "stream": "61",
+            "start_ns": 1792733126765611808,
+            "end_ns": 1792733126765640316,
+            "duration_ms": 0.028508,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 60,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198456",
+            "stream": "61",
+            "start_ns": 1792733126765640338,
+            "end_ns": 1792733126765650693,
+            "duration_ms": 0.010355,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 61,
+            "name": "l2norm_fwd_kernel2",
+            "kind": "l2norm_fwd_kernel2",
+            "task_id": "6198457",
+            "stream": "61",
+            "start_ns": 1792733126765650715,
+            "end_ns": 1792733126765677408,
+            "duration_ms": 0.026693,
+            "wait_ns": 145,
+            "wait_status": "bound"
+          },
+          {
+            "line": 62,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198458",
+            "stream": "61",
+            "start_ns": 1792733126765677430,
+            "end_ns": 1792733126765691274,
+            "duration_ms": 0.013844,
+            "wait_ns": 57,
+            "wait_status": "bound"
+          },
+          {
+            "line": 63,
+            "name": "aclnnInplaceCopy_AsStridedAiCore_AsStrided",
+            "kind": "AsStrided",
+            "task_id": "6198459",
+            "stream": "61",
+            "start_ns": 1792733126765691296,
+            "end_ns": 1792733126765716943,
+            "duration_ms": 0.025647,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 64,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198460",
+            "stream": "61",
+            "start_ns": 1792733126765716965,
+            "end_ns": 1792733126765722937,
+            "duration_ms": 0.005972,
+            "wait_ns": 103,
+            "wait_status": "bound"
+          },
+          {
+            "line": 65,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198461",
+            "stream": "61",
+            "start_ns": 1792733126765722959,
+            "end_ns": 1792733126765729930,
+            "duration_ms": 0.006971,
+            "wait_ns": 28,
+            "wait_status": "bound"
+          }
+        ],
+        "after": [
+          {
+            "line": 70,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198466",
+            "stream": "61",
+            "start_ns": 1792733126768915526,
+            "end_ns": 1792733126768923321,
+            "duration_ms": 0.007795,
+            "wait_ns": 100,
+            "wait_status": "bound"
+          },
+          {
+            "line": 71,
+            "name": "_kda_state_copy_kernel",
+            "kind": "_kda_state_copy_kernel",
+            "task_id": "6198467",
+            "stream": "61",
+            "start_ns": 1792733126768923343,
+            "end_ns": 1792733126768927002,
+            "duration_ms": 0.003659,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 72,
+            "name": "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+            "kind": "ZerosLike",
+            "task_id": "6198468",
+            "stream": "61",
+            "start_ns": 1792733126768927024,
+            "end_ns": 1792733126768937071,
+            "duration_ms": 0.010047,
+            "wait_ns": 91,
+            "wait_status": "bound"
+          },
+          {
+            "line": 73,
+            "name": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+            "kind": "TensorMove",
+            "task_id": "6198469",
+            "stream": "61",
+            "start_ns": 1792733126768937093,
+            "end_ns": 1792733126768950689,
+            "duration_ms": 0.013596,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 74,
+            "name": "layer_norm_gated_fwd_kernel",
+            "kind": "layer_norm_gated_fwd_kernel",
+            "task_id": "6198470",
+            "stream": "61",
+            "start_ns": 1792733126768950711,
+            "end_ns": 1792733126769087927,
+            "duration_ms": 0.137216,
+            "wait_ns": 154,
+            "wait_status": "bound"
+          },
+          {
+            "line": 75,
+            "name": "MatmulReduceScatterV2",
+            "kind": "MatmulReduceScatterV2",
+            "task_id": "6198474",
+            "stream": "61",
+            "start_ns": 1792733126769087998,
+            "end_ns": 1792733126771110983,
+            "duration_ms": 2.022985,
+            "wait_ns": 34,
+            "wait_status": "bound"
+          },
+          {
+            "line": 78,
+            "name": "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+            "kind": "AttnResFwd",
+            "task_id": "6198478",
+            "stream": "61",
+            "start_ns": 1792733126771111061,
+            "end_ns": 1792733126771180514,
+            "duration_ms": 0.069453,
+            "wait_ns": 8957,
+            "wait_status": "bound"
+          },
+          {
+            "line": 81,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198486",
+            "stream": "61",
+            "start_ns": 1792733126771492783,
+            "end_ns": 1792733126771551164,
+            "duration_ms": 0.058381,
+            "wait_ns": 667,
+            "wait_status": "bound"
+          },
+          {
+            "line": 82,
+            "name": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+            "kind": "QuantBatchMatmulV3",
+            "task_id": "6198487",
+            "stream": "61",
+            "start_ns": 1792733126771551186,
+            "end_ns": 1792733126772707446,
+            "duration_ms": 1.15626,
+            "wait_ns": 119,
+            "wait_status": "bound"
+          },
+          {
+            "line": 83,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198488",
+            "stream": "61",
+            "start_ns": 1792733126772707468,
+            "end_ns": 1792733126772745685,
+            "duration_ms": 0.038217,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 84,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198489",
+            "stream": "61",
+            "start_ns": 1792733126772745707,
+            "end_ns": 1792733126772800827,
+            "duration_ms": 0.05512,
+            "wait_ns": 33,
+            "wait_status": "bound"
+          },
+          {
+            "line": 85,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198490",
+            "stream": "61",
+            "start_ns": 1792733126772800849,
+            "end_ns": 1792733126772858386,
+            "duration_ms": 0.057537,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 86,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198491",
+            "stream": "61",
+            "start_ns": 1792733126772858408,
+            "end_ns": 1792733126772916194,
+            "duration_ms": 0.057786,
+            "wait_ns": 213,
+            "wait_status": "bound"
+          },
+          {
+            "line": 87,
+            "name": "aclnnDivs_Muls_Muls",
+            "kind": "Muls",
+            "task_id": "6198492",
+            "stream": "61",
+            "start_ns": 1792733126772916216,
+            "end_ns": 1792733126773014541,
+            "duration_ms": 0.098325,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 88,
+            "name": "aclnnTanh_Tanh_Tanh",
+            "kind": "Tanh",
+            "task_id": "6198493",
+            "stream": "61",
+            "start_ns": 1792733126773014563,
+            "end_ns": 1792733126773109549,
+            "duration_ms": 0.094986,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 89,
+            "name": "aclnnMuls_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198494",
+            "stream": "61",
+            "start_ns": 1792733126773109571,
+            "end_ns": 1792733126773192972,
+            "duration_ms": 0.083401,
+            "wait_ns": 14,
+            "wait_status": "bound"
+          },
+          {
+            "line": 90,
+            "name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+            "kind": "Sigmoid",
+            "task_id": "6198495",
+            "stream": "61",
+            "start_ns": 1792733126773192994,
+            "end_ns": 1792733126773280221,
+            "duration_ms": 0.087227,
+            "wait_ns": 99,
+            "wait_status": "bound"
+          },
+          {
+            "line": 91,
+            "name": "aclnnMul_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198496",
+            "stream": "61",
+            "start_ns": 1792733126773280243,
+            "end_ns": 1792733126773412534,
+            "duration_ms": 0.132291,
+            "wait_ns": 23,
+            "wait_status": "bound"
+          },
+          {
+            "line": 92,
+            "name": "aclnnDivs_Muls_Muls",
+            "kind": "Muls",
+            "task_id": "6198497",
+            "stream": "61",
+            "start_ns": 1792733126773412556,
+            "end_ns": 1792733126773490704,
+            "duration_ms": 0.078148,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 93,
+            "name": "aclnnTanh_Tanh_Tanh",
+            "kind": "Tanh",
+            "task_id": "6198498",
+            "stream": "61",
+            "start_ns": 1792733126773490726,
+            "end_ns": 1792733126773582551,
+            "duration_ms": 0.091825,
+            "wait_ns": 102,
+            "wait_status": "bound"
+          },
+          {
+            "line": 94,
+            "name": "aclnnMuls_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198499",
+            "stream": "61",
+            "start_ns": 1792733126773582573,
+            "end_ns": 1792733126773666168,
+            "duration_ms": 0.083595,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 95,
+            "name": "aclnnMul_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198500",
+            "stream": "61",
+            "start_ns": 1792733126773666190,
+            "end_ns": 1792733126773800334,
+            "duration_ms": 0.134144,
+            "wait_ns": 155,
+            "wait_status": "bound"
+          },
+          {
+            "line": 96,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198501",
+            "stream": "61",
+            "start_ns": 1792733126773800356,
+            "end_ns": 1792733126773857611,
+            "duration_ms": 0.057255,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 97,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198502",
+            "stream": "61",
+            "start_ns": 1792733126773857633,
+            "end_ns": 1792733126773886048,
+            "duration_ms": 0.028415,
+            "wait_ns": 245,
+            "wait_status": "bound"
+          }
+        ]
+      }
+    },
+    {
+      "id": "run1",
+      "global_before": [
+        {
+          "line": 117,
+          "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+          "kind": "Transpose",
+          "stream": "61"
+        },
+        {
+          "line": 118,
+          "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+          "kind": "Transpose",
+          "stream": "61"
+        }
+      ],
+      "events": [
+        {
+          "line": 119,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198545",
+          "stream": "61",
+          "start_ns": 1792733126777109893,
+          "end_ns": 1792733126778979050,
+          "duration_ms": 1.869157,
+          "wait_ns": 224,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 0,
+          "source_conditioned_stage": "GATE_PREPARE"
+        },
+        {
+          "line": 120,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198546",
+          "stream": "61",
+          "start_ns": 1792733126778979072,
+          "end_ns": 1792733126779052818,
+          "duration_ms": 0.073746,
+          "wait_ns": 0,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 1,
+          "source_conditioned_stage": "POST_WU"
+        },
+        {
+          "line": 121,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198547",
+          "stream": "61",
+          "start_ns": 1792733126779052840,
+          "end_ns": 1792733126780130284,
+          "duration_ms": 1.077444,
+          "wait_ns": 4,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 2,
+          "source_conditioned_stage": "FWD_H"
+        },
+        {
+          "line": 122,
+          "name": "aclnnChunkKdaFwd_KdaChunkForward_ChunkKdaFwd",
+          "kind": "ChunkKdaFwd",
+          "task_id": "6198548",
+          "stream": "61",
+          "start_ns": 1792733126780130306,
+          "end_ns": 1792733126780295291,
+          "duration_ms": 0.164985,
+          "wait_ns": 56,
+          "wait_status": "bound",
+          "descriptor_key": "a2f9cf575e40abcc4f730c59c5f138c37cea28b1a4a6a48b2572b0b021d8c2bb",
+          "observed_position": 3,
+          "source_conditioned_stage": "FINALIZE"
+        }
+      ],
+      "observed_run_length": 4,
+      "closed_by_non_kda_events": true,
+      "internal_time_ordered_nonoverlapping": true,
+      "descriptor_uniform": true,
+      "source_split_geometry_compatible": true,
+      "semantic_boundary_anchors": {
+        "preceding_short_convolution": true,
+        "preceding_qk_normalization": true,
+        "following_gated_normalization": true,
+        "following_output_projection": true
+      },
+      "preceding_names": [
+        "aclnnMuls_MulAiCore_Mul",
+        "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+        "aclnnMul_MulAiCore_Mul",
+        "aclnnDivs_Muls_Muls",
+        "aclnnTanh_Tanh_Tanh",
+        "aclnnMuls_MulAiCore_Mul",
+        "aclnnMul_MulAiCore_Mul",
+        "aclnnInplaceCopy_CastAiCore_Cast",
+        "DynamicMxQuant",
+        "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+        "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+        "DynamicMxQuant",
+        "aclnnInplaceFillScalar_FillAiCore_Fill",
+        "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+        "CausalConv1d",
+        "_kda_state_copy_kernel",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "l2norm_fwd_kernel2",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "l2norm_fwd_kernel2",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "aclnnInplaceCopy_AsStridedAiCore_AsStrided",
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose"
+      ],
+      "following_names": [
+        "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "_kda_state_copy_kernel",
+        "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+        "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+        "layer_norm_gated_fwd_kernel",
+        "MatmulReduceScatterV2",
+        "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+        "aclnnMm_MatMulV3Common_MatMulV3",
+        "DynamicMxQuant",
+        "aclnnInplaceFillScalar_FillAiCore_Fill",
+        "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+        "aclnnMoeGatingTopK_MoeGatingTopK_MoeGatingTopK",
+        "aclnnHistc_HistogramAiCore_HistogramV2",
+        "aclnnReduceSum_CastAiCore_Cast",
+        "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+        "aclnnReduceSum_SliceAiCore_Slice",
+        "aclnnReduceSum_CastAiCore_Cast",
+        "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+        "aclnnReduceSum_SliceAiCore_Slice",
+        "aclnnReduceSum_CastAiCore_Cast",
+        "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+        "aclnnInplaceCopy_SliceAiCore_Slice",
+        "aclnnReduceSum_CastAiCore_Cast",
+        "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum"
+      ],
+      "nearest_before": {
+        "line": 118,
+        "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "kind": "Transpose",
+        "task_id": "6198544",
+        "stream": "61",
+        "start_ns": 1792733126777103595,
+        "end_ns": 1792733126777109871,
+        "duration_ms": 0.006276,
+        "wait_ns": 0,
+        "wait_status": "bound"
+      },
+      "nearest_after": {
+        "line": 123,
+        "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+        "kind": "Transpose",
+        "task_id": "6198549",
+        "stream": "61",
+        "start_ns": 1792733126780295313,
+        "end_ns": 1792733126780303573,
+        "duration_ms": 0.00826,
+        "wait_ns": 15,
+        "wait_status": "bound"
+      },
+      "status": "source_compatible_conditional",
+      "activity_ms": 3.185332,
+      "span_ms": 3.185398,
+      "boundary_event_examples": {
+        "before": [
+          {
+            "line": 89,
+            "name": "aclnnMuls_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198494",
+            "stream": "61",
+            "start_ns": 1792733126773109571,
+            "end_ns": 1792733126773192972,
+            "duration_ms": 0.083401,
+            "wait_ns": 14,
+            "wait_status": "bound"
+          },
+          {
+            "line": 90,
+            "name": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+            "kind": "Sigmoid",
+            "task_id": "6198495",
+            "stream": "61",
+            "start_ns": 1792733126773192994,
+            "end_ns": 1792733126773280221,
+            "duration_ms": 0.087227,
+            "wait_ns": 99,
+            "wait_status": "bound"
+          },
+          {
+            "line": 91,
+            "name": "aclnnMul_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198496",
+            "stream": "61",
+            "start_ns": 1792733126773280243,
+            "end_ns": 1792733126773412534,
+            "duration_ms": 0.132291,
+            "wait_ns": 23,
+            "wait_status": "bound"
+          },
+          {
+            "line": 92,
+            "name": "aclnnDivs_Muls_Muls",
+            "kind": "Muls",
+            "task_id": "6198497",
+            "stream": "61",
+            "start_ns": 1792733126773412556,
+            "end_ns": 1792733126773490704,
+            "duration_ms": 0.078148,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 93,
+            "name": "aclnnTanh_Tanh_Tanh",
+            "kind": "Tanh",
+            "task_id": "6198498",
+            "stream": "61",
+            "start_ns": 1792733126773490726,
+            "end_ns": 1792733126773582551,
+            "duration_ms": 0.091825,
+            "wait_ns": 102,
+            "wait_status": "bound"
+          },
+          {
+            "line": 94,
+            "name": "aclnnMuls_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198499",
+            "stream": "61",
+            "start_ns": 1792733126773582573,
+            "end_ns": 1792733126773666168,
+            "duration_ms": 0.083595,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 95,
+            "name": "aclnnMul_MulAiCore_Mul",
+            "kind": "Mul",
+            "task_id": "6198500",
+            "stream": "61",
+            "start_ns": 1792733126773666190,
+            "end_ns": 1792733126773800334,
+            "duration_ms": 0.134144,
+            "wait_ns": 155,
+            "wait_status": "bound"
+          },
+          {
+            "line": 96,
+            "name": "aclnnInplaceCopy_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198501",
+            "stream": "61",
+            "start_ns": 1792733126773800356,
+            "end_ns": 1792733126773857611,
+            "duration_ms": 0.057255,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 97,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198502",
+            "stream": "61",
+            "start_ns": 1792733126773857633,
+            "end_ns": 1792733126773886048,
+            "duration_ms": 0.028415,
+            "wait_ns": 245,
+            "wait_status": "bound"
+          },
+          {
+            "line": 98,
+            "name": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+            "kind": "QuantBatchMatmulV3",
+            "task_id": "6198503",
+            "stream": "61",
+            "start_ns": 1792733126773886070,
+            "end_ns": 1792733126774470886,
+            "duration_ms": 0.584816,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 100,
+            "name": "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+            "kind": "AttnResFwd",
+            "task_id": "6198512",
+            "stream": "61",
+            "start_ns": 1792733126774914155,
+            "end_ns": 1792733126774996671,
+            "duration_ms": 0.082516,
+            "wait_ns": 1027,
+            "wait_status": "bound"
+          },
+          {
+            "line": 102,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198524",
+            "stream": "61",
+            "start_ns": 1792733126775301000,
+            "end_ns": 1792733126775365585,
+            "duration_ms": 0.064585,
+            "wait_ns": 912,
+            "wait_status": "bound"
+          },
+          {
+            "line": 105,
+            "name": "aclnnInplaceFillScalar_FillAiCore_Fill",
+            "kind": "Fill",
+            "task_id": "6198527",
+            "stream": "61",
+            "start_ns": 1792733126776214951,
+            "end_ns": 1792733126776217151,
+            "duration_ms": 0.0022,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 106,
+            "name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "kind": "GroupedMatmul",
+            "task_id": "6198528",
+            "stream": "61",
+            "start_ns": 1792733126776217173,
+            "end_ns": 1792733126776853458,
+            "duration_ms": 0.636285,
+            "wait_ns": 50,
+            "wait_status": "bound"
+          },
+          {
+            "line": 109,
+            "name": "CausalConv1d",
+            "kind": "CausalConv1d",
+            "task_id": "6198535",
+            "stream": "61",
+            "start_ns": 1792733126776853528,
+            "end_ns": 1792733126776976152,
+            "duration_ms": 0.122624,
+            "wait_ns": 625767,
+            "wait_status": "bound"
+          },
+          {
+            "line": 110,
+            "name": "_kda_state_copy_kernel",
+            "kind": "_kda_state_copy_kernel",
+            "task_id": "6198536",
+            "stream": "61",
+            "start_ns": 1792733126776976174,
+            "end_ns": 1792733126776979042,
+            "duration_ms": 0.002868,
+            "wait_ns": 126,
+            "wait_status": "bound"
+          },
+          {
+            "line": 111,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198537",
+            "stream": "61",
+            "start_ns": 1792733126776979064,
+            "end_ns": 1792733126776990811,
+            "duration_ms": 0.011747,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 112,
+            "name": "l2norm_fwd_kernel2",
+            "kind": "l2norm_fwd_kernel2",
+            "task_id": "6198538",
+            "stream": "61",
+            "start_ns": 1792733126776990833,
+            "end_ns": 1792733126777019815,
+            "duration_ms": 0.028982,
+            "wait_ns": 3,
+            "wait_status": "bound"
+          },
+          {
+            "line": 113,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198539",
+            "stream": "61",
+            "start_ns": 1792733126777019837,
+            "end_ns": 1792733126777031097,
+            "duration_ms": 0.01126,
+            "wait_ns": 18,
+            "wait_status": "bound"
+          },
+          {
+            "line": 114,
+            "name": "l2norm_fwd_kernel2",
+            "kind": "l2norm_fwd_kernel2",
+            "task_id": "6198540",
+            "stream": "61",
+            "start_ns": 1792733126777031119,
+            "end_ns": 1792733126777057827,
+            "duration_ms": 0.026708,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 115,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198541",
+            "stream": "61",
+            "start_ns": 1792733126777057849,
+            "end_ns": 1792733126777071372,
+            "duration_ms": 0.013523,
+            "wait_ns": 42,
+            "wait_status": "bound"
+          },
+          {
+            "line": 116,
+            "name": "aclnnInplaceCopy_AsStridedAiCore_AsStrided",
+            "kind": "AsStrided",
+            "task_id": "6198542",
+            "stream": "61",
+            "start_ns": 1792733126777071394,
+            "end_ns": 1792733126777097378,
+            "duration_ms": 0.025984,
+            "wait_ns": 227,
+            "wait_status": "bound"
+          },
+          {
+            "line": 117,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198543",
+            "stream": "61",
+            "start_ns": 1792733126777097400,
+            "end_ns": 1792733126777103573,
+            "duration_ms": 0.006173,
+            "wait_ns": 16,
+            "wait_status": "bound"
+          },
+          {
+            "line": 118,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198544",
+            "stream": "61",
+            "start_ns": 1792733126777103595,
+            "end_ns": 1792733126777109871,
+            "duration_ms": 0.006276,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          }
+        ],
+        "after": [
+          {
+            "line": 123,
+            "name": "aclnnChunkKdaFwd_TransposeAiCore_Transpose",
+            "kind": "Transpose",
+            "task_id": "6198549",
+            "stream": "61",
+            "start_ns": 1792733126780295313,
+            "end_ns": 1792733126780303573,
+            "duration_ms": 0.00826,
+            "wait_ns": 15,
+            "wait_status": "bound"
+          },
+          {
+            "line": 124,
+            "name": "_kda_state_copy_kernel",
+            "kind": "_kda_state_copy_kernel",
+            "task_id": "6198550",
+            "stream": "61",
+            "start_ns": 1792733126780303595,
+            "end_ns": 1792733126780307333,
+            "duration_ms": 0.003738,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 125,
+            "name": "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+            "kind": "ZerosLike",
+            "task_id": "6198551",
+            "stream": "61",
+            "start_ns": 1792733126780307355,
+            "end_ns": 1792733126780317597,
+            "duration_ms": 0.010242,
+            "wait_ns": 12,
+            "wait_status": "bound"
+          },
+          {
+            "line": 126,
+            "name": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+            "kind": "TensorMove",
+            "task_id": "6198552",
+            "stream": "61",
+            "start_ns": 1792733126780317619,
+            "end_ns": 1792733126780330964,
+            "duration_ms": 0.013345,
+            "wait_ns": 8,
+            "wait_status": "bound"
+          },
+          {
+            "line": 127,
+            "name": "layer_norm_gated_fwd_kernel",
+            "kind": "layer_norm_gated_fwd_kernel",
+            "task_id": "6198553",
+            "stream": "61",
+            "start_ns": 1792733126780330986,
+            "end_ns": 1792733126780466895,
+            "duration_ms": 0.135909,
+            "wait_ns": 155,
+            "wait_status": "bound"
+          },
+          {
+            "line": 128,
+            "name": "MatmulReduceScatterV2",
+            "kind": "MatmulReduceScatterV2",
+            "task_id": "6198557",
+            "stream": "61",
+            "start_ns": 1792733126780466966,
+            "end_ns": 1792733126781185867,
+            "duration_ms": 0.718901,
+            "wait_ns": 91,
+            "wait_status": "bound"
+          },
+          {
+            "line": 131,
+            "name": "aclnnAttnResFwd_AttnResFwd_AttnResFwd",
+            "kind": "AttnResFwd",
+            "task_id": "6198561",
+            "stream": "61",
+            "start_ns": 1792733126781185945,
+            "end_ns": 1792733126781269627,
+            "duration_ms": 0.083682,
+            "wait_ns": 8926,
+            "wait_status": "bound"
+          },
+          {
+            "line": 132,
+            "name": "aclnnMm_MatMulV3Common_MatMulV3",
+            "kind": "MatMulV3",
+            "task_id": "6198562",
+            "stream": "61",
+            "start_ns": 1792733126781269649,
+            "end_ns": 1792733126781313996,
+            "duration_ms": 0.044347,
+            "wait_ns": 68,
+            "wait_status": "bound"
+          },
+          {
+            "line": 133,
+            "name": "DynamicMxQuant",
+            "kind": "DynamicMxQuant",
+            "task_id": "6198573",
+            "stream": "61",
+            "start_ns": 1792733126781314067,
+            "end_ns": 1792733126781323725,
+            "duration_ms": 0.009658,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 135,
+            "name": "aclnnInplaceFillScalar_FillAiCore_Fill",
+            "kind": "Fill",
+            "task_id": "6198574",
+            "stream": "61",
+            "start_ns": 1792733126781323747,
+            "end_ns": 1792733126781325579,
+            "duration_ms": 0.001832,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 136,
+            "name": "aclnnGroupedMatmulWeightNz_GroupedMatmul_GroupedMatmul",
+            "kind": "GroupedMatmul",
+            "task_id": "6198575",
+            "stream": "61",
+            "start_ns": 1792733126781325601,
+            "end_ns": 1792733126781403271,
+            "duration_ms": 0.07767,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 137,
+            "name": "aclnnMoeGatingTopK_MoeGatingTopK_MoeGatingTopK",
+            "kind": "MoeGatingTopK",
+            "task_id": "6198582",
+            "stream": "61",
+            "start_ns": 1792733126781618755,
+            "end_ns": 1792733126781651312,
+            "duration_ms": 0.032557,
+            "wait_ns": 215580,
+            "wait_status": "bound"
+          },
+          {
+            "line": 139,
+            "name": "aclnnHistc_HistogramAiCore_HistogramV2",
+            "kind": "HistogramV2",
+            "task_id": "6198584",
+            "stream": "61",
+            "start_ns": 1792733126781651383,
+            "end_ns": 1792733126781712095,
+            "duration_ms": 0.060712,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 141,
+            "name": "aclnnReduceSum_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198585",
+            "stream": "61",
+            "start_ns": 1792733126781712117,
+            "end_ns": 1792733126781928357,
+            "duration_ms": 0.21624,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 142,
+            "name": "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+            "kind": "ReduceSum",
+            "task_id": "6198586",
+            "stream": "61",
+            "start_ns": 1792733126781928379,
+            "end_ns": 1792733126781932882,
+            "duration_ms": 0.004503,
+            "wait_ns": 260,
+            "wait_status": "bound"
+          },
+          {
+            "line": 144,
+            "name": "aclnnReduceSum_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198595",
+            "stream": "61",
+            "start_ns": 1792733126781965631,
+            "end_ns": 1792733126781968559,
+            "duration_ms": 0.002928,
+            "wait_ns": 885,
+            "wait_status": "bound"
+          },
+          {
+            "line": 145,
+            "name": "aclnnReduceSum_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198596",
+            "stream": "61",
+            "start_ns": 1792733126781968581,
+            "end_ns": 1792733126781970065,
+            "duration_ms": 0.001484,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 146,
+            "name": "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+            "kind": "ReduceSum",
+            "task_id": "6198597",
+            "stream": "61",
+            "start_ns": 1792733126781970087,
+            "end_ns": 1792733126781972384,
+            "duration_ms": 0.002297,
+            "wait_ns": 16,
+            "wait_status": "bound"
+          },
+          {
+            "line": 147,
+            "name": "aclnnReduceSum_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198599",
+            "stream": "61",
+            "start_ns": 1792733126781974228,
+            "end_ns": 1792733126781975417,
+            "duration_ms": 0.001189,
+            "wait_ns": 1953,
+            "wait_status": "bound"
+          },
+          {
+            "line": 148,
+            "name": "aclnnReduceSum_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198600",
+            "stream": "61",
+            "start_ns": 1792733126781975439,
+            "end_ns": 1792733126781976558,
+            "duration_ms": 0.001119,
+            "wait_ns": 61,
+            "wait_status": "bound"
+          },
+          {
+            "line": 149,
+            "name": "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+            "kind": "ReduceSum",
+            "task_id": "6198601",
+            "stream": "61",
+            "start_ns": 1792733126781976580,
+            "end_ns": 1792733126781980775,
+            "duration_ms": 0.004195,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 150,
+            "name": "aclnnInplaceCopy_SliceAiCore_Slice",
+            "kind": "Slice",
+            "task_id": "6198602",
+            "stream": "61",
+            "start_ns": 1792733126781980797,
+            "end_ns": 1792733126781982557,
+            "duration_ms": 0.00176,
+            "wait_ns": 55,
+            "wait_status": "bound"
+          },
+          {
+            "line": 151,
+            "name": "aclnnReduceSum_CastAiCore_Cast",
+            "kind": "Cast",
+            "task_id": "6198603",
+            "stream": "61",
+            "start_ns": 1792733126781982579,
+            "end_ns": 1792733126781983613,
+            "duration_ms": 0.001034,
+            "wait_ns": 0,
+            "wait_status": "bound"
+          },
+          {
+            "line": 152,
+            "name": "aclnnReduceSum_ReduceSumOpAiCore_ReduceSum",
+            "kind": "ReduceSum",
+            "task_id": "6198604",
+            "stream": "61",
+            "start_ns": 1792733126781983635,
+            "end_ns": 1792733126781986845,
+            "duration_ms": 0.00321,
+            "wait_ns": 216,
+            "wait_status": "bound"
+          }
+        ]
+      }
+    }
+  ],
+  "pinned_source": {
+    "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
+    "stage_order": [
+      "GATE_PREPARE",
+      "POST_WU",
+      "FWD_H",
+      "FINALIZE"
+    ],
+    "stage_attribute_observed": false,
+    "sources": [
+      {
+        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/ops/kimi_kda.py",
+        "sha256": "35365b3b353fc492b4dc5d75b88916431f6802c21bf51b61b4893d39d54f11f3",
+        "size_bytes": 30609,
+        "lines": [
+          [
+            460,
+            521
+          ],
+          [
+            623,
+            632
+          ],
+          [
+            746,
+            753
+          ]
+        ]
+      },
+      {
+        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp",
+        "sha256": "4db63cf9151d52d8b6d101abc05f3af1f42eaa88435483662dc9cb5d72370fa2",
+        "size_bytes": 37852,
+        "lines": [
+          [
+            650,
+            669
+          ],
+          [
+            770,
+            800
+          ]
+        ]
+      },
+      {
+        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp",
+        "sha256": "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0",
+        "size_bytes": 10682,
+        "lines": [
+          [
+            15,
+            70
+          ]
+        ]
+      }
+    ]
+  },
+  "assumptions": [
+    "Observed block order follows the pinned Ascend950 split-stage wrapper (chunk64 and present cu_seqlens).",
+    "Each block is a maximal observed consecutive KDA run, with short-convolution/qk-normalization before and gated-normalization/output-projection after.",
+    "Adjacent semantic names establish source-compatible boundaries, not captured tensor pointers.",
+    "A model layer/step identity is not inferred; activity is distinct from the complete model critical path."
+  ],
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/model-scoreboard-20261029-kimi-kda-call-blocks.json",
+    "sha256": "3654ece524506bd453f843ad05cc778ac93a1b07d943f67cbe85582a9e7e8d65",
+    "size_bytes": 1840500
+  }
+}

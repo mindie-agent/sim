@@ -1,0 +1,2011 @@
+{
+  "schema": "gdn-hf32-reg-source-review.v1",
+  "date": "2026-10-28",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "source_only": true,
+  "device_execution": false,
+  "shared_code_modified": false,
+  "hf32": {
+    "mechanism": "HF32 is global CTRL bit 46. MmadParams has no HF32 field; floating mad consumes current hardware mode.",
+    "evidence": [
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_macros.h",
+        "lines": [
+          [
+            99,
+            103
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_reg.h",
+        "lines": [
+          [
+            138,
+            145
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/kernel_struct_mm.h",
+        "lines": [
+          [
+            374,
+            420
+          ]
+        ]
+      },
+      {
+        "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+        "lines": [
+          [
+            468,
+            490
+          ]
+        ]
+      }
+    ],
+    "default_control": {
+      "value_hex": "0x1000000000000008",
+      "hf32_bit": 46,
+      "hf32_enabled_in_default_value": false,
+      "initialization_preserves_only_prior_bit": 48,
+      "evidence": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_utils_base.h",
+          "lines": [
+            [
+              64,
+              84
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_common_impl.h",
+          "lines": [
+            [
+              123,
+              142
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/reg_base_impl/sys_init_intf_impl.h",
+          "lines": [
+            [
+              21,
+              36
+            ]
+          ]
+        }
+      ]
+    },
+    "prepare": {
+      "source_enables_hf32": false,
+      "source_explicitly_resets_hf32": false,
+      "default_model_mode": "fp32",
+      "global_mode_must_be_explicit_if_inherited": true,
+      "runtime_ctrl_bit_46_observed": null,
+      "source": [
+        {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp",
+          "lines": [
+            [
+              17,
+              30
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h",
+          "lines": [
+            [
+              67,
+              95
+            ],
+            [
+              124,
+              131
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+          "lines": [
+            [
+              550,
+              550
+            ],
+            [
+              580,
+              585
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/chunk_gated_delta_rule_fwd_prepare.py",
+          "lines": [
+            [
+              240,
+              265
+            ]
+          ]
+        }
+      ],
+      "compiler_flags": "Generated shim adds HIGH_PERFORMANCE or HIGH_PRECISION defines and custom sync/end flags; no HF32 flag. Retained Prepare source does not branch on those precision defines.",
+      "binary_reviews": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.disasm.txt",
+          "fp32_mmad_sites": [
+            {
+              "line": 931,
+              "instruction": "e70:\t\t\t\tf08c53b5\tMMAD.f322f32\t[X6], [X5], [X7], X13"
+            },
+            {
+              "line": 959,
+              "instruction": "ee0:\t\t\t\tf0963299\tMMAD.f322f32\t[X11], [X3], [X5], X6"
+            },
+            {
+              "line": 1119,
+              "instruction": "1160:\t\t\t\tf08e660d\tMMAD.f322f32\t[X7], [X6], [X12], X3"
+            },
+            {
+              "line": 1173,
+              "instruction": "1238:\t\t\t\tf08e533d\tMMAD.f322f32\t[X7], [X5], [X6], X15"
+            },
+            {
+              "line": 1752,
+              "instruction": "1b44:\t\t\t\tf09e6649\tMMAD.f322f32\t[X15], [X6], [X12], X18"
+            }
+          ],
+          "aic_ctrl_mentions": 0,
+          "aic_unknown_decodes": 0,
+          "boundary": "Static disassembly, not device execution or CTRL readback."
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.disasm.txt",
+          "fp32_mmad_sites": [
+            {
+              "line": 931,
+              "instruction": "e70:\t\t\t\tf08c53b5\tMMAD.f322f32\t[X6], [X5], [X7], X13"
+            },
+            {
+              "line": 959,
+              "instruction": "ee0:\t\t\t\tf0963299\tMMAD.f322f32\t[X11], [X3], [X5], X6"
+            },
+            {
+              "line": 1119,
+              "instruction": "1160:\t\t\t\tf08e660d\tMMAD.f322f32\t[X7], [X6], [X12], X3"
+            },
+            {
+              "line": 1173,
+              "instruction": "1238:\t\t\t\tf08e533d\tMMAD.f322f32\t[X7], [X5], [X6], X15"
+            },
+            {
+              "line": 1752,
+              "instruction": "1b44:\t\t\t\tf09e6649\tMMAD.f322f32\t[X15], [X6], [X12], X18"
+            }
+          ],
+          "aic_ctrl_mentions": 0,
+          "aic_unknown_decodes": 0,
+          "boundary": "Static disassembly, not device execution or CTRL readback."
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/prepare_a42943b.disasm.txt",
+          "fp32_mmad_sites": [
+            {
+              "line": 931,
+              "instruction": "e70:\t\t\t\tf08c53b5\tMMAD.f322f32\t[X6], [X5], [X7], X13"
+            },
+            {
+              "line": 959,
+              "instruction": "ee0:\t\t\t\tf0963299\tMMAD.f322f32\t[X11], [X3], [X5], X6"
+            },
+            {
+              "line": 1119,
+              "instruction": "1160:\t\t\t\tf08e660d\tMMAD.f322f32\t[X7], [X6], [X12], X3"
+            },
+            {
+              "line": 1173,
+              "instruction": "1238:\t\t\t\tf08e533d\tMMAD.f322f32\t[X7], [X5], [X6], X15"
+            },
+            {
+              "line": 1752,
+              "instruction": "1b44:\t\t\t\tf09e6649\tMMAD.f322f32\t[X15], [X6], [X12], X18"
+            }
+          ],
+          "aic_ctrl_mentions": 0,
+          "aic_unknown_decodes": 0,
+          "boundary": "Static disassembly, not device execution or CTRL readback."
+        }
+      ],
+      "limitation": "Prepare uses direct local buffers, not TPipe, and does not itself invoke the shown reset. Default-mode modeling is supported by CANN default CTRL plus absence of an enable, but this is not proof of the captured runtime's incoming CTRL. HF32 persists until disabled within a control context.",
+      "persistence_evidence": {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/asc_enable_hf32.md",
+        "lines": [
+          [
+            114,
+            117
+          ]
+        ]
+      }
+    },
+    "theoretical_peaks": {
+      "clock_hz_nominal": 1650000000,
+      "aic_count": 32,
+      "flops_per_multiply_accumulate": 2,
+      "fp32": {
+        "cube_m": 16,
+        "cube_n": 16,
+        "cube_k": 1,
+        "k0": 8,
+        "per_aic_flops_per_cycle": 512,
+        "device_flops_per_s": 27033600000000
+      },
+      "hf32": {
+        "cube_m": 16,
+        "cube_n": 16,
+        "cube_k": 8,
+        "k0": 8,
+        "per_aic_flops_per_cycle": 4096,
+        "device_flops_per_s": 216268800000000
+      },
+      "evidence": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+          "lines": [
+            [
+              20,
+              37
+            ],
+            [
+              54,
+              68
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/HF32.md",
+          "lines": [
+            [
+              20,
+              23
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+          "lines": [
+            [
+              20,
+              22
+            ],
+            [
+              43,
+              43
+            ]
+          ]
+        }
+      ],
+      "scope": "Nominal body-throughput derivation, excluding startup, dependencies, contention and clock variation. No measurement fit or empirical multiplier."
+    }
+  },
+  "reg_vector": {
+    "scope": "NpuArch3510 / Ascend 950, not A3 Memory API.",
+    "register_bytes": 256,
+    "source": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/RegTensor.md",
+      "lines": [
+        [
+          42,
+          42
+        ]
+      ]
+    },
+    "rate_contract": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+      "lines": [
+        [
+          3,
+          9
+        ]
+      ]
+    },
+    "single_instruction_rates": [
+      {
+        "mode": "fp32_add",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 116,
+        "issue_line": 33
+      },
+      {
+        "mode": "fp32_mul",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 144,
+        "issue_line": 38
+      },
+      {
+        "mode": "fp32_muls",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 190,
+        "issue_line": 45
+      },
+      {
+        "mode": "fp32_sqrt_hardware",
+        "elements_per_cycle": 16,
+        "issue_class": "dual_capable",
+        "theory_line": 91,
+        "issue_line": 26
+      },
+      {
+        "mode": "fp32_div_hardware",
+        "elements_per_cycle": 16,
+        "issue_class": "dual_capable",
+        "theory_line": 120,
+        "issue_line": 35
+      },
+      {
+        "mode": "fp32_reduce_sum",
+        "elements_per_cycle": 64,
+        "issue_class": "single",
+        "theory_line": 358,
+        "issue_line": 88
+      },
+      {
+        "mode": "fp32_interleave",
+        "elements_per_cycle": 64,
+        "issue_class": "single",
+        "theory_line": 424,
+        "issue_line": 97
+      },
+      {
+        "mode": "fp32_deinterleave",
+        "elements_per_cycle": 64,
+        "issue_class": "single",
+        "theory_line": 433,
+        "issue_line": 98
+      },
+      {
+        "mode": "fp32_duplicate",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 402,
+        "issue_line": 65
+      },
+      {
+        "mode": "b32_loadalign_single_contiguous",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 17,
+        "issue_line": 16
+      },
+      {
+        "mode": "b32_loadalign_noncontiguous",
+        "elements_per_cycle": 32,
+        "issue_class": "single",
+        "theory_line": 20,
+        "issue_line": 72
+      },
+      {
+        "mode": "b32_storealign_contiguous",
+        "elements_per_cycle": 64,
+        "issue_class": "single",
+        "theory_line": 42,
+        "issue_line": 78
+      },
+      {
+        "mode": "b32_storealign_noncontiguous",
+        "elements_per_cycle": 32,
+        "issue_class": "single",
+        "theory_line": 45,
+        "issue_line": 77
+      },
+      {
+        "mode": "cast_fp32_bf16",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 320,
+        "issue_line": 63
+      },
+      {
+        "mode": "cast_bf16_fp32",
+        "elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "theory_line": 322,
+        "issue_line": 63
+      }
+    ],
+    "issue_topology": {
+      "max_instructions_per_cycle": 2,
+      "max_reg_writes_per_cycle": 2,
+      "ub_port_options_per_cycle": [
+        {
+          "read_vector_lengths": 2,
+          "write_vector_lengths": 0
+        },
+        {
+          "read_vector_lengths": 1,
+          "write_vector_lengths": 1
+        }
+      ],
+      "source": {
+        "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+        "lines": [
+          [
+            3,
+            4
+          ]
+        ]
+      },
+      "warning": "Dual-capable is a concurrency capability; dependent instructions do not become zero-latency. Do not create independent resources for every opcode or assume both slots always occupied."
+    },
+    "selected_lowering": [
+      {
+        "api": "Add<float, ZEROING>",
+        "builtins": [
+          "vadd"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+          "lines": [
+            [
+              132,
+              157
+            ]
+          ]
+        },
+        "qualifier": "MERGING follows an additional CopyMerging path."
+      },
+      {
+        "api": "Muls<float>",
+        "builtins": [
+          "vmuls"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_scalar_impl.h",
+          "lines": [
+            [
+              148,
+              180
+            ]
+          ]
+        }
+      },
+      {
+        "api": "Reduce<float,SUM>",
+        "builtins": [
+          "vcadd"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_reduce_impl.h",
+          "lines": [
+            [
+              34,
+              54
+            ]
+          ]
+        }
+      },
+      {
+        "api": "Interleave<b32>",
+        "builtins": [
+          "vintlv_with_two_destinations"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h",
+          "lines": [
+            [
+              305,
+              331
+            ]
+          ]
+        }
+      },
+      {
+        "api": "DeInterleave<b32>",
+        "builtins": [
+          "vdintlv_with_two_destinations"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h",
+          "lines": [
+            [
+              348,
+              374
+            ]
+          ]
+        }
+      },
+      {
+        "api": "LoadAlign<float, DIST_NORM or DIST_BRC_B32>",
+        "builtins": [
+          "vlds"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h",
+          "lines": [
+            [
+              31,
+              87
+            ]
+          ]
+        }
+      },
+      {
+        "api": "StoreAlign<float, DIST_NORM>",
+        "builtins": [
+          "vsts"
+        ],
+        "source": {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h",
+          "lines": [
+            [
+              49,
+              105
+            ]
+          ]
+        }
+      }
+    ],
+    "interleave_counting": {
+      "source_builtin_count_per_b32_call": 1,
+      "dest_registers_per_call": 2,
+      "nominal_issue_service_cycles_per_call": 1,
+      "basis": "Single-issue table explicitly defines one instruction per cycle, and maps VINTLV/VDINTLV to these APIs. Exact CANN uses one paired-output builtin. The 2-register write limit accommodates both outputs.",
+      "not_proven": "Full dependency latency or final compiler DCE of the entire VF. No claim that an unused second output halves a paired instruction."
+    },
+    "mask": {
+      "valid_lane_control_only_in_api_contract": true,
+      "same_b32_instruction_form_for_VL1_VL32_VL64": true,
+      "proportional_cpi_reduction_with_mask_proven": false,
+      "dependency_latency_cycles": null,
+      "evidence": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/MaskReg.md",
+          "lines": [
+            [
+              44,
+              44
+            ],
+            [
+              74,
+              84
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+          "lines": [
+            [
+              132,
+              157
+            ]
+          ]
+        }
+      ],
+      "modeling_boundary": "Keep valid arithmetic elements and fixed instruction issue demand separate. A masked call still passes the same instruction form; this does not supply undocumented result latency."
+    },
+    "ftz": {
+      "compiler_switch": "--cce-ftz",
+      "documented_default": true,
+      "prepare_shim_override_found": false,
+      "default_fp32_sqrt_builtin": "vsqrt",
+      "default_fp32_div_builtin": "vdiv",
+      "source": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Sqrt.md",
+          "lines": [
+            [
+              64,
+              64
+            ],
+            [
+              101,
+              113
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Div.md",
+          "lines": [
+            [
+              64,
+              64
+            ],
+            [
+              104,
+              112
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_unary_impl.h",
+          "lines": [
+            [
+              373,
+              443
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+          "lines": [
+            [
+              1537,
+              1576
+            ]
+          ]
+        }
+      ],
+      "nondefault": "FTZ=false and explicit precision modes can expand Sqrt/Div into several register instructions; hardware 16 elements/cycle is not a rate for the entire software API."
+    },
+    "generic_vector_rate_warning": {
+      "aiv_count": 64,
+      "nominal_clock_hz": 1650000000,
+      "single_fp32_instruction_elements_per_s": 6758400000000,
+      "two_independent_adds_elements_per_s_upper_bound": 13516800000000,
+      "two_independent_fmas_flops_per_s_upper_bound": 27033600000000,
+      "interpretation": "27.0336 TFLOP/s can describe two FMAs/cycle counting multiply+add, not a universal 256 FP32 Add elements/AIV/cycle. Conversely 6.7584 T elements/s is not a universal maximum because independent dual issue exists."
+    },
+    "mask_timing_followup": {
+      "masked_fp32_sqrt_div_VL1_service_cycles": null,
+      "masked_fp32_sqrt_div_VL1_dependency_latency_cycles": null,
+      "full_register_four_cycle_service_for_VL1_proven": false,
+      "active_lane_scaled_one_cycle_service_for_VL1_proven": false,
+      "same_builtin_is_not_timing_evidence": true,
+      "evidence": [
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+          "lines": [
+            [
+              9,
+              9
+            ],
+            [
+              90,
+              91
+            ],
+            [
+              120,
+              120
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+          "lines": [
+            [
+              3,
+              4
+            ],
+            [
+              26,
+              26
+            ],
+            [
+              35,
+              35
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Sqrt.md",
+          "lines": [
+            [
+              64,
+              73
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Div.md",
+          "lines": [
+            [
+              64,
+              74
+            ]
+          ]
+        },
+        {
+          "path": "/tmp/review-gdn-python-image-20261028/platform-units/MaskReg.md",
+          "lines": [
+            [
+              44,
+              44
+            ],
+            [
+              74,
+              84
+            ]
+          ]
+        }
+      ],
+      "conclusion": "The documents specify valid lanes, single-instruction throughput and dual-issue eligibility, but do not say whether sparse masks shorten hardware execution occupancy. The same vsqrt/vdiv builtin cannot prove either fixed four-cycle or active-lane-scaled one-cycle service. Keep masked service parameterized and separate from result latency.",
+      "issue_capacity_interpretation": "A dual-capable instruction consumes one issue slot; at most two eligible independent instructions can issue per cycle. This is not a claim of 0.5-cycle instruction latency. The two-data-register-write rule must not silently include predicate writes: the table does not establish whether MaskReg and RegTensor share a write port."
+    },
+    "cast_and_control_followup": {
+      "bf16_to_fp32": {
+        "documented_elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "source_layouts": [
+          "RegLayout::ZERO",
+          "RegLayout::ONE"
+        ],
+        "source_builtin": "one vcvt with layout converted to ::Part",
+        "max_converted_elements_per_call": 64,
+        "data_register_writes_per_call": 1,
+        "qualifier": "ZEROING path only; MERGING adds CopyMerging. A layout selects positions, not another 128-element conversion.",
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+            "lines": [
+              [
+                319,
+                322
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                63,
+                63
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Cast.md",
+            "lines": [
+              [
+                45,
+                45
+              ],
+              [
+                207,
+                213
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_RegLayout.md",
+            "lines": [
+              [
+                3,
+                3
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h",
+            "lines": [
+              [
+                36,
+                70
+              ],
+              [
+                92,
+                104
+              ]
+            ]
+          }
+        ]
+      },
+      "fp32_to_bf16": {
+        "documented_elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "source_builtin": "one vcvt with rounding, saturation and layout",
+        "max_converted_elements_per_call": 64,
+        "data_register_writes_per_call": 1,
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+            "lines": [
+              [
+                320,
+                320
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                63,
+                63
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h",
+            "lines": [
+              [
+                154,
+                186
+              ],
+              [
+                220,
+                227
+              ]
+            ]
+          }
+        ]
+      },
+      "duplicate_fp32": {
+        "documented_elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "source_builtin_unmasked_scalar": "vbr",
+        "data_register_writes_per_call": 1,
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+            "lines": [
+              [
+                400,
+                402
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                65,
+                65
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h",
+            "lines": [
+              [
+                65,
+                96
+              ]
+            ]
+          }
+        ]
+      },
+      "xor_b32": {
+        "documented_elements_per_cycle": 64,
+        "issue_class": "dual_capable",
+        "source_builtin": "vxor",
+        "data_register_writes_per_call": 1,
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+            "lines": [
+              [
+                220,
+                221
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                49,
+                49
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+            "lines": [
+              [
+                1976,
+                1990
+              ]
+            ]
+          }
+        ]
+      },
+      "create_mask_fp32": {
+        "issue_class": "dual_capable",
+        "source_builtin": "pset_b32",
+        "predicate_writes_per_call": 1,
+        "dependency_latency_cycles": null,
+        "shares_data_register_write_port": null,
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                14,
+                14
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h",
+            "lines": [
+              [
+                84,
+                102
+              ]
+            ]
+          }
+        ]
+      },
+      "update_mask_fp32": {
+        "issue_class": "dual_capable",
+        "source_builtin": "plt_b32(..., POST_UPDATE)",
+        "predicate_writes_per_call": 1,
+        "dependency_latency_cycles": null,
+        "shares_data_register_write_port": null,
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                15,
+                15
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h",
+            "lines": [
+              [
+                28,
+                50
+              ]
+            ]
+          }
+        ]
+      },
+      "other_predicate_apis": {
+        "documented_theory_cycles": {
+          "MaskReg_LoadAlign": 1,
+          "MaskGenWithRegTensor": 4,
+          "MaskReg_StoreAlign": 1,
+          "MaskReg_StoreUnAlign": 1,
+          "MaskReg_Move": 1,
+          "MaskReg_Interleave": 1,
+          "MaskReg_DeInterleave": 1,
+          "MaskReg_Select": 1,
+          "MaskReg_Pack": 1,
+          "MaskReg_UnPack": 1,
+          "MaskReg_MoveMask": 1
+        },
+        "evidence": [
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+            "lines": [
+              [
+                53,
+                77
+              ]
+            ]
+          },
+          {
+            "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+            "lines": [
+              [
+                19,
+                23
+              ],
+              [
+                74,
+                74
+              ],
+              [
+                81,
+                87
+              ]
+            ]
+          }
+        ],
+        "qualifier": "Do not transfer these predicate API cycle entries to PSET/PLT or ordinary vector Interleave/DeInterleave."
+      }
+    },
+    "ub_payload_followup": {
+      "vector_length_bytes": 256,
+      "modes": [
+        {
+          "api": "LoadAlign<bf16, DIST_UNPACK_B16>",
+          "ub_read_payload_bytes_per_call": 128,
+          "ub_write_payload_bytes_per_call": 0,
+          "data_register_writes_per_call": 1,
+          "source_builtin": "one vlds with DIST_UNPACK_B16",
+          "issue_class": "dual_capable",
+          "evidence": [
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_LoadAlign_continuous.md",
+              "lines": [
+                [
+                  147,
+                  147
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "lines": [
+                [
+                  16,
+                  16
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h",
+              "lines": [
+                [
+                  33,
+                  40
+                ],
+                [
+                  48,
+                  87
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "api": "StoreAlign<bf16, DIST_PACK_B32> with 64 active b32 source elements",
+          "ub_read_payload_bytes_per_call": 0,
+          "ub_write_payload_bytes_per_call": 128,
+          "data_register_writes_per_call": 0,
+          "source_builtin": "one vsts with DIST_PACK_B32",
+          "issue_class": "single",
+          "evidence": [
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_StoreAlign_continuous.md",
+              "lines": [
+                [
+                  138,
+                  138
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "lines": [
+                [
+                  78,
+                  78
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h",
+              "lines": [
+                [
+                  49,
+                  59
+                ],
+                [
+                  94,
+                  105
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "api": "LoadAlign<float, DIST_BRC_B32>",
+          "ub_read_payload_bytes_per_call": 4,
+          "ub_write_payload_bytes_per_call": 0,
+          "data_register_writes_per_call": 1,
+          "source_builtin": "one vlds with DIST_BRC_B32",
+          "issue_class": "dual_capable",
+          "evidence": [
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_LoadAlign_continuous.md",
+              "lines": [
+                [
+                  141,
+                  141
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "lines": [
+                [
+                  16,
+                  16
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h",
+              "lines": [
+                [
+                  33,
+                  40
+                ],
+                [
+                  48,
+                  87
+                ]
+              ]
+            }
+          ]
+        },
+        {
+          "api": "StoreAlign<float, DIST_FIRST_ELEMENT_B32>",
+          "ub_read_payload_bytes_per_call": 0,
+          "ub_write_payload_bytes_per_call": 4,
+          "mask_ignored": true,
+          "data_register_writes_per_call": 0,
+          "source_builtin": "one vsts with DIST_FIRST_ELEMENT_B32",
+          "issue_class": "single",
+          "evidence": [
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_StoreAlign_continuous.md",
+              "lines": [
+                [
+                  136,
+                  136
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "lines": [
+                [
+                  78,
+                  78
+                ]
+              ]
+            },
+            {
+              "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h",
+              "lines": [
+                [
+                  49,
+                  59
+                ],
+                [
+                  94,
+                  105
+                ]
+              ]
+            }
+          ]
+        }
+      ],
+      "physical_ub_transaction_bytes_for_partial_or_broadcast_modes": null,
+      "qualifier": "Payload bytes follow the documented instruction semantics. They are not evidence of physical UB bank transaction granules or fractional port occupation. Keep instruction issue capacity, register writes and logical UB byte conservation separate. Do not charge 256B of UB payload merely because a destination/source register is 256B wide."
+    }
+  },
+  "memory_rate_semantics": {
+    "exact_ini": {
+      "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+      "lines": [
+        [
+          73,
+          86
+        ],
+        [
+          234,
+          242
+        ]
+      ]
+    },
+    "aic_group_ddr_read_B_per_cycle": 80,
+    "aiv_group_ddr_read_B_per_cycle": 40,
+    "unit_evidence": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/GetCoreMemBw_pinned.md",
+      "lines": [
+        [
+          48,
+          48
+        ]
+      ]
+    },
+    "wrapper_source": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/platform_ascendc.cpp",
+      "lines": [
+        [
+          240,
+          244
+        ]
+      ]
+    },
+    "consumer_source": {
+      "path": "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_infos_def.cpp",
+      "lines": [
+        [
+          289,
+          302
+        ]
+      ]
+    },
+    "consumer_note": "GetCoreMemBw forwards to GetLocalMemBw, whose public implementation retrieves only AICoreMemoryRates.ddr_rate for HBM. No core-type selection or normalization is in that path. Public implementation is not exact-image SHA matched.",
+    "per_owner_physical_mte2_rate_confirmed": false,
+    "per_owner_nominal_memory_path_hard_limit_confirmed": false,
+    "shared_l2_bandwidth_B_per_cycle": null,
+    "recommendation": "Keep 80/40 as platform nominal metadata or explicit configurable hypothesis, not a verified physical MTE2/owner service ceiling. Separate AIC and AIV topology is supported, but rates need a consumer/architecture contract establishing owner semantics."
+  },
+  "limitations": [
+    "This report validates source and nominal instruction contracts, not end-to-end model accuracy.",
+    "Read-only Docker runs and bounded static disassembly launched no device contexts or kernels.",
+    "The installed llvm-objdump decodes AIC scalar/MMAD but did not expose named VINTLV/VDINTLV in SIMD VF regions; final VF DCE and issue grouping remain unverified.",
+    "No tests were rerun and no code was integrated in this continuation."
+  ],
+  "related_reports": [
+    "/tmp/review-a5-onchip-rates-20261028.json",
+    "/tmp/review-gdn-caller-boundary-20261028.json",
+    "/tmp/review-gdn-mmad-tail-20261028.json",
+    "/tmp/review-causal-conv-native-task-20261028.json"
+  ],
+  "sources": [
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/additional/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+      "sha256": "9ef1f4836bafcfb195810649b15cf00a6724dee602d983321c346e08b8c26d16",
+      "bytes": 45674,
+      "original_path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/additional/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h",
+      "sha256": "e5b81317a9444e683168f055915c496ef21e95b782dda74da0e0d782b73752c0",
+      "bytes": 5498,
+      "original_path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/additional/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp",
+      "sha256": "ecf49bfbf73ad9d6fd81145c2364357eba00f23382440d6797d91a77387159c2",
+      "bytes": 1170,
+      "original_path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/Ascend950DT_9582.ini",
+      "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+      "bytes": 20397,
+      "original_path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_common_impl.h",
+      "sha256": "aa871e7c459107c62b2661cb27445087081a0c9f50715ffaa205d61c45ce5025",
+      "bytes": 8289,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_common_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "sha256": "6fbe664ed6e0d846549b425a6b0d60e697a24fda1e0b6829f11a33f4ae7a41d9",
+      "bytes": 85819,
+      "relative_path": "impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "sha256": "ef7598e2db5e2839a08a1eb88fc849dd9f28154f9733a9dfcfce1b1a8e63cf7d",
+      "bytes": 41240,
+      "relative_path": "impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+      "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+      "bytes": 83067,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h",
+      "sha256": "4dea588909759b2d849e8034b33d6abc0c9141f7fcc2c2a915c28c4aa33ccafe",
+      "bytes": 48439,
+      "relative_path": "impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_macros.h",
+      "sha256": "d1c14c3039b530d98ae824d9219f7d8791dba5a8c046671ca48e7b7d8312456a",
+      "bytes": 3754,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_macros.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_common_intf_impl.h",
+      "sha256": "acad9d876ad4ac3488e5efc05d85a08d840a3584cd3a96eabd8429b8014b11d1",
+      "bytes": 10674,
+      "relative_path": "impl/basic_api/kernel_operator_common_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/kernel_operator_common_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_common_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "sha256": "23fedd925a3474b44cf9fd61a1e89b9cad8a2777151b9e420c84d5ff3d69ca31",
+      "bytes": 34232,
+      "relative_path": "impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "sha256": "5eed2f9d39c398317de9b82f5b15211442e8bec4fbd35bcb75b84833eb52b632",
+      "bytes": 13406,
+      "relative_path": "impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_reg.h",
+      "sha256": "05b96b9016ce90410b7d3e83b4755bea50f0ea039873c6ce0bf92d682ccfc4e1",
+      "bytes": 23196,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_reg.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_utils_base.h",
+      "sha256": "0b5494e9832f181355c453cb2659c580360015988ac3c2546243edfafd87e53a",
+      "bytes": 18145,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_utils_base.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h",
+      "sha256": "872abab1d6b92c0bf17655d774e8c900b54d34d0aa371ae672a006cb0586ca83",
+      "bytes": 15763,
+      "relative_path": "impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h",
+      "sha256": "ae8a96a87301997d3d85958d6ad4da1d693ebe6750f875c0d7ab284ba7669606",
+      "bytes": 24258,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h",
+      "sha256": "0aeea64d8c3e18054ae57142aeacf91de1ab1da5f5680dcb73b2da6dcf3b9857",
+      "bytes": 29310,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h",
+      "sha256": "fbb35baa07d2b605666161fa21fbb3bcea0f04f3e1b6b63ac390342f537fdbc6",
+      "bytes": 8631,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+      "sha256": "6f291f79f9e9d6c84b83c623ecda907cdcfde081b0d0d4d1379a243dff9b8a53",
+      "bytes": 101323,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_scalar_impl.h",
+      "sha256": "09fa65ce4a7b3fb3d57ce9e22e73075854e5b0fbd840f50a1c7470275a064901",
+      "bytes": 21476,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_scalar_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h",
+      "sha256": "07ebe10156b7c6b69c9977e22d967d71e923edd649b61d16f366690d038f02a4",
+      "bytes": 19900,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_reduce_impl.h",
+      "sha256": "cd68ef1355f5604a4230ccb0168d887048ab6f27244d47dda46e9e1a68cc3ccd",
+      "bytes": 17580,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_reduce_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_unary_impl.h",
+      "sha256": "7b4cc8c5871cfe1204e52a153e17ab4444fa655c9e144d95a580499584d6f0f6",
+      "bytes": 38360,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_unary_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h",
+      "sha256": "6cf55b9654ff223b9ec9b0a6f856584df250a2dacea773469230e1f8bb21b6f1",
+      "bytes": 34161,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h",
+      "sha256": "a6ba48b44a0dd18fb29c06eae7cc6e2e542e7c7165dc9e6a4019ffc854b8248b",
+      "bytes": 19250,
+      "relative_path": "impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h",
+      "sha256": "5b26385441a49b406f317e15ec59dd12772c4e9d251e2e5a916a8a2b315b541d",
+      "bytes": 2319,
+      "relative_path": "impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/memory_base_impl/cube_compute_intf_impl.h",
+      "sha256": "0b5e2706cec57606550bd5b3d1b2725d42c4831d71af5f3b985ff31d421a8591",
+      "bytes": 13483,
+      "relative_path": "impl/c_api/memory_base_impl/cube_compute_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/c_api/memory_base_impl/cube_compute_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/memory_base_impl/cube_compute_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/reg_base_impl/cube_compute_intf_impl.h",
+      "sha256": "171098dbd64751624ad85b0b2b5f58501d693993456ddd07cbac310e3ff45261",
+      "bytes": 18595,
+      "relative_path": "impl/c_api/reg_base_impl/cube_compute_intf_impl.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/c_api/reg_base_impl/cube_compute_intf_impl.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/reg_base_impl/cube_compute_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/reg_base_impl/sys_init_intf_impl.h",
+      "sha256": "3e19fa56cf74a4c5907174a53b5b41727a58dbe00732d97bae773e445218fcc1",
+      "bytes": 2027,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/reg_base_impl/sys_init_intf_impl.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/kernel_struct_mm.h",
+      "sha256": "c4ed92865d28df91123f3db41457e870f1b20dbca53dfeb5b1f65341f061721e",
+      "bytes": 19101,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/kernel_struct_mm.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h",
+      "sha256": "4609f0e0625ce6db16093f135bce12da7724fb52f4d78e849602947c441784ef",
+      "bytes": 3494,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h",
+      "sha256": "9a71a4c1ec06681835297cd70675a66d06b5e11070091506750db33b6eb1a577",
+      "bytes": 2903,
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/kernel_operator.h",
+      "sha256": "1c957118754373b9207a3d09c0df58ca42b8ab002843cac24922c85dd8499b70",
+      "bytes": 1405,
+      "relative_path": "include/kernel_operator.h",
+      "image_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/include/kernel_operator.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/cann/include/kernel_operator.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/DeInterleave.md",
+      "sha256": "ace453ae10d12323a2a8bfd76774fb9c20289543d367a51e0547de26638746a8",
+      "bytes": 4280,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/reg_vector_compute/data_reorder/DeInterleave.md",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/reg_vector_compute/data_reorder/DeInterleave.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/DeInterleave.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Fixpipe_L0CToGM.md",
+      "sha256": "1f55a31fe89adbed8b4eca9e8eb8c8ef8b2e6668d8a3fe35b23401e50ddacf35",
+      "bytes": 34002,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_store/Fixpipe_L0CToGM.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_store/Fixpipe_L0CToGM.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Fixpipe_L0CToGM.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/GetCoreMemBw_pinned.md",
+      "sha256": "329966ae98f6dc2e891794a3eb7214fa9f3ae8dc0cb563e4528516aef72f15f8",
+      "bytes": 5528,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/GetCoreMemBw_pinned.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/HF32.md",
+      "sha256": "e166009c7f243d08252b011a048be9c4cbbe93a01b28cc924cee30e11ff11d2f",
+      "bytes": 2578,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/HF32.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Interleave.md",
+      "sha256": "85e8651c155daaad0e87243d7f89f4e763bc40aa6dfd1c1cd5ce4e5d52ff9434",
+      "bytes": 4257,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/reg_vector_compute/data_reorder/Interleave.md",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/reg_vector_compute/data_reorder/Interleave.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Interleave.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/LoadDataWithTranspose.md",
+      "sha256": "95270d09d03309882d7e249bdc4396ccf72d4069ede68f3d40e3740e1136a790",
+      "bytes": 39891,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadDataWithTranspose.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadDataWithTranspose.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/LoadDataWithTranspose.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/LoadData_2D_V2.md",
+      "sha256": "c177936138dd16fc889f147abfe757ac59df588419476b0582ffffe5058303bd",
+      "bytes": 9849,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadData_2D_V2.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadData_2D_V2.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/LoadData_2D_V2.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/MaskReg.md",
+      "sha256": "f50cf813c50526f1d6e25fe321433bb81315e924a5a66d3fecdb0f96ad9c7c10",
+      "bytes": 17750,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/MaskReg.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Mmad.md",
+      "sha256": "1ebb798bb29605a5cbabb2b52964032fff2e5a3b0c02b9ba7556b05f573e062a",
+      "bytes": 19522,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Mmad.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/RegTensor.md",
+      "sha256": "29bd41f739a2dc3ef480ac30e707b9775df369263f984d2ea6fada1ebf70805c",
+      "bytes": 7232,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/RegTensor.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Cast.md",
+      "sha256": "d3820142e41dc7a546b2b5cf7f3a6f4fa01118651f88924ac6b2e0741bb77447",
+      "bytes": 28685,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Cast.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Div.md",
+      "sha256": "7fd801fd5686b4371a42e11dcde53627b4437a6a2387c9a38dd407961cfc1981",
+      "bytes": 8683,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Div.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Duplicate.md",
+      "sha256": "53c81c56c9d7562b01871cb5e26f90d0256ebdb16c9a85cd075356f1b4caaee1",
+      "bytes": 5859,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/reg_vector_compute/data_padding/Duplicate.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Duplicate.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_LoadAlign_continuous.md",
+      "sha256": "ddaee4231a9eec42e677eee35736e1d98cdf275b685b4125aac2c9b8d85c9676",
+      "bytes": 18520,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_LoadAlign_continuous.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_RegLayout.md",
+      "sha256": "c7d161c8cb0624d058e146304c2d4dbb97458bd710932d415fffd5c4fa54a886",
+      "bytes": 4384,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_RegLayout.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Sqrt.md",
+      "sha256": "92d29fbbd83184fd3a14bc34039f5c878e75a27dc50844e9bd04517ec37092e7",
+      "bytes": 7413,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Sqrt.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_StoreAlign_continuous.md",
+      "sha256": "c56ba86e3b63537a96ff89b069e208b3eeec2d6e8fbbae750a56be85879b6389",
+      "bytes": 17305,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_StoreAlign_continuous.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Xor.md",
+      "sha256": "2abecd61b39b5788533e01e4fae9291381fa062b1dccbf4018411b00790d45d8",
+      "bytes": 5490,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/reg_vector_compute/logical_compute/Xor.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Xor.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetCtrlSpr_ISASI.md",
+      "sha256": "89294981b9bd7417171309441949da795b8a3fd893b96df359465dc245b37007",
+      "bytes": 9727,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/special_register_access/SetCtrlSpr_ISASI.md",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/special_register_access/SetCtrlSpr_ISASI.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/SetCtrlSpr_ISASI.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetHF32Mode.md",
+      "sha256": "6c07106d25012903b72905595b2476a47f11b432b5b9f17de1156fa2fc50b0e0",
+      "bytes": 1533,
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute_aux_config/SetHF32Mode.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute_aux_config/SetHF32Mode.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/SetHF32Mode.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetHF32TransMode.md",
+      "sha256": "ddc559fac559b6a58c4ebacabf11db57f76d2ba4291069fe7cf7923311690c2e",
+      "bytes": 1750,
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute_aux_config/SetHF32TransMode.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute_aux_config/SetHF32TransMode.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/SetHF32TransMode.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/api_pipeline_type_summary.md",
+      "sha256": "04904132d7f803ab82a1c87297b6c9616fc6618f252ed08d92e7595872b82b02",
+      "bytes": 9091,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/appendix/api_pipeline_type_summary.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/appendix/api_pipeline_type_summary.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/api_pipeline_type_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_enable_hf32.md",
+      "sha256": "77da1dd2c6e72732dcf324dc187aa2e136744ae72f06d1790aef8c280b40cbea",
+      "bytes": 10166,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/asc_enable_hf32.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_init.md",
+      "sha256": "3b94b38d11d8a57a41b7fbcb50926877602ea4e3e71ef91c28463bf2a663df31",
+      "bytes": 8523,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/c_api/utils/sys_init/asc_init.md",
+      "relative_path": "docs/zh/api/SIMD-API/c_api/utils/sys_init/asc_init.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/asc_init.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_set_ctrl.md",
+      "sha256": "e72d7bb71cb20397321a731ccee79c7de51954f662e2087e2ce7c791840074c1",
+      "bytes": 6285,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/c_api/spr/asc_set_ctrl.md",
+      "relative_path": "docs/zh/api/SIMD-API/c_api/spr/asc_set_ctrl.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/asc_set_ctrl.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/bisheng_compiler.md",
+      "sha256": "16fd36b60e4dea767621c78aac476b7015824c26a5084c5103027b0271c2b709",
+      "bytes": 1567,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/bisheng_compiler.md",
+      "relative_path": "docs/zh/guide/programming_guide/compilation_and_execution/operator_compilation/bisheng_compiler.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/bisheng_compiler.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/c_api_reg_vector_compute_theoretical_perf_summary.md",
+      "sha256": "6b0e383e0bff694322f1c700ad565df5ea3a67754fafa5147f9865e0e57bdb54",
+      "bytes": 9793,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/appendix/c_api_reg_vector_compute_theoretical_perf_summary.md",
+      "relative_path": "docs/zh/api/appendix/c_api_reg_vector_compute_theoretical_perf_summary.md",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/c_api_reg_vector_compute_theoretical_perf_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/cube_instruction_theoretical_perf_summary.md",
+      "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+      "bytes": 21427,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/fixpipe_perf_README.md",
+      "sha256": "55740b2c538affdb5794235c29867cdca42144d12c5cc31b585b228f5d4b0709",
+      "bytes": 12694,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "tests/perf/fixpipe_perf/README.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/tests/perf/fixpipe_perf/README.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_README.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/fixpipe_perf_roofline.py",
+      "sha256": "2452cb929b69c1d05bad3d2884d21a65a868022ec01965d65f0a37cd74b1fe60",
+      "bytes": 20437,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "tests/perf/fixpipe_perf/generate_roofline.py",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/tests/perf/fixpipe_perf/generate_roofline.py",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_roofline.py"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/npu_3510_hw_arch.png",
+      "sha256": "b763517e689afc2d7dbafce20ed5c1816e63e2d36cdd0cd755daf4b79115ae60",
+      "bytes": 394810,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/guide/figures/npu_3510_hw_arch.png",
+      "url": "https://media.githubusercontent.com/media/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/guide/figures/npu_3510_hw_arch.png",
+      "git_lfs_sha_verified": true,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_3510_hw_arch.png"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/npu_arch_3510.md",
+      "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+      "bytes": 23771,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_3510.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_3510.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/platform_ascendc.cpp",
+      "sha256": "f5b65050797c89193ae17ac02d54f45d92c2c9d861547347c24443e7639de234",
+      "bytes": 22589,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/platform_ascendc.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/platform_ascendc.h",
+      "sha256": "ced0db53e43f36c6cc469df25a1ded5b1f1ecfc01fbe9a66af1d81f593bfc8d8",
+      "bytes": 6197,
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/include/utils/tiling/platform/platform_ascendc.h",
+      "relative_path": "include/utils/tiling/platform/platform_ascendc.h",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/platform_ascendc.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_device_defs.h",
+      "sha256": "c611b38f74a763ccd8404a14aacf79b428e5bb922bfb31809f88c86ac2291c91",
+      "bytes": 13785,
+      "repo": "Ascend/msopprof",
+      "revision": "a52c8694979016be703006ec242901519bef31d8",
+      "relative_path": "csrc/op_profiling/profiling/device/data_parse/device_defs.h",
+      "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_parse/device_defs.h",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_device_defs.h"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_pmu_calculator.cpp",
+      "sha256": "ea8cdbd5e6bbe4a6e93b030777e8cd5fbfb0dc0eb8e63c5b5260f5a911ee0b0e",
+      "bytes": 19856,
+      "repo": "Ascend/msopprof",
+      "revision": "a52c8694979016be703006ec242901519bef31d8",
+      "relative_path": "csrc/op_profiling/profiling/device/data_visualize/pmu_calculator.cpp",
+      "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/pmu_calculator.cpp",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_pmu_calculator.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_roofline.cpp",
+      "sha256": "0dbe5a22cf5187252115084a4dae587f3a5d97bdfd19840bd0ce1a547df75009",
+      "bytes": 39825,
+      "repo": "Ascend/msopprof",
+      "revision": "a52c8694979016be703006ec242901519bef31d8",
+      "relative_path": "csrc/op_profiling/profiling/device/data_visualize/roofline.cpp",
+      "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/roofline.cpp",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_roofline.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_storage_access.cpp",
+      "sha256": "cc0da05fe1e9dcf28031269672294e8cd40ed9d8267579c2b66f6d65493cae69",
+      "bytes": 101861,
+      "repo": "Ascend/msopprof",
+      "revision": "a52c8694979016be703006ec242901519bef31d8",
+      "relative_path": "csrc/op_profiling/profiling/device/data_visualize/storage_access.cpp",
+      "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/storage_access.cpp",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_storage_access.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+      "sha256": "1c8762844dd7f27b27565fd2a4bfc8fc4a6b6020c5ecefce76aa4ebade554d3d",
+      "bytes": 4637,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_precision_standard_summary.md",
+      "sha256": "53dc1a1b14450295c679d56b8ec8807a72c1488081d6dfeb83d8f6801221df0d",
+      "bytes": 3456,
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/appendix/reg_vector_compute_interface_precision_standard_summary.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/appendix/reg_vector_compute_interface_precision_standard_summary.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_precision_standard_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+      "sha256": "9bad332c6f0251c19d3282a9ad8a428cde09b36a9274cacafb9e7f8fe2146973",
+      "bytes": 18392,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/runtime_platform_info.cpp",
+      "sha256": "500fcc3258ef80b5f3fba9963883d493fa7b1223c110e3d30f8b115e8ccfd645",
+      "bytes": 61475,
+      "repo": "hicann/runtime",
+      "revision": "93b7ec22fb1141fa30c9c746b7dfa9cab5f53e55",
+      "relative_path": "src/platform/platform_info.cpp",
+      "url": "https://raw.githubusercontent.com/hicann/runtime/93b7ec22fb1141fa30c9c746b7dfa9cab5f53e55/src/platform/platform_info.cpp",
+      "exact_image_sha_verified": false,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_info.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/runtime_platform_infos_def.cpp",
+      "sha256": "b433a9320ebbaff6ea0fec753f248792bd6e02fcde6c42265c8abd812ccd514c",
+      "bytes": 18763,
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_infos_def.cpp"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/vector_instruction_theoretical_perf_summary.md",
+      "sha256": "0d68bf9fb2584e21ca64bc3f4ab6643241186cedbf6d5e93a6f07901900c6600",
+      "bytes": 12745,
+      "repo": "hicann/asc-devkit",
+      "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+      "relative_path": "docs/zh/api/appendix/vector_instruction_theoretical_perf_summary.md",
+      "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/appendix/vector_instruction_theoretical_perf_summary.md",
+      "original_path": "/tmp/review-gdn-python-image-20261028/platform-units/vector_instruction_theoretical_perf_summary.md"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.disasm.txt",
+      "sha256": "fddf35cfc7a84a2a93a211f65de20d3adb8aa1490035065742bd62b213f80e04",
+      "bytes": 519086,
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.disasm.txt"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json",
+      "sha256": "f6833cc1b4c92a0dd5d860429f5b52c3c73ffcf4d1fc63e6b48c481d54d51a65",
+      "bytes": 6008,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o",
+      "sha256": "60833aab4465eed0616dcb3f6a8f2d065eab065af5834ce86ae1b81b72f741bc",
+      "bytes": 51336,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json",
+      "sha256": "eeb41660cf5bfe0b3f04cf1085975600d53f608013f3e66f580369859e0dd106",
+      "bytes": 5964,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o",
+      "sha256": "6e950c8a29a8f483e4a22019591b57e8df2275a884c1a3a6bc1e973e56026caa",
+      "bytes": 51336,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.disasm.txt",
+      "sha256": "8d7b396cc911353571a62d537b728e17036e91b1b35652c2baceec609a73e760",
+      "bytes": 514561,
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.disasm.txt"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json",
+      "sha256": "eed65f8fbabc0f3d1fba9f1206783862dd8d2bf1ca92722095c2f0fb3d778269",
+      "bytes": 5996,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o",
+      "sha256": "f80f669546b02fafb72263f7cb34664ace52339df006070d0dd17d7edd513872",
+      "bytes": 50720,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json",
+      "sha256": "f18e4baf272041851be98883023c09db78fbc3a4cecfdf95163523102a88f9a9",
+      "bytes": 5964,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o",
+      "sha256": "ffbd7f6280768f617ecbe6072ddc4452c4f559f5a259f7dd53333a59dc70ddce",
+      "bytes": 50720,
+      "relative_path": "kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o",
+      "image_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/chunk_gated_delta_rule_fwd_prepare/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o",
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/chunk_gated_delta_rule_fwd_prepare.py",
+      "sha256": "db5da60aaf5ec8e58fb2e0f9f0afcb31a99a076973c086d4a8a42e54b10976ec",
+      "bytes": 16834,
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/chunk_gated_delta_rule_fwd_prepare.py"
+    },
+    {
+      "path": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/prepare_a42943b.disasm.txt",
+      "sha256": "9e93203a13d8e02ac65d8983c76fab3c853f85fa5193a9cb7e1297c6610cdea7",
+      "bytes": 518971,
+      "original_path": "/tmp/review-gdn-python-image-20261028/prepare-binaries/prepare_a42943b.disasm.txt"
+    }
+  ],
+  "retained_path_map": {
+    "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare.h": "data/observations/sources/arch3510-physical-services/register-evidence/additional/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+    "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h": "data/observations/sources/arch3510-physical-services/register-evidence/additional/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h",
+    "/tmp/mindie-sim-gdn-prefill-20261028/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/additional/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp",
+    "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini": "data/observations/sources/arch3510-physical-services/register-evidence/Ascend950DT_9582.ini",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_common_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_common_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/dav_3510/kernel_tpipe_impl_c310.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_macros.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_macros.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_common_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_common_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_mm_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_reg.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_reg.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/kernel_utils_base.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/kernel_utils_base.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_load_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_datacopy_store_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_scalar_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_binary_scalar_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_duplicate_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_reduce_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_reduce_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_unary_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_unary_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/kernel_reg_compute_datacopy_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/basic_api/reg_compute/kernel_reg_compute_vec_data_reorder_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/memory_base_impl/cube_compute_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/memory_base_impl/cube_compute_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/reg_base_impl/cube_compute_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/reg_base_impl/cube_compute_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/impl/c_api/reg_base_impl/sys_init_intf_impl.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/impl/c_api/reg_base_impl/sys_init_intf_impl.h",
+    "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/kernel_struct_mm.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/kernel_struct_mm.h",
+    "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h",
+    "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h",
+    "/tmp/review-gdn-python-image-20261028/cann/include/kernel_operator.h": "data/observations/sources/arch3510-physical-services/register-evidence/cann/include/kernel_operator.h",
+    "/tmp/review-gdn-python-image-20261028/platform-units/DeInterleave.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/DeInterleave.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Fixpipe_L0CToGM.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Fixpipe_L0CToGM.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/GetCoreMemBw_pinned.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/GetCoreMemBw_pinned.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/HF32.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/HF32.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Interleave.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Interleave.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/LoadDataWithTranspose.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/LoadDataWithTranspose.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/LoadData_2D_V2.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/LoadData_2D_V2.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/MaskReg.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/MaskReg.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Mmad.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Mmad.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/RegTensor.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/RegTensor.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Cast.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Cast.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Div.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Div.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Duplicate.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Duplicate.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_LoadAlign_continuous.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_LoadAlign_continuous.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_RegLayout.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_RegLayout.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Sqrt.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Sqrt.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_StoreAlign_continuous.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_StoreAlign_continuous.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/Reg_Xor.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/Reg_Xor.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/SetCtrlSpr_ISASI.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetCtrlSpr_ISASI.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/SetHF32Mode.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetHF32Mode.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/SetHF32TransMode.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/SetHF32TransMode.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/api_pipeline_type_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/api_pipeline_type_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/asc_enable_hf32.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_enable_hf32.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/asc_init.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_init.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/asc_set_ctrl.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/asc_set_ctrl.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/bisheng_compiler.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/bisheng_compiler.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/c_api_reg_vector_compute_theoretical_perf_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/c_api_reg_vector_compute_theoretical_perf_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/cube_instruction_theoretical_perf_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_README.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/fixpipe_perf_README.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_roofline.py": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/fixpipe_perf_roofline.py",
+    "/tmp/review-gdn-python-image-20261028/platform-units/npu_3510_hw_arch.png": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/npu_3510_hw_arch.png",
+    "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/npu_arch_3510.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/platform_ascendc.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/platform_ascendc.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/platform_ascendc.h": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/platform_ascendc.h",
+    "/tmp/review-gdn-python-image-20261028/platform-units/profiler_device_defs.h": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_device_defs.h",
+    "/tmp/review-gdn-python-image-20261028/platform-units/profiler_pmu_calculator.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_pmu_calculator.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/profiler_roofline.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_roofline.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/profiler_storage_access.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/profiler_storage_access.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_precision_standard_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_precision_standard_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/reg_vector_compute_interface_theoretical_perf_summary.md",
+    "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_info.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/runtime_platform_info.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/runtime_platform_infos_def.cpp": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/runtime_platform_infos_def.cpp",
+    "/tmp/review-gdn-python-image-20261028/platform-units/vector_instruction_theoretical_perf_summary.md": "data/observations/sources/arch3510-physical-services/register-evidence/platform-units/vector_instruction_theoretical_perf_summary.md",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.disasm.txt": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.disasm.txt",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.json",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_0d3bf8d799054af761665e676e06d1df.o",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.json",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_a42943bce4130730abc0a2682339d273.o",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.disasm.txt": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.disasm.txt",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.json",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_b49497c2a54c302762a60b2d67894139.o",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.json",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/ChunkGatedDeltaRuleFwdPrepare_f3235580c9e7801c902d5f3e67053a5f.o",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/chunk_gated_delta_rule_fwd_prepare.py": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/chunk_gated_delta_rule_fwd_prepare.py",
+    "/tmp/review-gdn-python-image-20261028/prepare-binaries/prepare_a42943b.disasm.txt": "data/observations/sources/arch3510-physical-services/register-evidence/prepare-binaries/prepare_a42943b.disasm.txt"
+  }
+}

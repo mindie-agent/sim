@@ -1,0 +1,274 @@
+{
+  "name": "kimi-k3-a5-current-checkpoint-conditional",
+  "machine": {
+    "name": "a5-950dt-32-die-4host",
+    "arch_family": "A5",
+    "sku": "Ascend950DT_9582",
+    "dies_per_package": 1,
+    "num_devices": 32,
+    "ranks_per_node": 8,
+    "device": {
+      "hbm_gib": 96,
+      "cube_flops_per_s": 432537600000000.0,
+      "hbm_bw_bytes_per_s": 4000000000000.0,
+      "mte_bw_bytes_per_s": 4000000000000.0,
+      "launch_us": 20.0,
+      "l2_bytes": 134217728,
+      "l1_bytes": 524288,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144,
+      "ub_bytes": 253952,
+      "aic_count": 32,
+      "aiv_count": 64
+    },
+    "links": [
+      {
+        "name": "ub-host0",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 1.8,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "ub-host1",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 1.8,
+        "members": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "ub-host2",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 1.8,
+        "members": [
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "ub-host3",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 1.8,
+        "members": [
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "roce-inter-node",
+        "channel": "d2d_inter_node",
+        "capacity_gbps": 200,
+        "latency_us": 5.0,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15,
+          16,
+          17,
+          18,
+          19,
+          20,
+          21,
+          22,
+          23,
+          24,
+          25,
+          26,
+          27,
+          28,
+          29,
+          30,
+          31
+        ],
+        "semantics": "switched",
+        "protocol": "RoCEv2_400G_x4"
+      }
+    ],
+    "hardware_key": "Ascend950DT_9582",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "kimi-k3",
+    "quant": {
+      "name": "current_checkpoint_conditional_mixed_mxfp8_mxfp4",
+      "weight_format": "bf16",
+      "activation_format": "bf16",
+      "expert_weight_format": "bf16",
+      "weight_block": [
+        1,
+        32
+      ],
+      "expert_block": 32,
+      "scale_format": "fp8_e8m0",
+      "scale_bytes": 1,
+      "activation_group_size": 32,
+      "activation_scale_format": "fp8_e8m0",
+      "activation_scale_pack": 2,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "router",
+        "lm_head",
+        "embedding",
+        "norm",
+        "mhc",
+        "vision",
+        "projector",
+        "conv_weight_f32"
+      ],
+      "category_overrides": {
+        "kda.q": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "kda.k": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "kda.v": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "mla.q_a": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "mla.q_b": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "mla.kv_a": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "dense_mlp": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "latent_moe": {
+          "weight_format": "fp8_e4m3",
+          "activation_format": "fp8_e4m3"
+        },
+        "routed_expert": {
+          "weight_format": "mxfp4",
+          "activation_format": "fp8_e4m3"
+        },
+        "shared_expert": {
+          "weight_format": "mxfp4",
+          "activation_format": "fp8_e4m3"
+        }
+      },
+      "source": {
+        "configuration_status": "current_checkpoint_conditional",
+        "checkpoint": "/home/models/Kimi-K3-w4a8-mxfp-quarot",
+        "config_sha256": "07677f14bc468c16a788fc6517f7fa715701fa1c3ff74b3f7ef3449a5bc8c735",
+        "quant_description_sha256": "f22b76c32dd43f29a34bf15d114b2eb4be1dcd8217a1f89a91919ecf5df0a893",
+        "weight_index_sha256": "53e03dafd621a106847d4494ed104d316ff32c77b746b8d0a88070322e9f4722",
+        "loader_revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
+        "metadata_evidence": "data/observations/sources/kimi-checkpoint-20261029/manifest.json"
+      },
+      "notes": [
+        "Independent current checkpoint metadata; historical config hash matches but historical quant-description hash was not captured.",
+        "FLOAT projections retain BF16 per sampled safetensors headers; FP32 state/conv parameter categories remain explicit.",
+        "MXFP4 declares FP8 activations and E8M0 group32 scales. Generic compute expands packed operands to BF16; native FP4 cube service and conversion latency are not inferred."
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 8,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 16,
+    "max_model_len": 66560,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16
+    ],
+    "tp": 8,
+    "dp": 4,
+    "ep": 32,
+    "pp": 1,
+    "metadata": {
+      "recipe": "DP4 x TP8, EP32, 4 hosts x 8 Ascend950DT dies; max-model-len 66560; max-num-seqs 16; max-num-batched-tokens 8192; gpu-memory-utilization 0.90; FULL_DECODE_ONLY; no prefix caching",
+      "weights": "Current independent checkpoint: KDA q/k/v, MLA q_a/q_b/kv_a, dense MLP and latent MoE projections W8A8_MXFP8; routed/shared experts W4A8_MXFP with FP8 E4M3 activations; gates, outputs, kv_b, router and LM head remain BF16. See model.quant role overrides.",
+      "fabric": "intra-host UB_MESH 392 GB/s per 8-die host; inter-host 4 x 400G RoCE declared as one 200 GB/s aggregate switched link",
+      "measured_baseline": ".workstreams/hp-serving/kimi-k3/longctx-report.md (2026-10-23, rack06 10-cell long-context matrix) and report.md (2026-10-22, 7-cell)",
+      "mtp": "none: speculative_config=None in the measured serve log",
+      "profile": "msprof rank0/TP0 p32768 o64: KDA 12.29%, MLA 4.62%, MoE GEMM 20.6%, other GEMM/quant 22.2%, TP/EP collectives 14.3%, alltoallv 46% of collectives",
+      "measured_profile": "examples/artifacts/a5-kimi-k3-longctx.json (schema a5-kimi-k3-profile-rows/1; bound only through run_k3_a5_cells.py --k3-profile, never auto-applied)",
+      "mte_bw_basis": "a5_fleet_1x_hbm: every other A5 case declares 4.0e12; the 8.0e12 value is the a3_types SKU-profile default 2*hbm_bw, which is only validated for A3 (2400 = 2*1200), so it is not kept",
+      "mte_bw_alternate_bytes_per_s": "8000000000000.0",
+      "mte_bw_alternate_source": "a3_types MachineSpec._from_profile default mte_bw_bytes_per_s = 2*hbm_bw (no measurement in this case)",
+      "mte1_basis": "Inherit Ascend950DT_9582 arch3510 profile: one shared PIPE_MTE1 at 256 B/cycle/AIC * 32 AIC * 1.65 GHz = 13.5168 TB/s. The former 4 TB/s override copied the off-chip transfer declaration without an independent L1-to-L0 basis. Same-campaign npu-smi confirms Ascend950DT/96 GiB; the 9582 suffix and nominal clock remain declared profile assumptions.",
+      "configuration_status": "current_checkpoint_conditional; current quant metadata is independent of profiler durations, but was not hashed during the historical capture"
+    }
+  }
+}

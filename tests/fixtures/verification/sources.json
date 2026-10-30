@@ -1,0 +1,216 @@
+{
+  "scope": "Maintained test and installed-CLI inputs; not current accuracy receipts.",
+  "fixtures": [
+    {
+      "file": "qwen38-family-costs.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-qwen38_a5-final-0-prediction.json",
+        "sha256": "456f0acf10942a97eb026586795c30b8a2db00a13327c533a97f4e237c237019",
+        "size_bytes": 91815
+      },
+      "size_bytes": 86969
+    },
+    {
+      "file": "kda-prepare-stages.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/kda-prepare-compact-alignment-20261029.json",
+        "sha256": "6083a5cf18010517b5964ff0211dfa665065d6f7329b4bfcdaf3afff64d494d2",
+        "size_bytes": 3960
+      },
+      "size_bytes": 1868
+    },
+    {
+      "file": "kda-call-blocks.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-kimi-kda-call-blocks.json",
+        "sha256": "3654ece524506bd453f843ad05cc778ac93a1b07d943f67cbe85582a9e7e8d65",
+        "size_bytes": 1840500
+      },
+      "size_bytes": 54975
+    },
+    {
+      "file": "kimi-native-descriptors.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-kimi-observed-expanded.json",
+        "sha256": "ef6b132844ae310e3f2c7a5e4993ea06e239881d4d623a093efa132f18b22995",
+        "size_bytes": 1038937
+      },
+      "size_bytes": 1039187
+    },
+    {
+      "file": "glm-supported-variants.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/glm-compatible-variants-20261030.json",
+        "sha256": "61909a71c0280bb92c322ccffd83318cfa8f08124e8fbf14ccce30c655475dd0",
+        "size_bytes": 714344
+      },
+      "size_bytes": 2072
+    },
+    {
+      "file": "qwen-gdn-native-contracts.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/qwen-source-gdn-native-new6-20261030.json",
+        "sha256": "9ada6e110bcf4eb83a594486fecc3649d3879986f8dfc42835a9f1dd9af35cbf",
+        "size_bytes": 47119
+      },
+      "size_bytes": 46408
+    },
+    {
+      "file": "qwen38-native-cohorts.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/matrix-cohort-wave4-20261029/a5_qwen38-steady.comparison.json",
+        "sha256": "809fb6afe82a349b2cf52b78e78226c44b707c4d867a2c2c763ea2c18662e761",
+        "size_bytes": 63879
+      },
+      "size_bytes": 64135
+    },
+    {
+      "file": "v4flash-sharedkv-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-v4flash_a3-final-case.json",
+        "sha256": "5c818878af4ed982a7e26cb29fe54fc615898060cb6ba5724e26640fcd427fb8",
+        "size_bytes": 8636
+      },
+      "size_bytes": 8159
+    },
+    {
+      "file": "v4flash-communication-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-v4flash_a3-mechanisms-case.json",
+        "sha256": "ea1b832f03bb6b1a06667ba3507524d23be6e962d66d23610ddf5b0f2e1a52e7",
+        "size_bytes": 9030
+      },
+      "size_bytes": 8553
+    },
+    {
+      "file": "v4flash-mtp-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-v4flash-steady-case.json",
+        "sha256": "5c818878af4ed982a7e26cb29fe54fc615898060cb6ba5724e26640fcd427fb8",
+        "size_bytes": 8636
+      },
+      "size_bytes": 8159
+    },
+    {
+      "file": "glm53-w4a8-shared-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-glm53-w4a8-msd-case.json",
+        "sha256": "a62e046d891aada1a1a8b5d0c032b0ff7548d6b49cb5b26a90f348e352ce1898",
+        "size_bytes": 16216
+      },
+      "size_bytes": 15998
+    },
+    {
+      "file": "qwen38-model-tensor-contracts.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/qwen38-native-20261028-model-source-boundaries.json",
+        "sha256": "23640f966998d266b7ca9b5e4ca6670f01221efa9f5516da06f89778e02c0955",
+        "size_bytes": 185302
+      },
+      "size_bytes": 185549
+    },
+    {
+      "file": "qwen38-observed-gemm-contracts.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/qwen38-operator-prefill.json",
+        "sha256": "47dc078055eefce3ad1be28bd294b21e3560cfba457b0d8c753e95dff9e744ad",
+        "size_bytes": 28923
+      },
+      "size_bytes": 29146
+    },
+    {
+      "file": "qwen38-staged-attention-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-qwen38_a5-mechanisms-case.json",
+        "sha256": "695545cdd1fbb2a01a5195ef3c8e8be4cc49d1382eff1d0c221fbce6a4a91684",
+        "size_bytes": 18446
+      },
+      "size_bytes": 17842
+    },
+    {
+      "file": "glm53-indexed-attention-case.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-glm53-indexed-pipeline-case.json",
+        "sha256": "4a4bc60242f345c7fa88b48cb5f7c82bbf83058192efe0fe532292ee48870ea6",
+        "size_bytes": 7607
+      },
+      "size_bytes": 7389
+    },
+    {
+      "file": "scoreboard-input.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-input.json",
+        "sha256": "b529dcc14d91f0cab0bdc7a6fb8f5e5303539b3b671ab844a7f3af32e3953d41",
+        "size_bytes": 104540
+      },
+      "size_bytes": 239857
+    },
+    {
+      "file": "a5-empty-programs.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/a5-invocation-20261029/summary.json",
+        "sha256": "3e0125de8c57b4717881e91ac6fb8c82fd62a3a01c2a136507d34d835c9fb2ae",
+        "size_bytes": 15139
+      },
+      "size_bytes": 15369
+    },
+    {
+      "file": "a5-tiny-programs.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/a5-invocation-20261029/tiny/summary.json",
+        "sha256": "af215242acf1ccb25b7ca68ac645bd92b53ae705a403e303a55757082acdab41",
+        "size_bytes": 8021
+      },
+      "size_bytes": 8255
+    },
+    {
+      "file": "v4flash-communication-scoreboard.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-final.json",
+        "sha256": "d81e789decc356610c74f0f2d8a067d46e567d4fb39ea7b3fae74f1f20d24374",
+        "size_bytes": 1175291
+      },
+      "size_bytes": 117637
+    },
+    {
+      "file": "v4flash-communication-input.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-final-input.json",
+        "sha256": "916c4dbc01ebe976b254581fbfba4e0742b342b23e8fe4430296de66a3fe57c6",
+        "size_bytes": 484771
+      },
+      "size_bytes": 39807
+    },
+    {
+      "file": "v4flash-communication-prediction.json",
+      "source": {
+        "revision": "14f10f67",
+        "path": "data/verification/model-scoreboard-20261029-mechanisms/v4flash_a3-0-prediction.json",
+        "sha256": "88ba35bd2f800a211a7cb7ca1f82fb5662c05beee11ff8d75dc64d7bd5a8caef",
+        "size_bytes": 145593
+      },
+      "size_bytes": 140615
+    }
+  ],
+  "case_metadata_cleanup": "Legacy top-level migration provenance is omitted from executable case inputs; original source hashes remain."
+}

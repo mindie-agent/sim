@@ -1,0 +1,1128 @@
+{
+  "schema": "mindie-sim.operator-comparison/1",
+  "source": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen38-c4-16k/raw/prof/p16384_c1_o32/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+  "line_window": [
+    45,
+    2315
+  ],
+  "model": "qwen3.8-27b",
+  "hardware": "Ascend950DT_9582",
+  "software": {
+    "runtime": "vllm-ascend",
+    "revision": "0.30.0rc2"
+  },
+  "phase": "prefill",
+  "tokens_per_sequence": 16384,
+  "sequences": 1,
+  "context": 0,
+  "calibration": "comparison rows never enter prediction parameters",
+  "declared_parameter_sources": [
+    "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json"
+  ],
+  "operator_sum_ms": 1464.382943082408,
+  "before_operator_sum_ms": 1417.7935571507742,
+  "baseline_revision": "81b376b",
+  "boundary": "sum_of_isolated_device_programs",
+  "comparisons": [
+    {
+      "recipe": "linear_qkvz",
+      "shape": [
+        16384,
+        16384,
+        5120
+      ],
+      "dtype": "bf16",
+      "program": "TiledMatmul",
+      "model_calls": 48,
+      "kernel": "aclnnMatmul_MatMulV3Common_MatMulV3",
+      "capture_calls": 48,
+      "launch_blocks": 32,
+      "contract_model_calls": 48,
+      "contract_capture_calls": 48,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        46,
+        86,
+        126
+      ],
+      "observed_median_us": 6375.468,
+      "predicted_us": 6355.272300604102,
+      "error_percent": -0.3167720298478116,
+      "before_us": 6355.272300604102,
+      "pipe_median_us": {
+        "aicore_time(us)": 6375.195,
+        "aic_mac_time(us)": 6370.1775,
+        "aic_scalar_time(us)": 613.3245,
+        "aic_mte1_time(us)": 1757.5305,
+        "aic_mte2_time(us)": 4656.2275,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 849.2864999999999,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "linear_beta_alpha",
+      "shape": [
+        16384,
+        96,
+        5120
+      ],
+      "dtype": "bf16",
+      "program": "TiledMatmul",
+      "model_calls": 48,
+      "kernel": "aclnnMatmul_MatMulV3Common_MatMulV3",
+      "capture_calls": 48,
+      "launch_blocks": 32,
+      "contract_model_calls": 48,
+      "contract_capture_calls": 48,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        47,
+        87,
+        127
+      ],
+      "observed_median_us": 62.894000000000005,
+      "predicted_us": 43.207959272727514,
+      "error_percent": -31.300347771285796,
+      "before_us": 43.207959272727514,
+      "pipe_median_us": {
+        "aicore_time(us)": 62.65,
+        "aic_mac_time(us)": 39.786500000000004,
+        "aic_scalar_time(us)": 10.493,
+        "aic_mte1_time(us)": 16.987,
+        "aic_mte2_time(us)": 59.435,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 4.038,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "convolution_input_contiguous",
+      "shape": [
+        16384,
+        10240
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 48,
+      "kernel": "aclnnContiguous_SliceAiCore_Slice",
+      "capture_calls": 48,
+      "launch_blocks": 64,
+      "contract_model_calls": 48,
+      "contract_capture_calls": 48,
+      "core": "AI_VECTOR_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        51,
+        91,
+        131
+      ],
+      "observed_median_us": 223.3675,
+      "predicted_us": 167.77216,
+      "error_percent": -24.889628079286375,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 223.125,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 2.7765,
+        "aiv_mte2_time(us)": 208.1805,
+        "aiv_mte3_time(us)": 173.9015
+      },
+      "match": "tensor_shapes; slice_offsets_not_observed"
+    },
+    {
+      "recipe": "gate_beta_contiguous",
+      "shape": [
+        16384,
+        48
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 48,
+      "kernel": "aclnnInplaceCopy_SliceAiCore_Slice",
+      "capture_calls": 96,
+      "launch_blocks": 64,
+      "contract_model_calls": 96,
+      "contract_capture_calls": 96,
+      "core": "AI_VECTOR_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        48,
+        49,
+        88
+      ],
+      "observed_median_us": 4.2059999999999995,
+      "predicted_us": 0.786432,
+      "error_percent": -81.3021398002853,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 3.925,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 1.3535,
+        "aiv_mte2_time(us)": 1.2515,
+        "aiv_mte3_time(us)": 0.5145
+      },
+      "match": "tensor_shapes; slice_offsets_not_observed"
+    },
+    {
+      "recipe": "gate_alpha_contiguous",
+      "shape": [
+        16384,
+        48
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 48,
+      "kernel": "aclnnInplaceCopy_SliceAiCore_Slice",
+      "capture_calls": 96,
+      "launch_blocks": 64,
+      "contract_model_calls": 96,
+      "contract_capture_calls": 96,
+      "core": "AI_VECTOR_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        48,
+        49,
+        88
+      ],
+      "observed_median_us": 4.2059999999999995,
+      "predicted_us": 0.786432,
+      "error_percent": -81.3021398002853,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 3.925,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 1.3535,
+        "aiv_mte2_time(us)": 1.2515,
+        "aiv_mte3_time(us)": 0.5145
+      },
+      "match": "tensor_shapes; slice_offsets_not_observed"
+    },
+    {
+      "recipe": "delta_gates",
+      "shape": [
+        16384,
+        48
+      ],
+      "dtype": "bf16",
+      "program": "TiledPointwise",
+      "model_calls": 48,
+      "kernel": "fused_gdn_gating_kernel",
+      "capture_calls": 48,
+      "launch_blocks": 64,
+      "contract_model_calls": 48,
+      "contract_capture_calls": 48,
+      "core": "AI_VECTOR_CORE",
+      "state": "static",
+      "source_lines": [
+        57,
+        97,
+        137
+      ],
+      "observed_median_us": 673.7035,
+      "predicted_us": 582.938030909039,
+      "error_percent": -13.472613559371593,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 673.435,
+        "aiv_vec_time(us)": 31.144,
+        "aiv_scalar_time(us)": 636.146,
+        "aiv_mte2_time(us)": 10.2175,
+        "aiv_mte3_time(us)": 5.977
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "linear_output",
+      "shape": [
+        16384,
+        5120,
+        6144
+      ],
+      "dtype": "bf16",
+      "program": "TiledMatmul",
+      "model_calls": 48,
+      "kernel": "aclnnMatmul_MatMulV3Common_MatMulV3",
+      "capture_calls": 48,
+      "launch_blocks": 32,
+      "contract_model_calls": 48,
+      "contract_capture_calls": 48,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        77,
+        117,
+        157
+      ],
+      "observed_median_us": 2394.767,
+      "predicted_us": 2383.3980183274075,
+      "error_percent": -0.47474270660119444,
+      "before_us": 2383.3980183274075,
+      "pipe_median_us": {
+        "aicore_time(us)": 2394.5,
+        "aic_mac_time(us)": 2389.7115,
+        "aic_scalar_time(us)": 229.31099999999998,
+        "aic_mte1_time(us)": 659.277,
+        "aic_mte2_time(us)": 1762.726,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 267.168,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "add_rmsnorm_quantize",
+      "shape": [
+        16384,
+        5120
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 80,
+      "kernel": "aclnnAddRmsNormDynamicMxQuant_AddRmsNormDynamicMxQuant_AddRmsNormDynamicMxQuant",
+      "capture_calls": 80,
+      "launch_blocks": 64,
+      "contract_model_calls": 80,
+      "contract_capture_calls": 80,
+      "core": "AI_VECTOR_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        79,
+        119,
+        159
+      ],
+      "observed_median_us": 186.6455,
+      "predicted_us": 147.45856,
+      "error_percent": -20.995384298040932,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 186.36,
+        "aiv_vec_time(us)": 179.6765,
+        "aiv_scalar_time(us)": 49.510000000000005,
+        "aiv_mte2_time(us)": 168.6405,
+        "aiv_mte3_time(us)": 100.24199999999999
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "dense_gate_up",
+      "shape": [
+        16384,
+        34816,
+        5120
+      ],
+      "dtype": "fp8_e4m3",
+      "program": "TiledMatmul",
+      "model_calls": 64,
+      "kernel": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+      "capture_calls": 64,
+      "launch_blocks": 32,
+      "contract_model_calls": 64,
+      "contract_capture_calls": 64,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        80,
+        120,
+        160
+      ],
+      "observed_median_us": 6770.201999999999,
+      "predicted_us": 6870.446514430984,
+      "error_percent": 1.4806724294339269,
+      "before_us": 6870.446514430984,
+      "pipe_median_us": {
+        "aicore_time(us)": 6769.93,
+        "aic_mac_time(us)": 6761.9775,
+        "aic_scalar_time(us)": 1790.4625,
+        "aic_mte1_time(us)": 2465.8595,
+        "aic_mte2_time(us)": 5813.805,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 1430.4859999999999,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "dynamic_quantize",
+      "shape": [
+        16384,
+        17408
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 64,
+      "kernel": "DynamicMxQuant",
+      "capture_calls": 64,
+      "launch_blocks": 64,
+      "contract_model_calls": 64,
+      "contract_capture_calls": 64,
+      "core": "MIX_AIV",
+      "state": "dynamic",
+      "source_lines": [
+        82,
+        122,
+        162
+      ],
+      "observed_median_us": 260.704,
+      "predicted_us": 216.137728,
+      "error_percent": -17.094586964526815,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 260.44,
+        "aiv_vec_time(us)": 149.60399999999998,
+        "aiv_scalar_time(us)": 31.997,
+        "aiv_mte2_time(us)": 252.6095,
+        "aiv_mte3_time(us)": 109.62
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "dense_down",
+      "shape": [
+        16384,
+        5120,
+        17408
+      ],
+      "dtype": "fp8_e4m3",
+      "program": "TiledMatmul",
+      "model_calls": 64,
+      "kernel": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+      "capture_calls": 64,
+      "launch_blocks": 32,
+      "contract_model_calls": 64,
+      "contract_capture_calls": 64,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        83,
+        123,
+        163
+      ],
+      "observed_median_us": 3392.483,
+      "predicted_us": 3394.0805507908053,
+      "error_percent": 0.0470909004055553,
+      "before_us": 3394.0805507908053,
+      "pipe_median_us": {
+        "aicore_time(us)": 3392.2250000000004,
+        "aic_mac_time(us)": 3380.6005,
+        "aic_scalar_time(us)": 862.4145,
+        "aic_mte1_time(us)": 1211.2205,
+        "aic_mte2_time(us)": 3052.9575,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 215.702,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "qkv_projection",
+      "shape": [
+        16384,
+        14336,
+        5120
+      ],
+      "dtype": "fp8_e4m3",
+      "program": "TiledMatmul",
+      "model_calls": 16,
+      "kernel": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+      "capture_calls": 16,
+      "launch_blocks": 32,
+      "contract_model_calls": 16,
+      "contract_capture_calls": 16,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        166,
+        308,
+        450
+      ],
+      "observed_median_us": 2790.525,
+      "predicted_us": 2829.416696241697,
+      "error_percent": 1.393705350846064,
+      "before_us": 2829.416696241697,
+      "pipe_median_us": {
+        "aicore_time(us)": 2790.24,
+        "aic_mac_time(us)": 2783.5805,
+        "aic_scalar_time(us)": 737.5065,
+        "aic_mte1_time(us)": 1015.2395,
+        "aic_mte2_time(us)": 2383.507,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 594.491,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "dynamic_quantize",
+      "shape": [
+        16384,
+        6144
+      ],
+      "dtype": "bf16",
+      "program": "ResourceEnvelope",
+      "model_calls": 16,
+      "kernel": "DynamicMxQuant",
+      "capture_calls": 16,
+      "launch_blocks": 64,
+      "contract_model_calls": 16,
+      "contract_capture_calls": 16,
+      "core": "MIX_AIV",
+      "state": "dynamic",
+      "source_lines": [
+        178,
+        320,
+        462
+      ],
+      "observed_median_us": 98.242,
+      "predicted_us": 76.28390399999999,
+      "error_percent": -22.351027055638127,
+      "before_us": null,
+      "pipe_median_us": {
+        "aicore_time(us)": 0.0,
+        "aic_mac_time(us)": 0.0,
+        "aic_scalar_time(us)": 0.0,
+        "aic_mte1_time(us)": 0.0,
+        "aic_mte2_time(us)": 0.0,
+        "aic_mte3_time(us)": 0.0,
+        "aic_fixpipe_time(us)": 0.0,
+        "aiv_time(us)": 97.99,
+        "aiv_vec_time(us)": 56.033,
+        "aiv_scalar_time(us)": 12.3855,
+        "aiv_mte2_time(us)": 92.336,
+        "aiv_mte3_time(us)": 34.8925
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    },
+    {
+      "recipe": "attention_output",
+      "shape": [
+        16384,
+        5120,
+        6144
+      ],
+      "dtype": "fp8_e4m3",
+      "program": "TiledMatmul",
+      "model_calls": 16,
+      "kernel": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+      "capture_calls": 16,
+      "launch_blocks": 32,
+      "contract_model_calls": 16,
+      "contract_capture_calls": 16,
+      "core": "AI_CORE",
+      "state": "dynamic",
+      "source_lines": [
+        179,
+        321,
+        463
+      ],
+      "observed_median_us": 1200.208,
+      "predicted_us": 1209.5472174545428,
+      "error_percent": 0.7781332447827971,
+      "before_us": 1209.5472174545428,
+      "pipe_median_us": {
+        "aicore_time(us)": 1199.96,
+        "aic_mac_time(us)": 1193.4560000000001,
+        "aic_scalar_time(us)": 313.41200000000003,
+        "aic_mte1_time(us)": 436.9785,
+        "aic_mte2_time(us)": 997.24,
+        "aic_mte3_time(us)": 0.001,
+        "aic_fixpipe_time(us)": 218.488,
+        "aiv_time(us)": 0.0,
+        "aiv_vec_time(us)": 0.0,
+        "aiv_scalar_time(us)": 0.0,
+        "aiv_mte2_time(us)": 0.0,
+        "aiv_mte3_time(us)": 0.0
+      },
+      "match": "tensor_contract; analytical_program_not_binary_tiling"
+    }
+  ],
+  "unresolved_rows": {
+    "unmapped_contract": 1455
+  },
+  "unmatched_kernels": [
+    {
+      "kernel": "FusedInferAttentionScore",
+      "calls": 16,
+      "sum_us": 201176.851,
+      "source_lines": [
+        173,
+        315,
+        457
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_ChunkGatedDeltaRuleFwdPrepare_ChunkGatedDeltaRuleFwdPrepare",
+      "calls": 48,
+      "sum_us": 73923.782,
+      "source_lines": [
+        65,
+        105,
+        145
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_ChunkFwdH_ChunkFwdH",
+      "calls": 48,
+      "sum_us": 38756.508,
+      "source_lines": [
+        66,
+        106,
+        146
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "SwiGlu",
+      "calls": 64,
+      "sum_us": 32839.771,
+      "source_lines": [
+        81,
+        121,
+        161
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_ChunkFwdO_ChunkFwdO",
+      "calls": 48,
+      "sum_us": 24817.066,
+      "source_lines": [
+        67,
+        107,
+        147
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "split_qkv_rmsnorm_mrope_kernel",
+      "calls": 16,
+      "sum_us": 16264.402,
+      "source_lines": [
+        171,
+        313,
+        455
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "CausalConv1d",
+      "calls": 48,
+      "sum_us": 16258.74,
+      "source_lines": [
+        52,
+        92,
+        132
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "_layer_norm_fwd_1pass_kernel_npu",
+      "calls": 48,
+      "sum_us": 11478.018,
+      "source_lines": [
+        76,
+        116,
+        156
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnCat_ConcatD_ConcatD",
+      "calls": 48,
+      "sum_us": 9913.82,
+      "source_lines": [
+        56,
+        96,
+        136
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnAddRmsNorm_AddRmsNorm_AddRmsNorm",
+      "calls": 47,
+      "sum_us": 9541.161,
+      "source_lines": [
+        85,
+        125,
+        187
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+      "calls": 48,
+      "sum_us": 6499.211,
+      "source_lines": [
+        74,
+        114,
+        154
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_TransposeAiCore_Transpose",
+      "calls": 48,
+      "sum_us": 6356.811,
+      "source_lines": [
+        64,
+        104,
+        144
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_SliceAiCore_Slice",
+      "calls": 48,
+      "sum_us": 6045.938,
+      "source_lines": [
+        55,
+        95,
+        135
+      ],
+      "reason": "no_matching_operator"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+      "calls": 48,
+      "sum_us": 5976.447,
+      "source_lines": [
+        72,
+        112,
+        152
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_SliceAiCore_Slice",
+      "calls": 48,
+      "sum_us": 5936.781,
+      "source_lines": [
+        73,
+        113,
+        153
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_TransposeAiCore_Transpose",
+      "calls": 96,
+      "sum_us": 5754.734,
+      "source_lines": [
+        68,
+        69,
+        108
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_SliceAiCore_Slice",
+      "calls": 96,
+      "sum_us": 5118.312,
+      "source_lines": [
+        53,
+        54,
+        93
+      ],
+      "reason": "no_matching_operator"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_TransposeAiCore_Transpose",
+      "calls": 96,
+      "sum_us": 4536.124,
+      "source_lines": [
+        62,
+        63,
+        102
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+      "calls": 32,
+      "sum_us": 3553.043,
+      "source_lines": [
+        174,
+        175,
+        316
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnMul_MulAiCore_Mul",
+      "calls": 16,
+      "sum_us": 3116.348,
+      "source_lines": [
+        177,
+        319,
+        461
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceZero_ZerosLikeAiCore_ZerosLike",
+      "calls": 48,
+      "sum_us": 2541.514,
+      "source_lines": [
+        50,
+        90,
+        130
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnSigmoid_SigmoidAiCore_Sigmoid",
+      "calls": 16,
+      "sum_us": 2436.738,
+      "source_lines": [
+        176,
+        318,
+        460
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_TransposeAiCore_Transpose",
+      "calls": 96,
+      "sum_us": 2362.078,
+      "source_lines": [
+        60,
+        61,
+        100
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_TransposeAiCore_Transpose",
+      "calls": 48,
+      "sum_us": 697.531,
+      "source_lines": [
+        70,
+        110,
+        150
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "_scatter_ssm_states_kernel",
+      "calls": 48,
+      "sum_us": 400.353,
+      "source_lines": [
+        71,
+        111,
+        151
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnAdds_AddAiCore_Add",
+      "calls": 127,
+      "sum_us": 384.544,
+      "source_lines": [
+        78,
+        84,
+        118
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "_gather_ssm_states_kernel",
+      "calls": 48,
+      "sum_us": 325.38,
+      "source_lines": [
+        58,
+        98,
+        138
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnInplaceCopy_TensorMoveAiCore_TensorMove",
+      "calls": 48,
+      "sum_us": 283.718,
+      "source_lines": [
+        75,
+        115,
+        155
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnChunkGatedDeltaRuleFwd_CastAiCore_Cast",
+      "calls": 48,
+      "sum_us": 230.828,
+      "source_lines": [
+        59,
+        99,
+        139
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnIndex_IndexAiCore_Index",
+      "calls": 16,
+      "sum_us": 178.435,
+      "source_lines": [
+        168,
+        310,
+        452
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "RmsNorm",
+      "calls": 1,
+      "sum_us": 108.051,
+      "source_lines": [
+        45
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.774,
+      "source_lines": [
+        1734
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.448,
+      "source_lines": [
+        1308
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.243,
+      "source_lines": [
+        2302
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.168,
+      "source_lines": [
+        882
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.158,
+      "source_lines": [
+        740
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 99.06,
+      "source_lines": [
+        1450
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.845,
+      "source_lines": [
+        172
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.627,
+      "source_lines": [
+        598
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.544,
+      "source_lines": [
+        314
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.368,
+      "source_lines": [
+        456
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.241,
+      "source_lines": [
+        2160
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 98.034,
+      "source_lines": [
+        2018
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 97.671,
+      "source_lines": [
+        1166
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 97.426,
+      "source_lines": [
+        1024
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 97.274,
+      "source_lines": [
+        1876
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnScatterPaKvCache_ScatterPaKvCache_ScatterPaKvCache",
+      "calls": 1,
+      "sum_us": 97.266,
+      "source_lines": [
+        1592
+      ],
+      "reason": "missing_or_unmapped_contract"
+    },
+    {
+      "kernel": "aclnnIndex_SliceAiCore_Slice",
+      "calls": 16,
+      "sum_us": 82.437,
+      "source_lines": [
+        167,
+        309,
+        451
+      ],
+      "reason": "no_matching_operator"
+    },
+    {
+      "kernel": "aclnnAdds_AddAiCore_Add",
+      "calls": 32,
+      "sum_us": 51.934,
+      "source_lines": [
+        169,
+        170,
+        311
+      ],
+      "reason": "missing_or_unmapped_contract"
+    }
+  ],
+  "matched_capture_kernel_sum_ms": 1215.019925,
+  "selected_capture_kernel_sum_ms": 1714.543481,
+  "serving_accuracy_accepted": false,
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/qwen38-operator-prefill.json",
+    "sha256": "47dc078055eefce3ad1be28bd294b21e3560cfba457b0d8c753e95dff9e744ad",
+    "size_bytes": 28923
+  }
+}

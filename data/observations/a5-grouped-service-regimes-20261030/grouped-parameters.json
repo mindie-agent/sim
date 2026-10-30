@@ -1,0 +1,558 @@
+{
+  "schema": "operator-service-calibration/1",
+  "producer": {
+    "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped_producer.py",
+    "sha256": "64a9f0daf85fb3d5f606563aae562b97936d494f74d4497098424d5734236ee4",
+    "size_bytes": 6892
+  },
+  "service_regimes": [
+    {
+      "id": "a5-int8-grouped-int32-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "int8",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "int32",
+        "metadata.matrix_output_contract": "int32_quant_matmul_without_epilogue"
+      },
+      "coordinates": {
+        "active_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "positive_count"
+        },
+        "declared_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "len"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        },
+        "n": {
+          "path": "local_shape.1"
+        },
+        "k": {
+          "path": "local_shape.2"
+        }
+      },
+      "domain": {
+        "active_banks": {
+          "min": 32,
+          "max": 64
+        },
+        "declared_banks": {
+          "min": 64,
+          "max": 64
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 16
+        },
+        "n": {
+          "min": 1024,
+          "max": 1024
+        },
+        "k": {
+          "min": 2048,
+          "max": 2048
+        }
+      },
+      "response": {
+        "fixed_us": 0,
+        "terms": [
+          {
+            "coordinate": "active_banks",
+            "us_per_unit": 0.9444110957278481,
+            "scale_with": {
+              "resource": "mte2_aic",
+              "reference_rate": 4224000000000
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "kind": "conditional_native_grouped_service_calibration",
+        "boundary": "inclusive native kernel completion",
+        "assignment": {
+          "native_mean_us": 60.44231012658228,
+          "declared_active_banks": 64,
+          "cohort_label": 64,
+          "source": {
+            "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+            "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+            "size_bytes": 49365
+          }
+        },
+        "geometry": "declared balanced histogram; captured group_list values unknown",
+        "scale_assumption": "inverse private weight-input pipe rate; engineered effective-regime hypothesis, not a hardware bandwidth measurement",
+        "input_precision": "int8",
+        "output_precision": "int32",
+        "validation_role": "c128 not used in this assignment; previously viewed observations, not blinded historical holdout",
+        "cross_model_validation": "same implementation/geometry observations pending",
+        "excludes": [
+          "Body_fit",
+          "model_name_selector",
+          "batch_selector",
+          "PMU_activity_sum",
+          "capacity_as_valid_rows"
+        ]
+      }
+    },
+    {
+      "id": "a5-int8-grouped-bf16-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "int8",
+        "metadata.weight_format": "int8",
+        "metadata.activation_format": "int8",
+        "metadata.output_format": "bf16",
+        "metadata.matrix_output_contract": "int32_cast_row_scale_column_scale_output_cast"
+      },
+      "coordinates": {
+        "active_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "positive_count"
+        },
+        "declared_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "len"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        },
+        "n": {
+          "path": "local_shape.1"
+        },
+        "k": {
+          "path": "local_shape.2"
+        }
+      },
+      "domain": {
+        "active_banks": {
+          "min": 32,
+          "max": 64
+        },
+        "declared_banks": {
+          "min": 64,
+          "max": 64
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 16
+        },
+        "n": {
+          "min": 2048,
+          "max": 2048
+        },
+        "k": {
+          "min": 512,
+          "max": 512
+        }
+      },
+      "response": {
+        "fixed_us": 0,
+        "terms": [
+          {
+            "coordinate": "active_banks",
+            "us_per_unit": 0.6601931863132912,
+            "scale_with": {
+              "resource": "mte2_aic",
+              "reference_rate": 4224000000000
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "kind": "conditional_native_grouped_service_calibration",
+        "boundary": "inclusive native kernel completion",
+        "assignment": {
+          "native_mean_us": 42.252363924050634,
+          "declared_active_banks": 64,
+          "cohort_label": 64,
+          "source": {
+            "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+            "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+            "size_bytes": 49365
+          }
+        },
+        "geometry": "declared balanced histogram; captured group_list values unknown",
+        "scale_assumption": "inverse private weight-input pipe rate; engineered effective-regime hypothesis, not a hardware bandwidth measurement",
+        "input_precision": "int8",
+        "output_precision": "bf16",
+        "validation_role": "c128 not used in this assignment; previously viewed observations, not blinded historical holdout",
+        "cross_model_validation": "same implementation/geometry observations pending",
+        "excludes": [
+          "Body_fit",
+          "model_name_selector",
+          "batch_selector",
+          "PMU_activity_sum",
+          "capacity_as_valid_rows"
+        ]
+      }
+    },
+    {
+      "id": "a5-mxa8w4-nznk-4608x5120-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_format": "mxfp4",
+        "metadata.activation_format": "fp8_e4m3",
+        "metadata.output_format": "bf16",
+        "metadata.program_execution.implementation": "ascend_mxa8w4_nznk",
+        "metadata.program_execution.mxa8w4.producer_mode": "dynamic_buffer4"
+      },
+      "coordinates": {
+        "active_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "positive_count"
+        },
+        "declared_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "len"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        },
+        "n": {
+          "path": "local_shape.1"
+        },
+        "k": {
+          "path": "local_shape.2"
+        }
+      },
+      "domain": {
+        "active_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "declared_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 2
+        },
+        "n": {
+          "min": 4608,
+          "max": 4608
+        },
+        "k": {
+          "min": 5120,
+          "max": 5120
+        }
+      },
+      "response": {
+        "fixed_us": 0,
+        "terms": [
+          {
+            "coordinate": "active_banks",
+            "us_per_unit": 5.054152083333333,
+            "scale_with": {
+              "resource": "mte2_aiv",
+              "reference_rate": 4224000000000
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "kind": "conditional_native_grouped_service_calibration",
+        "boundary": "inclusive native kernel completion",
+        "assignment": {
+          "native_mean_us": 242.5993,
+          "declared_active_banks": 48,
+          "cohort_label": 64,
+          "source": {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+            "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
+            "size_bytes": 214502
+          }
+        },
+        "geometry": "declared balanced histogram; captured group_list values unknown",
+        "scale_assumption": "inverse private weight-input pipe rate; engineered effective-regime hypothesis, not a hardware bandwidth measurement",
+        "input_precision": "mxfp4",
+        "output_precision": "bf16",
+        "validation_role": "c128 not used in this assignment; previously viewed observations, not blinded historical holdout",
+        "cross_model_validation": "same implementation/geometry observations pending",
+        "excludes": [
+          "Body_fit",
+          "model_name_selector",
+          "batch_selector",
+          "PMU_activity_sum",
+          "capacity_as_valid_rows"
+        ]
+      }
+    },
+    {
+      "id": "a5-mxa8w4-nznk-5120x2304-smallrows-effective-bank-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "family": "grouped_gemm",
+        "dtype": "bf16",
+        "metadata.weight_format": "mxfp4",
+        "metadata.activation_format": "fp8_e4m3",
+        "metadata.output_format": "bf16",
+        "metadata.program_execution.implementation": "ascend_mxa8w4_nznk",
+        "metadata.program_execution.mxa8w4.producer_mode": "dynamic_buffer4"
+      },
+      "coordinates": {
+        "active_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "positive_count"
+        },
+        "declared_banks": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "len"
+        },
+        "max_rows": {
+          "path": "metadata.matrix_group_rows",
+          "reduce": "max"
+        },
+        "n": {
+          "path": "local_shape.1"
+        },
+        "k": {
+          "path": "local_shape.2"
+        }
+      },
+      "domain": {
+        "active_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "declared_banks": {
+          "min": 48,
+          "max": 48
+        },
+        "max_rows": {
+          "min": 1,
+          "max": 2
+        },
+        "n": {
+          "min": 5120,
+          "max": 5120
+        },
+        "k": {
+          "min": 2304,
+          "max": 2304
+        }
+      },
+      "response": {
+        "fixed_us": 0,
+        "terms": [
+          {
+            "coordinate": "active_banks",
+            "us_per_unit": 2.4969651875,
+            "scale_with": {
+              "resource": "mte2_aiv",
+              "reference_rate": 4224000000000
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "kind": "conditional_native_grouped_service_calibration",
+        "boundary": "inclusive native kernel completion",
+        "assignment": {
+          "native_mean_us": 119.85432899999999,
+          "declared_active_banks": 48,
+          "cohort_label": 64,
+          "source": {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+            "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
+            "size_bytes": 214502
+          }
+        },
+        "geometry": "declared balanced histogram; captured group_list values unknown",
+        "scale_assumption": "inverse private weight-input pipe rate; engineered effective-regime hypothesis, not a hardware bandwidth measurement",
+        "input_precision": "mxfp4",
+        "output_precision": "bf16",
+        "validation_role": "c128 not used in this assignment; previously viewed observations, not blinded historical holdout",
+        "cross_model_validation": "same implementation/geometry observations pending",
+        "excludes": [
+          "Body_fit",
+          "model_name_selector",
+          "batch_selector",
+          "PMU_activity_sum",
+          "capacity_as_valid_rows"
+        ]
+      }
+    }
+  ],
+  "q35_source": {
+    "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+    "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+    "size_bytes": 49365
+  },
+  "v41_compact_observations": {
+    "64": {
+      "report": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+        "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
+        "size_bytes": 214502
+      },
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/deepseek_v4_1_flash_fp8_high_conc_decode_tpot30ms_c64_20261030/kernel_details.csv",
+        "size_bytes": 50179338,
+        "mtime_ns": 1793303665000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "085c8c00a0560d14a3ca4beb9b965efc04b6be1f40b47734cd47102af4363282"
+      },
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "measured_hidden_rows_divided_by_source_declared_decode_query",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "families": {
+        "expert_down": {
+          "observed_us": {
+            "count": 3000,
+            "mean": 119.85432899999999,
+            "p50": 118.821,
+            "p90": 127.094,
+            "min": 115.81,
+            "max": 132.167
+          },
+          "correspondence": {
+            "observed_buffer_row_capacity": 384,
+            "declared_valid_routed_rows": 48,
+            "observed_valid_routed_rows": null,
+            "observed_group_list_values": null,
+            "validated_geometry": {
+              "expert_banks": 48,
+              "output_width": 5120,
+              "input_width": 2304,
+              "operand_output_dtypes": [
+                "fp8_e4m3",
+                "mxfp4",
+                "bf16"
+              ]
+            }
+          },
+          "original_role": "unassigned"
+        },
+        "expert_up": {
+          "observed_us": {
+            "count": 3000,
+            "mean": 242.5993,
+            "p50": 241.3305,
+            "p90": 243.901,
+            "min": 237.834,
+            "max": 268.851
+          },
+          "correspondence": {
+            "observed_buffer_row_capacity": 384,
+            "declared_valid_routed_rows": 48,
+            "observed_valid_routed_rows": null,
+            "observed_group_list_values": null,
+            "validated_geometry": {
+              "expert_banks": 48,
+              "output_width": 4608,
+              "input_width": 5120,
+              "operand_output_dtypes": [
+                "fp8_e4m3",
+                "mxfp4",
+                "bf16"
+              ]
+            }
+          },
+          "original_role": "unassigned"
+        }
+      }
+    },
+    "128": {
+      "report": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_c128_p2k/body-operator-family-scoreboard.json",
+        "sha256": "74aa5551c4aa9136037d9c3732d30b6023bfbe81c771bf529c552375d5284810",
+        "size_bytes": 217165
+      },
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/deepseek_v4_1_flash_fp8_high_conc_decode_c128_p2k_20261030/kernel_details.csv",
+        "size_bytes": 49316349,
+        "mtime_ns": 1793305202000000000,
+        "schema_version": "kernel_details_csv_48col",
+        "sha256": "9f4378314a899c8389ba107c89a43dd5fa90c329553bd204ae546ffad39a2f41"
+      },
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "measured_hidden_rows_divided_by_source_declared_decode_query",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "families": {
+        "expert_down": {
+          "observed_us": {
+            "count": 2920,
+            "mean": 123.27315787671233,
+            "p50": 122.228,
+            "p90": 130.236,
+            "min": 119.179,
+            "max": 135.248
+          },
+          "correspondence": {
+            "observed_buffer_row_capacity": 768,
+            "declared_valid_routed_rows": 96,
+            "observed_valid_routed_rows": null,
+            "observed_group_list_values": null,
+            "validated_geometry": {
+              "expert_banks": 48,
+              "output_width": 5120,
+              "input_width": 2304,
+              "operand_output_dtypes": [
+                "fp8_e4m3",
+                "mxfp4",
+                "bf16"
+              ]
+            }
+          },
+          "original_role": "unassigned"
+        },
+        "expert_up": {
+          "observed_us": {
+            "count": 2920,
+            "mean": 250.140776369863,
+            "p50": 248.818,
+            "p90": 251.394,
+            "min": 244.422,
+            "max": 273.203
+          },
+          "correspondence": {
+            "observed_buffer_row_capacity": 768,
+            "declared_valid_routed_rows": 96,
+            "observed_valid_routed_rows": null,
+            "observed_group_list_values": null,
+            "validated_geometry": {
+              "expert_banks": 48,
+              "output_width": 4608,
+              "input_width": 5120,
+              "operand_output_dtypes": [
+                "fp8_e4m3",
+                "mxfp4",
+                "bf16"
+              ]
+            }
+          },
+          "original_role": "unassigned"
+        }
+      }
+    }
+  },
+  "roles": {
+    "64": "parameter_assignment",
+    "128": "not_used_in_parameter_assignment",
+    "4": "Q35 extra non-assignment geometry validation"
+  },
+  "raw_original_role": "unassigned",
+  "body_durations_used_for_assignment": false
+}

@@ -1,0 +1,22 @@
+{
+  "scope": "scalar UB-to-GM loop, BF16 stores, retained compiler binary",
+  "hardware": "Ascend950DT_9582",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "source_binary_sha256": "d8a98608a895c3ce9303611878827f2c0b176d2b3bf72ff54c796c8c6ac6a686",
+  "parameter_kind": "primitive service and finite-queue parameters",
+  "identification": "inferred from address/unit isolation; not a published hardware specification",
+  "per_unit_issue_rate_per_s": 88397790.05524862,
+  "queue": {
+    "outstanding": 8,
+    "granule_bytes": 128,
+    "response_ms": 9.125e-05,
+    "row_control_ms": 7e-06
+  },
+  "training": "../native-address-sweep/stdout.jsonl, first 24 rows only",
+  "independent_validation": "candidate-comparison.json",
+  "limitations": [
+    "shared effects at 64 units remain: 5.1-13.2 percent underprediction in three heldout cases",
+    "kernel entry, vector transcendental and synchronization stages are not calibrated by this primitive",
+    "no whole-operator or model latency was fitted"
+  ]
+}

@@ -1,0 +1,207 @@
+{
+  "schema": "mindie-sim.observable-kernel-regimes/1",
+  "service_regimes": [
+    {
+      "id": "a5-fullmesh-none-e16-w3584-dispatch-small-payload",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeDispatchV3",
+        "implementation": "arch35_fullmesh_unquantized_rows",
+        "dtype": "bf16",
+        "metadata.mc2_phase.ep": 8,
+        "metadata.mc2_phase.width": 3584,
+        "metadata.mc2_phase.experts": 16,
+        "metadata.mc2_phase.top_k": 8
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 53760.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 1,
+          "max": 4
+        }
+      },
+      "response": {
+        "fixed_us": 30.38074708436128,
+        "terms": [
+          {
+            "coordinate": "external_framed_bytes",
+            "us_per_unit": 1.774674481252606e-05
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native call elapsed from retained complete-forward partitions; not body latency, independently measured link rate, or additive PMU components",
+        "calibration_cases": [
+          "a5_kimi_tp8_e16_bf16_c1_p4k",
+          "a5_kimi_tp8_e16_bf16_c32_p4k"
+        ],
+        "parameter_units": {
+          "fixed_us": "inclusive fixed call completion component",
+          "us_per_unit": "us per external framed payload byte at the retained hardware configuration"
+        },
+        "resource_identifiability": "no independent hardware sweep: effective row response is not assigned to a guessed HBM/AIV/link primitive",
+        "independent_validation": "all remaining cases in the retained receipt; geometric and context holdouts are distinguished",
+        "combination": "max(analytic native group completion, observable response), once per native call",
+        "domain_exit": "analytic prediction remains available outside declared response domain"
+      }
+    },
+    {
+      "id": "a5-fullmesh-mx-e384-w5120-dispatch-small-payload",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeDispatchV3",
+        "implementation": "arch35_fullmesh_mx32_bf16_e4m3",
+        "dtype": "bf16",
+        "metadata.mc2_phase.ep": 8,
+        "metadata.mc2_phase.width": 5120,
+        "metadata.mc2_phase.experts": 384,
+        "metadata.mc2_phase.top_k": 6
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 32256.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 2,
+          "max": 16
+        }
+      },
+      "response": {
+        "fixed_us": 17.44856172916761,
+        "terms": [
+          {
+            "coordinate": "external_framed_bytes",
+            "us_per_unit": 6.969091254625997e-06
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native call elapsed from retained complete-forward partitions; not body latency, independently measured link rate, or additive PMU components",
+        "calibration_cases": [
+          "a5_v41_fp8_tp1_dp8_ep8_c16_p2k-dynamic-rotary-source.json",
+          "a5_v41_fp8_tp1_dp8_ep8_c128_p2k-dynamic-rotary-source.json"
+        ],
+        "parameter_units": {
+          "fixed_us": "inclusive fixed call completion component",
+          "us_per_unit": "us per external framed payload byte at the retained hardware configuration"
+        },
+        "resource_identifiability": "no independent hardware sweep: effective row response is not assigned to a guessed HBM/AIV/link primitive",
+        "independent_validation": "all remaining cases in the retained receipt; geometric and context holdouts are distinguished",
+        "combination": "max(analytic native group completion, observable response), once per native call",
+        "domain_exit": "analytic prediction remains available outside declared response domain"
+      }
+    },
+    {
+      "id": "a5-fullmesh-none-e16-w3584-combine-small-payload",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeCombineV3",
+        "implementation": "arch35_fullmesh_unquantized_rows",
+        "dtype": "bf16",
+        "metadata.mc2_phase.ep": 8,
+        "metadata.mc2_phase.width": 3584,
+        "metadata.mc2_phase.experts": 16,
+        "metadata.mc2_phase.top_k": 8
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 53760.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 1,
+          "max": 4
+        }
+      },
+      "response": {
+        "fixed_us": 14.543736919675757,
+        "terms": []
+      },
+      "provenance": {
+        "boundary": "native call elapsed from retained complete-forward partitions; not body latency, independently measured link rate, or additive PMU components",
+        "calibration_cases": [
+          "a5_kimi_tp8_e16_bf16_c1_p4k"
+        ],
+        "parameter_units": {
+          "fixed_us": "inclusive fixed call completion component",
+          "us_per_unit": "us per external framed payload byte at the retained hardware configuration"
+        },
+        "resource_identifiability": "no independent hardware sweep: effective row response is not assigned to a guessed HBM/AIV/link primitive",
+        "independent_validation": "all remaining cases in the retained receipt; geometric and context holdouts are distinguished",
+        "combination": "max(analytic native group completion, observable response), once per native call",
+        "domain_exit": "analytic prediction remains available outside declared response domain"
+      }
+    },
+    {
+      "id": "a5-fullmesh-mx-e384-w5120-combine-small-payload",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "MoeDistributeCombineV3",
+        "implementation": "arch35_fullmesh_unquantized_rows",
+        "dtype": "bf16",
+        "metadata.mc2_phase.ep": 8,
+        "metadata.mc2_phase.width": 5120,
+        "metadata.mc2_phase.experts": 384,
+        "metadata.mc2_phase.top_k": 6
+      },
+      "coordinates": {
+        "tokens": {
+          "path": "metadata.mc2_phase.source_tokens"
+        },
+        "external_framed_bytes": {
+          "path": "metadata.mc2_phase.source_tokens",
+          "scale": 59136.0
+        }
+      },
+      "domain": {
+        "tokens": {
+          "min": 2,
+          "max": 16
+        }
+      },
+      "response": {
+        "fixed_us": 11.297089339568258,
+        "terms": [
+          {
+            "coordinate": "external_framed_bytes",
+            "us_per_unit": 4.338491735493347e-06
+          }
+        ]
+      },
+      "provenance": {
+        "boundary": "native call elapsed from retained complete-forward partitions; not body latency, independently measured link rate, or additive PMU components",
+        "calibration_cases": [
+          "a5_v41_fp8_tp1_dp8_ep8_c16_p2k-dynamic-rotary-source.json",
+          "a5_v41_fp8_tp1_dp8_ep8_c128_p2k-dynamic-rotary-source.json"
+        ],
+        "parameter_units": {
+          "fixed_us": "inclusive fixed call completion component",
+          "us_per_unit": "us per external framed payload byte at the retained hardware configuration"
+        },
+        "resource_identifiability": "no independent hardware sweep: effective row response is not assigned to a guessed HBM/AIV/link primitive",
+        "independent_validation": "all remaining cases in the retained receipt; geometric and context holdouts are distinguished",
+        "combination": "max(analytic native group completion, observable response), once per native call",
+        "domain_exit": "analytic prediction remains available outside declared response domain"
+      }
+    }
+  ]
+}

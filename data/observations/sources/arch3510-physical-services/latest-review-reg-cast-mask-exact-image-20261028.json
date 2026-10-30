@@ -1,0 +1,26 @@
+[
+  {
+    "original_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h",
+    "sha256": "6cf55b9654ff223b9ec9b0a6f856584df250a2dacea773469230e1f8bb21b6f1",
+    "bytes": 34161,
+    "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_vec_vconv_impl.h"
+  },
+  {
+    "original_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h",
+    "sha256": "fbb35baa07d2b605666161fa21fbb3bcea0f04f3e1b6b63ac390342f537fdbc6",
+    "bytes": 8631,
+    "path": "/tmp/review-gdn-python-image-20261028/cann/impl/basic_api/reg_compute/dav_3510/kernel_reg_compute_maskreg_impl.h"
+  },
+  {
+    "original_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h",
+    "sha256": "9a71a4c1ec06681835297cd70675a66d06b5e11070091506750db33b6eb1a577",
+    "bytes": 2903,
+    "path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_struct_intf.h"
+  },
+  {
+    "original_path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h",
+    "sha256": "4609f0e0625ce6db16093f135bce12da7724fb52f4d78e849602947c441784ef",
+    "bytes": 3494,
+    "path": "/tmp/review-gdn-python-image-20261028/cann/include/basic_api/reg_compute/kernel_reg_compute_maskreg_intf.h"
+  }
+]

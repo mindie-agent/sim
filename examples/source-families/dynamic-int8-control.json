@@ -1,0 +1,148 @@
+{
+  "machine": {
+    "name": "synthetic-dynamic-int8-source-control",
+    "architecture": "declared",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0,
+        "int8": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0,
+        "shared_memory": 1000000000.0
+      },
+      "compute_units": 4,
+      "service_modes": {
+        "fp32_abs": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_max": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_div": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_mul": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_compare": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_select": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "warp_shuffle_calls": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_bf16_fp32": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_fp16_fp32": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_fp32_int8": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "shared_read_bytes": {
+          "resource": "shared_memory",
+          "rate": 1000000000.0
+        },
+        "shared_write_bytes": {
+          "resource": "shared_memory",
+          "rate": 1000000000.0
+        }
+      }
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [
+          0
+        ],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "quant": {
+      "name": "declared_per_row_int8",
+      "weight_format": "int8",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "source": [],
+      "notes": [],
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 3,
+        "output_tokens": 2
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "lowerings": {
+        "quantize": "cuda_dynamic_int8_quant_symmetric_no_azp"
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not accelerator specifications or calibration",
+      "implementation_scope": "dynamic-int8 declared source family; ordinary model graph"
+    }
+  }
+}

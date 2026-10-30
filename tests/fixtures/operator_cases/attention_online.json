@@ -1,0 +1,107 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "attention_online-0",
+      "split": "development",
+      "params": {
+        "query": 1,
+        "context": 128,
+        "heads": 8,
+        "key_heads": 2,
+        "head_dim": 64,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-1",
+      "split": "development",
+      "params": {
+        "query": 4,
+        "context": 1024,
+        "heads": 8,
+        "key_heads": 2,
+        "head_dim": 64,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-2",
+      "split": "development",
+      "params": {
+        "query": 64,
+        "context": 64,
+        "heads": 8,
+        "key_heads": 2,
+        "head_dim": 64,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-3",
+      "split": "heldout_geometry",
+      "params": {
+        "query": 17,
+        "context": 129,
+        "heads": 12,
+        "key_heads": 3,
+        "head_dim": 64,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-4",
+      "split": "heldout_geometry",
+      "params": {
+        "query": 65,
+        "context": 257,
+        "heads": 8,
+        "key_heads": 1,
+        "head_dim": 64,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-counterexample-0",
+      "split": "development",
+      "params": {
+        "query": 1,
+        "context": 0,
+        "heads": 1,
+        "key_heads": 1,
+        "head_dim": 16,
+        "block": 32,
+        "dtype": "bf16",
+        "causal": true
+      }
+    },
+    {
+      "id": "attention_online-counterexample-1",
+      "split": "development",
+      "params": {
+        "query": 33,
+        "context": 65,
+        "heads": 4,
+        "key_heads": 1,
+        "head_dim": 256,
+        "block": 128,
+        "dtype": "bf16",
+        "causal": true,
+        "compute_capability": [
+          10,
+          0
+        ]
+      }
+    }
+  ]
+}

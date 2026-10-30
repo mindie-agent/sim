@@ -1,4 +1,0 @@
-{
-  "observations": [],
-  "note": "No A3 measurement is bundled. Use a SQLite calibration store and the calibration manifest/runner loop for real data."
-}

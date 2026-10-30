@@ -1,0 +1,99 @@
+{
+  "name": "catalog-full-model-qwen36-27b-a5-8die",
+  "machine": {
+    "name": "a5-950dt-9582-8die",
+    "arch_family": "A5",
+    "sku": "Ascend950DT_9582",
+    "hardware_key": "Ascend950DT_9582",
+    "dies_per_package": 1,
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "device": {
+      "hbm_gib": 96,
+      "cube_flops_per_s": 432537600000000.0,
+      "hbm_bw_bytes_per_s": 4000000000000.0,
+      "mte_bw_bytes_per_s": 4000000000000.0,
+      "launch_us": 20.0,
+      "l2_bytes": 134217728,
+      "l1_bytes": 524288,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144,
+      "ub_bytes": 253952,
+      "aic_count": 32,
+      "aiv_count": 64,
+      "mte1_bw_bytes_per_s": 4000000000000.0
+    },
+    "compute_peaks": {
+      "bf16": 432537600000000.0,
+      "fp8_e4m3": 865075200000000.0,
+      "int8": 865075200000000.0
+    },
+    "links": [
+      {
+        "name": "ub-mesh",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 2.5,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      }
+    ],
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.6-27b",
+    "quantization": "w8a8_dynamic"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 8,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "max_model_len": 131072,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "kv_block_size": 128,
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "metadata": {
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "recipe": "vllm serve /home/weights/Qwen3.6-27B-W8A8 --tensor-parallel-size 8 --dtype bfloat16 --quantization ascend --trust-remote-code --max-model-len 131072 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enable-chunked-prefill --no-enable-prefix-caching --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3}'",
+      "weights": "Qwen3.6-27B-W8A8: int8 W8A8_DYNAMIC body (4.1966 GB/die at TP8), MTP1 head in the checkpoint, APC off",
+      "host": "rack08os8 (177.31.28.1), dies 0-7, one 8-die Ascend950DT host",
+      "image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5 (sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4); vllm 0.30.0, CANN 9.2.0",
+      "measured_baseline": ".workstreams/hp-serving/qwen36-a5/report.md (2026-10-23, rack08os8)",
+      "mtp": "MTP3: num_speculative_tokens=3, qwen3_5_mtp normalised to mtp; the served stream measured 3.476-3.989 committed tokens per decode step across the long-context matrix",
+      "row_policy": "measured A5 rows are declared by the cells manifest and applied only when their exact geometry matches; a row for another TP/head layout is declared missing, never substituted"
+    }
+  }
+}

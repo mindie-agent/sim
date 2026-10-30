@@ -1,0 +1,134 @@
+{
+  "model": {
+    "name": "example-transformer",
+    "layers": 4,
+    "hidden_size": 512,
+    "num_heads": 8,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "intermediate_size": 1536,
+    "vocab_size": 8192
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "a",
+        "prompt_tokens": 64,
+        "output_tokens": 8
+      },
+      {
+        "id": "b",
+        "prompt_tokens": 32,
+        "output_tokens": 6,
+        "arrival_ms": 0.2
+      }
+    ]
+  },
+  "slo": {
+    "ttft_ms": 20,
+    "tpot_ms": 5,
+    "itl_ms": 10
+  },
+  "pools": {
+    "prefill": {
+      "machine": {
+        "name": "illustrative-gpu",
+        "architecture": "generic-gpu",
+        "num_devices": 1,
+        "device": {
+          "memory_bytes": 25769803776,
+          "compute_units": 32,
+          "compute_peaks": {
+            "bf16": 100000000000000.0,
+            "fp32": 20000000000000.0
+          },
+          "rates": {
+            "memory": 800000000000.0,
+            "vector": 5000000000000.0
+          },
+          "launch_us": 5
+        },
+        "assumptions": {
+          "parameters": "Illustrative values for exploring geometry and policy; not a measured GPU specification."
+        }
+      },
+      "runtime": {
+        "max_num_batched_tokens": 64,
+        "max_num_seqs": 4,
+        "max_model_len": 2048,
+        "kv_block_size": 16,
+        "graph_capture_keys": [
+          1,
+          2,
+          4
+        ],
+        "graph_mode": "auto",
+        "kernels": {
+          "programs": {
+            "matmul": {
+              "kind": "tiled_matmul",
+              "tile_m": 64,
+              "tile_n": 128,
+              "tile_k": 128,
+              "slots": 2,
+              "reuse_inputs": true,
+              "reuse_weights": true
+            }
+          }
+        }
+      }
+    },
+    "decode": {
+      "machine": {
+        "name": "illustrative-gpu",
+        "architecture": "generic-gpu",
+        "num_devices": 1,
+        "device": {
+          "memory_bytes": 25769803776,
+          "compute_units": 32,
+          "compute_peaks": {
+            "bf16": 100000000000000.0,
+            "fp32": 20000000000000.0
+          },
+          "rates": {
+            "memory": 800000000000.0,
+            "vector": 5000000000000.0
+          },
+          "launch_us": 5
+        },
+        "assumptions": {
+          "parameters": "Illustrative values for exploring geometry and policy; not a measured GPU specification."
+        }
+      },
+      "runtime": {
+        "max_num_batched_tokens": 64,
+        "max_num_seqs": 1,
+        "max_model_len": 2048,
+        "kv_block_size": 16,
+        "graph_capture_keys": [
+          1,
+          2,
+          4
+        ],
+        "graph_mode": "auto",
+        "kernels": {
+          "programs": {
+            "matmul": {
+              "kind": "tiled_matmul",
+              "tile_m": 64,
+              "tile_n": 128,
+              "tile_k": 128,
+              "slots": 2,
+              "reuse_inputs": true,
+              "reuse_weights": true
+            }
+          }
+        }
+      }
+    }
+  },
+  "connector": {
+    "bytes_per_s": 32000000000.0,
+    "latency_us": 10
+  }
+}

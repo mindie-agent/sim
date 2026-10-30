@@ -1,0 +1,175 @@
+{
+  "package_retained_builds": [],
+  "compiler_config": [],
+  "compiler_tool_hits": [
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/op_compiler_tool.py",
+      "hits": [
+        {
+          "line": 87,
+          "text": "    OP_DEBUG_CONFIG_STATE = judgment_option_exist(\"op_debug_config\", opt_parser.compiling_options)"
+        },
+        {
+          "line": 126,
+          "text": "            logger.error(\"[-k/--kernel_name] can be used only with [-d/--op_debug_config].\")"
+        }
+      ],
+      "sha256": "baea277386f3848dae78e338eb081d0332c3c3acfcd2c928fea5d7e9a97f0f0d"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/op_compiler_parse_args.py",
+      "hits": [
+        {
+          "line": 122,
+          "text": "              \"  -d/--op_debug_config     configuring CCEC compilation options.\\n\""
+        },
+        {
+          "line": 231,
+          "text": "        if \"d\" in self.compiling_options or \"op_debug_config\" in self.compiling_options:"
+        },
+        {
+          "line": 506,
+          "text": "            if key in (\"-d\", \"--op_debug_config\"):"
+        },
+        {
+          "line": 513,
+          "text": "                self.__set_full_options_value([\"-d\", \"--op_debug_config\"], value)"
+        }
+      ],
+      "sha256": "8189b613019baf78ee30d3869ee7b05485b704b2ba588672c26c072318024188"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/op_compiler_common.py",
+      "hits": [
+        {
+          "line": 78,
+          "text": "    OP_DEBUG_CONFIG = \"op_debug_config\""
+        },
+        {
+          "line": 127,
+          "text": "    [\"-d\", \"--op_debug_config\"],"
+        }
+      ],
+      "sha256": "59f7e0e5073592572e133f6638bb3f7d7da1473d02a71dce4a27d9a9f0affeed"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/debug_compile/debug_compilation.py",
+      "hits": [
+        {
+          "line": 56,
+          "text": "def _parse_op_debug_config(path: str) -> Tuple[bool, str]:"
+        },
+        {
+          "line": 60,
+          "text": "    :return: True/False, op_debug_config"
+        },
+        {
+          "line": 70,
+          "text": "            op_debug_config = fd.readline().split(\"=\")[-1].strip()"
+        },
+        {
+          "line": 71,
+          "text": "            logger.debug(f\"the op_debug_config file is opened successfully, {path}, [{op_debug_config}]\")"
+        },
+        {
+          "line": 73,
+          "text": "        logger.exception(f\"{path}, failed to open the op_debug_config file\")"
+        },
+        {
+          "line": 75,
+          "text": "    op_debug_config_list  = op_debug_config.split(\",\")"
+        },
+        {
+          "line": 76,
+          "text": "    for item in op_debug_config_list: # \u68c0\u67e5op_debug_config\u662f\u5426\u5408\u6cd5"
+        },
+        {
+          "line": 78,
+          "text": "            logger.error(f\"op_debug_config value {item} is invalid.\")"
+        },
+        {
+          "line": 80,
+          "text": "    return True, op_debug_config   "
+        },
+        {
+          "line": 99,
+          "text": "        logger.exception(f\"{op_binary_json_path}, failed to open the op_debug_config file.\")"
+        },
+        {
+          "line": 430,
+          "text": "    logger.debug(f\"op_debug_config_path : {debug_compiler_params.op_debug_config_path}\")"
+        },
+        {
+          "line": 461,
+          "text": "def _assemble_opc_params(soc_version, compile_res_dir, op_debug_config, log_level, json_path_list: list) -> list:"
+        },
+        {
+          "line": 465,
+          "text": "             op_debug_config:"
+        },
+        {
+          "line": 476,
+          "text": "        \"op_debug_config\": op_debug_config,"
+        },
+        {
+          "line": 549,
+          "text": "    compile_res_dir, op_debug_config, log_level = assemble_compile_params"
+        },
+        {
+          "line": 568,
+          "text": "    op_param_list = _assemble_opc_params(soc_version, compile_res_dir, op_debug_config, log_level, json_path_list)"
+        },
+        {
+          "line": 580,
+          "text": "    op_params_dir, kernel_name, op_debug_config_path, soc_version, package_name, output_path, job, log_level = ("
+        },
+        {
+          "line": 583,
+          "text": "        path_conversion(parameters.full_options[\"--op_debug_config\"].get_value())[-1],"
+        },
+        {
+          "line": 591,
+          "text": "    parse_op_debug_config_flag, op_debug_config = _parse_op_debug_config(op_debug_config_path)"
+        },
+        {
+          "line": 592,
+          "text": "    if not parse_op_debug_config_flag:"
+        },
+        {
+          "line": 595,
+          "text": "                                       \"op_params_dir, kernel_name, op_debug_config_path, \\"
+        },
+        {
+          "line": 597,
+          "text": "    _print_debug_compiler_params(debug_compiler_params(op_params_dir, kernel_name, op_debug_config_path, \\"
+        },
+        {
+          "line": 621,
+          "text": "                                   compile_res_dir, op_debug_config, log_level]"
+        }
+      ],
+      "sha256": "3cf0e8b43f721e1873ad4274d1487f67aebd67a540317433b4feb51e8ac4735c"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/debug_compile/get_dyn_support_info.py",
+      "hits": [
+        {
+          "line": 169,
+          "text": "        logger.exception(f\"{json_path}, failed to open the op_debug_config file.\")"
+        }
+      ],
+      "sha256": "e01010dcf53b55bd5bf65356d8b4578faeef49e9fca0877543add407a0200e3f"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/op_compile_tool/static_compile/static_compilation.py",
+      "hits": [
+        {
+          "line": 457,
+          "text": "        opc_compile_md += ' --op_debug_config=dump_cce'"
+        }
+      ],
+      "sha256": "8745d2a1f20d5f5368970978808f543bda947b54e489e2e66f87cdf0732d7fa4"
+    }
+  ],
+  "defaults_docs": []
+}

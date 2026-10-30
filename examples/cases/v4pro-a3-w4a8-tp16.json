@@ -1,0 +1,94 @@
+{
+  "name": "catalog-full-model-v4pro-a3-w4a8-mtp-tp16-reduced-64k",
+  "machine": {
+    "name": "a3-9362-16die-tp16",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 16,
+    "ranks_per_node": 16,
+    "note": "one A3 host (192.168.13.165), eight two-die packages = all 16 dies 0-15, one rank per die; links are omitted so the machine's declared transfer channels materialize eight SIO intra-package pairs at 448 GB/s and one 16-die HCCS_SW intra-node link at 196 GB/s",
+    "device": {
+      "hbm_gib": 64,
+      "cube_flops_per_s": 270336000000000.0,
+      "vector_ops_per_s": 8448000000000.0,
+      "hbm_bw_bytes_per_s": 1200000000000.0,
+      "mte_bw_bytes_per_s": 2400000000000.0,
+      "launch_us": 20.0,
+      "l2_bytes": 176160768,
+      "aic_count": 20,
+      "aiv_count": 40
+    },
+    "compute_peaks": {
+      "bf16": 270336000000000.0,
+      "int8": 540672000000000.0
+    },
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "deepseek-v4-pro-0813",
+    "quantization": "w4a8_dynamic"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 8,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 1024,
+    "max_num_seqs": 16,
+    "max_model_len": 65536,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.97,
+    "kv_block_size": 128,
+    "graph_mode": "auto",
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "mtp_acceptance_length": 2.0,
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/DeepSeek-V4-Pro-w4a8-mtp --host 0.0.0.0 --port 18237 --served-model-name dsv4pro --data-parallel-size 1 --tensor-parallel-size 16 --enable-expert-parallel --max-model-len 65536 --max-num-batched-tokens 1024 --max-num-seqs 16 --gpu-memory-utilization 0.97 --block-size 128 --trust-remote-code --no-enable-prefix-caching --tokenizer-mode deepseek_v4 --tool-call-parser deepseek_v4 --enable-auto-tool-choice --reasoning-parser deepseek_v4 --attention_config.indexer_kv_dtype int8 --model-loader-extra-config '{\"enable_multithread_load\": true, \"num_threads\": 128}' --quantization ascend --speculative-config '{\"num_speculative_tokens\": 1, \"method\": \"mtp\", \"enforce_eager\": true}' --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' --additional-config '{\"ascend_compilation_config\":{\"enable_npugraph_ex\": true, \"enable_static_kernel\": false}, \"enable_cpu_binding\": true, \"multistream_overlap_shared_expert\": true}'",
+      "topology": "DP1 x TP16 + EP16 on one engine, all 16 dies 0-15, ranks_per_node 16",
+      "quantization": "W4A8_DYNAMIC routed experts (packed int4, per-channel fp32 scale) + W8A8_DYNAMIC attention/shared/dense; norms, router, embedding, LM head and the MTP layer stay BF16/FP32. Measured per-die weight load 53.66 GiB (Loading model weights took 53.6637 GB on 16/16 ranks), versus the analytic 49.87 GiB: the resident MTP layer, scales and unquantized categories are not fully priced.",
+      "weights": "DeepSeek-V4-Pro-w4a8-mtp (791 GiB, 205 shards, DeepseekV4ForCausalLM, 61 body layers, hidden 7168, 128 Q / 1 KV, head_dim 512, q_lora 1536, kv_lora 512, qk 448+64 rope, v 512, 384 routed experts top-6 + 1 shared, moe_intermediate 3072, MTP1 num_nextn_predict_layers 1, max_position_embeddings 1048576)",
+      "host": "192.168.13.165 (A3, openEuler, 640 CPU / 2013 GB RAM), 8 x Ascend910 packages x 2 dies = 16 dies of 65 536 MB; all dies 0-15 exposed",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (id 5bdd40411c1a, vLLM 0.30.0, vllm-ascend 0.30.0rc2.dev200+g8fd0bc488, CANN 9.2.1)",
+      "mtp": "MTP1 deepseek_mtp, the checkpoint's own one-layer DeepSeekV4MTPModel drafter, num_speculative_tokens=1; measured mean acceptance length 2.00 in every cell. Declared as the measured acceptance with a zero additive step cost because the served step interval already contains draft+verify. The catalog auxiliary dspark draft is a 3-layer foreign spec and is not lowered. 100% draft acceptance is a workload artefact (uniform-random greedy prompts collapse to degenerate continuations), not a model property.",
+      "mtp_acceptance_source": ".workstreams/hp-serving/v4pro-a3-w4a8/report.md section 5: Mean acceptance length 2.00 in every cell; Prometheus accepted/drafted 10,234/10,245 (99.89%) at p4096/c1, 10,190/10,289 (99.04%) at p16384/c1, 10,231/10,240 (99.91%) at p61440/c1.",
+      "enable_prefix_caching": "false (--no-enable-prefix-caching)",
+      "indexer_kv_dtype": "int8 (--attention_config.indexer_kv_dtype int8)",
+      "graph": "cudagraph_mode=FULL_DECODE_ONLY + npugraph_ex; six decode capture sizes, capture about 39 s / 0.64 GiB. The report publishes the count but not the six values; this case declares six buckets [1, 2, 4, 8, 12, 16], all within max_num_seqs 16, so the c1 and c4 capture classes are represented. The bucket values are a declared modeling input, not a claimed measurement.",
+      "chunked_prefill": "enabled, max_num_batched_tokens=1024; a 61,440-token prompt is 60 scheduler chunks and about 28.9 s of prefill",
+      "kv_cache": "measured engine lines: Available KV cache memory 2.39 GiB -> NPU KV cache size 71,891 tokens; after warmup Current KV cache memory 2.41 GiB; Maximum concurrency for 65,536 tokens per request 1.10x; about 35.1 KiB/token/die. The analytic compressed-row model prices 9,310.5 B/token (1,257,600 tokens). These are different quantities (static engine pool vs compressed live rows): the measured 71,891-token pool is declared as the admission capacity (kv_pool_tokens / kv_pool_measured_tokens) and the analytic number stays the live-row price, reported separately and never used as an admission fallback. The pool is why 131072 is refused and why c4 at p61440 serialized.",
+      "kv_pool_admission": "runtime.metadata.kv_pool_tokens=71891 + kv_pool_measured_tokens=71891 (the engine's own NPU KV cache size line) overrides the analytic admission capacity. A request is admitted only when its whole prompt allocation (ceil(prompt/128) blocks) fits the measured pool; otherwise it is deferred with kv_capacity_blocked_admission and re-admitted when an earlier request releases its blocks. A finished request holds its prompt reservation until its declared output completes, because the engine cannot free context rows it still needs. This reproduces the measured p61440/c4 serialization (one 65,536-token context at a time) while leaving the four p16384/c4 and p4096/c4 requests concurrent (prompt allocations 4x128=512 and 4x32=128 blocks both fit 561 blocks).",
+      "kv_pool_tokens": 71891,
+      "kv_pool_measured_tokens": 71891,
+      "kv_pool_source": ".workstreams/hp-serving/v4pro-a3-w4a8/report.md section 1 (A4 engine line NPU KV cache size: 71,891 tokens) and section 5 (2.41 GiB / 71,891 tokens / about 35.1 KiB/token)",
+      "reduced_config": true,
+      "reduced_config_reason": "128k refused by the engine's own KV check: 4.18 GiB needed vs 2.05-2.39 GiB available; the node can supply at most 3.61 GiB at any gmu (61.28 free - 53.66 weights - 4.01 activation/non-torch/graph). 64k serves with 71,891 tokens. p61440 is the declared 64k rung because prompt + o4096 = 65,536 = max_model_len; it is never quoted as a 65,536-token prompt.",
+      "unsupported_context": "131072 (and any prompt+output above 65,536) is unsupported on this single-node TP16/64 GiB configuration; it is refused, never extrapolated. The p126976 rung needs about 4.05 GiB of KV against a 3.61 GiB ceiling and was not attempted.",
+      "serialization_61k": "4 concurrent requests x 65,536 tokens = 262,144 KV tokens against a 71,891-token pool (364.7% demand, static concurrency 1.10x). The engine ran one 65,536-token context at a time (running max 1, waiting max 3): TTFTs in admission order are 28.8/175.8/322.8/469.3 s, i.e. each next request is admitted only after the previous whole E2E (about 147 s), so TTFT_k = sum(E2E_1..k-1) + prefill_k. This is serialization, not 1/2/3/4 prefills.",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted. The measured serving matrix lives only in examples/artifacts/a3-v4pro-tp16-w4a8-mtp-matrix.json and is read only by the comparison runner.",
+      "expert_parallel": "the served recipe passes --enable-expert-parallel with TP16 -> EP16 on 16 ranks; 384 routed experts / EP16 = 24 local experts per rank at full moe_intermediate width 3072. The trace has no published EP dispatch/combine row; no all-to-all latency is claimed.",
+      "fabric": "8 SIO intra-package die pairs (448 GB/s, direct) + one 16-die HCCS_SW switched intra-node fabric (196 GB/s declared default). TP16 all-reduce spans eight packages; the A3 comm campaign measured only 2-rank SIO/HCCS_SW and 4-rank package-to-package rows, so the 16-rank all-reduce and the EP16 all-to-all stay analytic and are declared missing.",
+      "measured_baseline": ".workstreams/hp-serving/v4pro-a3-w4a8/report.md (2026-10-23 18:22-20:12 UTC, 192.168.13.165, all 16 dies, 6/6 served cells, 0 OOM, 0 failed requests)",
+      "package": "sim 7e7123e + feat/v4pro-a3-kvpool (measured KV-pool admission bound on top of the reduced-64k case)",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 1
+    },
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      12,
+      16
+    ]
+  }
+}

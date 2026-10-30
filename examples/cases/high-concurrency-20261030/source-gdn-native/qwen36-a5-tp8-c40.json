@@ -1,0 +1,133 @@
+{
+  "name": "qwen36-a5-tp8-c40-source-gdn-native",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8,
+    "device": {
+      "rates": {
+        "scalar_store_issue": 5657458563.535912
+      },
+      "resource_units": {
+        "scalar_store_issue": 64
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "qwen3.6-27b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.beta_alpha": {
+          "activation_format": "bf16",
+          "weight_format": "bf16"
+        },
+        "gdn.o": {
+          "activation_format": "bf16",
+          "weight_format": "bf16"
+        }
+      },
+      "source": {
+        "activation_scheme": "dynamic",
+        "checkpoint": "Qwen3.5-35B-A3B-w8a8-mtp",
+        "quant_method": "w8a8_dynamic",
+        "weight_scale": "per_channel_fp32"
+      },
+      "notes": [
+        "measured A5 recipe: W8A8 int8 dynamic (per-channel fp32 weight scale, per-token int8 activations)",
+        "body attention + routed expert projections are int8; MTP, norms, embedding, LM head, conv and vision stay BF16/FP32"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "device-body analysis only; workload placeholder is not a replay of the concurrent server",
+      "geometry_policy": "supply actual query rows and sequence count from profiler; capture padding must be stated separately",
+      "capture_summary": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_high_conc_decode_tpot10ms_c40_20261030/benchmark_summary.json",
+      "capture_client": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_high_conc_decode_tpot10ms_c40_20261030/client_cell.json",
+      "source_image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5 (c3d00a196905)",
+      "source_model_path": "/mnt/weight/Qwen3.6-27B-W8A8",
+      "mtp_policy": "metadata proves 3 proposed tokens per draft event; actual target query geometry awaits tensor extraction",
+      "gdn_primitive_parameters": {
+        "identity": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
+          "sha256": "6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb",
+          "bytes": 1046
+        },
+        "hardware": "Ascend950DT_9582",
+        "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+        "scope": "scalar UB-to-GM loop, BF16 stores, retained compiler binary",
+        "calibration": "existing independent BF16 scalar-store primitive; no capture-duration fit",
+        "new_capture_binary_verified": false,
+        "g_fp32": "positive-stride aligned FP32 DMA inferred from retained compiler binary",
+        "recurrence": "explicit arch35_fp32 native core; new scenario, not the earlier analytic-core control",
+        "cache_indices": "captured INT32 table [512,4], first column [batch,1]; selected payload batch*4 bytes; capacity 512 is not work"
+      }
+    },
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            },
+            "recurrent_implementation": "arch35_fp32",
+            "cache_index_row_stride": 4
+          }
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4104,
+        "output_tokens": 512
+      }
+    ]
+  }
+}

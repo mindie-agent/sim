@@ -1,0 +1,77 @@
+{
+  "machine": {
+    "name": "synthetic-mla-decode-source-control",
+    "architecture": "declared",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0
+      },
+      "compute_units": 4
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [
+          0
+        ],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 1,
+    "head_dim": 48,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "attention": "mla",
+    "mla": {
+      "q_lora_rank": 32,
+      "kv_lora_rank": 256,
+      "qk_nope_head_dim": 16,
+      "qk_rope_head_dim": 32,
+      "v_head_dim": 16
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 4,
+        "output_tokens": 3
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "lowerings": {
+        "mla_decode": {
+          "implementation": "vllm_triton_mla_decode_tuple",
+          "options": {
+            "num_kv_splits": 3
+          }
+        }
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not accelerator specifications or calibration",
+      "implementation_scope": "mla-decode declared source family; ordinary model graph"
+    }
+  }
+}

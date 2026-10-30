@@ -1,0 +1,440 @@
+{
+  "schema": "mindie-sim.a3-physical-hierarchy/1",
+  "boundary": "two isolated ordinary-body AllReduce calls per TP configuration",
+  "coverage": "explicit source-compatible AICPU schedule on declared A3 topology",
+  "unmodeled": [
+    "captured native selector",
+    "independent controller issue-rate calibration",
+    "CCU endpoint-die classification",
+    "interlevel chunk overlap"
+  ],
+  "source_sha256": {
+    "mindie_sim/prediction/hccl_hierarchy.py": "cd0d0ddb75dc740c79e73b845bcc03719af21a2bee64fe29cd1e682f0ebbbd2b",
+    "mindie_sim/prediction/topology.py": "56c85f33a5435ed7ce7743aab127567c64a8b8028722768471a7b04a26941e2e",
+    "mindie_sim/backends/ascend.py": "58ac16779419c5e4cd08b2bde6551043e3701a0f8b900804a4580f784e720c60",
+    "mindie_sim/backends/profiles/ascend.json": "002ba633cee363b455adc802f00ceaf3cd9ecc9257e2a951a08e442418888063"
+  },
+  "results": [
+    {
+      "ranks": 8,
+      "case": {
+        "machine": {
+          "backend": "ascend",
+          "sku": "Ascend910_9362",
+          "num_devices": 8,
+          "ranks_per_node": 16,
+          "dies_per_package": 2
+        },
+        "model": {
+          "name": "geometry",
+          "layers": 1,
+          "hidden_size": 1024,
+          "num_heads": 32,
+          "num_kv_heads": 32,
+          "head_dim": 32,
+          "intermediate_size": 2048,
+          "vocab_size": 128
+        },
+        "workload": {
+          "requests": [
+            {
+              "id": "r",
+              "prompt_tokens": 4,
+              "output_tokens": 2
+            }
+          ]
+        },
+        "runtime": {
+          "tp": 8,
+          "max_num_batched_tokens": 128,
+          "kernels": {
+            "hccl": {
+              "allreduce": {
+                "expansion": "AICPU_TS",
+                "template": "parallel_mesh_nhr_route0",
+                "topology_levels": 2,
+                "level0_size": 2,
+                "max_loop_bytes": 8388608,
+                "signal_bytes": 4
+              }
+            }
+          }
+        },
+        "metadata": {
+          "selection": "source-compatible declaration, not observed A3 executor",
+          "signal_bytes": "explicit control geometry, not measured wire framing"
+        }
+      },
+      "calls": 2,
+      "links": [
+        {
+          "name": "d2d_intra_package:0",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            0,
+            1
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:2",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            2,
+            3
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:4",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            4,
+            5
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:6",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            6,
+            7
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_node:0",
+          "capacity_bytes_per_ms": 196000000.0,
+          "members": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7
+          ],
+          "latency_us": 2.5,
+          "channel": "d2d_intra_node",
+          "semantics": "per_port"
+        }
+      ],
+      "selection": {
+        "expansion": "AICPU_TS",
+        "collective": "allreduce",
+        "template": "parallel_mesh_nhr_route0",
+        "ranks": 8,
+        "payload_bytes": 65536,
+        "dtype_bytes": 2,
+        "topology": "MESH_1D",
+        "topology_levels": 2,
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "selection_basis": "explicit_source_compatible_declaration",
+        "block_limit": null,
+        "buffer_mode": "separate",
+        "level0_size": 2,
+        "max_loop_bytes": 8388608,
+        "signal_bytes": 4
+      },
+      "payload_wire_bytes_per_call": 917504,
+      "declared_signal_wire_bytes_per_call": 320,
+      "scans": [
+        {
+          "channel": "d2d_intra_package",
+          "factor": 0.5,
+          "duration_ms": 0.061069374965983414,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        },
+        {
+          "channel": "d2d_intra_package",
+          "factor": 1,
+          "duration_ms": 0.06077673210884704,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        },
+        {
+          "channel": "d2d_intra_package",
+          "factor": 2,
+          "duration_ms": 0.06063041068027708,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 0.5,
+          "duration_ms": 0.06127852802721456,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 1,
+          "duration_ms": 0.06077673210884704,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 2,
+          "duration_ms": 0.06052583414967039,
+          "wire_bytes": 1835648.0,
+          "tx_capacity_bytes": 1835648.0,
+          "rx_capacity_bytes": 1835648.0
+        }
+      ]
+    },
+    {
+      "ranks": 16,
+      "case": {
+        "machine": {
+          "backend": "ascend",
+          "sku": "Ascend910_9362",
+          "num_devices": 16,
+          "ranks_per_node": 16,
+          "dies_per_package": 2
+        },
+        "model": {
+          "name": "geometry",
+          "layers": 1,
+          "hidden_size": 1024,
+          "num_heads": 32,
+          "num_kv_heads": 32,
+          "head_dim": 32,
+          "intermediate_size": 2048,
+          "vocab_size": 128
+        },
+        "workload": {
+          "requests": [
+            {
+              "id": "r",
+              "prompt_tokens": 4,
+              "output_tokens": 2
+            }
+          ]
+        },
+        "runtime": {
+          "tp": 16,
+          "max_num_batched_tokens": 128,
+          "kernels": {
+            "hccl": {
+              "allreduce": {
+                "expansion": "AICPU_TS",
+                "template": "parallel_mesh_nhr_route0",
+                "topology_levels": 2,
+                "level0_size": 2,
+                "max_loop_bytes": 8388608,
+                "signal_bytes": 4
+              }
+            }
+          }
+        },
+        "metadata": {
+          "selection": "source-compatible declaration, not observed A3 executor",
+          "signal_bytes": "explicit control geometry, not measured wire framing"
+        }
+      },
+      "calls": 2,
+      "links": [
+        {
+          "name": "d2d_intra_package:0",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            0,
+            1
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:2",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            2,
+            3
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:4",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            4,
+            5
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:6",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            6,
+            7
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:8",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            8,
+            9
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:10",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            10,
+            11
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:12",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            12,
+            13
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_package:14",
+          "capacity_bytes_per_ms": 448000000.0,
+          "members": [
+            14,
+            15
+          ],
+          "latency_us": 0.8,
+          "channel": "d2d_intra_package",
+          "semantics": "per_port"
+        },
+        {
+          "name": "d2d_intra_node:0",
+          "capacity_bytes_per_ms": 196000000.0,
+          "members": [
+            0,
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15
+          ],
+          "latency_us": 2.5,
+          "channel": "d2d_intra_node",
+          "semantics": "per_port"
+        }
+      ],
+      "selection": {
+        "expansion": "AICPU_TS",
+        "collective": "allreduce",
+        "template": "parallel_mesh_nhr_route0",
+        "ranks": 16,
+        "payload_bytes": 65536,
+        "dtype_bytes": 2,
+        "topology": "MESH_1D",
+        "topology_levels": 2,
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "selection_basis": "explicit_source_compatible_declaration",
+        "block_limit": null,
+        "buffer_mode": "separate",
+        "level0_size": 2,
+        "max_loop_bytes": 8388608,
+        "signal_bytes": 4
+      },
+      "payload_wire_bytes_per_call": 1966080,
+      "declared_signal_wire_bytes_per_call": 832,
+      "scans": [
+        {
+          "channel": "d2d_intra_package",
+          "factor": 0.5,
+          "duration_ms": 0.08615308925170062,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        },
+        {
+          "channel": "d2d_intra_package",
+          "factor": 1,
+          "duration_ms": 0.08586044639456425,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        },
+        {
+          "channel": "d2d_intra_package",
+          "factor": 2,
+          "duration_ms": 0.08571412496599429,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 0.5,
+          "duration_ms": 0.08644595659864507,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 1,
+          "duration_ms": 0.08586044639456425,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        },
+        {
+          "channel": "d2d_intra_node",
+          "factor": 2,
+          "duration_ms": 0.08556769129253361,
+          "wire_bytes": 3933824.0,
+          "tx_capacity_bytes": 3933824.0,
+          "rx_capacity_bytes": 3933824.0
+        }
+      ]
+    }
+  ],
+  "wall_seconds": 0.6842944170348346
+}

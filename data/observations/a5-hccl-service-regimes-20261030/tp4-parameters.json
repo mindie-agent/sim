@@ -1,0 +1,123 @@
+{
+  "schema": "mindie-sim.observable-kernel-regimes/1",
+  "service_regimes": [
+    {
+      "id": "a5-aiv-tp4-allreduce-mesh_twoshot-observable-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "HCCL_AIV_allreduce_mesh_twoshot",
+        "implementation": "HCCL_AIV_allreduce_mesh_twoshot",
+        "dtype": "bf16",
+        "metadata.hccl_selection.ranks": 4,
+        "metadata.hccl_selection.dtype_bytes": 2,
+        "metadata.hccl_selection.block_limit": 60,
+        "metadata.hccl_selection.buffer_mode": "separate"
+      },
+      "coordinates": {
+        "payload_bytes": {
+          "path": "metadata.hccl_selection.payload_bytes"
+        }
+      },
+      "domain": {
+        "payload_bytes": {
+          "min": 65536,
+          "max": 2097152
+        }
+      },
+      "response": {
+        "fixed_us": 24.619873955981763,
+        "terms": [
+          {
+            "coordinate": "payload_bytes",
+            "us_per_unit": 1.0624772236973017e-05
+          }
+        ]
+      },
+      "provenance": {
+        "assignment_sources": [
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+            "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+            "size_bytes": 852008
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+            "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+            "size_bytes": 874253
+          }
+        ],
+        "holdout_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+          "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+          "size_bytes": 887805
+        },
+        "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+        "population": "steady layers pooled across attention/FFN",
+        "template_identity": "explicit compatible source template; capture algorithm not observed",
+        "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+        "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+        "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+        "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+      }
+    },
+    {
+      "id": "a5-aiv-tp4-allgather-mesh-observable-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "HCCL_AIV_allgather_mesh",
+        "implementation": "HCCL_AIV_allgather_mesh",
+        "dtype": "bf16",
+        "metadata.hccl_selection.ranks": 4,
+        "metadata.hccl_selection.dtype_bytes": 2,
+        "metadata.hccl_selection.block_limit": 64,
+        "metadata.hccl_selection.buffer_mode": "separate"
+      },
+      "coordinates": {
+        "payload_bytes": {
+          "path": "metadata.hccl_selection.payload_bytes"
+        }
+      },
+      "domain": {
+        "payload_bytes": {
+          "min": 16384,
+          "max": 524288
+        }
+      },
+      "response": {
+        "fixed_us": 9.941192620664564,
+        "terms": [
+          {
+            "coordinate": "payload_bytes",
+            "us_per_unit": 3.8591617303885746e-05
+          }
+        ]
+      },
+      "provenance": {
+        "assignment_sources": [
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+            "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
+            "size_bytes": 852008
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+            "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
+            "size_bytes": 874253
+          }
+        ],
+        "holdout_source": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+          "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
+          "size_bytes": 887805
+        },
+        "boundary": "deduplicated AivKernel elapsed; one inclusive native group completion constraint",
+        "population": "all 40 native gathers per forward",
+        "template_identity": "explicit compatible source template; capture algorithm not observed",
+        "payload_identity": "source caller bytes agree with adjacent BF16 output; direct communication descriptors unavailable",
+        "excluded": "summary duplicates and unlinked HcclLaunchAicpuKernel wrappers; no Body data",
+        "resource_identifiability": "effective call response only; not independent bandwidth calibration; no guessed scale_with",
+        "holdout_role": "M64 excluded from these coefficients, already seen during diagnosis; not blind"
+      }
+    }
+  ]
+}

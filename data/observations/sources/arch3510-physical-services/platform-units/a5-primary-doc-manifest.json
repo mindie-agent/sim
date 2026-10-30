@@ -1,0 +1,101 @@
+[
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/cube_instruction_theoretical_perf_summary.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+    "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+    "bytes": 21427
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/Mmad.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/mmad_compute/Mmad.md",
+    "sha256": "1ebb798bb29605a5cbabb2b52964032fff2e5a3b0c02b9ba7556b05f573e062a",
+    "bytes": 19522
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_roofline.py",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "tests/perf/fixpipe_perf/generate_roofline.py",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/tests/perf/fixpipe_perf/generate_roofline.py",
+    "sha256": "2452cb929b69c1d05bad3d2884d21a65a868022ec01965d65f0a37cd74b1fe60",
+    "bytes": 20437
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/fixpipe_perf_README.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "tests/perf/fixpipe_perf/README.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/tests/perf/fixpipe_perf/README.md",
+    "sha256": "55740b2c538affdb5794235c29867cdca42144d12c5cc31b585b228f5d4b0709",
+    "bytes": 12694
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_roofline.cpp",
+    "repo": "Ascend/msopprof",
+    "revision": "a52c8694979016be703006ec242901519bef31d8",
+    "relative_path": "csrc/op_profiling/profiling/device/data_visualize/roofline.cpp",
+    "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/roofline.cpp",
+    "sha256": "0dbe5a22cf5187252115084a4dae587f3a5d97bdfd19840bd0ce1a547df75009",
+    "bytes": 39825
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_pmu_calculator.cpp",
+    "repo": "Ascend/msopprof",
+    "revision": "a52c8694979016be703006ec242901519bef31d8",
+    "relative_path": "csrc/op_profiling/profiling/device/data_visualize/pmu_calculator.cpp",
+    "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/pmu_calculator.cpp",
+    "sha256": "ea8cdbd5e6bbe4a6e93b030777e8cd5fbfb0dc0eb8e63c5b5260f5a911ee0b0e",
+    "bytes": 19856
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_device_defs.h",
+    "repo": "Ascend/msopprof",
+    "revision": "a52c8694979016be703006ec242901519bef31d8",
+    "relative_path": "csrc/op_profiling/profiling/device/data_parse/device_defs.h",
+    "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_parse/device_defs.h",
+    "sha256": "c611b38f74a763ccd8404a14aacf79b428e5bb922bfb31809f88c86ac2291c91",
+    "bytes": 13785
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/npu_arch_3510.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_3510.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_3510.md",
+    "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+    "bytes": 23771
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/profiler_storage_access.cpp",
+    "repo": "Ascend/msopprof",
+    "revision": "a52c8694979016be703006ec242901519bef31d8",
+    "relative_path": "csrc/op_profiling/profiling/device/data_visualize/storage_access.cpp",
+    "url": "https://raw.githubusercontent.com/Ascend/msopprof/a52c8694979016be703006ec242901519bef31d8/csrc/op_profiling/profiling/device/data_visualize/storage_access.cpp",
+    "sha256": "cc0da05fe1e9dcf28031269672294e8cd40ed9d8267579c2b66f6d65493cae69",
+    "bytes": 101861
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/Fixpipe_L0CToGM.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_store/Fixpipe_L0CToGM.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_store/Fixpipe_L0CToGM.md",
+    "sha256": "1f55a31fe89adbed8b4eca9e8eb8c8ef8b2e6668d8a3fe35b23401e50ddacf35",
+    "bytes": 34002
+  },
+  {
+    "path": "/tmp/review-gdn-python-image-20261028/platform-units/LoadDataWithTranspose.md",
+    "repo": "hicann/asc-devkit",
+    "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+    "relative_path": "docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadDataWithTranspose.md",
+    "url": "https://raw.githubusercontent.com/hicann/asc-devkit/56500ea0dc219380f50f4a17ce73ef5264f830fc/docs/zh/api/SIMD-API/basic_api/cube_compute_ISASI/cube_compute_load/LoadDataWithTranspose.md",
+    "sha256": "95270d09d03309882d7e249bdc4396ccf72d4069ede68f3d40e3740e1136a790",
+    "bytes": 39891
+  }
+]

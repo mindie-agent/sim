@@ -1,0 +1,54 @@
+{
+  "stages": [
+    {
+      "stage": "GATE_PREPARE",
+      "observed_calls": 276,
+      "observed_sum_ms": 517.895295,
+      "expanded_predicted_sum_ms": 103.96876991672694,
+      "compact_predicted_sum_ms": 102.27323146145187,
+      "compact_predicted_per_call_ms": 0.3705551864545358,
+      "signed_gap_ms": -415.62206353854816,
+      "absolute_gap_ms": 415.62206353854816,
+      "compact_minus_expanded_ms": -1.69553845527507
+    },
+    {
+      "stage": "POST_WU",
+      "observed_calls": 276,
+      "observed_sum_ms": 20.208037,
+      "expanded_predicted_sum_ms": 7.813988351999999,
+      "compact_predicted_sum_ms": 7.813988351999999,
+      "compact_predicted_per_call_ms": 0.028311551999999997,
+      "signed_gap_ms": -12.394048648000002,
+      "absolute_gap_ms": 12.394048648000002,
+      "compact_minus_expanded_ms": 0.0
+    },
+    {
+      "stage": "FWD_H",
+      "observed_calls": 276,
+      "observed_sum_ms": 298.471487,
+      "expanded_predicted_sum_ms": 164.49614345308805,
+      "compact_predicted_sum_ms": 164.49614345308805,
+      "compact_predicted_per_call_ms": 0.5960005197575654,
+      "signed_gap_ms": -133.97534354691197,
+      "absolute_gap_ms": 133.97534354691197,
+      "compact_minus_expanded_ms": 0.0
+    },
+    {
+      "stage": "FINALIZE",
+      "observed_calls": 276,
+      "observed_sum_ms": 45.423019000000004,
+      "expanded_predicted_sum_ms": 13.891534848,
+      "compact_predicted_sum_ms": 13.891534848,
+      "compact_predicted_per_call_ms": 0.050331648,
+      "signed_gap_ms": -31.531484152000004,
+      "absolute_gap_ms": 31.531484152000004,
+      "compact_minus_expanded_ms": 0.0
+    }
+  ],
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/kda-prepare-compact-alignment-20261029.json",
+    "sha256": "6083a5cf18010517b5964ff0211dfa665065d6f7329b4bfcdaf3afff64d494d2",
+    "size_bytes": 3960
+  }
+}

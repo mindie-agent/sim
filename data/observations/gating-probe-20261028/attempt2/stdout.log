@@ -1,0 +1,6 @@
+INFO 10-27 18:45:40 [__init__.py:52] Available plugins for group vllm.platform_plugins:
+INFO 10-27 18:45:40 [__init__.py:54] - ascend -> vllm_ascend:register
+INFO 10-27 18:45:40 [__init__.py:57] All plugins in this group will be loaded. Set `VLLM_PLUGINS` to control which plugins to load.
+INFO 10-27 18:45:40 [__init__.py:272] Platform plugin ascend is activated
+INFO 10-27 18:45:40 [platform.py:74] Breakable CUDAGraph on Ascend is opt-in; using VLLM_USE_BREAKABLE_CUDAGRAPH=0.
+[ERROR] 2026-10-27-18:46:10 (PID:71, Device:0, RankID:-1) ERR99999 UNKNOWN applicaiton exception

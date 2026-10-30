@@ -1,0 +1,31 @@
+{
+  "schema": "mindie-sim.capture-protocol/1",
+  "adapter": "grouped_calls",
+  "producer": {
+    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
+    "sha256": "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a"
+  },
+  "supporting_sources": [
+    {
+      "path": "examples/artifacts/a5-qwen35-grouped-served.json",
+      "sha256": "ac63a7078310a4599b0d178ac159d37901b9732046788cf3beddec4ef6187f89"
+    }
+  ],
+  "captures": [
+    {
+      "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen35-grouped/probe/probe_grouped_graph.json",
+      "sha256": "b89924f519db9739f24595b7203f22ec230907a018d546f74076505376414fe9"
+    }
+  ],
+  "hardware": {
+    "host": "rack08os8",
+    "visible_device": "0"
+  },
+  "limitations": [
+    "Original probe has no train/heldout assignment for the current predictor.",
+    "Eager events, one-call graph replay and eight-call graph replay are separate identities. Graph timing is not divided into independent per-call samples.",
+    "Producer constructs balanced counts over the first G experts; this is not the serving route distribution.",
+    "Activation quantization and input/weight preparation occur outside the timed grouped call.",
+    "Loaded binary identity, graph replay launch gaps and resource rates are not recovered from the timing."
+  ]
+}

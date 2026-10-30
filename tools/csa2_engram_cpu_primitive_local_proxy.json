@@ -1,0 +1,183 @@
+{
+ "kind": "engram_cpu_lookup_primitive",
+ "runtime_sequence": "vllm_ascend/models/deepseek_v41/engram_hbm.py NodeShardedEngram.lookup_local FP8 branch: index_select(weight), index_select(weight_scale), float, mul scale, reshape, pinned BF16 copy_",
+ "platform": {
+  "host": "local macOS arm64 (not the A5 host)",
+  "os": "macOS-27.0.1-arm64",
+  "cpu_cores": 10,
+  "ram_gb": 16,
+  "torch": "2.14.1",
+  "threads": 10,
+  "omp_num_threads": 10,
+  "cpu_affinity": "not available on macOS; the A5 worker's 16-CPU affinity was not reproducible",
+  "a5_host_access": "A5 host root/agent SSH denied or hung; actual host-CPU primitive not run"
+ },
+ "shape": {
+  "ids_per_table": 49152,
+  "tables": 2,
+  "lookups_per_requester": 98304,
+  "measured_tables": {
+   "2M": 2,
+   "8M": 2,
+   "32M": 1
+  },
+  "table_rows_note": "runtime rank shard ~96M rows / 94 GiB; local tables are bounded samples"
+ },
+ "results": {
+  "2M": {
+   "sequential": [
+    {
+     "requesters": 1,
+     "per_req_total_ms": 11.739,
+     "us_per_lookup": 0.1194,
+     "wall_ms": 11.756,
+     "index_ms": 2.71,
+     "dequant_ms": 6.376,
+     "copy_ms": 2.587
+    },
+    {
+     "requesters": 2,
+     "per_req_total_ms": 12.499,
+     "us_per_lookup": 0.1271,
+     "wall_ms": 25.26,
+     "index_ms": 2.956,
+     "dequant_ms": 6.881,
+     "copy_ms": 2.863
+    },
+    {
+     "requesters": 3,
+     "per_req_total_ms": 11.341,
+     "us_per_lookup": 0.1154,
+     "wall_ms": 35.449,
+     "index_ms": 2.603,
+     "dequant_ms": 6.177,
+     "copy_ms": 2.706
+    }
+   ],
+   "concurrent": [
+    {
+     "requesters": 1,
+     "per_req_total_ms": 18.714,
+     "us_per_lookup": 0.1904,
+     "wall_ms": 18.937,
+     "index_ms": 3.825,
+     "dequant_ms": 9.983,
+     "copy_ms": 4.507,
+     "scaling": 1.0
+    },
+    {
+     "requesters": 2,
+     "per_req_total_ms": 26.75,
+     "us_per_lookup": 0.2721,
+     "wall_ms": 27.391,
+     "index_ms": 6.985,
+     "dequant_ms": 13.593,
+     "copy_ms": 5.45,
+     "scaling": 1.43
+    },
+    {
+     "requesters": 3,
+     "per_req_total_ms": 48.16,
+     "us_per_lookup": 0.4899,
+     "wall_ms": 52.4,
+     "index_ms": 12.893,
+     "dequant_ms": 23.082,
+     "copy_ms": 7.789,
+     "scaling": 2.57
+    }
+   ]
+  },
+  "8M": {
+   "concurrent": [
+    {
+     "requesters": 1,
+     "per_req_total_ms": 29.287,
+     "us_per_lookup": 0.2979,
+     "wall_ms": 29.644,
+     "index_ms": 16.783,
+     "dequant_ms": 10.95,
+     "copy_ms": 4.122,
+     "scaling": 1.0
+    },
+    {
+     "requesters": 2,
+     "per_req_total_ms": 23.353,
+     "us_per_lookup": 0.2376,
+     "wall_ms": 23.809,
+     "index_ms": 6.116,
+     "dequant_ms": 12.105,
+     "copy_ms": 4.286,
+     "scaling": 0.797
+    },
+    {
+     "requesters": 3,
+     "per_req_total_ms": 31.06,
+     "us_per_lookup": 0.316,
+     "wall_ms": 40.827,
+     "index_ms": 9.732,
+     "dequant_ms": 14.251,
+     "copy_ms": 4.895,
+     "scaling": 1.061
+    }
+   ],
+   "note": "noisy (2-requester faster than 1); table 4.2 GB"
+  },
+  "32M_1table": {
+   "concurrent": [
+    {
+     "requesters": 1,
+     "per_req_total_ms": 13.868,
+     "us_per_lookup": 0.2822,
+     "wall_ms": 15.968,
+     "index_ms": 3.677,
+     "dequant_ms": 7.386,
+     "copy_ms": 2.206
+    },
+    {
+     "requesters": 2,
+     "per_req_total_ms": 23.023,
+     "us_per_lookup": 0.4684,
+     "wall_ms": 30.955,
+     "index_ms": 6.96,
+     "dequant_ms": 11.606,
+     "copy_ms": 3.051
+    },
+    {
+     "requesters": 3,
+     "per_req_total_ms": 792.107,
+     "us_per_lookup": 16.115,
+     "wall_ms": 827.209,
+     "index_ms": 419.248,
+     "dequant_ms": 162.049,
+     "copy_ms": 27.384,
+     "excluded": "memory-pressure outlier: 8 GB table + 3 requesters in 16 GB; not a host-compatible number"
+    }
+   ]
+  }
+ },
+ "h2d": {
+  "measured": false,
+  "bytes_per_request": {
+   "p2048": 50331648,
+   "p3072": 75497472
+  },
+  "bound_ms_at_10_gbps": [
+   5.03,
+   7.55
+  ],
+  "bound_ms_at_50_gbps": [
+   1.01,
+   1.51
+  ]
+ },
+ "compatibility": {
+  "h2d_bandwidth": "ruled out: 1.0-7.5 ms << 89/293 ms",
+  "single_prefill_host_cpu": "not confirmed: local 11.7-29.3 ms per 98,304 lookups is 3-10x below 89/293; host x86/94 GiB TLB/4 workers/all-to-all missing",
+  "deferred_wave_host": "not confirmed: local 3-requester 35.4-48.2 ms is 9-22x below 432/771; concurrency scaling 2.57x direction only",
+  "model_device_engram_gather_ms": {
+   "p2048": 0.053,
+   "p3072": 0.059
+  },
+  "rate_added_to_model": false
+ }
+}

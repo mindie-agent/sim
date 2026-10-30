@@ -1,0 +1,1330 @@
+{
+  "boundary": "one ordinary model logits AllGather per TP8/TP16 graph, isolated from unrelated compute",
+  "timing_basis": "explicit synthetic rates; no device measurements or selector cost coefficients",
+  "upstream_source_receipt": "hccl-ccu-two-die-20261030.sources.json",
+  "input_sha256": "c5f80bb0f6f597102e46c20b657fa47f18c62aa6d21486e343fbe50af00d5988",
+  "source_sha256": {
+    "mindie_sim/prediction/hccl_ccu_two_die.py": "0adf43ae0472cf1ca0783ac559a43a29427c49b832f1fff496536eb6698ab02e",
+    "mindie_sim/prediction/hccl_contracts.py": "824edda07ae5a92b3d11e92a4958de21196e8974171b2a4b2a95b1669158b797",
+    "mindie_sim/prediction/hccl_graph.py": "3c1dbd6c78b8e5a032beafa113ad969e355793a4f9667840962804333497de06",
+    "mindie_sim/prediction/hccl_signals.py": "3eb0a9f73e9a4b88ae35cd80c1e5675422cbc7f3c69783a1f9c94f4a2702c27b"
+  },
+  "domains": [
+    {
+      "ranks": 8,
+      "selection": {
+        "expansion": "CCU_MS",
+        "collective": "allgather",
+        "template": "mesh_2die_broadcast_v1",
+        "ranks": 8,
+        "payload_bytes": 384,
+        "dtype_bytes": 2,
+        "topology": "TWO_DIE_REGULAR",
+        "topology_levels": 1,
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "selection_basis": "explicit_source_compatible_declaration",
+        "block_limit": null,
+        "buffer_mode": "separate",
+        "level0_size": null,
+        "max_loop_bytes": null,
+        "signal_bytes": 8,
+        "channel_die_map": [
+          [
+            null,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            null,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            null
+          ]
+        ]
+      },
+      "rank0_peer_groups": [
+        [
+          1,
+          2,
+          3
+        ],
+        [
+          4,
+          5,
+          6,
+          7
+        ]
+      ],
+      "rank0_self_copy_owner": 0,
+      "per_rank_local_work": {
+        "hccl_control": 4,
+        "ccu_control": 39,
+        "hbm": 3840,
+        "ccu_copy": 1152,
+        "ccu_buffer_bytes": 3840
+      },
+      "full_group_payload_bytes": 21504,
+      "full_group_notify_count": 168,
+      "unmodeled": [
+        "one_equal_payload_executor_repeat_single_CCU_4096B_or_smaller_fragment",
+        "homogeneous_endpoint_degrees_only; no_per_rank_CCU_owner_skew",
+        "whole_group_notify_and_peer_phase_barriers; no_submessage_overlap",
+        "source_compatible_explicit_selection_not_captured_deployed_dispatch",
+        "two_internal_CCU_kernel_launches_and_endpoint_address_setup_not_separately_priced",
+        "CCU_SRAM_logical_bytes_not_bank_transactions_or_physical_handle_capacity",
+        "explicit_signal_frame_bytes"
+      ]
+    },
+    {
+      "ranks": 16,
+      "selection": {
+        "expansion": "CCU_MS",
+        "collective": "allgather",
+        "template": "mesh_2die_broadcast_v1",
+        "ranks": 16,
+        "payload_bytes": 384,
+        "dtype_bytes": 2,
+        "topology": "TWO_DIE_REGULAR",
+        "topology_levels": 1,
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "selection_basis": "explicit_source_compatible_declaration",
+        "block_limit": null,
+        "buffer_mode": "separate",
+        "level0_size": null,
+        "max_loop_bytes": null,
+        "signal_bytes": 8,
+        "channel_die_map": [
+          [
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null,
+            0
+          ],
+          [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            null
+          ]
+        ]
+      },
+      "rank0_peer_groups": [
+        [
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ]
+      ],
+      "rank0_self_copy_owner": 0,
+      "per_rank_local_work": {
+        "hccl_control": 4,
+        "ccu_control": 79,
+        "hbm": 6912,
+        "ccu_copy": 1152,
+        "ccu_buffer_bytes": 6912
+      },
+      "full_group_payload_bytes": 92160,
+      "full_group_notify_count": 720,
+      "unmodeled": [
+        "one_equal_payload_executor_repeat_single_CCU_4096B_or_smaller_fragment",
+        "homogeneous_endpoint_degrees_only; no_per_rank_CCU_owner_skew",
+        "whole_group_notify_and_peer_phase_barriers; no_submessage_overlap",
+        "source_compatible_explicit_selection_not_captured_deployed_dispatch",
+        "two_internal_CCU_kernel_launches_and_endpoint_address_setup_not_separately_priced",
+        "CCU_SRAM_logical_bytes_not_bank_transactions_or_physical_handle_capacity",
+        "explicit_signal_frame_bytes"
+      ]
+    }
+  ],
+  "scans": [
+    {
+      "ranks": 8,
+      "scan": "ccu_copy",
+      "factor": 0.5,
+      "duration_ms": 0.25729333333333226,
+      "physical_wire_bytes": 80639.99999999999,
+      "tx_capacity_service_bytes": 80639.99999999999,
+      "rx_capacity_service_bytes": 80639.99999999999,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_copy",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_copy",
+      "factor": 2,
+      "duration_ms": 0.2457733333333323,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_buffer_bytes",
+      "factor": 0.5,
+      "duration_ms": 0.24961333333333258,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999946,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_buffer_bytes",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_buffer_bytes",
+      "factor": 2,
+      "duration_ms": 0.2496133333333308,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3839.9999999999995,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_control",
+      "factor": 0.5,
+      "duration_ms": 0.282946666666664,
+      "physical_wire_bytes": 80640.0,
+      "tx_capacity_service_bytes": 80640.0,
+      "rx_capacity_service_bytes": 80640.0,
+      "switch_capacity_service_bytes": 80639.99999999975,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_control",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "ccu_control",
+      "factor": 2,
+      "duration_ms": 0.23294666666666952,
+      "physical_wire_bytes": 80640.00000000006,
+      "tx_capacity_service_bytes": 80640.00000000006,
+      "rx_capacity_service_bytes": 80640.00000000006,
+      "switch_capacity_service_bytes": 80640.00000000016,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "memory",
+      "factor": 0.5,
+      "duration_ms": 0.2496133333333299,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80640.0000000004,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "memory",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "memory",
+      "factor": 2,
+      "duration_ms": 0.2496133333333308,
+      "physical_wire_bytes": 80639.99999999999,
+      "tx_capacity_service_bytes": 80639.99999999999,
+      "rx_capacity_service_bytes": 80639.99999999999,
+      "switch_capacity_service_bytes": 80639.99999999996,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "link",
+      "factor": 0.5,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "link",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "link",
+      "factor": 2,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "switch",
+      "factor": 0.5,
+      "duration_ms": 0.4512133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.9999999998,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "switch",
+      "factor": 1,
+      "duration_ms": 0.2496133333333317,
+      "physical_wire_bytes": 80640.00000000001,
+      "tx_capacity_service_bytes": 80640.00000000001,
+      "rx_capacity_service_bytes": 80640.00000000001,
+      "switch_capacity_service_bytes": 80639.99999999987,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 8,
+      "scan": "switch",
+      "factor": 2,
+      "duration_ms": 0.14881333333333124,
+      "physical_wire_bytes": 80639.9999999999,
+      "tx_capacity_service_bytes": 80639.9999999999,
+      "rx_capacity_service_bytes": 80639.9999999999,
+      "switch_capacity_service_bytes": 80640.00000000017,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 3840.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 3840.0,
+        "ccu_control": 39.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_copy",
+      "factor": 0.5,
+      "duration_ms": 0.9600742857142865,
+      "physical_wire_bytes": 345600.0000000001,
+      "tx_capacity_service_bytes": 345600.0000000001,
+      "rx_capacity_service_bytes": 345600.0000000001,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_copy",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_copy",
+      "factor": 2,
+      "duration_ms": 0.9485542857142839,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_buffer_bytes",
+      "factor": 0.5,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345600.0000000001,
+      "tx_capacity_service_bytes": 345600.0000000001,
+      "rx_capacity_service_bytes": 345600.0000000001,
+      "switch_capacity_service_bytes": 345600.00000000687,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_buffer_bytes",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_buffer_bytes",
+      "factor": 2,
+      "duration_ms": 0.9523942857142833,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000061,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_control",
+      "factor": 0.5,
+      "duration_ms": 1.0261085714285727,
+      "physical_wire_bytes": 345600.0,
+      "tx_capacity_service_bytes": 345600.0,
+      "rx_capacity_service_bytes": 345600.0,
+      "switch_capacity_service_bytes": 345599.9999999971,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_control",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "ccu_control",
+      "factor": 2,
+      "duration_ms": 0.9155371428571453,
+      "physical_wire_bytes": 345599.99999999907,
+      "tx_capacity_service_bytes": 345599.99999999907,
+      "rx_capacity_service_bytes": 345599.99999999907,
+      "switch_capacity_service_bytes": 345599.9999999898,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "memory",
+      "factor": 0.5,
+      "duration_ms": 0.9523942857142824,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000138,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "memory",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "memory",
+      "factor": 2,
+      "duration_ms": 0.9523942857142842,
+      "physical_wire_bytes": 345599.99999999936,
+      "tx_capacity_service_bytes": 345599.99999999936,
+      "rx_capacity_service_bytes": 345599.99999999936,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "link",
+      "factor": 0.5,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "link",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "link",
+      "factor": 2,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "switch",
+      "factor": 0.5,
+      "duration_ms": 1.8163942857142832,
+      "physical_wire_bytes": 345600.0000000009,
+      "tx_capacity_service_bytes": 345600.0000000009,
+      "rx_capacity_service_bytes": 345600.0000000009,
+      "switch_capacity_service_bytes": 345599.99999998906,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "switch",
+      "factor": 1,
+      "duration_ms": 0.9523942857142851,
+      "physical_wire_bytes": 345599.9999999999,
+      "tx_capacity_service_bytes": 345599.9999999999,
+      "rx_capacity_service_bytes": 345599.9999999999,
+      "switch_capacity_service_bytes": 345600.0000000068,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    },
+    {
+      "ranks": 16,
+      "scan": "switch",
+      "factor": 2,
+      "duration_ms": 0.5203942857142856,
+      "physical_wire_bytes": 345600.0000000003,
+      "tx_capacity_service_bytes": 345600.0000000003,
+      "rx_capacity_service_bytes": 345600.0000000003,
+      "switch_capacity_service_bytes": 345599.9999999964,
+      "ccu_copy_bytes_by_owner": {
+        "0": 768.0,
+        "1": 384.0
+      },
+      "local_work": {
+        "memory": 6912.0,
+        "ccu_copy": 1152.0,
+        "ccu_buffer_bytes": 6912.0,
+        "ccu_control": 79.0,
+        "hccl_control": 4.0
+      },
+      "live_tasks": 0,
+      "live_programs": 0
+    }
+  ],
+  "wall_seconds": 1.4683104580035433,
+  "maxrss_platform_native_units": 43761664
+}

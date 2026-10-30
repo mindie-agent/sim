@@ -1,0 +1,178 @@
+{
+  "machine": {
+    "name": "synthetic-gqa-norm-source-control",
+    "architecture": "declared",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0,
+        "fp16": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0,
+        "shared_memory": 1000000000.0
+      },
+      "compute_units": 4,
+      "service_modes": {
+        "fp32_add": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_sub": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_mul": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_max": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_div": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_exp": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_compare": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_select": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "int32_compare": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "predicate_and": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_fp32_bf16": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_fp32_fp16": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "source_tl_reduce_max_elements": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "source_tl_reduce_sum_elements": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp32_rsqrt": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "warp_shuffle_calls": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "bf16_add": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "fp16_add": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_bf16_fp32": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_fp16_fp32": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "cvt_int32_fp32": {
+          "resource": "vector",
+          "rate": 1000000000.0
+        },
+        "shared_read_bytes": {
+          "resource": "shared_memory",
+          "rate": 1000000000.0
+        },
+        "shared_write_bytes": {
+          "resource": "shared_memory",
+          "rate": 1000000000.0
+        }
+      }
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [
+          0
+        ],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "kv_dtype": "bf16"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 4,
+        "output_tokens": 2
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 1,
+    "tp": 1,
+    "pp": 1,
+    "ep": 1,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "lowerings": {
+        "gqa_attention": {
+          "implementation": "vllm_triton_unified_attention_2d_pointer",
+          "options": {
+            "compute_capability": [
+              8,
+              9
+            ]
+          }
+        },
+        "rmsnorm": {
+          "implementation": "vllm_cuda_rms_norm",
+          "recipes": [
+            "rmsnorm"
+          ]
+        }
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not GPU specifications or calibration",
+      "implementation_scope": "declared pointer 2D attention and standard weighted RMSNorm"
+    }
+  }
+}

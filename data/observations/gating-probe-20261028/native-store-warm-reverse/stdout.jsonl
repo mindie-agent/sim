@@ -1,0 +1,7 @@
+{"primitive":"strided_store","tokens":4225,"heads":33,"units":64,"warmup":512,"repetitions":20,"durations_us":[237.994873,237.718948,237.768280,237.837738,237.460449],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":12288,"heads":40,"units":64,"warmup":512,"repetitions":20,"durations_us":[419.236084,418.862061,419.173645,418.920410,419.139587],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":8192,"heads":64,"units":64,"warmup":512,"repetitions":20,"durations_us":[316.312103,316.500854,316.180237,316.358490,316.150269],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":4096,"heads":64,"units":64,"warmup":512,"repetitions":20,"durations_us":[166.982941,166.728607,166.940094,166.927551,166.834793],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":8192,"heads":32,"units":64,"warmup":512,"repetitions":20,"durations_us":[242.556732,242.366791,242.536865,242.599808,242.532303],"all_elements_verified":true}
+{"primitive":"strided_store","tokens":4096,"heads":32,"units":64,"warmup":512,"repetitions":20,"durations_us":[126.467751,126.505264,126.494461,126.401955,126.497353],"all_elements_verified":true}
+{"peak_rss_kib":175392,"tensor_budget_bytes":16777216}

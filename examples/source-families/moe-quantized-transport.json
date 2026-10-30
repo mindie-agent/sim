@@ -1,0 +1,91 @@
+{
+  "machine": {
+    "name": "synthetic-moe-quantized-transport",
+    "architecture": "declared",
+    "num_devices": 2,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0,
+        "int8": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0
+      },
+      "compute_units": 4
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000,
+        "members": [0, 1],
+        "semantics": "shared"
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "ffn": "moe",
+    "num_experts": 4,
+    "top_k": 2,
+    "moe_intermediate_size": 32,
+    "activation_dtype": "bf16",
+    "weight_dtype": "bf16",
+    "compute_dtype": "bf16",
+    "kv_dtype": "bf16",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [1, 1],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": ["mtp", "norm", "lm_head", "embedding", "vision", "projector",
+                     "conv_weight_f32", "conv_weight_bf16"],
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1
+    }
+  },
+  "workload": {
+    "requests": [
+      {"id": "a", "prompt_tokens": 4, "output_tokens": 1},
+      {"id": "b", "prompt_tokens": 4, "output_tokens": 1}
+    ]
+  },
+  "runtime": {
+    "dp": 2,
+    "tp": 1,
+    "pp": 1,
+    "ep": 2,
+    "max_num_batched_tokens": 16,
+    "routing": {"policy": "balanced"},
+    "kernels": {
+      "moe_transport": {
+        "kind": "separate_quantized_payload",
+        "payload_dtype": "int8",
+        "scale_dtype": "fp32",
+        "scale_granularity": "row",
+        "histogram_dtype": "int64"
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates, not accelerator specifications or calibration",
+      "implementation_scope": "explicit ordinary ALLTOALL per-row INT8 payload and FP32 row scales with BF16 return rows"
+    }
+  }
+}

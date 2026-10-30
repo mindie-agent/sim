@@ -1,0 +1,125 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "index_topk-0",
+      "split": "development",
+      "params": {
+        "query": 1,
+        "context": 512,
+        "head_dim": 128,
+        "topk": 2,
+        "block_size_q": 1,
+        "score_block": 128,
+        "topk_block": 256,
+        "init_blocks": 0,
+        "local_blocks": 1,
+        "dtype": "bf16",
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      }
+    },
+    {
+      "id": "index_topk-1",
+      "split": "development",
+      "params": {
+        "query": 4,
+        "context": 2048,
+        "head_dim": 128,
+        "topk": 4,
+        "block_size_q": 1,
+        "score_block": 128,
+        "topk_block": 256,
+        "init_blocks": 0,
+        "local_blocks": 1,
+        "dtype": "bf16",
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      }
+    },
+    {
+      "id": "index_topk-2",
+      "split": "development",
+      "params": {
+        "query": 2,
+        "context": 16384,
+        "head_dim": 128,
+        "topk": 8,
+        "block_size_q": 1,
+        "score_block": 128,
+        "topk_block": 256,
+        "init_blocks": 0,
+        "local_blocks": 1,
+        "dtype": "bf16",
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      }
+    },
+    {
+      "id": "index_topk-3",
+      "split": "heldout_geometry",
+      "params": {
+        "query": 3,
+        "context": 640,
+        "head_dim": 128,
+        "topk": 2,
+        "block_size_q": 1,
+        "score_block": 128,
+        "topk_block": 256,
+        "init_blocks": 0,
+        "local_blocks": 1,
+        "dtype": "bf16",
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      }
+    },
+    {
+      "id": "index_topk-4",
+      "split": "heldout_geometry",
+      "params": {
+        "query": 1,
+        "context": 32768,
+        "head_dim": 128,
+        "topk": 16,
+        "block_size_q": 1,
+        "score_block": 128,
+        "topk_block": 256,
+        "init_blocks": 0,
+        "local_blocks": 1,
+        "dtype": "bf16",
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_block_index_topk",
+        "mask_init": false,
+        "mask_local": false
+      }
+    }
+  ]
+}

@@ -1,0 +1,231 @@
+{
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "read_date": "2026-10-28",
+  "retrieval": "read-only CPU container, no device mounts or runtime imports, 384 MiB memory, 1 CPU, 20s bound",
+  "archive": "sources.tar.gz",
+  "archive_sha256": "97bba4058df7809c5d67ee0196e291ae3f4afc5b3ae16081c01333d6b2dffe65",
+  "files": [
+    {
+      "archive_path": "ops/ascendc/__init__.py",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/__init__.py",
+      "bytes": 29521,
+      "sha256": "f1111574e58df1e9a3578780d141fa7e97784cea955de38d86841a148a455027"
+    },
+    {
+      "archive_path": "ops/ascendc/_stable.py",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_stable.py",
+      "bytes": 81928,
+      "sha256": "d6be8820bb54e0177cf92e396099011402f97066b0974a2f1a8a90187f08aae0"
+    },
+    {
+      "archive_path": "ops/ascendc/_runtime.py",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_runtime.py",
+      "bytes": 18397,
+      "sha256": "133ee84d1451db89165f35465f980d3f5106f3cb601215dc5541c2b3ffe39605"
+    },
+    {
+      "archive_path": "ops/ascendc/_aclnn_ctypes.py",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_aclnn_ctypes.py",
+      "bytes": 179883,
+      "sha256": "2aae5a0d7131f78f26a285f2b2cce2cbae3e2001fb20cf7e8fd373daf9e4cd8a"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/chunk_gated_delta_rule_fwd_prepare.cpp",
+      "bytes": 1170,
+      "sha256": "ecf49bfbf73ad9d6fd81145c2364357eba00f23382440d6797d91a77387159c2"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_vf.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_vf.h",
+      "bytes": 36130,
+      "sha256": "618ce8ff3371e928841b96ee218bb14d977a9aa7ada0fba24203171c33fa4f5e"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_matmul.h",
+      "bytes": 5498,
+      "sha256": "e5b81317a9444e683168f055915c496ef21e95b782dda74da0e0d782b73752c0"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+      "bytes": 45674,
+      "sha256": "9ef1f4836bafcfb195810649b15cf00a6724dee602d983321c346e08b8c26d16"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_common.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_common.h",
+      "bytes": 22471,
+      "sha256": "215b9333df8f315a6ff7ec1316aeef8fc7a934c2bc291dc769b55f7b0862409a"
+    },
+    {
+      "archive_path": "chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_datacopy.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_gated_delta_rule_fwd_prepare/arch35/chunk_gated_delta_rule_fwd_prepare_datacopy.h",
+      "bytes": 9333,
+      "sha256": "f71e5cef9fb075737e7d824c099bae2ca28386badc0cc424f225d02cddba9459"
+    },
+    {
+      "archive_path": "chunk_fwd_h/chunk_fwd_h_utils.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/chunk_fwd_h_utils.h",
+      "bytes": 10984,
+      "sha256": "410c13596c338658e0f8a8bc5a9144638d2a006cf5919fe889de8566a59d9cb8"
+    },
+    {
+      "archive_path": "chunk_fwd_h/chunk_fwd_h_struct.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/chunk_fwd_h_struct.h",
+      "bytes": 1366,
+      "sha256": "085601eb9da34db34c6cba53233c723668c4570763195e9381e2bca01bbb005d"
+    },
+    {
+      "archive_path": "chunk_fwd_h/arch35/chunk_fwd_h_cube.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/arch35/chunk_fwd_h_cube.h",
+      "bytes": 40269,
+      "sha256": "e31e2cb6ebc8b3dbbb4db9a35c6b77447d0de3dd1430febc9ef1830972d1c27a"
+    },
+    {
+      "archive_path": "chunk_fwd_h/arch35/chunk_fwd_h_vec.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/arch35/chunk_fwd_h_vec.h",
+      "bytes": 60901,
+      "sha256": "997b78289c327fc880f41d7fe1f8c2409f0bfe56ef38129dbe5399c2af83eee1"
+    },
+    {
+      "archive_path": "chunk_fwd_h/chunk_fwd_h_tiling_key.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/chunk_fwd_h_tiling_key.h",
+      "bytes": 2469,
+      "sha256": "2e3db1fd227e65393c20dde8e3de0825b370e6a35b36ad4da9d7154e0c357240"
+    },
+    {
+      "archive_path": "chunk_fwd_h/arch22/chunk_fwd_h_cube.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/arch22/chunk_fwd_h_cube.h",
+      "bytes": 34404,
+      "sha256": "2e7a4bb34c915c841e9d643f18ba30a7863ef32be03634334386b3e15bc99d4d"
+    },
+    {
+      "archive_path": "chunk_fwd_h/arch22/chunk_fwd_h_vec.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/arch22/chunk_fwd_h_vec.h",
+      "bytes": 41369,
+      "sha256": "744d233ccb8fec6f85c09a75227237c2843afe5258b914823d770d5896b059c7"
+    },
+    {
+      "archive_path": "chunk_fwd_h/chunk_fwd_h.cpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/chunk_fwd_h.cpp",
+      "bytes": 4678,
+      "sha256": "89c6b331e74ff7289e4a6ee838aeedbbf931195ac1782ca78d1515275d854616"
+    },
+    {
+      "archive_path": "chunk_fwd_h/chunk_fwd_h_policy.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_h/chunk_fwd_h_policy.h",
+      "bytes": 6915,
+      "sha256": "74842abaab65713db9a937ac60e5327fbf001d62b879bc45119331fcc93552c1"
+    },
+    {
+      "archive_path": "chunk_fwd_o/chunk_fwd_o_tiling_key.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/chunk_fwd_o_tiling_key.h",
+      "bytes": 840,
+      "sha256": "b11ee8d812e7fef9d62a86db041eb234bca90707fde1a08def4d0c07e8bc20c9"
+    },
+    {
+      "archive_path": "chunk_fwd_o/chunk_fwd_o_a5_constants.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/chunk_fwd_o_a5_constants.h",
+      "bytes": 942,
+      "sha256": "74c5480b8146e16f91ea42b7148e15e72f5aae098d3420ee83dbba2aa44561fe"
+    },
+    {
+      "archive_path": "chunk_fwd_o/chunk_fwd_o.cpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/chunk_fwd_o.cpp",
+      "bytes": 5002,
+      "sha256": "facd3f836c90d07228516a95a9641dc2a8ca3730f8c1500e9e3026e93fa36bbf"
+    },
+    {
+      "archive_path": "chunk_fwd_o/chunk_fwd_o_struct.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/chunk_fwd_o_struct.h",
+      "bytes": 1587,
+      "sha256": "dfcc53b98ddf18f33cd8a8b91cd7dfbbcfb672da7d238882ef1f7edf13ff7200"
+    },
+    {
+      "archive_path": "chunk_fwd_o/gemm/kernel/gdn_fwd_o_kernel.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/gemm/kernel/gdn_fwd_o_kernel.hpp",
+      "bytes": 21312,
+      "sha256": "08064d1077aaa5f1a57d09acdef3a513a117b00afc027e384d471af9dbeab5b9"
+    },
+    {
+      "archive_path": "chunk_fwd_o/gemm/block/block_scheduler_gdn_fwd_o.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/gemm/block/block_scheduler_gdn_fwd_o.hpp",
+      "bytes": 10046,
+      "sha256": "c7d9ceec0ae57acbd1f2b9d67146aed2939be26a488362ebe4b743c1a13006e9"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/chunk_fwd_o_common.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/chunk_fwd_o_common.h",
+      "bytes": 11194,
+      "sha256": "edb97160e54fabc348b360f2f0cc27c473cf3ab2f28b9ca6acdec1c90fabb9ca"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/chunk_fwd_o_a5.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/chunk_fwd_o_a5.h",
+      "bytes": 3162,
+      "sha256": "28ae87677d3a3d6f00fbf6992818a8fcad1d1d5e1d1b8c20a30e02783e455677"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/gemm/kernel/gdn_fwd_o_kernel.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/gemm/kernel/gdn_fwd_o_kernel.hpp",
+      "bytes": 38668,
+      "sha256": "1dc28639885747b5cb7eab7a2c6c5699a1e16f0ea2dac099ab96f99840fb8a5f"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/gemm/block/block_scheduler_gdn_fwd_o.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/gemm/block/block_scheduler_gdn_fwd_o.hpp",
+      "bytes": 10477,
+      "sha256": "3f8c606f42a8a8b7721bdfb821271f09b856c20c2bae7b6275903c2ea7a68fc0"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+      "bytes": 29511,
+      "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/epilogue/block/block_epilogue_gdn_fwdo_output.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/epilogue/block/block_epilogue_gdn_fwdo_output.hpp",
+      "bytes": 44804,
+      "sha256": "d612edfdd188a52a72ff3d5d10cb00c1a8bea344f74e6180f22e91a1721d0092"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/epilogue/block/block_epilogue_gdn_fwdo_qkmask.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/epilogue/block/block_epilogue_gdn_fwdo_qkmask.hpp",
+      "bytes": 38346,
+      "sha256": "87f0e13a501bd3767669262100d4f76128e552e0e367a2eec8dd974af11a3315"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/epilogue/gdn_fwd_o_epilogue_policies.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/epilogue/gdn_fwd_o_epilogue_policies.hpp",
+      "bytes": 959,
+      "sha256": "1a1b14eb026bcbcb09fc6789564e0182db59718e2cc5726b7472dd3649920364"
+    },
+    {
+      "archive_path": "chunk_fwd_o/arch35/chunk_fwd_o_vector.h",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/arch35/chunk_fwd_o_vector.h",
+      "bytes": 24697,
+      "sha256": "8a1f15897f237633289484566ccf6c2c18f8d8a568aea3b9d29ad3b6c8693a30"
+    },
+    {
+      "archive_path": "chunk_fwd_o/epilogue/block/block_epilogue_gdn_fwdo_output.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/epilogue/block/block_epilogue_gdn_fwdo_output.hpp",
+      "bytes": 30656,
+      "sha256": "a8cd0ff38d57f4103b229467d1b24f6921fd3bb9f65098b368e8969f2899a9df"
+    },
+    {
+      "archive_path": "chunk_fwd_o/epilogue/block/block_epilogue_gdn_fwdo_qkmask.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/epilogue/block/block_epilogue_gdn_fwdo_qkmask.hpp",
+      "bytes": 26011,
+      "sha256": "58fd1ead4a39bd3337f5858dfb054dc0f1aad63baffe5931dad4de1a94506ac6"
+    },
+    {
+      "archive_path": "chunk_fwd_o/epilogue/gdn_fwd_o_epilogue_policies.hpp",
+      "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/fla_npu_transformer_impl/ascendc/chunk_fwd_o/epilogue/gdn_fwd_o_epilogue_policies.hpp",
+      "bytes": 955,
+      "sha256": "3d60a10b2840fee77f23719dd6d4904cbed183e8d9c0d279144ee2f763ac8dfc"
+    }
+  ]
+}

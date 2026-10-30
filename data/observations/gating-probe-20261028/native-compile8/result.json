@@ -1,0 +1,4 @@
+{
+  "exit_code": 0,
+  "command": "docker run --rm --name sim-store-compile-20261028 --network none --memory 1g --cpus 2 -v /tmp/mindie-sim-gating-20261028-0241:/scratch --entrypoint bash sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4 -c \"ulimit -c 0; timeout -k 5 70 bash /scratch/compile_native_probe.sh /scratch /scratch/cache/EQP2TYU2SBBF5NXIGESBFFP6NLUMGAEQRNBEDMKSPLRQUOIMTD4Q/strided_store.bcmlir\""
+}

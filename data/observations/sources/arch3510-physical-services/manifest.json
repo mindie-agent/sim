@@ -1,0 +1,195 @@
+{
+  "scope": "source_and_hardware_service_declarations_not_calibration",
+  "sources": [
+    {
+      "path": "Ascend950DT_9582.ini",
+      "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+      "bytes": 20397
+    },
+    {
+      "path": "review-a5-onchip-rates-20261028.json",
+      "sha256": "3af6848d28f7f3f337b148b7a5d9e63e7cca20d70fb750a0be21547ae0c6af94",
+      "bytes": 10970
+    },
+    {
+      "path": "review-gdn-mmad-tail-20261028.json",
+      "sha256": "aaa215410b928738e93ed9b69c0152f4b392cffde48796f8b2c6415101efa72e",
+      "bytes": 18711
+    },
+    {
+      "path": "platform-units/asc-devkit-README.md",
+      "sha256": "5592af0f28db6efc95317624457455765f2b9fd0700ea52fa21ba3c30d5ae185",
+      "bytes": 19569
+    },
+    {
+      "path": "platform-units/profiler_storage_access.cpp",
+      "sha256": "cc0da05fe1e9dcf28031269672294e8cd40ed9d8267579c2b66f6d65493cae69",
+      "bytes": 101861
+    },
+    {
+      "path": "platform-units/LoadDataWithTranspose.md",
+      "sha256": "95270d09d03309882d7e249bdc4396ccf72d4069ede68f3d40e3740e1136a790",
+      "bytes": 39891
+    },
+    {
+      "path": "platform-units/conv2d_backprop_filter_schedule.py",
+      "sha256": "686e5c3c7a81c93a63693b3e5b3f6a959cc8714d11fa028dc1ad361bfc39f81e",
+      "bytes": 150416
+    },
+    {
+      "path": "platform-units/fixpipe_perf_roofline.py",
+      "sha256": "2452cb929b69c1d05bad3d2884d21a65a868022ec01965d65f0a37cd74b1fe60",
+      "bytes": 20437
+    },
+    {
+      "path": "platform-units/profiler_device_defs.h",
+      "sha256": "c611b38f74a763ccd8404a14aacf79b428e5bb922bfb31809f88c86ac2291c91",
+      "bytes": 13785
+    },
+    {
+      "path": "platform-units/exact-image-rate-consumers.json",
+      "sha256": "f5ffe361d83bdf90038b24846e993037fd367bc1e3e698d90424a3b2dff53e32",
+      "bytes": 3848
+    },
+    {
+      "path": "platform-units/profiler_pmu_calculator.cpp",
+      "sha256": "ea8cdbd5e6bbe4a6e93b030777e8cd5fbfb0dc0eb8e63c5b5260f5a911ee0b0e",
+      "bytes": 19856
+    },
+    {
+      "path": "platform-units/Fixpipe_L0CToGM.md",
+      "sha256": "1f55a31fe89adbed8b4eca9e8eb8c8ef8b2e6668d8a3fe35b23401e50ddacf35",
+      "bytes": 34002
+    },
+    {
+      "path": "platform-units/a5-primary-doc-manifest.json",
+      "sha256": "4019bd957383328e2cfe5d6eac9905a38da46184d1e1d79a6e3066dd5ca654f2",
+      "bytes": 6213
+    },
+    {
+      "path": "platform-units/GetCoreMemBw.md",
+      "sha256": "cda9193b5a2f6c318f5939217808023e37b0ef061cec45cb68e29bc2a4486f0f",
+      "bytes": 5185
+    },
+    {
+      "path": "platform-units/fixpipe_perf_README.md",
+      "sha256": "55740b2c538affdb5794235c29867cdca42144d12c5cc31b585b228f5d4b0709",
+      "bytes": 12694
+    },
+    {
+      "path": "platform-units/Mmad.md",
+      "sha256": "1ebb798bb29605a5cbabb2b52964032fff2e5a3b0c02b9ba7556b05f573e062a",
+      "bytes": 19522
+    },
+    {
+      "path": "platform-units/exact-image-rate-declarations.json",
+      "sha256": "369547a6140a489dc499f56e13abb46af132516b78b20e916839df98cdf63895",
+      "bytes": 9543
+    },
+    {
+      "path": "platform-units/npu_arch_3510.md",
+      "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+      "bytes": 23771
+    },
+    {
+      "path": "platform-units/cube_instruction_theoretical_perf_summary.md",
+      "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+      "bytes": 21427
+    },
+    {
+      "path": "platform-units/profiler_roofline.cpp",
+      "sha256": "0dbe5a22cf5187252115084a4dae587f3a5d97bdfd19840bd0ce1a547df75009",
+      "bytes": 39825
+    },
+    {
+      "path": "cann/exact-image-transfer.jsonl",
+      "sha256": "9e30a2914b53512ff59d983de3e52e4a7785f3ccda5d8848a8de3cdb0a35bb10",
+      "bytes": 345169
+    },
+    {
+      "path": "catlass/exact-image-transfer2.jsonl",
+      "sha256": "b4ccb1b45f0e2e3cad2d55accf93e4ac85fd820f392b39ad94f2d0f3e4789dc0",
+      "bytes": 28438
+    },
+    {
+      "path": "catlass/exact-image-transfer.jsonl",
+      "sha256": "d997ac0cf1e48c81c671be44089ad42089eabdc2b71ab0a5ea00dcf495dbfbc9",
+      "bytes": 154234
+    },
+    {
+      "path": "catlass/gemm/helper.hpp",
+      "sha256": "85e48a3184939beabade25817397199f1705b6b4f2e9ed201a09a5d5bbeec3f3",
+      "bytes": 15761
+    },
+    {
+      "path": "catlass/detail/tag_to_layout.hpp",
+      "sha256": "c845eea8962e7f5c63d7b8e547fcc81341d79a71bc6166c3e36d26f85e8dc588",
+      "bytes": 3949
+    },
+    {
+      "path": "catlass/gemm/tile/tile_copy.hpp",
+      "sha256": "1300e4ad135759504233bcd47c9a877624df6b1a32f0ffd050b357594ca9aef0",
+      "bytes": 23929
+    },
+    {
+      "path": "catlass/gemm/tile/copy_l1_to_l0b.hpp",
+      "sha256": "6a910fee9c5528d4d9a3be446fcffca86cb80d3998fc7c942f53c9f8ed7d9277",
+      "bytes": 985
+    },
+    {
+      "path": "catlass/gemm/tile/copy_l1_to_l0a.hpp",
+      "sha256": "0a8efe150a05fe439058a93a74b43d49370ba0066f2cf8fddee2628bb161530c",
+      "bytes": 985
+    },
+    {
+      "path": "catlass/gemm/tile/ascend950/copy_l0c_to_ub.hpp",
+      "sha256": "adf47d15aa590b62ea35c9e4c15e6d9709fa0772f7ef1cd6c4d0a926b5b23219",
+      "bytes": 7919
+    },
+    {
+      "path": "catlass/gemm/tile/ascend950/copy_l0c_to_dst.hpp",
+      "sha256": "3a1f039c068a3559caf8769b74b2adfb60d2b266f02c343e63d01b0052686ac8",
+      "bytes": 7256
+    },
+    {
+      "path": "catlass/gemm/tile/ascend950/copy_l0c_to_gm.hpp",
+      "sha256": "4a61bad15a97a65fb18dd0a5038b3f8d5fdc87bfc3dd42840cf13d4065232137",
+      "bytes": 21816
+    },
+    {
+      "path": "catlass/gemm/tile/ascend950/copy_l1_to_l0b.hpp",
+      "sha256": "592c526cba387d36ad708896c7cb336a0fb9bbc212cd99cad7a9b6792afbc0a0",
+      "bytes": 24663
+    },
+    {
+      "path": "catlass/gemm/tile/ascend950/copy_l1_to_l0a.hpp",
+      "sha256": "44f207065b9c19ec290b34168eff33a8027c8ad7711b1dd80a080e2012615cb8",
+      "bytes": 26190
+    },
+    {
+      "path": "cann/impl/basic_api/kernel_operator_mm_load2d_impl.h",
+      "sha256": "5eed2f9d39c398317de9b82f5b15211442e8bec4fbd35bcb75b84833eb52b632",
+      "bytes": 13406
+    },
+    {
+      "path": "cann/impl/basic_api/kernel_operator_mm_intf_impl.h",
+      "sha256": "23fedd925a3474b44cf9fd61a1e89b9cad8a2777151b9e420c84d5ff3d69ca31",
+      "bytes": 34232
+    },
+    {
+      "path": "cann/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+      "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+      "bytes": 83067
+    },
+    {
+      "path": "cann/impl/basic_api/dav_3510/kernel_operator_data_copy_impl.h",
+      "sha256": "6fbe664ed6e0d846549b425a6b0d60e697a24fda1e0b6829f11a33f4ae7a41d9",
+      "bytes": 85819
+    },
+    {
+      "path": "cann/impl/basic_api/dav_3510/kernel_operator_fixpipe_impl.h",
+      "sha256": "ef7598e2db5e2839a08a1eb88fc849dd9f28154f9733a9dfcfce1b1a8e63cf7d",
+      "bytes": 41240
+    }
+  ]
+}

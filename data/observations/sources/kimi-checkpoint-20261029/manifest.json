@@ -1,0 +1,51 @@
+{
+  "schema": "kimi-checkpoint-metadata-provenance/v1",
+  "captured_at": "2026-10-29",
+  "capture_endpoint": {
+    "host": "177.25.21.1",
+    "port": 22,
+    "user": "root",
+    "hostname": "rack06os1",
+    "checkpoint": "/home/models/Kimi-K3-w4a8-mxfp-quarot",
+    "container_required": false
+  },
+  "capture_producer": {
+    "original_path": "/tmp/kimi_checkpoint_metadata_audit_20261029.py",
+    "sha256": "85936753e7cf8363f421123e07c3e489e3df522e3e5d44586889164e862cd1ee",
+    "execution": "ssh root@177.25.21.1 python3 - < original_script",
+    "source_retained_here": false
+  },
+  "reusable_driver": {
+    "path": "tools/kimi_checkpoint_metadata.py",
+    "sha256": "de0a8479995a01196937b1f0ccfffde0616a601d63d71668b8fa3b88b58ab6a2",
+    "relationship": "derived_after_capture; did_not_produce_retained_reports",
+    "changes": [
+      "Required checkpoint CLI argument and optional -o output.",
+      "Wrapped collection in an importable function; selected entries missing from index are explicit.",
+      "Config read capped at 1MiB; RSS field declares native OS units."
+    ],
+    "example": "python tools/kimi_checkpoint_metadata.py /path/to/Kimi-checkpoint -o kimi-metadata.json"
+  },
+  "artifacts": [
+    {
+      "path": "kimi-checkpoint-module-quant-20261029.json",
+      "bytes": 89961,
+      "sha256": "f4942357bcd4d8baae034d4f344e488a0281e7448af03ca54b3a3c3dd2494394",
+      "original_local_path": "/tmp/kimi-checkpoint-module-quant-20261029.json",
+      "byte_preserved": true
+    },
+    {
+      "path": "kimi-checkpoint-quant-loader-evidence-20261029.json",
+      "bytes": 2019,
+      "sha256": "12cba6995978b971d908b03387c8a4dd623fb9f74e6562edef4aae00751d40b7",
+      "original_local_path": "/tmp/kimi-checkpoint-quant-loader-evidence-20261029.json",
+      "byte_preserved": true
+    }
+  ],
+  "limits": [
+    "Only checkpoint metadata and selected safetensors headers were read; weight payload read was zero.",
+    "Current config hash exactly matches the retained historical campaign; historical quant-description hash was not retained.",
+    "Independent loader source explains storage/compute formats; it does not prove the capture-installed binary identity.",
+    "Reusable driver was not rerun against the remote checkpoint during persistence."
+  ]
+}

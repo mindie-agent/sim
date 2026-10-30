@@ -1,0 +1,1387 @@
+{
+ "alternative_impls": {
+  "refusals": [
+   {
+    "error_first_line": "causal_conv1d_fn: weight dim mismatch, x dim=4096, weight.shape=(10240, 4)",
+    "error_type": "RuntimeError",
+    "role": "conv_prefill",
+    "tokens": 4096,
+    "trace": [
+     "    raise RuntimeError(",
+     "RuntimeError: causal_conv1d_fn: weight dim mismatch, x dim=4096, weight.shape=(10240, 4)"
+    ]
+   }
+  ],
+  "rows": [
+   {
+    "batch": 1,
+    "impl": "vllm_ascend.ops.causal_conv1d.causal_conv1d_update (pure PyTorch)",
+    "role": "conv_update",
+    "stat_max": 0.25331300497055054,
+    "stat_median": 0.19526199996471405,
+    "stat_min": 0.18411700427532196,
+    "stat_n": 40,
+    "tokens": 1
+   },
+   {
+    "batch": 4,
+    "impl": "vllm_ascend.ops.causal_conv1d.causal_conv1d_update (pure PyTorch)",
+    "role": "conv_update",
+    "stat_max": 0.5984079837799072,
+    "stat_median": 0.5726019740104675,
+    "stat_min": 0.5517500042915344,
+    "stat_n": 40,
+    "tokens": 1
+   }
+  ],
+  "source": "same image, measured with gdn_alternatives.py",
+  "verdict": "the CANN/AscendC kernels are what the Qwen GDN layer dispatches; the pure-PyTorch causal_conv1d_update in this image costs 0.195 ms/layer at batch 1 and 0.573 ms at batch 4 against the measured CANN 0.067/0.061 ms, and its prefill function refuses the layer's [tokens, width] call shape"
+ },
+ "arch_family": "A5",
+ "calibration_scope": "a5/rack06os2/die0/gdn-linear-attention-operators",
+ "dispatch": {
+  "conv_decode": "from fla_npu.ops.ascendc import causal_conv1d_update",
+  "conv_prefill": "from fla_npu.ops.ascendc import causal_conv1d_fn",
+  "gating": "DeviceOperator.fused_gdn_gating -> vllm_ascend.ops.triton.fused_gdn_gating.fused_gdn_gating_patch",
+  "scan_decode": "from fla_npu.ops.ascendc import recurrent_gated_delta_rule (after l2norm_fwd on q/k)",
+  "scan_prefill": "HardwareCapability.FLA_GDN_PREFILL on A5 -> DeviceOperator.fla_gdn_prefill -> fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd",
+  "source": "vllm_ascend/ops/gdn.py (image quay.io/ascend/vllm-ascend:v0.30.0rc2-a5)",
+  "unused_by_layer": [
+   "torch_npu.npu_chunk_gated_delta_rule (smoke-callable here, but the A5 profile selects the fla_npu FLA_GDN_PREFILL path first)",
+   "vllm_ascend.ops.causal_conv1d PyTorch fallback (only for the kimi_kda path, not the Qwen GDN layer)"
+  ]
+ },
+ "families": {
+  "linear_conv/npu_causal_conv1d_fn": {
+   "backend": "CANN/AscendC (fla_npu direct aclnn binding)",
+   "conditions": 16,
+   "family": "linear_conv",
+   "heldout_ape_max_pct": 8.469157538628675,
+   "heldout_ape_median_pct": 6.373760571926139,
+   "heldout_conditions": 4,
+   "heldout_scope": "T=16384 rows of both geometries",
+   "intercept_ms": 0.025428536897866887,
+   "launch_ms": 0.025428536897866887,
+   "loo_wape_pct": 7.892933544437497,
+   "model_form": "ms = intercept_ms + slope_ms_per_unit * tokens_x_width",
+   "model_kind": "linear_launch_plus_work",
+   "phase": "prefill",
+   "quality": "measured_declared",
+   "raw_event_count": 640,
+   "recipe": "npu_causal_conv1d_fn",
+   "rows": [
+    {
+     "batch": 1,
+     "max_ms": 0.17711800336837769,
+     "mean_ms": 0.17141150124371052,
+     "median_ms": 0.17181000113487244,
+     "min_ms": 0.16651199758052826,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.3126069903373718,
+     "mean_ms": 0.305723924189806,
+     "median_ms": 0.30601900815963745,
+     "min_ms": 0.30112600326538086,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.5752779841423035,
+     "mean_ms": 0.569352000951767,
+     "median_ms": 0.5694100260734558,
+     "min_ms": 0.5653520226478577,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 1.1045680046081543,
+     "mean_ms": 1.0963768184185028,
+     "median_ms": 1.0965019464492798,
+     "min_ms": 1.0915230512619019,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.5720160007476807,
+     "mean_ms": 0.5688417479395866,
+     "median_ms": 0.5691530108451843,
+     "min_ms": 0.5633310079574585,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 1.107475996017456,
+     "mean_ms": 1.0971469551324844,
+     "median_ms": 1.0966989994049072,
+     "min_ms": 1.0918630361557007,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 2.1605188846588135,
+     "mean_ms": 2.152851814031601,
+     "median_ms": 2.153101921081543,
+     "min_ms": 2.143381118774414,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 4.268054962158203,
+     "mean_ms": 4.262927854061127,
+     "median_ms": 4.262979030609131,
+     "min_ms": 4.257070064544678,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.2506850063800812,
+     "mean_ms": 0.2418008256703615,
+     "median_ms": 0.24175100028514862,
+     "min_ms": 0.23190100491046906,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.44602400064468384,
+     "mean_ms": 0.4315517246723175,
+     "median_ms": 0.43066999316215515,
+     "min_ms": 0.4222719967365265,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.8115670084953308,
+     "mean_ms": 0.8016637951135636,
+     "median_ms": 0.8012049794197083,
+     "min_ms": 0.7945039868354797,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 1.5658260583877563,
+     "mean_ms": 1.5566538542509079,
+     "median_ms": 1.5567899942398071,
+     "min_ms": 1.5480560064315796,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.8093940019607544,
+     "mean_ms": 0.801655250787735,
+     "median_ms": 0.8020300269126892,
+     "min_ms": 0.7924010157585144,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 1.579300045967102,
+     "mean_ms": 1.5666546940803527,
+     "median_ms": 1.5679240226745605,
+     "min_ms": 1.5532679557800293,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 3.085966110229492,
+     "mean_ms": 3.0732205510139465,
+     "median_ms": 3.0745909214019775,
+     "min_ms": 3.060467004776001,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 6.096047878265381,
+     "mean_ms": 6.082015573978424,
+     "median_ms": 6.081788063049316,
+     "min_ms": 6.070374011993408,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    }
+   ],
+   "samples_per_row": 20,
+   "slope_ms_per_unit": 4.30487992225532e-09,
+   "status": "measured",
+   "timing_scope": "device_event_warm_operator_per_call",
+   "train_wape_pct": 6.801596610762764,
+   "work_unit": "tokens_x_width",
+   "work_unit_description": "tokens * conv_width"
+  },
+  "linear_conv/npu_causal_conv1d_update": {
+   "backend": "CANN/AscendC (fla_npu direct aclnn binding)",
+   "conditions": 4,
+   "family": "linear_conv",
+   "heldout_ape_max_pct": 1.275920118058905,
+   "heldout_ape_median_pct": 1.2025368066463606,
+   "heldout_conditions": 2,
+   "heldout_scope": "Qwen3.5-35B-A3B geometry (32 v-heads)",
+   "intercept_ms": 0.0,
+   "launch_ms": 0.0,
+   "loo_wape_pct": 4.012460812380764,
+   "model_form": "ms = intercept_ms (launch bound, no measured batch dependence)",
+   "model_kind": "linear_work_only",
+   "phase": "decode",
+   "quality": "measured_declared",
+   "raw_event_count": 160,
+   "recipe": "npu_causal_conv1d_update",
+   "rows": [
+    {
+     "batch": 1,
+     "max_ms": 0.0625080019235611,
+     "mean_ms": 0.050530975218862295,
+     "median_ms": 0.050301000475883484,
+     "min_ms": 0.04541600123047829,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.06451799720525742,
+     "mean_ms": 0.0502173999324441,
+     "median_ms": 0.050374001264572144,
+     "min_ms": 0.04485499858856201,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.07953999936580658,
+     "mean_ms": 0.0671454998664558,
+     "median_ms": 0.06645700335502625,
+     "min_ms": 0.05784999951720238,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.07276400178670883,
+     "mean_ms": 0.06134209996089339,
+     "median_ms": 0.0608999989926815,
+     "min_ms": 0.05356200039386749,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    }
+   ],
+   "samples_per_row": 20,
+   "slope_ms_per_unit": 6.1897688327717775e-06,
+   "status": "measured",
+   "timing_scope": "device_event_warm_operator_per_call",
+   "train_wape_pct": 2.542327648827231,
+   "work_unit": "width",
+   "work_unit_description": "conv_width"
+  },
+  "linear_gate/fused_gdn_gating_kernel": {
+   "backend": "Triton (vllm_ascend fused_gdn_gating_patch)",
+   "conditions": 20,
+   "family": "linear_gate",
+   "heldout_ape_max_pct": 28.140451113520328,
+   "heldout_ape_median_pct": 19.117082511018467,
+   "heldout_conditions": 10,
+   "heldout_scope": "Qwen3.5-35B-A3B geometry (32 v-heads)",
+   "intercept_ms": 0.06544462373163094,
+   "launch_ms": 0.06544462373163094,
+   "loo_wape_pct": 12.920196519927245,
+   "model_form": "ms = intercept_ms + slope_ms_per_unit * tokens_x_heads",
+   "model_kind": "linear_launch_plus_work",
+   "phase": "prefill+decode",
+   "quality": "measured_declared",
+   "raw_event_count": 800,
+   "recipe": "fused_gdn_gating_kernel",
+   "rows": [
+    {
+     "batch": 1,
+     "max_ms": 0.10621500015258789,
+     "mean_ms": 0.07941045053303242,
+     "median_ms": 0.07892800122499466,
+     "min_ms": 0.07514200359582901,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.0926700010895729,
+     "mean_ms": 0.08173607550561428,
+     "median_ms": 0.08113200217485428,
+     "min_ms": 0.07743500173091888,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.10552100092172623,
+     "mean_ms": 0.08022852502763271,
+     "median_ms": 0.07957000285387039,
+     "min_ms": 0.07571999728679657,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.09108900278806686,
+     "mean_ms": 0.07927647512406111,
+     "median_ms": 0.07899600267410278,
+     "min_ms": 0.07507599890232086,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.0927010029554367,
+     "mean_ms": 0.08029527477920055,
+     "median_ms": 0.07977800071239471,
+     "min_ms": 0.07656700164079666,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.08954799920320511,
+     "mean_ms": 0.07848634999245405,
+     "median_ms": 0.07795300334692001,
+     "min_ms": 0.07410000264644623,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.09440600126981735,
+     "mean_ms": 0.07958032488822937,
+     "median_ms": 0.07929100096225739,
+     "min_ms": 0.0748870000243187,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.09244199842214584,
+     "mean_ms": 0.08106442503631114,
+     "median_ms": 0.08056599646806717,
+     "min_ms": 0.07802800089120865,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.11132500320672989,
+     "mean_ms": 0.10684940051287413,
+     "median_ms": 0.10661199688911438,
+     "min_ms": 0.10432399809360504,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.1692419946193695,
+     "mean_ms": 0.16028974950313568,
+     "median_ms": 0.15967300534248352,
+     "min_ms": 0.15660400688648224,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.0727119967341423,
+     "mean_ms": 0.06783549953252077,
+     "median_ms": 0.06783799827098846,
+     "min_ms": 0.06393799930810928,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.08010300248861313,
+     "mean_ms": 0.06778349988162517,
+     "median_ms": 0.06683199852705002,
+     "min_ms": 0.06322299689054489,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.07836399972438812,
+     "mean_ms": 0.06713490020483733,
+     "median_ms": 0.06680600345134735,
+     "min_ms": 0.06326500326395035,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.07201100140810013,
+     "mean_ms": 0.0664942255243659,
+     "median_ms": 0.06639499962329865,
+     "min_ms": 0.06303100287914276,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.0757410004734993,
+     "mean_ms": 0.0700752504169941,
+     "median_ms": 0.06989400088787079,
+     "min_ms": 0.06737899780273438,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.07044000178575516,
+     "mean_ms": 0.06601209957152605,
+     "median_ms": 0.06558199971914291,
+     "min_ms": 0.06277299672365189,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.07207900285720825,
+     "mean_ms": 0.06675110012292862,
+     "median_ms": 0.06665000319480896,
+     "min_ms": 0.06317999958992004,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.0765639990568161,
+     "mean_ms": 0.07160875014960766,
+     "median_ms": 0.07119499891996384,
+     "min_ms": 0.06802500039339066,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.10345400124788284,
+     "mean_ms": 0.09813399985432625,
+     "median_ms": 0.09771399945020676,
+     "min_ms": 0.09551399946212769,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.1791429966688156,
+     "mean_ms": 0.17365662679076194,
+     "median_ms": 0.17364400625228882,
+     "min_ms": 0.17067399621009827,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    }
+   ],
+   "samples_per_row": 20,
+   "slope_ms_per_unit": 1.65262831949922e-08,
+   "status": "measured",
+   "timing_scope": "device_event_warm_operator_per_call",
+   "train_wape_pct": 11.746754057642438,
+   "work_unit": "tokens_x_heads",
+   "work_unit_description": "tokens * v_heads"
+  },
+  "recurrent_scan/npu_chunk_gated_delta_rule_fwd": {
+   "backend": "CANN/AscendC (fla_npu FLA_GDN_PREFILL path, chunk 64)",
+   "conditions": 16,
+   "family": "recurrent_scan",
+   "heldout_ape_max_pct": 6.079132749363021,
+   "heldout_ape_median_pct": 4.636086854890723,
+   "heldout_conditions": 4,
+   "heldout_scope": "T=16384 rows of both geometries",
+   "intercept_ms": 0.44756875111341227,
+   "launch_ms": 0.44756875111341227,
+   "loo_wape_pct": 9.735481283245175,
+   "model_form": "ms = intercept_ms + slope_ms_per_unit * tokens_x_state",
+   "model_kind": "linear_launch_plus_work",
+   "phase": "prefill",
+   "quality": "measured_declared",
+   "raw_event_count": 640,
+   "recipe": "npu_chunk_gated_delta_rule_fwd",
+   "rows": [
+    {
+     "batch": 1,
+     "max_ms": 0.731656014919281,
+     "mean_ms": 0.7260651245713234,
+     "median_ms": 0.7264670133590698,
+     "min_ms": 0.7204650044441223,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 1.3178349733352661,
+     "mean_ms": 1.3071142971515655,
+     "median_ms": 1.306494951248169,
+     "min_ms": 1.3018690347671509,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 2.472230911254883,
+     "mean_ms": 2.4668993234634398,
+     "median_ms": 2.4667060375213623,
+     "min_ms": 2.461575984954834,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 5.0560078620910645,
+     "mean_ms": 5.030007135868073,
+     "median_ms": 5.029946804046631,
+     "min_ms": 5.0131330490112305,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 2.0055348873138428,
+     "mean_ms": 1.991184476017952,
+     "median_ms": 1.9907820224761963,
+     "min_ms": 1.9791909456253052,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 4.0770487785339355,
+     "mean_ms": 4.056264424324036,
+     "median_ms": 4.056522846221924,
+     "min_ms": 4.036378860473633,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 7.647601127624512,
+     "mean_ms": 7.543528270721436,
+     "median_ms": 7.539224147796631,
+     "min_ms": 7.502080917358398,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 14.587237358093262,
+     "mean_ms": 14.554585576057434,
+     "median_ms": 14.554791450500488,
+     "min_ms": 14.53054428100586,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.9823030233383179,
+     "mean_ms": 0.9711747705936432,
+     "median_ms": 0.9705129861831665,
+     "min_ms": 0.9634829759597778,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 1,
+     "max_ms": 1.7932649850845337,
+     "mean_ms": 1.7772322952747346,
+     "median_ms": 1.7775219678878784,
+     "min_ms": 1.7684509754180908,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 1,
+     "max_ms": 3.4220120906829834,
+     "mean_ms": 3.4018279016017914,
+     "median_ms": 3.401911973953247,
+     "min_ms": 3.385098934173584,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 1,
+     "max_ms": 6.9071221351623535,
+     "mean_ms": 6.862775647640229,
+     "median_ms": 6.862072944641113,
+     "min_ms": 6.823399066925049,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    },
+    {
+     "batch": 4,
+     "max_ms": 3.148629903793335,
+     "mean_ms": 3.1363605141639708,
+     "median_ms": 3.1372029781341553,
+     "min_ms": 3.124821901321411,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 4096
+    },
+    {
+     "batch": 4,
+     "max_ms": 6.516441822052002,
+     "mean_ms": 6.34046061038971,
+     "median_ms": 6.331139087677002,
+     "min_ms": 6.304890155792236,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 8192
+    },
+    {
+     "batch": 4,
+     "max_ms": 12.061111450195312,
+     "mean_ms": 11.997405195236206,
+     "median_ms": 12.001063346862793,
+     "min_ms": 11.94866943359375,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 16384
+    },
+    {
+     "batch": 4,
+     "max_ms": 23.563232421875,
+     "mean_ms": 23.48993968963623,
+     "median_ms": 23.48784828186035,
+     "min_ms": 23.42564582824707,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "prefill",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 32768
+    }
+   ],
+   "samples_per_row": 20,
+   "slope_ms_per_unit": 2.8126751207528304e-08,
+   "status": "measured",
+   "timing_scope": "device_event_warm_operator_per_call",
+   "train_wape_pct": 8.672117143329121,
+   "work_unit": "tokens_x_state",
+   "work_unit_description": "tokens * v_heads * v_dim"
+  },
+  "recurrent_scan/npu_recurrent_gated_delta_rule": {
+   "backend": "CANN/AscendC (fla_npu direct aclnn binding)",
+   "conditions": 4,
+   "family": "recurrent_scan",
+   "heldout_ape_max_pct": 45.48768669245885,
+   "heldout_ape_median_pct": 45.30250631808296,
+   "heldout_conditions": 2,
+   "heldout_scope": "Qwen3.5-35B-A3B geometry (32 v-heads)",
+   "intercept_ms": 0.315907746553421,
+   "launch_ms": 0.315907746553421,
+   "loo_wape_pct": 13.278904210799773,
+   "model_form": "ms = per_geometry_median_ms (launch bound; no measured batch dependence)",
+   "model_kind": "constant_launch_bound",
+   "per_geometry_median_ms": {
+    "qwen3.5-35b-a3b": {
+     "conditions": 2,
+     "max_ms": 0.3482399880886078,
+     "median_ms": 0.3470649868249893,
+     "min_ms": 0.34588998556137085
+    },
+    "qwen3.8-27b": {
+     "conditions": 2,
+     "max_ms": 0.28502801060676575,
+     "median_ms": 0.2847505062818527,
+     "min_ms": 0.2844730019569397
+    }
+   },
+   "phase": "decode",
+   "quality": "measured_declared",
+   "raw_event_count": 160,
+   "recipe": "npu_recurrent_gated_delta_rule",
+   "rows": [
+    {
+     "batch": 1,
+     "max_ms": 0.3702250123023987,
+     "mean_ms": 0.3467292241752148,
+     "median_ms": 0.34588998556137085,
+     "min_ms": 0.3056730031967163,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.35966700315475464,
+     "mean_ms": 0.34587160050868987,
+     "median_ms": 0.3482399880886078,
+     "min_ms": 0.31768599152565,
+     "model_geometry": "qwen3.5-35b-a3b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 1,
+     "max_ms": 0.3004319965839386,
+     "mean_ms": 0.285002726316452,
+     "median_ms": 0.28502801060676575,
+     "min_ms": 0.2617120146751404,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    },
+    {
+     "batch": 4,
+     "max_ms": 0.30344700813293457,
+     "mean_ms": 0.2823892764747143,
+     "median_ms": 0.2844730019569397,
+     "min_ms": 0.25034698843955994,
+     "model_geometry": "qwen3.8-27b",
+     "phase": "decode",
+     "samples": 40,
+     "status": "measured",
+     "tokens": 1
+    }
+   ],
+   "samples_per_row": 20,
+   "slope_ms_per_unit": 0.0,
+   "status": "measured",
+   "timing_scope": "device_event_warm_operator_per_call",
+   "train_wape_pct": 9.959178158099832,
+   "work_unit": "state_elems",
+   "work_unit_description": "v_heads * v_dim"
+  }
+ },
+ "hardware_key": "Ascend950DT_9582",
+ "kernels": {
+  "fla_npu_file": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/__init__.py",
+  "hardware_profile": {
+   "device_type": "None",
+   "fla_gdn_prefill": true
+  },
+  "init_device_properties_triton": "ok",
+  "npu_causal_conv1d_fn": {
+   "file": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_stable.py",
+   "module": "fla_npu.ops.ascendc._stable",
+   "qualname": "npu_causal_conv1d_fn",
+   "resolved": true
+  },
+  "npu_causal_conv1d_update": {
+   "file": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_stable.py",
+   "module": "fla_npu.ops.ascendc._stable",
+   "qualname": "npu_causal_conv1d_update",
+   "resolved": true
+  },
+  "npu_chunk_gated_delta_rule_fwd": {
+   "file": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_stable.py",
+   "module": "fla_npu.ops.ascendc._stable",
+   "qualname": "npu_chunk_gated_delta_rule_fwd",
+   "resolved": true
+  },
+  "npu_recurrent_gated_delta_rule": {
+   "file": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/ops/ascendc/_stable.py",
+   "module": "fla_npu.ops.ascendc._stable",
+   "qualname": "npu_recurrent_gated_delta_rule",
+   "resolved": true
+  },
+  "torch_npu_fused_causal_conv1d_present": true,
+  "torch_npu_npu_chunk_gated_delta_rule_smoke": {
+   "ok": true,
+   "op_present": true
+  },
+  "vllm_ascend_file": "/vllm-workspace/vllm-ascend/vllm_ascend/__init__.py"
+ },
+ "kind": "a5_gdn_operator_calibration",
+ "label": "a5-gdn-rack06os2",
+ "machine": {
+  "aicore_clock_mhz": 1650,
+  "aicore_clock_observed": 0.0,
+  "aicore_clock_source": "rated 1650 MHz for Ascend950DT 9582; npu-smi -t clock is not exposed on 25.1.rc3.1",
+  "cann": "9.2.0 (/usr/local/Ascend/cann-9.2.0)",
+  "device": "Ascend950DT_9582",
+  "die": 0,
+  "driver": "25.1.rc3.1 (ascendhal 7.35.23)",
+  "firmware": "driver-package 25.1.rc3.1",
+  "fla_npu": "image-bundled fla_npu.ops.ascendc (site-packages/fla_npu)",
+  "host": "rack06os2",
+  "host_ip": "177.25.22.1",
+  "image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5",
+  "image_id": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "npu_smi": "25.1.rc3.1",
+  "sku": "Ascend950DT_9582",
+  "soc": "ascend950dt_9582",
+  "torch": "2.10.0+cpu",
+  "torch_npu": "2.10.0.post7",
+  "visible_devices": "0"
+ },
+ "provenance": {
+  "canary": {
+   "conv_prefill": {
+    "abs_max": 0.03052520751953125,
+    "ok": true,
+    "rel_max": 0.0038900969084352255,
+    "shape": [
+     64,
+     1024
+    ]
+   },
+   "conv_update": {
+    "abs_max": 0.015587329864501953,
+    "ok": true,
+    "rel_max": 0.003793509444221854,
+    "state_order": "state_oldest_first"
+   },
+   "gating": {
+    "ok": true,
+    "rel_max_beta": 1.8545009083936748e-07,
+    "rel_max_g": 5.289526143315015e-06
+   },
+   "scan_decode": {
+    "abs_max": 0.0014625564217567444,
+    "ok": true,
+    "ref_abs_max": 0.03851344808936119,
+    "rel_max": 0.029251128435134888,
+    "steps": 4
+   },
+   "scan_prefill": {
+    "abs_max": 0.0024209499824792147,
+    "mapping": "interleave",
+    "ok": true,
+    "ref_abs_max": 0.04431895911693573,
+    "rel_max": 0.04841899871826172,
+    "state_abs_max": 0.014234695583581924,
+    "state_rel_max": 0.2846938967704773
+   }
+  },
+  "canary_record": ".workstreams/a5-gdn/raw/canary2.json",
+  "canary_record_note": "gdn_measure2.py canary section re-run after fixing the fp32 reference of the chunked scan; the operator rows are unaffected",
+  "canary_rule": "a role is admitted only when its operator output reproduces a CPU fp32 reference of the same math (conv/conv-update/gating exact formula; scan = naive delta-rule recurrence)",
+  "cann": "9.2.0 (/usr/local/Ascend/cann-9.2.0)",
+  "die": 0,
+  "gdn_layers": {
+   "qwen3.5-35b-a3b": 30,
+   "qwen3.8-27b": 48
+  },
+  "host": "rack06os2",
+  "host_ip": "177.25.22.1",
+  "image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5",
+  "image_id": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "measured_utc": "2026-10-22T11:30Z (19:30 Asia/Shanghai)",
+  "measurement_record_sha256": "30f300b9fae5a5116247830ad142f923413b67f8fa799c1bc9bc05e8af7ff9d8",
+  "measurement_script": "gdn_measure2.py",
+  "measurement_script_sha256": "ca8e71a773cc9832d6d05d70edac0e0188729ecea95ed579ece7e2a7b4e62d49",
+  "model_geometry": {
+   "qwen3.5-35b-a3b": {
+    "conv_kernel": 4,
+    "conv_width": 8192,
+    "full_layers": 10,
+    "gdn_layers": 30,
+    "hidden": 2048,
+    "k_dim": 128,
+    "k_heads": 16,
+    "layers": 40,
+    "v_dim": 128,
+    "v_heads": 32
+   },
+   "qwen3.8-27b": {
+    "conv_kernel": 4,
+    "conv_width": 10240,
+    "full_layers": 16,
+    "gdn_layers": 48,
+    "hidden": 5120,
+    "k_dim": 128,
+    "k_heads": 16,
+    "layers": 64,
+    "v_dim": 128,
+    "v_heads": 48
+   }
+  },
+  "no_local_predictions": true,
+  "raw_data": "/Volumes/data/mindie-sim-data/a5/2026-10-22/gdn/",
+  "sample_reduction": "a condition whose warm-up sample exceeds 1000 ms keeps 2x5 device events and is marked",
+  "samples_per_condition": 20,
+  "seed": 20261022,
+  "stream_record_sha256": "fad8b475ccb15caf6bff9ac6b318e3b14d76c853d339f55bcab5b2e307176268",
+  "timing_scope": "device_event_warm_operator_per_call",
+  "trials": 2,
+  "warmup": 10
+ },
+ "schema_version": "mindie-sim.physical-calibration/1",
+ "terms": {
+  "amortised_stream_ms": {
+   "qwen3.5-35b-a3b": {
+    "decode": {
+     "1": {
+      "conv_update": {
+       "block_ms": 1.8080960512161255,
+       "per_layer_ms": 0.03766866773366928,
+       "tokens": 1
+      },
+      "gating": {
+       "block_ms": 1.6619839668273926,
+       "per_layer_ms": 0.03462466597557068,
+       "tokens": 1
+      },
+      "scan_decode": {
+       "block_ms": 2.138922929763794,
+       "per_layer_ms": 0.04456089437007904,
+       "tokens": 1
+      },
+      "total_per_layer_ms": 0.116854228079319,
+      "whole_model_ms": 3.50562684237957
+     },
+     "4": {
+      "conv_update": {
+       "block_ms": 2.0168070793151855,
+       "per_layer_ms": 0.0420168141523997,
+       "tokens": 1
+      },
+      "gating": {
+       "block_ms": 1.6560150384902954,
+       "per_layer_ms": 0.03450031330188116,
+       "tokens": 1
+      },
+      "scan_decode": {
+       "block_ms": 2.1870739459991455,
+       "per_layer_ms": 0.045564040541648865,
+       "tokens": 1
+      },
+      "total_per_layer_ms": 0.12208116799592972,
+      "whole_model_ms": 3.6624350398778915
+     }
+    },
+    "layers_per_block": 48,
+    "prefill": {
+     "1": {
+      "conv_prefill": {
+       "block_ms": 13.872337341308594,
+       "per_layer_ms": 0.289007027943929,
+       "tokens": 4096
+      },
+      "gating": {
+       "block_ms": 1.6709959506988525,
+       "per_layer_ms": 0.034812415639559426,
+       "tokens": 4096
+      },
+      "scan_prefill": {
+       "block_ms": 31.031259536743164,
+       "per_layer_ms": 0.6464845736821493,
+       "tokens": 4096
+      },
+      "total_per_layer_ms": 0.9703040172656378,
+      "whole_model_ms": 29.10912051796913
+     }
+    }
+   },
+   "qwen3.8-27b": {
+    "decode": {
+     "1": {
+      "conv_update": {
+       "block_ms": 1.9093769788742065,
+       "per_layer_ms": 0.0397786870598793,
+       "tokens": 1
+      },
+      "gating": {
+       "block_ms": 1.6555709838867188,
+       "per_layer_ms": 0.03449106216430664,
+       "tokens": 1
+      },
+      "scan_decode": {
+       "block_ms": 2.307404041290283,
+       "per_layer_ms": 0.0480709175268809,
+       "tokens": 1
+      },
+      "total_per_layer_ms": 0.12234066675106683,
+      "whole_model_ms": 5.8723520040512085
+     },
+     "4": {
+      "conv_update": {
+       "block_ms": 1.798280954360962,
+       "per_layer_ms": 0.03746418654918671,
+       "tokens": 1
+      },
+      "gating": {
+       "block_ms": 1.6499639749526978,
+       "per_layer_ms": 0.034374249478181206,
+       "tokens": 1
+      },
+      "scan_decode": {
+       "block_ms": 2.3509180545806885,
+       "per_layer_ms": 0.04897745947043101,
+       "tokens": 1
+      },
+      "total_per_layer_ms": 0.12081589549779892,
+      "whole_model_ms": 5.799162983894348
+     }
+    },
+    "layers_per_block": 48,
+    "prefill": {
+     "1": {
+      "conv_prefill": {
+       "block_ms": 16.782470703125,
+       "per_layer_ms": 0.3496348063151042,
+       "tokens": 4096
+      },
+      "gating": {
+       "block_ms": 1.6677910089492798,
+       "per_layer_ms": 0.034745646019776665,
+       "tokens": 4096
+      },
+      "scan_prefill": {
+       "block_ms": 41.69563293457031,
+       "per_layer_ms": 0.8686590194702148,
+       "tokens": 4096
+      },
+      "total_per_layer_ms": 1.2530394718050957,
+      "whole_model_ms": 60.14589464664459
+     }
+    }
+   }
+  },
+  "amortised_stream_note": "48 back-to-back calls of one operator between two device events, so the host launch gap of call N overlaps the device work of call N-1 as it does in a served layer stack. Use these for per-layer aggregates; the family rows stay isolated per-call observations.",
+  "per_layer_ms": {
+   "qwen3.5-35b-a3b": {
+    "decode": {
+     "1": {
+      "conv1d": 0.0507065862780664,
+      "gating": 0.06544515257269318,
+      "recurrent_scan": 0.3470649868249893,
+      "total": 0.4632167256757489
+     },
+     "4": {
+      "conv1d": 0.0507065862780664,
+      "gating": 0.0654467390958799,
+      "recurrent_scan": 0.3470649868249893,
+      "total": 0.4632183121989356
+     }
+    },
+    "prefill": {
+     "16384": {
+      "chunk_scan": 2.335123072661265,
+      "conv1d": 0.6032197393757925,
+      "gating": 0.07410915569536701,
+      "total": 3.0124519677324244
+     },
+     "32768": {
+      "chunk_scan": 4.222677394209118,
+      "conv1d": 1.1810109418537182,
+      "gating": 0.08277368765910309,
+      "total": 5.4864620237219395
+     },
+     "4096": {
+      "chunk_scan": 0.9194573315003755,
+      "conv1d": 0.16987633751734832,
+      "gating": 0.06761075672256496,
+      "total": 1.1569444257402888
+     },
+     "8192": {
+      "chunk_scan": 1.3913459118873386,
+      "conv1d": 0.31432413813682974,
+      "gating": 0.06977688971349898,
+      "total": 1.7754469397376673
+     }
+    }
+   },
+   "qwen3.8-27b": {
+    "decode": {
+     "1": {
+      "conv1d": 0.063383232847583,
+      "gating": 0.0654454169932243,
+      "recurrent_scan": 0.2847505062818527,
+      "total": 0.41357915612266005
+     },
+     "4": {
+      "conv1d": 0.063383232847583,
+      "gating": 0.06544779677800439,
+      "recurrent_scan": 0.2847505062818527,
+      "total": 0.4135815359074401
+     }
+    },
+    "prefill": {
+     "16384": {
+      "chunk_scan": 3.2789002334351913,
+      "conv1d": 0.7476675399952739,
+      "gating": 0.07844142167723504,
+      "total": 4.105009195107701
+     },
+     "32768": {
+      "chunk_scan": 6.11023171575697,
+      "conv1d": 1.469906543092681,
+      "gating": 0.09143821962283916,
+      "total": 7.67157647847249
+     },
+     "4096": {
+      "chunk_scan": 1.155401621693857,
+      "conv1d": 0.20598828767221866,
+      "gating": 0.06869382321803197,
+      "total": 1.4300837325841078
+     },
+     "8192": {
+      "chunk_scan": 1.8632344922743018,
+      "conv1d": 0.38654803844657043,
+      "gating": 0.071943022704433,
+      "total": 2.3217255534253054
+     }
+    }
+   }
+  },
+  "whole_model_ms": {
+   "qwen3.5-35b-a3b": {
+    "decode_step": {
+     "1": {
+      "conv1d": 1.521197588341992,
+      "gating": 1.9633545771807954,
+      "recurrent_scan": 10.41194960474968,
+      "total": 13.896501770272467
+     },
+     "4": {
+      "conv1d": 1.521197588341992,
+      "gating": 1.963402172876397,
+      "recurrent_scan": 10.41194960474968,
+      "total": 13.896549365968069
+     }
+    },
+    "gdn_layers": 30,
+    "prefill": {
+     "16384": {
+      "chunk_scan": 70.05369217983795,
+      "conv1d": 18.096592181273778,
+      "gating": 2.2232746708610103,
+      "total": 90.37355903197273
+     },
+     "32768": {
+      "chunk_scan": 126.68032182627354,
+      "conv1d": 35.43032825561155,
+      "gating": 2.483210629773093,
+      "total": 164.59386071165818
+     },
+     "4096": {
+      "chunk_scan": 27.583719945011264,
+      "conv1d": 5.09629012552045,
+      "gating": 2.0283227016769487,
+      "total": 34.708332772208664
+     },
+     "8192": {
+      "chunk_scan": 41.74037735662016,
+      "conv1d": 9.429724144104892,
+      "gating": 2.0933066914049694,
+      "total": 53.26340819213002
+     }
+    }
+   },
+   "qwen3.8-27b": {
+    "decode_step": {
+     "1": {
+      "conv1d": 3.042395176683984,
+      "gating": 3.141380015674766,
+      "recurrent_scan": 13.66802430152893,
+      "total": 19.851799493887683
+     },
+     "4": {
+      "conv1d": 3.042395176683984,
+      "gating": 3.1414942453442105,
+      "recurrent_scan": 13.66802430152893,
+      "total": 19.851913723557125
+     }
+    },
+    "gdn_layers": 48,
+    "prefill": {
+     "16384": {
+      "chunk_scan": 157.38721120488918,
+      "conv1d": 35.888041919773144,
+      "gating": 3.765188240507282,
+      "total": 197.0404413651696
+     },
+     "32768": {
+      "chunk_scan": 293.29112235633454,
+      "conv1d": 70.55551406844869,
+      "gating": 4.3890345418962795,
+      "total": 368.23567096667955
+     },
+     "4096": {
+      "chunk_scan": 55.45927784130514,
+      "conv1d": 9.887437808266496,
+      "gating": 3.2973035144655345,
+      "total": 68.64401916403718
+     },
+     "8192": {
+      "chunk_scan": 89.43525562916649,
+      "conv1d": 18.55430584543538,
+      "gating": 3.453265089812784,
+      "total": 111.44282656441466
+     }
+    }
+   }
+  }
+ }
+}

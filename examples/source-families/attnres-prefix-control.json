@@ -1,0 +1,106 @@
+{
+  "machine": {
+    "name": "synthetic-attnres-prefix-control",
+    "num_devices": 1,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_units": 4,
+      "compute_peaks": {
+        "bf16": 100000000000000.0,
+        "fp32": 25000000000000.0
+      },
+      "rates": {
+        "memory": 1000000000000.0,
+        "vector": 2000000000000.0,
+        "mte2": 1000000000000.0,
+        "mte3": 1000000000000.0
+      },
+      "resource_units": {
+        "vector": 8,
+        "mte2": 8,
+        "mte3": 8
+      },
+      "buffers": {
+        "ub": 262144
+      }
+    },
+    "assumptions": {
+      "parameters": "Synthetic rates and UB for source-contract verification, not device calibration."
+    }
+  },
+  "model": {
+    "name": "attnres-prefix-3-layer-b2",
+    "layers": 3,
+    "hidden_size": 256,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 64,
+    "intermediate_size": 512,
+    "vocab_size": 1024,
+    "activation_dtype": "bf16",
+    "layer_plans": [
+      {
+        "index": 0,
+        "attention": "gqa",
+        "architecture": "gqa",
+        "ffn": "dense",
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 512,
+        "residual_block_size": 2
+      },
+      {
+        "index": 1,
+        "attention": "gqa",
+        "architecture": "gqa",
+        "ffn": "dense",
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 512,
+        "residual_block_size": 2
+      },
+      {
+        "index": 2,
+        "attention": "gqa",
+        "architecture": "gqa",
+        "ffn": "dense",
+        "num_heads": 4,
+        "num_kv_heads": 2,
+        "head_dim": 64,
+        "intermediate_size": 512,
+        "residual_block_size": 2
+      }
+    ]
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r",
+        "prompt_tokens": 64,
+        "output_tokens": 1
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 128,
+    "max_num_seqs": 1,
+    "max_model_len": 1024,
+    "kv_block_size": 16,
+    "kernels": {
+      "lowerings": {
+        "attention_residual": {
+          "implementation": "vllm_ascend_attn_res_prefix",
+          "options": {
+            "optimize_prefill": true
+          }
+        }
+      }
+    },
+    "metadata": {
+      "parameter_basis": "Synthetic physical rates; the AttnRes cross-layer state is the declared source mechanism.",
+      "scope": "Public three-layer B=2 control for the selected prefix point; not a device measurement."
+    }
+  }
+}

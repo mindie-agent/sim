@@ -1,0 +1,33 @@
+{
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "read_date": "2026-10-28",
+  "retrieval": "bounded read-only CPU container, no device mounts or model contexts",
+  "capture_image_reference": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen38-c4-16k/report.md",
+  "limits": "Image source, not a disassembly or compiled instruction schedule. Captured runtime may also load binary package code.",
+  "files": [
+    {
+      "source_path": "/vllm-workspace/vllm-ascend/vllm_ascend/ops/gdn.py",
+      "path": "gdn.py.txt",
+      "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
+      "bytes": 33354
+    },
+    {
+      "source_path": "/vllm-workspace/vllm-ascend/vllm_ascend/ops/triton/fused_gdn_gating.py",
+      "path": "fused_gdn_gating.py.txt",
+      "sha256": "5587bf3440e64eda125899f5de2d1ab609061e2b5336f847af101ada51d81058",
+      "bytes": 3011
+    },
+    {
+      "source_path": "/vllm-workspace/vllm/vllm/model_executor/layers/mamba/gdn/base.py",
+      "path": "base.py.txt",
+      "sha256": "7fec748fc74131f5a45bcaf2644b3fa3a0598fd437d7347f8207ea3644a951c5",
+      "bytes": 2072
+    },
+    {
+      "source_path": "/vllm-workspace/vllm-ascend/vllm_ascend/device/device_op.py",
+      "path": "device_op.py.txt",
+      "sha256": "01ce13ea60e46f901ad69ad4c71e4be0e31cd69fbc56ebb7d898f957d5e54f67",
+      "bytes": 73699
+    }
+  ]
+}

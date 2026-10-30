@@ -1,0 +1,14 @@
+{
+  "builder": "activation",
+  "arguments": {
+    "variant": "swiglu_separate",
+    "tokens": 128,
+    "intermediate": 4096,
+    "dtype": "bf16",
+    "phase": "prefill"
+  },
+  "protocol": {
+    "invocations": 20,
+    "mode": "eager"
+  }
+}

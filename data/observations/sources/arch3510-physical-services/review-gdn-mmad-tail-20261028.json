@@ -1,0 +1,770 @@
+{
+  "schema": "gdn-mmad-tail-source-review.v1",
+  "date": "2026-10-28",
+  "status": "source_dimensions_and_BF16_physical_fractal16_confirmed",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "selected_operation": "GDN O AV tail, Aprime[r,r] times V[r,128]",
+  "caller": {
+    "path": "/tmp/mindie-sim-gdn-prefill-20261028/chunk_fwd_o/arch35/chunk_fwd_o_cube.h",
+    "sha256": "2c97c98f9c35460f50c390cb0563201734c13f9176355cbb61dd57657135e6d8",
+    "bytes": 29511,
+    "lines": [
+      [
+        250,
+        282
+      ]
+    ]
+  },
+  "catlass": {
+    "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/tile_mmad.hpp",
+    "sha256": "66bbf9b29a6fa3be3958c7c850f4409591e46f1e96da1070431a1466aadff209",
+    "bytes": 10708,
+    "lines": [
+      [
+        240,
+        282
+      ]
+    ]
+  },
+  "cann_dav3510": {
+    "path": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/ascendc/include/basic_api/impl/dav_3510/kernel_operator_mm_impl.h",
+    "resolved": "/usr/local/Ascend/cann-9.2.0/aarch64-linux/asc/impl/basic_api/dav_3510/kernel_operator_mm_impl.h",
+    "sha256": "038eabbca7fbbd601d5febe4f006fbae0fcee4afcd020b662e403e6b3bb077bf",
+    "bytes": 83067,
+    "lines": [
+      [
+        468,
+        "#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)"
+      ],
+      [
+        469,
+        "template <typename DstT, typename Src0T, typename Src1T>"
+      ],
+      [
+        470,
+        "__aicore__ inline void MmadCal(__cc__ DstT* c, __ca__ Src0T* a, __cb__ Src1T* b, const MmadParams& mmadParams)"
+      ],
+      [
+        471,
+        "{"
+      ],
+      [
+        472,
+        "    if ASCEND_IS_AIC {"
+      ],
+      [
+        473,
+        "        bool cmatrixInitVal = mmadParams.cmatrixInitVal && (!mmadParams.isBias);"
+      ],
+      [
+        474,
+        "        constexpr bool isMx = SupportType<"
+      ],
+      [
+        475,
+        "            Tuple<DstT, Src0T, Src1T>, Tuple<float, fp4x2_e1m2_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        476,
+        "            Tuple<float, fp4x2_e1m2_t, fp4x2_e2m1_t>, Tuple<float, fp4x2_e2m1_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        477,
+        "            Tuple<float, fp4x2_e2m1_t, fp4x2_e2m1_t>, Tuple<float, mx_fp8_e4m3_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        478,
+        "            Tuple<float, mx_fp8_e4m3_t, mx_fp8_e5m2_t>, Tuple<float, mx_fp8_e5m2_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        479,
+        "            Tuple<float, mx_fp8_e5m2_t, mx_fp8_e5m2_t>>();"
+      ],
+      [
+        480,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        481,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        482,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        483,
+        "            mad_mx("
+      ],
+      [
+        484,
+        "                c, (__ca__ AType*)a, (__cb__ BType*)b, mmadParams.m, mmadParams.k, mmadParams.n, mmadParams.unitFlag,"
+      ],
+      [
+        485,
+        "                mmadParams.disableGemv, mmadParams.cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        486,
+        "        } else {"
+      ],
+      [
+        487,
+        "            mad(c, a, b, mmadParams.m, mmadParams.k, mmadParams.n, mmadParams.unitFlag, mmadParams.disableGemv,"
+      ],
+      [
+        488,
+        "                mmadParams.cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        489,
+        "        }"
+      ],
+      [
+        490,
+        "    }"
+      ],
+      [
+        491,
+        "}"
+      ],
+      [
+        492,
+        ""
+      ],
+      [
+        493,
+        "template <typename DstT, typename Src0T, typename Src1T>"
+      ],
+      [
+        494,
+        "__aicore__ inline void MmadCal("
+      ],
+      [
+        495,
+        "    __cc__ DstT* c, __ca__ Src0T* a, __cb__ Src1T* b, uint64_t bias, const MmadParams& mmadParams, bool cmatrixSource)"
+      ],
+      [
+        496,
+        "{"
+      ],
+      [
+        497,
+        "    if ASCEND_IS_AIC {"
+      ],
+      [
+        498,
+        "        bool cmatrixInitVal = mmadParams.cmatrixInitVal && (!mmadParams.isBias);"
+      ],
+      [
+        499,
+        "        constexpr bool isMx = SupportType<"
+      ],
+      [
+        500,
+        "            Tuple<DstT, Src0T, Src1T>, Tuple<float, fp4x2_e1m2_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        501,
+        "            Tuple<float, fp4x2_e1m2_t, fp4x2_e2m1_t>, Tuple<float, fp4x2_e2m1_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        502,
+        "            Tuple<float, fp4x2_e2m1_t, fp4x2_e2m1_t>, Tuple<float, mx_fp8_e4m3_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        503,
+        "            Tuple<float, mx_fp8_e4m3_t, mx_fp8_e5m2_t>, Tuple<float, mx_fp8_e5m2_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        504,
+        "            Tuple<float, mx_fp8_e5m2_t, mx_fp8_e5m2_t>>();"
+      ],
+      [
+        505,
+        "#if defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1"
+      ],
+      [
+        506,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        507,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        508,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        509,
+        "            mad_mx("
+      ],
+      [
+        510,
+        "                (__cc__ DstT*)c, (__ca__ AType*)a, (__cb__ BType*)b, bias, mmadParams.m, mmadParams.k, mmadParams.n,"
+      ],
+      [
+        511,
+        "                mmadParams.unitFlag, mmadParams.disableGemv, cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        512,
+        "        } else {"
+      ],
+      [
+        513,
+        "            mad(c, a, b, bias, mmadParams.m, mmadParams.k, mmadParams.n, mmadParams.unitFlag, mmadParams.disableGemv,"
+      ],
+      [
+        514,
+        "                cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        515,
+        "        }"
+      ],
+      [
+        516,
+        "#else"
+      ],
+      [
+        517,
+        "        // Xd[31:0]: matrix c addr in L0C, Xd[63:32]: bias addr in bias table buffer;"
+      ],
+      [
+        518,
+        "        uint64_t xd = ((uint64_t)c) & 0xffffffffULL | ((bias & 0xffffffffULL) << 32);"
+      ],
+      [
+        519,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        520,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        521,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        522,
+        "            mad_mx("
+      ],
+      [
+        523,
+        "                (__cc__ DstT*)xd, (__ca__ AType*)a, (__cb__ BType*)b, mmadParams.m, mmadParams.k, mmadParams.n,"
+      ],
+      [
+        524,
+        "                mmadParams.unitFlag, mmadParams.disableGemv, cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        525,
+        "        } else {"
+      ],
+      [
+        526,
+        "            mad((__cc__ DstT*)xd, a, b, mmadParams.m, mmadParams.k, mmadParams.n, mmadParams.unitFlag,"
+      ],
+      [
+        527,
+        "                mmadParams.disableGemv, cmatrixSource, cmatrixInitVal);"
+      ],
+      [
+        528,
+        "        }"
+      ],
+      [
+        529,
+        "#endif"
+      ],
+      [
+        530,
+        "    }"
+      ],
+      [
+        531,
+        "}"
+      ],
+      [
+        532,
+        ""
+      ],
+      [
+        533,
+        "template <typename DstT, typename Src0T, typename Src1T>"
+      ],
+      [
+        534,
+        "__aicore__ inline void MmadCal(__cc__ DstT* c, __ca__ Src0T* a, __cb__ Src1T* b, const MmadBitModeParams& mmadParams)"
+      ],
+      [
+        535,
+        "{"
+      ],
+      [
+        536,
+        "    if ASCEND_IS_AIC {"
+      ],
+      [
+        537,
+        "        constexpr bool isMx = SupportType<"
+      ],
+      [
+        538,
+        "            Tuple<DstT, Src0T, Src1T>, Tuple<float, fp4x2_e1m2_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        539,
+        "            Tuple<float, fp4x2_e1m2_t, fp4x2_e2m1_t>, Tuple<float, fp4x2_e2m1_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        540,
+        "            Tuple<float, fp4x2_e2m1_t, fp4x2_e2m1_t>, Tuple<float, mx_fp8_e4m3_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        541,
+        "            Tuple<float, mx_fp8_e4m3_t, mx_fp8_e5m2_t>, Tuple<float, mx_fp8_e5m2_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        542,
+        "            Tuple<float, mx_fp8_e5m2_t, mx_fp8_e5m2_t>>();"
+      ],
+      [
+        543,
+        "#if defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1"
+      ],
+      [
+        544,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        545,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        546,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        547,
+        "            mad_mx("
+      ],
+      [
+        548,
+        "                c, (__ca__ AType*)a, (__cb__ BType*)b, mmadParams.GetM(), mmadParams.GetK(), mmadParams.GetN(),"
+      ],
+      [
+        549,
+        "                mmadParams.GetUnitFlag(), mmadParams.GetDisableGemv(), mmadParams.GetCmatrixSource(),"
+      ],
+      [
+        550,
+        "                mmadParams.GetCmatrixInitVal());"
+      ],
+      [
+        551,
+        "        } else {"
+      ],
+      [
+        552,
+        "            mad(c, a, b, mmadParams.GetM(), mmadParams.GetK(), mmadParams.GetN(), mmadParams.GetUnitFlag(),"
+      ],
+      [
+        553,
+        "                mmadParams.GetDisableGemv(), mmadParams.GetCmatrixSource(), mmadParams.GetCmatrixInitVal());"
+      ],
+      [
+        554,
+        "        }"
+      ],
+      [
+        555,
+        "#else"
+      ],
+      [
+        556,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        557,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        558,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        559,
+        "            mad_mx(c, (__ca__ AType*)a, (__cb__ BType*)b, mmadParams.GetConfig0());"
+      ],
+      [
+        560,
+        "        } else {"
+      ],
+      [
+        561,
+        "            mad(c, a, b, mmadParams.GetConfig0());"
+      ],
+      [
+        562,
+        "        }"
+      ],
+      [
+        563,
+        "#endif"
+      ],
+      [
+        564,
+        "    }"
+      ],
+      [
+        565,
+        "}"
+      ],
+      [
+        566,
+        ""
+      ],
+      [
+        567,
+        "template <typename DstT, typename Src0T, typename Src1T>"
+      ],
+      [
+        568,
+        "__aicore__ inline void MmadCal("
+      ],
+      [
+        569,
+        "    __cc__ DstT* c, __ca__ Src0T* a, __cb__ Src1T* b, uint64_t bias, MmadBitModeParams& mmadParams)"
+      ],
+      [
+        570,
+        "{"
+      ],
+      [
+        571,
+        "    if ASCEND_IS_AIC {"
+      ],
+      [
+        572,
+        "        mmadParams.SetCmatrixInitVal(false);"
+      ],
+      [
+        573,
+        "        constexpr bool isMx = SupportType<"
+      ],
+      [
+        574,
+        "            Tuple<DstT, Src0T, Src1T>, Tuple<float, fp4x2_e1m2_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        575,
+        "            Tuple<float, fp4x2_e1m2_t, fp4x2_e2m1_t>, Tuple<float, fp4x2_e2m1_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        576,
+        "            Tuple<float, fp4x2_e2m1_t, fp4x2_e2m1_t>, Tuple<float, mx_fp8_e4m3_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        577,
+        "            Tuple<float, mx_fp8_e4m3_t, mx_fp8_e5m2_t>, Tuple<float, mx_fp8_e5m2_t, mx_fp8_e4m3_t>,"
+      ],
+      [
+        578,
+        "            Tuple<float, mx_fp8_e5m2_t, mx_fp8_e5m2_t>>();"
+      ],
+      [
+        579,
+        "#if defined(ASCENDC_CPU_DEBUG) && ASCENDC_CPU_DEBUG == 1"
+      ],
+      [
+        580,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        581,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        582,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        583,
+        "            mad_mx("
+      ],
+      [
+        584,
+        "                (__cc__ DstT*)c, (__ca__ AType*)a, (__cb__ BType*)b, bias, mmadParams.GetM(), mmadParams.GetK(),"
+      ],
+      [
+        585,
+        "                mmadParams.GetN(), mmadParams.GetUnitFlag(), mmadParams.GetDisableGemv(), mmadParams.GetCmatrixSource(),"
+      ],
+      [
+        586,
+        "                mmadParams.GetCmatrixInitVal());"
+      ],
+      [
+        587,
+        "        } else {"
+      ],
+      [
+        588,
+        "            mad(c, a, b, bias, mmadParams.GetM(), mmadParams.GetK(), mmadParams.GetN(), mmadParams.GetUnitFlag(),"
+      ],
+      [
+        589,
+        "                mmadParams.GetDisableGemv(), mmadParams.GetCmatrixSource(), mmadParams.GetCmatrixInitVal());"
+      ],
+      [
+        590,
+        "        }"
+      ],
+      [
+        591,
+        "#else"
+      ],
+      [
+        592,
+        "        // Xd[31:0]: matrix c addr in L0C, Xd[63:32]: bias addr in bias table buffer;"
+      ],
+      [
+        593,
+        "        uint64_t xd = ((uint64_t)c) & 0xffffffffULL | ((bias & 0xffffffffULL) << 32);"
+      ],
+      [
+        594,
+        "        if constexpr (isMx) {"
+      ],
+      [
+        595,
+        "            using AType = typename GetDstType<Src0T>::Type;"
+      ],
+      [
+        596,
+        "            using BType = typename GetDstType<Src1T>::Type;"
+      ],
+      [
+        597,
+        "            mad_mx((__cc__ DstT*)xd, (__ca__ AType*)a, (__cb__ BType*)b, mmadParams.GetConfig0());"
+      ],
+      [
+        598,
+        "        } else {"
+      ],
+      [
+        599,
+        "            mad((__cc__ DstT*)xd, a, b, mmadParams.GetConfig0());"
+      ],
+      [
+        600,
+        "        }"
+      ],
+      [
+        601,
+        "#endif"
+      ],
+      [
+        602,
+        "    }"
+      ],
+      [
+        603,
+        "}"
+      ],
+      [
+        604,
+        "#endif"
+      ],
+      [
+        605,
+        ""
+      ],
+      [
+        606,
+        "/* **************************************************************************************************"
+      ],
+      [
+        607,
+        " * MmadMx                                                                                           *"
+      ],
+      [
+        608,
+        " * **************************************************************************************************/"
+      ],
+      [
+        609,
+        "#if defined(__NPU_ARCH__) && (__NPU_ARCH__ == 3510)"
+      ],
+      [
+        610,
+        "template <typename DstT, typename Src0T, typename Src1T>"
+      ],
+      [
+        611,
+        "__aicore__ inline void MmadMxCal(__cc__ DstT* c, __ca__ Src0T* a, __cb__ Src1T* b, const MmadParams& mmadParams)"
+      ],
+      [
+        612,
+        "{"
+      ],
+      [
+        613,
+        "    if ASCEND_IS_AIC {"
+      ],
+      [
+        614,
+        "        constexpr bool isMx = SupportType<"
+      ],
+      [
+        615,
+        "            Tuple<DstT, Src0T, Src1T>, Tuple<float, fp4x2_e1m2_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        616,
+        "            Tuple<float, fp4x2_e1m2_t, fp4x2_e2m1_t>, Tuple<float, fp4x2_e2m1_t, fp4x2_e1m2_t>,"
+      ],
+      [
+        617,
+        "            Tuple<float, fp4x2_e2m1_t, fp4x2_e2m1_t>, Tuple<float, fp8_e4m3fn_t, fp8_e4m3fn_t>,"
+      ],
+      [
+        618,
+        "            Tuple<float, fp8_e4m3fn_t, fp8_e5m2_t>, Tuple<float, fp8_e5m2_t, fp8_e4m3fn_t>,"
+      ],
+      [
+        619,
+        "            Tuple<float, fp8_e5m2_t, fp8_e5m2_t>>();"
+      ]
+    ]
+  },
+  "hardware_performance_source": {
+    "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+    "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+    "bytes": 21427,
+    "lines": [
+      [
+        20,
+        37
+      ],
+      [
+        54,
+        68
+      ]
+    ]
+  },
+  "conclusions": [
+    "O tail constructs actual shapes(r,r),(r,128),(r,128) and invokes automatic TileMmadTla overload.",
+    "Automatic overload forwards m,n,k from originShape; no software pad-to64 or pad-to16. On3510 non-VectorLayout disableGemv=true.",
+    "CANN3510 BF16 MmadCal passes raw m,k,n to mad intrinsic; no intermediate host/runtime rounding in inspected code.",
+    "Published3510 theoretical MMAD timing uses ceil_m=ceil16(m),ceil_n=ceil16(n),ceil_k=ceil_k0(k), BF16 cube16x16x16,k0=16.",
+    "Thus raw/source useful shape and physical issued/fractal work must remain separate. DeltaT is a separate per-instruction startup quantity, not an unexplained efficiency factor."
+  ],
+  "tail_examples": [
+    {
+      "r": 1,
+      "logical_mnk": [
+        1,
+        128,
+        1
+      ],
+      "useful_flops": 256,
+      "issued_mnk": [
+        16,
+        128,
+        16
+      ],
+      "issued_flops": 65536,
+      "nominal_body_cycles_without_startup": 8
+    },
+    {
+      "r": 16,
+      "logical_mnk": [
+        16,
+        128,
+        16
+      ],
+      "useful_flops": 65536,
+      "issued_mnk": [
+        16,
+        128,
+        16
+      ],
+      "issued_flops": 65536,
+      "nominal_body_cycles_without_startup": 8
+    },
+    {
+      "r": 17,
+      "logical_mnk": [
+        17,
+        128,
+        17
+      ],
+      "useful_flops": 73984,
+      "issued_mnk": [
+        32,
+        128,
+        32
+      ],
+      "issued_flops": 262144,
+      "nominal_body_cycles_without_startup": 32
+    },
+    {
+      "r": 33,
+      "logical_mnk": [
+        33,
+        128,
+        33
+      ],
+      "useful_flops": 278784,
+      "issued_mnk": [
+        48,
+        128,
+        48
+      ],
+      "issued_flops": 589824,
+      "nominal_body_cycles_without_startup": 72
+    },
+    {
+      "r": 49,
+      "logical_mnk": [
+        49,
+        128,
+        49
+      ],
+      "useful_flops": 614656,
+      "issued_mnk": [
+        64,
+        128,
+        64
+      ],
+      "issued_flops": 1048576,
+      "nominal_body_cycles_without_startup": 128
+    },
+    {
+      "r": 63,
+      "logical_mnk": [
+        63,
+        128,
+        63
+      ],
+      "useful_flops": 1016064,
+      "issued_mnk": [
+        64,
+        128,
+        64
+      ],
+      "issued_flops": 1048576,
+      "nominal_body_cycles_without_startup": 128
+    }
+  ],
+  "limits": [
+    "No startup cycle constant inferred from this report.",
+    "No hardware timing measurement was performed.",
+    "Other GDN MMADs must derive their own actual dimensions and flags rather than inherit O AV tail shape."
+  ]
+}

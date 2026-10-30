@@ -1,0 +1,29 @@
+{
+  "sources": [
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend/csrc/moe/moe_grouped_matmul/op_kernel/moe_grouped_matmul.cpp",
+      "sha256": "7a6f14a3078351c8297915a9d452364a737fe6e41b15d562d169a22d2848214e",
+      "bytes": 2443
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend/csrc/moe/moe_grouped_matmul/op_kernel/moe_grouped_matmul.h",
+      "sha256": "dfd18924241fa153f3b42c85e07a29733f575de95bb236c297a7a106ce35f628",
+      "bytes": 7861
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend/csrc/moe/moe_grouped_matmul/op_kernel/moe_grouped_matmul_tiling_data.h",
+      "sha256": "4f23e438d69fa69bfdfddc82fef893f4886ef5be072bcf6f3c74199047bdd6cf",
+      "bytes": 411
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend/csrc/moe/moe_grouped_matmul/op_host/moe_grouped_matmul_tiling.h",
+      "sha256": "ef061fc0afc726100a5b9ded5f4e648ea4a6d5674dd053e7941e3c19b01444c3",
+      "bytes": 1267
+    },
+    {
+      "path": "/Users/maoxx241/code/vllm-ascend/csrc/moe/moe_grouped_matmul/op_host/moe_grouped_matmul_cpu.cpp",
+      "sha256": "5953db15ff725024880f90982b531385b0187eed484c8b68a8c5d601bd792508",
+      "bytes": 14500
+    }
+  ]
+}

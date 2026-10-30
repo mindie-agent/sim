@@ -1,0 +1,60 @@
+{
+  "cases": [
+    {
+      "case_id": "glm53flash-a5-tp8-c3",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 4,
+        "context_tokens": 4104,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "baseline": {
+        "path": "examples/cases/high-concurrency-20261030/new17/glm53flash-a5-tp8-c3.json",
+        "sha256": "619bd71493a5f33896970112f0ae40025a85dfdcbffb6467dd3964fecb354cde",
+        "size_bytes": 2834
+      },
+      "variants": [
+        {
+          "name": "attention-only",
+          "path": "examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c3--attention-only.json"
+        },
+        {
+          "name": "attention-plus-down",
+          "path": "examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c3--attention-plus-down.json"
+        }
+      ]
+    },
+    {
+      "case_id": "glm53flash-a3-tp16-c2",
+      "geometry": {
+        "query_rows": 12,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 6,
+        "context_tokens": 4096,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "phase": "decode"
+      },
+      "baseline": {
+        "path": "examples/cases/high-concurrency-20261030/new17/glm53flash-a3-tp16-c2.json",
+        "sha256": "6e7eeb90361546bc8791cf31f5c0e0fb48b712609e3cfcdd4586e4c20fd1f2ec",
+        "size_bytes": 2893
+      },
+      "variants": [
+        {
+          "name": "attention-only",
+          "path": "examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a3-tp16-c2--attention-only.json"
+        }
+      ]
+    }
+  ],
+  "fixture_source": {
+    "revision": "14f10f67",
+    "path": "data/verification/glm-compatible-variants-20261030.json",
+    "sha256": "61909a71c0280bb92c322ccffd83318cfa8f08124e8fbf14ccce30c655475dd0",
+    "size_bytes": 714344
+  }
+}

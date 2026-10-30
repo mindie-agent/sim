@@ -1,0 +1,156 @@
+{
+  "name": "catalog-full-model-glm53-a5-true128k",
+  "machine": {
+    "name": "a5-950dt-9582-16die-2host",
+    "arch_family": "A5",
+    "sku": "Ascend950DT_9582",
+    "hardware_key": "Ascend950DT_9582",
+    "dies_per_package": 1,
+    "num_devices": 16,
+    "ranks_per_node": 8,
+    "device": {
+      "hbm_gib": 96,
+      "cube_flops_per_s": 432537600000000.0,
+      "hbm_bw_bytes_per_s": 4000000000000.0,
+      "mte_bw_bytes_per_s": 4000000000000.0,
+      "launch_us": 20.0,
+      "l2_bytes": 134217728,
+      "l1_bytes": 524288,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144,
+      "ub_bytes": 253952,
+      "aic_count": 32,
+      "aiv_count": 64,
+      "mte1_bw_bytes_per_s": 4000000000000.0
+    },
+    "compute_peaks": {
+      "bf16": 432537600000000.0,
+      "fp8_e4m3": 865075200000000.0,
+      "int8": 865075200000000.0
+    },
+    "links": [
+      {
+        "name": "ub-host0",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 2.5,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "ub-host1",
+        "channel": "d2d_intra_node",
+        "capacity_gbps": 392,
+        "latency_us": 2.5,
+        "members": [
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "semantics": "mesh",
+        "protocol": "UB_MESH"
+      },
+      {
+        "name": "ub-2node-r16",
+        "channel": "d2d_inter_node",
+        "capacity_gbps": 392,
+        "latency_us": 5.0,
+        "members": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          5,
+          6,
+          7,
+          8,
+          9,
+          10,
+          11,
+          12,
+          13,
+          14,
+          15
+        ],
+        "semantics": "switched",
+        "protocol": "UB_MESH"
+      }
+    ],
+    "transfer_channels": [
+      {
+        "channel": "d2d_inter_node",
+        "protocol": "UB_MESH",
+        "uni_peak_bw_gbps": 392,
+        "bi_peak_bw_gbps": 392,
+        "alpha_us": 5.0,
+        "transport_mode": "ub_urma",
+        "channel_semantics": "switched",
+        "notes": "the 2-node TP16 collectives run over the 197.33 compute fabric's UB/URMA data path, measured as the a5-comm-w16 r16 all-reduce rows; declaring UB_MESH keeps the fabric token 'ub' so those measured rows are queried instead of an RoCE curve this deployment never used"
+      }
+    ],
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 131072,
+        "output_tokens": 4096
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "max_model_len": 135168,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "kv_block_size": 384,
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/GLM-5.3-Flash-BF16 --tensor-parallel-size 16 --distributed-executor-backend mp --nnodes 2 --node-rank N --master-addr 197.33.35.1 --master-port 29501 --dtype bfloat16 --trust-remote-code --max-model-len 131072 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --enable-chunked-prefill --no-enable-prefix-caching",
+      "weights": "GLM-5.3-Flash-BF16 (642,652,070,880 B = 321.3 B BF16 parameters, 120 shards); 45 body layers = 11 DSA/MLA + 34 KDA, 288 routed experts top-8 + 1 shared, hidden 4096, index_topk 2048; the dequantised checkpoint has no quantization signature",
+      "host": "rack06os7 (177.25.27.1) + rack06os8 (177.25.28.1), 8 x Ascend950DT 9582 each, one rank per die, 2-node TP16",
+      "image": "quay.io/ascend/vllm-ascend:v0.30.0rc2-a5 (sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4); vllm 0.30.0, CANN 9.2.0",
+      "fabric": "intra-host UB mesh (392 Gbps per die) on both hosts; inter-host HCCL over the 197.33 compute fabric (UB/URMA data path), measured as the a5-comm-w16 2-node r16 all-reduce rows",
+      "measured_baseline": ".workstreams/hp-serving/glm53-a5/report.md (2026-10-23, rack06os7/os8)",
+      "mtp": "none: speculative_config=None in the measured serve log; the checkpoint's one num_nextn_predict_layers layer is loaded but not run, so one token per sequence per step",
+      "row_policy": "measured A5 rows are declared by the cells manifest and applied only when their exact geometry matches; a foreign-geometry row is declared missing, never substituted",
+      "dsa_topk": 2048,
+      "enable_prefix_caching": false,
+      "true_128k": "prompt 131072 + output 4096; model max_position=1048576; deployment recipe maxlen 131072"
+    }
+  }
+}

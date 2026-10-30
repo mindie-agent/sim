@@ -1,0 +1,44 @@
+[
+  {
+    "id": "deepseek-v2",
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V2/resolve/4461458f186c35188585855f28f77af5661ad489/modeling_deepseek.py",
+    "sha256": "82f8aa5e64d53a7f378719798fac763749cff92a6cea8437b9a8d7f37193bb90",
+    "size": 78103,
+    "path": "/tmp/sim-family-configs-20261029/deepseek-v2-modeling.py"
+  },
+  {
+    "id": "deepseek-v2-lite",
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/resolve/604d5664dddd88a0433dbae533b7fe9472482de0/modeling_deepseek.py",
+    "sha256": "7d8e5221095286eea991137760893fd7ba52727c0b4ebf48ec09e8bc56b45b9c",
+    "size": 78672,
+    "path": "/tmp/sim-family-configs-20261029/deepseek-v2-lite-modeling.py"
+  },
+  {
+    "id": "deepseek-v3",
+    "url": "https://huggingface.co/deepseek-ai/DeepSeek-V3/resolve/e815299b0bcbac849fa540c768ef21845365c9eb/modeling_deepseek.py",
+    "sha256": "eb6d535742061cf9da7a4232ecfe2f089d5ce20080afc5d2181e9d70ec4af8a4",
+    "size": 75741,
+    "path": "/tmp/sim-family-configs-20261029/deepseek-v3-modeling.py"
+  },
+  {
+    "id": "glm4",
+    "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.55.4/src/transformers/models/glm4/modeling_glm4.py",
+    "sha256": "6c3de2ba20b37b5877988d3888ed09eaef6b6a0f28df647897fa8568245b94d2",
+    "size": 22082,
+    "path": "/tmp/sim-family-configs-20261029/glm4-modeling.py"
+  },
+  {
+    "id": "glm4_moe",
+    "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.55.4/src/transformers/models/glm4_moe/modeling_glm4_moe.py",
+    "sha256": "a3d9a139e0a9f73181f3c18f71a738d2f87170bf50745bdd2c8a8ef187fd1879",
+    "size": 26751,
+    "path": "/tmp/sim-family-configs-20261029/glm4_moe-modeling.py"
+  },
+  {
+    "id": "chatglm",
+    "url": "https://huggingface.co/zai-org/glm-4-9b-chat/resolve/bd8234fe5e0c09c48637a92abb0c797cb5fa0e73/modeling_chatglm.py",
+    "sha256": "cb7b04f1ba3026677a714807da539a0abe6437203eb95e1ebd3aeda0ec634a36",
+    "size": 47851,
+    "path": "/tmp/sim-family-configs-20261029/chatglm-modeling.py"
+  }
+]

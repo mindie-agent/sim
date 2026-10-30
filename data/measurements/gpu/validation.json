@@ -1,0 +1,53 @@
+{
+  "gpu": "NVIDIA GeForce RTX 4090",
+  "source": "/Users/maoxx241/code/sim-rewrite-20261027/data/measurements/gpu/sim-probe-20261027-234735.stdout",
+  "calibration": "hardware memory service rate from 64/96/128 MiB; 112 MiB held out",
+  "peak_device_allocation_mib": 256,
+  "fit": {
+    "bytes_per_ms": 785839906.6142311,
+    "setup_ms": 0,
+    "train_trials": 15,
+    "heldout": [
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.29717334111531574,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": 0.005782338422857469,
+        "engine_predicted_ms": 0.29889169794389575,
+        "engine_relative_error": 0.005782338422857469
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.3205546736717224,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.06757965959345691,
+        "engine_predicted_ms": 0.29889169794389575,
+        "engine_relative_error": -0.06757965959345691
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.3205973307291667,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.06770372272253056,
+        "engine_predicted_ms": 0.29889169794389575,
+        "engine_relative_error": -0.06770372272253056
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.2923520008722941,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": 0.022369257101333417,
+        "engine_predicted_ms": 0.29889169794389575,
+        "engine_relative_error": 0.022369257101333417
+      },
+      {
+        "work_bytes": 234881024,
+        "observed_ms": 0.30182000001271564,
+        "predicted_ms": 0.29889169794389575,
+        "relative_error": -0.009702147202625855,
+        "engine_predicted_ms": 0.29889169794389575,
+        "engine_relative_error": -0.009702147202625855
+      }
+    ]
+  }
+}

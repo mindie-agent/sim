@@ -1,0 +1,72 @@
+{
+  "sources": [
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/compile_op.py",
+      "relative": "asc_op_compiler/compile_op.py",
+      "sha256": "265344a1e06f1fb5eb62dbe7b8bf002d1bf677686b026eb4960e8e1f151e8779",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/compile_op.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/ascendc_common_utility.py",
+      "relative": "asc_op_compiler/ascendc_common_utility.py",
+      "sha256": "34a2500314cc8cb273e8d84327feebbe4e524fc8888da29f3ab2e5f4fb09b410",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/ascendc_common_utility.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/ascendc_compile_base.py",
+      "relative": "asc_op_compiler/ascendc_compile_base.py",
+      "sha256": "43348f4eb4ce76ab4bc1c12efde7c9cca7f485267896834c3a8ae88a1b3e0b38",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/ascendc_compile_base.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/ascendc_compile_gen_code.py",
+      "relative": "asc_op_compiler/ascendc_compile_gen_code.py",
+      "sha256": "4d28db56c9757fda365da620ae96665b2c72a5a64f34aa5d28919f7d326385cb",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/ascendc_compile_gen_code.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/ascendc_compile_v220.py",
+      "relative": "asc_op_compiler/ascendc_compile_v220.py",
+      "sha256": "5a1415cd3823ad029ddf1111a2fec82558d601aaaa0fa55f348b7c8c2ff05fc0",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/ascendc_compile_v220.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/ascendc_constants.py",
+      "relative": "asc_op_compiler/ascendc_constants.py",
+      "sha256": "b3a44de2491541c896e20fbe7470a60b0d6bcdf0361163d35532440c82f1feec",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/ascendc_constants.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/asc_op_compiler/static_compile_resource_generator.py",
+      "relative": "asc_op_compiler/static_compile_resource_generator.py",
+      "sha256": "b9623c90823876a7fb60130a1eda567df34eaf91c999070c20f8a977518b38b2",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/asc_op_compiler/static_compile_resource_generator.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/common/buildcfg/default_buildcfg.py",
+      "relative": "common/buildcfg/default_buildcfg.py",
+      "sha256": "d1868a27a8ba3418c2b1223ca40897292bec66706caccbe022bc59d50297e280",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/common/buildcfg/default_buildcfg.py"
+    },
+    {
+      "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/asc_op_compile_base/common/ccec.py",
+      "relative": "common/ccec.py",
+      "sha256": "1de9ec11f171ec853bd051984aa09c9fb6ec71e40f9b13fc8e62cda35748fba8",
+      "local": "/tmp/review-native-conv-compiler-20261028/asc_op_compile_base/common/ccec.py"
+    }
+  ],
+  "compiler": {
+    "--help": {
+      "returncode": 0,
+      "local": "/tmp/review-native-conv-compiler-20261028/bisheng--help.txt",
+      "sha256": "e010ed48b3890539e3827960a7e50c21880068aedb5f600c46a45ac91746039b"
+    },
+    "--version": {
+      "returncode": 0,
+      "local": "/tmp/review-native-conv-compiler-20261028/bisheng--version.txt",
+      "sha256": "9fb5b9b6bc8721108d7ce6339c600c543e9540bd2c190b812177a14e88273bc0"
+    },
+    "path": "/usr/local/Ascend/cann-9.2.0/tools/bisheng_compiler/bin/bisheng",
+    "resolved": "/usr/local/Ascend/cann-9.2.0/tools/bisheng_compiler/bin/bisheng"
+  }
+}

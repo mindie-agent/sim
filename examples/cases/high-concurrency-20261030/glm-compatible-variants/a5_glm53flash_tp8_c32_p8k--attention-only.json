@@ -1,0 +1,254 @@
+{
+  "name": "a5_glm53flash_tp8_c32_p8k-body-input:attention-only",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_mxfp8",
+    "quant": {
+      "name": "W8A8_MXFP8",
+      "weight_format": "fp8_e4m3",
+      "native_format": "bf16",
+      "activation_format": "fp8_e4m3",
+      "expert_weight_format": "fp8_e4m3",
+      "weight_block": [
+        1,
+        32
+      ],
+      "expert_block": 32,
+      "scale_format": "fp8_e8m0",
+      "scale_bytes": 1.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "gdn",
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 32,
+      "activation_scale_format": "fp8_e8m0",
+      "activation_scale_pack": 2,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_contract",
+        "checkpoint": "/mnt/weight/GLM-5.3-Flash-w8a8-mxfp8",
+        "basis": "resolved ascend loader plus sampled FP8/E8M0 matrix operands; source BF16 KDA/MLA exclusions"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "KDA_nonempty_accepted_token_state_ABI_not_source_bound",
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "KDA_analytic_state_boundary",
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 16384,
+    "max_num_seqs": 256,
+    "max_num_batched_tokens": 8192,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_capture_mode": "full",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32,
+      40,
+      48,
+      56,
+      64,
+      72,
+      80,
+      88,
+      96,
+      104,
+      112,
+      120,
+      128,
+      136,
+      144,
+      152,
+      160,
+      168,
+      176,
+      184,
+      192,
+      200,
+      208,
+      216,
+      224,
+      232,
+      240,
+      248,
+      256,
+      272,
+      288,
+      304,
+      320,
+      336,
+      352,
+      368,
+      384,
+      400,
+      416,
+      432,
+      448,
+      464,
+      480,
+      496,
+      512
+    ],
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        },
+        "indexed_attention": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        }
+      }
+    },
+    "metadata": {
+      "input_boundary": "complete 45-layer target-body template; placeholder request is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p8k_20261030",
+      "client_summary": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p8k_20261030/benchmark_summary.json",
+        "bytes": 19405,
+        "sha256": "d9e19bb31b35dc807c5c7a712c125b5a1315677ba929c0da9965c622ddddbf50"
+      },
+      "startup": {
+        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "bytes": 335341,
+        "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
+      },
+      "resolved_configuration_lines": [
+        25,
+        67
+      ],
+      "checkpoint": "/mnt/weight/GLM-5.3-Flash-w8a8-mxfp8",
+      "force_eplb": {
+        "enabled": true,
+        "basis": "startup line25"
+      },
+      "expert_parallel": {
+        "enabled": false,
+        "basis": "resolved TP8/DP1 with no enable_expert_parallel flag"
+      },
+      "graph_native_mode": "FULL_AND_PIECEWISE",
+      "prefix_cache": {
+        "enabled": true,
+        "basis": "startup lines25/67",
+        "observed_metrics": {
+          "prefix_cache_hits": 0.0,
+          "prefix_cache_queries": 0.0,
+          "prefix_cache_hit_ratio": null
+        },
+        "caution": "zero metric queries do not prove a zero hit rate"
+      },
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "speculative": {
+        "draft_len": 3,
+        "acceptance": [
+          0.8,
+          0.64,
+          0.512
+        ],
+        "acceptance_mode": "marginal",
+        "label": "configured synthetic acceptance, not observed ratio"
+      },
+      "observed_accept_ratio": 0.6420029895366218,
+      "client": {
+        "concurrency": 32,
+        "prompt_lengths": [
+          8200
+        ],
+        "completion_lengths": [
+          256
+        ],
+        "median_tpot_ms": 25.04988604900884,
+        "metric_boundary": "client token TPOT; not target forward or SSE chunk step"
+      },
+      "geometry_policy": "q4 is the declared target verification width; profiler must resolve active batch/context and graph padding",
+      "unresolved_capture_contracts": [
+        "current checkpoint config bytes not independently captured",
+        "per-body active context and accepted-state indices",
+        "all layer projection exceptions beyond native source defaults"
+      ],
+      "compatible_variant": {
+        "variant": "attention-only",
+        "not_observed_dispatch": true,
+        "scope": "conditional body declaration; unchanged precision and routing",
+        "indexed": {
+          "kind": "indexed_attention_pipeline",
+          "scratch_policy": "offchip",
+          "operand_modes": false,
+          "rope0_analytic": true
+        },
+        "source_down": false,
+        "KDA": "existing analytic decomposition retained; accepted-state ABI unbound",
+        "evidence_assumptions": {
+          "indexed_captured_schedule_and_valid_mask_identity": "not_established",
+          "indexed_geometry_extension": "BF16_rope0_is_not_retained_native_rope64_kernel",
+          "MXFP8_down_captured_dispatch_identity": "not_selected",
+          "scope": "evidence limitations, not model structural coverage"
+        },
+        "validation": "mechanism execution only; no claimed body or kernel accuracy"
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

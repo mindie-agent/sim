@@ -1,0 +1,102 @@
+{
+  "transformers": {
+    "repository": "huggingface/transformers",
+    "revision": "v4.51.3",
+    "tag_url": "https://github.com/huggingface/transformers/tree/v4.51.3",
+    "fetched_sources": [
+      {
+        "path": "src/transformers/models/qwen2/modeling_qwen2.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen2/modeling_qwen2.py",
+        "sha256": "1760c628019995d3564c8572be6c5149f488b6c3aa95ceda16099c2516e146ff",
+        "bytes": 50670,
+        "relevant_lines": "135-150 (Qwen2 attention head_dim/bias), 176-182 (FlashAttn window condition)"
+      },
+      {
+        "path": "src/transformers/models/qwen2_moe/modeling_qwen2_moe.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen2_moe/modeling_qwen2_moe.py",
+        "sha256": "60beee9fc29141b9484e17e9fe98569afbd320ea77945cd32c1c284bd4d6c439",
+        "bytes": 74628,
+        "relevant_lines": "277-306 (derived head_dim, qkv_bias), 580-627 (shared expert/gate), 649-650 (one-based sparse step)"
+      },
+      {
+        "path": "src/transformers/models/qwen3/modeling_qwen3.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen3/modeling_qwen3.py",
+        "sha256": "704c914530530a1acb0b443add1f520404e3ac2c28c0ab7e16f80f86cfe8ccb2",
+        "bytes": 51968,
+        "relevant_lines": "170-203 (explicit head_dim, Q/K norm, attention bias, FlashAttn window condition)"
+      },
+      {
+        "path": "src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen3_moe/modeling_qwen3_moe.py",
+        "sha256": "3af43d01f9f902c8009b6dd7d7b8b563561b53dd0aa54175f585ae90d049fdb8",
+        "bytes": 61931,
+        "relevant_lines": "144-163 (explicit head_dim/QK norm/bias), 237-289 (softmax router), 322-325 (sparse schedule)"
+      },
+      {
+        "path": "src/transformers/models/qwen2/configuration_qwen2.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen2/configuration_qwen2.py",
+        "sha256": "4d3fc49747ab9dd0be658842bd30b877bd8bb644e494bba484b98c191e3952ed",
+        "bytes": 10764
+      },
+      {
+        "path": "src/transformers/models/qwen3/configuration_qwen3.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen3/configuration_qwen3.py",
+        "sha256": "87f0d17326c44f2dfe1bfc329faf9201ab4b19a89ad555da085b4cc81461b201",
+        "bytes": 11202,
+        "relevant_lines": "55 (head_dim default), 109/169 (attention_bias default)"
+      },
+      {
+        "path": "src/transformers/models/qwen2_moe/configuration_qwen2_moe.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen2_moe/configuration_qwen2_moe.py",
+        "sha256": "2e804ac99fa2d1192d5eabf7967c8048ab47744e9c1cd99ba0b2d4c7f76c4ff9",
+        "bytes": 13148
+      },
+      {
+        "path": "src/transformers/models/qwen3_moe/configuration_qwen3_moe.py",
+        "url": "https://raw.githubusercontent.com/huggingface/transformers/v4.51.3/src/transformers/models/qwen3_moe/configuration_qwen3_moe.py",
+        "sha256": "d868dd3b2e94b6406a7abf1f7ec4192f35ce7c1c106dbfe6eb7f6854b62f92ec",
+        "bytes": 12975
+      }
+    ]
+  },
+  "models": [
+    {
+      "repository": "moonshotai/Kimi-K2-Instruct",
+      "revision": "fd1984e2b7a3350dbf7305fe73a4ede25c14de50",
+      "sources": [
+        {
+          "path": "modeling_deepseek.py",
+          "url": "https://huggingface.co/moonshotai/Kimi-K2-Instruct/resolve/fd1984e2b7a3350dbf7305fe73a4ede25c14de50/modeling_deepseek.py",
+          "sha256": "ce753fc9076ce13ce9557e680e2f5bd68ae8929a8225772968a9a22a1d17b7d4",
+          "bytes": 75769,
+          "relevant_lines": "648-683 (MLA q_lora/direct-q and biases), 1152-1158 (first-dense/modulo MoE)"
+        },
+        {
+          "path": "configuration_deepseek.py",
+          "url": "https://huggingface.co/moonshotai/Kimi-K2-Instruct/resolve/fd1984e2b7a3350dbf7305fe73a4ede25c14de50/configuration_deepseek.py",
+          "sha256": "54f29dd0d56e9a13f639c703e524daa71794e360050012aea3788ad7cfc38b17",
+          "bytes": 10652
+        }
+      ]
+    },
+    {
+      "repository": "moonshotai/Kimi-VL-A3B-Instruct",
+      "revision": "398eede0903cd983a2bfa0cc634e9ac1d843f375",
+      "sources": [
+        {
+          "path": "modeling_kimi_vl.py",
+          "url": "https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/resolve/398eede0903cd983a2bfa0cc634e9ac1d843f375/modeling_kimi_vl.py",
+          "sha256": "74e8f18afa5bf8f580ef5be5f15b51506f1e4f604df5a84f508a7796b8947c0b",
+          "bytes": 105649,
+          "relevant_lines": "1235-1245 (direct Q vs q-LoRA), 1731-1737 (first-dense/modulo MoE), 2441 (text model)"
+        },
+        {
+          "path": "configuration_kimi_vl.py",
+          "url": "https://huggingface.co/moonshotai/Kimi-VL-A3B-Instruct/resolve/398eede0903cd983a2bfa0cc634e9ac1d843f375/configuration_kimi_vl.py",
+          "sha256": "d30462b89993b9fef138db983d3884bbc39750effadf2efe67f404d28ee40e5b",
+          "bytes": 13151
+        }
+      ]
+    }
+  ]
+}

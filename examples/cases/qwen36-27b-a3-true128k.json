@@ -1,0 +1,70 @@
+{
+  "name": "catalog-full-model-qwen36-27b-a3-true128k",
+  "machine": {
+    "name": "a3-9362-4die-tp4",
+    "arch_family": "A3",
+    "sku": "Ascend910_9362",
+    "hardware_key": "Ascend910_9362",
+    "dies_per_package": 2,
+    "num_devices": 4,
+    "ranks_per_node": 4,
+    "note": "one A3 host (192.168.13.165), dies 0-3 = cards 0+1 = two two-die packages, one rank per die; the SKU profile materializes the two SIO intra-package links (448 GB/s) and the 4-die HCCS_SW intra-node fabric (196 GB/s)",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.6-27b",
+    "quantization": "W8A8_DYNAMIC"
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 131072,
+        "output_tokens": 4096
+      }
+    ]
+  },
+  "runtime": {
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 8,
+    "max_model_len": 135168,
+    "enable_chunked_prefill": true,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "auto",
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      24,
+      32
+    ],
+    "kv_block_size": 128,
+    "tp": 4,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "mtp_acceptance_by_output_tokens": {
+      "4096": 3.6403
+    },
+    "metadata": {
+      "recipe": "vllm serve /mnt/weight/Qwen3.6-27B-W8A8 --host 0.0.0.0 --port 18232 --served-model-name qwen36 --trust-remote-code --distributed-executor-backend mp --data-parallel-size 1 --tensor-parallel-size 4 --quantization ascend --max-model-len 131072 --max-num-seqs 8 --max-num-batched-tokens 8192 --no-enable-prefix-caching --gpu-memory-utilization 0.90 --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3, \"enforce_eager\": true}' --compilation-config '{\"cudagraph_mode\": \"FULL_DECODE_ONLY\"}' --additional-config '{\"enable_cpu_binding\": true}'",
+      "weights": "/mnt/weight/Qwen3.6-27B-W8A8: W8A8_DYNAMIC int8 body (8 shards, 29.92 GiB, per-die load 8.2111 GB at TP4), 64 layers = 48 GDN + 16 GQA, hidden 5120, 24 Q / 4 KV heads, head_dim 256, vocab 248,320, one MTP head; config.json sha256 69db4eb7...44a9d9c, index 9934094b...21c775e34",
+      "host": "192.168.13.165 (A3, openEuler), 8 NPU packages x 2 dies = 16 dies of 65,536 MB; only dies 0-3 exposed to torch as ranks 0-3",
+      "image": "swr.cn-north-12.myhuaweicloud.com/atlas_inference/vllm-ascend:daily-releases-v0.30.0-a3-cann9.2.1_20261021210600-20261021-r21 (sha256:5bdd40411c1a...), CANN 9.2.1, vLLM 0.30.0 / vllm-ascend 0.30.0rc2.dev200+g8fd0bc488",
+      "measured_baseline": ".workstreams/hp-serving/qwen36-a3-tp4/report.md (2026-10-24 05:43-06:07 CST, 192.168.13.165 dies 0-3); raw /Volumes/data/mindie-sim-data/a3/2026-10-23/qwen36-a3-tp4/; supplement .workstreams/hp-serving/qwen36-a3-tp4/supplement.md (2026-10-23 22:11-22:28 UTC, same host dies 4-7, max-num-seqs 16); raw /Volumes/data/mindie-sim-data/a3/2026-10-23/qwen36-8k32k/",
+      "grid": "16 measured cells: p4096/p16384/p65536/p126976 at c1/c4 plus the 8k/32k supplement at c1/c2/c4/c8. The supplement cells materialize max_num_seqs 16 (their measured serving cap) through the cells manifest's per-cell runtime override; the original eight cells keep the base 8. No latency is stored here.",
+      "max_num_seqs_note": "runtime.max_num_seqs 8 is the original 4k/16k/64k/127k recipe. The 8k/32k supplement ran 16 (the only recipe delta; the KV pool was unchanged) and each supplement cell declares that cap per cell; the profile row binds only a case whose max_num_seqs equals the row's measured cap.",
+      "mtp": "MTP3: qwen3_5_mtp normalised to mtp, num_speculative_tokens=3, draft enforce_eager; the served streams committed 3.361-3.971 tokens per engine step across the eight cells (aggregate 3.6403), 78.5-99.2 % of drafted tokens accepted",
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "enable_prefix_caching": "false",
+      "graph": "FULL_DECODE_ONLY: decode replayed from the engine's captured buckets [1,2,4,8,16,24,32], prefill eager; graph capture 11 s / 0.32 GiB",
+      "kv_cache": "kv block 128; measured pool 2,539,829 tokens / 44.76 GiB per die = 19.38x at 131,072, peak 20.62 % at 126,976 c4; no preemption",
+      "row_policy": "measured rows are declared by the cells manifest and applied only when their exact hardware/geometry matches; a foreign-hardware or foreign-shape row is declared missing, never substituted",
+      "note": "the checkpoint is byte-identical to the A5 TP8 PASS row's checkpoint, so the A3-vs-A5 comparison is same-model, same-checkpoint",
+      "true_128k": "prompt 131072 + output 4096; model config 262144; deployment recipe 131072"
+    }
+  }
+}

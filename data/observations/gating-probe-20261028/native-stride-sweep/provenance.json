@@ -1,0 +1,12 @@
+{
+  "purpose": "isolate destination row stride from logical column count",
+  "source": "data/observations/gating-probe-20261028/native-compile6/store.bcmlir",
+  "source_sha256": "6c598cc6691ddfe33b8774e7c1fd28ae1af312059cc70c06daa1850dfec7e64b",
+  "result_sha256": "3efd5dea0f5199633003eee4fb8b825a8b68c5366ec9671aa2557d697da3861d",
+  "changes": [
+    "new leading_dim i32 before grid arguments",
+    "destination base and row stride use leading_dim",
+    "masks and loops still use logical heads"
+  ],
+  "calibration": false
+}

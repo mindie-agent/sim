@@ -1,0 +1,178 @@
+{
+  "name": "qwen36-a5-tp2-c96-body-input / source GDN native conditional",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 2,
+    "ranks_per_node": 8,
+    "device": {
+      "rates": {
+        "scalar_store_issue": 5657458563.535912
+      },
+      "resource_units": {
+        "scalar_store_issue": 64
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "qwen3.6-27b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.beta_alpha": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.o": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        }
+      },
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 2,
+    "dp": 1,
+    "ep": 1,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/qwen3_6_27b_w8a8_tp2_high_conc_decode_tpot30ms_c96_20261030",
+      "client_concurrency": 96,
+      "captured_execution_mode": "ACLGraph; campaign report",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentGatedDeltaRule",
+          "tensor_batch_slots": 96,
+          "query_rows_per_slot": 4,
+          "tensor_query_rows": 384,
+          "first_csv_row": 114,
+          "sample_count": 144,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "gdn_source_native_condition": {
+        "base_case_identity": {
+          "path": "examples/cases/high-concurrency-20261030/new9/qwen36-a5-tp2-c96.json",
+          "sha256": "06d1ae9e123d3e6f11addc2257dbb0f90014ab511ca414da7a9fb5d0fd4eea50",
+          "size_bytes": 2985
+        },
+        "reference_selection_identity": {
+          "path": "examples/cases/high-concurrency-20261030/source-gdn-native/qwen36-a5-tp8-c4.json",
+          "sha256": "f6bf90351b1258bd0bd92e5fcac49feeb6f254908a914222362c42ab82db7a15",
+          "size_bytes": 4596
+        },
+        "primitive_parameters_identity": {
+          "path": "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
+          "sha256": "6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb",
+          "size_bytes": 1046
+        },
+        "contract_evidence_path": "data/verification/qwen-source-gdn-native-new6-20261030.json",
+        "observed_primary_execution_geometry": {
+          "query_rows": 384,
+          "sequences_per_replica": 96,
+          "tokens_per_sequence": 4,
+          "context_tokens": null,
+          "batch_basis": "captured_paged_attention_block_table_rows",
+          "context_basis": "not_observed_from_cache_capacity"
+        },
+        "observed_primary_forward_count": 24,
+        "geometry_policy": "Preserve original model, TP/DP/EP and workload. Runtime q/B/context are supplied by the retained Body replay geometry; client concurrency is not active request proof.",
+        "primitive_rate_scope": "Independent Ascend950DT_9582 BF16 scalar-store per-unit issue rate times 64 per-device owners; no capture/operator/Body latency was fitted.",
+        "per_device_scalar_store_owners": 64,
+        "recurrent_implementation": "arch35_fp32",
+        "cache_index_row_stride": {
+          "selected": 4,
+          "basis": "explicit speculative caller proposal-table source condition; captured CausalConv receives a contiguous [B] view and does not establish original strides"
+        },
+        "gating_tensor_abi_observed": false,
+        "capture_binary_source_identity_verified": false,
+        "limitations": [
+          "Selected representative RecurrentGatedDeltaRule and CausalConv ABIs are retained; this is not full-family occurrence validation.",
+          "The fused gating event lacks a complete tensor contract; BF16 beta/FP32 decay agree with the adjacent recurrence contract and source caller, not a strict standalone gating binding.",
+          "Captured state/cache bank capacity is storage capacity, not active work.",
+          "Primitive service calibration is reused independently; binary dispatch, peer activity and active context lengths remain unverified.",
+          "shared effects at 64 units remain: 5.1-13.2 percent underprediction in three heldout cases",
+          "kernel entry, vector transcendental and synchronization stages are not calibrated by this primitive",
+          "no whole-operator or model latency was fitted"
+        ]
+      }
+    },
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            },
+            "recurrent_implementation": "arch35_fp32",
+            "cache_index_row_stride": 4
+          }
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4104,
+        "output_tokens": 384
+      }
+    ]
+  }
+}

@@ -1,0 +1,1828 @@
+{
+  "name": "a5_kimi_tp8_e16_bf16_c8_p16k-conditional-body-input",
+  "model": {
+    "name": "kimi-k3-e16-bf16-conditional",
+    "hf_config": {
+      "architectures": [
+        "KimiK3ForConditionalGeneration"
+      ],
+      "auto_map": {
+        "AutoConfig": "configuration_kimi_k3.KimiK3Config",
+        "AutoModel": "modeling_kimi_k3.KimiK3ForConditionalGeneration",
+        "AutoModelForCausalLM": "modeling_kimi_k3.KimiK3ForConditionalGeneration"
+      },
+      "bos_token_id": 163584,
+      "dtype": "bfloat16",
+      "eos_token_id": 163586,
+      "ignore_index": -100,
+      "image_placeholder": "<|kimi_image_placeholder|>",
+      "media_placeholder_token_id": 163605,
+      "model_type": "kimi_k3",
+      "pad_token_id": 163839,
+      "text_config": {
+        "_name_or_path": "",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "add_cross_attention": false,
+        "architectures": [
+          "KimiLinearForCausalLM"
+        ],
+        "attn_res_block_size": 12,
+        "auto_map": {
+          "AutoConfig": "configuration_kimi_k3.KimiLinearConfig",
+          "AutoModel": "modeling_kimi_linear.KimiLinearModel",
+          "AutoModelForCausalLM": "modeling_kimi_linear.KimiLinearForCausalLM"
+        },
+        "bad_words_ids": null,
+        "begin_suppress_tokens": null,
+        "bos_token_id": 163584,
+        "chunk_size_feed_forward": 0,
+        "cross_attention_hidden_size": null,
+        "decoder_start_token_id": null,
+        "diversity_penalty": 0,
+        "do_sample": false,
+        "dtype": "bfloat16",
+        "early_stopping": false,
+        "encoder_no_repeat_ngram_size": 0,
+        "eos_token_id": 163586,
+        "exponential_decay_length_penalty": null,
+        "finetuning_task": null,
+        "first_k_dense_replace": 1,
+        "forced_bos_token_id": null,
+        "forced_eos_token_id": null,
+        "hidden_act": "situ",
+        "hidden_size": 7168,
+        "id2label": {
+          "0": "LABEL_0",
+          "1": "LABEL_1"
+        },
+        "initializer_range": 0.02,
+        "intermediate_size": 33792,
+        "is_decoder": false,
+        "is_encoder_decoder": false,
+        "kv_lora_rank": 512,
+        "label2id": {
+          "LABEL_0": 0,
+          "LABEL_1": 1
+        },
+        "latent_moe_use_norm": true,
+        "length_penalty": 1,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            36,
+            40,
+            44,
+            48,
+            52,
+            56,
+            60,
+            64,
+            68,
+            72,
+            76,
+            80,
+            84,
+            88,
+            92,
+            93
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            19,
+            21,
+            22,
+            23,
+            25,
+            26,
+            27,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            37,
+            38,
+            39,
+            41,
+            42,
+            43,
+            45,
+            46,
+            47,
+            49,
+            50,
+            51,
+            53,
+            54,
+            55,
+            57,
+            58,
+            59,
+            61,
+            62,
+            63,
+            65,
+            66,
+            67,
+            69,
+            70,
+            71,
+            73,
+            74,
+            75,
+            77,
+            78,
+            79,
+            81,
+            82,
+            83,
+            85,
+            86,
+            87,
+            89,
+            90,
+            91
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "max_length": 20,
+        "max_position_embeddings": 1048576,
+        "min_length": 0,
+        "mla_use_nope": true,
+        "mla_use_output_gate": true,
+        "model_type": "kimi_linear",
+        "moe_intermediate_size": 3072,
+        "moe_layer_freq": 1,
+        "moe_renormalize": true,
+        "moe_router_activation_func": "sigmoid",
+        "no_repeat_ngram_size": 0,
+        "num_attention_heads": 96,
+        "num_beam_groups": 1,
+        "num_beams": 1,
+        "num_expert_group": 1,
+        "num_experts": 16,
+        "num_experts_per_token": 8,
+        "num_hidden_layers": 93,
+        "num_key_value_heads": 128,
+        "num_nextn_predict_layers": 0,
+        "num_return_sequences": 1,
+        "num_shared_experts": 2,
+        "output_attentions": false,
+        "output_hidden_states": false,
+        "output_scores": false,
+        "pad_token_id": 163839,
+        "prefix": null,
+        "problem_type": null,
+        "pruned_heads": {},
+        "q_lora_rank": 1536,
+        "qk_nope_head_dim": 128,
+        "qk_rope_head_dim": 64,
+        "remove_invalid_values": false,
+        "repetition_penalty": 1,
+        "return_dict": true,
+        "return_dict_in_generate": false,
+        "rms_norm_eps": 1e-05,
+        "routed_expert_hidden_size": 3584,
+        "routed_scaling_factor": 1,
+        "sep_token_id": null,
+        "suppress_tokens": null,
+        "task_specific_params": null,
+        "temperature": 1,
+        "tf_legacy_loss": false,
+        "tie_encoder_decoder": false,
+        "tie_word_embeddings": false,
+        "tokenizer_class": null,
+        "top_k": 50,
+        "top_p": 1,
+        "topk_group": 1,
+        "topk_method": "noaux_tc",
+        "torchscript": false,
+        "transformers_version": "4.56.2",
+        "typical_p": 1,
+        "use_bfloat16": false,
+        "use_cache": true,
+        "use_grouped_topk": true,
+        "v_head_dim": 128,
+        "vocab_size": 163840
+      },
+      "tie_word_embeddings": false,
+      "vision_config": {
+        "_attn_implementation": "flash_attention_2",
+        "activation_func": "gelu_pytorch_tanh",
+        "attn_bias": false,
+        "init_pos_emb_height": 64,
+        "init_pos_emb_time": 4,
+        "init_pos_emb_width": 64,
+        "linear_bias": false,
+        "merge_kernel_size": [
+          2,
+          2
+        ],
+        "merge_type": "sd2_tpool",
+        "mlp_type": "mlp2",
+        "mm_hidden_size": 1024,
+        "mm_projector_type": "patchmergerv2",
+        "norm_type": "rmsnorm",
+        "patch_embed_proj_bias": false,
+        "patch_size": 14,
+        "pos_emb_interpolation_mode": "bilinear",
+        "pos_emb_type": "divided_fixed",
+        "projector_hidden_act": "gelu",
+        "projector_ln_eps": 1e-05,
+        "qkv_hidden_size": 1536,
+        "text_hidden_size": 7168,
+        "vt_hidden_size": 1024,
+        "vt_intermediate_size": 4096,
+        "vt_num_attention_heads": 12,
+        "vt_num_hidden_layers": 27
+      }
+    },
+    "quant": {
+      "name": "bf16",
+      "weight_format": "bf16",
+      "native_format": "bf16",
+      "activation_format": "bf16",
+      "expert_weight_format": "bf16",
+      "weight_block": [
+        0,
+        0
+      ],
+      "expert_block": 32,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "conditional_capture_representation",
+        "basis": "sampled operand dtypes plus distinct checkpoint launch declaration",
+        "checkpoint_config_bytes": "not_delivered"
+      },
+      "notes": [
+        "No old checkpoint calibration or FP8 source binding is inherited."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "Kimi BF16 packed input projection padding/packing is not source-bound",
+        "native MoeDistributeDispatchV3/CombineV3 protocol uses analytic collective decomposition"
+      ],
+      "degraded_submodules": [
+        "native_projection_packing",
+        "native_moe_dispatch"
+      ],
+      "checkpoint_contract": "conditional_source_and_tensor_declaration",
+      "field_evidence": {
+        "hidden_size": {
+          "value": 7168,
+          "basis": "router/input projection tensors"
+        },
+        "routed_expert_hidden_size": {
+          "value": 3584,
+          "basis": "latent projection and grouped matrix K/N"
+        },
+        "moe_intermediate_size": {
+          "value": 3072,
+          "basis": "grouped gate/up N6144 and down K3072"
+        },
+        "intermediate_size": {
+          "value": 33792,
+          "basis": "first dense layer N8448=2*33792/TP8, down K4224"
+        },
+        "num_shared_experts": {
+          "value": 2,
+          "basis": "MoE shared N1536=2*(2*3072)/TP8, down K768"
+        },
+        "linear_attn_config.num_heads": {
+          "value": 96,
+          "basis": "RecurrentKda local heads12 at TP8"
+        },
+        "linear_attn_config.head_dim": {
+          "value": 128,
+          "basis": "RecurrentKda native dimension"
+        },
+        "q_lora_rank": {
+          "value": 1536,
+          "basis": "q_a/q_b matrix operands"
+        },
+        "kv_lora_rank": {
+          "value": 512,
+          "basis": "FIA cache/head operands"
+        },
+        "qk_nope_head_dim": {
+          "value": 128,
+          "basis": "absorbed Q projection operands"
+        },
+        "qk_rope_head_dim": {
+          "value": 64,
+          "basis": "FIA RoPE operands"
+        },
+        "first_k_dense_replace": {
+          "value": 1,
+          "basis": "first dense FFN precedes router/grouped FFNs"
+        },
+        "num_hidden_layers": {
+          "value": 93,
+          "basis": "launch declaration plus 69 KDA / 24 MLA complete topology candidate"
+        },
+        "num_experts": {
+          "value": 16,
+          "basis": "router N16 and two experts per EP8 bank"
+        },
+        "num_experts_per_token": {
+          "value": 8,
+          "basis": "expert16-top8 launch checkpoint declaration"
+        },
+        "num_attention_heads": {
+          "value": 96,
+          "basis": "TransposeBatchMatMul logical batch12 with FIA physical16; source slices before v_up_proj",
+          "evidence": "examples/structure/acceptance-20261030-matrix-fix/a5_kimi_tp8_e16_bf16_c8_p16k-matrix-partitions.json"
+        },
+        "quant": {
+          "value": "bf16",
+          "basis": "sampled dense, shared, routed and attention projection operands are BF16"
+        },
+        "router_precision": {
+          "value": {
+            "operands": "bf16",
+            "output": "fp32"
+          },
+          "basis": "captured full tensor ABI; generic GateLinear supports separate out_dtype"
+        }
+      },
+      "retained_catalog_assumptions": {
+        "attn_res_block_size": 12,
+        "hidden_act": "situ",
+        "activation_situ_beta": 4,
+        "activation_situ_linear_beta": 25,
+        "latent_moe_use_norm": true,
+        "rms_norm_eps": 1e-05,
+        "v_head_dim": 128,
+        "vocab_size": 163840,
+        "moe_router_activation_func": "sigmoid",
+        "routed_scaling_factor": 1,
+        "mla_use_output_gate": true,
+        "linear_attn_config": {
+          "full_attn_layers": [
+            4,
+            8,
+            12,
+            16,
+            20,
+            24,
+            28,
+            32,
+            36,
+            40,
+            44,
+            48,
+            52,
+            56,
+            60,
+            64,
+            68,
+            72,
+            76,
+            80,
+            84,
+            88,
+            92,
+            93
+          ],
+          "gate_lower_bound": -5,
+          "head_dim": 128,
+          "kda_layers": [
+            1,
+            2,
+            3,
+            5,
+            6,
+            7,
+            9,
+            10,
+            11,
+            13,
+            14,
+            15,
+            17,
+            18,
+            19,
+            21,
+            22,
+            23,
+            25,
+            26,
+            27,
+            29,
+            30,
+            31,
+            33,
+            34,
+            35,
+            37,
+            38,
+            39,
+            41,
+            42,
+            43,
+            45,
+            46,
+            47,
+            49,
+            50,
+            51,
+            53,
+            54,
+            55,
+            57,
+            58,
+            59,
+            61,
+            62,
+            63,
+            65,
+            66,
+            67,
+            69,
+            70,
+            71,
+            73,
+            74,
+            75,
+            77,
+            78,
+            79,
+            81,
+            82,
+            83,
+            85,
+            86,
+            87,
+            89,
+            90,
+            91
+          ],
+          "num_heads": 96,
+          "short_conv_kernel_size": 4,
+          "use_full_rank_gate": true
+        },
+        "num_shared_experts": 2,
+        "first_k_dense_replace": 1
+      },
+      "catalog_assumption_source": {
+        "path": "/Users/maoxx241/code/sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
+        "bytes": 6991,
+        "sha256": "ceb15bb6babc95c3afc948f0887a732b69e8ac126dae36ef7b6aeb1effb2b46f"
+      },
+      "inheritance_note": "Values are explicit structural assumptions unless field_evidence independently confirms them; layer counts are this checkpoint, not a truncated accuracy surrogate.",
+      "superseded_head_inference": {
+        "value": 128,
+        "basis": "MlaProlog/FIA local heads16 times TP8"
+      },
+      "logical_physical_head_contract": {
+        "logical_global_heads": 96,
+        "logical_local_heads": 12,
+        "physical_decode_heads": 16,
+        "kv_cache_heads": 1,
+        "checkpoint_config_bytes": "not_delivered",
+        "num_key_value_heads_field": "retained config placeholder; MLA cache is shared single latent head",
+        "source_binding": "explicit native-BF16 retained-prefill-weight caller assumption",
+        "capture_abi": {
+          "FusedInferAttentionScore": [
+            "attention_paged_mla_qk_rope",
+            "FusedInferAttentionScore",
+            [
+              [
+                [
+                  8,
+                  16,
+                  1,
+                  512
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  8,
+                  16,
+                  1,
+                  64
+                ],
+                "bf16",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  1,
+                  128,
+                  512
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  1,
+                  128,
+                  512
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  1,
+                  128,
+                  64
+                ],
+                "bf16",
+                "ND"
+              ]
+            ],
+            [
+              [
+                16,
+                8,
+                1,
+                512
+              ],
+              "bf16",
+              "ND"
+            ],
+            8
+          ],
+          "TransposeBatchMatMul": [
+            "transpose_batchmatmul_active",
+            "TransposeBatchMatMul",
+            [
+              12,
+              8,
+              128,
+              512
+            ],
+            "bf16",
+            "bf16",
+            "bf16"
+          ],
+          "router": [
+            "native_tensor_abi",
+            "MatMulV3",
+            [
+              [
+                [
+                  1,
+                  7168
+                ],
+                "bf16",
+                "ND"
+              ],
+              [
+                [
+                  16,
+                  7168
+                ],
+                "bf16",
+                "ND"
+              ]
+            ],
+            [
+              [
+                [
+                  1,
+                  16
+                ],
+                "fp32",
+                "ND"
+              ]
+            ]
+          ]
+        },
+        "source_abi_receipt": {
+          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-matrix-fix/a5_kimi_tp8_e16_bf16_c8_p16k-matrix-partitions.json",
+          "sha256": "4b2f4498e97c0ee9f5528a960cc54c332c42623d04b419ec756f2be479f8728c",
+          "size_bytes": 248499
+        }
+      }
+    },
+    "layer_overrides": {
+      "0": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "1": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "2": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "3": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "4": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "5": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "6": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "7": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "8": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "9": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "10": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "11": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "12": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "13": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "14": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "15": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "16": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "17": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "18": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "19": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "20": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "21": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "22": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "23": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "24": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "25": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "26": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "27": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "28": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "29": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "30": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "31": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "32": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "33": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "34": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "35": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "36": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "37": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "38": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "39": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "40": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "41": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "42": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "43": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "44": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "45": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "46": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "47": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "48": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "49": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "50": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "51": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "52": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "53": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "54": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "55": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "56": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "57": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "58": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "59": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "60": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "61": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "62": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "63": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "64": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "65": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "66": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "67": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "68": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "69": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "70": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "71": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "72": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "73": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "74": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "75": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "76": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "77": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "78": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "79": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "80": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "81": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "82": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "83": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "84": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "85": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "86": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "87": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "88": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "89": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "90": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "91": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      },
+      "92": {
+        "router_dtype": "bf16",
+        "router_output_dtype": "fp32"
+      }
+    }
+  },
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 8,
+    "ranks_per_node": 8
+  },
+  "runtime": {
+    "tp": 8,
+    "dp": 1,
+    "ep": 8,
+    "pp": 1,
+    "routing": {
+      "policy": "balanced"
+    },
+    "max_model_len": 65536,
+    "max_num_seqs": 64,
+    "max_num_batched_tokens": 8192,
+    "gpu_memory_utilization": 0.9,
+    "graph_mode": "eager",
+    "kernels": {
+      "programs": {
+        "matmul": {
+          "kind": "steady_matmul"
+        }
+      },
+      "sequence_parallel": {
+        "implementation": "vllm_ascend_kimi_sequence_parallel",
+        "enable_expert_parallel": true,
+        "padding": "right_to_tp",
+        "attention_output": "separate_reduce_scatter",
+        "shard_materialization": "view",
+        "shared_expert_layout": "tp_sharded"
+      },
+      "recipes": {},
+      "lowerings": {
+        "attention_residual": {
+          "implementation": "vllm_ascend_attn_res_prefix",
+          "options": {
+            "optimize_prefill": false
+          }
+        },
+        "mla_head_padding": "vllm_ascend_mla_head_padding",
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch35",
+          "options": {
+            "use_beta_sigmoid": false
+          }
+        },
+        "paged_mla_attention": {
+          "implementation": "ascend_paged_mla_decode_arch35",
+          "options": {
+            "kv_splits": 1,
+            "dispatch": {
+              "contexts": [
+                16392,
+                16392,
+                16392,
+                16392,
+                16392,
+                16392,
+                16392,
+                16392
+              ],
+              "heads": 16,
+              "aic_owner_segments": [
+                [
+                  [
+                    0,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    0,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    0,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    0,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    0,
+                    128,
+                    1
+                  ],
+                  [
+                    1,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    1,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    1,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    1,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    1,
+                    128,
+                    1
+                  ],
+                  [
+                    2,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    2,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    2,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    2,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    2,
+                    128,
+                    1
+                  ],
+                  [
+                    3,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    3,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    3,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    3,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    3,
+                    128,
+                    1
+                  ],
+                  [
+                    4,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    4,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    4,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    4,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    4,
+                    128,
+                    1
+                  ],
+                  [
+                    5,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    5,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    5,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    5,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    5,
+                    128,
+                    1
+                  ],
+                  [
+                    6,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    6,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    6,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    6,
+                    96,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    6,
+                    128,
+                    1
+                  ],
+                  [
+                    7,
+                    0,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    7,
+                    32,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    7,
+                    64,
+                    32
+                  ]
+                ],
+                [
+                  [
+                    7,
+                    96,
+                    33
+                  ]
+                ]
+              ],
+              "aiv_merge_segments": [
+                [
+                  0,
+                  0,
+                  2
+                ],
+                [
+                  0,
+                  2,
+                  2
+                ],
+                [
+                  0,
+                  4,
+                  2
+                ],
+                [
+                  0,
+                  6,
+                  2
+                ],
+                [
+                  0,
+                  8,
+                  2
+                ],
+                [
+                  0,
+                  10,
+                  2
+                ],
+                [
+                  0,
+                  12,
+                  2
+                ],
+                [
+                  0,
+                  14,
+                  2
+                ],
+                [
+                  1,
+                  0,
+                  2
+                ],
+                [
+                  1,
+                  2,
+                  2
+                ],
+                [
+                  1,
+                  4,
+                  2
+                ],
+                [
+                  1,
+                  6,
+                  2
+                ],
+                [
+                  1,
+                  8,
+                  2
+                ],
+                [
+                  1,
+                  10,
+                  2
+                ],
+                [
+                  1,
+                  12,
+                  2
+                ],
+                [
+                  1,
+                  14,
+                  2
+                ],
+                [
+                  2,
+                  0,
+                  2
+                ],
+                [
+                  2,
+                  2,
+                  2
+                ],
+                [
+                  2,
+                  4,
+                  2
+                ],
+                [
+                  2,
+                  6,
+                  2
+                ],
+                [
+                  2,
+                  8,
+                  2
+                ],
+                [
+                  2,
+                  10,
+                  2
+                ],
+                [
+                  2,
+                  12,
+                  2
+                ],
+                [
+                  2,
+                  14,
+                  2
+                ],
+                [
+                  3,
+                  0,
+                  2
+                ],
+                [
+                  3,
+                  2,
+                  2
+                ],
+                [
+                  3,
+                  4,
+                  2
+                ],
+                [
+                  3,
+                  6,
+                  2
+                ],
+                [
+                  3,
+                  8,
+                  2
+                ],
+                [
+                  3,
+                  10,
+                  2
+                ],
+                [
+                  3,
+                  12,
+                  2
+                ],
+                [
+                  3,
+                  14,
+                  2
+                ],
+                [
+                  4,
+                  0,
+                  2
+                ],
+                [
+                  4,
+                  2,
+                  2
+                ],
+                [
+                  4,
+                  4,
+                  2
+                ],
+                [
+                  4,
+                  6,
+                  2
+                ],
+                [
+                  4,
+                  8,
+                  2
+                ],
+                [
+                  4,
+                  10,
+                  2
+                ],
+                [
+                  4,
+                  12,
+                  2
+                ],
+                [
+                  4,
+                  14,
+                  2
+                ],
+                [
+                  5,
+                  0,
+                  2
+                ],
+                [
+                  5,
+                  2,
+                  2
+                ],
+                [
+                  5,
+                  4,
+                  2
+                ],
+                [
+                  5,
+                  6,
+                  2
+                ],
+                [
+                  5,
+                  8,
+                  2
+                ],
+                [
+                  5,
+                  10,
+                  2
+                ],
+                [
+                  5,
+                  12,
+                  2
+                ],
+                [
+                  5,
+                  14,
+                  2
+                ],
+                [
+                  6,
+                  0,
+                  2
+                ],
+                [
+                  6,
+                  2,
+                  2
+                ],
+                [
+                  6,
+                  4,
+                  2
+                ],
+                [
+                  6,
+                  6,
+                  2
+                ],
+                [
+                  6,
+                  8,
+                  2
+                ],
+                [
+                  6,
+                  10,
+                  2
+                ],
+                [
+                  6,
+                  12,
+                  2
+                ],
+                [
+                  6,
+                  14,
+                  2
+                ],
+                [
+                  7,
+                  0,
+                  3
+                ],
+                [
+                  7,
+                  3,
+                  3
+                ],
+                [
+                  7,
+                  6,
+                  3
+                ],
+                [
+                  7,
+                  9,
+                  3
+                ],
+                [
+                  7,
+                  12,
+                  3
+                ],
+                [
+                  7,
+                  15,
+                  1
+                ]
+              ],
+              "source": {
+                "oracle": {
+                  "path": "data/verification/paged-mla-split-actual-context-20261030.json",
+                  "sha256": "8af4f775eab928d6bec7613cf9a44a98203585fc9b7ab5fc02ee47d0e9cea21f",
+                  "bytes": 65868
+                },
+                "geometry_source": "profiler primary geometry / initial prompt reference; per-forward growth unobserved",
+                "capture_binary_identity": "not_established"
+              }
+            }
+          }
+        }
+      },
+      "native_moe_protocol": {
+        "kind": "arch35_fullmesh",
+        "max_inflight_per_rank": 8
+      },
+      "families": {
+        "grouped_gemm": {
+          "kind": "ascend_bf16_grouped"
+        }
+      }
+    },
+    "metadata": {
+      "input_boundary": "target body template; native graph buckets unresolved, no invented capture padding",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/kimi_k3_tp8_high_conc_decode_c8_p16k_20261030",
+      "selected_source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/kimi_k3_tp8_high_conc_decode_c8_p16k_20261030/kernel_details.csv",
+        "size_bytes": 92257150,
+        "identity_basis": "new extension path/stat; profiler source hashing pending"
+      },
+      "deployment_evidence": {
+        "launch_source": {
+          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/scripts/ws9/serve_kimi_k3_tp8.sh",
+          "sha256": "f3589dfd1d458c8f62557a233b573fe2c380320cd6312aa8e3f500ccc08ca262",
+          "size_bytes": 3892
+        },
+        "resolved_startup": null,
+        "configured": {
+          "checkpoint": "/mnt/weight/Kimi-K3-expert16-top8-100B-CountBenchQA",
+          "tp": 8,
+          "dp": 1,
+          "ep": 8,
+          "model_body_layers": 93,
+          "force_eplb": true,
+          "prefix_caching": false,
+          "num_speculative_tokens": 0,
+          "graph_mode": "FULL_DECODE_ONLY",
+          "quantization": "checkpoint_auto; not an explicit CLI flag"
+        },
+        "evidence_strength": "retained_launch_intent; resolved startup not located",
+        "actual_force_eplb": null
+      },
+      "routing_basis": "explicit forced-balance scenario from retained launch intent; resolved startup absent",
+      "speculation": {
+        "enabled": false,
+        "basis": "launch declaration"
+      },
+      "prefix_cache": {
+        "configured": false,
+        "observed_metrics": {
+          "prefix_cache_hits": 0.0,
+          "prefix_cache_queries": 0.0,
+          "prefix_cache_hit_ratio": null
+        }
+      },
+      "captured_execution_mode": "FULL_DECODE_ONLY launch intent; simulated graph wrapper omitted at this body boundary",
+      "client": {
+        "concurrency": 8,
+        "prompt_lengths": [
+          16392
+        ],
+        "median_tpot_ms": 65.3152442445942,
+        "metric_boundary": "client token TPOT, not body time"
+      },
+      "geometry": null,
+      "geometry_source": null,
+      "sp_contract": "source-verified right padding; current captured helper binary not identified",
+      "moe_boundary": "native DistributeDispatch/Combine retained in capture; analytic alltoall decomposition is not exact MC2 protocol",
+      "representation_source": {
+        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-tp8/geometry-probe.json",
+        "bytes": 116563,
+        "sha256": "00a6dec71a4bdb521e6a7df428ad3c6c636a3420451e595ad616a2f981a9ccb5"
+      },
+      "unresolved_capture_contracts": [
+        "checkpoint config and quant-description bytes",
+        "resolved force-EPLB startup",
+        "current context and actual group_list",
+        "native physical padding/dispatch protocol",
+        "all layer-specific quant exceptions"
+      ],
+      "attnres_contract": {
+        "basis": "explicit_source_compatible_full_prefix_call",
+        "implementation": "vllm_ascend_attn_res_prefix",
+        "caller_sha256": "be9adc792774f919f443caf483eb2e04e4453617465381f47a482dd4736ec63f",
+        "prefix_bank_capacity": 8,
+        "points_per_body": 187,
+        "source_scope": "PP1, BF16, inference, deferred FFN addition, no materialized DSpark auxiliary rows",
+        "capture_identity": "187 events per complete 93-layer body supports call count; scalar flags and loaded kernel binary unresolved",
+        "boundary": "replaces decomposed mixture, norms and residual additions; never additive to them"
+      },
+      "source_scenario": {
+        "id": "a5_kimi_tp8_e16_bf16_c8_p16k_source_actual_context",
+        "base_case": "a5_kimi_tp8_e16_bf16_c8_p16k",
+        "selected": [
+          "kda_decode_arch35",
+          "arch35_fullmesh_native_mc2",
+          "ascend_bf16_grouped",
+          "vllm_ascend_attn_res_prefix",
+          "vllm_ascend_mla_head_padding",
+          "ascend_paged_mla_decode_arch35_retained_source_host_metadata"
+        ],
+        "not_selected": [
+          "captured_FIA_host_dispatch_binary_identity_unverified"
+        ],
+        "identity": "retained_source_compatible; capture_binary_and_host_tiling_unverified",
+        "routing": "unchanged_explicit_balanced_scenario; captured_group_list_unknown",
+        "context": "profiler initial prompt context; active per-forward KV growth unobserved",
+        "kda": {
+          "query_tokens": 1,
+          "accepted_tokens": false,
+          "state_dtype": "fp32",
+          "raw_gate_dtype": "bf16",
+          "beta_dtype": "fp32",
+          "basis": "native tensor ABI plus no-MTP launch; scalar safe_gate source default remains conditional"
+        },
+        "actual_context_reference": {
+          "manifest_case_id": "a5_kimi_tp8_e16_bf16_c8_p16k",
+          "original_case": {
+            "path": "examples/cases/high-concurrency-20261030/kimi-source-paged-host/a5_kimi_tp8_e16_bf16_c8_p16k_source.json",
+            "sha256": "7211d95c7187b5413fb37754fb696bbea88ccd088e480a12a4c7914917198fff",
+            "size_bytes": 44677
+          },
+          "primary_geometry": {
+            "query_rows": 8,
+            "sequences_per_replica": 8,
+            "tokens_per_sequence": 1,
+            "context_tokens": 16392,
+            "batch_basis": "captured_paged_attention_block_table_rows",
+            "context_basis": "not_observed_from_cache_capacity",
+            "phase": "decode"
+          },
+          "client_context_evidence": {
+            "concurrency": 8,
+            "input_len": 16392,
+            "observed_prompt_tokens": [
+              16392
+            ],
+            "output_len": 256
+          },
+          "source_identity": {
+            "path": "/Volumes/data/mindie-sim-data/a5/kimi_k3_tp8_high_conc_decode_c8_p16k_20261030/kernel_details.csv",
+            "sha256": "705cd2cd4965560f3a1149bcb62d2a053cded55e0aff15aabb374d318011f749",
+            "size_bytes": 92257150
+          },
+          "oracle": {
+            "path": "data/verification/paged-mla-split-actual-context-20261030.json",
+            "sha256": "8af4f775eab928d6bec7613cf9a44a98203585fc9b7ab5fc02ee47d0e9cea21f",
+            "size_bytes": 65868
+          }
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "placeholder",
+        "prompt_tokens": 1,
+        "output_tokens": 1
+      }
+    ]
+  }
+}

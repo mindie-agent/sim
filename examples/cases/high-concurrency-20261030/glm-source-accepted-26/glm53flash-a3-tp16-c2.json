@@ -1,0 +1,190 @@
+{
+  "name": "glm53flash-a3-tp16-c2:source-accepted-conditional",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend910_9362",
+    "num_devices": 16,
+    "ranks_per_node": 16
+  },
+  "model": {
+    "catalog_key": "glm-5.3-flash",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "int8",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {},
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    },
+    "metadata": {
+      "model_coverage": "partial",
+      "unmodeled_features": [
+        "fused_expert_gate_up_source_schedule_not_bound",
+        "unrecognized_config_field:hc_eps",
+        "unrecognized_config_field:index_kpool",
+        "unrecognized_config_field:index_kpool_always_select_tail",
+        "unrecognized_config_field:index_kpool_compress",
+        "unrecognized_config_field:index_share_for_mtp_iteration",
+        "unrecognized_config_field:indexer_rope_interleave",
+        "unrecognized_config_field:mla_use_nope",
+        "unrecognized_config_field:provenance",
+        "unrecognized_config_field:qk_head_dim",
+        "unrecognized_config_field:swiglu_limit"
+      ],
+      "degraded_submodules": [
+        "fused_expert_gate_up_analytic_decomposition"
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 16,
+    "dp": 1,
+    "ep": 16,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a3/glm5_3_flash_w8a8_high_conc_decode_tpot30_c2_20261030",
+      "client_concurrency": 2,
+      "captured_execution_mode": "not_established",
+      "fusion_contract": null,
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentKda",
+          "tensor_batch_slots": 1,
+          "query_rows_per_slot": 6,
+          "tensor_query_rows": 6,
+          "first_csv_row": 4461,
+          "sample_count": 34,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "force_eplb_not_established; do_not_enable_balanced_routing",
+        "INT8_KV_payload_proven_but_scale_packing_and_sparse_KV_kernel_not_bound",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "compatible_variant": {
+        "variant": "attention-only",
+        "not_observed_dispatch": true,
+        "scope": "conditional body declaration; unchanged precision and routing",
+        "indexed": {
+          "kind": "indexed_attention_packed_int8",
+          "scratch_policy": "offchip",
+          "operand_modes": true
+        },
+        "source_down": false,
+        "KDA": "explicit symbolic accepted-state source reference; captured values and flags unobserved",
+        "evidence_assumptions": {
+          "indexed_captured_schedule_and_valid_mask_identity": "not_established",
+          "indexed_geometry_extension": "packed_INT8_528_is_not_retained_native_672_kernel",
+          "MXFP8_down_captured_dispatch_identity": "not_selected",
+          "scope": "evidence limitations, not model structural coverage"
+        },
+        "validation": "mechanism execution only; no claimed body or kernel accuracy"
+      },
+      "accepted_state_scenario": {
+        "id": "glm53flash-a3-tp16-c2",
+        "baseline": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a3-tp16-c2--attention-only.json",
+          "sha256": "c4a2c53842f55837145106b9814469bbb1da73c5d42037474c3830eab8cf032b",
+          "size_bytes": 4934
+        },
+        "prototype": {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a3-b4-q6.json",
+          "sha256": "84d1b902098e09fd34b68c9b11592a2519258d19528b0bd6753cc5ac828583fa",
+          "size_bytes": 6869
+        },
+        "tokens_per_sequence": 6,
+        "sequences_per_replica": 2,
+        "context_tokens": 4096,
+        "scope": "body",
+        "source_architecture": "arch22",
+        "value_identity": "not_established",
+        "acceptance_changes_query_work": false,
+        "sigmoid_placement": "explicit in-kernel scenario, not inferred from BF16 beta",
+        "private_external_fp32_sigmoid_boundary": "not_matched_by_this_conditional_native_program",
+        "observed_geometry_identity": {
+          "path": "/Volumes/data/code/mindie-release-20261014/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-glm53flash-a3-tp16-c2.json",
+          "sha256": "7925fcbe9dada890cbd391f2908605e612289627d2eefd1c7e7209ddd998dc1c",
+          "size_bytes": 2103590
+        }
+      }
+    },
+    "kernels": {
+      "programs": {
+        "indexed_attention": {
+          "kind": "indexed_attention_packed_int8",
+          "scratch_policy": "offchip",
+          "operand_modes": true
+        }
+      },
+      "lowerings": {
+        "kda": {
+          "implementation": "vllm_ascend_recurrent_kda_arch22",
+          "options": {
+            "safe_gate": true,
+            "use_beta_sigmoid": true,
+            "state_selection": {
+              "kind": "symbolic_valid_selection",
+              "index_layout": "speculative",
+              "index_row_stride": 6,
+              "validity": {
+                "prefix": true,
+                "state_indices": true,
+                "accepted_tokens": true,
+                "independent_sequences": true
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4096,
+        "output_tokens": 96
+      }
+    ]
+  }
+}

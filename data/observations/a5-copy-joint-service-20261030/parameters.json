@@ -1,0 +1,406 @@
+{
+  "schema": "mindie-sim.copy-joint-service/1",
+  "provenance": {
+    "kind": "conditional_joint_source_program_busy",
+    "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+    "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+    "train_batches": [
+      16,
+      32,
+      64
+    ],
+    "independent_check_batches": [
+      1,
+      4,
+      8
+    ],
+    "feature_rank": 1,
+    "features": {
+      "programs": 1,
+      "metadata_loads": 3,
+      "payload_bytes": 512
+    },
+    "native_duration_used_for_fit": false,
+    "body_residual_used": false,
+    "capture_binary_and_grid_assignment_confirmed": false,
+    "pmu_scope": "CSV exporter units retained. The inspected Ascend950 syscnt interval path differs from generic block-average paths; capture exporter binary and raw syscnt are not established.",
+    "interpretation": "overlapping busy lower bounds; not independent DMA or scalar prices"
+  },
+  "joint_program_service": {
+    "contract": {
+      "payload_bytes_per_program": 512,
+      "metadata_bytes_per_program": 12,
+      "state_tail_shape": [
+        6,
+        3072
+      ],
+      "dtype": "bf16",
+      "owners": 64
+    },
+    "directions": {
+      "gather": {
+        "scalar": {
+          "resource": "copy_joint_scalar_busy",
+          "owner_busy_ns": 1112.636148007578,
+          "program_busy_ns": 181.16136562151766
+        },
+        "mte2": {
+          "resource": "copy_joint_mte2_busy",
+          "owner_busy_ns": 330.77558507276626,
+          "program_busy_ns": 298.51765810266664
+        },
+        "mte3": {
+          "resource": "copy_joint_mte3_busy",
+          "owner_busy_ns": 571.9693548387079,
+          "program_busy_ns": 139.95537483810728
+        }
+      },
+      "scatter": {
+        "scalar": {
+          "resource": "copy_joint_scalar_busy",
+          "owner_busy_ns": 1922.2697975964556,
+          "program_busy_ns": 136.33430293264271
+        },
+        "mte2": {
+          "resource": "copy_joint_mte2_busy",
+          "owner_busy_ns": 750.8654648956376,
+          "program_busy_ns": 133.20652691184006
+        },
+        "mte3": {
+          "resource": "copy_joint_mte3_busy",
+          "owner_busy_ns": 642.035673624278,
+          "program_busy_ns": 134.41291903858337
+        }
+      }
+    },
+    "provenance": {
+      "kind": "conditional_joint_source_program_busy",
+      "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+      "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+      "train_batches": [
+        16,
+        32,
+        64
+      ],
+      "independent_check_batches": [
+        1,
+        4,
+        8
+      ],
+      "feature_rank": 1,
+      "features": {
+        "programs": 1,
+        "metadata_loads": 3,
+        "payload_bytes": 512
+      },
+      "native_duration_used_for_fit": false,
+      "body_residual_used": false,
+      "capture_binary_and_grid_assignment_confirmed": false,
+      "pmu_scope": "CSV exporter units retained. The inspected Ascend950 syscnt interval path differs from generic block-average paths; capture exporter binary and raw syscnt are not established.",
+      "interpretation": "overlapping busy lower bounds; not independent DMA or scalar prices"
+    }
+  },
+  "compute_arch": {
+    "instruction_services": {
+      "copy_joint_scalar_busy": {
+        "unit": "busy_ns",
+        "owner_axis": "vector",
+        "per_owner_rate": 1000000000.0,
+        "provenance": {
+          "kind": "conditional_joint_source_program_busy",
+          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+          "train_batches": [
+            16,
+            32,
+            64
+          ],
+          "independent_check_batches": [
+            1,
+            4,
+            8
+          ],
+          "feature_rank": 1,
+          "features": {
+            "programs": 1,
+            "metadata_loads": 3,
+            "payload_bytes": 512
+          },
+          "native_duration_used_for_fit": false,
+          "body_residual_used": false,
+          "capture_binary_and_grid_assignment_confirmed": false,
+          "pmu_scope": "CSV exporter units retained. The inspected Ascend950 syscnt interval path differs from generic block-average paths; capture exporter binary and raw syscnt are not established.",
+          "interpretation": "overlapping busy lower bounds; not independent DMA or scalar prices"
+        }
+      },
+      "copy_joint_mte2_busy": {
+        "unit": "busy_ns",
+        "owner_axis": "vector",
+        "per_owner_rate": 1000000000.0,
+        "provenance": {
+          "kind": "conditional_joint_source_program_busy",
+          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+          "train_batches": [
+            16,
+            32,
+            64
+          ],
+          "independent_check_batches": [
+            1,
+            4,
+            8
+          ],
+          "feature_rank": 1,
+          "features": {
+            "programs": 1,
+            "metadata_loads": 3,
+            "payload_bytes": 512
+          },
+          "native_duration_used_for_fit": false,
+          "body_residual_used": false,
+          "capture_binary_and_grid_assignment_confirmed": false,
+          "pmu_scope": "CSV exporter units retained. The inspected Ascend950 syscnt interval path differs from generic block-average paths; capture exporter binary and raw syscnt are not established.",
+          "interpretation": "overlapping busy lower bounds; not independent DMA or scalar prices"
+        }
+      },
+      "copy_joint_mte3_busy": {
+        "unit": "busy_ns",
+        "owner_axis": "vector",
+        "per_owner_rate": 1000000000.0,
+        "provenance": {
+          "kind": "conditional_joint_source_program_busy",
+          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+          "train_batches": [
+            16,
+            32,
+            64
+          ],
+          "independent_check_batches": [
+            1,
+            4,
+            8
+          ],
+          "feature_rank": 1,
+          "features": {
+            "programs": 1,
+            "metadata_loads": 3,
+            "payload_bytes": 512
+          },
+          "native_duration_used_for_fit": false,
+          "body_residual_used": false,
+          "capture_binary_and_grid_assignment_confirmed": false,
+          "pmu_scope": "CSV exporter units retained. The inspected Ascend950 syscnt interval path differs from generic block-average paths; capture exporter binary and raw syscnt are not established.",
+          "interpretation": "overlapping busy lower bounds; not independent DMA or scalar prices"
+        }
+      }
+    }
+  },
+  "observations": [
+    {
+      "split": "conditional_train",
+      "batch": 16,
+      "direction": "gather",
+      "calls": 1020,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c16_p4k_20261030/kernel_details.csv",
+        "sha256": "bd9aaa075053ec7b4520a8a45238e810192b9b83f96d9833792be3ce9a46ca34",
+        "size_bytes": 47658417
+      },
+      "busy_us": {
+        "scalar": 4.247544117647054,
+        "mte2": 5.780160784313728,
+        "mte3": 3.2328735294117656
+      },
+      "duration_us": 9.384521568627452
+    },
+    {
+      "split": "conditional_train",
+      "batch": 16,
+      "direction": "scatter",
+      "calls": 1020,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c16_p4k_20261030/kernel_details.csv",
+        "sha256": "bd9aaa075053ec7b4520a8a45238e810192b9b83f96d9833792be3ce9a46ca34",
+        "size_bytes": 47658417
+      },
+      "busy_us": {
+        "scalar": 4.253849019607843,
+        "mte2": 3.0561823529411765,
+        "mte3": 2.9815911764705816
+      },
+      "duration_us": 7.292756862745087
+    },
+    {
+      "split": "conditional_train",
+      "batch": 32,
+      "direction": "gather",
+      "calls": 1054,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p4k_20261030/kernel_details.csv",
+        "sha256": "f48928ad671257a81014752dcb9a81848d5214e87251018a0b06f159be75da72",
+        "size_bytes": 41401175
+      },
+      "busy_us": {
+        "scalar": 7.823440227703975,
+        "mte2": 10.963310246679322,
+        "mte3": 5.39780170777988
+      },
+      "duration_us": 15.043888994307407
+    },
+    {
+      "split": "conditional_train",
+      "batch": 32,
+      "direction": "scatter",
+      "calls": 1054,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c32_p4k_20261030/kernel_details.csv",
+        "sha256": "f48928ad671257a81014752dcb9a81848d5214e87251018a0b06f159be75da72",
+        "size_bytes": 41401175
+      },
+      "busy_us": {
+        "scalar": 7.013962049335865,
+        "mte2": 5.684901328273254,
+        "mte3": 5.600716318785576
+      },
+      "duration_us": 10.747849146110058
+    },
+    {
+      "split": "conditional_train",
+      "batch": 64,
+      "direction": "gather",
+      "calls": 1054,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c64_p4k_20261030/kernel_details.csv",
+        "sha256": "1d33448e6faeeedf5175035f4c324b74220bbc179d2cec85657162970576095a",
+        "size_bytes": 34995055
+      },
+      "busy_us": {
+        "scalar": 14.093256166982929,
+        "mte2": 21.862080645161246,
+        "mte3": 10.719610056925996
+      },
+      "duration_us": 26.798966793168873
+    },
+    {
+      "split": "conditional_train",
+      "batch": 64,
+      "direction": "scatter",
+      "calls": 1054,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c64_p4k_20261030/kernel_details.csv",
+        "sha256": "1d33448e6faeeedf5175035f4c324b74220bbc179d2cec85657162970576095a",
+        "size_bytes": 34995055
+      },
+      "busy_us": {
+        "scalar": 11.67712049335864,
+        "mte2": 10.295535104364332,
+        "mte3": 10.279827324478182
+      },
+      "duration_us": 16.755250474383292
+    },
+    {
+      "split": "independent_check",
+      "batch": 8,
+      "direction": "gather",
+      "calls": 1020,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c8_p4k_20261030/kernel_details.csv",
+        "sha256": "b259cfca342b034f9b057cd4499289a7b7244660bf02411c624f8a416b9d0a5f",
+        "size_bytes": 41993164
+      },
+      "busy_us": {
+        "scalar": 2.634277450980392,
+        "mte2": 2.99228137254902,
+        "mte3": 1.6838882352941176
+      },
+      "duration_us": 6.403400980392157
+    },
+    {
+      "split": "independent_check",
+      "batch": 8,
+      "direction": "scatter",
+      "calls": 1020,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c8_p4k_20261030/kernel_details.csv",
+        "sha256": "b259cfca342b034f9b057cd4499289a7b7244660bf02411c624f8a416b9d0a5f",
+        "size_bytes": 41993164
+      },
+      "busy_us": {
+        "scalar": 2.7678107843137254,
+        "mte2": 1.5657549019607844,
+        "mte3": 1.562492156862745
+      },
+      "duration_us": 5.242191176470588
+    },
+    {
+      "split": "independent_check",
+      "batch": 4,
+      "direction": "gather",
+      "calls": 374,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c4_p8k_20261030/kernel_details.csv",
+        "sha256": "1c75ebb7233b7181728dcab47c69c6bd5cee8fca5b4f28da3d9b4c72332551cd",
+        "size_bytes": 25256665
+      },
+      "busy_us": {
+        "scalar": 1.9646818181818182,
+        "mte2": 1.5333957219251337,
+        "mte3": 0.936572192513369
+      },
+      "duration_us": 4.895724598930482
+    },
+    {
+      "split": "independent_check",
+      "batch": 4,
+      "direction": "scatter",
+      "calls": 374,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_c4_p8k_20261030/kernel_details.csv",
+        "sha256": "1c75ebb7233b7181728dcab47c69c6bd5cee8fca5b4f28da3d9b4c72332551cd",
+        "size_bytes": 25256665
+      },
+      "busy_us": {
+        "scalar": 1.9868475935828878,
+        "mte2": 0.8346524064171122,
+        "mte3": 0.7740775401069518
+      },
+      "duration_us": 4.152901069518717
+    },
+    {
+      "split": "independent_check",
+      "batch": 1,
+      "direction": "gather",
+      "calls": 2210,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+        "sha256": "c3c78ba68f3ef2ad896b25ea0ab6e9e2215aaac0a94ca7fc6b228a1c3444a443",
+        "size_bytes": 71005746
+      },
+      "busy_us": {
+        "scalar": 1.5950502262443438,
+        "mte2": 0.5463859728506787,
+        "mte3": 0.27130452488687784
+      },
+      "duration_us": 3.8100570135746605
+    },
+    {
+      "split": "independent_check",
+      "batch": 1,
+      "direction": "scatter",
+      "calls": 2210,
+      "source_identity": {
+        "path": "/Volumes/data/mindie-sim-data/a5/glm5_3_flash_w8a8_mxfp8_high_conc_decode_tpot5ms_c1_20261030/kernel_details.csv",
+        "sha256": "c3c78ba68f3ef2ad896b25ea0ab6e9e2215aaac0a94ca7fc6b228a1c3444a443",
+        "size_bytes": 71005746
+      },
+      "busy_us": {
+        "scalar": 1.561245701357466,
+        "mte2": 0.2778497737556561,
+        "mte3": 0.22162262443438915
+      },
+      "duration_us": 3.5588429864253395
+    }
+  ]
+}

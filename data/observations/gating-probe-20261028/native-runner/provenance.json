@@ -1,0 +1,8 @@
+{
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "source": "tools/measure/native_kernel_probe.cpp",
+  "source_sha256": "95ac1c67709f8f3d61e7dbd54c05c83d362484d364ff34c9bdecc7ce2ef4943c",
+  "binary_sha256": "74dcfd81ba484c33ac227ae53119bc5e6870ad9b1144fdee30d7e2009b0e9d82",
+  "build": "tools/measure/compile_native_probe.sh",
+  "runtime": "ACL; no model weights or Python device runtime"
+}

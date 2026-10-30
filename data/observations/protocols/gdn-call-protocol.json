@@ -1,0 +1,118 @@
+{
+  "schema": "historical-call-protocol/1",
+  "capture": {
+    "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/gdn/measure.json",
+    "sha256": "30f300b9fae5a5116247830ad142f923413b67f8fa799c1bc9bc05e8af7ff9d8"
+  },
+  "producer": {
+    "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/gdn/gdn_measure2.py",
+    "sha256": "1662a58957250fed9043593b62a9c5b558783850c1016f66367cb5737cb43063"
+  },
+  "capture_schema": "a5-gdn-measure/1",
+  "hardware": {
+    "device": "Ascend950DT_9582",
+    "host": "rack06os2",
+    "die": 0,
+    "image_id": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+    "driver": "25.1.rc3.1 (ascendhal 7.35.23)",
+    "cann": "9.2.0 (/usr/local/Ascend/cann-9.2.0)"
+  },
+  "boundary": "device_event_operator_call",
+  "boundary_basis": "Producer timed() lines 212-223 records events around the complete fn() callback; timing is not automatically one device kernel.",
+  "calls": {
+    "conv_prefill": {
+      "components": [
+        "fla_npu causal_conv1d_fn call"
+      ],
+      "activation": "silu",
+      "bias": true,
+      "initial_state": false,
+      "input_dtype": "bf16",
+      "sequence_lengths": "batch equal-length sequences, tokens per sequence",
+      "state_cache_rows": "batch+1",
+      "weight_layout": "[kernel,width]",
+      "producer_lines": [
+        514,
+        535
+      ]
+    },
+    "conv_update": {
+      "components": [
+        "fla_npu causal_conv1d_update call"
+      ],
+      "activation": "silu",
+      "bias": true,
+      "max_query_len": 1,
+      "input_dtype": "bf16",
+      "state_cache_rows": "batch+1",
+      "producer_lines": [
+        539,
+        553
+      ]
+    },
+    "scan_prefill": {
+      "components": [
+        "fla_npu chunk_gated_delta_rule_fwd call including internal materializations and Prepare/H/O"
+      ],
+      "chunk_size": 64,
+      "input_dtype": "bf16",
+      "gate_dtype": "fp32",
+      "beta_dtype": "bf16",
+      "state_dtype": "fp32",
+      "state_v_first": true,
+      "output_final_state": true,
+      "use_qk_l2norm_in_kernel": true,
+      "layout": "BSND",
+      "use_exp2": true,
+      "disable_recompute": true,
+      "allow_neg_eigval": false,
+      "producer_lines": [
+        555,
+        581
+      ]
+    },
+    "scan_decode": {
+      "components": [
+        "l2norm(q)",
+        "l2norm(k)",
+        "actual_seq_lengths tensor creation and device transfer",
+        "fla_npu recurrent_gated_delta_rule call"
+      ],
+      "input_dtype": "bf16",
+      "gate_dtype": "fp32",
+      "beta_dtype": "bf16",
+      "state_dtype": "fp32",
+      "query_tokens_per_sequence": 1,
+      "producer_lines": [
+        583,
+        600
+      ]
+    },
+    "gating": {
+      "components": [
+        "fused_gdn_gating_patch call"
+      ],
+      "a_dtype": "fp32",
+      "b_dtype": "fp32",
+      "a_log_dtype": "fp32",
+      "dt_bias_dtype": "fp32",
+      "producer_lines": [
+        602,
+        616
+      ]
+    }
+  },
+  "interpretation_limits": [
+    "The recorded clock_mhz_start/end are retained as capture fields, not treated as usable sustained-clock rates.",
+    "The original scan_prefill canary failed; the later canary2.json is a separate source and does not rewrite that original outcome.",
+    "No binary hash was captured; producer and container image identities do not identify compiled kernel bytes.",
+    "No calibration train/heldout split is inferred from old fit assignments."
+  ],
+  "metadata_sources": [
+    {
+      "path": "tests/fixtures/mindie_sim/a5-gdn-calibration.json",
+      "sha256": "839a03777fc42bd3d22ae05a61c44d62e9255affc7d06861b2cae9c811a5e35f",
+      "scope": "machine hardware/software identity only; timing fits and derived model terms are not consumed"
+    }
+  ]
+}

@@ -1,0 +1,159 @@
+{
+  "schema": "operator-service-calibration/1",
+  "producer": {
+    "path": "data/observations/a5-grouped-service-regimes-20261030/producer.py",
+    "sha256": "074b42e0e7713e97465323fd6add3b06aea5a40903ac169d929ecc665fdf6918",
+    "size_bytes": 6387
+  },
+  "service_regimes": [
+    {
+      "id": "a5-arch35-dsq-full-load-normal-smallrows-effective-service-v1",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "recipe": "grouped_int32_dequant_swiglu",
+        "dtype": "int8",
+        "metadata.program_execution.grouped_dequant_schedule.kind": "arch35_full_load",
+        "metadata.program_execution.grouped_dequant_schedule.host_special_group_cut": false
+      },
+      "coordinates": {
+        "visits": {
+          "path": "metadata.program_execution.grouped_dequant_schedule.groups_per_owner",
+          "reduce": "max"
+        },
+        "width": {
+          "path": "local_shape.1"
+        },
+        "max_group_rows": {
+          "path": "metadata.grouped_dequant.expert_rows",
+          "reduce": "max"
+        },
+        "min_group_rows": {
+          "path": "metadata.grouped_dequant.expert_rows",
+          "reduce": "min"
+        },
+        "rows": {
+          "path": "local_shape.0"
+        },
+        "capacity": {
+          "path": "metadata.program_execution.grouped_dequant_schedule.input_capacity_rows"
+        },
+        "aiv_units": {
+          "path": "metadata.program_execution.grouped_dequant_schedule.physical_aiv"
+        }
+      },
+      "domain": {
+        "visits": {
+          "min": 64,
+          "max": 64
+        },
+        "width": {
+          "min": 512,
+          "max": 512
+        },
+        "min_group_rows": {
+          "min": 8,
+          "max": 16
+        },
+        "max_group_rows": {
+          "min": 8,
+          "max": 16
+        },
+        "rows": {
+          "min": 512,
+          "max": 1024
+        },
+        "capacity": {
+          "min": 2048,
+          "max": 4096
+        },
+        "aiv_units": {
+          "min": 64,
+          "max": 64
+        }
+      },
+      "response": {
+        "fixed_us": 0,
+        "terms": [
+          {
+            "coordinate": "visits",
+            "us_per_unit": 0.8442353392009494,
+            "scale_with": {
+              "resource": "vector",
+              "reference_rate": 6758400000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "kind": "conditional_operator_service_calibration",
+        "boundary": "inclusive whole native DSQ device-call completion, not incremental latency",
+        "geometry": "declared forced-balanced histogram; actual group_list values unavailable",
+        "calibration_observation": {
+          "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+          "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+          "size_bytes": 49365
+        },
+        "calibration_cohort": {
+          "concurrency_label": 64,
+          "calls": 3160,
+          "mean_us": 54.03106170886076,
+          "source_normal_owner_group_visits": 64
+        },
+        "assignment": "mean native duration / maximum positive group visits per source AIV owner",
+        "response_semantics": "max(existing physical execution, effective inclusive service)",
+        "scaling_assumption": "inverse declared total AIV vector throughput; engineered extrapolation, not measured cross-rate response",
+        "excluded": [
+          "Body_total_fit",
+          "per_model_selector",
+          "batch_selector",
+          "PMU_sum",
+          "hidden_extra_polling",
+          "allocation_as_valid_rows"
+        ],
+        "data_roles": "new parameter-assignment/validation usage only; raw historic split remains unassigned",
+        "cross_model_validation": "pending same implementation/domain observations; not established by this receipt"
+      }
+    }
+  ],
+  "observation_roles": [
+    {
+      "source": {
+        "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+        "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+        "size_bytes": 49365
+      },
+      "cohort_concurrency_label": 64,
+      "role": "parameter_assignment",
+      "raw_original_role": "unassigned",
+      "native_operator": "DequantSwigluQuant"
+    },
+    {
+      "source": {
+        "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+        "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+        "size_bytes": 49365
+      },
+      "cohort_concurrency_label": 128,
+      "role": "not_used_in_this_parameter_assignment",
+      "raw_original_role": "unassigned",
+      "native_operator": "DequantSwigluQuant",
+      "independence": "previously inspected observations; not a historically blinded holdout"
+    },
+    {
+      "source": {
+        "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+        "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+        "size_bytes": 49365
+      },
+      "cohort_concurrency_label": 4,
+      "role": "out_of_domain_nonapplication_control",
+      "raw_original_role": "unassigned",
+      "native_operator": "DequantSwigluQuant"
+    }
+  ],
+  "not_calibrated": {
+    "grouped_matmul": "active bank distributions and exact output branch remain conditional; separate coefficients not assigned here",
+    "v41": "captured group_list/peer-valid rows unavailable; do not derive bank service from capacity",
+    "Body": "no Body durations read for coefficient assignment"
+  }
+}

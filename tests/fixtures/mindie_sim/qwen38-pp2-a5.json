@@ -1,0 +1,192 @@
+{
+  "schema_version": "mindie-sim.pp-measurement/1",
+  "kind": "a5_qwen38_pp2_prefill_ttft",
+  "label": "a5-qwen38-27b-tp8-pp2-prefill",
+  "source": ".workstreams/hp-serving/qwen38-pp2/report.md",
+  "measured_utc": "2026-10-22",
+  "machine": {
+    "arch_family": "A5",
+    "hosts": 2,
+    "dies_per_host": 8,
+    "total_dies": 16,
+    "clock_caveat": "two hosts differ by a fixed 24.878 s clock offset; only durations are used, so the offset cancels"
+  },
+  "model": {
+    "key": "qwen3.8-27b",
+    "num_hidden_layers": 64,
+    "hidden_size": 5120,
+    "num_attention_heads": 24,
+    "num_kv_heads": 4,
+    "head_dim": 256,
+    "kv_dtype_bytes": 2,
+    "full_attention_interval": 4,
+    "full_attention_layers": 16,
+    "kv_bytes_per_token": 65536,
+    "mtp_layers": 1,
+    "tp": 8
+  },
+  "protocol": {
+    "workload": "prefill-only P node (no D node, no KV transfer)",
+    "metric": "TTFT at output_tokens=1",
+    "units": "ms",
+    "c4_note": "c4 TTFT is engine-serialised (per-request queue positions 1-4) and is not a pipeline-parallel property",
+    "partition_env": "VLLM_PP_LAYER_PARTITION",
+    "max_num_batched_tokens": 8192,
+    "chunk_note": "p16k = 2 chunks, p64k = 8 chunks; a 4k prompt is one chunk"
+  },
+  "cells": [
+    {
+      "prompt_tokens": 4096,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 154.2,
+        "pp2": 157.9
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 556.7,
+        "pp2": 452.8
+      }
+    },
+    {
+      "prompt_tokens": 65536,
+      "concurrency": 1,
+      "ttft_ms": {
+        "pp1": 2500.7,
+        "pp2": 1629.0
+      }
+    },
+    {
+      "prompt_tokens": 4096,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 385.5,
+        "pp2": 388.9
+      }
+    },
+    {
+      "prompt_tokens": 16384,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 1265.0,
+        "pp2": 863.1
+      }
+    },
+    {
+      "prompt_tokens": 65536,
+      "concurrency": 4,
+      "ttft_ms": {
+        "pp1": 5824.3,
+        "pp2": 3467.7
+      }
+    }
+  ],
+  "per_die_efficiency_vs_tp1": {
+    "prompt_tokens": [
+      4096,
+      16384,
+      65536
+    ],
+    "pp1": [
+      0.38,
+      0.43,
+      0.52
+    ],
+    "pp2": [
+      0.19,
+      0.27,
+      0.4
+    ],
+    "derivation": "speedup over the same single-die TP1 run divided by the number of dies",
+    "note": "PP2 is 2x less efficient per die at 4k and 1.3x at 64k; the headline 6.34x vs TP1 is mostly TP8 (PP1 4.13x)"
+  },
+  "trace": {
+    "prompt_tokens": 16384,
+    "concurrency": 1,
+    "partition": [
+      32,
+      32
+    ],
+    "stage_kernel_ms": [
+      409.7,
+      485.2
+    ],
+    "stage_wall_ms": [
+      240.2,
+      299.1
+    ],
+    "stage1_delta_pct": {
+      "kernel": 18.4,
+      "wall": 24.5
+    },
+    "bubble": {
+      "stage": 0,
+      "idle_ms": 146.9,
+      "step_wall_ms": 382.4,
+      "fraction": 0.384
+    },
+    "p2p": {
+      "payload_bytes": 88080384,
+      "pure_transfer_ms": [
+        0.05,
+        0.06
+      ],
+      "wire_ms": 2.0,
+      "blocking_send_ms": 11.07,
+      "blocking_recv_ms": 38.14,
+      "note": "4 hcom_send + 4 hcom_receive kernels; 3 of each are pure (0.05-0.06 ms), one send blocks 11.07 ms and one receive blocks 38.14 ms - synchronisation, not bandwidth; 84 MiB is about 2 ms on the link",
+      "chunks_per_step": 2,
+      "handoffs_per_step": 4,
+      "handoff_payload_tokens": 8192,
+      "blocking_send_count": 1,
+      "blocking_recv_count": 1,
+      "stage0_send_total_ms": 11.24,
+      "stage1_recv_total_ms": 38.44
+    },
+    "note": "p16384 c1 is 2 chunks of 8192 tokens; stage1 kernel/wall is higher at equal 32/32 layers because MTP + final norm + lm_head run on the last stage"
+  },
+  "uneven_partition": {
+    "env": "VLLM_PP_LAYER_PARTITION",
+    "partition": [
+      40,
+      24
+    ],
+    "even_partition": [
+      32,
+      32
+    ],
+    "ttft_delta_pct": {
+      "16384": 3.6,
+      "65536": 6.7
+    },
+    "stage0_compute_ms": 188.9,
+    "stage1_compute_ms": 135.6,
+    "stage1_bubble_ms": 91.9,
+    "conclusion": "even 32/32 is the measured optimum; 40/24 makes stage0 the bottleneck and starves stage1",
+    "ttft_delta_pct_c4": {
+      "16384": 3.1,
+      "65536": 6.7
+    },
+    "kv_capacity_delta_pct": -9.4
+  },
+  "anomalies": [
+    "the p16k c1 first sample reported an empty first delta; the clean re-run is the cell used here",
+    "the c4 cells are engine-serialised and do not isolate PP"
+  ],
+  "tp1_ttft_ms": {
+    "prompt_tokens": [
+      4096,
+      16384,
+      65536
+    ],
+    "ms": [
+      472.4,
+      1934.9,
+      10320.5
+    ],
+    "source": "measured TP1 single-die baseline, campaign qwen38-longctx (same model/recipe)"
+  }
+}

@@ -1,0 +1,4 @@
+{
+  "exit_code": 0,
+  "command": "docker run --rm --name sim-store-native-20261028 --network none --privileged --ipc=host --memory 512m --cpus 2 -v /dev:/dev -v /usr/local/Ascend/driver:/usr/local/Ascend/driver:ro -v /usr/local/dcmi:/usr/local/dcmi:ro -v /tmp/mindie-sim-gating-20261028-0241:/scratch:ro -e ASCEND_RT_VISIBLE_DEVICES=0 --entrypoint bash sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4 -c 'source /usr/local/Ascend/ascend-toolkit/set_env.sh; exec timeout -k 5 25 /scratch/native_kernel_probe /scratch/store-kernel.o strided_store reverse'"
+}

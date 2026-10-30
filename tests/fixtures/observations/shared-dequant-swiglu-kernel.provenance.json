@@ -1,0 +1,8 @@
+{
+  "source_path": "/Users/maoxx241/code/profiler/tests/fixtures/fusion_contracts/a3_glm53_prefill.csv",
+  "source_sha256": "aacc90c83ff0d6bc2cffdb6e97aae67194f44dff07cab00596a9e84f34ed0d00",
+  "source_line": 54,
+  "copied_bytes": "original header and one complete native event row; timings unchanged",
+  "fixture_sha256": "59cb6fd77317c1d80bc23a03aacc3178fcd23fda1bd8f9040f306faca7be9d8d",
+  "native_capture_sha256": "ded3a03adc7a82b0801acc6a88bb85589b8f3a3f3a4a416a1322ebfb514c614f"
+}

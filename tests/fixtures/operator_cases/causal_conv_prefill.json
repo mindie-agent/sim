@@ -1,0 +1,123 @@
+{
+  "schema": "operator-cases/1",
+  "cases": [
+    {
+      "id": "causal_conv_prefill-0",
+      "split": "development",
+      "params": {
+        "lengths": [
+          1
+        ],
+        "channels": 128,
+        "width": 4,
+        "dtype": "bf16",
+        "initial_state": false,
+        "bias": false,
+        "activation": "silu",
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      }
+    },
+    {
+      "id": "causal_conv_prefill-1",
+      "split": "development",
+      "params": {
+        "lengths": [
+          65
+        ],
+        "channels": 256,
+        "width": 4,
+        "dtype": "bf16",
+        "initial_state": true,
+        "bias": true,
+        "activation": "silu",
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      }
+    },
+    {
+      "id": "causal_conv_prefill-2",
+      "split": "development",
+      "params": {
+        "lengths": [
+          64,
+          1
+        ],
+        "channels": 128,
+        "width": 4,
+        "dtype": "bf16",
+        "initial_state": true,
+        "bias": false,
+        "activation": "silu",
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      }
+    },
+    {
+      "id": "causal_conv_prefill-3",
+      "split": "heldout_geometry",
+      "params": {
+        "lengths": [
+          3,
+          127
+        ],
+        "channels": 130,
+        "width": 4,
+        "dtype": "bf16",
+        "initial_state": false,
+        "bias": true,
+        "activation": "silu",
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      }
+    },
+    {
+      "id": "causal_conv_prefill-4",
+      "split": "heldout_geometry",
+      "params": {
+        "lengths": [
+          129,
+          2
+        ],
+        "channels": 256,
+        "width": 4,
+        "dtype": "bf16",
+        "initial_state": true,
+        "bias": true,
+        "activation": "silu",
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      },
+      "expected_dispatch": {
+        "implementation": "triton_causal_conv1d_fwd",
+        "is_apc_enabled": false,
+        "has_null_block": false
+      }
+    }
+  ]
+}

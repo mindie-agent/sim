@@ -1,0 +1,394 @@
+{
+  "name": "qwen35-35b-a5-tp4-c64-graph-body-input / source GDN native conditional / HCCL AIV AR+AG conditional / native INT8 MC2 with TP token caller / arch35 full-load DSQ conditional / conditional effective DSQ service",
+  "machine": {
+    "backend": "ascend",
+    "sku": "Ascend950DT_9582",
+    "num_devices": 4,
+    "ranks_per_node": 8,
+    "device": {
+      "rates": {
+        "scalar_store_issue": 5657458563.535912
+      },
+      "resource_units": {
+        "scalar_store_issue": 64
+      }
+    }
+  },
+  "model": {
+    "catalog_key": "qwen3.5-35b-a3b",
+    "quantization": "w8a8_dynamic",
+    "quant": {
+      "name": "W8A8_DYNAMIC",
+      "weight_format": "int8",
+      "native_format": "bf16",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16"
+      ],
+      "engram_table_mode": "device_bf16",
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1,
+      "category_overrides": {
+        "gdn.qkvz": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.beta_alpha": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        },
+        "gdn.o": {
+          "weight_format": "bf16",
+          "activation_format": "bf16"
+        }
+      },
+      "source": {
+        "kind": "representation_preset",
+        "preset": "w8a8_dynamic",
+        "checkpoint_identity": "not_verified_from_capture_config"
+      },
+      "notes": [
+        "Declared representation template; retained tensor samples establish selected contracts separately."
+      ]
+    }
+  },
+  "runtime": {
+    "tp": 4,
+    "dp": 1,
+    "ep": 4,
+    "pp": 1,
+    "graph_mode": "none",
+    "metadata": {
+      "input_boundary": "body-input template only; placeholder workload is not serving replay",
+      "capture_directory": "/Volumes/data/mindie-sim-data/a5/qwen3_5_35b_a3b_w8a8_mtp_high_conc_decode_tpot10ms_c64_20261030",
+      "client_concurrency": 64,
+      "captured_execution_mode": "ACLGraph",
+      "fusion_contract": {
+        "fusion_ops_gmmswigluquant": false,
+        "provenance": "campaign_launch_log",
+        "launch_log_independently_confirmed": true,
+        "basis": "/Users/maoxx241/code/mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
+        "sim_selection": "ordinary separate grouped GEMM + activation + quantization; no fused MSD lowering"
+      },
+      "tensor_geometry_candidates": [
+        {
+          "operator": "RecurrentGatedDeltaRule",
+          "tensor_batch_slots": 1,
+          "query_rows_per_slot": 4,
+          "tensor_query_rows": 4,
+          "first_csv_row": 2447,
+          "sample_count": 59,
+          "phase": "not_classified_by_shape_only"
+        }
+      ],
+      "geometry_policy": "profiler must distinguish active requests from graph slots and supply exact q/B/context",
+      "unresolved_capture_contracts": [
+        "exact_active_context_lengths_not_encoded_in_tensor_shapes",
+        "checkpoint_config_json_not_in_delivered_capture",
+        "capture_tensor_slots_may_include_graph_padding_or_inactive_requests",
+        "per_projection_precision_and_fused_KDA_MLA_wrapper_contracts_not_fully_audited"
+      ],
+      "gdn_source_native_condition": {
+        "base_case_identity": {
+          "path": "examples/cases/high-concurrency-20261030/new9/qwen35-35b-a5-tp4-c64-graph.json",
+          "sha256": "fcd7c235d50ca62a16edfd9c102fcd492379a5eb52db12efa4f3cd34e8d2c1fe",
+          "size_bytes": 3529
+        },
+        "reference_selection_identity": {
+          "path": "examples/cases/high-concurrency-20261030/source-gdn-native/qwen36-a5-tp8-c4.json",
+          "sha256": "f6bf90351b1258bd0bd92e5fcac49feeb6f254908a914222362c42ab82db7a15",
+          "size_bytes": 4596
+        },
+        "primitive_parameters_identity": {
+          "path": "data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
+          "sha256": "6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb",
+          "size_bytes": 1046
+        },
+        "contract_evidence_path": "data/verification/qwen-source-gdn-native-new6-20261030.json",
+        "observed_primary_execution_geometry": {
+          "query_rows": 256,
+          "sequences_per_replica": 64,
+          "tokens_per_sequence": 4,
+          "context_tokens": null,
+          "batch_basis": "captured_paged_attention_block_table_rows",
+          "context_basis": "not_observed_from_cache_capacity"
+        },
+        "observed_primary_forward_count": 79,
+        "geometry_policy": "Preserve original model, TP/DP/EP and workload. Runtime q/B/context are supplied by the retained Body replay geometry; client concurrency is not active request proof.",
+        "primitive_rate_scope": "Independent Ascend950DT_9582 BF16 scalar-store per-unit issue rate times 64 per-device owners; no capture/operator/Body latency was fitted.",
+        "per_device_scalar_store_owners": 64,
+        "recurrent_implementation": "arch35_fp32",
+        "cache_index_row_stride": {
+          "selected": 4,
+          "basis": "explicit speculative caller proposal-table source condition; captured CausalConv receives a contiguous [B] view and does not establish original strides"
+        },
+        "gating_tensor_abi_observed": false,
+        "capture_binary_source_identity_verified": false,
+        "limitations": [
+          "Selected representative RecurrentGatedDeltaRule and CausalConv ABIs are retained; this is not full-family occurrence validation.",
+          "The fused gating event lacks a complete tensor contract; BF16 beta/FP32 decay agree with the adjacent recurrence contract and source caller, not a strict standalone gating binding.",
+          "Captured state/cache bank capacity is storage capacity, not active work.",
+          "Primitive service calibration is reused independently; binary dispatch, peer activity and active context lengths remain unverified.",
+          "shared effects at 64 units remain: 5.1-13.2 percent underprediction in three heldout cases",
+          "kernel entry, vector transcendental and synchronization stages are not calibrated by this primitive",
+          "no whole-operator or model latency was fitted"
+        ]
+      },
+      "grouped_int32_condition": {
+        "parent": "examples/cases/high-concurrency-20261030/qwen-source-gdn-native/qwen35-35b-a5-tp4-c64-graph-source-gdn-native.json",
+        "parent_sha256": "45af9b4b530a72d55925e70f1100fc76d4af044d5c7b718d5c837e8c4012d3f7",
+        "input_scale_producer": "native MC2 received INT8 payload and FP32 per-row scale; down INT8 payload/scale produced by DequantSwigluQuant",
+        "rows": "forced-balanced_integer_assignment; capture_capacity_not_valid_row_proof",
+        "native_binary_and_tiling": "unverified",
+        "timing": "analytical_owner_phases; no_fixed_duration_or_body_offset"
+      },
+      "hccl_source_condition": {
+        "parent": "examples/cases/high-concurrency-20261030/qwen-grouped-int32-conditional/qwen35-35b-a5-tp4-c64-grouped-int32.json",
+        "parent_sha256": "0a81d50af12df72131d7a16416342d1a1bdab8bf016eecf97f5948aad086968e",
+        "retained_model_and_kernels": "Retain W8A8/GDN/grouped INT32/TP4/EP4; native MC2 caller source slices and final TP gather now explicitly composed.",
+        "source_revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+        "engine_and_templates": "AIV AllReduce mesh_twoshot Block60 and AllGather mesh Block64 on TP axis.",
+        "capture_algorithm_and_payload": "Unverified; adjacent tensor shapes do not establish communication descriptors.",
+        "comparison_boundary": "Complete decode model body at retained q4 and B geometry; no inter-step gaps or fitted offset.",
+        "first_operator_flag_initialization": "Not selected. Unknown retries/control issue are not fitted from residuals."
+      },
+      "mc2_tp_source_complete_condition": {
+        "parent": "examples/cases/high-concurrency-20261030/qwen35-hccl-conditional/qwen35-35b-a5-tp4-c64-hccl-source.json",
+        "parent_sha256": "0b4a86084b5180d26355c2904dad181b175ee78c081f124742f4904e91b8cb4c",
+        "historical_parent_input_scale_producer": "existing_explicit_quantization; captured_quantized_MC2_not_selected",
+        "source_revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
+        "caller": "full-M router/shared, local-M/TP selection/MC2, final TP gather, independent shared TP reduction",
+        "capture_contract": "Selected q4 fullM16/256/512 populations; local source rows4/64/128; no capture binary identity claim",
+        "peer_window": {
+          "max_inflight_per_rank": 4,
+          "basis": "retain prior wrapper declared control; all 3 remote peers fit, not independently observed queue depth"
+        },
+        "materialization": "TP gather output views, no additional materialization calls selected",
+        "routing": "Retain existing balanced global counts; selected geometry source row classes and peer row counts verified equivalent, token identities not declared",
+        "timing": "No rates, launch floors, context values or measured duration changed to reduce residuals",
+        "context": "4096 declared prompt condition; active cache lengths not established from shape"
+      },
+      "dsq_arch35_condition": {
+        "parent": "examples/cases/high-concurrency-20261030/qwen35-mc2-tp-source-complete-conditional/qwen35-35b-a5-tp4-c64-mc2-tp-source-complete.json",
+        "parent_sha256": "382c56151b85d5d23011fdaf7be8ea481b2a29bc8be318c5dc95e0ba33352870",
+        "input_capacity_rows": 2048,
+        "capacity_basis": "retained full native tensor ABI; allocation does not establish valid expert rows",
+        "valid_rows_basis": "unchanged declared balanced integer histogram and typed MC2 receiver",
+        "source_revision": "955f8b33985b6d72989ebff341bb9c2c564a51bc",
+        "source_branch": "explicit arch35 full_load conditional; captured binary dispatch unverified",
+        "unpriced_control": "scalar descriptor issue and unknown queue/compiler latency not inferred from PMU",
+        "unchanged": "all model/hardware/other kernels/quantization/routing and q4 context4096 body input"
+      },
+      "dsq_effective_service_condition": {
+        "parent": {
+          "path": "examples/cases/high-concurrency-20261030/qwen35-mc2-tp-dsq-source-conditional/qwen35-35b-a5-tp4-c64-mc2-tp-dsq-source.json",
+          "sha256": "f6603afa4800af90662bfabc360caddfa576a745e51af4b5e5b1e4d3ae0abc46",
+          "size_bytes": 12284
+        },
+        "parameters": {
+          "path": "data/observations/a5-grouped-service-regimes-20261030/parameters.json",
+          "sha256": "0d2d07742414fcc2c9b3bc9a4eb5e0b3a667eb83f734ba5708c11a3d64e498c2",
+          "size_bytes": 5525
+        },
+        "scope": "only matched normal-branch DSQ; special branch remains physical source control",
+        "geometry": "declared balanced valid rows; upstream allocation ABI remains incomplete"
+      }
+    },
+    "routing": {
+      "policy": "balanced"
+    },
+    "kernels": {
+      "lowerings": {
+        "gdn_decode": {
+          "implementation": "vllm_ascend_gdn_decode",
+          "options": {
+            "gating_beta_store": {
+              "bytes_per_element": 2,
+              "resource": "scalar_store_issue",
+              "queue": {
+                "outstanding": 8,
+                "granule_bytes": 128,
+                "response_ms": 9.125e-05,
+                "row_control_ms": 7e-06
+              }
+            },
+            "recurrent_implementation": "arch35_fp32",
+            "cache_index_row_stride": 4
+          }
+        },
+        "grouped_int8_caller": {
+          "implementation": "ascend_grouped_int32_dequant_swiglu",
+          "options": {
+            "dequant_program": "arch35_full_load",
+            "input_capacity_rows": 2048
+          }
+        }
+      },
+      "hccl": {
+        "allreduce": {
+          "expansion": "AIV",
+          "template": "mesh_twoshot",
+          "block_limit": 60,
+          "axes": [
+            "tp"
+          ]
+        },
+        "allgather": {
+          "expansion": "AIV",
+          "template": "mesh",
+          "block_limit": 64,
+          "axes": [
+            "tp"
+          ]
+        }
+      },
+      "moe_token_partition": {
+        "kind": "vllm_ascend_mc2_tp_slice",
+        "gather_output_materialization": "view"
+      },
+      "native_moe_protocol": {
+        "kind": "arch35_fullmesh",
+        "max_inflight_per_rank": 4,
+        "dispatch_quant": "per_token_int8"
+      },
+      "service_regimes": [
+        {
+          "id": "a5-arch35-dsq-full-load-normal-smallrows-effective-service-v1",
+          "match": {
+            "hardware": "Ascend950DT_9582",
+            "recipe": "grouped_int32_dequant_swiglu",
+            "dtype": "int8",
+            "metadata.program_execution.grouped_dequant_schedule.kind": "arch35_full_load",
+            "metadata.program_execution.grouped_dequant_schedule.host_special_group_cut": false
+          },
+          "coordinates": {
+            "visits": {
+              "path": "metadata.program_execution.grouped_dequant_schedule.groups_per_owner",
+              "reduce": "max"
+            },
+            "width": {
+              "path": "local_shape.1"
+            },
+            "max_group_rows": {
+              "path": "metadata.grouped_dequant.expert_rows",
+              "reduce": "max"
+            },
+            "min_group_rows": {
+              "path": "metadata.grouped_dequant.expert_rows",
+              "reduce": "min"
+            },
+            "rows": {
+              "path": "local_shape.0"
+            },
+            "capacity": {
+              "path": "metadata.program_execution.grouped_dequant_schedule.input_capacity_rows"
+            },
+            "aiv_units": {
+              "path": "metadata.program_execution.grouped_dequant_schedule.physical_aiv"
+            }
+          },
+          "domain": {
+            "visits": {
+              "min": 64,
+              "max": 64
+            },
+            "width": {
+              "min": 512,
+              "max": 512
+            },
+            "min_group_rows": {
+              "min": 8,
+              "max": 16
+            },
+            "max_group_rows": {
+              "min": 8,
+              "max": 16
+            },
+            "rows": {
+              "min": 512,
+              "max": 1024
+            },
+            "capacity": {
+              "min": 2048,
+              "max": 4096
+            },
+            "aiv_units": {
+              "min": 64,
+              "max": 64
+            }
+          },
+          "response": {
+            "fixed_us": 0,
+            "terms": [
+              {
+                "coordinate": "visits",
+                "us_per_unit": 0.8442353392009494,
+                "scale_with": {
+                  "resource": "vector",
+                  "reference_rate": 6758400000000.0
+                }
+              }
+            ]
+          },
+          "provenance": {
+            "kind": "conditional_operator_service_calibration",
+            "boundary": "inclusive whole native DSQ device-call completion, not incremental latency",
+            "geometry": "declared forced-balanced histogram; actual group_list values unavailable",
+            "calibration_observation": {
+              "path": "data/verification/qwen35-source-residual-pmu-20261030.json",
+              "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
+              "size_bytes": 49365
+            },
+            "calibration_cohort": {
+              "concurrency_label": 64,
+              "calls": 3160,
+              "mean_us": 54.03106170886076,
+              "source_normal_owner_group_visits": 64
+            },
+            "assignment": "mean native duration / maximum positive group visits per source AIV owner",
+            "response_semantics": "max(existing physical execution, effective inclusive service)",
+            "scaling_assumption": "inverse declared total AIV vector throughput; engineered extrapolation, not measured cross-rate response",
+            "excluded": [
+              "Body_total_fit",
+              "per_model_selector",
+              "batch_selector",
+              "PMU_sum",
+              "hidden_extra_polling",
+              "allocation_as_valid_rows"
+            ],
+            "data_roles": "new parameter-assignment/validation usage only; raw historic split remains unassigned",
+            "cross_model_validation": "pending same implementation/domain observations; not established by this receipt"
+          }
+        }
+      ]
+    }
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "analysis-placeholder",
+        "prompt_tokens": 4096,
+        "output_tokens": 256
+      }
+    ]
+  }
+}

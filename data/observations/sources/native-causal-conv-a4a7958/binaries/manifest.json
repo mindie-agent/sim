@@ -1,0 +1,43 @@
+{
+  "source_image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "host": "rack06os8",
+  "date": "2026-10-28",
+  "read_scope": "read-only CPU container; no network, no device mounts or runtime imports; 384MiB RAM,1CPU,45s execution bound; standard llvm-objdump -d --demangle",
+  "source_path": "/usr/local/python3.12.13/lib/python3.12/site-packages/fla_npu/opp/vendors/fla_npu_transformer/op_impl/ai_core/tbe/kernel/ascend950/causal_conv1d",
+  "identity_limit": "Image matches retained capture provenance; profiler CSV does not observe exact selected ELF hash or tiling key. BF16/FP16 support metadata identifies the applicable binary family.",
+  "decode_status": "incomplete: standard llvm-objdump emits 815 unknown, 95 FAKEISA and 135 VAG_V310 entries in each listing; neither listing is accepted as a Reg/VF instruction inventory",
+  "decode_limit": "No debug line/info or named VF symbols. Binary identity does not establish compiled load/store elimination, hoisting or Exp/Div FTZ expansion.",
+  "decode_review": "data/verification/native-convolution-review/review-native-conv-binary-decode-20261028.json",
+  "files": [
+    {
+      "path": "CausalConv1d_b9dafb0ee50135cc8aba2421cef03b5a.o.disasm.txt",
+      "sha256": "c5c6aa33234afa0a94d286ae8d8b54fdcb25dc0965d8294271fd00f349f6c9d4",
+      "bytes": 1447083
+    },
+    {
+      "path": "CausalConv1d_b0123b7fae3057c534dbb03661977c42.o.disasm.txt",
+      "sha256": "a9b661ac7fefdd0e00d0b2894bd6d3c926c2097687096f45737330b5163357b4",
+      "bytes": 1447083
+    },
+    {
+      "path": "CausalConv1d_b9dafb0ee50135cc8aba2421cef03b5a.o",
+      "sha256": "91dad92b769b225cbf266e289dd4fe62f073d72963d988469abc679723c2fcb9",
+      "bytes": 150888
+    },
+    {
+      "path": "CausalConv1d_b0123b7fae3057c534dbb03661977c42.o",
+      "sha256": "8397305ea6aea244f79d66c27859ca64a1180dc9fdf6ec5c92cb5c20d72913b8",
+      "bytes": 150888
+    },
+    {
+      "path": "CausalConv1d_b9dafb0ee50135cc8aba2421cef03b5a.json",
+      "sha256": "a310deadfab173aac559f88869d17db07c221a77a7b7948cb2c0ad7f15e9c2ff",
+      "bytes": 5683
+    },
+    {
+      "path": "CausalConv1d_b0123b7fae3057c534dbb03661977c42.json",
+      "sha256": "e4ede7a12c1e2c5f4df62b17c123ee90b7ef75d9e16bd813a76b44e2c712471c",
+      "bytes": 5700
+    }
+  ]
+}

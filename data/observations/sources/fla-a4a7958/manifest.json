@@ -1,0 +1,307 @@
+{
+  "repository": "flashserve/flash-linear-attention-npu",
+  "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+  "wheel_version": "26.9.1+deva4a7958",
+  "files": [
+    {
+      "path": "chunk_fwd_h/op_host/CMakeLists.txt",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/CMakeLists.txt",
+      "bytes": 1085,
+      "sha256": "e0136823a11883d9612c9ba7e923d367c5f83533be4b0aea61c311db47a31530"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/chunk_fwd_h_def.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/chunk_fwd_h_def.cpp",
+      "bytes": 4963,
+      "sha256": "b6ea11cb2822c06597b696f890bbbcad62cf4523e50ab3b2a3fdb8ab6a2edd9a"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/chunk_fwd_h_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/chunk_fwd_h_tiling.cpp",
+      "bytes": 11270,
+      "sha256": "4f54e9aefb18cdd5a617f644c652757691c28c6efb06710b78fca86e7822967d"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/chunk_fwd_h_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/chunk_fwd_h_tiling.h",
+      "bytes": 1690,
+      "sha256": "da7b329a69c43c225063490386c42326c47a5016131804e2c429d24833707c40"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/chunk_fwd_h_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/chunk_fwd_h_tiling_processor.h",
+      "bytes": 5853,
+      "sha256": "bcb699ac1363fab1f3514a7b92baf2c58b28f435a01631ec78f81cab74a9734d"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/op_api/aclnn_chunk_fwd_h.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/op_api/aclnn_chunk_fwd_h.cpp",
+      "bytes": 21730,
+      "sha256": "2ce2432cd79eb44f68d8f86e7806a337034cdfd466d3f03920b4c0a394aaf1ac"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/op_api/aclnn_chunk_fwd_h.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/op_api/aclnn_chunk_fwd_h.h",
+      "bytes": 2653,
+      "sha256": "b8d76a0a29d9df743ec195fe01802d7288e9cdbc6528332c608f3ca7f661f34c"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/op_api/chunk_fwd_h.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/op_api/chunk_fwd_h.cpp",
+      "bytes": 4829,
+      "sha256": "a75fe8a4b1c006937eebcb68ae0948a6438cce3eaadd3a7e3b14998b414e5b8b"
+    },
+    {
+      "path": "chunk_fwd_h/op_host/op_api/chunk_fwd_h.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_host/op_api/chunk_fwd_h.h",
+      "bytes": 1334,
+      "sha256": "60bb37242e013fb48298b06f0a80b78fd5fc80bed561da54c35c0f0557bc6817"
+    },
+    {
+      "path": "chunk_fwd_h/op_kernel/arch35/chunk_fwd_h_cube.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_h/op_kernel/arch35/chunk_fwd_h_cube.h",
+      "bytes": 40269,
+      "sha256": "e31e2cb6ebc8b3dbbb4db9a35c6b77447d0de3dd1430febc9ef1830972d1c27a"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/CMakeLists.txt",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/CMakeLists.txt",
+      "bytes": 1085,
+      "sha256": "94262b43572848a6bc851ba2c3b9150e73a949bbb28650331ed63a149265fc4c"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/chunk_fwd_o_def.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/chunk_fwd_o_def.cpp",
+      "bytes": 4660,
+      "sha256": "23732b36f07b77f8e45e93c31ff07c6a1fae2094d9231464a26887b26ec9d409"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/chunk_fwd_o_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/chunk_fwd_o_tiling.cpp",
+      "bytes": 6109,
+      "sha256": "3edc8e99aea5f65c51a8cf473a2fa0ad062147bc7ba4a950348a11bd62eeea42"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/chunk_fwd_o_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/chunk_fwd_o_tiling.h",
+      "bytes": 804,
+      "sha256": "78b647e1132b0ec1dcc6033c9a23db88bea373cdcdaa0313084c2d4a76957956"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/chunk_fwd_o_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/chunk_fwd_o_tiling_processor.h",
+      "bytes": 20953,
+      "sha256": "acda66ce2dc9c143421ee3d63678f29133a0e59db2327433549daa186ab534a3"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/op_api/aclnn_chunk_fwd_o.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/op_api/aclnn_chunk_fwd_o.cpp",
+      "bytes": 14079,
+      "sha256": "3c00c7d6d51e11edaac2bdf33a704cfafb999620d386ae047f5f2668cb5c4a52"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/op_api/aclnn_chunk_fwd_o.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/op_api/aclnn_chunk_fwd_o.h",
+      "bytes": 2162,
+      "sha256": "a2782e32647388bc9b2c5c3c48b77613503f94ff6d15cd2a00d8e1c8128f906b"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/op_api/chunk_fwd_o.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/op_api/chunk_fwd_o.cpp",
+      "bytes": 2904,
+      "sha256": "f86a35a78aa7d9bf58215d7d4a4f8c77b75d6e37ad22e7e5b49e09e7d0908467"
+    },
+    {
+      "path": "chunk_fwd_o/op_host/op_api/chunk_fwd_o.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_host/op_api/chunk_fwd_o.h",
+      "bytes": 1214,
+      "sha256": "5e5f02cbadf92d80ee1f170870d3e797106135059669b6a622844ae6754ee550"
+    },
+    {
+      "path": "chunk_fwd_o/op_kernel/arch35/chunk_fwd_o_common.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_fwd_o/op_kernel/arch35/chunk_fwd_o_common.h",
+      "bytes": 11194,
+      "sha256": "edb97160e54fabc348b360f2f0cc27c473cf3ab2f28b9ca6acdec1c90fabb9ca"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/CMakeLists.txt",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/CMakeLists.txt",
+      "bytes": 1893,
+      "sha256": "a100c0b663c8d60c7d7f6c980d1d6570ad51d8130cd1d2fb7f0cff37ff3c4856"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_def.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_def.cpp",
+      "bytes": 3884,
+      "sha256": "aa68c85268313353524e933af13af804dc6f4cfbc7e1bcb12cf4852af61b0784"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_tiling.cpp",
+      "bytes": 1328,
+      "sha256": "5c67caf1bc1557059906e89078c3da83b209422a702eb5aa79f881b6eba0ef8a"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/chunk_gated_delta_rule_fwd_tiling.h",
+      "bytes": 214,
+      "sha256": "c7966c7e652210375912bb538e3b779869027e65a70e21be7687a9c1b4538830"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd.cpp",
+      "bytes": 42697,
+      "sha256": "f7be8520e600693bd400f6875cebf6d4da9fd4be597cc60a55168df6f2c4362d"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd.h",
+      "bytes": 1582,
+      "sha256": "6b5254ea9fe58d28261e0e75096f6781dab0968177bd69ee3098178baceed33e"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_api/chunk_gated_delta_rule_fwd.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_api/chunk_gated_delta_rule_fwd.cpp",
+      "bytes": 2767,
+      "sha256": "6707816465ada2621caccbbb61703638e2fcc54b1b05f5b4efd61c458e37f5ed"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_api/chunk_gated_delta_rule_fwd.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_api/chunk_gated_delta_rule_fwd.h",
+      "bytes": 950,
+      "sha256": "3b5d75c4d14a20196fc7d2d333a1ebd30bf16c3580ec2243d34ec4a712aca47c"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_tiling/arch22/chunk_gated_delta_rule_fwd_arch22_state_output_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_tiling/arch22/chunk_gated_delta_rule_fwd_arch22_state_output_tiling.cpp",
+      "bytes": 20578,
+      "sha256": "df4edb0e138043f84c911b4c7aa158efc3faeab10fc5b33c191694ca7c4e1931"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_tiling/arch22/chunk_gated_delta_rule_fwd_arch22_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_tiling/arch22/chunk_gated_delta_rule_fwd_arch22_tiling.cpp",
+      "bytes": 18570,
+      "sha256": "1d3726708a57643d4fc37df81f84178b29749b6ff4a09e1886b3f161d47cb9c5"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_tiling/arch35/chunk_gated_delta_rule_fwd_arch35_state_output_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_tiling/arch35/chunk_gated_delta_rule_fwd_arch35_state_output_tiling.cpp",
+      "bytes": 20468,
+      "sha256": "9d0eaa51ff4c7acb41617573ad5438f6bd5a1d109b24fcaf3fa340e848d72040"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_host/op_tiling/arch35/chunk_gated_delta_rule_fwd_arch35_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_host/op_tiling/arch35/chunk_gated_delta_rule_fwd_arch35_tiling.cpp",
+      "bytes": 18853,
+      "sha256": "21f318e4227b9f459b1a13802a8c0dbac83e86315eda90d568a0ca54b8695709"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h",
+      "bytes": 2024,
+      "sha256": "8d5d4cbe206dd830984672a90d66c86700cdbcaca42fb63487b9f961fb85b0a5"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h",
+      "bytes": 6454,
+      "sha256": "414ed11e1ae48fe7113b35596225e3ddf68316671bd98b5a9ce2c3ff6cf27bff"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_host/chunk_recompute_wu_fwd_ho_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/chunk_recompute_wu_fwd_ho/op_host/chunk_recompute_wu_fwd_ho_tiling.h",
+      "bytes": 213,
+      "sha256": "65c70200feab86c9e518f5a6da0665038afbce7aeb92bb7a16c3f0fea7a08098"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling.h",
+      "bytes": 845,
+      "sha256": "aa2b02ed72af3a8c57df9a67e99bab6e9845a0da706f81b8fb7b27d4c761222f"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/arch22/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h",
+      "bytes": 21654,
+      "sha256": "8b2d6c967a764a495d059eaa77cb419f2cefed0fcc296dc240b7f9ca6bc78bf8"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling.h",
+      "bytes": 2024,
+      "sha256": "d4ec42c31a42a906b47c0cbeb54bc8914df60122e3d17b6307aa117a9f52d0a3"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/operators/chunk_gated_delta_rule_fwd_h/op_host/chunk_gated_delta_rule_fwd_h_tiling_processor.h",
+      "bytes": 6454,
+      "sha256": "b1403463fb1758d634fd62904b6d5cd1319de2a04dbec5eba31173a64d811e29"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd/op_kernel/internal/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd/op_kernel/internal/operators/recompute_w_u_fwd/op_host/op_tiling/recompute_w_u_fwd_tiling_processor.h",
+      "bytes": 24919,
+      "sha256": "fc2d52a62a255ab460aab0e1328b0d9f167843e20cff39143e96a74c5b56ab9e"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/CMakeLists.txt",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/CMakeLists.txt",
+      "bytes": 1166,
+      "sha256": "34bda66e1f4369f0f28a1e02a92ce428b7f3e392fd1190ad3ead499a11d2b528"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_def.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_def.cpp",
+      "bytes": 4655,
+      "sha256": "710aed5f1a5fb2c15e3384cc2dae8ec133ed6d6f5c2d81176212e7045d22ccfa"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_infershape.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_infershape.cpp",
+      "bytes": 3945,
+      "sha256": "2cbf4fe1726b6157e921fab7ea873de0335f036f9986cefd12db4ca32e7fd025"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_tiling.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_tiling.cpp",
+      "bytes": 10235,
+      "sha256": "3994bf2b1e38b1c90734a28639eb1021324ea5e3c391e1258dce1329b7e4021a"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_tiling.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/chunk_gated_delta_rule_fwd_prepare_tiling.h",
+      "bytes": 4526,
+      "sha256": "0fe8902b0a3de2ea49717d99824e026f9eb1563c204bb001a9c3cc577dd73101"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd_prepare.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd_prepare.cpp",
+      "bytes": 18144,
+      "sha256": "4b25bcfa694b93e73f49568ef7ae74bea3c53aef62c2af24f20b454eb2fcde45"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd_prepare.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/op_api/aclnn_chunk_gated_delta_rule_fwd_prepare.h",
+      "bytes": 1246,
+      "sha256": "43f9387f7ca3dd5ad7b0728488c8ac0232f9563d960a51e48499acd3c6189bdf"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/op_api/chunk_gated_delta_rule_fwd_prepare.cpp",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/op_api/chunk_gated_delta_rule_fwd_prepare.cpp",
+      "bytes": 5945,
+      "sha256": "80d28d6a2b9144cab13ca292c66b5e8e5f231828fe7e94fda1d44759964d1eff"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_host/op_api/chunk_gated_delta_rule_fwd_prepare.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_host/op_api/chunk_gated_delta_rule_fwd_prepare.h",
+      "bytes": 1110,
+      "sha256": "e0eb9757a249ad8b64856333aa1cf480611d66479b5c108760fc5178c85ba471"
+    },
+    {
+      "path": "chunk_gated_delta_rule_fwd_prepare/op_kernel/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+      "source_path": "fla/ops/ascendc/gdn/chunk_gdn_fwd/chunk_gated_delta_rule_fwd_prepare/op_kernel/arch35/chunk_gated_delta_rule_fwd_prepare.h",
+      "bytes": 45674,
+      "sha256": "9ef1f4836bafcfb195810649b15cf00a6724dee602d983321c346e08b8c26d16"
+    }
+  ]
+}

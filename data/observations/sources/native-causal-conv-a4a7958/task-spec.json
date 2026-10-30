@@ -1,0 +1,723 @@
+{
+  "schema": "native-operator-model-task.v1",
+  "task": "native_causal_conv_prefill",
+  "date": "2026-10-28",
+  "status": "ready_for_root_campaign_creation",
+  "objective": "Model the real source-selected FLA native AscendC causal_conv1d prefill, with per-unit ownership and source branch coverage. Measurements calibrate hardware services; they do not determine dispatch or introduce per-model corrections.",
+  "image": "sha256:c3d00a196905159dbf0b97588d34f085086c2708712fa0d1c8fedd807f0e48a4",
+  "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
+  "sources": [
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_data.h",
+      "relative_path": "op_kernel/causal_conv1d_tiling_data.h",
+      "sha256": "d14363c7ad45b6522632e089270fa2dc7365a091d4565b976cb18b3c555467cb",
+      "bytes": 2237,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_tiling_data.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_tiling_data.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
+      "relative_path": "op_kernel/causal_conv1d.cpp",
+      "sha256": "73835f0d1ec7e7ddc0aca92c3e55821b312440e964dfad4e5aeb8b448f50f281",
+      "bytes": 3271,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d.cpp",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d.cpp",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+      "relative_path": "op_kernel/causal_conv1d_fn_tasks.h",
+      "sha256": "c65ab9cd60492580fce6063dbf6eb511ba97dd3636a4f00854108919f112dd18",
+      "bytes": 12945,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_fn_tasks.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_fn_tasks.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+      "relative_path": "op_kernel/causal_conv1d.h",
+      "sha256": "040d8fbc70e68710633dd33427c1d1888f47beb6c1f26bed6140db601295f554",
+      "bytes": 57111,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_key.h",
+      "relative_path": "op_kernel/causal_conv1d_tiling_key.h",
+      "sha256": "c0bb9ace833d13f45a992f72b2c6dfb9174bb79bf4499f02a7121da459119fb0",
+      "bytes": 3603,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_tiling_key.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_tiling_key.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_update.h",
+      "relative_path": "op_kernel/causal_conv1d_update.h",
+      "sha256": "d3857bc00e44bdf174c72ceeeda8d8e2e2db2fb480a561ecba5c88ae7d07c2b9",
+      "bytes": 3765,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_update.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_update.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
+      "relative_path": "op_kernel/causal_conv1d_fn.h",
+      "sha256": "6889b93c74a5a293cc954a3c6ba862794b9e1f7fb2618ee585f11a609701fae4",
+      "bytes": 4180,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_fn.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_fn.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_common.h",
+      "relative_path": "op_kernel/causal_conv1d_common.h",
+      "sha256": "d2155e287cad145128f0cf8a0847278d3b264133531f47daaeade8933e7de688",
+      "bytes": 1932,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/causal_conv1d_common.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/causal_conv1d_common.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
+      "relative_path": "op_kernel/arch35/causal_conv1d_regbase.h",
+      "sha256": "c47a785a92926fc38d53eaf726d51807b1f702729fc85fcde1442c1e728601a5",
+      "bytes": 16666,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_kernel/arch35/causal_conv1d_regbase.h",
+      "image_path": "/tmp/sim-gdn-composite-20261028/causal_conv1d/arch35/causal_conv1d_regbase.h",
+      "same_as_image": true
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+      "relative_path": "op_host/causal_conv1d_tiling.cpp",
+      "sha256": "5a34e7e4df90816faddc26ca4037d1064806495319631ac72a1fc9cd8d7f0128",
+      "bytes": 9545,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling.cpp",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+      "relative_path": "op_host/causal_conv1d_tiling_planner.h",
+      "sha256": "8dfcfba40075364b583f0bf60d50889965975d769677151a6ce10bbdb454e6a5",
+      "bytes": 12757,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_planner.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_utils.h",
+      "relative_path": "op_host/causal_conv1d_tiling_utils.h",
+      "sha256": "ee4a98db1d2ae65fef76961db29ffe63aa962cad07d0529563cf68ea737bff36",
+      "bytes": 5857,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_utils.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+      "relative_path": "op_host/causal_conv1d_tiling_validation.h",
+      "sha256": "91f6cd899bba5e06ae664a8fc7df4900f2c5fa74c461f1693640541cd3bf945e",
+      "bytes": 35305,
+      "source_url": "https://raw.githubusercontent.com/flashserve/flash-linear-attention-npu/a4a795857868729fbdbb0118c1e06c8655a7b31b/fla/ops/ascendc/gdn/gdn_preprocess/causal_conv1d/op_host/causal_conv1d_tiling_validation.h",
+      "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/_stable.py",
+      "role": "exact_image_python_wrapper",
+      "sha256": "d6be8820bb54e0177cf92e396099011402f97066b0974a2f1a8a90187f08aae0",
+      "bytes": 81928
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/__init__.py",
+      "role": "exact_image_public_dispatch",
+      "sha256": "f1111574e58df1e9a3578780d141fa7e97784cea955de38d86841a148a455027",
+      "bytes": 29521
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+      "role": "exact_image_gdn_caller",
+      "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
+      "bytes": 33354
+    },
+    {
+      "path": "/tmp/review-gdn-python-image-20261028/Ascend950DT_9582.ini",
+      "role": "exact_image_hardware_config",
+      "sha256": "b8e7d61780056889e795639504530ecacb2b759ad1602e929b863d837fdf0099",
+      "bytes": 20397
+    }
+  ],
+  "source_completeness": {
+    "operator_local_headers": "complete; all relative operator headers resolve in source bundle",
+    "sdk_headers": "Not bundled; CANN framework headers are external SDK dependencies and are not required to import/execute the pure CPU model. No fabricated hashes or paths for absent SDK headers.",
+    "kernel_image_hash_matches": 9,
+    "host_revision_binding": "Host source is exact repository revision; all9 kernel/header files from the same revision independently match the image. Host sources themselves are not installed in the image."
+  },
+  "checks": [
+    {
+      "id": "dispatch_is_native",
+      "requires": "Implement the exact FLA native AscendC runMode=0 fn/prefill branch selected by gdn caller. Existing wave2 causal_conv_prefill models Triton and must not be mislabeled as this implementation. Public implementation identity must select the native lowerer explicitly.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+          "lines": [
+            23,
+            25
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+          "lines": [
+            499,
+            510
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "lines": [
+            48,
+            68
+          ]
+        }
+      ]
+    },
+    {
+      "id": "host_planner",
+      "requires": "Translate legal shape-dependent tiling, UB resource budget and token/dim ownership exactly; no model-name or sequence-length multipliers. Preserve dim multiple-of-16 input contract, width2..4, CUTBS/CUTBSD and explicit sequence-range eligibility.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+          "lines": [
+            76,
+            184
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+          "lines": [
+            187,
+            300
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "lines": [
+            202,
+            213
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "lines": [
+            304,
+            308
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "lines": [
+            55,
+            121
+          ]
+        }
+      ]
+    },
+    {
+      "id": "metadata_and_cache_semantics",
+      "requires": "Keep parameter presence, host visibility, dtype, values, null/pad and has-initial state distinct. Count source metadata loads at their actual block/sequence scope; do not globally hoist them or infer eight-byte loads from an int64 cast.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "lines": [
+            519,
+            558
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "lines": [
+            1138,
+            1196
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "lines": [
+            66,
+            92
+          ]
+        }
+      ]
+    },
+    {
+      "id": "state_snapshot_and_global_sync",
+      "requires": "If native tiling enables initial-state workspace, model sync32B per launched block and snapshot batch*(width-1)*dim*2B storage separately from actual copied payload. Each valid true-state sequence/channel has one assigned snapshot owner, followed by SyncAll before computation. Source false flags suppress copies, not the existence of the global sync path.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "lines": [
+            138,
+            155
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "lines": [
+            192,
+            259
+          ]
+        }
+      ]
+    },
+    {
+      "id": "rolling_and_generic_source_branch",
+      "requires": "Derive actual vector loads, casts, Mul/Add, rolling partials, SiLU, stores, event waits and output drain from the selected source branch. Width, bias and activation change the execution program. Do not map useful math only to generic bandwidth/compute maxima.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "lines": [
+            305,
+            359
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "lines": [
+            463,
+            550
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "lines": [
+            563,
+            755
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "lines": [
+            1318,
+            1322
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
+          "lines": [
+            1,
+            340
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tail_state_and_output_conservation",
+      "requires": "Chunk history may read preceding x within a sequence or cached/zero history. Only the sequence-ending chunk writes state. Every valid output token/channel exactly once. Invalid/null/pad work has no invented output initialization. Physical copies and logical tensor bytes must be separately accounted.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "lines": [
+            96,
+            171
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "lines": [
+            175,
+            189
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "lines": [
+            264,
+            320
+          ]
+        }
+      ]
+    },
+    {
+      "id": "one_native_boundary",
+      "requires": "FN has one native kernel launch. Snapshot, SyncAll, rolling loop and state tail writes are stages inside it; do not create host-launch tax per token/block. Surrounding Python layout materializations/copy_ remain separate operators.",
+      "refs": [
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
+          "lines": [
+            1,
+            74
+          ]
+        },
+        {
+          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
+          "lines": [
+            61,
+            78
+          ]
+        }
+      ]
+    }
+  ],
+  "expected_cases_suggestions": [
+    {
+      "id": "one_cta",
+      "inputs": {
+        "total_tokens": 1,
+        "dim": 16,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBS",
+        "base_dim": 16,
+        "base_dim_count": 1,
+        "token_core_budget": 64,
+        "token_block_size": 1,
+        "token_block_count": 1,
+        "block_dim": 1
+      }
+    },
+    {
+      "id": "token_threshold",
+      "inputs": {
+        "total_tokens": 128,
+        "dim": 4096,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBS",
+        "base_dim": 4096,
+        "base_dim_count": 1,
+        "token_core_budget": 64,
+        "token_block_size": 2,
+        "token_block_count": 64,
+        "block_dim": 64
+      }
+    },
+    {
+      "id": "first_legal_dim_cosplit",
+      "inputs": {
+        "total_tokens": 128,
+        "dim": 4112,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBSD",
+        "base_dim": 4096,
+        "base_dim_count": 2,
+        "token_core_budget": 32,
+        "token_block_size": 4,
+        "token_block_count": 32,
+        "block_dim": 64
+      }
+    },
+    {
+      "id": "nondivisor_dim_cosplit",
+      "inputs": {
+        "total_tokens": 16384,
+        "dim": 10240,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBSD",
+        "base_dim": 2560,
+        "base_dim_count": 4,
+        "token_core_budget": 16,
+        "token_block_size": 1024,
+        "token_block_count": 16,
+        "block_dim": 64
+      }
+    },
+    {
+      "id": "token_tail",
+      "inputs": {
+        "total_tokens": 65,
+        "dim": 16,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBS",
+        "base_dim": 16,
+        "base_dim_count": 1,
+        "token_core_budget": 64,
+        "token_block_size": 2,
+        "token_block_count": 33,
+        "block_dim": 33
+      }
+    },
+    {
+      "id": "aligned_dim_tail",
+      "inputs": {
+        "total_tokens": 129,
+        "dim": 8208,
+        "width": 4,
+        "core_count": 64,
+        "ub_bytes": 253952,
+        "bias": false,
+        "activation": "silu",
+        "input_mode": "varlen"
+      },
+      "expected_planner": {
+        "execution_plan": "CUTBSD",
+        "base_dim": 2064,
+        "base_dim_count": 4,
+        "token_core_budget": 16,
+        "token_block_size": 9,
+        "token_block_count": 15,
+        "block_dim": 60
+      }
+    },
+    {
+      "id": "initial_state_device_all_false",
+      "inputs": {
+        "seqlens": [
+          1,
+          3,
+          7
+        ],
+        "dim": 16,
+        "width": 4,
+        "state_rows": 8,
+        "state_history_slots": 6,
+        "cache_indices": [
+          1,
+          3,
+          6
+        ],
+        "has_initial_state": [
+          false,
+          false,
+          false
+        ],
+        "metadata_placement": "device",
+        "metadata_dtypes": {
+          "query_start_loc": "int32",
+          "cache_indices": "int32",
+          "has_initial_state": "bool"
+        }
+      },
+      "expected": [
+        "hasInitialState tiling flag remains 1 because device data is not host-visible",
+        "workspace enabled and SyncAll remains",
+        "no initial snapshot payload copied when per-sequence flags false",
+        "one logical output write per valid token/channel, state update only sequence tail and first width-1 history slots"
+      ]
+    },
+    {
+      "id": "initial_state_cpu_all_false",
+      "inputs": {
+        "seqlens": [
+          1,
+          3,
+          7
+        ],
+        "dim": 16,
+        "width": 4,
+        "state_rows": 8,
+        "cache_indices": [
+          1,
+          3,
+          6
+        ],
+        "has_initial_state": [
+          false,
+          false,
+          false
+        ],
+        "metadata_placement": "cpu",
+        "metadata_dtypes": {
+          "query_start_loc": "int64",
+          "cache_indices": "int64",
+          "has_initial_state": "int64"
+        }
+      },
+      "expected": [
+        "host-visible all-false initial flags disable hasInitialState and workspace snapshot/SyncAll branch",
+        "CPU int64 query_start_loc may populate explicit token-sequence range plan when tokenBlockCnt<=128"
+      ]
+    },
+    {
+      "id": "mixed_state_null_pad",
+      "inputs": {
+        "seqlens": [
+          1,
+          2,
+          0,
+          5,
+          3
+        ],
+        "dim": 16,
+        "width": 4,
+        "cache_indices": [
+          1,
+          0,
+          3,
+          -1,
+          4
+        ],
+        "has_initial_state": [
+          true,
+          true,
+          false,
+          true,
+          false
+        ],
+        "null_block_id": 0,
+        "pad_slot_id": -1,
+        "metadata_placement": "device"
+      },
+      "expected": [
+        "null0 and pad-1 sequences skip execution/state writes",
+        "zero-length sequence does no payload work",
+        "initial history loads and snapshot payload only for true valid state sequences",
+        "skipped output storage is unspecified; do not assume zero"
+      ]
+    },
+    {
+      "id": "bias_disables_rolling",
+      "inputs": {
+        "seqlens": [
+          2,
+          5
+        ],
+        "dim": 32,
+        "width": 4,
+        "bias": true,
+        "activation": "silu"
+      },
+      "compare_to": {
+        "bias": false
+      },
+      "expected": [
+        "bias=true selects generic RunSeq; no-bias selects rolling/regbase branch",
+        "oracle includes bias once per output; source arithmetic and register/UB costs change"
+      ]
+    },
+    {
+      "id": "width_and_activation_dispatch",
+      "parameter_grid": {
+        "width": [
+          2,
+          3,
+          4
+        ],
+        "activation": [
+          null,
+          "silu"
+        ],
+        "dtype": [
+          "float16",
+          "bfloat16"
+        ]
+      },
+      "inputs": {
+        "seqlens": [
+          1,
+          2,
+          3,
+          5
+        ],
+        "dim": 16,
+        "bias": false
+      },
+      "expected": [
+        "derive per-width rolling history, Mul/Add/cast and activation instruction counts from arch35 source",
+        "compare output and mutated state to independent direct convolution oracle"
+      ]
+    },
+    {
+      "id": "large_sequence_symbolic",
+      "inputs": {
+        "total_tokens": 1048576,
+        "dim": 10240,
+        "width": 4,
+        "bias": false
+      },
+      "expected": [
+        "same source-derived tiling equations",
+        "bounded planner/trace representation; no per-token/per-element Python object expansion",
+        "time/service and payload conservation scales through repeat counts, not sampled tokens"
+      ]
+    }
+  ],
+  "ownership": {
+    "allowed": "Dedicated native operator module, targeted tests/cases and SOURCE.md inside assigned worker checkout; root assigns exact filenames and integration point.",
+    "prohibited": [
+      "Do not modify common scheduler, hardware schemas/rates, other worker modules or mainline. Root owns shared infrastructure.",
+      "Do not run device tests, torch_npu imports, GPU/NPU context initialization, or remote jobs.",
+      "Do not change existing Triton lowerer identity to pretend it is the native kernel.",
+      "Do not fit observed CausalConv1d duration or add efficiency/multiplier/per-model branches."
+    ],
+    "resource_requirements": [
+      "Each logical block is bound to a single AIV unit; cannot borrow aggregate vector throughput.",
+      "Use parent-supplied generic unit-ownership and composite-launch APIs. If required APIs are missing, describe precise need instead of implementing private scheduler.",
+      "Separate device-global GM/HBM contention, per-unit UB/vector/MTE service, capacity, dependencies and barriers.",
+      "Keep plan creation memory bounded; use repeated symbolic pipelines for long sequence loops."
+    ]
+  },
+  "numerical_oracle": {
+    "required": true,
+    "placement": "CPU only, no device SDK import",
+    "implementation": "Independent small direct depthwise causal convolution reference from mathematical definition plus cache-state rules. Compare it to a source-branch schedule/interpreter on deterministic explicit arrays; do not compare model to itself.",
+    "equation": "For each valid sequence/channel, y[t,c] = activation(bias[c] + sum_j weight[j,c]*history_or_x[t-(width-1)+j,c]). Initial negative-time history comes from cache only if the actual source has-initial predicate is true; otherwise zero.",
+    "checks": [
+      "FP32 accumulation and output cast semantics for float16/BF16; tolerate only stated rounding differences, not timing multipliers.",
+      "Final state tail follows actual source cache stride/history slot writes and leaves untouched cache rows/extra slots unchanged.",
+      "Sequences crossing token-block boundaries produce same valid y/state as unsplit reference.",
+      "Permuting cache_indices remaps state ownership without changing sequence mathematical output when state data is permuted consistently.",
+      "Null/pad/empty sequences are tested via unchanged sentinel storage, not an assumed all-zero return.",
+      "Compare operation/byte counts and branch trace against small explicit schedule, including initial snapshots and sequence-boundary history reload."
+    ]
+  },
+  "acceptance": {
+    "not_sufficient": [
+      "Passing self-authored tests alone",
+      "Campaign row status ok without expected dispatch and executed branch matching",
+      "Matching one aggregate measured duration"
+    ],
+    "required": [
+      "Source refs for each modeled branch and ownership",
+      "Literal-wrapper cases and branch discriminating counterexamples",
+      "Independent numerical oracle",
+      "Per-unit capacity and work/byte conservation",
+      "CPU boundedness for large symbolic shapes",
+      "Public lowerer/plan/schedule output agreement under two control hardware profiles; no implied hardware runtime verification"
+    ]
+  },
+  "reference_observation": {
+    "path": "/Volumes/data/mindie-sim-data/a5/2026-10-22/qwen38-c4-16k/raw/prof/p16384_c1_o32/ASCEND_PROFILER_OUTPUT/kernel_details.csv",
+    "row": {
+      "csv_line": 52,
+      "Name": "CausalConv1d",
+      "Duration(us)": "336.261",
+      "Accelerator Core": "MIX_AIV",
+      "Block Num": "64",
+      "Mix Block Num": "0",
+      "Input Shapes": "\"16384,10240;4,10240;;648,6,10240;2;1;1;;;;;\"",
+      "Input Data Types": "DT_BF16;DT_BF16;DT_UNDEFINED;DT_BF16;INT32;INT32;BOOL;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED"
+    },
+    "use": "Trace validation only; do not fit duration. This capture has T16384,D10240,width4, BF16, device int32 metadata and device bool initial flag."
+  }
+}

@@ -1,0 +1,134 @@
+[
+  {
+    "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/dsl/static_schedule/conv2d_backprop_filter_schedule.py",
+    "resolved": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/dsl/static_schedule/conv2d_backprop_filter_schedule.py",
+    "sha256": "686e5c3c7a81c93a63693b3e5b3f6a959cc8714d11fa028dc1ad361bfc39f81e",
+    "bytes": 150416,
+    "lines": [
+      [
+        1881,
+        "                m_block = tiling.get(\"CL0_matrix\")[1]"
+      ],
+      [
+        1882,
+        "                n_block = tiling.get(\"CL0_matrix\")[0]"
+      ],
+      [
+        1883,
+        "                k_block = tiling.get(\"AL0_matrix\")[1]"
+      ],
+      [
+        1884,
+        "                byte_size = DTYPE_BYTE_MAPPING.get(in_dtype, 2)"
+      ],
+      [
+        1885,
+        "                l1_2_l0a_rate = int(tbe_platform_info.get_soc_spec(\"l1_to_l0_a_rate\"))"
+      ],
+      [
+        1886,
+        "                l1_2_l0b_rate = int(tbe_platform_info.get_soc_spec(\"l1_to_l0_b_rate\"))"
+      ],
+      [
+        1887,
+        "                if l1_2_l0a_rate == 0 or l1_2_l0b_rate == 0:"
+      ],
+      [
+        1888,
+        "                    dict_args = {'errCode': \"E60108\", 'reason': \"Get l1 to l0 rate error\"}"
+      ],
+      [
+        1889,
+        "                    error_manager_util.raise_runtime_error(dict_args)"
+      ],
+      [
+        1890,
+        "                extra_l0a = (l1_2_l0_tiling_nparts[0] - 1) * (LOAD2D_CONSUME + m_block * k_block *"
+      ],
+      [
+        1891,
+        "                                                              CUBE_MUL_SHAPE * byte_size // l1_2_l0a_rate)"
+      ],
+      [
+        1892,
+        "                extra_l0b = (l1_2_l0_tiling_nparts[1] - 1) * (LOAD3D_CONSUME + n_block * k_block *"
+      ],
+      [
+        1893,
+        "                                                              CUBE_MUL_SHAPE * byte_size // l1_2_l0b_rate)"
+      ]
+    ]
+  },
+  {
+    "path": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/common/utils/op_util/op_util_conv2d.py",
+    "resolved": "/usr/local/Ascend/cann-9.2.0/python/site-packages/tbe/common/utils/op_util/op_util_conv2d.py",
+    "sha256": "829b25f0e8488f37f54f313f06112b153352b18b61b56802c41529a48bb41553",
+    "bytes": 52931,
+    "lines": [
+      [
+        1167,
+        "                              \"l0_b_size\", \"l0_c_size\","
+      ],
+      [
+        1168,
+        "                              \"ub_size\", \"bt_size\","
+      ],
+      [
+        1169,
+        "                              \"ddr_read_rate\", \"ddr_write_rate\","
+      ],
+      [
+        1170,
+        "                              \"l2_rate\", \"l2_read_rate\","
+      ],
+      [
+        1171,
+        "                              \"l2_write_rate\", \"l1_to_l0_a_rate\","
+      ],
+      [
+        1172,
+        "                              \"l1_to_l0_b_rate\", \"l1_to_ub_rate\","
+      ],
+      [
+        1173,
+        "                              \"l0_c_to_ub_rate\", \"ub_to_l2_rate\","
+      ],
+      [
+        1174,
+        "                              \"ub_to_ddr_rate\", \"ub_to_l1_rate\"]"
+      ],
+      [
+        1175,
+        "    for platform_key in platform_info_name_int:"
+      ],
+      [
+        1176,
+        "        if platform.platform_info.get_soc_spec(platform_key) is None:"
+      ],
+      [
+        1177,
+        "            raise RuntimeError(\"get_soc_spec {} failed!\".format(platform_key))"
+      ],
+      [
+        1178,
+        ""
+      ],
+      [
+        1179,
+        "        if platform.platform_info.get_soc_spec(platform_key) == \"unknown\":"
+      ],
+      [
+        1180,
+        "            hardware_info_dict[platform_key] = 0"
+      ],
+      [
+        1181,
+        "            continue"
+      ],
+      [
+        1182,
+        ""
+      ]
+    ]
+  }
+]

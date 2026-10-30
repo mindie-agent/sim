@@ -1,0 +1,73 @@
+{
+  "scope": "declared_source_not_captured_toolchain",
+  "vllm_revision": "752a3a504485790a2e8491cacbb35c137339ad34",
+  "cccl_revision": "e944297b0b51a8e9c0f1b30425370c31c1c0e0a0",
+  "files": [
+    {
+      "path": "scaled_quant.cu",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/quantization/w8a8/int8/scaled_quant.cu",
+      "sha256": "e6fc36b6ddc925e40e0a7a84543dd29da456c19672e0daf28f8287d2e3645243",
+      "bytes": 12407
+    },
+    {
+      "path": "vectorization_utils.cuh",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/quantization/vectorization_utils.cuh",
+      "sha256": "991d501211c90a6a5c88d1062723b04c73ca1418d84f8aa07e255bd97128dff8",
+      "bytes": 7055
+    },
+    {
+      "path": "cub_helpers.h",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/cub_helpers.h",
+      "sha256": "91bd3c5f862387c475806a13245f0353369439a4e83962d2798e820314c48c31",
+      "bytes": 446
+    },
+    {
+      "path": "block_reduce.cuh",
+      "source_path": "/tmp/review-firstwave-cccl-v3.0.0-20261028/block_reduce.cuh",
+      "sha256": "63b196aa7d6434b487a406bf4792b5cbaf12b504ea1b6f16302fc7393a47e3b1",
+      "bytes": 23921
+    },
+    {
+      "path": "block_reduce_warp_reductions.cuh",
+      "source_path": "/tmp/review-firstwave-cccl-v3.0.0-20261028/block_reduce_warp_reductions.cuh",
+      "sha256": "894f3a93fbec0c675fe550228ccfe511b825afcb827696fc6a4570e4a0ac6f32",
+      "bytes": 9552
+    },
+    {
+      "path": "warp_reduce_shfl.cuh",
+      "source_path": "/tmp/review-firstwave-cccl-v3.0.0-20261028/warp_reduce_shfl.cuh",
+      "sha256": "1bf8a57652fa1bb2d1b23a0e7b34958ded66074854cf67085c2fc65b0544cb61",
+      "bytes": 22020
+    },
+    {
+      "path": "layernorm_kernels.cu",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/layernorm_kernels.cu",
+      "sha256": "faaf442f9a520eb7d636acac06b7b52a1765da9b5db13d0d818ff2e1e2537a82",
+      "bytes": 15657
+    },
+    {
+      "path": "type_convert.cuh",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/type_convert.cuh",
+      "sha256": "9274a7464c53de92976f6b5a19cc548b315f5d85e68b825515a6ff1fd73be4ca",
+      "bytes": 6205
+    },
+    {
+      "path": "vectorization.cuh",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/quantization/vectorization.cuh",
+      "sha256": "6b28cf0cfe9e948c989274adbfa46c6cdec393bf245efb49678213eca15171e7",
+      "bytes": 904
+    },
+    {
+      "path": "dispatch_utils.h",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/dispatch_utils.h",
+      "sha256": "7ec1bb7b43cee1e9d8e8150c799618f53e37b7060b061f628049f454d6272e76",
+      "bytes": 9233
+    },
+    {
+      "path": "batch_invariant.hpp",
+      "source_path": "/Users/maoxx241/code/vllm-v0.25.1/csrc/core/batch_invariant.hpp",
+      "sha256": "0f7d5937bf059a1fe2a13d8710667d3ec826ba0bf221c0137e477773ad6049bd",
+      "bytes": 414
+    }
+  ]
+}

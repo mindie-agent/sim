@@ -1,0 +1,123 @@
+{
+  "machine": {
+    "name": "synthetic-arch22-mc2-caller-control",
+    "architecture": "declared",
+    "num_devices": 2,
+    "device": {
+      "memory_bytes": 1073741824,
+      "compute_peaks": {
+        "bf16": 1000000000.0,
+        "fp32": 1000000000.0,
+        "int8": 1000000000.0
+      },
+      "rates": {
+        "memory": 1000000000.0,
+        "vector": 1000000000.0,
+        "mte2_aiv": 1000000000.0,
+        "mte3": 1000000000.0,
+        "mte2_aic": 1000000000.0
+      },
+      "compute_units": 4,
+      "resource_units": {
+        "vector": 4,
+        "mte2_aiv": 4,
+        "mte3": 4,
+        "mte2_aic": 4
+      }
+    },
+    "links": [
+      {
+        "name": "fabric",
+        "capacity_bytes_per_ms": 1000000.0,
+        "members": [
+          0,
+          1
+        ],
+        "semantics": "per_pair",
+        "latency_us": 1
+      }
+    ]
+  },
+  "model": {
+    "name": "geometry",
+    "layers": 1,
+    "hidden_size": 32,
+    "num_heads": 4,
+    "num_kv_heads": 2,
+    "head_dim": 8,
+    "intermediate_size": 64,
+    "vocab_size": 128,
+    "quant": {
+      "name": "declared_per_row_int8",
+      "weight_format": "int8",
+      "activation_format": "int8",
+      "expert_weight_format": "int8",
+      "weight_block": [
+        1,
+        1
+      ],
+      "expert_block": 1,
+      "scale_format": "fp32",
+      "scale_bytes": 4.0,
+      "kv_dtype": "bf16",
+      "index_dtype": "bf16",
+      "index_scale_dtype": "none",
+      "exclusions": [
+        "mtp",
+        "norm",
+        "lm_head",
+        "embedding",
+        "vision",
+        "projector",
+        "conv_weight_f32",
+        "conv_weight_bf16",
+        "router"
+      ],
+      "engram_table_mode": "device_bf16",
+      "source": [],
+      "notes": [],
+      "activation_group_size": 0,
+      "activation_scale_format": "",
+      "activation_scale_pack": 1
+    },
+    "ffn": "moe",
+    "num_experts": 4,
+    "top_k": 2,
+    "moe_intermediate_size": 32
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 1,
+        "output_tokens": 2
+      },
+      {
+        "id": "r1",
+        "prompt_tokens": 1,
+        "output_tokens": 2
+      }
+    ]
+  },
+  "runtime": {
+    "dp": 2,
+    "tp": 1,
+    "pp": 1,
+    "ep": 2,
+    "max_num_batched_tokens": 16,
+    "kernels": {
+      "native_moe_protocol": {
+        "kind": "arch22_v2_caller",
+        "dispatch_quant": "per_token_int8",
+        "max_inflight_per_rank": 2
+      }
+    },
+    "metadata": {
+      "parameter_basis": "synthetic control rates; not hardware calibration",
+      "implementation_scope": "arch22 V2 caller ABI; logical transport/local-work lower bound; native inner tiling unidentified"
+    },
+    "routing": {
+      "policy": "balanced"
+    }
+  }
+}

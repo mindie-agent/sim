@@ -1,0 +1,605 @@
+"""[Role] Measure the FFN activation operators on ONE A3 die at the FFN shape
+grid: fused SwiGLU, separate SwiGLU (silu+mul), separate GeGLU (gelu+mul),
+standalone SiLU and standalone GELU, in bfloat16.
+
+[Invariants]
+- One die only. ``ASCEND_RT_VISIBLE_DEVICES=3`` and an assert that exactly one
+  logical device is visible; the process never falls back to another die.
+- The activation operator's tensor is ``[tokens, intermediate]`` (SwiGLU fuses
+  ``[tokens, 2*intermediate]`` gate-first), so ``hidden`` is an FFN context
+  label, not an operator dimension: every ``hidden`` pair is an explicit
+  replicate that measures hidden-independence instead of being deduplicated.
+- Every timed value is a pair of NPU events around one call. Tensors are
+  allocated and zeroed outside the timed region; 10 warmup calls precede each
+  cell; the row keeps both 20-event passes and all samples.
+- A 64 MiB bf16 copy is measured before and after every cell as a drift canary;
+  the drift is recorded per cell and never corrects the row.
+- Correctness canaries (CPU float32 reference, rel <= 2%) run before any row.
+  A rejected cell keeps its verbatim first error; a cell is never silently
+  dropped.
+- ``--mode sensitivity`` re-times a representative cell on zero vs uniform
+  random inputs so the zero fill cannot be mistaken for a fast path.
+
+[Timeouts & Locks] Single-threaded device loop; one synchronize per pass; the
+outer ssh/docker exec bounds the process.
+[Side-Effect Policy] Allocates NPU tensors on the visible die; writes only the
+JSON/trace paths given on argv.
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import glob
+import json
+import os
+import statistics
+import sys
+import time
+import traceback
+from datetime import datetime, timezone
+
+os.environ.setdefault("ASCEND_RT_VISIBLE_DEVICES", "3")
+
+import torch  # noqa: E402
+import torch_npu  # noqa: E402
+import torch_npu.profiler as prof  # noqa: E402
+
+DTYPE = torch.bfloat16
+DTYPE_BYTES = 2
+HIDDENS = (5120, 7168)
+WIDTHS = (17408, 33792, 3072)
+BATCHES = (1, 4, 8)
+SEQS = (1, 4096, 16384)
+
+#: Traffic model per variant, in bf16 element passes over the output tensor.
+#: fused swiglu reads gate+up and writes out (3); a separate gated form writes
+#: the activation then reads it again with the other head (5); a standalone
+#: activation reads one tensor and writes the output (2).
+TRAFFIC_PASSES = {
+    "swiglu_fused": 3,
+    "swiglu_separate": 5,
+    "geglu_separate": 5,
+    "silu_standalone": 2,
+    "gelu_standalone": 2,
+}
+VARIANTS = tuple(TRAFFIC_PASSES)
+
+
+def log(msg: str) -> None:
+    print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def scope_of(seq: int) -> str:
+    return "decode_step" if seq == 1 else "prefill_chunk"
+
+
+def tokens_of(batch: int, seq: int) -> int:
+    return batch if seq == 1 else batch * seq
+
+
+def stats(samples_ms: list[float]) -> dict:
+    s = sorted(samples_ms)
+    if not s:
+        return {"n": 0}
+    return {
+        "n": len(s),
+        "median_ms": statistics.median(s),
+        "mean_ms": statistics.fmean(s),
+        "min_ms": s[0],
+        "max_ms": s[-1],
+        "stdev_ms": statistics.pstdev(s) if len(s) > 1 else 0.0,
+    }
+
+
+def first_error(exc: BaseException) -> str:
+    lines = [ln.strip() for ln in str(exc).splitlines() if ln.strip()]
+    for ln in lines:
+        if any(t in ln for t in ("EZ", "aclnn", "Invalid", "not implemented",
+                                 "not in", "Failed", "failed", "Error", "Check",
+                                 "schema", "memory", "Memory")):
+            return ln[:800]
+    return (lines[0] if lines else type(exc).__name__)[:800]
+
+
+# ------------------------------------------------------------------ operators
+def make_cell(variant: str, tokens: int, width: int):
+    """Build one operator closure; returns (fn, keep, traffic_bytes, elements)."""
+    n = tokens * width
+    traffic = float(n * TRAFFIC_PASSES[variant] * DTYPE_BYTES)
+    if variant == "swiglu_fused":
+        x = torch.empty((tokens, 2 * width), dtype=DTYPE, device="npu")
+        x.zero_()
+
+        def fn():
+            return torch_npu.npu_swiglu(x, dim=-1)
+
+        return fn, (x,), traffic, n
+    if variant == "swiglu_separate":
+        gate = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        up = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        gate.zero_()
+        up.zero_()
+
+        def fn():
+            return torch.nn.functional.silu(gate).mul(up)
+
+        return fn, (gate, up), traffic, n
+    if variant == "geglu_separate":
+        gate = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        up = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        gate.zero_()
+        up.zero_()
+
+        def fn():
+            return torch.nn.functional.gelu(gate, approximate="tanh").mul(up)
+
+        return fn, (gate, up), traffic, n
+    if variant == "silu_standalone":
+        x = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        x.zero_()
+
+        def fn():
+            return torch.nn.functional.silu(x)
+
+        return fn, (x,), traffic, n
+    if variant == "gelu_standalone":
+        x = torch.empty((tokens, width), dtype=DTYPE, device="npu")
+        x.zero_()
+
+        def fn():
+            return torch.nn.functional.gelu(x, approximate="tanh")
+
+        return fn, (x,), traffic, n
+    raise ValueError(variant)
+
+
+# ------------------------------------------------------------------ canaries
+def rel_err(got: torch.Tensor, ref: torch.Tensor) -> dict:
+    g = got.detach().float().cpu()
+    r = ref.detach().float().cpu()
+    diff = (g - r).abs()
+    scale = float(r.abs().max())
+    return {
+        "relative_max": round(float(diff.max()) / max(scale, 1e-9), 6),
+        "max_abs_error": round(float(diff.max()), 6),
+        "reference_abs_max": round(scale, 6),
+    }
+
+
+def correctness_canaries() -> dict:
+    torch.manual_seed(20261024)
+    t, i = 7, 37
+    gate = torch.randn(t, i)
+    up = torch.randn(t, i)
+    silu_mul = torch.nn.functional.silu(gate) * up
+    gelu_mul = torch.nn.functional.gelu(gate, approximate="tanh") * up
+    out: dict = {"shape": [t, i], "tolerance": 0.02}
+
+    x = torch.cat([gate, up], dim=-1).to(DTYPE).npu()
+    got = torch_npu.npu_swiglu(x, dim=-1)
+    torch.npu.synchronize()
+    fused = rel_err(got, silu_mul)
+    out["swiglu_fused"] = {
+        "ok": fused["relative_max"] <= 0.02, **fused,
+        "layout": "gate_first",
+    }
+
+    gg = gate.to(DTYPE).npu()
+    uu = up.to(DTYPE).npu()
+    got_sep = torch.nn.functional.silu(gg).mul(uu)
+    got_fused_2d = torch_npu.npu_swiglu(torch.cat([gg, uu], dim=-1), dim=-1)
+    torch.npu.synchronize()
+    sep = rel_err(got_sep, silu_mul)
+    out["swiglu_separate"] = {"ok": sep["relative_max"] <= 0.02, **sep}
+    agree = rel_err(got_sep, got_fused_2d.float())
+    out["fused_vs_separate"] = {"relative_max": agree["relative_max"]}
+
+    got_gelu = torch.nn.functional.gelu(gg, approximate="tanh").mul(uu)
+    torch.npu.synchronize()
+    geg = rel_err(got_gelu, gelu_mul)
+    out["geglu_separate"] = {"ok": geg["relative_max"] <= 0.02, **geg}
+
+    got_silu = torch.nn.functional.silu(gg)
+    torch.npu.synchronize()
+    silu_only = rel_err(got_silu, torch.nn.functional.silu(gate))
+    out["silu_standalone"] = {"ok": silu_only["relative_max"] <= 0.02, **silu_only}
+
+    got_gelu1 = torch.nn.functional.gelu(gg, approximate="tanh")
+    torch.npu.synchronize()
+    gelu_only = rel_err(
+        got_gelu1, torch.nn.functional.gelu(gate, approximate="tanh")
+    )
+    out["gelu_standalone"] = {"ok": gelu_only["relative_max"] <= 0.02, **gelu_only}
+    return out
+
+
+def make_drift_canary() -> tuple:
+    src = torch.empty(128 * 1024 * 1024, dtype=DTYPE, device="npu")
+    dst = torch.empty_like(src)
+    src.zero_()
+    dst.zero_()
+
+    def copy():
+        dst.copy_(src)
+
+    return copy, (src, dst), float(src.numel() * 2 * DTYPE_BYTES)
+
+
+# ------------------------------------------------------------------ timing
+def measure(fn, passes: int = 2, events: int = 20, warmup: int = 10) -> dict:
+    for _ in range(warmup):
+        fn()
+    torch.npu.synchronize()
+    per_pass: list[list[float]] = []
+    samples: list[float] = []
+    event_class = torch.npu.Event
+    for _ in range(passes):
+        pairs = [(event_class(enable_timing=True), event_class(enable_timing=True))
+                 for _ in range(events)]
+        torch.npu.synchronize()
+        for e0, e1 in pairs:
+            e0.record()
+            fn()
+            e1.record()
+        torch.npu.synchronize()
+        tms = [e0.elapsed_time(e1) for e0, e1 in pairs]
+        per_pass.append([round(x, 6) for x in tms])
+        samples.extend(tms)
+    return {"per_pass_ms": per_pass, "samples_ms": [round(x, 6) for x in samples],
+            **stats(samples)}
+
+
+def measure_burst(fn, per_call_ms: float, target_s: float = 0.05,
+                  max_ops: int = 100, reps: int = 5) -> dict:
+    """Steady-state per-op cost: one event pair around ``n`` back-to-back calls.
+
+    The per-call event method charges the host dispatch gap of a lone launch to
+    the call; a burst divides the saturated-stream time by ``n`` and is the
+    cost the operator contributes when the stream is already busy.  Both are
+    reported because a single-token decode FFN launches this op alone.
+    """
+    per_op_s = max(per_call_ms / 1000.0, 1e-6)
+    n = int(max(2, min(max_ops, round(target_s / per_op_s))))
+    for _ in range(3):
+        fn()
+    torch.npu.synchronize()
+    event_class = torch.npu.Event
+    samples = []
+    for _ in range(reps):
+        e0 = event_class(enable_timing=True)
+        e1 = event_class(enable_timing=True)
+        torch.npu.synchronize()
+        e0.record()
+        for _ in range(n):
+            fn()
+        e1.record()
+        torch.npu.synchronize()
+        samples.append(e0.elapsed_time(e1) / n)
+    return {"burst_ops": n, "burst_reps": reps,
+            "burst_samples_ms": [round(x, 6) for x in samples],
+            "burst_per_op_us": round(statistics.median(samples) * 1000.0, 3)}
+
+
+
+def run_cell(cell: dict, drift_fn, drift_traffic: float) -> dict:
+    rec = dict(cell)
+    rec["status"] = "pending"
+    t0 = time.perf_counter()
+    keep = None
+    try:
+        canary_before = measure(drift_fn, passes=1, events=20, warmup=3)
+        fn, keep, traffic, elements = make_cell(
+            cell["variant"], cell["tokens"], cell["intermediate"]
+        )
+        rec["elements"] = int(elements)
+        rec["traffic_bytes"] = int(traffic)
+        rec["activation_input_bytes"] = int(
+            elements * (2 if cell["variant"] == "swiglu_fused" else 1) * DTYPE_BYTES
+        )
+        w0 = time.perf_counter()
+        out0 = fn()
+        torch.npu.synchronize()
+        rec["warm_s"] = round(time.perf_counter() - w0, 4)
+        rec["out_shape"] = list(out0.shape)
+        del out0
+        timed = measure(fn)
+        rec.update(timed)
+        burst = measure_burst(fn, timed["median_ms"])
+        rec.update(burst)
+        canary_after = measure(drift_fn, passes=1, events=20, warmup=3)
+        rec["canary_before_ms"] = canary_before["median_ms"]
+        rec["canary_after_ms"] = canary_after["median_ms"]
+        rec["canary_drift_pct"] = round(
+            100.0 * (canary_after["median_ms"] / canary_before["median_ms"] - 1.0), 3
+        )
+        rec["canary_effective_bw_gbps"] = round(
+            drift_traffic / (canary_before["median_ms"] * 1e-3) / 1e9, 1
+        )
+        rec["ms"] = timed["median_ms"]
+        rec["us_per_call"] = round(timed["median_ms"] * 1000.0, 3)
+        rec["us_per_token"] = round(
+            timed["median_ms"] * 1000.0 / cell["tokens"], 5
+        )
+        rec["effective_bw_gbps"] = round(
+            traffic / (timed["median_ms"] * 1e-3) / 1e9, 1
+        )
+        rec["burst_effective_bw_gbps"] = round(
+            traffic / (burst["burst_per_op_us"] * 1e-6) / 1e9, 1
+        )
+        rec["burst_us_per_token"] = round(
+            burst["burst_per_op_us"] / cell["tokens"], 5
+        )
+        rec["status"] = "measured"
+        del keep, fn
+        torch_npu.npu.empty_cache()
+    except BaseException as exc:  # noqa: BLE001 - a rejection is data
+        rec["status"] = "rejected"
+        rec["error_type"] = type(exc).__name__
+        rec["error"] = first_error(exc)
+        rec["trace_tail"] = traceback.format_exc().strip().splitlines()[-3:]
+        try:
+            torch.npu.synchronize()
+            torch_npu.npu.empty_cache()
+        except BaseException:  # noqa: BLE001
+            pass
+    rec["wall_s"] = round(time.perf_counter() - t0, 2)
+    return rec
+
+
+# ------------------------------------------------------------------ profiles
+def parse_trace(root: str, reps: int) -> dict:
+    paths = glob.glob(os.path.join(root, "**", "kernel_details.csv"),
+                      recursive=True)
+    if not paths:
+        raise FileNotFoundError(f"kernel_details.csv not found under {root}")
+    path = max(paths, key=os.path.getmtime)
+    rows = []
+    with open(path, newline="") as f:
+        for row in csv.DictReader(f):
+            rows.append(row)
+    names: dict[str, dict] = {}
+    cores: dict[str, int] = {}
+    total = aiv_total = aic_total = 0.0
+    for row in rows:
+        name = row.get("Name") or ""
+        dur = float((row.get("Duration(us)") or "0").replace("\t", "").strip() or 0)
+        aiv = float((row.get("aiv_time(us)") or "0").replace("\t", "").strip() or 0)
+        aic = float((row.get("aicore_time(us)") or "0").replace("\t", "").strip() or 0)
+        core = (row.get("Accelerator Core") or "").strip()
+        total += dur
+        aiv_total += aiv
+        aic_total += aic
+        cores[core] = cores.get(core, 0) + 1
+        ent = names.setdefault(name, {"kernels": 0, "duration_us": 0.0,
+                                      "aiv_us": 0.0, "aic_us": 0.0,
+                                      "core": core, "types": set(),
+                                      "blocks": set()})
+        ent["kernels"] += 1
+        ent["duration_us"] += dur
+        ent["aiv_us"] += aiv
+        ent["aic_us"] += aic
+        ent["types"].add((row.get("Type") or "").strip())
+        ent["blocks"].add((row.get("Block Num") or "").strip())
+    for ent in names.values():
+        ent["kernels_per_repeat"] = round(ent["kernels"] / reps, 3)
+        ent["duration_us_per_repeat"] = round(ent["duration_us"] / reps, 3)
+        ent["aiv_us_per_repeat"] = round(ent["aiv_us"] / reps, 3)
+        ent["aic_us_per_repeat"] = round(ent["aic_us"] / reps, 3)
+        ent["types"] = sorted(ent["types"])
+        ent["blocks"] = sorted(ent["blocks"])
+        del ent["kernels"], ent["duration_us"], ent["aiv_us"], ent["aic_us"]
+    return {
+        "trace": path,
+        "rows": len(rows),
+        "reps": reps,
+        "kernels_per_repeat": round(len(rows) / reps, 3),
+        "duration_us_per_repeat": round(total / reps, 3),
+        "aiv_us_per_repeat": round(aiv_total / reps, 3),
+        "aic_us_per_repeat": round(aic_total / reps, 3),
+        "accelerator_cores": cores,
+        "kernels": names,
+    }
+
+
+def profile_cell(variant: str, tokens: int, width: int, reps: int,
+                 root: str) -> dict:
+    pdir = os.path.join(root, f"{variant}-t{tokens}-i{width}")
+    os.makedirs(pdir, exist_ok=True)
+    fn, keep, traffic, elements = make_cell(variant, tokens, width)
+    for _ in range(5):
+        fn()
+    torch.npu.synchronize()
+    t0 = time.perf_counter()
+    with prof.profile(
+        activities=[prof.ProfilerActivity.NPU],
+        on_trace_ready=prof.tensorboard_trace_handler(pdir),
+        experimental_config=prof._ExperimentalConfig(
+            profiler_level=prof.ProfilerLevel.Level1
+        ),
+    ):
+        for _ in range(reps):
+            fn()
+        torch.npu.synchronize()
+    rec = parse_trace(pdir, reps)
+    rec.update({"variant": variant, "tokens": tokens, "intermediate": width,
+                "traffic_bytes": int(traffic), "elements": int(elements),
+                "wall_s": round(time.perf_counter() - t0, 2)})
+    del keep, fn
+    torch_npu.npu.empty_cache()
+    return rec
+
+
+# ------------------------------------------------------------------ modes
+def build_cells() -> list[dict]:
+    cells = []
+    for hidden in HIDDENS:
+        for width in WIDTHS:
+            for batch in BATCHES:
+                for seq in SEQS:
+                    for variant in VARIANTS:
+                        tokens = tokens_of(batch, seq)
+                        cells.append({
+                            "cell": f"{variant}-h{hidden}-i{width}-b{batch}-s{seq}",
+                            "variant": variant,
+                            "hidden": hidden,
+                            "intermediate": width,
+                            "batch": batch,
+                            "seq": seq,
+                            "scope": scope_of(seq),
+                            "tokens": tokens,
+                            "dtype": "bfloat16",
+                        })
+    return cells
+
+
+def mode_cells(args) -> int:
+    report = {
+        "schema": "a3-activation-measure/1",
+        "created_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "visible": os.environ.get("ASCEND_RT_VISIBLE_DEVICES"),
+        "device": torch_npu.npu.get_device_name(0),
+        "torch": torch.__version__,
+        "torch_npu": torch_npu.__version__,
+        "hbm_total_mb": round(torch_npu.npu.mem_get_info()[1] / 2**20, 1),
+        "canaries": {}, "cells": {},
+    }
+    if args.resume and os.path.exists(args.out):
+        with open(args.out) as f:
+            old = json.load(f)
+        report["cells"] = old.get("cells", {})
+        report["canaries"] = old.get("canaries", {})
+    torch.npu.set_device(0)
+    if not report["canaries"]:
+        report["canaries"] = correctness_canaries()
+        log(f"canaries {json.dumps(report['canaries'])[:400]}")
+
+    def persist():
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=1)
+
+    persist()
+    drift_fn, drift_keep, drift_traffic = make_drift_canary()
+    cells = build_cells()
+    if args.variant:
+        cells = [c for c in cells if c["variant"] in args.variant.split(",")]
+    if args.width:
+        cells = [c for c in cells if c["intermediate"] in
+                 [int(x) for x in args.width.split(",")]]
+    if args.cell:
+        cells = [c for c in cells if c["cell"] in args.cell.split(",")]
+    log(f"{len(cells)} cells")
+    for cell in cells:
+        if (cell["cell"] in report["cells"]
+                and report["cells"][cell["cell"]].get("status") == "measured"):
+            continue
+        rec = run_cell(cell, drift_fn, drift_traffic)
+        report["cells"][cell["cell"]] = rec
+        if rec["status"] == "measured":
+            log(
+                f"{cell['cell']}: {rec['ms']:.4f} ms  "
+                f"{rec['us_per_token']:.3f} us/token  "
+                f"{rec['effective_bw_gbps']:.0f} GB/s  drift "
+                f"{rec['canary_drift_pct']:+.2f}%"
+            )
+        else:
+            log(f"REJECT {cell['cell']}: {rec.get('error', '')[:160]}")
+        persist()
+    del drift_keep
+    return 0
+
+
+def mode_profile(args) -> int:
+    torch.npu.set_device(0)
+    out = {"schema": "a3-activation-profile/1", "device": torch_npu.npu.get_device_name(0),
+           "reps": args.reps, "cells": {}}
+    if args.resume and os.path.exists(args.out):
+        with open(args.out) as f:
+            out = json.load(f)
+    root = os.path.join(os.path.dirname(args.out), "profile")
+    os.makedirs(root, exist_ok=True)
+    tasks = []
+    for width in (3072, 17408, 33792):
+        for tokens in (1, 4096, 16384):
+            for variant in VARIANTS:
+                tasks.append((variant, tokens, width))
+    for variant in VARIANTS:
+        tasks.append((variant, 131072, 3072))
+    if args.variant:
+        tasks = [t for t in tasks if t[0] in args.variant.split(",")]
+    if args.width:
+        tasks = [t for t in tasks if t[2] in [int(x) for x in args.width.split(",")]]
+    log(f"{len(tasks)} profile windows")
+    for variant, tokens, width in tasks:
+        key = f"{variant}-t{tokens}-i{width}"
+        if key in out["cells"] and out["cells"][key].get("ok"):
+            continue
+        try:
+            rec = profile_cell(variant, tokens, width, args.reps, root)
+            rec["ok"] = True
+            out["cells"][key] = rec
+            log(f"{key}: kernels={rec['kernels_per_repeat']} "
+                f"dur={rec['duration_us_per_repeat']:.1f}us "
+                f"aiv={rec['aiv_us_per_repeat']:.1f} aic={rec['aic_us_per_repeat']:.1f} "
+                f"cores={rec['accelerator_cores']} names="
+                f"{list(rec['kernels'])[:4]}")
+        except BaseException as exc:  # noqa: BLE001
+            out["cells"][key] = {"ok": False, "variant": variant,
+                                 "tokens": tokens, "intermediate": width,
+                                 "error": f"{type(exc).__name__}: {exc}"[:800],
+                                 "trace_tail": traceback.format_exc().strip().splitlines()[-3:]}
+            log(f"PROFILE FAIL {key}: {type(exc).__name__}: {exc}")
+        with open(args.out, "w") as f:
+            json.dump(out, f, indent=1)
+    return 0
+
+
+def mode_sensitivity(args) -> int:
+    torch.npu.set_device(0)
+    out = {"schema": "a3-activation-sensitivity/1", "cells": {}}
+    for variant in VARIANTS:
+        rec = {}
+        for label, fill in (("zeros", "zeros"), ("uniform", "uniform")):
+            fn, keep, traffic, elements = make_cell(variant, 16384, 17408)
+            if fill == "uniform":
+                for buf in keep:
+                    buf.uniform_(-2.0, 2.0)
+            torch.npu.synchronize()
+            timed = measure(fn)
+            rec[label] = {"ms": timed["median_ms"],
+                          "effective_bw_gbps": round(
+                              traffic / (timed["median_ms"] * 1e-3) / 1e9, 1)}
+            del keep, fn
+            torch_npu.npu.empty_cache()
+        rec["ratio_uniform_over_zeros"] = round(
+            rec["uniform"]["ms"] / rec["zeros"]["ms"], 4)
+        out["cells"][variant] = rec
+        log(f"sensitivity {variant}: {rec['ratio_uniform_over_zeros']}x")
+    with open(args.out, "w") as f:
+        json.dump(out, f, indent=1)
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("out")
+    ap.add_argument("--mode", default="cells",
+                    choices=["cells", "profile", "sensitivity"])
+    ap.add_argument("--reps", type=int, default=10)
+    ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--variant", default="")
+    ap.add_argument("--width", default="")
+    ap.add_argument("--cell", default="")
+    args = ap.parse_args()
+    if torch.npu.device_count() != 1:
+        raise SystemExit(
+            f"expected exactly one visible device, got {torch.npu.device_count()}"
+        )
+    if args.mode == "cells":
+        return mode_cells(args)
+    if args.mode == "profile":
+        return mode_profile(args)
+    return mode_sensitivity(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

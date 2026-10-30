@@ -1,0 +1,211 @@
+[
+  {
+    "id": "deepseek-v2",
+    "repository": "deepseek-ai/DeepSeek-V2",
+    "requested_url": "https://huggingface.co/deepseek-ai/DeepSeek-V2/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/deepseek-ai/DeepSeek-V2/4461458f186c35188585855f28f77af5661ad489/config.json?%2Fdeepseek-ai%2FDeepSeek-V2%2Fresolve%2Fmain%2Fconfig.json=&etag=%22c2c1efbc4eaeb72bc2696281ea1b0c3f3b7a0f95%22",
+    "revision": "4461458f186c35188585855f28f77af5661ad489",
+    "sha256": "36f572d2909bd108d73a814c585fd61afd56266960a13eb67c713e229d3435d1",
+    "local_path": "/tmp/sim-family-configs-20261029/deepseek-v2.json",
+    "config": {
+      "architectures": [
+        "DeepseekV2ForCausalLM"
+      ],
+      "attention_bias": false,
+      "first_k_dense_replace": 1,
+      "hidden_size": 5120,
+      "model_type": "deepseek_v2",
+      "moe_layer_freq": 1,
+      "n_routed_experts": 160,
+      "n_shared_experts": 2,
+      "num_attention_heads": 128,
+      "num_hidden_layers": 60,
+      "num_key_value_heads": 128,
+      "q_lora_rank": 1536,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64
+    }
+  },
+  {
+    "id": "deepseek-v2-lite",
+    "repository": "deepseek-ai/DeepSeek-V2-Lite",
+    "requested_url": "https://huggingface.co/deepseek-ai/DeepSeek-V2-Lite/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/deepseek-ai/DeepSeek-V2-Lite/604d5664dddd88a0433dbae533b7fe9472482de0/config.json?%2Fdeepseek-ai%2FDeepSeek-V2-Lite%2Fresolve%2Fmain%2Fconfig.json=&etag=%22a1aa8126bbf462cbec8fcc79e8c98d8d87f5c7ed%22",
+    "revision": "604d5664dddd88a0433dbae533b7fe9472482de0",
+    "sha256": "f346286b0f1c8b044252fd54cb4fa78b9fab6472a6e8bebb9edfe03d414ea03d",
+    "local_path": "/tmp/sim-family-configs-20261029/deepseek-v2-lite.json",
+    "config": {
+      "architectures": [
+        "DeepseekV2ForCausalLM"
+      ],
+      "attention_bias": false,
+      "first_k_dense_replace": 1,
+      "hidden_size": 2048,
+      "model_type": "deepseek_v2",
+      "moe_layer_freq": 1,
+      "n_routed_experts": 64,
+      "n_shared_experts": 2,
+      "num_attention_heads": 16,
+      "num_hidden_layers": 27,
+      "num_key_value_heads": 16,
+      "q_lora_rank": null,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64
+    }
+  },
+  {
+    "id": "deepseek-v3",
+    "repository": "deepseek-ai/DeepSeek-V3",
+    "requested_url": "https://huggingface.co/deepseek-ai/DeepSeek-V3/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/deepseek-ai/DeepSeek-V3/e815299b0bcbac849fa540c768ef21845365c9eb/config.json?%2Fdeepseek-ai%2FDeepSeek-V3%2Fresolve%2Fmain%2Fconfig.json=&etag=%22aec35a75d9bd54d463287e655724a0aeffdb38ce%22",
+    "revision": "e815299b0bcbac849fa540c768ef21845365c9eb",
+    "sha256": "cbf0b95dc614de208a109bb5fd4e7eed11385e9c68411d2c17db5319443035d9",
+    "local_path": "/tmp/sim-family-configs-20261029/deepseek-v3.json",
+    "config": {
+      "architectures": [
+        "DeepseekV3ForCausalLM"
+      ],
+      "attention_bias": false,
+      "first_k_dense_replace": 3,
+      "hidden_size": 7168,
+      "model_type": "deepseek_v3",
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "n_shared_experts": 1,
+      "num_attention_heads": 128,
+      "num_hidden_layers": 61,
+      "num_key_value_heads": 128,
+      "num_nextn_predict_layers": 1,
+      "q_lora_rank": 1536,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64
+    }
+  },
+  {
+    "id": "deepseek-r1",
+    "repository": "deepseek-ai/DeepSeek-R1",
+    "requested_url": "https://huggingface.co/deepseek-ai/DeepSeek-R1/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/deepseek-ai/DeepSeek-R1/56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad/config.json?%2Fdeepseek-ai%2FDeepSeek-R1%2Fresolve%2Fmain%2Fconfig.json=&etag=%22c482e777cbacba9cb292d0fceba48ef52956583e%22",
+    "revision": "56d4cbbb4d29f4355bab4b9a39ccb717a14ad5ad",
+    "sha256": "79ddea672a62e95d3f0be27be434375538e1988975971cffcf87c96c1de84a65",
+    "local_path": "/tmp/sim-family-configs-20261029/deepseek-r1.json",
+    "config": {
+      "architectures": [
+        "DeepseekV3ForCausalLM"
+      ],
+      "attention_bias": false,
+      "first_k_dense_replace": 3,
+      "hidden_size": 7168,
+      "model_type": "deepseek_v3",
+      "moe_layer_freq": 1,
+      "n_routed_experts": 256,
+      "n_shared_experts": 1,
+      "num_attention_heads": 128,
+      "num_hidden_layers": 61,
+      "num_key_value_heads": 128,
+      "num_nextn_predict_layers": 1,
+      "q_lora_rank": 1536,
+      "qk_nope_head_dim": 128,
+      "qk_rope_head_dim": 64
+    }
+  },
+  {
+    "id": "glm4-0414",
+    "repository": "zai-org/GLM-4-9B-0414",
+    "requested_url": "https://huggingface.co/zai-org/GLM-4-9B-0414/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/zai-org/GLM-4-9B-0414/645b8482494e31b6b752272bf7f7f273ef0f3caf/config.json?%2Fzai-org%2FGLM-4-9B-0414%2Fresolve%2Fmain%2Fconfig.json=&etag=%229ecfae699d5973828d1915369265c15f26c175df%22",
+    "revision": "645b8482494e31b6b752272bf7f7f273ef0f3caf",
+    "sha256": "98794d8150da03ca7baec63208584810d01caf43427e376071c00e770f4b4fa7",
+    "local_path": "/tmp/sim-family-configs-20261029/glm4-0414.json",
+    "config": {
+      "architectures": [
+        "Glm4ForCausalLM"
+      ],
+      "attention_bias": true,
+      "head_dim": 128,
+      "hidden_size": 4096,
+      "model_type": "glm4",
+      "num_attention_heads": 32,
+      "num_hidden_layers": 40,
+      "num_key_value_heads": 2,
+      "partial_rotary_factor": 0.5
+    }
+  },
+  {
+    "id": "glm4-chat",
+    "repository": "zai-org/glm-4-9b-chat",
+    "requested_url": "https://huggingface.co/zai-org/glm-4-9b-chat/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/zai-org/glm-4-9b-chat/bd8234fe5e0c09c48637a92abb0c797cb5fa0e73/config.json?%2Fzai-org%2Fglm-4-9b-chat%2Fresolve%2Fmain%2Fconfig.json=&etag=%22f4e13cf449af415ec7b3185c3bb661c1603859f7%22",
+    "revision": "bd8234fe5e0c09c48637a92abb0c797cb5fa0e73",
+    "sha256": "d135f1555ed1036be6eda988fc6ae365cdc8a8122aff0bf6d0602c1e1c93bee6",
+    "local_path": "/tmp/sim-family-configs-20261029/glm4-chat.json",
+    "config": {
+      "model_type": "chatglm",
+      "architectures": [
+        "ChatGLMModel"
+      ],
+      "add_bias_linear": false,
+      "add_qkv_bias": true,
+      "ffn_hidden_size": 13696,
+      "hidden_size": 4096,
+      "kv_channels": 128,
+      "multi_query_group_num": 2,
+      "num_attention_heads": 32,
+      "num_hidden_layers": 40,
+      "num_layers": 40,
+      "rmsnorm": true
+    }
+  },
+  {
+    "id": "glm45",
+    "repository": "zai-org/GLM-4.5",
+    "requested_url": "https://huggingface.co/zai-org/GLM-4.5/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/zai-org/GLM-4.5/cbb2c7cfb52fa128a9660cb1a7a78e017899e115/config.json?%2Fzai-org%2FGLM-4.5%2Fresolve%2Fmain%2Fconfig.json=&etag=%22c8a792d99a36139dda07b552468252dc36873f32%22",
+    "revision": "cbb2c7cfb52fa128a9660cb1a7a78e017899e115",
+    "sha256": "a5dbd07371a8a51b0013a63a7a70543a7094af1a9598812b537133e6da78dda7",
+    "local_path": "/tmp/sim-family-configs-20261029/glm45.json",
+    "config": {
+      "architectures": [
+        "Glm4MoeForCausalLM"
+      ],
+      "attention_bias": true,
+      "head_dim": 128,
+      "hidden_size": 5120,
+      "partial_rotary_factor": 0.5,
+      "model_type": "glm4_moe",
+      "num_attention_heads": 96,
+      "n_routed_experts": 160,
+      "n_shared_experts": 1,
+      "first_k_dense_replace": 3,
+      "num_hidden_layers": 92,
+      "num_key_value_heads": 8,
+      "num_nextn_predict_layers": 1
+    }
+  },
+  {
+    "id": "glm45-air",
+    "repository": "zai-org/GLM-4.5-Air",
+    "requested_url": "https://huggingface.co/zai-org/GLM-4.5-Air/resolve/main/config.json",
+    "resolved_url": "https://huggingface.co/api/resolve-cache/models/zai-org/GLM-4.5-Air/a24ceef6ce4f3536971efe9b778bdaa1bab18daa/config.json?%2Fzai-org%2FGLM-4.5-Air%2Fresolve%2Fmain%2Fconfig.json=&etag=%22f1c84cb5930ca1a0499e77c4b690e478323aa856%22",
+    "revision": "a24ceef6ce4f3536971efe9b778bdaa1bab18daa",
+    "sha256": "e59f21d7be4b4b917d80bb3a2d1211356d29cf3aeff93372523daf7d0ffb839d",
+    "local_path": "/tmp/sim-family-configs-20261029/glm45-air.json",
+    "config": {
+      "architectures": [
+        "Glm4MoeForCausalLM"
+      ],
+      "attention_bias": true,
+      "head_dim": 128,
+      "hidden_size": 4096,
+      "partial_rotary_factor": 0.5,
+      "model_type": "glm4_moe",
+      "num_attention_heads": 96,
+      "n_routed_experts": 128,
+      "n_shared_experts": 1,
+      "first_k_dense_replace": 1,
+      "num_hidden_layers": 46,
+      "num_key_value_heads": 8,
+      "num_nextn_predict_layers": 1
+    }
+  }
+]

@@ -1,0 +1,95 @@
+{
+  "name": "catalog-full-model-qwen35-35b-a3b-a5-true128k",
+  "machine": {
+    "arch_family": "A5",
+    "compute_peaks": {
+      "bf16": 432537600000000.0,
+      "fp8_e4m3": 865075200000000.0,
+      "int8": 865075200000000.0
+    },
+    "device": {
+      "aic_count": 32,
+      "aiv_count": 64,
+      "cube_flops_per_s": 432537600000000.0,
+      "hbm_bw_bytes_per_s": 4000000000000.0,
+      "hbm_gib": 96,
+      "l2_bytes": 134217728,
+      "launch_us": 20,
+      "mte_bw_bytes_per_s": 4000000000000.0,
+      "l1_bytes": 524288,
+      "ub_bytes": 253952,
+      "l0a_bytes": 65536,
+      "l0b_bytes": 65536,
+      "l0c_bytes": 262144
+    },
+    "dies_per_package": 2,
+    "hardware_key": "Ascend950DT_9582",
+    "links": [
+      {
+        "capacity_gbps": 392,
+        "channel": "d2d_intra_node",
+        "latency_us": 2.5,
+        "members": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "name": "d2d"
+      }
+    ],
+    "name": "a5-950dt-9582-4die",
+    "num_devices": 4,
+    "ranks_per_node": 8,
+    "sku": "Ascend950DT_9582",
+    "backend": "ascend"
+  },
+  "model": {
+    "catalog_key": "qwen3.5-35b-a3b",
+    "quantization": "W8A8_DYNAMIC"
+  },
+  "runtime": {
+    "dp": 1,
+    "enable_chunked_prefill": true,
+    "ep": 1,
+    "gpu_memory_utilization": 0.9,
+    "graph_buckets": [
+      1,
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "graph_mode": "auto",
+    "kv_block_size": 128,
+    "max_model_len": 135168,
+    "max_num_batched_tokens": 8192,
+    "max_num_seqs": 32,
+    "metadata": {
+      "draft_mode": "mtp",
+      "draft_proposal_tokens": 3,
+      "comm_prefill_scope": "prefill",
+      "recipe": "vllm serve /mnt/weight/Qwen3.5-35B-A3B-w8a8-mtp --tensor-parallel-size 4 --quantization ascend --trust-remote-code --max-model-len 135168 --max-num-seqs 32 --max-num-batched-tokens 8192 --gpu-memory-utilization 0.90 --no-enable-prefix-caching --async-scheduling --speculative-config '{\"method\": \"qwen3_5_mtp\", \"num_speculative_tokens\": 3}' --compilation-config '{\"cudagraph_mode\":\"FULL_DECODE_ONLY\"}'",
+      "weights": "Qwen3.5-35B-A3B-w8a8-mtp: int8 W8A8_DYNAMIC body (9.5 GiB/die at TP4), MTP3 head in the checkpoint, APC off, container-local non-fused probe (HAS_TRITON -> False)",
+      "host": "rack08os8 (177.31.28.1) dies 0-3, one 4-die Ascend950DT slice; supplemental rows on rack08os7 dies 0-3",
+      "image": "swr.cn-north-12.myhuaweicloud.com/base_image/ascend-ci/vllm-ascend@sha256:21de5566... (image 75dd914da79d); vllm 0.31.0, CANN 9.2.0",
+      "measured_baseline": ".workstreams/hp-serving/qwen35-longctx/gate-v4/report.md (2026-10-23, rack08os8)",
+      "mtp": "MTP3: num_speculative_tokens=3, qwen3_5_mtp normalised to mtp; the PASS gate measured 3.72-3.99 committed tokens per decode step on its long-context cells",
+      "row_policy": "measured A5 rows are declared by the cells manifest and applied only when their exact geometry matches; a row for another TP/head layout or an uncovered band is declared missing, never substituted",
+      "true_128k": "prompt 131072 + output 4096 = 135168 total; requires max_model_len >= 135168"
+    },
+    "moe_recipe": "alltoall",
+    "pp": 1,
+    "tp": 4
+  },
+  "workload": {
+    "requests": [
+      {
+        "id": "r0",
+        "prompt_tokens": 131072,
+        "output_tokens": 4096
+      }
+    ]
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "profiler.csv": "raw/fia-paged-probe/op_summary_20261025101818.csv",
+  "catalogue.sqlite": "/Volumes/data/mindie-sim-data/profiling-reuse-20261023/kernels.sqlite",
+  "service.json": "/Volumes/data/mindie-sim-data/a3/2026-10-23/qwen38-tp4/raw/tp4-base/p4096_c1.json",
+  "selection": "first 6 CSV records; first 16 database events and their original parents; service capture retained in full",
+  "service_sha256": "1ed138a8d919b3abccb1e6dd3b13ed60d39d190c5efe971abdaac1e1b50bbe21",
+  "service_metric_producer": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen38-a3-tp4/cfg/bench_stream.py"
+}

@@ -1,0 +1,31 @@
+{
+  "repository": "https://github.com/hicann/hccl",
+  "revision": "c2d6790464654ccf58aca39448de4b65fdc7b184",
+  "identity_boundary": "Pinned upstream source; no installed runtime or device capability identity claim",
+  "files": [
+    {
+      "path": "src/ops/op_common/topo_info/topo_host.cc",
+      "sha256": "dc2f89f303d8e3e69662659c72f18c72fe6e22ab9ba5c573bc8efe352d2d2ee8"
+    },
+    {
+      "path": "src/ops/all_gather/algorithm/executor/ins_v2_all_gather_sole_executor.cc",
+      "sha256": "91dbfe5c7536f08ef251775207dfc97434319565efa58b9aae0063901a70b8cf"
+    },
+    {
+      "path": "src/ops/all_gather/algorithm/template/ccu/ccu_temp_all_gather_2dies_mesh_1D.cc",
+      "sha256": "bc317ccd45bdb81ee0a142e8acb09815364d40fa3b6a2c46963cfd1ef1ecadf3"
+    },
+    {
+      "path": "src/ops/all_gather/algorithm/template/ccu/kernel/ccu_kernel_all_gather_2dies_mesh_1D.cc",
+      "sha256": "34f06871571f48d36613b506269fbbc03e10ac64e3a67eee0bbccb3188498c6a"
+    },
+    {
+      "path": "src/ops/op_common/algorithm/template/ccu/ccu_kernel_alg_base.cc",
+      "sha256": "04eef2e92a0aa5495f84743b1752417878effaf7c4cfc034e23a466038c2b01f"
+    },
+    {
+      "path": "src/ops/op_common/algorithm/template/ccu/ccu_kernel_alg_base.h",
+      "sha256": "02d0f51dc79502b9f0f6a0be922768e6337c6ddf27956e0be2dd4dbcab98d197"
+    }
+  ]
+}

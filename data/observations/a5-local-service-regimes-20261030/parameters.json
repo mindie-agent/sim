@@ -1,0 +1,433 @@
+{
+  "schema": "mindie-sim.observable-regimes/1",
+  "rules": [
+    {
+      "id": "a5-strided-state-gather",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "recipe": "triton_noncontiguous_conv_state_copy",
+        "dtype": "bf16",
+        "metadata.direction": "gather",
+        "local_shape.1": 6,
+        "local_shape.2": 3072,
+        "resource_units.vector": 64
+      },
+      "coordinates": {
+        "rows": {
+          "path": "local_shape.0"
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 16,
+          "max": 64
+        }
+      },
+      "response": {
+        "fixed_us": 3.5797064937803116,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.3628009421779463,
+            "scale_with": {
+              "resource": "mte2_aiv",
+              "reference_rate": 4224000000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "basis": "observed_native_call_affine_service",
+        "original_split": "unassigned",
+        "assignment_batches": [
+          16,
+          64
+        ],
+        "validation_batch": 32,
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "observed_mean_us": {
+          "16": 9.384521568627452,
+          "32": 15.043888994307407,
+          "64": 26.798966793168873
+        },
+        "sources": [
+          {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+          }
+        ],
+        "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+      }
+    },
+    {
+      "id": "a5-strided-state-scatter",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "recipe": "triton_noncontiguous_conv_state_copy",
+        "dtype": "bf16",
+        "metadata.direction": "scatter",
+        "local_shape.1": 6,
+        "local_shape.2": 3072,
+        "resource_units.vector": 64
+      },
+      "coordinates": {
+        "rows": {
+          "path": "local_shape.0"
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 16,
+          "max": 64
+        }
+      },
+      "response": {
+        "fixed_us": 4.138592325532352,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.19713528357579593,
+            "scale_with": {
+              "resource": "mte3",
+              "reference_rate": 13516800000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "basis": "observed_native_call_affine_service",
+        "original_split": "unassigned",
+        "assignment_batches": [
+          16,
+          64
+        ],
+        "validation_batch": 32,
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "observed_mean_us": {
+          "16": 7.292756862745087,
+          "32": 10.747849146110058,
+          "64": 16.755250474383292
+        },
+        "sources": [
+          {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+          }
+        ],
+        "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+      }
+    },
+    {
+      "id": "a5-mxfp8-routing-count",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "recipe": "ascend_moe_init_routing_v3_mxfp8",
+        "dtype": "bf16",
+        "metadata.moe_init_config.experts": 288,
+        "metadata.moe_init_config.topk": 8,
+        "metadata.moe_init_config.width": 4096
+      },
+      "coordinates": {
+        "rows": {
+          "path": "metadata.moe_init_config.tokens",
+          "scale": 0.25
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 16,
+          "max": 64
+        }
+      },
+      "response": {
+        "fixed_us": 21.091916350913127,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.11993761894094564,
+            "scale_with": {
+              "resource": "vector",
+              "reference_rate": 6758400000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "basis": "observed_native_call_affine_service",
+        "original_split": "unassigned",
+        "assignment_batches": [
+          16,
+          64
+        ],
+        "validation_batch": 32,
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "observed_mean_us": {
+          "16": 23.010918253968256,
+          "32": 24.68482411674347,
+          "64": 28.767923963133647
+        },
+        "sources": [
+          {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+          }
+        ],
+        "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+      }
+    },
+    {
+      "id": "a5-aicpu-mesh-oneshot-payload",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "kernel": "HCCL_AICPU_TS_allreduce_mesh_oneshot",
+        "metadata.hccl_selection.ranks": 8,
+        "metadata.hccl_selection.dtype_bytes": 2
+      },
+      "coordinates": {
+        "rows": {
+          "path": "metadata.hccl_selection.payload_bytes",
+          "scale": 3.0517578125e-05
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 16,
+          "max": 64
+        }
+      },
+      "response": {
+        "fixed_us": 31.665457108721633,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.17175268070489835
+          }
+        ]
+      },
+      "provenance": {
+        "basis": "observed_native_call_affine_service",
+        "original_split": "unassigned",
+        "assignment_batches": [
+          16,
+          64
+        ],
+        "validation_batch": 32,
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "observed_mean_us": {
+          "16": 34.413500000000006,
+          "32": 36.277049820788534,
+          "64": 42.65762867383513
+        },
+        "sources": [
+          {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+          }
+        ],
+        "rate_interpretation": "fixed_protocol_response_in_declared_hardware_regime"
+      }
+    },
+    {
+      "id": "a5-mxfp8-grouped-swiglu-small-banks",
+      "match": {
+        "hardware": "Ascend950DT_9582",
+        "recipe": "ascend_mxfp8_grouped_swiglu_quant",
+        "metadata.mxfp8_swiglu_config.k": 4096,
+        "metadata.mxfp8_swiglu_config.width": 256
+      },
+      "coordinates": {
+        "rows": {
+          "path": "local_shape.0",
+          "scale": 0.03125
+        },
+        "groups": {
+          "path": "metadata.mxfp8_swiglu_config.rows",
+          "reduce": "len"
+        }
+      },
+      "domain": {
+        "rows": {
+          "min": 16,
+          "max": 64
+        },
+        "groups": {
+          "min": 288,
+          "max": 288
+        }
+      },
+      "response": {
+        "fixed_us": 204.60682679638163,
+        "terms": [
+          {
+            "coordinate": "rows",
+            "us_per_unit": 0.10127997205154553,
+            "scale_with": {
+              "resource": "vector",
+              "reference_rate": 6758400000000.0
+            }
+          }
+        ]
+      },
+      "provenance": {
+        "basis": "observed_native_call_affine_service",
+        "original_split": "unassigned",
+        "assignment_batches": [
+          16,
+          64
+        ],
+        "validation_batch": 32,
+        "validation_history": "previously_examined_not_pristine_holdout",
+        "observed_mean_us": {
+          "16": 206.22730634920634,
+          "32": 207.86539861751152,
+          "64": 211.08874500768053
+        },
+        "sources": [
+          {
+            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
+          },
+          {
+            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
+          }
+        ],
+        "rate_interpretation": "effective_service_scaling_assumption_not_isolated_pipe_measurement"
+      }
+    }
+  ],
+  "validation": [
+    {
+      "id": "a5-strided-state-gather",
+      "parameter_assignment": [
+        16,
+        64
+      ],
+      "observed_us": {
+        "16": 9.384521568627452,
+        "32": 15.043888994307407,
+        "64": 26.798966793168873
+      },
+      "unused_in_assignment": 32,
+      "validation_predicted_us": 15.189336643474594,
+      "validation_relative_error": 0.00966822137694745
+    },
+    {
+      "id": "a5-strided-state-scatter",
+      "parameter_assignment": [
+        16,
+        64
+      ],
+      "observed_us": {
+        "16": 7.292756862745087,
+        "32": 10.747849146110058,
+        "64": 16.755250474383292
+      },
+      "unused_in_assignment": 32,
+      "validation_predicted_us": 10.446921399957823,
+      "validation_relative_error": -0.02799888071197476
+    },
+    {
+      "id": "a5-mxfp8-routing-count",
+      "parameter_assignment": [
+        16,
+        64
+      ],
+      "observed_us": {
+        "16": 23.010918253968256,
+        "32": 24.68482411674347,
+        "64": 28.767923963133647
+      },
+      "unused_in_assignment": 32,
+      "validation_predicted_us": 24.92992015702339,
+      "validation_relative_error": 0.009929017080323232
+    },
+    {
+      "id": "a5-aicpu-mesh-oneshot-payload",
+      "parameter_assignment": [
+        16,
+        64
+      ],
+      "observed_us": {
+        "16": 34.413500000000006,
+        "32": 36.277049820788534,
+        "64": 42.65762867383513
+      },
+      "unused_in_assignment": 32,
+      "validation_predicted_us": 37.16154289127838,
+      "validation_relative_error": 0.024381615232200726
+    },
+    {
+      "id": "a5-mxfp8-grouped-swiglu-small-banks",
+      "parameter_assignment": [
+        16,
+        64
+      ],
+      "observed_us": {
+        "16": 206.22730634920634,
+        "32": 207.86539861751152,
+        "64": 211.08874500768053
+      },
+      "unused_in_assignment": 32,
+      "validation_predicted_us": 207.8477859020311,
+      "validation_relative_error": -8.473134825504047e-05
+    }
+  ],
+  "scope": "native_kernel_response_not_body_fit"
+}
