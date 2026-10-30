@@ -116,9 +116,10 @@ def _template(raw_items, compute_units, resource_items):
             steps = phase.steps or (("service", phase.work),)
 
             def append_primitive(target, name, when, after, *, share=1.0, owner=owner, prefix=None):
-                demand = services[owner].get(when + ':' + name, Work()).scaled(share)
-                if not demand.resources:
+                source = services[owner].get(when + ':' + name)
+                if source is None or not source.resources:
                     return after
+                demand = source.scaled(share)
                 step_id = (f"owner{owner}:" if prefix is None else prefix) + name + ':' + when + ':primitive'
                 target.append(Stage(step_id, context.bind(demand), after=after,
                     placement=context.owned(owner, units, demand.resources)))
@@ -133,12 +134,12 @@ def _template(raw_items, compute_units, resource_items):
                     placement=context.owned(owner, units, demand.resources)))
                 owned_rows = raw["source_tokens"] * weight
 
-                def token_stages(token, *, owner=owner, owned_rows=owned_rows):
-                    fraction = min(1.0, owned_rows - token) / raw["source_tokens"]
+                def token_stages(rows):
+                    fraction = rows / raw["source_tokens"]
                     token_chain, previous = [], ()
                     for name, values in steps[1:]:
                         demand = Work(resources=dict(values)).scaled(fraction)
-                        share = min(1.0, owned_rows-token) / owned_rows
+                        share = rows / owned_rows
                         previous = append_primitive(token_chain, name, 'before', previous,
                                                     share=share, owner=owner, prefix='')
                         token_chain.append(Stage(name, context.bind(demand), after=previous,
@@ -147,8 +148,18 @@ def _template(raw_items, compute_units, resource_items):
                                                     share=share, owner=owner, prefix='')
                     return tuple(token_chain)
 
+                # Full rows repeat the same source instruction DAG. Bind its
+                # immutable stage template once per owner, with one additional
+                # fractional expected-row tail; PipelineProgram still issues
+                # every token and retains the original one-slot dependencies.
+                full_count = math.floor(owned_rows)
+                tail_rows = owned_rows - full_count
+                full = token_stages(1.0) if full_count else ()
+                tail = token_stages(tail_rows) if tail_rows else ()
                 stages.append(Stage(f"owner{owner}:tokens", after=(step_id,),
-                    program=PipelineProgram(math.ceil(owned_rows), 1, token_stages)))
+                    program=PipelineProgram(math.ceil(owned_rows), 1,
+                        lambda token, full=full, tail=tail, count=full_count:
+                        full if token < count else tail)))
             else:
                 for name, values in steps:
                     # Sender prefix lengths depend on the assignment's global

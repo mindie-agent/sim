@@ -85,3 +85,41 @@ def test_owner_topology_and_declared_primitive_roles_select_different_templates(
                for row in owner.values()) == 48
     for role in ('hbm', 'mte2_aiv', 'mte3', 'vector'):
         assert fewer.work.resources.get(role, 0) == ordinary.work.resources.get(role, 0)
+
+
+def test_million_token_owner_program_reuses_full_rows_and_keeps_fractional_tail_work():
+    raw, op, original = inputs()
+    tokens, units = 1_000_000.25, 4
+    raw.update(source_tokens=tokens, source_assignments=tokens * raw['top_k'],
+               received_assignments=tokens * raw['top_k'])
+    roles = {role: 1 if role == 'hbm' else units for role in original.resource_units}
+    geometry = Geometry(units, roles)
+    plan = build(op, geometry)
+    context = RecipeContext(op, {}, {role: role for role in roles},
+                            {role: 1000 * count for role, count in roles.items()},
+                            units, resource_units=roles)
+    program = plan.program(context)
+    total, tails = {}, 0
+
+    def add(stages, repeats=1):
+        for stage in stages:
+            for role, value in stage.work.items():
+                total[role] = total.get(role, 0) + repeats * value
+
+    for stage in program.stages:
+        if stage.program is None:
+            add((stage,))
+            continue
+        rows = stage.program
+        first, last = rows.tile(0), rows.tile(rows.count - 1)
+        # Construction/binding is bounded by owners and two row geometries,
+        # while the original token count and per-token instruction DAG remain.
+        assert rows.tile(rows.count // 2) is first
+        add(first, rows.count - 1)
+        add(last)
+        tails += last is not first
+    assert tails == 1
+    assert total == pytest.approx(plan.work.resources, rel=1e-12)
+    assert total['hbm'] == tokens * raw['top_k'] * (
+        4 + math.ceil(raw['width'] * 2 / 480) * 480)
+    assert total['vector'] == tokens * (3 * raw['top_k'] + 1) * raw['width']
