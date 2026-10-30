@@ -79,3 +79,27 @@ def test_capacity_retains_pipeline_stage_and_replica_limits_without_truncating_w
         assert row["resident_bytes"] == pytest.approx(
             row["weights_bytes"] + row["workspace_bytes"] + row["reserved_bytes"] + row["cache_bytes"])
         assert row["headroom_bytes"] == row["cache_capacity_bytes"] - row["cache_bytes"]
+
+
+def test_valid_requests_capture_bucket_and_sp_padding_are_distinct_public_geometry():
+    from mindie_sim.prediction.sequence_parallel import DECLARATION
+    raw = case(tp=16, ep=16)
+    raw['model'].update(hidden_size=128, num_heads=16, num_kv_heads=2,
+                        intermediate_size=256, ffn='moe', num_experts=16,
+                        top_k=2, moe_intermediate_size=64,
+                        layer_plans=[{'index':i, 'attention':'gqa', 'ffn':'moe',
+                                      'num_heads':16, 'num_kv_heads':2, 'head_dim':8,
+                                      'num_experts':16, 'top_k':2, 'moe_intermediate_size':64,
+                                      'residual_block_size':2} for i in range(2)])
+    raw['runtime'].update(graph_mode='auto', graph_capture_mode='full',
+                           graph_capture_keys=[8], routing={'policy':'balanced'},
+                           kernels={'sequence_parallel':dict(DECLARATION,padding='right_to_tp')})
+    report = predict(raw, scope='body', tokens=1, sequences=6, context=32)
+    geometry = report['geometry']
+    assert geometry['valid_query_tokens_by_replica'] == {0:6}
+    assert geometry['graph_query_tokens_by_replica'] == {0:8}
+    assert geometry['padded_query_tokens_by_replica'] == {0:16}
+    assert report['replay_scope_by_replica'] == {0:'full'}
+    capacity = report['capacity']
+    assert capacity['graph_query_tokens_by_replica'] == {0:8}
+    assert capacity['ranks'][0]['cache_bytes'] == 6 * capacity['cache_bytes_per_sequence_stage'][0]

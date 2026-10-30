@@ -10,6 +10,7 @@
 from .balanced_routing import cohort_padded_tokens
 from .capacity import Memory
 from .dispatch import cohorts
+from .graph import GraphPolicy
 from .operator_analysis import _check_geometry, cohort_sequence_counts
 from .structure import parse_case
 from mindie_sim.schema.workload import RequestView
@@ -48,9 +49,14 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode"):
     _check_geometry(phase, tokens, 1, context, "body")
     participants = cohorts(case.runtime.parallel)[0]
     counts = cohort_sequence_counts(sequences, participants)
-    padded = {r: cohort_padded_tokens((tuple(
+    views = {r: tuple(
         RequestView(f"capacity{r}:{i}", tokens, context, False, phase)
-        for i in range(count)),), case.runtime) for r, count in counts.items()}
+        for i in range(count)) for r, count in counts.items()}
+    selections = {r: GraphPolicy().select(group, case.runtime) if group else (None, "none")
+                  for r, group in views.items()}
+    graph_rows = {r: max(tokens * counts[r], bucket or 0)
+                  for r, (bucket, _) in selections.items()}
+    padded = {r: cohort_padded_tokens((group,), case.runtime) for r, group in views.items()}
     # Body queries, not the case's potentially 126K prefill request, determine
     # live activation workspace. KV grows with valid contexts, not padding.
     memory = Memory(case, workspace_tokens=max(padded.values(), default=0))
@@ -92,6 +98,8 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode"):
             "participating_replicas": list(participants),
             "unprobed_replicas": [r for r in range(runtime.parallel.dp) if r not in counts],
             "padded_query_tokens_by_replica": padded,
+            "graph_query_tokens_by_replica": graph_rows,
+            "graph_replay_scope_by_replica": {r: scope for r, (_, scope) in selections.items()},
             "cache_bytes_per_sequence_stage": cache, "ranks": rows,
             "violations": violations,
             "assumptions": ["KV prefixes are private per request; ready prefix KV is not free memory",

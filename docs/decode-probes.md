@@ -47,3 +47,18 @@ visible and do not suppress an analytical body prediction or reduce its batch.
 The report is a declared resident-geometry check, not a serving admission or
 memory-peak guarantee; runtime scratch not declared in the case remains outside
 that estimate. No hardware context, weights or remote process is initialized.
+# Capture rows and sequence-parallel rows
+
+Body results keep three different row domains. For six valid q1 requests,
+an observed FULL capture bucket of eight and TP16 right padding,
+`valid_query_tokens_by_replica` is 6, `graph_query_tokens_by_replica` is 8,
+and `padded_query_tokens_by_replica` is 16. The latter includes declared
+sequence-parallel padding; it is not the captured graph bucket. Request KV
+residency still counts six requests. The report does not infer eight valid
+queries or sixteen independent KV histories from padded tensors.
+
+To replay that contract, retain `graph_mode="auto"`,
+`graph_capture_mode="full"`, `graph_capture_keys=[8]`, and call
+`predict(..., scope="body", tokens=1, sequences=6, context=...)`.
+Setting `graph_mode="none"` would also change implementation-domain selection,
+so it is not a way to suppress double padding while retaining FULL semantics.

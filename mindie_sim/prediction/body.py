@@ -28,14 +28,11 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                          include_submission=False, isolated=False,
                          trace_limit=event_limit)
     counts = cohort_sequence_counts(sequences, tuple(graphs))
-    from .balanced_routing import cohort_padded_tokens
-    from mindie_sim.schema.workload import RequestView
-    padded = {r: cohort_padded_tokens((tuple(
-        RequestView(f"geometry{r}:{i}", tokens, context, False, phase)
-        for i in range(count)),), case.runtime) for r, count in counts.items()}
     from .decode_probe import probe_capacity
     capacity = probe_capacity(case, context=context, tokens=tokens,
                               sequences=sequences, phase=phase)
+    padded = capacity["padded_query_tokens_by_replica"]
+    graph_rows = capacity["graph_query_tokens_by_replica"]
     return {
         **result, "schema": "mindie-sim.body-forward/1", "status": "modeled",
         "scope": "body", "body_forward_ms": result["duration_ms"],
@@ -45,7 +42,10 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                      "participating_replicas": list(graphs),
                      "sequences_by_replica": counts,
                      "valid_query_tokens_by_replica": {r: tokens * count for r, count in counts.items()},
+                     "graph_query_tokens_by_replica": graph_rows,
+                     "graph_query_tokens": sum(graph_rows.values()),
                      "padded_query_tokens_by_replica": padded,
+                     "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
                      "valid_query_tokens": tokens * sum(counts.values()),
                      "padded_query_tokens": sum(padded.values())},
         "routing": case.runtime.routing or {"policy": "probability_moments"},
