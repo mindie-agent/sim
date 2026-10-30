@@ -1,0 +1,593 @@
+{
+  "boundary": "frontend/context selection only, no timed Body rerun",
+  "body_reference_commit": "1c5939cd",
+  "cases": [
+    {
+      "case_id": "a3-qwen35-tp4-decode-c12-p126000",
+      "unchanged_joint_calls": 0,
+      "unchanged_joint_work": [],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "1fa00563314b0897a52818969392641d5f947119beb9fba4357fd4b808987160"
+    },
+    {
+      "case_id": "a3-qwen35-tp4-decode-c24-p126000",
+      "unchanged_joint_calls": 10,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        },
+        {
+          "native_call_service@r0:s0": 3286272.2442432432
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "1fa00563314b0897a52818969392641d5f947119beb9fba4357fd4b808987160"
+    },
+    {
+      "case_id": "a3-qwen35-tp4-decode-c64-p126000",
+      "unchanged_joint_calls": 10,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        },
+        {
+          "native_call_service@r0:s0": 6572544.4884864865
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "1fa00563314b0897a52818969392641d5f947119beb9fba4357fd4b808987160"
+    },
+    {
+      "case_id": "a3-qwen36-tp2-decode-c12-p126000",
+      "unchanged_joint_calls": 16,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "74cf4ff549efa737116c58d08cbb4cb518a28061f1d5643b45d83a55f9562e4f"
+    },
+    {
+      "case_id": "a3-qwen36-tp2-decode-c24-p126000",
+      "unchanged_joint_calls": 16,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        },
+        {
+          "native_call_service@r0:s0": 5245399.567260847
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "74cf4ff549efa737116c58d08cbb4cb518a28061f1d5643b45d83a55f9562e4f"
+    },
+    {
+      "case_id": "a3-qwen36-tp4-decode-c12-p126000",
+      "unchanged_joint_calls": 0,
+      "unchanged_joint_work": [],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "1b6bfa4b88f7273dd11041b4146206aeb2b5b62c8c9dabb049295dbd929b5e48"
+    },
+    {
+      "case_id": "a3-qwen36-tp4-decode-c24-p126000",
+      "unchanged_joint_calls": 16,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "1b6bfa4b88f7273dd11041b4146206aeb2b5b62c8c9dabb049295dbd929b5e48"
+    },
+    {
+      "case_id": "a3-qwen38-tp2-decode-c12-p126000",
+      "unchanged_joint_calls": 16,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "65350a31704b558a99c5d61aa4515ba8ce95aab33363efa7cecd0ecd32c765ab"
+    },
+    {
+      "case_id": "a3-qwen38-tp4-decode-c12-p126000",
+      "unchanged_joint_calls": 0,
+      "unchanged_joint_work": [],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "0a9332976e55bbec0bc8c728f916e8d4ac770fd70160fd3ee890c5f28d503c9b"
+    },
+    {
+      "case_id": "a3-qwen38-tp4-decode-c24-p126000",
+      "unchanged_joint_calls": 16,
+      "unchanged_joint_work": [
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        },
+        {
+          "native_call_service@r0:s0": 3496933.044840565
+        }
+      ],
+      "perturbations": [
+        {
+          "section": "rates",
+          "role": "hbm",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "mte2_aic",
+          "joint_calls": 0
+        },
+        {
+          "section": "rates",
+          "role": "vector",
+          "joint_calls": 0
+        },
+        {
+          "section": "compute_peaks",
+          "role": "bf16",
+          "joint_calls": 0
+        }
+      ],
+      "guarded_case_sha256": "0a9332976e55bbec0bc8c728f916e8d4ac770fd70160fd3ee890c5f28d503c9b"
+    }
+  ]
+}

@@ -16,6 +16,22 @@ from pathlib import Path
 
 DIRECTORY = Path(__file__).resolve().parent
 SOURCE = "ops-transformer/a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
+# Fixed physical supplies of the calibrated input profile. Do not regenerate
+# these from a changed default profile: kernel timing does not identify its
+# response to a bandwidth sweep. Changed supplies must use the analytic path.
+SUPPLY_DOMAIN = {
+    **{f"physical_rates.resources.{role}": rate for role, rate in {
+        "hbm": 1.2e12, "mte1": 4.224e12, "mte2_aic": 1.056e12,
+        "mte2_aiv": 2.112e12, "mte3": 4.224e12, "fixpipe": 4.224e12,
+        "vector": 2.112e12}.items()},
+    "physical_rates.compute_peaks.bf16": 270336e9,
+    "physical_rates.compute_peaks.fp32": 67584e9,
+    "physical_rates.service_modes.mte1_l0a": ["mte1", 8.448e12],
+    "physical_rates.service_modes.mte1_l0b": ["mte1", 4.224e12],
+    **{f"resource_units.{role}": units for role, units in {
+        "mte1": 20, "mte2_aic": 20, "mte2_aiv": 40,
+        "mte3": 40, "fixpipe": 20, "vector": 40}.items()},
+}
 
 
 def geometry(row):
@@ -73,6 +89,7 @@ def produce():
                 rules.append(dict(
                     id=f"a3-fai-regular-g{group}-kv{kv_heads}-wave{waves}",
                     match={"hardware": "Ascend910_9362", "core_count": 20,
+                           **SUPPLY_DOMAIN,
                            "phase": "decode", "recipe": "flash_attention_decode",
                            "metadata.gqa_decode.query_dtype": "bf16",
                            "metadata.gqa_decode.kv_dtype": "bf16",

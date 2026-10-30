@@ -65,3 +65,13 @@ python3 data/observations/parameters/a3-fai-long-context-20261030/validate_body.
 The five conditional inputs are in
 `examples/cases/longctx-decode-20261030/a3-fai-regular/`. They retain the source
 cases' other programs and rules; they are not alternative best-of-Body fits.
+
+The retained Body measurements and input hashes above refer to commit
+`1c5939cd`. The current packet additionally fixes the original physical resource
+rates, BF16/FP32 compute peaks, MTE1 service modes and owner counts in its match
+domain. Changing HBM, AIC or AIV supplies on the same SKU therefore selects the
+analytical program instead of silently keeping an opaque native duration.
+`domain-validation.json` verifies unchanged selection on all ten actual frontend
+graphs and forty independent hardware-rate perturbations. These are binding
+checks, not new Body accuracy results; parameter values and native timing
+predictions are unchanged.

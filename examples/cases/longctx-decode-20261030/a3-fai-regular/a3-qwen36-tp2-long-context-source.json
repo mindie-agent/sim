@@ -462,6 +462,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -564,6 +587,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -666,6 +712,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -768,6 +837,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -870,6 +962,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1008,6 +1123,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1146,6 +1284,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1284,6 +1445,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1422,6 +1606,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1560,6 +1767,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1698,6 +1928,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
@@ -1836,6 +2089,29 @@
           "match": {
             "hardware": "Ascend910_9362",
             "core_count": 20,
+            "physical_rates.resources.hbm": 1200000000000.0,
+            "physical_rates.resources.mte1": 4224000000000.0,
+            "physical_rates.resources.mte2_aic": 1056000000000.0,
+            "physical_rates.resources.mte2_aiv": 2112000000000.0,
+            "physical_rates.resources.mte3": 4224000000000.0,
+            "physical_rates.resources.fixpipe": 4224000000000.0,
+            "physical_rates.resources.vector": 2112000000000.0,
+            "physical_rates.compute_peaks.bf16": 270336000000000.0,
+            "physical_rates.compute_peaks.fp32": 67584000000000.0,
+            "physical_rates.service_modes.mte1_l0a": [
+              "mte1",
+              8448000000000.0
+            ],
+            "physical_rates.service_modes.mte1_l0b": [
+              "mte1",
+              4224000000000.0
+            ],
+            "resource_units.mte1": 20,
+            "resource_units.mte2_aic": 20,
+            "resource_units.mte2_aiv": 40,
+            "resource_units.mte3": 40,
+            "resource_units.fixpipe": 20,
+            "resource_units.vector": 40,
             "phase": "decode",
             "recipe": "flash_attention_decode",
             "metadata.gqa_decode.query_dtype": "bf16",
