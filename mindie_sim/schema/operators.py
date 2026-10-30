@@ -184,6 +184,7 @@ class IterationWork:
     cp_work: tuple[tuple[str, Any], ...] = ()
     #: Comm buffers/collectives this iteration's plan requires.
     cp_comm: tuple[tuple[str, Any], ...] = ()
+    implementation_selections: tuple[dict[str, Any], ...] = ()
 
     def to_dict(self, *, include_ops: bool = True) -> dict[str, Any]:
         payload = {
@@ -200,6 +201,7 @@ class IterationWork:
             "recipe_guards": [dict(item) for item in self.recipe_guards],
             "notes": list(self.notes),
             "requests": [view.to_dict() for view in self.plan.requests],
+            "implementation_selections": list(self.implementation_selections),
         }
         if self.local_tokens:
             payload["local_tokens"] = int(self.local_tokens)

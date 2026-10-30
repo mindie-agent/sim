@@ -45,11 +45,15 @@ class StepTotals:
 class StepSummary:
     total: StepTotals = field(default_factory=StepTotals)
     groups: dict = field(default_factory=dict)
+    selections: dict = field(default_factory=dict)
 
     def record(self, step):
         self.total.record(step)
         key = step.mode, step.replay_scope, step.graph_bucket
         self.groups.setdefault(key, StepTotals()).record(step)
+        for decision in step.implementation_selections:
+            key = decision["selector"], decision["case"], decision["implementation"], decision["coverage"]
+            self.selections[key] = self.selections.get(key, 0) + 1
 
     def to_dict(self):
         return {"unit": "replica_microbatch", "total": self.total.to_dict(),
@@ -58,4 +62,8 @@ class StepSummary:
                            for (mode, scope, bucket), totals in self.groups.items()],
                 "duration_boundary": "scheduled_release_to_step_ready",
                 "device_duration_boundary": "scheduled_release_to_all_device_ops_complete",
+                "implementation_selections": [
+                    {"selector": selector, "case": case, "implementation": implementation,
+                     "coverage": coverage, "steps": count}
+                    for (selector, case, implementation, coverage), count in self.selections.items()],
                 "sum_semantics": "overlapping_step_durations_are_additive_not_makespan"}

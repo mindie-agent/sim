@@ -67,6 +67,9 @@ def submit_batch(case, schedulers, plans, execution, lower, now):
             commits={request: event for item in items for request, event in item.commits.items()},
             host_results={request: event for item in items for request, event in item.host_results.items()},
             client_deliveries={request: event for item in items for request, event in item.client_deliveries.items()},
+            implementation_selections=tuple(
+                {**decision, "microbatch": item.iteration}
+                for item in items for decision in item.implementation_selections),
             device_complete=execution.engine.submit(
                 f"{execution.namespace}r{replica}:batch_device_complete",
                 after=tuple(s.device_complete for s in items)),

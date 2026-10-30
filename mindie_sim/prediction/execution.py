@@ -88,6 +88,7 @@ class ScheduledIteration:
     device_complete: Event
     host_results: Mapping[str, Event]
     client_deliveries: Mapping[str, Event]
+    implementation_selections: tuple[dict, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -99,6 +100,7 @@ class ScheduledIteration:
             "replay_scope": self.replay_scope, "operators": self.operators,
             "device_end_ms": self.device_complete.time,
             "host_result_ready_ms": max((event.time for event in self.host_results.values()), default=None),
+            "implementation_selections": list(self.implementation_selections),
         }
 
 
@@ -503,7 +505,7 @@ class Execution:
         step = ScheduledIteration(replica, work.plan.iteration, completion, release_ms,
                                   work.mode, work.valid_tokens, work.padded_tokens,
                                   work.graph_bucket, scope, len(physical_ops), commits,
-                                  device_complete, host_results, clients)
+                                  device_complete, host_results, clients, work.implementation_selections)
         engine.submit(prefix + ":step_metrics", after=(completion,),
                       on_complete=lambda _: self.step_summary.record(step))
         return step

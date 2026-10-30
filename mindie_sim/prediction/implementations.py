@@ -140,6 +140,10 @@ def select(bindings, selector):
     raw = bindings.get(selector)
     if raw is None:
         return None
+    if isinstance(raw, dict) and "cases" in raw:
+        from .implementation_selection import alternatives
+        tuple(alternatives(raw, selector))
+        raise ModelingError(f"implementation_policy_requires_batch_geometry:{selector}")
     declaration = {"implementation": raw} if isinstance(raw, str) else raw
     if set(declaration) - {"implementation", "options", "recipes"}:
         raise ModelingError(f"implementation_binding_fields_unknown:{selector}")
@@ -164,12 +168,17 @@ def select(bindings, selector):
 
 
 def recipes(bindings):
+    from .implementation_selection import alternatives
+
     result, loaded = {}, set()
-    for selector in bindings:
-        selected = select(bindings, selector)
-        if selected.name not in loaded:
-            result.update(selected.module.recipes())
-            loaded.add(selected.name)
+    for selector, raw in bindings.items():
+        for binding in alternatives(raw, selector):
+            if binding == "analytical":
+                continue
+            selected = select({selector: binding}, selector)
+            if selected.name not in loaded:
+                result.update(selected.module.recipes())
+                loaded.add(selected.name)
     return result
 
 

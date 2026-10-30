@@ -87,6 +87,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     replica 0. Cross-DP expert collectives require their complete cohort mapping.
     """
     from .body_defaults import consume_target_declaration
+    from .implementation_selection import graph_selections
     case = consume_target_declaration(parse_case(case), ops)
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
@@ -144,6 +145,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     works = {r: IterationWork(
         items, IterationPlan(()), case.runtime.parallel.pp, 0, 0, None,
         "graph", "declared_graph", replay_scope=scopes[r],
+        implementation_selections=graph_selections(items),
     ) for r, items in graphs.items()}
     steps = {}
     for group in groups:

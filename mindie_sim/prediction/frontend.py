@@ -27,6 +27,7 @@ from .routing_realizations import select_realization
 from .structure import normalize_model, stage_map
 from .transforms import lower_implementations
 from . import family_attnres, sequence_parallel
+from .implementation_selection import resolve as resolve_implementations, annotate
 
 
 def _scope(ops, block, role="body"):
@@ -348,6 +349,9 @@ class Frontend:
         valid = sum(view.q_len for view in views)
         bucket, scope = self.graph.select(views, runtime) if views else (None, "none")
         padded = max(valid, bucket or 0)
+        runtime, selections = resolve_implementations(
+            runtime, views, padded_tokens=padded, replay_scope=scope,
+            global_views=global_views)
         requests = tuple(view.request_id for view in views)
         ops = []
         entry = barrier_op(
@@ -445,10 +449,11 @@ class Frontend:
             from .native_fusion import lower_native_fusions
             ops = lower_native_fusions(ops, runtime, local_tokens=local_tokens)
         return IterationWork(
-            ops=ops,
+            ops=annotate(ops, selections),
             plan=plan, stage_count=runtime.parallel.pp,
             valid_tokens=valid, padded_tokens=padded, graph_bucket=bucket, mode=mode,
             recipe="structural", replay_scope=scope,
+            implementation_selections=selections,
         )
 
 

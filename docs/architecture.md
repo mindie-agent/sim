@@ -173,6 +173,11 @@ schedule or calibrated reduction/synchronization latency.
 
 ## Semantic frontend
 
+[Explicit implementation domains](implementation-selection.md) resolve declared
+phase and batch geometry alternatives before lowering in Serving and body/model
+probes. Unmatched domains fail by default; analytical alternatives are explicit
+and recorded. Source planner failures never trigger another branch.
+
 Attention, FFN and residual builders are registries. Supported building blocks
 include GQA/windowed attention; latent MLA; compressed/window caches, index/top-k
 selection and shared owners; GDN/KDA state transitions; dense and MoE feed-forward;

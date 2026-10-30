@@ -77,6 +77,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     from .attention import AttentionPolicy
     from .frontend import Frontend
     from .transforms import lower_implementations
+    from .implementation_selection import resolve, annotate
 
     frontend = Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
     global_tokens = (cohort_tokens if cohort_tokens is not None else
@@ -99,8 +100,12 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
             result.append(replace(op, deps=dependencies, metadata=metadata))
         return tuple(result)
     bucket, replay_scope = frontend.graph.select(views, case.runtime) if views else (None, "none")
+    padded_tokens = max(sum(v.q_len for v in views), bucket or 0)
+    runtime, selections = resolve(case.runtime, views, padded_tokens=padded_tokens,
+                                  replay_scope=replay_scope, global_views=global_views)
+    case = replace(case, runtime=runtime)
     local, local_tokens, _ = frontend.partition_views(
-        views, case.runtime, max(sum(v.q_len for v in views), bucket or 0))
+        views, case.runtime, padded_tokens)
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
                           tokens=local_tokens, mode=views[0].phase if views else phase,
                           global_tokens=global_tokens, replica=replica)
@@ -110,8 +115,8 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     if resource_fusion:
         from .native_fusion import lower_native_fusions
         ops = lower_native_fusions(ops, case.runtime, local_tokens=local_tokens)
-    return tuple(replace(op, metadata=op.metadata + (("graph_replay_scope", replay_scope),))
-                 for op in ops)
+    return annotate(tuple(replace(op, metadata=op.metadata + (("graph_replay_scope", replay_scope),))
+                          for op in ops), selections)
 
 
 def _media_case(case, views, scope, media_tokens):
