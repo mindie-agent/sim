@@ -1,0 +1,193 @@
+{
+  "schema": "mindie-kimi-longctx-decode-inputs/1",
+  "cases": [
+    {
+      "id": "kimi-current-ctx32768-c1-split1",
+      "context": 32768,
+      "concurrency": 1,
+      "splits": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx32768-c1-split1.json",
+        "sha256": "14d4ec7b2b952e336425cb9cd1e4bd6e4e2c7d95ca21139d241c7771c612bc5b",
+        "size_bytes": 11544
+      }
+    },
+    {
+      "id": "kimi-current-ctx32768-c1-split32",
+      "context": 32768,
+      "concurrency": 1,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx32768-c1-split32.json",
+        "sha256": "271ea474b4f14039a9c4fc4cfec64940d8d00837ce0a7a072057844badaa6111",
+        "size_bytes": 11546
+      }
+    },
+    {
+      "id": "kimi-current-ctx65536-c1-split32",
+      "context": 65536,
+      "concurrency": 1,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx65536-c1-split32.json",
+        "sha256": "c4fd8c0c166a28fd1beaa3e54e63c727d84872a4a82186b86a8977ac93c95129",
+        "size_bytes": 11546
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c1-split32",
+      "context": 126000,
+      "concurrency": 1,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx126000-c1-split32.json",
+        "sha256": "87ded642b185acd3609fb6eb4c5af5114763569f01d76d80d4f9c6b406ceebf0",
+        "size_bytes": 11548
+      }
+    },
+    {
+      "id": "kimi-current-ctx127500-c1-split32",
+      "context": 127500,
+      "concurrency": 1,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx127500-c1-split32.json",
+        "sha256": "5f6431c7de0d7f24304a31757fe8561a0f38d7e34b12d3e2d7bb9ebff8ff70fd",
+        "size_bytes": 11548
+      }
+    },
+    {
+      "id": "kimi-current-ctx128999-c1-split32",
+      "context": 128999,
+      "concurrency": 1,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx128999-c1-split32.json",
+        "sha256": "518845c5a8eb5efedb00be38008ce1f13d56dced5a77196d854c641a030a83be",
+        "size_bytes": 11548
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c4-split32",
+      "context": 126000,
+      "concurrency": 4,
+      "splits": 32,
+      "sequences_by_replica": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx126000-c4-split32.json",
+        "sha256": "0588eabd8c42a5f66da8ea247d4d2aeb0553436042e58b1db08ff284c0b563e9",
+        "size_bytes": 11848
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c16-split8",
+      "context": 126000,
+      "concurrency": 16,
+      "splits": 8,
+      "sequences_by_replica": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx126000-c16-split8.json",
+        "sha256": "7809ee133053175a37bb41c5665d98cf5346a15dfa96ef299c8ab0a4761f492a",
+        "size_bytes": 13053
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c64-split2",
+      "context": 126000,
+      "concurrency": 64,
+      "splits": 2,
+      "sequences_by_replica": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "input": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/cases/kimi-current-ctx126000-c64-split2.json",
+        "sha256": "0522e14cf9a6c5465891ab2eeec89b2b82e6edbd82e29aa9086ad043568dfc52",
+        "size_bytes": 17905
+      }
+    }
+  ],
+  "base": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-k3-a5-sp-right-pad-conditional.json",
+    "sha256": "6c55c4fa02b6cc20d6a7eb2ee2a6aff8ec7e4ae29a404609c58618e9c7e0cd57",
+    "size_bytes": 10492
+  },
+  "producer": {
+    "path": "data/verification/kimi-longctx-decode-20261030.producer.py",
+    "sha256": "2ad25bde570b4a4a7161ad07195addee5b8410ff6f93a7a06f6ffaf94e5efcc9",
+    "size_bytes": 23023
+  },
+  "standard_decode_windows": [
+    {
+      "generated_before": 0,
+      "context": 126000,
+      "tokens": 1,
+      "kv_length": 126001
+    },
+    {
+      "generated_before": 1500,
+      "context": 127500,
+      "tokens": 1,
+      "kv_length": 127501
+    },
+    {
+      "generated_before": 2999,
+      "context": 128999,
+      "tokens": 1,
+      "kv_length": 129000
+    }
+  ],
+  "limits": {
+    "seconds": 90,
+    "rss_bytes": 536870912,
+    "cleanup_seconds": 5
+  }
+}

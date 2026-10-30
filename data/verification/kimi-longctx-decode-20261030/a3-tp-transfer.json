@@ -1,0 +1,585 @@
+{
+  "schema": "mindie-kimi-a3-tp-transfer-geometry/1",
+  "base": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c64_source.json",
+    "sha256": "f3edbf8756c1af1c6e77e78baaa3b5744344fb261463b39c13b0e4835ef58cc4",
+    "size_bytes": 17893
+  },
+  "runtime": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "rows": [
+    {
+      "tp": 8,
+      "ep": 8,
+      "dp": 1,
+      "layers": 4,
+      "topology": "single_A3_host_physical_Die_group; no_cross_node_link_inferred",
+      "source_startup": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_ep8_heldout_20261030/logs/serve.log",
+        "sha256": "071ded8c3947638f2099bf84b372cd9b0e3cfe05c6d7d35c84fb85b934e068d2",
+        "size_bytes": 544238
+      },
+      "startup_args_line": 23,
+      "model_local_mla_heads": 12,
+      "resident_experts_per_rank": 112,
+      "cache_components_unpadded": {
+        "0": {
+          "recurrent_state": 786432.0,
+          "conv_state": 27648.0
+        },
+        "1": {
+          "recurrent_state": 786432.0,
+          "conv_state": 27648.0
+        },
+        "2": {
+          "recurrent_state": 786432.0,
+          "conv_state": 27648.0
+        },
+        "3": {
+          "mla_kv": 37749888.0
+        }
+      },
+      "operators": {
+        "linear_q": {
+          "local_shape": [
+            12,
+            1536,
+            7168
+          ],
+          "flops": 264241152.0,
+          "hbm_bytes": 11145264.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "linear_k": {
+          "local_shape": [
+            12,
+            1536,
+            7168
+          ],
+          "flops": 264241152.0,
+          "hbm_bytes": 11145264.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "linear_v": {
+          "local_shape": [
+            12,
+            1536,
+            7168
+          ],
+          "flops": 264241152.0,
+          "hbm_bytes": 11145264.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "q_b": {
+          "local_shape": [
+            12,
+            2304,
+            1536
+          ],
+          "flops": 84934656.0,
+          "hbm_bytes": 3631152.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "q_absorb": {
+          "local_shape": [
+            144,
+            512,
+            128
+          ],
+          "flops": 18874368.0,
+          "hbm_bytes": 1757184.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 12
+        },
+        "v_expand": {
+          "local_shape": [
+            144,
+            128,
+            512
+          ],
+          "flops": 18874368.0,
+          "hbm_bytes": 1757184.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 12
+        },
+        "output": {
+          "local_shape": [
+            12,
+            7168,
+            1536
+          ],
+          "flops": 264241152.0,
+          "hbm_bytes": 22228992.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "expert_dispatch": {
+          "local_shape": [
+            32,
+            3584
+          ],
+          "flops": 0.0,
+          "hbm_bytes": 0.0,
+          "link_bytes": 200704.0,
+          "matrix_groups": null
+        },
+        "balanced_grouped_gate_up": {
+          "local_shape": [
+            32,
+            6144,
+            3584
+          ],
+          "flops": 1409286144,
+          "hbm_bytes": 353616000.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 32
+        },
+        "balanced_grouped_down": {
+          "local_shape": [
+            32,
+            3584,
+            3072
+          ],
+          "flops": 704643072,
+          "hbm_bytes": 176947328.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 32
+        },
+        "expert_combine": {
+          "local_shape": [
+            32,
+            3584
+          ],
+          "flops": 0.0,
+          "hbm_bytes": 0.0,
+          "link_bytes": 200704.0,
+          "matrix_groups": null
+        }
+      },
+      "kda": {
+        "local_shape": [
+          12,
+          12,
+          128,
+          128
+        ],
+        "isolated_us": 20.687436969694772,
+        "physical_hbm_bytes": 19139904,
+        "program_execution": {
+          "execution_class": "vector",
+          "kda_recurrent_schedule": {
+            "value_step": 64,
+            "parts": 2,
+            "state_slots": 2,
+            "attention_slots": 2,
+            "ub_rest_bytes": 85184,
+            "ub_bytes_per_owner": 194432,
+            "host_ub_capacity": 196608,
+            "logical_heads": 144,
+            "active_aiv": 40,
+            "physical_aiv": 40,
+            "owner_cycles": [
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "resource_cycles": 64,
+            "compact": true,
+            "compaction_domain": "complete_owner_waves_with_explicit_partial_tails",
+            "beta_load_scope": "owner_sequence",
+            "delta_update": "UB_broadcast_MulAddDst_query_Mul",
+            "ownership": "task_id=(sequence*HV+head);owner=task_id%launched_aiv",
+            "state_residency": "one_initial_load_per_head;checkpoint_write_every_query",
+            "head_handoff": "conservative_serial_head_retirement",
+            "contention_approximation": "serial_cycle_fluid_rephasing",
+            "scalar_metadata_getvalue_bytes": 9568,
+            "accepted_metadata_getvalue_bytes": 0,
+            "unmodeled_services": [
+              "scalar_GetValue_cache_and_issue",
+              "queue_flag_and_vector_instruction_issue"
+            ]
+          }
+        }
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 32768,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 32769,
+        "sequences_by_replica": {
+          "0": 12
+        },
+        "sequences_in_cohort": 12,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 16
+        },
+        "cache_bytes_per_sequence_stage": [
+          40338432.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 12,
+            "cache_bytes": 484061184.0,
+            "cache_capacity_bytes": 50719425801.6,
+            "headroom_bytes": 50235364617.6,
+            "resident_bytes": 8176190608.0,
+            "weights_bytes": 7682823312.0,
+            "workspace_bytes": 9306112.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "tp": 16,
+      "ep": 16,
+      "dp": 1,
+      "layers": 4,
+      "topology": "single_A3_host_physical_Die_group; no_cross_node_link_inferred",
+      "source_startup": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_ep16_heldout_20261030/logs/serve.log",
+        "sha256": "6effee95cef57225b510fb17aacbc6b31ef2343dedd9d7aaa3f0163de8da4078",
+        "size_bytes": 561211
+      },
+      "startup_args_line": 23,
+      "model_local_mla_heads": 6,
+      "resident_experts_per_rank": 56,
+      "cache_components_unpadded": {
+        "0": {
+          "recurrent_state": 393216.0,
+          "conv_state": 13824.0
+        },
+        "1": {
+          "recurrent_state": 393216.0,
+          "conv_state": 13824.0
+        },
+        "2": {
+          "recurrent_state": 393216.0,
+          "conv_state": 13824.0
+        },
+        "3": {
+          "mla_kv": 37749888.0
+        }
+      },
+      "operators": {
+        "linear_q": {
+          "local_shape": [
+            12,
+            768,
+            7168
+          ],
+          "flops": 132120576.0,
+          "hbm_bytes": 5615664.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "linear_k": {
+          "local_shape": [
+            12,
+            768,
+            7168
+          ],
+          "flops": 132120576.0,
+          "hbm_bytes": 5615664.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "linear_v": {
+          "local_shape": [
+            12,
+            768,
+            7168
+          ],
+          "flops": 132120576.0,
+          "hbm_bytes": 5615664.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "q_b": {
+          "local_shape": [
+            12,
+            1152,
+            1536
+          ],
+          "flops": 42467328.0,
+          "hbm_bytes": 1824816.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "q_absorb": {
+          "local_shape": [
+            72,
+            512,
+            128
+          ],
+          "flops": 9437184.0,
+          "hbm_bytes": 878592.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 6
+        },
+        "v_expand": {
+          "local_shape": [
+            72,
+            128,
+            512
+          ],
+          "flops": 9437184.0,
+          "hbm_bytes": 878592.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 6
+        },
+        "output": {
+          "local_shape": [
+            12,
+            7168,
+            768
+          ],
+          "flops": 132120576.0,
+          "hbm_bytes": 11200512.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 1
+        },
+        "expert_dispatch": {
+          "local_shape": [
+            16,
+            3584
+          ],
+          "flops": 0.0,
+          "hbm_bytes": 0.0,
+          "link_bytes": 107520.0,
+          "matrix_groups": null
+        },
+        "balanced_grouped_gate_up": {
+          "local_shape": [
+            16,
+            6144,
+            3584
+          ],
+          "flops": 704643072,
+          "hbm_bytes": 176808000.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 16
+        },
+        "balanced_grouped_down": {
+          "local_shape": [
+            16,
+            3584,
+            3072
+          ],
+          "flops": 352321536,
+          "hbm_bytes": 88473664.0,
+          "link_bytes": 0.0,
+          "matrix_groups": 16
+        },
+        "expert_combine": {
+          "local_shape": [
+            16,
+            3584
+          ],
+          "flops": 0.0,
+          "hbm_bytes": 0.0,
+          "link_bytes": 107520.0,
+          "matrix_groups": null
+        }
+      },
+      "kda": {
+        "local_shape": [
+          12,
+          6,
+          128,
+          128
+        ],
+        "isolated_us": 10.341975454549512,
+        "physical_hbm_bytes": 9568224,
+        "program_execution": {
+          "execution_class": "vector",
+          "kda_recurrent_schedule": {
+            "value_step": 64,
+            "parts": 2,
+            "state_slots": 2,
+            "attention_slots": 2,
+            "ub_rest_bytes": 85184,
+            "ub_bytes_per_owner": 194240,
+            "host_ub_capacity": 196608,
+            "logical_heads": 72,
+            "active_aiv": 40,
+            "physical_aiv": 40,
+            "owner_cycles": [
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              2,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1,
+              1
+            ],
+            "resource_cycles": 72,
+            "compact": true,
+            "compaction_domain": "complete_owner_waves_with_explicit_partial_tails",
+            "beta_load_scope": "owner_sequence",
+            "delta_update": "UB_broadcast_MulAddDst_query_Mul",
+            "ownership": "task_id=(sequence*HV+head);owner=task_id%launched_aiv",
+            "state_residency": "one_initial_load_per_head;checkpoint_write_every_query",
+            "head_handoff": "conservative_serial_head_retirement",
+            "contention_approximation": "serial_cycle_fluid_rephasing",
+            "scalar_metadata_getvalue_bytes": 8704,
+            "accepted_metadata_getvalue_bytes": 0,
+            "unmodeled_services": [
+              "scalar_GetValue_cache_and_issue",
+              "queue_flag_and_vector_instruction_issue"
+            ]
+          }
+        }
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 32768,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 32769,
+        "sequences_by_replica": {
+          "0": 12
+        },
+        "sequences_in_cohort": 12,
+        "deployment_dp": 1,
+        "participating_replicas": [
+          0
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 16
+        },
+        "cache_bytes_per_sequence_stage": [
+          39117312.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 12,
+            "cache_bytes": 469407744.0,
+            "cache_capacity_bytes": 54006337873.6,
+            "headroom_bytes": 53536930129.6,
+            "resident_bytes": 4874625096.0,
+            "weights_bytes": 4395911240.0,
+            "workspace_bytes": 9306112.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    }
+  ],
+  "checks": {
+    "projection_and_active_expert_flops_halve": true,
+    "shared_latent_mla_cache_unchanged": true,
+    "kda_state_and_conv_storage_halve": true
+  },
+  "split": {
+    "tp16": "entire_new_capture_group_heldout; never_fit",
+    "capture_duration_files_read": 0
+  },
+  "limitations": [
+    "Startup and source geometry audit only; newly arrived TP16 measurements remain with the Profiler pipeline.",
+    "A3 MLA remains generic latent attention; no arch35 paged kernel or captured padding/dispatch is claimed.",
+    "Physical FIA head padding (logical6 versus possible8) requires the new native ABI export.",
+    "Declared context32768 is a structural probe; actual per-forward KV lengths are not inferred from tensor capacity."
+  ]
+}

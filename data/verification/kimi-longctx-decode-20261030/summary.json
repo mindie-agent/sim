@@ -1,0 +1,1778 @@
+{
+  "schema": "mindie-kimi-longctx-decode-summary/1",
+  "rows": [
+    {
+      "id": "kimi-current-ctx32768-c1-split1",
+      "status": "completed",
+      "context": 32768,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "14d4ec7b2b952e336425cb9cd1e4bd6e4e2c7d95ca21139d241c7771c612bc5b",
+      "runtime_before": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_after": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx32768-c1-split1.operators.json",
+        "sha256": "a7706e9ab8b5e7621564f518f7688e5bdaba24d45155ab730d9d67d989b5e1b4",
+        "size_bytes": 50734
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 0.779391249991022,
+        "peak_sampled_rss_bytes": 61603840,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 577.168280242546,
+        "hbm_bytes": 37785732,
+        "hbm_ledger": {
+          "kv_shared_once": 37749888,
+          "split_query_reads": 18432,
+          "page_index_reads": 1028,
+          "partial_roundtrip": 0,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 1,
+        "active_aic_owners": 1,
+        "physical_segments": 1
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 32768,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 32769,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          965680128.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 965680128.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 30995373737.600006,
+            "resident_bytes": 61775919856.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx32768-c1-split32",
+      "status": "completed",
+      "context": 32768,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "271ea474b4f14039a9c4fc4cfec64940d8d00837ce0a7a072057844badaa6111",
+      "runtime_before": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_after": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx32768-c1-split32.body.json",
+        "sha256": "ee0705a4ff3b899650d10679198d7876cde4361fb47c0e0263160a8cc61d83cb",
+        "size_bytes": 450075
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 37.07028645905666,
+        "peak_sampled_rss_bytes": 175964160,
+        "body_requested": true
+      },
+      "mla": {
+        "isolated_us": 33.15594957580004,
+        "hbm_bytes": 40462468,
+        "hbm_ledger": {
+          "kv_shared_once": 37749888,
+          "split_query_reads": 589824,
+          "page_index_reads": 1028,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "completed",
+        "duration_ms": 22.371688731425643,
+        "native_core_elapsed_span_sum_replica0_ms": {
+          "vllm_ascend_recurrent_kda_arch35": 0.17236407731844022,
+          "ascend_paged_mla_decode_arch35": 0.7957427898200347
+        },
+        "native_core_occurrences_replica0": {
+          "vllm_ascend_recurrent_kda_arch35": 69,
+          "ascend_paged_mla_decode_arch35": 24
+        }
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 32768,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 32769,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          965680128.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 965680128.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 30995373737.600006,
+            "resident_bytes": 61775919856.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx65536-c1-split32",
+      "status": "completed",
+      "context": 65536,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "c4fd8c0c166a28fd1beaa3e54e63c727d84872a4a82186b86a8977ac93c95129",
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx65536-c1-split32.operators.json",
+        "sha256": "0a6aab496e160db776b10e2046ab45d57c2a4cd871df1b2663b45d021811a50d",
+        "size_bytes": 57464
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 0.7914167089620605,
+        "peak_sampled_rss_bytes": 68403200,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 51.16551078793208,
+        "hbm_bytes": 78212228,
+        "hbm_ledger": {
+          "kv_shared_once": 75498624,
+          "split_query_reads": 589824,
+          "page_index_reads": 2052,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 65536,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 65537,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          1871649792.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 1871649792.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 30089404073.600006,
+            "resident_bytes": 62681889520.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c1-split32",
+      "status": "completed",
+      "context": 126000,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "87ded642b185acd3609fb6eb4c5af5114763569f01d76d80d4f9c6b406ceebf0",
+      "runtime_before": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_after": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx126000-c1-split32.body.json",
+        "sha256": "22d94b0fb6c93bfa127a0bef1bd4face3b27888f754e740d46a712a5f290426f",
+        "size_bytes": 450144
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 38.58196516602766,
+        "peak_sampled_rss_bytes": 176472064,
+        "body_requested": true
+      },
+      "mla": {
+        "isolated_us": 82.68224290914628,
+        "hbm_bytes": 147868644,
+        "hbm_ledger": {
+          "kv_shared_once": 145153152,
+          "split_query_reads": 589824,
+          "page_index_reads": 3940,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "completed",
+        "duration_ms": 23.56031977142617,
+        "native_core_elapsed_span_sum_replica0_ms": {
+          "vllm_ascend_recurrent_kda_arch35": 0.17236407731848385,
+          "ascend_paged_mla_decode_arch35": 1.9843738298206755
+        },
+        "native_core_occurrences_replica0": {
+          "vllm_ascend_recurrent_kda_arch35": 69,
+          "ascend_paged_mla_decode_arch35": 24
+        }
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          3542031360.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3542031360.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28419022505.600006,
+            "resident_bytes": 64352271088.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx127500-c1-split32",
+      "status": "completed",
+      "context": 127500,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "5f6431c7de0d7f24304a31757fe8561a0f38d7e34b12d3e2d7bb9ebff8ff70fd",
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx127500-c1-split32.operators.json",
+        "sha256": "3c3a45c121ea10226820423ae51570b7e453fd7697e8c70dbce83f5c18d687eb",
+        "size_bytes": 57520
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 1.0495318330358714,
+        "peak_sampled_rss_bytes": 64733184,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 84.93343806064146,
+        "hbm_bytes": 149596692,
+        "hbm_ledger": {
+          "kv_shared_once": 146881152,
+          "split_query_reads": 589824,
+          "page_index_reads": 3988,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 127500,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 127501,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          3584498688.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3584498688.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28376555177.600006,
+            "resident_bytes": 64394738416.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx128999-c1-split32",
+      "status": "completed",
+      "context": 128999,
+      "concurrency": 1,
+      "sequences_by_replica": [
+        1,
+        0,
+        0,
+        0
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "518845c5a8eb5efedb00be38008ce1f13d56dced5a77196d854c641a030a83be",
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx128999-c1-split32.operators.json",
+        "sha256": "cf9816038520ad7dc7d0c3febabab3ab8399a5371daf12d2e9545eaa9ff9e54b",
+        "size_bytes": 57473
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 0.7832879580091685,
+        "peak_sampled_rss_bytes": 65847296,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 84.93343806063969,
+        "hbm_bytes": 151323584,
+        "hbm_ledger": {
+          "kv_shared_once": 148608000,
+          "split_query_reads": 589824,
+          "page_index_reads": 4032,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 128999,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 129000,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "sequences_in_cohort": 1,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 0,
+          "2": 0,
+          "3": 0
+        },
+        "cache_bytes_per_sequence_stage": [
+          3623427072.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3623427072.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28337626793.600006,
+            "resident_bytes": 64433666800.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 0,
+            "cache_bytes": 0.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 31961053865.600006,
+            "resident_bytes": 60810239728.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c4-split32",
+      "status": "completed",
+      "context": 126000,
+      "concurrency": 4,
+      "sequences_by_replica": [
+        1,
+        1,
+        1,
+        1
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "0588eabd8c42a5f66da8ea247d4d2aeb0553436042e58b1db08ff284c0b563e9",
+      "runtime_before": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_after": {
+        "sha256": "ab5a46ebb4885624d1116ffa7641716af343917a09edf31105b1fd4993a415ff",
+        "files": 277
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx126000-c4-split32.body.json",
+        "sha256": "8e47b21727325897cc76509f47389a2494f0ea958a563b9bb17901c9cbf40e8b",
+        "size_bytes": 458460
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 71.28724679094739,
+        "peak_sampled_rss_bytes": 401063936,
+        "body_requested": true
+      },
+      "mla": {
+        "isolated_us": 82.68224290914628,
+        "hbm_bytes": 147868644,
+        "hbm_ledger": {
+          "kv_shared_once": 145153152,
+          "split_query_reads": 589824,
+          "page_index_reads": 3940,
+          "partial_roundtrip": 2105344,
+          "final_output": 16384
+        },
+        "physical_heads": 16,
+        "requested_splits": 32,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.498030106061755,
+        "hbm_bytes": 1594992,
+        "active_aiv": 12,
+        "logical_heads": 12,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "completed",
+        "duration_ms": 30.200919024758214,
+        "native_core_elapsed_span_sum_replica0_ms": {
+          "vllm_ascend_recurrent_kda_arch35": 0.17236407731862685,
+          "ascend_paged_mla_decode_arch35": 1.9843738298199876
+        },
+        "native_core_occurrences_replica0": {
+          "vllm_ascend_recurrent_kda_arch35": 69,
+          "ascend_paged_mla_decode_arch35": 24
+        }
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 1,
+          "1": 1,
+          "2": 1,
+          "3": 1
+        },
+        "sequences_in_cohort": 4,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 8,
+          "2": 8,
+          "3": 8
+        },
+        "cache_bytes_per_sequence_stage": [
+          3542031360.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3542031360.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28419022505.600006,
+            "resident_bytes": 64352271088.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3542031360.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28419022505.600006,
+            "resident_bytes": 64352271088.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3542031360.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28419022505.600006,
+            "resident_bytes": 64352271088.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 1,
+            "cache_bytes": 3542031360.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 28419022505.600006,
+            "resident_bytes": 64352271088.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c16-split8",
+      "status": "completed",
+      "context": 126000,
+      "concurrency": 16,
+      "sequences_by_replica": [
+        4,
+        4,
+        4,
+        4
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "7809ee133053175a37bb41c5665d98cf5346a15dfa96ef299c8ab0a4761f492a",
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx126000-c16-split8.operators.json",
+        "sha256": "adfb867f462c07ba1bc807811d618eef270106a5be72ccab9d847f9666f90c97",
+        "size_bytes": 59796
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 2.3855898330220953,
+        "peak_sampled_rss_bytes": 104448000,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 282.923723636527,
+        "hbm_bytes": 583389072,
+        "hbm_ledger": {
+          "kv_shared_once": 580612608,
+          "split_query_reads": 589824,
+          "page_index_reads": 15760,
+          "partial_roundtrip": 2105344,
+          "final_output": 65536
+        },
+        "physical_heads": 16,
+        "requested_splits": 8,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 2.4980301061097165,
+        "hbm_bytes": 6379968,
+        "active_aiv": 48,
+        "logical_heads": 48,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "within_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 4,
+          "1": 4,
+          "2": 4,
+          "3": 4
+        },
+        "sequences_in_cohort": 16,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 8,
+          "1": 8,
+          "2": 8,
+          "3": 8
+        },
+        "cache_bytes_per_sequence_stage": [
+          3542031360.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 14168125440.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 17792928425.600006,
+            "resident_bytes": 74978365168.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 14168125440.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 17792928425.600006,
+            "resident_bytes": 74978365168.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 14168125440.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 17792928425.600006,
+            "resident_bytes": 74978365168.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 4,
+            "cache_bytes": 14168125440.0,
+            "cache_capacity_bytes": 31961053865.600006,
+            "headroom_bytes": 17792928425.600006,
+            "resident_bytes": 74978365168.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 5455872.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    },
+    {
+      "id": "kimi-current-ctx126000-c64-split2",
+      "status": "completed",
+      "context": 126000,
+      "concurrency": 64,
+      "sequences_by_replica": [
+        16,
+        16,
+        16,
+        16
+      ],
+      "model": {
+        "layers": 93,
+        "layer_counts": {
+          "kda": 69,
+          "mla": 24
+        },
+        "tp": 8,
+        "dp": 4,
+        "ep": 32
+      },
+      "input_sha256": "0522e14cf9a6c5465891ab2eeec89b2b82e6edbd82e29aa9086ad043568dfc52",
+      "runtime_before": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_after": {
+        "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+        "files": 278
+      },
+      "runtime_unchanged": true,
+      "raw_result": {
+        "path": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030/runs/kimi-current-ctx126000-c64-split2.operators.json",
+        "sha256": "cbf7c36999dc7137ac69b803973fd49ee2314ff087f43989cc8660e88b8cd5fc",
+        "size_bytes": 63609
+      },
+      "receipt": {
+        "status": "completed",
+        "exit_code": 0,
+        "wall_seconds": 5.496222207904793,
+        "peak_sampled_rss_bytes": 105578496,
+        "body_requested": false
+      },
+      "mla": {
+        "isolated_us": 1111.3348174551588,
+        "hbm_bytes": 2325470784,
+        "hbm_ledger": {
+          "kv_shared_once": 2322450432,
+          "split_query_reads": 589824,
+          "page_index_reads": 63040,
+          "partial_roundtrip": 2105344,
+          "final_output": 262144
+        },
+        "physical_heads": 16,
+        "requested_splits": 2,
+        "active_aic_owners": 32,
+        "physical_segments": 32
+      },
+      "kda": {
+        "isolated_us": 7.4940903181790475,
+        "hbm_bytes": 25519872,
+        "active_aiv": 64,
+        "logical_heads": 192,
+        "owner_cycles": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ]
+      },
+      "body": {
+        "status": "not_requested"
+      },
+      "capacity": {
+        "status": "outside_declared_capacity",
+        "basis": "declared_resident_geometry_not_serving_admission",
+        "context_tokens": 126000,
+        "query_tokens_per_sequence": 1,
+        "kv_length": 126001,
+        "sequences_by_replica": {
+          "0": 16,
+          "1": 16,
+          "2": 16,
+          "3": 16
+        },
+        "sequences_in_cohort": 64,
+        "deployment_dp": 4,
+        "participating_replicas": [
+          0,
+          1,
+          2,
+          3
+        ],
+        "unprobed_replicas": [],
+        "padded_query_tokens_by_replica": {
+          "0": 16,
+          "1": 16,
+          "2": 16,
+          "3": 16
+        },
+        "cache_bytes_per_sequence_stage": [
+          3542031360.0
+        ],
+        "ranks": [
+          {
+            "replica": 0,
+            "stage": 0,
+            "sequences": 16,
+            "cache_bytes": 56672501760.0,
+            "cache_capacity_bytes": 31955597993.600006,
+            "headroom_bytes": -24716903766.399994,
+            "resident_bytes": 117488197360.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 10911744.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 1,
+            "stage": 0,
+            "sequences": 16,
+            "cache_bytes": 56672501760.0,
+            "cache_capacity_bytes": 31955597993.600006,
+            "headroom_bytes": -24716903766.399994,
+            "resident_bytes": 117488197360.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 10911744.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 2,
+            "stage": 0,
+            "sequences": 16,
+            "cache_bytes": 56672501760.0,
+            "cache_capacity_bytes": 31955597993.600006,
+            "headroom_bytes": -24716903766.399994,
+            "resident_bytes": 117488197360.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 10911744.0,
+            "reserved_bytes": 0
+          },
+          {
+            "replica": 3,
+            "stage": 0,
+            "sequences": 16,
+            "cache_bytes": 56672501760.0,
+            "cache_capacity_bytes": 31955597993.600006,
+            "headroom_bytes": -24716903766.399994,
+            "resident_bytes": 117488197360.0,
+            "weights_bytes": 60804783856.0,
+            "workspace_bytes": 10911744.0,
+            "reserved_bytes": 0
+          }
+        ],
+        "violations": [
+          {
+            "constraint": "resident_memory",
+            "replica": 0,
+            "stage": 0,
+            "required": 56672501760.0,
+            "available": 31955597993.600006
+          },
+          {
+            "constraint": "resident_memory",
+            "replica": 1,
+            "stage": 0,
+            "required": 56672501760.0,
+            "available": 31955597993.600006
+          },
+          {
+            "constraint": "resident_memory",
+            "replica": 2,
+            "stage": 0,
+            "required": 56672501760.0,
+            "available": 31955597993.600006
+          },
+          {
+            "constraint": "resident_memory",
+            "replica": 3,
+            "stage": 0,
+            "required": 56672501760.0,
+            "available": 31955597993.600006
+          }
+        ],
+        "assumptions": [
+          "KV prefixes are private per request; ready prefix KV is not free memory",
+          "Workspace uses the maximum padded query rows in this cohort",
+          "Declared graph/runtime/communication reserves remain included",
+          "Analytical body execution remains available outside this capacity"
+        ]
+      }
+    }
+  ],
+  "checks": [
+    {
+      "id": "kimi-current-ctx32768-c1-split1",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx32768-c1-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx65536-c1-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx126000-c1-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx127500-c1-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx128999-c1-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx126000-c4-split32",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx126000-c16-split8",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    },
+    {
+      "id": "kimi-current-ctx126000-c64-split2",
+      "input_content_unchanged": true,
+      "exact_independent_mla_hbm_ledger": true,
+      "complete_cleanup": true
+    }
+  ],
+  "standard_workload": {
+    "prompt_tokens": 126000,
+    "output_tokens": 3000,
+    "windows": [
+      {
+        "generated_before": 0,
+        "context": 126000,
+        "tokens": 1,
+        "kv_length": 126001
+      },
+      {
+        "generated_before": 1500,
+        "context": 127500,
+        "tokens": 1,
+        "kv_length": 127501
+      },
+      {
+        "generated_before": 2999,
+        "context": 128999,
+        "tokens": 1,
+        "kv_length": 129000
+      }
+    ]
+  },
+  "context_control": {
+    "body_growth_ms": 1.1886310400005264,
+    "24_mla_calls_growth_ms": 1.18863104000031,
+    "kda_state_bytes_and_duration_context_invariant": true
+  },
+  "capacity_reporting_runtime": {
+    "sha256": "067f56ddab56a06c9ad19828473634b617a75a11a80bad829fc33396db90a20a",
+    "files": 278
+  },
+  "capacity_reporting_note": "Recomputed by shared probe_capacity using Decode query workspace; initial raw Memory reports used case Prefill workspace. Operator/body runs are unchanged.",
+  "limitations": [
+    "Physical scenarios only; no same-boundary measured accuracy or heldout pass is claimed.",
+    "Split counts are explicit sensitivity controls; historical/native host dispatch is not established.",
+    "Three full 93-layer bodies executed; six additional cells executed native cores and constructed complete DP graphs.",
+    "No full autoregressive trajectory, TTFT, client TPOT or throughput is inferred from sampled bodies.",
+    "Current E896/MX checkpoint quant metadata is conditional relative to the historical A5 capture.",
+    "A3 TP16 heldout captures remain excluded from fitting and from these A5 controls."
+  ],
+  "raw_artifact_directory": "/var/folders/lq/zhw9ylln6z3bmmckpb3594gc0000gn/T/mindie-kimi-longctx-decode-20261030"
+}
