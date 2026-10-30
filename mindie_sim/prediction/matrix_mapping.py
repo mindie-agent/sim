@@ -7,6 +7,7 @@
 [Timeouts & Locks] O(candidates * cores * cores) arithmetic, no I/O or locks.
 [Side-Effect Policy] Emits bounded mapping diagnostics through the caller only.
 """
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 import math
 
@@ -138,6 +139,33 @@ def footprint(context, recipe):
             "l0b": recipe.compute_slots * max(right * bi / b, bi * kd * width)}
 
 
+_SELECT_CACHE = {}
+
+
+def _tuples(items):
+    return None if items is None else tuple(tuple(x) for x in items)
+
+
+def _matmul_recipe_key(recipe):
+    return (
+        type(recipe), _tuples(recipe.candidates), recipe.compute_m, recipe.compute_n,
+        recipe.slots, recipe.compute_slots, recipe.reuse_inputs, recipe.reuse_weights,
+        _tuples(recipe.narrow_candidates), _tuples(recipe.underfilled_candidates),
+        getattr(recipe, "compact_output_tiles", None),
+    )
+
+
+def _op_matrix_key(op):
+    meta = dict(op.metadata)
+    return (
+        op.local_shape, op.dtype, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
+        meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
+        meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
+        meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
+        MatrixEpilogue.from_op(op),
+    )
+
+
 @dataclass(frozen=True)
 class MappedMatmul:
     candidates: tuple | None = None
@@ -151,6 +179,17 @@ class MappedMatmul:
     underfilled_candidates: tuple | None = None
 
     def select(self, context):
+        cache_key = (
+            _matmul_recipe_key(self), _op_matrix_key(context.op), context.core_count,
+            tuple(sorted(context.resource_names.items())),
+            tuple(sorted(context.rates.items())),
+            tuple(sorted(context.work.items())),
+            tuple(sorted(context.resource_units.items())),
+            tuple(sorted(context.pool_capacities.items())),
+        )
+        if cache_key in _SELECT_CACHE:
+            recipe, record = _SELECT_CACHE[cache_key]
+            return recipe, deepcopy(record)
         records = []
         selected = None
         meta = dict(context.op.metadata)
@@ -201,7 +240,7 @@ class MappedMatmul:
         if selected is None:
             raise ModelingError(f"matrix_no_feasible_declared_mapping:"
                                 f"shape={context.op.local_shape}:groups={groups}:dtype={context.op.dtype}")
-        return selected[1], {
+        res = selected[1], {
             "basis": "declared_candidates_resource_lower_bound",
             "shape": list(context.op.local_shape[-3:]),
             "groups": groups,
@@ -224,6 +263,10 @@ class MappedMatmul:
             "representation_policy": "packed_payload_and_scales_with_compute_width_bound",
             "conversion_latency": "not_inferred_from_transfer_bytes",
         }
+        if len(_SELECT_CACHE) >= 1024:
+            _SELECT_CACHE.pop(next(iter(_SELECT_CACHE)))
+        _SELECT_CACHE[cache_key] = res
+        return res[0], deepcopy(res[1])
 
     def lower(self, context):
         recipe, record = self.select(context)

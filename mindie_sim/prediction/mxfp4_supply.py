@@ -135,14 +135,14 @@ def build(op, geometry: Geometry):
                            "mte3": details["expanded_l1_write_bytes"]})
 
     def owner_program(context, owner):
-        sequence = iter(panels(config, owner, aic))
+        sequence = tuple(panels(config, owner, aic))
         count = details["owner_tile_counts"][owner] * ((config.k + config.k_tile - 1) // config.k_tile)
         allocations = (
             context.allocate(f"weight_l1_{owner}", "l1", L1_WEIGHT_BYTES, (owner,)),
             *(context.allocate(f"weight_ub_{owner}_{s}", "ub", UB_BYTES, (2 * owner + s,)) for s in (0, 1)))
 
-        def tile(_):
-            *_, offset = next(sequence)
+        def tile(index):
+            *_, offset = sequence[index]
             stages = []
             for sub in (0, 1):
                 work = half_work(config, offset, sub, read).resources

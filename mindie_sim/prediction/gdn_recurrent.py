@@ -146,9 +146,9 @@ def build(op, geometry, *, compact=True):
                             Stage("tokens", after=("state_resident_copy",), program=PipelineProgram(q, 2, token)))
                 return (Stage("gamma_zero", v(q * ak), placement=owned),
                         Stage("value_tiles", after=("gamma_zero",), program=PipelineProgram(parts, 1, part)))
-            pending = head_runs(lengths, segments, compact=compact)
+            pending = tuple(head_runs(lengths, segments, compact=compact))
             heads_program = PipelineProgram(run_counts[owner], 1,
-                                            lambda index: head(*next(pending)))
+                                            lambda index, pending=pending: head(*pending[index]))
             pool = context.pool_names.get("ub")
             if pool is None:
                 return heads_program

@@ -204,6 +204,8 @@ class RegimePolicy:
         axes, matches = _axes(context, physical_rates=self.physical_rates), []
         for raw, key in self.rules:
             selectors = raw.get("match", {})
+            if any(axes.get(k) != selectors[k] for k in ("recipe", "kernel", "family") if k in selectors):
+                continue
             mismatches = [path for path, value in selectors.items()
                           if not axis_equal(lookup(axes, path), value)]
             if mismatches:

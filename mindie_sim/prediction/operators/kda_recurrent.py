@@ -312,9 +312,9 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     def program(context):
         def owner_program(owner):
             placement = context.owned(owner, units, ("vector", read, "mte3"))
-            pending = runs(owner)
-            def head(_):
-                q, count, beta_count = next(pending)
+            pending = tuple(runs(owner))
+            def head(index):
+                q, count, beta_count = pending[index]
                 return _head_stages(p, q, count, profile, context, placement, read,
                                     beta_repetitions=beta_count,
                                     delta_broadcast=execution.delta_broadcast)

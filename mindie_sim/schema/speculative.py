@@ -52,7 +52,7 @@ class SpeculativeSpec:
 
     def acceptance_marginals(self):
         if self.accepted_distribution is not None:
-            return tuple(sum(self.accepted_distribution[index + 1:]) for index in range(self.draft_len))
+            return tuple(math.fsum(self.accepted_distribution[index + 1:]) for index in range(self.draft_len))
         if self.acceptance_mode == "marginal":
             return self.acceptance
         result, survival = [], 1
@@ -68,4 +68,4 @@ class SpeculativeSpec:
         return tuple(a - b for a, b in zip(survival, survival[1:]))
 
     def expected_committed_tokens(self):
-        return 1 + sum(self.acceptance_marginals())
+        return 1 + math.fsum(self.acceptance_marginals())

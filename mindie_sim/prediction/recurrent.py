@@ -62,6 +62,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     projection_group = None
     conv_width = 2 * key_width + value_width
     chunk = policy.recurrent_chunk if policy else 64
+    if not isinstance(chunk, int) or isinstance(chunk, bool) or chunk <= 0:
+        raise ModelingError("recurrent_chunk_must_be_positive")
     if plan.attention == "gdn":
         # Checkpoints can retain gate/output projections in native precision
         # while quantizing QKV. Role overrides inherit the existing gdn parent.
@@ -153,32 +155,53 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         last = gated
         if view.phase == "prefill":
             pairs = sum(min(chunk, q - offset) ** 2 for offset in range(0, q, chunk))
-            # KDA forms QK and KK before WY; only Aqk @ V belongs after the scan.
-            product_flops = (4 if plan.attention == "kda" else 2) * pairs * heads * dk
+            # KDA forms QK and KK before WY with a dk-wide decay gate per head
+            # (stored in activation_dtype from delta_gates, accumulated in FP32);
+            # only Aqk @ V belongs after the scan.
+            is_kda = plan.attention == "kda"
+            act_bytes = dtype_bytes(model.activation_dtype)
+            product_flops = (4 if is_kda else 2) * pairs * heads * dk
+            prod_vec = pairs * heads * (3 * dk if is_kda else 4)
+            prod_read = q * heads * (3 if is_kda else 2) * dk * act_bytes
+            prod_write = pairs * heads * (8 if is_kda else 2)
             local = b.work(f"chunk_products{index}", (gated, normalized), (q, heads, dk, dv),
-                           flops=product_flops, vector=pairs * heads * 4,
-                           read=q * heads * 2 * dk * 2, write=pairs * heads * 2,
+                           flops=product_flops, vector=prod_vec,
+                           read=prod_read, write=prod_write,
                            family="recurrent_local")
             last = b.work(f"triangular_solve{index}", (local,), (chunks, heads, span, span),
                           flops=2 / 3 * sum(min(chunk, q - offset) ** 3
                                            for offset in range(0, q, chunk)) * heads,
-                          vector=pairs * heads * 2, read=pairs * heads * 2, write=pairs * heads * 2,
+                          vector=pairs * heads * (256 if is_kda else 2),
+                          read=pairs * heads * (32 if is_kda else 2),
+                          write=pairs * heads * (32 if is_kda else 2),
                           family="triangular_solve")
             prepare_ids.extend((local, last))
+            wy_vec = q * heads * (2 * dk + dv) * 4 if is_kda else 0
+            wy_read = (2 * pairs + q * (3 * dk + dv)) * heads * act_bytes if is_kda else (pairs + q * (dk + dv)) * heads * act_bytes
+            wy_write = q * heads * (3 * dk + dv if is_kda else dk + dv) * act_bytes
             last = b.work(f"wy_transform{index}", (last,), (q, heads, dk, dv),
-                          flops=2 * pairs * heads * (dk + dv),
-                          read=(pairs + q * (dk + dv)) * heads * 2,
-                          write=q * heads * (dk + dv) * 2, family="recurrent_local")
+                          flops=2 * pairs * heads * (dk + dv), vector=wy_vec,
+                          read=wy_read, write=wy_write, family="recurrent_local")
         state_bytes = heads * dk * dv * dtype_bytes(plan.recurrent_state_dtype)
         if view.phase == "prefill" or plan.attention != "gdn":
+            is_kda_prefill = view.phase == "prefill" and plan.attention == "kda"
+            chunk_vec = chunks * (6 if is_kda_prefill else 2) * heads * dk * dv
+            token_vec = q * heads * (dk * dv if is_kda_prefill else 2 + 2 * dv)
+            scan_vec = token_vec + chunk_vec
+            scan_read = (2 * chunks * state_bytes + q * heads * ((2 * dk + dv) * 2 + dk * 4)
+                         if is_kda_prefill else
+                         chunks * state_bytes + q * heads * (2 * dk + dv) * 2)
+            scan_write = (2 * chunks * state_bytes + q * (value_width + heads * dv) * 2
+                          if is_kda_prefill else
+                          chunks * state_bytes + q * value_width * 2)
             last = b.work(
                 f"recurrent_scan{index}", (last, normalized), (q, heads, dk, dv),
                 flops=(4 if view.phase == "prefill" else 6) * q * heads * dk * dv,
-                vector=q * heads * (2 + 2 * dv) + chunks * 2 * heads * dk * dv,
-                read=chunks * state_bytes + q * heads * (2 * dk + dv) * 2,
-                write=chunks * state_bytes + q * value_width * 2, family="recurrent_scan",
+                vector=scan_vec, read=scan_read, write=scan_write, family="recurrent_scan",
                 metadata=(("chunk", span), ("chunks", chunks), ("tokens", q),
-                          ("heads", heads), ("dk", dk), ("dv", dv)),
+                          ("heads", heads), ("dk", dk), ("dv", dv),
+                          ("chunk_vector_ops", float(chunk_vec)),
+                          ("token_vector_ops", float(token_vec))),
             )
             if view.phase == "prefill":
                 prefill_scan_ids.append(last)
@@ -196,11 +219,14 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                           ("state_checkpoints", q)),
             )
         if view.phase == "prefill":
-            pair_width = dv if plan.attention == "kda" else dk + dv
+            is_kda = plan.attention == "kda"
+            pair_width = dv if is_kda else dk + dv
+            out_vec = pairs * heads * 6 + q * heads * dv * 4 if is_kda else pairs * heads
+            out_read = (chunks * state_bytes + (pairs + q * (2 * dk + dv)) * heads * 2
+                        if is_kda else chunks * state_bytes + q * heads * (2 * dk + dv) * 2)
             last = b.work(f"recurrent_output{index}", (last, normalized), (q, heads, dk, dv),
                           flops=2 * q * heads * dk * dv + 2 * pairs * heads * pair_width,
-                          vector=pairs * heads,
-                          read=chunks * state_bytes + q * heads * (2 * dk + dv) * 2,
+                          vector=out_vec, read=out_read,
                           write=q * value_width * 2, family="recurrent_output")
         outputs.append(last)
     decode_core = None

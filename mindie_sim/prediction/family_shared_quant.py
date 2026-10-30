@@ -208,14 +208,22 @@ def transfer_ledger(rows, width, *, weight_scale_bytes):
 
 
 def _weight_scale_descriptor(metadata, gate_width):
-    fmt = metadata.get("weight_scale_format", metadata.get("weight_scale_dtype", "bf16"))
+    generic_epilogue = (
+        metadata.get("matrix_output_contract") == "int32_cast_row_scale_column_scale_output_cast"
+        and "weight_scale_dtype" not in metadata
+    )
+    fmt = (
+        "bf16"
+        if generic_epilogue and metadata.get("weight_scale_bytes") in {2, 2.0, 4, 4.0}
+        else metadata.get("weight_scale_format", metadata.get("weight_scale_dtype", "bf16"))
+    )
     aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32"}
     fmt = aliases.get(fmt, fmt)
     if fmt not in {"bf16", "fp16", "fp32"}:
         raise ModelingError(f"shared_gate_up_weight_scale_format_unsupported:{fmt}")
     declared = metadata.get("weight_scale_bytes")
     expected = gate_width * dtype_bytes(fmt)
-    if declared is None:
+    if declared is None or (generic_epilogue and declared in {2, 2.0, 4, 4.0}):
         declared = expected
     if not isfinite(float(declared)) or int(declared) != expected:
         raise ModelingError("shared_gate_up_weight_scale_bytes_disagree_with_abi")

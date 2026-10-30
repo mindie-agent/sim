@@ -162,10 +162,14 @@ class Engine:
         placement: Mapping[str, Sequence[int]] | None = None,
         coupled: bool = False,
     ) -> Event:
-        prepared = self._prepare(
-            name, work, latency=latency, caps=caps, acquire=acquire, free=free,
-            placement=placement, coupled=coupled,
-        )
+        if (work is None and latency == 0.0 and caps is None and not acquire
+                and not free and placement is None and not coupled):
+            prepared = _EMPTY_TASK
+        else:
+            prepared = self._prepare(
+                name, work, latency=latency, caps=caps, acquire=acquire, free=free,
+                placement=placement, coupled=coupled,
+            )
         return self._submit_prepared(
             prepared, name, after=after, release=release, owner=owner,
             metadata=metadata, on_complete=on_complete,

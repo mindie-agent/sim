@@ -205,8 +205,7 @@ class HierarchicalMatmul:
             # A source adapter supplies finite owner-local rectangles. K-panel
             # execution and all resource/buffer semantics remain shared here.
             counts = tuple(count for count, _ in owner_tiles)
-            tile_sources = [iter(tiles) for _, tiles in owner_tiles]
-        current_tiles = {}
+            tile_sources = [tuple(tiles) for _, tiles in owner_tiles]
 
         def allocation(name, pool, size, core):
             return (() if pool not in context.pool_names else
@@ -225,9 +224,7 @@ class HierarchicalMatmul:
                 a = min(self.tile_m, m - ((tile // nn) % nm) * self.tile_m)
                 b = min(self.tile_n, n - (tile % nn) * self.tile_n)
             else:
-                if kk == 0:
-                    current_tiles[core] = next(tile_sources[core])
-                a, b = current_tiles[core]
+                a, b = tile_sources[core][wave]
             kd = min(self.tile_k, k - kk * self.tile_k)
             fraction, k_fraction = a * b / (total_m * n), kd / k
             a_copy = inputs * a / total_m * k_fraction
