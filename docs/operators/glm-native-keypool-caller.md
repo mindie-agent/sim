@@ -191,3 +191,55 @@ equal `48 query rows * topk8 / EP16`; it does not apply a second TP division.
 The model has router groups 1/1, and the delivered artifacts do not establish
 force-EPLB. Neither an unobserved routing correlation nor capacity 384 is used
 to lower the active-expert count.
+
+### One-case short/long matrix and the B7 boundary
+
+`data/observations/a3-native-keypool-20261030/gmm_matrix.py` evaluates the same
+case and unchanged parameters for every complete q6 population in both retained
+captures. It reuses the 45-layer segmentation contract, records every Forward
+and all layer spans, and does not select a different case per population.
+The short scenario uses initial context 4481; the long scenario uses 131201.
+Actual per-call context lengths are not present in the kernel CSV.
+
+| Context | Batch | Forwards | Predicted Body ms | Observed Body mean ms | Error |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 4481 | 1 | 8 | 22.196 | 25.973 | -14.54% |
+| 4481 | 3 | 1 | 27.758 | 40.243 | **-31.02%** |
+| 4481 | 4 | 1 | 30.593 | 37.246 | **-17.86%** |
+| 4481 | 5 | 2 | 32.731 | 38.206 | -14.33% |
+| 4481 | 6 | 1 | 28.118 | 42.491 | **-33.83%** |
+| 4481 | 7 | 1 | 29.510 | 42.902 | **-31.22%** |
+| 4481 | 9 | 6 | 40.201 | 36.933 | +8.85% |
+| 4481 | 10 | 17 | 41.804 | 37.204 | +12.37% |
+| 131201 | 1 | 68 | 22.621 | 22.603 | +0.08% |
+| 131201 | 2 | 3 | 25.407 | 25.713 | -1.19% |
+| 131201 | 3 | 1 | 28.159 | 31.415 | -10.36% |
+| 131201 | 4 | 13 | 30.978 | 28.251 | +9.65% |
+| 131201 | 7 | 1 | 29.843 | 35.748 | **-16.52%** |
+| 131201 | 8 | 12 | 30.890 | 31.580 | -2.19% |
+
+The unchanged case passes 4/8 short populations and 5/6 long populations at
+15%. Short B6/B7 fail Body validation despite supplying the GMM primitive
+training calls. The GMM service domain remains expected rows 18–24; outside
+that domain the original probability-moment program runs. PoolKeyIndexer
+calibration remains confined to context 131201. These domain decisions are
+fixed in the one case, not selected after viewing a Body error. The matrix
+finished in 71.7 seconds with peak RSS 101.2 MB and zero remaining live tasks
+or programs. `gmm-matrix-validation.json` retains the exact case, parameter,
+capture and runtime source identities.
+
+`gmm-layer0-boundary.json` identifies B7's first layer as a real collective
+interval. Its 3.540150 ms span contains 3.527669 ms of retained device activity
+and only 12.481 us uncovered by concrete device events. At CSV line 255474,
+the stream-197 `AivKernel` / `hcom_allReduce_` runs for 3.212924 ms; the second
+all-reduce in that layer lasts 26.461 us. The preceding `HcPre` and following
+`HcPost` and successor-layer events preserve the original structural boundary.
+Duplicate HCOM summaries and the scheduler controller are excluded from the
+diagnostic activity union, but the actual collective remains. There is no
+CPU/runtime trace in the retained bundle, so the evidence cannot distinguish
+collective transport from rank-arrival or other internal waiting.
+
+B8 also includes a 5.701734 ms first-layer span in its first Forward; its
+remaining 11 first-layer spans are 0.743275–0.849697 ms. Every Forward and
+layer remains included in the matrix above. Removing the first layer would
+change the acceptance boundary and is not used to turn B7 into a pass.
