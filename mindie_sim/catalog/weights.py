@@ -309,6 +309,13 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                           _t("kda_g_b", d, plan.gate_rank, "kda.g_b", "out_tp")])
         else:
             terms.append(_t("kda_g", d, h, "kda.g", "out_tp"))
+        prepared_projection = dict(model.metadata).get("kda_input_projection", {}).get("layers", {}).get(str(plan.index))
+        if prepared_projection:
+            # The loader retains both low-rank factors after composing F.
+            # B and G already own their slices in the packed BFG allocation.
+            terms.append(replace(
+                _t("kda_composed_f", decay_dim, h, "kda.f", "out_tp"),
+                source_owned=False, runtime_dtype=prepared_projection["dtype"]))
         prepared_conv = dict(model.metadata).get("causal_conv_update", {}).get("layers", {}).get(str(plan.index))
         if prepared_conv:
             # The source registers a separate activation-dtype W x 3C tensor;

@@ -71,6 +71,8 @@ IMPLEMENTATIONS = {
     "cannbot_mixed_quant_sparse_flash_mla": Implementation(
         "mindie_sim.prediction.family_mqsmla", blocks=("mqsmla_attention",),
         options=("metadata_support_fd", "addressing", "return_softmax_lse")),
+    "vllm_ascend_kda_mixed_projection": Implementation(
+        "mindie_sim.prediction.family_kda_projection", blocks=("kda_input_projection",)),
     "vllm_ascend_recurrent_kda_arch22": Implementation(
         "mindie_sim.prediction.family_kda_recurrent_arch22", blocks=("kda",),
         options=("safe_gate", "use_beta_sigmoid", "gate_dtype", "beta_dtype",

@@ -57,6 +57,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if kda_source:
         kda_source.module.validate(
             key_heads=key_heads, value_heads=heads, key_width=dk, value_width=dv, model=model)
+    projection_source = (select(runtime.kernels.get("lowerings", {}), "kda_input_projection")
+                         if runtime and plan.attention == "kda" else None)
+    projection_group = None
     conv_width = 2 * key_width + value_width
     chunk = policy.recurrent_chunk if policy else 64
     if plan.attention == "gdn":
@@ -79,24 +82,30 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         output_gate_view = projection.narrow(1, conv_width, value_width)
         sources = [conv_input.producer]
     else:
-        sources, output_gate, beta, decay = kda_projections(
-            b, plan=plan, tokens=tokens, hidden=hidden, key_width=key_width,
-            value_width=value_width, heads=heads, dk=dk, deps=deps)
-        if len(set(sources)) == 1 and not conv_source:
-            # The native q1 convolution adapter already owns AutoContiguous.
-            # Other callers obey the explicit layout contract at this boundary.
-            incoming = require_packed_slice(
-                b, tensors, sources[0], ("q", "k", "v"), "short_convolution", "input",
-                "convolution_input_contiguous")
-            sources = [incoming] * 3
-        beta = require_packed_slice(b, tensors, beta, ("b",), "kda_recurrent", "beta",
-                                    "kda_beta_contiguous")
-        raw_beta = beta
-        beta = b.vector(
-            "linear_beta_sigmoid", (beta,), tokens * heads, 5,
-            dtype="fp32", family="sigmoid", shape=(tokens, heads),
-            read_bytes_override=tokens * heads * dtype_bytes(model.activation_dtype),
-            write_bytes_override=tokens * heads * 4)
+        if projection_source:
+            projection_group = projection_source.module.lower(
+                b, tensors, plan=plan, tokens=tokens, hidden=hidden, key_width=key_width,
+                value_width=value_width, heads=heads, dk=dk, deps=deps)
+            sources, output_gate, beta, decay, raw_beta = (projection_group[key] for key in
+                ("sources", "output_gate", "beta", "decay", "raw_beta"))
+        else:
+            sources, output_gate, beta, decay = kda_projections(
+                b, plan=plan, tokens=tokens, hidden=hidden, key_width=key_width,
+                value_width=value_width, heads=heads, dk=dk, deps=deps)
+            if len(set(sources)) == 1 and not conv_source:
+                # The native q1 convolution adapter already owns AutoContiguous.
+                incoming = require_packed_slice(
+                    b, tensors, sources[0], ("q", "k", "v"), "short_convolution", "input",
+                    "convolution_input_contiguous")
+                sources = [incoming] * 3
+            beta = require_packed_slice(b, tensors, beta, ("b",), "kda_recurrent", "beta",
+                                        "kda_beta_contiguous")
+            raw_beta = beta
+            beta = b.vector(
+                "linear_beta_sigmoid", (beta,), tokens * heads, 5,
+                dtype="fp32", family="sigmoid", shape=(tokens, heads),
+                read_bytes_override=tokens * heads * dtype_bytes(model.activation_dtype),
+                write_bytes_override=tokens * heads * 4)
     if conv_source:
         conv = conv_source.module.lower(
             b, tensors, plan=plan, views=views, tokens=tokens, sources=sources,
@@ -106,6 +115,10 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         tokens * conv_width, 2 * plan.conv_kernel,
                         read_bytes_override=(tokens + (plan.conv_kernel - 1) * len(views)) * conv_width * 2,
                         write_bytes_override=tokens * conv_width * 2)
+    if projection_group:
+        # Source returns from its auxiliary stream only after beta is ready.
+        b.ops[-1] = replace(b.ops[-1], deps=tuple(dict.fromkeys(
+            (*b.ops[-1].deps, projection_group["join"]))))
     state_copy = (select(runtime.kernels.get("lowerings", {}), "conv_state_copy")
                   if runtime and plan.attention == "kda"
                   and views and all(view.phase == "decode" for view in views) else None)
@@ -200,6 +213,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         # This caller provides raw Q/K and decay. The selected kernel owns
         # normalization and gate evaluation, so their old nodes are removed.
         internal_beta = options.get("use_beta_sigmoid", False)
+        if projection_group and internal_beta:
+            raise ModelingError("kda_mixed_projection_supplies_preprocessed_beta")
         supplied_beta = raw_beta if internal_beta else beta
         beta_dtype = model.activation_dtype if internal_beta else "fp32"
         if options.get("beta_dtype", beta_dtype) != beta_dtype:
@@ -213,6 +228,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             key_heads=key_heads, dk=dk, dv=dv, dtype=model.activation_dtype,
             state_dtype=plan.recurrent_state_dtype, requests=b.common["requests"],
             deps=tuple(dict.fromkeys((conv, decay, supplied_beta))), **options)
+        if projection_group:
+            decode_core = replace(decode_core, metadata=decode_core.metadata + (
+                ("projection_input_views", projection_group["views"]),))
         removed = {normalized, gated, *(op.op_id for op in scans)}
         if internal_beta:
             removed.add(beta)
@@ -410,7 +428,9 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         metadata=(("norm_kind", "rmsnorm"), ("norm_has_weight", True),
                   ("norm_has_bias", False), ("norm_group_width", dv),
                   ("gate_present", True), ("recurrent_attention_kind", plan.attention),
-                  ("fused_from", ("rmsnorm", "gate"))))
+                  ("fused_from", ("rmsnorm", "gate"))) + (
+                      (("gate_input_layout", projection_group["views"]["output_gate"]),)
+                      if projection_group else ()))
     last = b.matrix("linear_output", (output,), tokens, hidden, value_width,
                     category="kda.o" if plan.attention == "kda" else "gdn.o")
     if tp > 1:

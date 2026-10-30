@@ -58,9 +58,10 @@ def activation_quantization(ops, source_dtype):
         if (op.plan_required or meta.get("program_kind") != "matmul"
                 or not meta.get("activation_scale_bytes")
                 or meta.get("activation_producer") in {
-                    "explicit_transport_quantization", "explicit_routing_quantization"}):
-            # Selected MoE transport/routing already produced this expert
-            # input's low-precision payload and scales. Preserve it; down and
+                    "explicit_transport_quantization", "explicit_routing_quantization",
+                    "explicit_quantization"}):
+            # Selected callers or an earlier pass already produced this
+            # low-precision payload and scales. Preserve that producer;
             # other matmuls still receive their ordinary conversion.
             result.append(op)
             continue

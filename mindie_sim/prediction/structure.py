@@ -107,6 +107,12 @@ def parse_case(value: Case | Mapping) -> Case:
     elif "causal_conv_update" in dict(model.metadata):
         model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
                                              if key != "causal_conv_update"))
+    kda_projection = select(case.runtime.kernels.get("lowerings", {}), "kda_input_projection")
+    if kda_projection:
+        model = kda_projection.module.prepare_model(model, case.runtime)
+    elif "kda_input_projection" in dict(model.metadata):
+        model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
+                                             if key != "kda_input_projection"))
     mx_matrix = select(case.runtime.kernels.get("lowerings", {}), "mx_matrix")
     if mx_matrix:
         model = mx_matrix.module.prepare_model(model, case.runtime, mx_matrix)

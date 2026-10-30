@@ -1,0 +1,4874 @@
+{
+  "schema": "mindie-kda-mixed-projection-source-control/1",
+  "scope": "A3 source-compatible mixed projection; local structural and Engine evidence",
+  "timing_acceptance": "not_established; no captured duration is fitted or scored",
+  "source_binary_identity": "unverified; retained source revision and ABI are explicit",
+  "producer": {
+    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/kimi-mixed-projection-source-control-20261030.producer.py",
+    "sha256": "7f18317c3adfbe0c7d9eb6129c261c55224dd7a15e809918e1cb630e181e422d",
+    "size_bytes": 8850
+  },
+  "runtime_git_head": "260927bed300cc32747391762c50ec06b3371cc9",
+  "runtime_modules": [
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/family_kda_projection.py",
+      "sha256": "7e79796a1ff463ac24af4009950a488cf36df523f62b60b07b7baf6c162ef0aa",
+      "size_bytes": 7500
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/recurrent.py",
+      "sha256": "ab3d17bba80103363f86582df33aa34da64aef7758daefd39bbc4ae91b592b1f",
+      "size_bytes": 27144
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/transforms.py",
+      "sha256": "cc16248b3dc18510100452afd9d6bffc29f4149f31efc09300ee55aceadc108f",
+      "size_bytes": 12549
+    },
+    {
+      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/catalog/weights.py",
+      "sha256": "ecc791287ede7a933eda42c77477ff0fb9e73826395ceb7fbef8db86081b73f0",
+      "size_bytes": 31243
+    }
+  ],
+  "census_summary": {
+    "matched": 46,
+    "excluded_BF16_deployment": 6
+  },
+  "census": [
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "size_bytes": 20706836,
+        "mtime_ns": 1793352655000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "3554dcb2b430dd5eb499e180639b45c5cd18099a6c20d05e1b4fe2e66c6ba5f4"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c1-extraction.json",
+        "sha256": "e1c431b5b8e1d8d5e564402408f8cbc90dd430ceb09c12b00e859dec67545b24",
+        "size_bytes": 438083
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 1,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 1,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        75,
+        86
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"1,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"1,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "324",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 84,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"1,7168;144,448,16,32;4608;1\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"1,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "229",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c12",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "size_bytes": 20181904,
+        "mtime_ns": 1793352941000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "ea494b46fa323656fbd3221ac8757751f0fa64443d768e12a434727b2c3497f6"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c12-head-unpadding-extraction.json",
+        "sha256": "9179c45eca5aa5e1687e8f2dbf211d45b39bd15eaa24e25d203bb686299f1ad4",
+        "size_bytes": 425082
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 90,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c16",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+        "size_bytes": 16621834,
+        "mtime_ns": 1793353004000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "31fcbcb4b0bb8bd31cf19851f0317c3eedc5c4c15a0bb34a186d13199bbb6ae7"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c16-extraction.json",
+        "sha256": "4325bebaf5549c25e0effa140941f5520302cd9cbf650ee2a5f122916972385b",
+        "size_bytes": 378947
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        80
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c2",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "size_bytes": 21688834,
+        "mtime_ns": 1793352711000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "e5d77ab06a8e920cf4618b3ee692576eb30fb3c611242794d5dd441c58d68368"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c2-extraction.json",
+        "sha256": "145638a02184a6a3a379172478e23033f16c775c875d93deac51db1f8c0d1dbd",
+        "size_bytes": 435104
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 2,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 2,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"2,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "230",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 85,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"2,7168;144,448,16,32;4608;2\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"2,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "235",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c24",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+        "size_bytes": 12845342,
+        "mtime_ns": 1793353070000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "a8e3a1a73bafcf496ac6b582f941a641934c7c8604905a4f41010af2367b8d0f"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c24-extraction.json",
+        "sha256": "dc126df04b867c674d4f90cc77e6ee2dd13f1773d8b9bc062e580e6e8a2c0710",
+        "size_bytes": 317586
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "254",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;144,448,16,32;4608;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "259",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c32",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+        "size_bytes": 10497998,
+        "mtime_ns": 1793353143000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "c802535d1ce5847a433bd829d5bfcbb41335726482a199ad5a0c8c2d5e6a7c65"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c32-extraction.json",
+        "sha256": "0f4dd8639fb8a6b279b98c82fd2488a2649ed9e227337e3dfc67655fc473bbce",
+        "size_bytes": 278023
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 32,
+        "sequences_per_replica": 32,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 32,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        80
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"32,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"32,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "260",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"32,7168;144,448,16,32;4608;32\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"32,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "265",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c4",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "size_bytes": 21973796,
+        "mtime_ns": 1793352768000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "7b94b3ad53e6f290f4a1bc57d82a4b39de5041b78dac8a1715d9e8515643abb5"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c4-extraction.json",
+        "sha256": "c7e16b56693892b87b79a7fa2c291cc7420d590ebe97000eab9ed10302d1a2d1",
+        "size_bytes": 439169
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 4,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"4,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"4,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "236",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"4,7168;144,448,16,32;4608;4\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"4,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "241",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c48",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+        "size_bytes": 7696198,
+        "mtime_ns": 1793353229000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "444a004af91cc22397e2f274fa941d6baf2833458c146cdcbfc6f172c058d854"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c48-extraction.json",
+        "sha256": "e75ecc15258826d4960cdb62f4c14d3712cbfbf2507febeecdd6ea6ab3795f3d",
+        "size_bytes": 232639
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 48,
+        "sequences_per_replica": 48,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 48,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        81
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"48,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"48,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "272",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"48,7168;144,448,16,32;4608;48\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"48,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "93",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c6",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "size_bytes": 20529885,
+        "mtime_ns": 1793352826000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "7a2f1703d265db51f6bc83b288e2dfea35e0eff0155c0ecc08adc594fbdc8787"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c6-head-unpadding-extraction.json",
+        "sha256": "827a7d5feb982a08ecaa1a91ab1c944422e7cbae7eb5af38a2dc936564955b47",
+        "size_bytes": 430756
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 6
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 86,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "242",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;144,448,16,32;4608;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "247",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c64",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+        "size_bytes": 6253384,
+        "mtime_ns": 1793353328000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "b66fec0e9aeb4bfd6806d2119b4bb71b5baee0116a07109a1e2dfdeba6773b83"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c64-extraction.json",
+        "sha256": "6c83221ab01aab806bfe798f3604f42fb5da1b31062223323905e374a78aec75",
+        "size_bytes": 209901
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 64,
+        "sequences_per_replica": 64,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 64,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        80
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"64,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"64,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "100",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"64,7168;144,448,16,32;4608;64\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"64,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "107",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c8",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "size_bytes": 19707907,
+        "mtime_ns": 1793352882000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "d85b1d94ee14b2cc6b081bc7288d767a3747affb5feaaf6cd95d729f500fcb18"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-128k-in126k-out3k-c8-extraction.json",
+        "sha256": "565578c04643be0ae635f0c51fb19288e438bf1dc233c1fa9b7f6c30fa214045",
+        "size_bytes": 429788
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "242",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;144,448,16,32;4608;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "247",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p16k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p16k/kernel_details.csv",
+        "size_bytes": 16739604,
+        "mtime_ns": 1793353683000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "18c459ca5b8ed2e0df7f7a184eb575ea27695630747d42b37566777f3650fda8"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p16k-head-unpadding-extraction.json",
+        "sha256": "b5e60f89d682412175d38019b76afb3bb5a9cefebef9cb5ccd423b5c65ff847f",
+        "size_bytes": 368472
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 90,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p32k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p32k/kernel_details.csv",
+        "size_bytes": 16737785,
+        "mtime_ns": 1793353764000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "0a5110616afdfebf11152221d5569491b1f4079db02282cf0e39d2bd5aeaa4a4"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p32k-head-unpadding-extraction.json",
+        "sha256": "b122bc905cc92963e42cea8bb33157ca52aca0c2904bc1e377a46b4e59471b6e",
+        "size_bytes": 368435
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 86,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p4k/kernel_details.csv",
+        "size_bytes": 16916978,
+        "mtime_ns": 1793353484000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "eaefbda6e8b6b899da943bd665806d65d1371c36e8696084bf79fdc7a9a221cc"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p4k-head-unpadding-extraction.json",
+        "sha256": "2dca7f63671a87f3eaaaa730289f2becea5c4947bb5318434ea9ded8761ab512",
+        "size_bytes": 371162
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 90,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c12-p8k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c12_p8k/kernel_details.csv",
+        "size_bytes": 16830467,
+        "mtime_ns": 1793353603000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "c5cb903d70a9a6ff2271182bdb46b2700369216d2ab3bca182107e2c525698e9"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c12-p8k-head-unpadding-extraction.json",
+        "sha256": "85ff72c6d57a2c90e9517fd8e928285b54cdf3bb68d9dfb5fcb28d17c7342115",
+        "size_bytes": 370050
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        95
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 86,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "248",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;144,448,16,32;4608;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "253",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p16k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p16k/kernel_details.csv",
+        "size_bytes": 15961222,
+        "mtime_ns": 1793353725000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "3c82010b83edbfcadd3b0ed04a5596980860c8c6801df044f8c6cf54cc914170"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p16k-extraction.json",
+        "sha256": "4522a11d0f38f2bd09c79acbd272a8b8ee6ccc12fe5a69265ad199c68e2c8a7d",
+        "size_bytes": 365671
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 70,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "254",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;144,448,16,32;4608;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "259",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p32k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p32k/kernel_details.csv",
+        "size_bytes": 16214474,
+        "mtime_ns": 1793353804000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "79e7ecb6c145460b6dcfe12dff660a83bc1d402bd96abee873c008f7b4f8e3b8"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p32k-extraction.json",
+        "sha256": "cb505b1c5faa8ac3c4f62566d2d12f7eb21eb494dc764e15fccd127d3c2d7a0e",
+        "size_bytes": 369618
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "254",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;144,448,16,32;4608;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "259",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p4k/kernel_details.csv",
+        "size_bytes": 16801673,
+        "mtime_ns": 1793353525000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "8e1b18f02318ab650d5b7444163dc7a0dd0dc2980bc6f70307c80990e130bfd3"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p4k-extraction.json",
+        "sha256": "51ff6770f41a45dcf33dacfa61ba5b242535dafe8f6037ce32bb5ba8e0d64b40",
+        "size_bytes": 378567
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 70,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "254",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 75,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;144,448,16,32;4608;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "259",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c24-p8k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c24_p8k/kernel_details.csv",
+        "size_bytes": 16382529,
+        "mtime_ns": 1793353645000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "97f4a2cf48b4cca9c0d28e6567c26176d6d33542c193f5e757b2d39a46a3d749"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c24-p8k-extraction.json",
+        "sha256": "78d7116622c25df99474b0b2eb57711eae62776b93693527e67ce77b888982cc",
+        "size_bytes": 372232
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 70,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "254",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 75,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;144,448,16,32;4608;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "259",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c2-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c2_p4k/kernel_details.csv",
+        "size_bytes": 18076883,
+        "mtime_ns": 1793353367000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "1e816d73ff9a5743ee0b87648c591a5a46b7d944ee1b0424a2f4cf54fb9e2315"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c2-p4k-extraction.json",
+        "sha256": "e3bbf3d37334e3a66694bf080d4e52f8d9694f45d769f5b049a6aa0b35d313ac",
+        "size_bytes": 377790
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 2,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 2,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"2,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "230",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"2,7168;144,448,16,32;4608;2\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"2,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "235",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c48-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c48_p4k/kernel_details.csv",
+        "size_bytes": 13444348,
+        "mtime_ns": 1793353565000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "f864b8937e07ebf3b4e9879250f691c398cffd4d0c90b029046793fefdf86eea"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c48-p4k-extraction.json",
+        "sha256": "a4cea5c2b1d8d1df7ba692b6ba5412cf2f79e40f50a88f5751bf6bf473ec5927",
+        "size_bytes": 322831
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 48,
+        "sequences_per_replica": 48,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 48,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        81
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"48,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"48,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "272",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"48,7168;144,448,16,32;4608;48\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"48,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "93",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c6-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c6_p4k/kernel_details.csv",
+        "size_bytes": 16388913,
+        "mtime_ns": 1793353406000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "6af60db1a7aa74149627818fd872e81c9b26d18b62de661734fe3f3791e4c999"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c6-p4k-head-unpadding-extraction.json",
+        "sha256": "11db010824a5cb8f63d130ddeefdad2aee5556f0696a595c170b36d0b2b463be",
+        "size_bytes": 363430
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 6
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        82,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "242",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;144,448,16,32;4608;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "247",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp8-longctx-decode-c8-p4k",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp8_128k_decode_20261030/prof/decode_c8_p4k/kernel_details.csv",
+        "size_bytes": 15948245,
+        "mtime_ns": 1793353444000000000,
+        "schema_version": "kernel_details_csv_46col",
+        "sha256": "87a2cf8a81193173a769544908fc35eb485621378c0f6c98be2bad33a1c79ee3"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/a3-kimi4-tp8-longctx-decode-c8-p4k-extraction.json",
+        "sha256": "5b6543c23443519516a8e5f1248a18d2ffad7850abce8210a8aea2c0c43c6a57",
+        "size_bytes": 365998
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;3084,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,3084\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "242",
+          "Device_id": "4"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;144,448,16,32;4608;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,4608\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "247",
+          "Device_id": "4"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c1",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "0ab84756eeed12352b0087ca6c9be43d720602a09ca907fdcb23ca7b671175d7",
+        "size_bytes": 19486354,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/edf89fa21c28d8a08bff8365e9387b344b8ae15487a31a92b3815074822426dd.json",
+        "sha256": "edf89fa21c28d8a08bff8365e9387b344b8ae15487a31a92b3815074822426dd",
+        "size_bytes": 606235
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 1,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 1,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        75,
+        83
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 77,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"1,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"1,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "316",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 81,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"1,7168;72,448,16,32;2304;1\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"1,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "321",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c12",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "sha256": "e09199e5ab7e75012524a124fe87ebb63efd753235b976ab3e4496a944b254c4",
+        "size_bytes": 18280058,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/13c5a6ec52a6457d13b2b74e56e4351f8f332374bae67e1bb7a9f53b7aefaaeb.json",
+        "sha256": "13c5a6ec52a6457d13b2b74e56e4351f8f332374bae67e1bb7a9f53b7aefaaeb",
+        "size_bytes": 39675
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 16,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        93
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 90,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c16",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c16/kernel_details.csv",
+        "sha256": "c3dcbef37969338502b7b93feb8f59033c51da7c73139ef9525314f6754bfc68",
+        "size_bytes": 17245372,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/8efe53d8062ec49f63496b0fbeacbb59bfd124fa1ee925800137248b8cb47bd1.json",
+        "sha256": "8efe53d8062ec49f63496b0fbeacbb59bfd124fa1ee925800137248b8cb47bd1",
+        "size_bytes": 564587
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c2",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "sha256": "a6c841b939055c4cb88ae455d05b6a2f18e196b6c649cc793278e5ad98c5b87a",
+        "size_bytes": 20946651,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c1c45d2db1e7fa52a8c2d212aa20221aff88a3b0f418bb293cc85a58cc0dfc7a.json",
+        "sha256": "c1c45d2db1e7fa52a8c2d212aa20221aff88a3b0f418bb293cc85a58cc0dfc7a",
+        "size_bytes": 614027
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 2,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 2,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"2,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "322",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"2,7168;72,448,16,32;2304;2\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"2,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "227",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c24",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c24/kernel_details.csv",
+        "sha256": "e21e412d78c57ba02254e07f7a983c8972eb6db9e9f7e06e969394cd99a79357",
+        "size_bytes": 15173997,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/38ee940f2166722c821ea07556981882f67db2993b0fba5e4d5f9d089d4139a2.json",
+        "sha256": "38ee940f2166722c821ea07556981882f67db2993b0fba5e4d5f9d089d4139a2",
+        "size_bytes": 489277
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "246",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 85,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;72,448,16,32;2304;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "251",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c32",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c32/kernel_details.csv",
+        "sha256": "62b3f43b7c5da867768c3f3b2591cd247cd6acee0df7bfc6cb11a3cc8b3f5f94",
+        "size_bytes": 11662100,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/4ec7a720b54cac9270f60d62595c8aa57226ca30ca463f41e5671480a3e75bfb.json",
+        "sha256": "4ec7a720b54cac9270f60d62595c8aa57226ca30ca463f41e5671480a3e75bfb",
+        "size_bytes": 433661
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 32,
+        "sequences_per_replica": 32,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 32,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        80
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 71,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"32,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"32,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "252",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"32,7168;72,448,16,32;2304;32\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"32,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "257",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c4",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "462cfc90519918bc578b9e382fb8b9ba98f945e38c8be7483399af3e0af18db6",
+        "size_bytes": 20407999,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/0d0971d348f0909dedf291a8ef347ee8d20e950dd991ee70794b4dce863cdf9f.json",
+        "sha256": "0d0971d348f0909dedf291a8ef347ee8d20e950dd991ee70794b4dce863cdf9f",
+        "size_bytes": 602287
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 4,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"4,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"4,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "228",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"4,7168;72,448,16,32;2304;4\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"4,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "233",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c48",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c48/kernel_details.csv",
+        "sha256": "c7a2bab6b8de5f798cdcd95fdea36d31b1bc6073b75070288b6bf1fd858462c9",
+        "size_bytes": 8707082,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5144350e325cb681d32041253020abb8ca52d704f29556bd19ae861d30a0b1b2.json",
+        "sha256": "5144350e325cb681d32041253020abb8ca52d704f29556bd19ae861d30a0b1b2",
+        "size_bytes": 365777
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 48,
+        "sequences_per_replica": 48,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 48,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        80
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"48,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"48,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "264",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"48,7168;72,448,16,32;2304;48\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"48,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "269",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c6",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "sha256": "0c29d27ae7fb3cb342f47f260b51fc8fc4a7757f043fc38349d3f36eb196501e",
+        "size_bytes": 20889791,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/611bef60f0ff201ff81911bc5806cbe578e0564a8eca7267b59f46e0195839a5.json",
+        "sha256": "611bef60f0ff201ff81911bc5806cbe578e0564a8eca7267b59f46e0195839a5",
+        "size_bytes": 39274
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 8,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        102
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 93,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "234",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 98,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;72,448,16,32;2304;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "239",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c64",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c64/kernel_details.csv",
+        "sha256": "4efd9558d8bd621a57a224d796366888a899bd105ce278f3060ee704646e6134",
+        "size_bytes": 6984772,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/890b41b3e5cd60fa2604f06c874347ea261a0fc03f6c77cbde6ce046c769cc86.json",
+        "sha256": "890b41b3e5cd60fa2604f06c874347ea261a0fc03f6c77cbde6ce046c769cc86",
+        "size_bytes": 326760
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 64,
+        "sequences_per_replica": 64,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 64,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        67,
+        79
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 70,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"64,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"64,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "92",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 76,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"64,7168;72,448,16,32;2304;64\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"64,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "99",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-128k-in126k-out3k-c8",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "sha256": "31cae10038155c42786bdab3cceca114b3cd4aab5d73976358f6b1b63ca0f314",
+        "size_bytes": 19160219,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/959b201faae46b31e64ba3a733f0005854323fe0f30b85423278e34150ce789e.json",
+        "sha256": "959b201faae46b31e64ba3a733f0005854323fe0f30b85423278e34150ce789e",
+        "size_bytes": 575261
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "234",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;72,448,16,32;2304;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "239",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p16k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p16k/kernel_details.csv",
+        "sha256": "284379517c0bd73fc65585cefdb46cdf5143f37efe84b592fd34f5f02f6da802",
+        "size_bytes": 15901620,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/9be3020ef309deb1fcde4475d50c290bc65b890a88cf3986e9a07285c9306c8c.json",
+        "sha256": "9be3020ef309deb1fcde4475d50c290bc65b890a88cf3986e9a07285c9306c8c",
+        "size_bytes": 36104
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 16,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 86,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p32k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p32k/kernel_details.csv",
+        "sha256": "b5c18183a25ad5aa13d94ae1cbd4feec0109fbbbf0474dd4786ec9c0f8988339",
+        "size_bytes": 15725814,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/2d74a1a730b1f5b86d2dc15bbd99ff63177b9b5aa7e09b71971462f79a9467d4.json",
+        "sha256": "2d74a1a730b1f5b86d2dc15bbd99ff63177b9b5aa7e09b71971462f79a9467d4",
+        "size_bytes": 35734
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 16,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        94
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 86,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 91,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p4k/kernel_details.csv",
+        "sha256": "b98be4ef1438ff886f5c6e9f31418da690c5dd0c8ccd5c02f0354838f463439f",
+        "size_bytes": 14306099,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/556fd6705b201b48373c1b7ed6d298a013ab560a06ee15fe11cc331b24cc29ee.json",
+        "sha256": "556fd6705b201b48373c1b7ed6d298a013ab560a06ee15fe11cc331b24cc29ee",
+        "size_bytes": 32773
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 16,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        93
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 85,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 90,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c12-p8k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c12_p8k/kernel_details.csv",
+        "sha256": "6c79dd9157570d9442f63c1d266ee13772919a9818c5ac00487005d03ce0f7a9",
+        "size_bytes": 15282800,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/90f4b3b67442a49f4cc68aeb5d10b6929892cc4c821336d5138224a0b6be9eaf.json",
+        "sha256": "90f4b3b67442a49f4cc68aeb5d10b6929892cc4c821336d5138224a0b6be9eaf",
+        "size_bytes": 34808
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 16,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        95
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 87,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"16,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "240",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 92,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"16,7168;72,448,16,32;2304;16\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"16,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "245",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p16k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p16k/kernel_details.csv",
+        "sha256": "ce775b31c94536e97ded1e2db3f051212c2d9df2f7f41af8263e465351f33d6c",
+        "size_bytes": 15898489,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/aac67ad13f7f1179fd24c1a1cf016b02ac36cccd50b1318ed494982a521b4501.json",
+        "sha256": "aac67ad13f7f1179fd24c1a1cf016b02ac36cccd50b1318ed494982a521b4501",
+        "size_bytes": 502163
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "246",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;72,448,16,32;2304;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "251",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p32k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p32k/kernel_details.csv",
+        "sha256": "c8e5dbacc89540de33e2240809e25dbb0f92a525388f997ec76275b42bbbae1f",
+        "size_bytes": 16896921,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/b90392e92938d0a209b5f75e5c2826f78ebb68acbb6c7d085ba462e0e80de9ab.json",
+        "sha256": "b90392e92938d0a209b5f75e5c2826f78ebb68acbb6c7d085ba462e0e80de9ab",
+        "size_bytes": 523724
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "246",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;72,448,16,32;2304;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "251",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p4k/kernel_details.csv",
+        "sha256": "0e3ffbdaa496b730037a8379bf609f8d3abef631cfcaa6a5ec37e220b691d62b",
+        "size_bytes": 16262648,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/5c087f2c33ae5cf4d39e43991c795d3daa691a2f88e8e21d1499cadf70d7ffbb.json",
+        "sha256": "5c087f2c33ae5cf4d39e43991c795d3daa691a2f88e8e21d1499cadf70d7ffbb",
+        "size_bytes": 507038
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        89
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "246",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 86,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;72,448,16,32;2304;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "251",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c24-p8k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c24_p8k/kernel_details.csv",
+        "sha256": "4ee7620db31ec4f2ca820792164dc8825b2218e921de7af383f019a61a4e493e",
+        "size_bytes": 16261759,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/d3676a11b7a33cce20535f4e4c2e0f920ca89f2143b00a89b12f8dde66aba031.json",
+        "sha256": "d3676a11b7a33cce20535f4e4c2e0f920ca89f2143b00a89b12f8dde66aba031",
+        "size_bytes": 509898
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 24,
+        "sequences_per_replica": 24,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 24,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        90
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 81,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"24,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"24,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "246",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 87,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"24,7168;72,448,16,32;2304;24\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"24,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "251",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c2-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c2_p4k/kernel_details.csv",
+        "sha256": "45912269b0152dfd7a6832d22ce130b42bd21964ed145d6001076797454ad25b",
+        "size_bytes": 16924440,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/fd8ca5c7a0890f852ca2c78567a08945d4d5b8003495f62d0602d92f46f2ca3b.json",
+        "sha256": "fd8ca5c7a0890f852ca2c78567a08945d4d5b8003495f62d0602d92f46f2ca3b",
+        "size_bytes": 523402
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 2,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 2,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        88
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 80,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"2,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "322",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 85,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"2,7168;72,448,16,32;2304;2\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"2,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "227",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c48-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c48_p4k/kernel_details.csv",
+        "sha256": "6543b4af2e998914518e479b450679041fed3f985c14f1e0565da9e238ee76cb",
+        "size_bytes": 14534653,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/d26f26b0b049aec8d3e36c74754644be884c77313ea8e9ce663af0346cd72f5e.json",
+        "sha256": "d26f26b0b049aec8d3e36c74754644be884c77313ea8e9ce663af0346cd72f5e",
+        "size_bytes": 496509
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 48,
+        "sequences_per_replica": 48,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 48,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        68,
+        81
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 72,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"48,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"48,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "264",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 77,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"48,7168;72,448,16,32;2304;48\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"48,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "11",
+          "Stream ID": "269",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c6-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c6_p4k/kernel_details.csv",
+        "sha256": "3f812e3b6f5528c55a29bb5631554f303f082f00d6215e208d8d704eafab3340",
+        "size_bytes": 17024693,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/c4e4260014e91192133459055fa344ddce9ca4d868a5a36823b4963c2e6c095f.json",
+        "sha256": "c4e4260014e91192133459055fa344ddce9ca4d868a5a36823b4963c2e6c095f",
+        "size_bytes": 35925
+      },
+      "extraction_status": "unresolved",
+      "geometry": null,
+      "physical_projection_rows": 8,
+      "scope": "bounded first native KDA block; prepared extraction has no complete forward",
+      "source_csv_lines": [
+        2,
+        102
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 93,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "234",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 99,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;72,448,16,32;2304;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "239",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a3-kimi4-tp16-128k-decode-c8-p4k",
+      "tp": 16,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/kimi_k3_w4a8_4layer_tp16_128k_decode_20261030/prof/decode_c8_p4k/kernel_details.csv",
+        "sha256": "fe9df220c08a1312a9e13230a7e5bf6d590a9e245fc0efe79d1cd94b146e09e6",
+        "size_bytes": 16531708,
+        "kind": "csv"
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/2d18b1af8f73e403f42785901f3371015d4931d3b1d1dc8d0fad8c8207d498e7.json",
+        "sha256": "2d18b1af8f73e403f42785901f3371015d4931d3b1d1dc8d0fad8c8207d498e7",
+        "size_bytes": 516780
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity"
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        78,
+        90
+      ],
+      "mixed_projection_contract": "matched",
+      "projection_rows": [
+        {
+          "csv_line": 82,
+          "Type": "MatMulV2",
+          "Input Shapes": "\"8,7168;1542,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1542\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "20",
+          "Mix Block Num": "0",
+          "Task ID": "1",
+          "Stream ID": "234",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 87,
+          "Type": "QuantBatchMatmulV3",
+          "Input Shapes": "\"8,7168;72,448,16,32;2304;8\"",
+          "Input Data Types": "INT8;INT8;DT_BF16;FLOAT",
+          "Input Formats": "ND;FRACTAL_NZ;ND;ND",
+          "Output Shapes": "\"8,2304\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "18",
+          "Mix Block Num": "18",
+          "Task ID": "18",
+          "Stream ID": "239",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c1",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c1/kernel_details.csv",
+        "sha256": "81b40e25df63f86bf59aea1394b32b7141c78e3f0a217a220db6df6869149088",
+        "size_bytes": 97434547,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c1.json",
+        "sha256": "efb7a5c5ba025c15de48c9e6c9ce0b6e002e1376b9929360d4c20d696bfb6ab5",
+        "size_bytes": 2371675
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 1,
+        "sequences_per_replica": 1,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 1
+      },
+      "physical_projection_rows": 1,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        55,
+        62
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 57,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"1,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"1,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "250198",
+          "Stream ID": "184",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 58,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"1,128;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"1,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "250199",
+          "Stream ID": "184",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c2",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c2/kernel_details.csv",
+        "sha256": "ea71026728e26f46aac8d20d0a414e4dc664d345dc087d138b05a59277723313",
+        "size_bytes": 94312857,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c2.json",
+        "sha256": "46d7dab69a47d50dd576544534c4366b4e0ea21035a5ca203dc14fd27856efb6",
+        "size_bytes": 2351518
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 2,
+        "sequences_per_replica": 2,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 2
+      },
+      "physical_projection_rows": 2,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        58,
+        67
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 60,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"2,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "229144",
+          "Stream ID": "187",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 61,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"6432;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"2,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "229145",
+          "Stream ID": "187",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c4",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c4/kernel_details.csv",
+        "sha256": "045f37808c79a2d452156e51b95d8f0679bf60114525cbef0a6f3f166edad905",
+        "size_bytes": 84916836,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c4.json",
+        "sha256": "031731ddc8aacc0c0249b385615e680dbd36ff1c41eb2d4a079a041beb281fc4",
+        "size_bytes": 2346718
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 4,
+        "sequences_per_replica": 4,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 4
+      },
+      "physical_projection_rows": 4,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        58,
+        67
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 60,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"4,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"4,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "207578",
+          "Stream ID": "190",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 61,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"19008;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"4,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "207579",
+          "Stream ID": "190",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c6",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c6/kernel_details.csv",
+        "sha256": "0e0c33954921e4f12924bc572e795f2a6ff9967b011f861cfafb2fa79e3ce718",
+        "size_bytes": 76385139,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c6.json",
+        "sha256": "ce6ed46f3c872c091ecf01a1c145bed575441652abe7274c813d9515f1401a4c",
+        "size_bytes": 2339528
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 6
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        59,
+        68
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 61,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"8,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "186197",
+          "Stream ID": "1",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 62,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"44160;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "186198",
+          "Stream ID": "1",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c8",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c8/kernel_details.csv",
+        "sha256": "2176834d9e01784ea4af9448ba503ce9263a59ae585c6a2b1c3607e4a6a8924b",
+        "size_bytes": 72668484,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c8.json",
+        "sha256": "dd96184fb131b806c3ca70ecbdf772585a11be8a1cd9bf245af1e5bbabf051d5",
+        "size_bytes": 2326470
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 8,
+        "sequences_per_replica": 8,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 8
+      },
+      "physical_projection_rows": 8,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        53,
+        62
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 55,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"8,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "186197",
+          "Stream ID": "1",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 56,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"44160;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"8,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "186198",
+          "Stream ID": "1",
+          "Device_id": "0"
+        }
+      ]
+    },
+    {
+      "case_id": "a5_kimi_tp8_e16_bf16_128k_c12",
+      "tp": 8,
+      "source": {
+        "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261030/kimi_k3_bf16_tp8_ep8_128k_decode_20261030/prof/decode_128k_in126k_out3k_c12/kernel_details.csv",
+        "sha256": "4354f0403a8579c47eba38a5075add2c3582787410023ca43ce12daf0b94f242",
+        "size_bytes": 62015375,
+        "kind": "csv",
+        "rank_id": "rank0",
+        "rank_index": 0
+      },
+      "extraction": {
+        "path": "/Volumes/data/mindie-sim-data/acceptance-archives-20261030/pending/long-context-decode/auto-forward-a5_kimi_tp8_e16_bf16_128k_c12.json",
+        "sha256": "a136acb891338e58a05b2b64c967f6c329c3270604d58a03c7053b988ef69736",
+        "size_bytes": 2324724
+      },
+      "extraction_status": "measured",
+      "geometry": {
+        "query_rows": 16,
+        "sequences_per_replica": 16,
+        "tokens_per_sequence": 1,
+        "context_tokens": null,
+        "batch_basis": "captured_paged_attention_block_table_rows",
+        "context_basis": "not_observed_from_cache_capacity",
+        "output_query_rows": 12
+      },
+      "physical_projection_rows": 16,
+      "scope": "first complete source KDA block, not all-forward ABI census",
+      "source_csv_lines": [
+        59,
+        68
+      ],
+      "mixed_projection_contract": "excluded_BF16_deployment",
+      "projection_rows": [
+        {
+          "csv_line": 61,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"16,7168;6288,7168\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,6288\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "31",
+          "Mix Block Num": "0",
+          "Task ID": "165003",
+          "Stream ID": "4",
+          "Device_id": "0"
+        },
+        {
+          "csv_line": 62,
+          "Type": "MatMulV3",
+          "Input Shapes": "\"94464;1536,128\"",
+          "Input Data Types": "DT_BF16;DT_BF16",
+          "Input Formats": "ND;ND",
+          "Output Shapes": "\"16,1536\"",
+          "Output Data Types": "DT_BF16",
+          "Block Num": "32",
+          "Mix Block Num": "0",
+          "Task ID": "165004",
+          "Stream ID": "4",
+          "Device_id": "0"
+        }
+      ]
+    }
+  ],
+  "first_layer_controls": [
+    {
+      "tp": 8,
+      "batch_slots": 2,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp8.json",
+        "sha256": "5308f086749470d2f27c95ebad1a0df5bc9930cfbe1134e144e51a94e5876d84",
+        "size_bytes": 14501
+      },
+      "variants": {
+        "separate_semantic_projections": {
+          "first_layer_span_ms": 0.4068246416666671,
+          "operator_count": 41,
+          "execution": {
+            "time_ms": 0.4068246416666671,
+            "serviced": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 175854432.00000063,
+              "mte1@r0:s0": 177362943.99999997,
+              "mte2_aic@r0:s0": 175470592.00000066,
+              "mte2_aiv@r0:s0": 1775903.999999997,
+              "mte3@r0:s0": 2574055.999999994,
+              "vector@r0:s0": 5766766.000000013,
+              "matrix@r0:s0": 0.003276363636363632,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 401408.0,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 401408.0,
+              "link:d2d_intra_package:2:tx:port2": 401408.0,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 401408.0,
+              "link:d2d_intra_package:4:tx:port4": 401408.0,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 401408.0,
+              "link:d2d_intra_package:6:tx:port6": 401408.0,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 401408.0,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 401408.0,
+              "link:d2d_intra_node:0:tx:port1": 401408.0,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 401408.0,
+              "link:d2d_intra_node:0:tx:port3": 401408.0,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 401408.0,
+              "link:d2d_intra_node:0:tx:port5": 401408.0,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 401408.0,
+              "link:d2d_intra_node:0:tx:port7": 401408.0,
+              "link:d2d_intra_node:0:rx:port7": 0.0
+            },
+            "resource_busy_ms": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 0.2613169112842714,
+              "mte1@r0:s0": 0.2548439393939394,
+              "mte2_aic@r0:s0": 0.259229393939394,
+              "mte2_aiv@r0:s0": 0.10565606060606057,
+              "mte3@r0:s0": 0.12773976136363635,
+              "vector@r0:s0": 0.10812365056818181,
+              "matrix@r0:s0": 0.2547087878787879,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 0.000896,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 0.000896,
+              "link:d2d_intra_package:2:tx:port2": 0.000896,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 0.000896,
+              "link:d2d_intra_package:4:tx:port4": 0.000896,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 0.000896,
+              "link:d2d_intra_package:6:tx:port6": 0.000896,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 0.000896,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 0.002048,
+              "link:d2d_intra_node:0:tx:port1": 0.002048,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 0.002048,
+              "link:d2d_intra_node:0:tx:port3": 0.002048,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 0.002048,
+              "link:d2d_intra_node:0:tx:port5": 0.002048,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 0.002048,
+              "link:d2d_intra_node:0:tx:port7": 0.002048,
+              "link:d2d_intra_node:0:rx:port7": 0.0
+            },
+            "peak_allocated": {
+              "l0a@r0:s0": 2048.0,
+              "l0b@r0:s0": 65536.0,
+              "l0c@r0:s0": 8192,
+              "l1@r0:s0": 67584.0,
+              "ub@r0:s0": 194432
+            },
+            "live_allocated": {
+              "l0a@r0:s0": 0.0,
+              "l0b@r0:s0": 0.0,
+              "l0c@r0:s0": 0.0,
+              "l1@r0:s0": 0.0,
+              "ub@r0:s0": 0.0
+            },
+            "peak_allocated_per_unit": {
+              "l1@r0:s0:unit0": 67584.0,
+              "l0c@r0:s0:unit0": 8192,
+              "l0a@r0:s0:unit0": 2048.0,
+              "l0b@r0:s0:unit0": 65536.0,
+              "l1@r0:s0:unit1": 67584.0,
+              "l0c@r0:s0:unit1": 8192,
+              "l0a@r0:s0:unit1": 2048.0,
+              "l0b@r0:s0:unit1": 65536.0,
+              "l1@r0:s0:unit2": 67584.0,
+              "l0c@r0:s0:unit2": 8192,
+              "l0a@r0:s0:unit2": 2048.0,
+              "l0b@r0:s0:unit2": 65536.0,
+              "l1@r0:s0:unit3": 67584.0,
+              "l0c@r0:s0:unit3": 8192,
+              "l0a@r0:s0:unit3": 2048.0,
+              "l0b@r0:s0:unit3": 65536.0,
+              "l1@r0:s0:unit4": 67584.0,
+              "l0c@r0:s0:unit4": 8192,
+              "l0a@r0:s0:unit4": 2048.0,
+              "l0b@r0:s0:unit4": 65536.0,
+              "l1@r0:s0:unit5": 67584.0,
+              "l0c@r0:s0:unit5": 8192,
+              "l0a@r0:s0:unit5": 2048.0,
+              "l0b@r0:s0:unit5": 65536.0,
+              "l1@r0:s0:unit6": 67584.0,
+              "l0c@r0:s0:unit6": 8192,
+              "l0a@r0:s0:unit6": 2048.0,
+              "l0b@r0:s0:unit6": 65536.0,
+              "l1@r0:s0:unit7": 67584.0,
+              "l0c@r0:s0:unit7": 8192,
+              "l0a@r0:s0:unit7": 2048.0,
+              "l0b@r0:s0:unit7": 65536.0,
+              "l1@r0:s0:unit8": 67584.0,
+              "l0c@r0:s0:unit8": 8192,
+              "l0a@r0:s0:unit8": 2048.0,
+              "l0b@r0:s0:unit8": 65536.0,
+              "l1@r0:s0:unit9": 67584.0,
+              "l0c@r0:s0:unit9": 8192,
+              "l0a@r0:s0:unit9": 2048.0,
+              "l0b@r0:s0:unit9": 65536.0,
+              "l1@r0:s0:unit10": 67584.0,
+              "l0c@r0:s0:unit10": 8192,
+              "l0a@r0:s0:unit10": 2048.0,
+              "l0b@r0:s0:unit10": 65536.0,
+              "l1@r0:s0:unit11": 67584.0,
+              "l0c@r0:s0:unit11": 8192,
+              "l0a@r0:s0:unit11": 2048.0,
+              "l0b@r0:s0:unit11": 65536.0,
+              "ub@r0:s0:unit0": 194432,
+              "ub@r0:s0:unit1": 194432,
+              "ub@r0:s0:unit2": 194432,
+              "ub@r0:s0:unit3": 194432,
+              "ub@r0:s0:unit4": 194432,
+              "ub@r0:s0:unit5": 194432,
+              "ub@r0:s0:unit6": 194432,
+              "ub@r0:s0:unit7": 194432,
+              "ub@r0:s0:unit8": 194432,
+              "ub@r0:s0:unit9": 194432,
+              "ub@r0:s0:unit10": 194432,
+              "ub@r0:s0:unit11": 194432,
+              "ub@r0:s0:unit12": 194432,
+              "ub@r0:s0:unit13": 194432,
+              "ub@r0:s0:unit14": 194432,
+              "ub@r0:s0:unit15": 194432,
+              "ub@r0:s0:unit16": 194432,
+              "ub@r0:s0:unit17": 194432,
+              "ub@r0:s0:unit18": 194432,
+              "ub@r0:s0:unit19": 194432,
+              "ub@r0:s0:unit20": 194432,
+              "ub@r0:s0:unit21": 194432,
+              "ub@r0:s0:unit22": 194432,
+              "ub@r0:s0:unit23": 194432,
+              "l1@r0:s0:unit12": 67584.0,
+              "l0c@r0:s0:unit12": 8192,
+              "l0a@r0:s0:unit12": 2048.0,
+              "l0b@r0:s0:unit12": 65536.0,
+              "l1@r0:s0:unit13": 67584.0,
+              "l0c@r0:s0:unit13": 8192,
+              "l0a@r0:s0:unit13": 2048.0,
+              "l0b@r0:s0:unit13": 65536.0,
+              "l1@r0:s0:unit14": 67584.0,
+              "l0c@r0:s0:unit14": 8192,
+              "l0a@r0:s0:unit14": 2048.0,
+              "l0b@r0:s0:unit14": 65536.0,
+              "l1@r0:s0:unit15": 67584.0,
+              "l0c@r0:s0:unit15": 8192,
+              "l0a@r0:s0:unit15": 2048.0,
+              "l0b@r0:s0:unit15": 65536.0,
+              "l1@r0:s0:unit16": 67584.0,
+              "l0c@r0:s0:unit16": 8192,
+              "l0a@r0:s0:unit16": 2048.0,
+              "l0b@r0:s0:unit16": 65536.0,
+              "l1@r0:s0:unit17": 67584.0,
+              "l0c@r0:s0:unit17": 8192,
+              "l0a@r0:s0:unit17": 2048.0,
+              "l0b@r0:s0:unit17": 65536.0,
+              "l1@r0:s0:unit18": 67584.0,
+              "l0c@r0:s0:unit18": 8192,
+              "l0a@r0:s0:unit18": 2048.0,
+              "l0b@r0:s0:unit18": 65536.0,
+              "l1@r0:s0:unit19": 67584.0,
+              "l0c@r0:s0:unit19": 8192,
+              "l0a@r0:s0:unit19": 2048.0,
+              "l0b@r0:s0:unit19": 65536.0
+            },
+            "completed_tasks": 2525,
+            "live_tasks": 0,
+            "live_programs": 0,
+            "peak_live_tasks": 790,
+            "retained_trace_events": 0,
+            "trace_dropped": 0,
+            "work": {
+              "flops": 1678356480.0,
+              "vector_ops": 5766766.0,
+              "hbm_bytes": 175854432.0,
+              "link_bytes": 401408.0
+            },
+            "recipes": {
+              "sequence_parallel_right_pad": 1,
+              "residual_values_fp32": 2,
+              "rmsnorm": 4,
+              "attention_residual_scores": 2,
+              "attention_residual_softmax": 2,
+              "attention_residual_mix": 2,
+              "attention_residual_output_cast": 2,
+              "ring_allgather": 2,
+              "sequence_parallel_attention_view": 1,
+              "dynamic_quantize": 3,
+              "linear_q": 1,
+              "linear_k": 1,
+              "linear_v": 1,
+              "linear_beta": 1,
+              "linear_decay_a": 1,
+              "linear_gate": 1,
+              "linear_decay_b": 1,
+              "linear_beta_sigmoid": 1,
+              "short_convolution": 1,
+              "vllm_ascend_recurrent_kda_arch22": 1,
+              "linear_output_norm_gate": 1,
+              "linear_output": 1,
+              "sequence_parallel_reduce_scatter_pad": 1,
+              "ring_reduce_scatter": 2,
+              "residual_add": 2,
+              "dense_gate_up": 1,
+              "situ": 1,
+              "dense_down": 1
+            },
+            "submission": {
+              "included": false,
+              "eager_invocations": 0,
+              "graph_replays": 0,
+              "host_service_ms": 0.0,
+              "stages": [
+                {
+                  "replica": 0,
+                  "stage": 0,
+                  "kernel_launch_ms": 0.0,
+                  "graph_replay_ms": 0.0,
+                  "kernel_parameter": "machine.device.launch_us",
+                  "replay_parameter": "kernel_launch_parameter"
+                }
+              ],
+              "boundary": "host enqueue service; may overlap ready device work",
+              "zero_parameter": "excludes undeclared host cost; not measured zero overhead"
+            },
+            "rank_model": "representative_local_shard_per_stage"
+          },
+          "resident_layer_weights_bytes": 170631728.0,
+          "derived_composed_F_bytes": 0,
+          "projection_ops": [
+            {
+              "recipe": "linear_q",
+              "shape": [
+                2,
+                1536,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 44040192.0,
+              "mte2_bytes": 11036680.0,
+              "mte3_bytes": 6144.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.043012,
+              "complete_ms": 0.0607667606060606
+            },
+            {
+              "recipe": "linear_k",
+              "shape": [
+                2,
+                1536,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 44040192.0,
+              "mte2_bytes": 11036680.0,
+              "mte3_bytes": 6144.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.0607667606060606,
+              "complete_ms": 0.07852152121212122
+            },
+            {
+              "recipe": "linear_v",
+              "shape": [
+                2,
+                1536,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 44040192.0,
+              "mte2_bytes": 11036680.0,
+              "mte3_bytes": 6144.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.07852152121212122,
+              "complete_ms": 0.09627628181818185
+            },
+            {
+              "recipe": "linear_beta",
+              "shape": [
+                2,
+                12,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 344064.0,
+              "mte2_bytes": 200704.0,
+              "mte3_bytes": 48.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.09627628181818185,
+              "complete_ms": 0.10127628181818185
+            },
+            {
+              "recipe": "linear_decay_a",
+              "shape": [
+                2,
+                128,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 3670016.0,
+              "mte2_bytes": 1863680.0,
+              "mte3_bytes": 512.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.10127628181818185,
+              "complete_ms": 0.13673810000000006
+            },
+            {
+              "recipe": "linear_gate",
+              "shape": [
+                2,
+                1536,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 44040192.0,
+              "mte2_bytes": 22048768.0,
+              "mte3_bytes": 6144.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.13673810000000006,
+              "complete_ms": 0.172202613939394
+            },
+            {
+              "recipe": "linear_decay_b",
+              "shape": [
+                2,
+                1536,
+                128
+              ],
+              "dtype": "bf16",
+              "flops": 786432.0,
+              "mte2_bytes": 393728.0,
+              "mte3_bytes": 6144.0,
+              "deps": [
+                "s0.l0.linear_decay_a"
+              ],
+              "stream": "",
+              "ready_ms": 0.172202613939394,
+              "complete_ms": 0.17720261393939402
+            },
+            {
+              "recipe": "linear_beta_sigmoid",
+              "shape": [
+                2,
+                12
+              ],
+              "dtype": "fp32",
+              "flops": 0.0,
+              "mte2_bytes": 48.0,
+              "mte3_bytes": 96.0,
+              "deps": [
+                "s0.l0.linear_beta"
+              ],
+              "stream": "",
+              "ready_ms": 0.17720261393939402,
+              "complete_ms": 0.17970261393939402
+            }
+          ]
+        },
+        "source_mixed_projection": {
+          "first_layer_span_ms": 0.3732661119696976,
+          "operator_count": 38,
+          "execution": {
+            "time_ms": 0.3732661119696976,
+            "serviced": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 195559536.00000116,
+              "mte1@r0:s0": 197464064.0,
+              "mte2_aic@r0:s0": 194969600.00000077,
+              "mte2_aiv@r0:s0": 1775759.999999997,
+              "mte3@r0:s0": 2573687.999999994,
+              "vector@r0:s0": 5766766.000000013,
+              "matrix@r0:s0": 0.0034227878787878746,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 401408.0,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 401408.0,
+              "link:d2d_intra_package:2:tx:port2": 401408.0,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 401408.0,
+              "link:d2d_intra_package:4:tx:port4": 401408.0,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 401408.0,
+              "link:d2d_intra_package:6:tx:port6": 401408.0,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 401408.0,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 401408.0,
+              "link:d2d_intra_node:0:tx:port1": 401408.0,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 401408.0,
+              "link:d2d_intra_node:0:tx:port3": 401408.0,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 401408.0,
+              "link:d2d_intra_node:0:tx:port5": 401408.0,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 401408.0,
+              "link:d2d_intra_node:0:tx:port7": 401408.0,
+              "link:d2d_intra_node:0:rx:port7": 0.0
+            },
+            "resource_busy_ms": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 0.23988178946608946,
+              "mte1@r0:s0": 0.23390696969696967,
+              "mte2_aic@r0:s0": 0.23623909090909087,
+              "mte2_aiv@r0:s0": 0.1056462121212121,
+              "mte3@r0:s0": 0.12773494696969695,
+              "vector@r0:s0": 0.10811395359848484,
+              "matrix@r0:s0": 0.23391439393939395,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 0.000896,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 0.000896,
+              "link:d2d_intra_package:2:tx:port2": 0.000896,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 0.000896,
+              "link:d2d_intra_package:4:tx:port4": 0.000896,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 0.000896,
+              "link:d2d_intra_package:6:tx:port6": 0.000896,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 0.000896,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 0.002048,
+              "link:d2d_intra_node:0:tx:port1": 0.002048,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 0.002048,
+              "link:d2d_intra_node:0:tx:port3": 0.002048,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 0.002048,
+              "link:d2d_intra_node:0:tx:port5": 0.002048,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 0.002048,
+              "link:d2d_intra_node:0:tx:port7": 0.002048,
+              "link:d2d_intra_node:0:rx:port7": 0.0
+            },
+            "peak_allocated": {
+              "l0a@r0:s0": 2048.0,
+              "l0b@r0:s0": 65536.0,
+              "l0c@r0:s0": 8192,
+              "l1@r0:s0": 132096.0,
+              "ub@r0:s0": 194432
+            },
+            "live_allocated": {
+              "l0a@r0:s0": 0.0,
+              "l0b@r0:s0": 0.0,
+              "l0c@r0:s0": 0.0,
+              "l1@r0:s0": 0.0,
+              "ub@r0:s0": 0.0
+            },
+            "peak_allocated_per_unit": {
+              "l1@r0:s0:unit0": 132096.0,
+              "l0c@r0:s0:unit0": 8192,
+              "l0a@r0:s0:unit0": 2048.0,
+              "l0b@r0:s0:unit0": 65536.0,
+              "l1@r0:s0:unit1": 132096.0,
+              "l0c@r0:s0:unit1": 8192,
+              "l0a@r0:s0:unit1": 2048.0,
+              "l0b@r0:s0:unit1": 65536.0,
+              "l1@r0:s0:unit2": 132096.0,
+              "l0c@r0:s0:unit2": 8192,
+              "l0a@r0:s0:unit2": 2048.0,
+              "l0b@r0:s0:unit2": 65536.0,
+              "l1@r0:s0:unit3": 132096.0,
+              "l0c@r0:s0:unit3": 8192,
+              "l0a@r0:s0:unit3": 2048.0,
+              "l0b@r0:s0:unit3": 65536.0,
+              "l1@r0:s0:unit4": 132096.0,
+              "l0c@r0:s0:unit4": 8192,
+              "l0a@r0:s0:unit4": 2048.0,
+              "l0b@r0:s0:unit4": 65536.0,
+              "l1@r0:s0:unit5": 132096.0,
+              "l0c@r0:s0:unit5": 8192,
+              "l0a@r0:s0:unit5": 2048.0,
+              "l0b@r0:s0:unit5": 65536.0,
+              "l1@r0:s0:unit6": 132096.0,
+              "l0c@r0:s0:unit6": 8192,
+              "l0a@r0:s0:unit6": 2048.0,
+              "l0b@r0:s0:unit6": 65536.0,
+              "l1@r0:s0:unit7": 132096.0,
+              "l0c@r0:s0:unit7": 8192,
+              "l0a@r0:s0:unit7": 2048.0,
+              "l0b@r0:s0:unit7": 65536.0,
+              "l1@r0:s0:unit8": 132096.0,
+              "l0c@r0:s0:unit8": 8192,
+              "l0a@r0:s0:unit8": 2048.0,
+              "l0b@r0:s0:unit8": 65536.0,
+              "l1@r0:s0:unit9": 132096.0,
+              "l0c@r0:s0:unit9": 8192,
+              "l0a@r0:s0:unit9": 2048.0,
+              "l0b@r0:s0:unit9": 65536.0,
+              "l1@r0:s0:unit10": 132096.0,
+              "l0c@r0:s0:unit10": 8192,
+              "l0a@r0:s0:unit10": 2048.0,
+              "l0b@r0:s0:unit10": 65536.0,
+              "l1@r0:s0:unit11": 132096.0,
+              "l0c@r0:s0:unit11": 8192,
+              "l0a@r0:s0:unit11": 2048.0,
+              "l0b@r0:s0:unit11": 65536.0,
+              "l1@r0:s0:unit12": 132096.0,
+              "l0c@r0:s0:unit12": 8192,
+              "l0a@r0:s0:unit12": 2048.0,
+              "l0b@r0:s0:unit12": 65536.0,
+              "l1@r0:s0:unit13": 67584.0,
+              "l0c@r0:s0:unit13": 8192,
+              "l0a@r0:s0:unit13": 2048.0,
+              "l0b@r0:s0:unit13": 65536.0,
+              "l1@r0:s0:unit14": 67584.0,
+              "l0c@r0:s0:unit14": 8192,
+              "l0a@r0:s0:unit14": 2048.0,
+              "l0b@r0:s0:unit14": 65536.0,
+              "l1@r0:s0:unit15": 67584.0,
+              "l0c@r0:s0:unit15": 8192,
+              "l0a@r0:s0:unit15": 2048.0,
+              "l0b@r0:s0:unit15": 65536.0,
+              "l1@r0:s0:unit16": 67584.0,
+              "l0c@r0:s0:unit16": 8192,
+              "l0a@r0:s0:unit16": 2048.0,
+              "l0b@r0:s0:unit16": 65536.0,
+              "l1@r0:s0:unit17": 67584.0,
+              "l0c@r0:s0:unit17": 8192,
+              "l0a@r0:s0:unit17": 2048.0,
+              "l0b@r0:s0:unit17": 65536.0,
+              "ub@r0:s0:unit0": 194432,
+              "ub@r0:s0:unit1": 194432,
+              "ub@r0:s0:unit2": 194432,
+              "ub@r0:s0:unit3": 194432,
+              "ub@r0:s0:unit4": 194432,
+              "ub@r0:s0:unit5": 194432,
+              "ub@r0:s0:unit6": 194432,
+              "ub@r0:s0:unit7": 194432,
+              "ub@r0:s0:unit8": 194432,
+              "ub@r0:s0:unit9": 194432,
+              "ub@r0:s0:unit10": 194432,
+              "ub@r0:s0:unit11": 194432,
+              "ub@r0:s0:unit12": 194432,
+              "ub@r0:s0:unit13": 194432,
+              "ub@r0:s0:unit14": 194432,
+              "ub@r0:s0:unit15": 194432,
+              "ub@r0:s0:unit16": 194432,
+              "ub@r0:s0:unit17": 194432,
+              "ub@r0:s0:unit18": 194432,
+              "ub@r0:s0:unit19": 194432,
+              "ub@r0:s0:unit20": 194432,
+              "ub@r0:s0:unit21": 194432,
+              "ub@r0:s0:unit22": 194432,
+              "ub@r0:s0:unit23": 194432,
+              "l1@r0:s0:unit18": 67584.0,
+              "l0c@r0:s0:unit18": 8192,
+              "l0a@r0:s0:unit18": 2048.0,
+              "l0b@r0:s0:unit18": 65536.0,
+              "l1@r0:s0:unit19": 67584.0,
+              "l0c@r0:s0:unit19": 8192,
+              "l0a@r0:s0:unit19": 2048.0,
+              "l0b@r0:s0:unit19": 65536.0
+            },
+            "completed_tasks": 2055,
+            "live_tasks": 0,
+            "live_programs": 0,
+            "peak_live_tasks": 790,
+            "retained_trace_events": 0,
+            "trace_dropped": 0,
+            "work": {
+              "flops": 1717940224.0,
+              "vector_ops": 5766766.0,
+              "hbm_bytes": 195559536.0,
+              "link_bytes": 401408.0
+            },
+            "recipes": {
+              "sequence_parallel_right_pad": 1,
+              "residual_values_fp32": 2,
+              "rmsnorm": 4,
+              "attention_residual_scores": 2,
+              "attention_residual_softmax": 2,
+              "attention_residual_mix": 2,
+              "attention_residual_output_cast": 2,
+              "ring_allgather": 2,
+              "sequence_parallel_attention_view": 1,
+              "linear_bfg": 1,
+              "dynamic_quantize": 3,
+              "linear_qkv": 1,
+              "kda_beta_contiguous": 1,
+              "linear_beta_cast": 1,
+              "linear_beta_sigmoid": 1,
+              "short_convolution": 1,
+              "vllm_ascend_recurrent_kda_arch22": 1,
+              "linear_output_norm_gate": 1,
+              "linear_output": 1,
+              "sequence_parallel_reduce_scatter_pad": 1,
+              "ring_reduce_scatter": 2,
+              "residual_add": 2,
+              "dense_gate_up": 1,
+              "situ": 1,
+              "dense_down": 1
+            },
+            "submission": {
+              "included": false,
+              "eager_invocations": 0,
+              "graph_replays": 0,
+              "host_service_ms": 0.0,
+              "stages": [
+                {
+                  "replica": 0,
+                  "stage": 0,
+                  "kernel_launch_ms": 0.0,
+                  "graph_replay_ms": 0.0,
+                  "kernel_parameter": "machine.device.launch_us",
+                  "replay_parameter": "kernel_launch_parameter"
+                }
+              ],
+              "boundary": "host enqueue service; may overlap ready device work",
+              "zero_parameter": "excludes undeclared host cost; not measured zero overhead"
+            },
+            "rank_model": "representative_local_shard_per_stage"
+          },
+          "resident_layer_weights_bytes": 192651824.0,
+          "derived_composed_F_bytes": 22020096.0,
+          "projection_ops": [
+            {
+              "recipe": "linear_bfg",
+              "shape": [
+                2,
+                3084,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 88424448.0,
+              "mte2_bytes": 44240896.0,
+              "mte3_bytes": 12336.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.040512,
+              "complete_ms": 0.11089314909090908
+            },
+            {
+              "recipe": "linear_qkv",
+              "shape": [
+                2,
+                4608,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 132120576.0,
+              "mte2_bytes": 33081352.0,
+              "mte3_bytes": 18432.0,
+              "deps": [
+                "s0.l0.linear_qkv.quantize",
+                "s0.l0.linear_bfg"
+              ],
+              "stream": "",
+              "ready_ms": 0.11089314909090908,
+              "complete_ms": 0.14614408424242453
+            },
+            {
+              "recipe": "linear_beta_cast",
+              "shape": [
+                2,
+                12
+              ],
+              "dtype": "fp32",
+              "flops": 0,
+              "mte2_bytes": 48.0,
+              "mte3_bytes": 96.0,
+              "deps": [
+                "s0.l0.kda_beta_contiguous",
+                "s0.l0.linear_qkv.quantize"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.11089466909090909,
+              "complete_ms": 0.11339466909090909
+            },
+            {
+              "recipe": "linear_beta_sigmoid",
+              "shape": [
+                2,
+                12
+              ],
+              "dtype": "fp32",
+              "flops": 0.0,
+              "mte2_bytes": 96.0,
+              "mte3_bytes": 96.0,
+              "deps": [
+                "s0.l0.linear_beta_cast",
+                "s0.l0.linear_qkv.quantize"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.11339466909090909,
+              "complete_ms": 0.11589466909090909
+            }
+          ]
+        }
+      }
+    },
+    {
+      "tp": 16,
+      "batch_slots": 1,
+      "case": {
+        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp16.json",
+        "sha256": "dd080041df77108b993df61b08c4cd3c47e2f93071b2db60ca2be6125c56b3e8",
+        "size_bytes": 11818
+      },
+      "variants": {
+        "separate_semantic_projections": {
+          "first_layer_span_ms": 0.4261485493578645,
+          "operator_count": 41,
+          "execution": {
+            "time_ms": 0.4261485493578645,
+            "serviced": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 89508616.00000024,
+              "mte1@r0:s0": 92192256.00000006,
+              "mte2_aic@r0:s0": 90357247.99999988,
+              "mte2_aiv@r0:s0": 516912.00000000006,
+              "mte3@r0:s0": 1727927.9999999967,
+              "vector@r0:s0": 3221932.0000000075,
+              "matrix@r0:s0": 0.002838803030303034,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 860160.0,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 860160.0,
+              "link:d2d_intra_package:2:tx:port2": 860160.0,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 860160.0,
+              "link:d2d_intra_package:4:tx:port4": 860160.0,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 860160.0,
+              "link:d2d_intra_package:6:tx:port6": 860160.0,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 860160.0,
+              "link:d2d_intra_package:8:tx:port8": 860160.0,
+              "link:d2d_intra_package:8:rx:port8": 0.0,
+              "link:d2d_intra_package:8:tx:port9": 0.0,
+              "link:d2d_intra_package:8:rx:port9": 860160.0,
+              "link:d2d_intra_package:10:tx:port10": 860160.0,
+              "link:d2d_intra_package:10:rx:port10": 0.0,
+              "link:d2d_intra_package:10:tx:port11": 0.0,
+              "link:d2d_intra_package:10:rx:port11": 860160.0,
+              "link:d2d_intra_package:12:tx:port12": 860160.0,
+              "link:d2d_intra_package:12:rx:port12": 0.0,
+              "link:d2d_intra_package:12:tx:port13": 0.0,
+              "link:d2d_intra_package:12:rx:port13": 860160.0,
+              "link:d2d_intra_package:14:tx:port14": 860160.0,
+              "link:d2d_intra_package:14:rx:port14": 0.0,
+              "link:d2d_intra_package:14:tx:port15": 0.0,
+              "link:d2d_intra_package:14:rx:port15": 860160.0,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 860160.0,
+              "link:d2d_intra_node:0:tx:port1": 860160.0,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 860160.0,
+              "link:d2d_intra_node:0:tx:port3": 860160.0,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 860160.0,
+              "link:d2d_intra_node:0:tx:port5": 860160.0,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 860160.0,
+              "link:d2d_intra_node:0:tx:port7": 860160.0,
+              "link:d2d_intra_node:0:rx:port7": 0.0,
+              "link:d2d_intra_node:0:tx:port8": 0.0,
+              "link:d2d_intra_node:0:rx:port8": 860160.0,
+              "link:d2d_intra_node:0:tx:port9": 860160.0,
+              "link:d2d_intra_node:0:rx:port9": 0.0,
+              "link:d2d_intra_node:0:tx:port10": 0.0,
+              "link:d2d_intra_node:0:rx:port10": 860160.0,
+              "link:d2d_intra_node:0:tx:port11": 860160.0,
+              "link:d2d_intra_node:0:rx:port11": 0.0,
+              "link:d2d_intra_node:0:tx:port12": 0.0,
+              "link:d2d_intra_node:0:rx:port12": 860160.0,
+              "link:d2d_intra_node:0:tx:port13": 860160.0,
+              "link:d2d_intra_node:0:rx:port13": 0.0,
+              "link:d2d_intra_node:0:tx:port14": 0.0,
+              "link:d2d_intra_node:0:rx:port14": 860160.0,
+              "link:d2d_intra_node:0:tx:port15": 860160.0,
+              "link:d2d_intra_node:0:rx:port15": 0.0
+            },
+            "resource_busy_ms": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 0.19439010652236655,
+              "mte1@r0:s0": 0.19037818181818178,
+              "mte2_aic@r0:s0": 0.19443272727272723,
+              "mte2_aiv@r0:s0": 0.018723674242424247,
+              "mte3@r0:s0": 0.029438072916666676,
+              "vector@r0:s0": 0.021499652462121214,
+              "matrix@r0:s0": 0.19025238636363637,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 0.00192,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 0.00192,
+              "link:d2d_intra_package:2:tx:port2": 0.00192,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 0.00192,
+              "link:d2d_intra_package:4:tx:port4": 0.00192,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 0.00192,
+              "link:d2d_intra_package:6:tx:port6": 0.00192,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 0.00192,
+              "link:d2d_intra_package:8:tx:port8": 0.00192,
+              "link:d2d_intra_package:8:rx:port8": 0.0,
+              "link:d2d_intra_package:8:tx:port9": 0.0,
+              "link:d2d_intra_package:8:rx:port9": 0.00192,
+              "link:d2d_intra_package:10:tx:port10": 0.00192,
+              "link:d2d_intra_package:10:rx:port10": 0.0,
+              "link:d2d_intra_package:10:tx:port11": 0.0,
+              "link:d2d_intra_package:10:rx:port11": 0.00192,
+              "link:d2d_intra_package:12:tx:port12": 0.00192,
+              "link:d2d_intra_package:12:rx:port12": 0.0,
+              "link:d2d_intra_package:12:tx:port13": 0.0,
+              "link:d2d_intra_package:12:rx:port13": 0.00192,
+              "link:d2d_intra_package:14:tx:port14": 0.00192,
+              "link:d2d_intra_package:14:rx:port14": 0.0,
+              "link:d2d_intra_package:14:tx:port15": 0.0,
+              "link:d2d_intra_package:14:rx:port15": 0.00192,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port1": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port3": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port5": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port7": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port7": 0.0,
+              "link:d2d_intra_node:0:tx:port8": 0.0,
+              "link:d2d_intra_node:0:rx:port8": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port9": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port9": 0.0,
+              "link:d2d_intra_node:0:tx:port10": 0.0,
+              "link:d2d_intra_node:0:rx:port10": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port11": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port11": 0.0,
+              "link:d2d_intra_node:0:tx:port12": 0.0,
+              "link:d2d_intra_node:0:rx:port12": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port13": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port13": 0.0,
+              "link:d2d_intra_node:0:tx:port14": 0.0,
+              "link:d2d_intra_node:0:rx:port14": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port15": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port15": 0.0
+            },
+            "peak_allocated": {
+              "l0a@r0:s0": 4096.0,
+              "l0b@r0:s0": 65536.0,
+              "l0c@r0:s0": 16384,
+              "l1@r0:s0": 69632.0,
+              "ub@r0:s0": 194240
+            },
+            "live_allocated": {
+              "l0a@r0:s0": 0.0,
+              "l0b@r0:s0": 0.0,
+              "l0c@r0:s0": 0.0,
+              "l1@r0:s0": 0.0,
+              "ub@r0:s0": 0.0
+            },
+            "peak_allocated_per_unit": {
+              "l1@r0:s0:unit0": 69632.0,
+              "l0c@r0:s0:unit0": 16384,
+              "l0a@r0:s0:unit0": 4096.0,
+              "l0b@r0:s0:unit0": 65536.0,
+              "l1@r0:s0:unit1": 69632.0,
+              "l0c@r0:s0:unit1": 16384,
+              "l0a@r0:s0:unit1": 4096.0,
+              "l0b@r0:s0:unit1": 65536.0,
+              "l1@r0:s0:unit2": 69632.0,
+              "l0c@r0:s0:unit2": 16384,
+              "l0a@r0:s0:unit2": 4096.0,
+              "l0b@r0:s0:unit2": 65536.0,
+              "l1@r0:s0:unit3": 69632.0,
+              "l0c@r0:s0:unit3": 16384,
+              "l0a@r0:s0:unit3": 4096.0,
+              "l0b@r0:s0:unit3": 65536.0,
+              "l1@r0:s0:unit4": 69632.0,
+              "l0c@r0:s0:unit4": 16384,
+              "l0a@r0:s0:unit4": 4096.0,
+              "l0b@r0:s0:unit4": 65536.0,
+              "l1@r0:s0:unit5": 69632.0,
+              "l0c@r0:s0:unit5": 16384,
+              "l0a@r0:s0:unit5": 4096.0,
+              "l0b@r0:s0:unit5": 65536.0,
+              "ub@r0:s0:unit0": 194240,
+              "ub@r0:s0:unit1": 194240,
+              "ub@r0:s0:unit2": 194240,
+              "ub@r0:s0:unit3": 194240,
+              "ub@r0:s0:unit4": 194240,
+              "ub@r0:s0:unit5": 194240,
+              "l1@r0:s0:unit6": 69632.0,
+              "l0c@r0:s0:unit6": 16384,
+              "l0a@r0:s0:unit6": 4096.0,
+              "l0b@r0:s0:unit6": 65536.0,
+              "l1@r0:s0:unit7": 69632.0,
+              "l0c@r0:s0:unit7": 16384,
+              "l0a@r0:s0:unit7": 4096.0,
+              "l0b@r0:s0:unit7": 65536.0,
+              "l1@r0:s0:unit8": 69632.0,
+              "l0c@r0:s0:unit8": 16384,
+              "l0a@r0:s0:unit8": 4096.0,
+              "l0b@r0:s0:unit8": 65536.0,
+              "l1@r0:s0:unit9": 69632.0,
+              "l0c@r0:s0:unit9": 16384,
+              "l0a@r0:s0:unit9": 4096.0,
+              "l0b@r0:s0:unit9": 65536.0,
+              "l1@r0:s0:unit10": 69632.0,
+              "l0c@r0:s0:unit10": 16384,
+              "l0a@r0:s0:unit10": 4096.0,
+              "l0b@r0:s0:unit10": 65536.0,
+              "l1@r0:s0:unit11": 69632.0,
+              "l0c@r0:s0:unit11": 16384,
+              "l0a@r0:s0:unit11": 4096.0,
+              "l0b@r0:s0:unit11": 65536.0,
+              "l1@r0:s0:unit12": 69632.0,
+              "l0c@r0:s0:unit12": 16384,
+              "l0a@r0:s0:unit12": 4096.0,
+              "l0b@r0:s0:unit12": 65536.0,
+              "l1@r0:s0:unit13": 69632.0,
+              "l0c@r0:s0:unit13": 16384,
+              "l0a@r0:s0:unit13": 4096.0,
+              "l0b@r0:s0:unit13": 65536.0,
+              "l1@r0:s0:unit14": 69632.0,
+              "l0c@r0:s0:unit14": 16384,
+              "l0a@r0:s0:unit14": 4096.0,
+              "l0b@r0:s0:unit14": 65536.0,
+              "l1@r0:s0:unit15": 69632.0,
+              "l0c@r0:s0:unit15": 16384,
+              "l0a@r0:s0:unit15": 4096.0,
+              "l0b@r0:s0:unit15": 65536.0,
+              "l1@r0:s0:unit16": 69632.0,
+              "l0c@r0:s0:unit16": 16384,
+              "l0a@r0:s0:unit16": 4096.0,
+              "l0b@r0:s0:unit16": 65536.0,
+              "l1@r0:s0:unit17": 66048.0,
+              "l0c@r0:s0:unit17": 8192,
+              "l0a@r0:s0:unit17": 4096.0,
+              "l0b@r0:s0:unit17": 65536.0,
+              "l1@r0:s0:unit18": 66048.0,
+              "l0c@r0:s0:unit18": 8192,
+              "l0a@r0:s0:unit18": 4096.0,
+              "l0b@r0:s0:unit18": 65536.0,
+              "l1@r0:s0:unit19": 66048.0,
+              "l0c@r0:s0:unit19": 8192,
+              "l0a@r0:s0:unit19": 4096.0,
+              "l0b@r0:s0:unit19": 65536.0
+            },
+            "completed_tasks": 1523,
+            "live_tasks": 0,
+            "live_programs": 0,
+            "peak_live_tasks": 232,
+            "retained_trace_events": 0,
+            "trace_dropped": 0,
+            "work": {
+              "flops": 1510522880.0,
+              "vector_ops": 3221932.0,
+              "hbm_bytes": 89508616.0,
+              "link_bytes": 860160.0
+            },
+            "recipes": {
+              "sequence_parallel_right_pad": 1,
+              "residual_values_fp32": 2,
+              "rmsnorm": 4,
+              "attention_residual_scores": 2,
+              "attention_residual_softmax": 2,
+              "attention_residual_mix": 2,
+              "attention_residual_output_cast": 2,
+              "ring_allgather": 2,
+              "sequence_parallel_attention_view": 1,
+              "dynamic_quantize": 3,
+              "linear_q": 1,
+              "linear_k": 1,
+              "linear_v": 1,
+              "linear_beta": 1,
+              "linear_decay_a": 1,
+              "linear_gate": 1,
+              "linear_decay_b": 1,
+              "linear_beta_sigmoid": 1,
+              "short_convolution": 1,
+              "vllm_ascend_recurrent_kda_arch22": 1,
+              "linear_output_norm_gate": 1,
+              "linear_output": 1,
+              "sequence_parallel_reduce_scatter_pad": 1,
+              "ring_reduce_scatter": 2,
+              "residual_add": 2,
+              "dense_gate_up": 1,
+              "situ": 1,
+              "dense_down": 1
+            },
+            "submission": {
+              "included": false,
+              "eager_invocations": 0,
+              "graph_replays": 0,
+              "host_service_ms": 0.0,
+              "stages": [
+                {
+                  "replica": 0,
+                  "stage": 0,
+                  "kernel_launch_ms": 0.0,
+                  "graph_replay_ms": 0.0,
+                  "kernel_parameter": "machine.device.launch_us",
+                  "replay_parameter": "kernel_launch_parameter"
+                }
+              ],
+              "boundary": "host enqueue service; may overlap ready device work",
+              "zero_parameter": "excludes undeclared host cost; not measured zero overhead"
+            },
+            "rank_model": "representative_local_shard_per_stage"
+          },
+          "resident_layer_weights_bytes": 86305304.0,
+          "derived_composed_F_bytes": 0,
+          "projection_ops": [
+            {
+              "recipe": "linear_q",
+              "shape": [
+                1,
+                768,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 11010048.0,
+              "mte2_bytes": 5518340.0,
+              "mte3_bytes": 1536.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.06359714285714285,
+              "complete_ms": 0.0812051274025974
+            },
+            {
+              "recipe": "linear_k",
+              "shape": [
+                1,
+                768,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 11010048.0,
+              "mte2_bytes": 5518340.0,
+              "mte3_bytes": 1536.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.0812051274025974,
+              "complete_ms": 0.09881311194805195
+            },
+            {
+              "recipe": "linear_v",
+              "shape": [
+                1,
+                768,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 11010048.0,
+              "mte2_bytes": 5518340.0,
+              "mte3_bytes": 1536.0,
+              "deps": [
+                "s0.l0.linear_q.quantize"
+              ],
+              "stream": "",
+              "ready_ms": 0.09881311194805195,
+              "complete_ms": 0.1164210964935065
+            },
+            {
+              "recipe": "linear_beta",
+              "shape": [
+                1,
+                6,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 86016.0,
+              "mte2_bytes": 100352.0,
+              "mte3_bytes": 12.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.1164210964935065,
+              "complete_ms": 0.1214210964935065
+            },
+            {
+              "recipe": "linear_decay_a",
+              "shape": [
+                1,
+                128,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 1835008.0,
+              "mte2_bytes": 1849344.0,
+              "mte3_bytes": 256.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.1214210964935065,
+              "complete_ms": 0.15660655103896107
+            },
+            {
+              "recipe": "linear_gate",
+              "shape": [
+                1,
+                768,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 11010048.0,
+              "mte2_bytes": 11024384.0,
+              "mte3_bytes": 1536.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "",
+              "ready_ms": 0.15660655103896107,
+              "complete_ms": 0.19179207346320348
+            },
+            {
+              "recipe": "linear_decay_b",
+              "shape": [
+                1,
+                768,
+                128
+              ],
+              "dtype": "bf16",
+              "flops": 196608.0,
+              "mte2_bytes": 196864.0,
+              "mte3_bytes": 1536.0,
+              "deps": [
+                "s0.l0.linear_decay_a"
+              ],
+              "stream": "",
+              "ready_ms": 0.19179207346320348,
+              "complete_ms": 0.1967920734632035
+            },
+            {
+              "recipe": "linear_beta_sigmoid",
+              "shape": [
+                1,
+                6
+              ],
+              "dtype": "fp32",
+              "flops": 0.0,
+              "mte2_bytes": 12.0,
+              "mte3_bytes": 24.0,
+              "deps": [
+                "s0.l0.linear_beta"
+              ],
+              "stream": "",
+              "ready_ms": 0.1967920734632035,
+              "complete_ms": 0.1992920734632035
+            }
+          ]
+        },
+        "source_mixed_projection": {
+          "first_layer_span_ms": 0.34075659420634963,
+          "operator_count": 37,
+          "execution": {
+            "time_ms": 0.34075659420634963,
+            "serviced": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 98443568.00000016,
+              "mte1@r0:s0": 101240832.00000042,
+              "mte2_aic@r0:s0": 99405823.99999994,
+              "mte2_aiv@r0:s0": 516912.0000000001,
+              "mte3@r0:s0": 1727695.9999999963,
+              "vector@r0:s0": 3221932.0000000075,
+              "matrix@r0:s0": 0.002872015151515151,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 860160.0,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 860160.0,
+              "link:d2d_intra_package:2:tx:port2": 860160.0,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 860160.0,
+              "link:d2d_intra_package:4:tx:port4": 860160.0,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 860160.0,
+              "link:d2d_intra_package:6:tx:port6": 860160.0,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 860160.0,
+              "link:d2d_intra_package:8:tx:port8": 860160.0,
+              "link:d2d_intra_package:8:rx:port8": 0.0,
+              "link:d2d_intra_package:8:tx:port9": 0.0,
+              "link:d2d_intra_package:8:rx:port9": 860160.0,
+              "link:d2d_intra_package:10:tx:port10": 860160.0,
+              "link:d2d_intra_package:10:rx:port10": 0.0,
+              "link:d2d_intra_package:10:tx:port11": 0.0,
+              "link:d2d_intra_package:10:rx:port11": 860160.0,
+              "link:d2d_intra_package:12:tx:port12": 860160.0,
+              "link:d2d_intra_package:12:rx:port12": 0.0,
+              "link:d2d_intra_package:12:tx:port13": 0.0,
+              "link:d2d_intra_package:12:rx:port13": 860160.0,
+              "link:d2d_intra_package:14:tx:port14": 860160.0,
+              "link:d2d_intra_package:14:rx:port14": 0.0,
+              "link:d2d_intra_package:14:tx:port15": 0.0,
+              "link:d2d_intra_package:14:rx:port15": 860160.0,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 860160.0,
+              "link:d2d_intra_node:0:tx:port1": 860160.0,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 860160.0,
+              "link:d2d_intra_node:0:tx:port3": 860160.0,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 860160.0,
+              "link:d2d_intra_node:0:tx:port5": 860160.0,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 860160.0,
+              "link:d2d_intra_node:0:tx:port7": 860160.0,
+              "link:d2d_intra_node:0:rx:port7": 0.0,
+              "link:d2d_intra_node:0:tx:port8": 0.0,
+              "link:d2d_intra_node:0:rx:port8": 860160.0,
+              "link:d2d_intra_node:0:tx:port9": 860160.0,
+              "link:d2d_intra_node:0:rx:port9": 0.0,
+              "link:d2d_intra_node:0:tx:port10": 0.0,
+              "link:d2d_intra_node:0:rx:port10": 860160.0,
+              "link:d2d_intra_node:0:tx:port11": 860160.0,
+              "link:d2d_intra_node:0:rx:port11": 0.0,
+              "link:d2d_intra_node:0:tx:port12": 0.0,
+              "link:d2d_intra_node:0:rx:port12": 860160.0,
+              "link:d2d_intra_node:0:tx:port13": 860160.0,
+              "link:d2d_intra_node:0:rx:port13": 0.0,
+              "link:d2d_intra_node:0:tx:port14": 0.0,
+              "link:d2d_intra_node:0:rx:port14": 860160.0,
+              "link:d2d_intra_node:0:tx:port15": 860160.0,
+              "link:d2d_intra_node:0:rx:port15": 0.0
+            },
+            "resource_busy_ms": {
+              "scheduler@r0": 0.0,
+              "fixpipe@r0:s0": 0.0,
+              "memory@r0:s0": 0.12365219561327567,
+              "mte1@r0:s0": 0.11982545454545455,
+              "mte2_aic@r0:s0": 0.12153454545454546,
+              "mte2_aiv@r0:s0": 0.018704204545454548,
+              "mte3@r0:s0": 0.029433230113636372,
+              "vector@r0:s0": 0.021489955492424245,
+              "matrix@r0:s0": 0.11984863636363638,
+              "host@r0:s0": 0.0,
+              "link:d2d_intra_package:0:tx:port0": 0.00192,
+              "link:d2d_intra_package:0:rx:port0": 0.0,
+              "link:d2d_intra_package:0:tx:port1": 0.0,
+              "link:d2d_intra_package:0:rx:port1": 0.00192,
+              "link:d2d_intra_package:2:tx:port2": 0.00192,
+              "link:d2d_intra_package:2:rx:port2": 0.0,
+              "link:d2d_intra_package:2:tx:port3": 0.0,
+              "link:d2d_intra_package:2:rx:port3": 0.00192,
+              "link:d2d_intra_package:4:tx:port4": 0.00192,
+              "link:d2d_intra_package:4:rx:port4": 0.0,
+              "link:d2d_intra_package:4:tx:port5": 0.0,
+              "link:d2d_intra_package:4:rx:port5": 0.00192,
+              "link:d2d_intra_package:6:tx:port6": 0.00192,
+              "link:d2d_intra_package:6:rx:port6": 0.0,
+              "link:d2d_intra_package:6:tx:port7": 0.0,
+              "link:d2d_intra_package:6:rx:port7": 0.00192,
+              "link:d2d_intra_package:8:tx:port8": 0.00192,
+              "link:d2d_intra_package:8:rx:port8": 0.0,
+              "link:d2d_intra_package:8:tx:port9": 0.0,
+              "link:d2d_intra_package:8:rx:port9": 0.00192,
+              "link:d2d_intra_package:10:tx:port10": 0.00192,
+              "link:d2d_intra_package:10:rx:port10": 0.0,
+              "link:d2d_intra_package:10:tx:port11": 0.0,
+              "link:d2d_intra_package:10:rx:port11": 0.00192,
+              "link:d2d_intra_package:12:tx:port12": 0.00192,
+              "link:d2d_intra_package:12:rx:port12": 0.0,
+              "link:d2d_intra_package:12:tx:port13": 0.0,
+              "link:d2d_intra_package:12:rx:port13": 0.00192,
+              "link:d2d_intra_package:14:tx:port14": 0.00192,
+              "link:d2d_intra_package:14:rx:port14": 0.0,
+              "link:d2d_intra_package:14:tx:port15": 0.0,
+              "link:d2d_intra_package:14:rx:port15": 0.00192,
+              "link:d2d_intra_node:0:tx:port0": 0.0,
+              "link:d2d_intra_node:0:rx:port0": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port1": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port1": 0.0,
+              "link:d2d_intra_node:0:tx:port2": 0.0,
+              "link:d2d_intra_node:0:rx:port2": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port3": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port3": 0.0,
+              "link:d2d_intra_node:0:tx:port4": 0.0,
+              "link:d2d_intra_node:0:rx:port4": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port5": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port5": 0.0,
+              "link:d2d_intra_node:0:tx:port6": 0.0,
+              "link:d2d_intra_node:0:rx:port6": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port7": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port7": 0.0,
+              "link:d2d_intra_node:0:tx:port8": 0.0,
+              "link:d2d_intra_node:0:rx:port8": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port9": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port9": 0.0,
+              "link:d2d_intra_node:0:tx:port10": 0.0,
+              "link:d2d_intra_node:0:rx:port10": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port11": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port11": 0.0,
+              "link:d2d_intra_node:0:tx:port12": 0.0,
+              "link:d2d_intra_node:0:rx:port12": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port13": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port13": 0.0,
+              "link:d2d_intra_node:0:tx:port14": 0.0,
+              "link:d2d_intra_node:0:rx:port14": 0.004388571428571428,
+              "link:d2d_intra_node:0:tx:port15": 0.004388571428571428,
+              "link:d2d_intra_node:0:rx:port15": 0.0
+            },
+            "peak_allocated": {
+              "l0a@r0:s0": 4096.0,
+              "l0b@r0:s0": 65536.0,
+              "l0c@r0:s0": 16384,
+              "l1@r0:s0": 69632.0,
+              "ub@r0:s0": 194240
+            },
+            "live_allocated": {
+              "l0a@r0:s0": 0.0,
+              "l0b@r0:s0": 0.0,
+              "l0c@r0:s0": 0.0,
+              "l1@r0:s0": 0.0,
+              "ub@r0:s0": 0.0
+            },
+            "peak_allocated_per_unit": {
+              "l1@r0:s0:unit0": 69632.0,
+              "l0c@r0:s0:unit0": 16384,
+              "l0a@r0:s0:unit0": 4096.0,
+              "l0b@r0:s0:unit0": 65536.0,
+              "l1@r0:s0:unit1": 69632.0,
+              "l0c@r0:s0:unit1": 16384,
+              "l0a@r0:s0:unit1": 4096.0,
+              "l0b@r0:s0:unit1": 65536.0,
+              "l1@r0:s0:unit2": 69632.0,
+              "l0c@r0:s0:unit2": 16384,
+              "l0a@r0:s0:unit2": 4096.0,
+              "l0b@r0:s0:unit2": 65536.0,
+              "l1@r0:s0:unit3": 69632.0,
+              "l0c@r0:s0:unit3": 16384,
+              "l0a@r0:s0:unit3": 4096.0,
+              "l0b@r0:s0:unit3": 65536.0,
+              "l1@r0:s0:unit4": 69632.0,
+              "l0c@r0:s0:unit4": 16384,
+              "l0a@r0:s0:unit4": 4096.0,
+              "l0b@r0:s0:unit4": 65536.0,
+              "l1@r0:s0:unit5": 69632.0,
+              "l0c@r0:s0:unit5": 16384,
+              "l0a@r0:s0:unit5": 4096.0,
+              "l0b@r0:s0:unit5": 65536.0,
+              "l1@r0:s0:unit6": 69632.0,
+              "l0c@r0:s0:unit6": 16384,
+              "l0a@r0:s0:unit6": 4096.0,
+              "l0b@r0:s0:unit6": 65536.0,
+              "l1@r0:s0:unit7": 69632.0,
+              "l0c@r0:s0:unit7": 16384,
+              "l0a@r0:s0:unit7": 4096.0,
+              "l0b@r0:s0:unit7": 65536.0,
+              "l1@r0:s0:unit8": 69632.0,
+              "l0c@r0:s0:unit8": 16384,
+              "l0a@r0:s0:unit8": 4096.0,
+              "l0b@r0:s0:unit8": 65536.0,
+              "l1@r0:s0:unit9": 69632.0,
+              "l0c@r0:s0:unit9": 16384,
+              "l0a@r0:s0:unit9": 4096.0,
+              "l0b@r0:s0:unit9": 65536.0,
+              "l1@r0:s0:unit10": 69632.0,
+              "l0c@r0:s0:unit10": 16384,
+              "l0a@r0:s0:unit10": 4096.0,
+              "l0b@r0:s0:unit10": 65536.0,
+              "l1@r0:s0:unit11": 69632.0,
+              "l0c@r0:s0:unit11": 16384,
+              "l0a@r0:s0:unit11": 4096.0,
+              "l0b@r0:s0:unit11": 65536.0,
+              "l1@r0:s0:unit12": 69632.0,
+              "l0c@r0:s0:unit12": 16384,
+              "l0a@r0:s0:unit12": 4096.0,
+              "l0b@r0:s0:unit12": 65536.0,
+              "l1@r0:s0:unit13": 69632.0,
+              "l0c@r0:s0:unit13": 16384,
+              "l0a@r0:s0:unit13": 4096.0,
+              "l0b@r0:s0:unit13": 65536.0,
+              "l1@r0:s0:unit14": 69632.0,
+              "l0c@r0:s0:unit14": 16384,
+              "l0a@r0:s0:unit14": 4096.0,
+              "l0b@r0:s0:unit14": 65536.0,
+              "l1@r0:s0:unit15": 69632.0,
+              "l0c@r0:s0:unit15": 16384,
+              "l0a@r0:s0:unit15": 4096.0,
+              "l0b@r0:s0:unit15": 65536.0,
+              "l1@r0:s0:unit16": 69632.0,
+              "l0c@r0:s0:unit16": 16384,
+              "l0a@r0:s0:unit16": 4096.0,
+              "l0b@r0:s0:unit16": 65536.0,
+              "l1@r0:s0:unit17": 66048.0,
+              "l0c@r0:s0:unit17": 8192,
+              "l0a@r0:s0:unit17": 4096.0,
+              "l0b@r0:s0:unit17": 65536.0,
+              "ub@r0:s0:unit0": 194240,
+              "ub@r0:s0:unit1": 194240,
+              "ub@r0:s0:unit2": 194240,
+              "ub@r0:s0:unit3": 194240,
+              "ub@r0:s0:unit4": 194240,
+              "ub@r0:s0:unit5": 194240,
+              "l1@r0:s0:unit18": 66048.0,
+              "l0c@r0:s0:unit18": 8192,
+              "l0a@r0:s0:unit18": 4096.0,
+              "l0b@r0:s0:unit18": 65536.0,
+              "l1@r0:s0:unit19": 66048.0,
+              "l0c@r0:s0:unit19": 8192,
+              "l0a@r0:s0:unit19": 4096.0,
+              "l0b@r0:s0:unit19": 65536.0
+            },
+            "completed_tasks": 1473,
+            "live_tasks": 0,
+            "live_programs": 0,
+            "peak_live_tasks": 273,
+            "retained_trace_events": 0,
+            "trace_dropped": 0,
+            "work": {
+              "flops": 1519501312.0,
+              "vector_ops": 3221932.0,
+              "hbm_bytes": 98443568.0,
+              "link_bytes": 860160.0
+            },
+            "recipes": {
+              "sequence_parallel_right_pad": 1,
+              "residual_values_fp32": 2,
+              "rmsnorm": 4,
+              "attention_residual_scores": 2,
+              "attention_residual_softmax": 2,
+              "attention_residual_mix": 2,
+              "attention_residual_output_cast": 2,
+              "ring_allgather": 2,
+              "sequence_parallel_attention_view": 1,
+              "linear_bfg": 1,
+              "dynamic_quantize": 3,
+              "linear_qkv": 1,
+              "linear_beta_cast": 1,
+              "linear_beta_sigmoid": 1,
+              "short_convolution": 1,
+              "vllm_ascend_recurrent_kda_arch22": 1,
+              "linear_output_norm_gate": 1,
+              "linear_output": 1,
+              "sequence_parallel_reduce_scatter_pad": 1,
+              "ring_reduce_scatter": 2,
+              "residual_add": 2,
+              "dense_gate_up": 1,
+              "situ": 1,
+              "dense_down": 1
+            },
+            "submission": {
+              "included": false,
+              "eager_invocations": 0,
+              "graph_replays": 0,
+              "host_service_ms": 0.0,
+              "stages": [
+                {
+                  "replica": 0,
+                  "stage": 0,
+                  "kernel_launch_ms": 0.0,
+                  "graph_replay_ms": 0.0,
+                  "kernel_parameter": "machine.device.launch_us",
+                  "replay_parameter": "kernel_launch_parameter"
+                }
+              ],
+              "boundary": "host enqueue service; may overlap ready device work",
+              "zero_parameter": "excludes undeclared host cost; not measured zero overhead"
+            },
+            "rank_model": "representative_local_shard_per_stage"
+          },
+          "resident_layer_weights_bytes": 97315352.0,
+          "derived_composed_F_bytes": 11010048.0,
+          "projection_ops": [
+            {
+              "recipe": "linear_bfg",
+              "shape": [
+                1,
+                1542,
+                7168
+              ],
+              "dtype": "bf16",
+              "flops": 22106112.0,
+              "mte2_bytes": 22120448.0,
+              "mte3_bytes": 3084.0,
+              "deps": [
+                "s0.l0.attention.sp_input_view"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.06109714285714286,
+              "complete_ms": 0.09628394528138531
+            },
+            {
+              "recipe": "linear_qkv",
+              "shape": [
+                1,
+                2304,
+                7168
+              ],
+              "dtype": "int8",
+              "flops": 33030144.0,
+              "mte2_bytes": 16540676.0,
+              "mte3_bytes": 4608.0,
+              "deps": [
+                "s0.l0.linear_qkv.quantize",
+                "s0.l0.linear_bfg"
+              ],
+              "stream": "",
+              "ready_ms": 0.09628394528138531,
+              "complete_ms": 0.11390011831168864
+            },
+            {
+              "recipe": "linear_beta_cast",
+              "shape": [
+                1,
+                6
+              ],
+              "dtype": "fp32",
+              "flops": 0,
+              "mte2_bytes": 12.0,
+              "mte3_bytes": 24.0,
+              "deps": [
+                "s0.l0.linear_bfg",
+                "s0.l0.linear_qkv.quantize"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.09628394528138531,
+              "complete_ms": 0.09878394528138532
+            },
+            {
+              "recipe": "linear_beta_sigmoid",
+              "shape": [
+                1,
+                6
+              ],
+              "dtype": "fp32",
+              "flops": 0.0,
+              "mte2_bytes": 24.0,
+              "mte3_bytes": 24.0,
+              "deps": [
+                "s0.l0.linear_beta_cast",
+                "s0.l0.linear_qkv.quantize"
+              ],
+              "stream": "kda_bfg",
+              "ready_ms": 0.09878394528138532,
+              "complete_ms": 0.10128394528138532
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "elapsed_seconds": 0.3767027501016855,
+  "peak_rss_bytes": 47054848
+}
