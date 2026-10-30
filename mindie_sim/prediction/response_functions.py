@@ -114,14 +114,20 @@ class ResponseFunction:
         xs = _ordered_knots(pair[0] for pair in knots)
         return cls(kind, coordinate=coordinate, knots=knots, outside=_outside(raw), coordinates=xs)
 
-    def evaluate(self, values, *, rate_for=None):
+    def evaluate(self, values, *, rate_for=None, resource_for=None):
         """Return the numerical response, not an Engine completion prediction."""
         if self.kind == "roofline":
             if rate_for is None:
                 raise ModelingError("service_regime_scaled_response_requires_physical_rates")
-            duration = self.fixed_us + max(
-                nonnegative(values[term["coordinate"]]) * 1e6
-                / (rate_for(term) * term["utilization"]) for term in self.terms)
+            service = {}
+            for term in self.terms:
+                resource = resource_for(term) if resource_for is not None else term["resource"]
+                duration = (nonnegative(values[term["coordinate"]]) * 1e6
+                            / (rate_for(term) * term["utilization"]))
+                service[resource] = service.get(resource, 0) + duration
+            # Distinct instruction modes and compute precisions can consume
+            # the same physical pipe; their service adds before pipe overlap.
+            duration = self.fixed_us + max(service.values())
             return ResponseValue(nonnegative(duration), "physical_supply")
         if self.kind == "affine":
             duration = self.fixed_us

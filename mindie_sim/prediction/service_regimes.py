@@ -160,7 +160,10 @@ class RegimePolicy:
             response = ResponseFunction.from_mapping(raw["response"], raw.get("coordinates", {}))
             if response.kind in {"piecewise_linear", "multilinear", "roofline"}:
                 selectors = raw.get("match", {})
-                if (not {"hardware", "dtype", "layout", "replay_scope", "implementation"} <= selectors.keys()
+                identity = {"hardware", "dtype", "layout", "replay_scope", "implementation"}
+                if response.kind != "roofline":
+                    identity |= {"runtime", "revision", "format"}
+                if (not identity <= selectors.keys()
                         or not selectors.keys() & {"recipe", "kernel"}):
                     raise ModelingError("service_regime_curve_requires_fixed_execution_identity")
             if response.kind in {"piecewise_linear", "multilinear"}:
@@ -205,7 +208,9 @@ class RegimePolicy:
                    for name, bounds in raw.get("domain", {}).items()):
                 record(raw, key, "analytic_outside_domain", coordinate_values=values)
                 continue
-            result = self.responses[key].evaluate(values, rate_for=lambda d: _rate(context, d))
+            result = self.responses[key].evaluate(values, rate_for=lambda d: _rate(context, d),
+                resource_for=lambda d: context.resource_names.get(
+                    context.physical_role(d["resource"]), d["resource"]))
             if result.duration_us is None:
                 record(raw, key, result.basis, coordinate_values=values)
                 continue

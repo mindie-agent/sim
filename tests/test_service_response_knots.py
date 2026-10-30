@@ -16,6 +16,7 @@ def curve_case(*, outside="analytic", joint=True):
     rule = raw["runtime"]["kernels"]["service_regimes"][0]
     rule.update(match={"hardware": "arbitrary", "recipe": "copy", "dtype": "bf16",
         "layout": "contiguous", "replay_scope": "none", "implementation": {},
+        "runtime": "", "revision": "", "format": "",
         "metadata.protocol": "retained"},
         coordinates={"bytes": {"path": "work.hbm"},
                      "context": {"path": "metadata.context_tokens"}},

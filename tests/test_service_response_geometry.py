@@ -38,7 +38,7 @@ def rule_for(raw, operation, response):
     identity = service_identity(parse_case(raw), operation)
     return {"id": "geometry-response", "match": {
         **{key: identity[key] for key in (
-            "runtime", "revision", "dtype", "layout", "implementation", "replay_scope")},
+            "runtime", "revision", "format", "dtype", "layout", "implementation", "replay_scope")},
         "hardware": identity["hardware"]["key"], "recipe": operation.recipe},
         "coordinates": {"m": {"path": "local_shape.0"}, "n": {"path": "local_shape.1"},
             "k": {"path": "local_shape.2"}, "flops": {"path": "work.cube"},
@@ -86,6 +86,7 @@ def test_same_supply_parameters_follow_tp2_to_tp8_and_large_prefill_without_poin
         assert not isolated["service_before_input"]
         record = result["parameters"]["service_regimes"][0]
         assert record["response_relations"] == {"physical_supply": 1}
+        assert result["parameters"]["calibration"] == "none"
         assert record["coordinate_ranges"]["m"] == {"min": rows, "max": rows}
     assert shapes[2, 1][1] * shapes[2, 1][2] == 4 * shapes[8, 1][1] * shapes[8, 1][2]
     assert rule == original
@@ -118,6 +119,27 @@ def test_context_changes_actual_kv_traffic_and_supply_bottleneck_without_refitti
     assert after["execution"]["work"] == before["execution"]["work"]
 
 
+def test_two_instruction_modes_on_one_pipe_add_before_overlapping_other_resources():
+    from test_resource_services import copy_op
+
+    raw = geometry_case(1)
+    raw["machine"]["device"]["service_modes"] = {
+        "mode_a": {"resource": "vector", "rate": 1e6},
+        "mode_b": {"resource": "vector", "rate": 2e6}}
+    op = copy_op(1000, metadata=(("resource_work", {"mode_a": 1000, "mode_b": 2000}),))
+    before = graph_costs(raw, (op,), input_ready_ms=7, isolated=False)
+    rule = rule_for(raw, op, {"kind": "roofline", "services": [
+        {"coordinate": "first", "resource": "mode_a"},
+        {"coordinate": "second", "resource": "mode_b"},
+        {"coordinate": "bytes", "resource": "hbm"}]})
+    rule["coordinates"] = {"first": {"path": "work.mode_a"},
+        "second": {"path": "work.mode_b"}, "bytes": {"path": "work.hbm"}}
+    after = graph_costs(bind(raw, rule), (op,), input_ready_ms=7, isolated=False)
+    assert before["duration_ms"] == after["duration_ms"] == 2
+    assert after["complete_ms"] == 9
+    assert after["execution"]["work"] == before["execution"]["work"]
+
+
 @pytest.mark.parametrize("recipe", ("qkv_projection", "attention_output"))
 def test_complete_multi_axis_training_grid_interpolates_unseen_local_shapes_in_engine(recipe):
     # A synthetic multilinear oracle establishes interpolation mechanics; these
@@ -145,3 +167,21 @@ def test_complete_multi_axis_training_grid_interpolates_unseen_local_shapes_in_e
     answer = extrapolated.evaluate({"m": 16384, "n": 64, "k": 32})
     assert answer.basis == "extrapolated"
     assert answer.duration_us == pytest.approx(oracle(16384, 64, 32))
+
+
+@pytest.mark.parametrize("field", ("vllm_impl", "vllm_version", "kernel_format"))
+def test_empirical_grid_does_not_cross_changed_execution_identity(field):
+    raw = geometry_case(2)
+    op = lowered(raw, "qkv_projection", 1)
+    rule = rule_for(raw, op, {"kind": "multilinear", "grid": [
+        {"coordinate": "m", "knots": [1, 8192]}], "values_us": [10000, 100000]})
+    rule["coordinates"] = {key: rule["coordinates"][key] for key in ("m", "n", "k")}
+    rule["domain"] = {key: {"min": value, "max": value}
+                      for key, value in zip(("n", "k"), op.local_shape[1:])}
+    assert graph_costs(bind(raw, rule), (op,), isolated=False)["duration_ms"] == 10
+    raw["runtime"][field] = "different-implementation"
+    changed = graph_costs(raw, (op,), isolated=False)
+    raw["runtime"]["kernels"] = {}
+    analytical = graph_costs(raw, (op,), isolated=False)
+    assert changed["duration_ms"] == analytical["duration_ms"]
+    assert changed["parameters"]["service_regimes"][0]["queries"] == {"physical_identity_mismatch": 1}

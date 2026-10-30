@@ -189,7 +189,8 @@ class CostModel:
                             if r["queries"].get("observable_response") or r["queries"].get("joint_native_service")}
         queried_regimes = {r["id"] for r in self.regimes.values()
                            if set(r["queries"]) - {"physical_identity_mismatch"}}
-        if selected_regimes:
+        if any(r["id"] in selected_regimes and r["response"].get("kind") != "roofline"
+               for r in self.regimes.values()):
             calibration.append("observable_kernel_regimes")
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
         return {
