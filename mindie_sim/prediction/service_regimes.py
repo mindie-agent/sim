@@ -158,14 +158,15 @@ class RegimePolicy:
                 if high is not None and high < low:
                     raise ModelingError("service_regime_domain_reversed")
             response = ResponseFunction.from_mapping(raw["response"], raw.get("coordinates", {}))
-            if response.kind == "piecewise_linear":
+            if response.kind in {"piecewise_linear", "multilinear", "roofline"}:
                 selectors = raw.get("match", {})
-                if (not {"hardware", "dtype", "layout", "replay_scope"} <= selectors.keys()
+                if (not {"hardware", "dtype", "layout", "replay_scope", "implementation"} <= selectors.keys()
                         or not selectors.keys() & {"recipe", "kernel"}):
                     raise ModelingError("service_regime_curve_requires_fixed_execution_identity")
-                # A one-coordinate table cannot identify a response to changing
-                # context, expert occupancy or other declared numerical axes.
-                for name in raw.get("coordinates", {}).keys() - {response.coordinate}:
+            if response.kind in {"piecewise_linear", "multilinear"}:
+                # An empirical table identifies only its declared axes. Other
+                # numerical inputs remain fixed conditions, not wildcards.
+                for name in raw.get("coordinates", {}).keys() - response.varying_coordinates:
                     bounds = raw.get("domain", {}).get(name, {})
                     if "min" not in bounds or "max" not in bounds or bounds["min"] != bounds["max"]:
                         raise ModelingError("service_regime_curve_requires_fixed_other_coordinates:" + name)
