@@ -120,11 +120,7 @@ def build(op, geometry):
             for size, _ in sizes:
                 prefix.append(prefix[-1] + math.ceil(size / UB_BATCH))
 
-            def tile(index, *, owner=owner, sizes=sizes, prefix=tuple(prefix)):
-                import bisect
-                call = bisect.bisect_right(prefix, index)-1
-                size, atomic = sizes[call]
-                amount = min(UB_BATCH, size-(index-prefix[call])*UB_BATCH)
+            def copy_stages(amount, atomic):
                 read = Work(resources={'hbm': amount,'mte2_aiv': amount})
                 write = Work(resources={'hbm': amount*(2 if atomic else 1),'mte3': amount})
                 return (
@@ -132,6 +128,21 @@ def build(op, geometry):
                     Stage('write',context.bind(write),after=('read',),
                           placement=context.owned(owner,units,write.resources)),
                 )
+
+            # Repeated full UB batches have identical bound work and owner
+            # placement. Reuse those stages and each source call's real tail;
+            # the one-slot pipeline still issues every read before its write.
+            shapes = {(min(size, UB_BATCH), atomic) for size, atomic in sizes}
+            shapes.update((size % UB_BATCH, atomic) for size, atomic in sizes
+                          if size % UB_BATCH)
+            templates = {shape: copy_stages(*shape) for shape in shapes}
+
+            def tile(index, *, sizes=sizes, prefix=tuple(prefix), templates=templates):
+                import bisect
+                call = bisect.bisect_right(prefix, index)-1
+                size, atomic = sizes[call]
+                amount = min(UB_BATCH, size-(index-prefix[call])*UB_BATCH)
+                return templates[amount, atomic]
             if prefix[-1]:
                 allocations = (() if GROUP_BUFFER in context.group_buffers else (
                     context.allocate(f'owner{owner}:copy', 'ub', UB_RESIDENCY, (owner,)),))
