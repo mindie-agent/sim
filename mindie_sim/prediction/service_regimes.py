@@ -23,7 +23,7 @@ from .response_functions import ResponseFunction, nonnegative as _nonnegative
 ROOTS = {"hardware", "runtime", "revision", "format", "kernel", "implementation",
          "dtype", "layout", "replay_scope", "recipe", "family", "phase",
          "local_shape", "semantic_shape", "padded_shape", "launch_shape",
-         "metadata", "work", "resource_units", "core_count", "physical_rates"}
+         "metadata", "work", "resource_units", "core_count", "physical_rates", "transport"}
 REDUCERS = {"sum": sum, "max": max, "min": min, "len": len,
             "product": math.prod, "positive_count": lambda x: sum(v > 0 for v in x)}
 MISSING = object()

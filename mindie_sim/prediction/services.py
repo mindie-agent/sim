@@ -40,6 +40,19 @@ def service_identity(case, op, scope="none", *, device=None):
         "layout": op.layout, "replay_scope": scope or "none",
         "axes": metadata.get("service_axes", {}),
     }
+    if (op.family in {"collective", "alltoall", "alltoallv", "allreduce", "allgather",
+                      "reduce_scatter", "broadcast", "send", "recv"}
+            or metadata.get("hccl_selection")):
+        # A native communication envelope includes the declared physical
+        # transport domain. Equal SKU/local pipes do not identify changed
+        # link bandwidth, latency, framing, hops or rank placement.
+        identity["transport"] = {
+            "links": [link.to_dict() for link in case.machine.links],
+            "placements": [{"rank": die.rank, "node": die.node, "package": die.package}
+                           for die in case.machine.dies],
+            "ranks_per_node": case.machine.ranks_per_node,
+            "dies_per_package": case.machine.dies_per_package,
+        }
     return json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
 
 
