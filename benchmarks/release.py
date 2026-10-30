@@ -70,8 +70,7 @@ def main():
             run()
         metrics.append({"name": name, "unit": "us/op", "iterations": count,
                         "value": (time.perf_counter_ns() - start) / count / 1000})
-    Path(output).write_text(json.dumps({"status": "pass", "scope": "local_cpu_microbenchmark",
-                                      "metrics": metrics}, indent=2) + "\n")
+    Path(output).write_text(json.dumps({"status": "pass", "metrics": metrics}, indent=2) + "\n")
 
 
 if __name__ == "__main__":
