@@ -45,7 +45,7 @@ def test_explicit_program_and_unsupported_precision_keep_their_existing_executio
     assert other["default_mechanisms"]["selections"][0]["reason"] == "gdn_requires_bf16_inputs_fp32_state"
 
 
-def test_prefill_does_not_install_a_decode_caller_and_explicit_options_are_unchanged():
+def test_prefill_does_not_install_a_decode_caller_and_explicit_options_retain_priority():
     raw = case("Ascend950DT_9582")
     parsed, report = attention_defaults(parse_case(raw), "prefill", tokens=4)
     assert "gdn_decode" not in parsed.runtime.kernels.get("lowerings", {})
@@ -53,7 +53,11 @@ def test_prefill_does_not_install_a_decode_caller_and_explicit_options_are_uncha
     binding = {"implementation": "vllm_ascend_gdn_decode", "options": {"gating_programs": 8}}
     raw["runtime"]["kernels"] = {"lowerings": {"gdn_decode": binding}}
     selected, report = attention_defaults(parse_case(raw), "decode", tokens=4)
-    assert selected.runtime.kernels["lowerings"]["gdn_decode"] == binding
+    options = selected.runtime.kernels["lowerings"]["gdn_decode"]["options"]
+    assert options["gating_programs"] == 8
+    assert "recurrent_implementation" not in options
+    assert options["gating_beta_store"]["from_hardware"] is True
+    assert binding == {"implementation": "vllm_ascend_gdn_decode", "options": {"gating_programs": 8}}
     assert report["selections"][0]["reason"] == "explicit_implementation_preserved"
 
 

@@ -1,6 +1,6 @@
 """Structural resource-program defaults for device-body probes.
 
-[Role] Select supported resource pipelines when no implementation is declared.
+[Role] Select resource pipelines and complete omitted helpers of the same caller.
 [Invariants] Explicit software choices win. Selection uses tensor and resource
   geometry, never model labels or measured latency. Unsupported domains retain
   their existing analytic program and a visible selection reason.
@@ -13,6 +13,68 @@ from dataclasses import replace
 from math import ceil
 
 from mindie_sim.schema.common import dtype_bytes
+
+
+_GDN_CALLER = "vllm_ascend_gdn_decode"
+
+
+def _gdn_source_options(binding):
+    if binding == _GDN_CALLER:
+        return {}
+    if isinstance(binding, dict) and binding.get("implementation") == _GDN_CALLER:
+        return binding.get("options", {})
+    return None
+
+
+def _inherit_gdn_store(binding, default=None, carried=None):
+    """Inherit one helper of the same caller; explicit empty means DMA.
+
+    Policy leaves inherit independently. Recurrence and other implementation
+    options remain whole-entry choices, not recursively merged defaults.
+    """
+    from .implementation_selection import is_policy
+
+    if is_policy(binding):
+        prior = carried if is_policy(carried) else {}
+        cases = []
+        for case in binding["cases"]:
+            previous = next((item["binding"] for item in prior.get("cases", ())
+                             if item["domain"] == case["domain"]), None)
+            cases.append({**case, "binding": _inherit_gdn_store(
+                case["binding"], default, previous)})
+        result = {**binding, "cases": cases}
+        if "otherwise" in binding:
+            result["otherwise"] = _inherit_gdn_store(
+                binding["otherwise"], default, prior.get("otherwise"))
+        return result
+    options = _gdn_source_options(binding)
+    if options is None or "gating_beta_store" in options:
+        return binding
+    prior = _gdn_source_options(carried)
+    store = prior.get("gating_beta_store", default) if prior is not None else default
+    if store is None:
+        return binding
+    declaration = {"implementation": binding} if isinstance(binding, str) else binding
+    return {**declaration, "options": {**options, "gating_beta_store": deepcopy(store)}}
+
+
+def _gdn_store_default(case, kernels):
+    """Select only the declared BF16 store helper, independently of recurrence."""
+    layers = [p for p in case.model.layer_plans if p.attention == "gdn"]
+    if (not layers or case.model.activation_dtype != "bf16" or case.runtime.parallel.pcp != 1
+            or any(p.recurrent_state_dtype != "fp32" for p in layers)):
+        return None
+    declared = kernels.get("families", {}).get("gdn_gating", {})
+    outputs = declared.get("outputs", ()) if declared.get("kind") == "tiled_pointwise" else ()
+    if len(outputs) == 2 and "queue" in outputs[1]:
+        return dict(outputs[1])
+    queues = [dict(dict(d.store_queues).get("scalar_store_issue", ()))
+              for d in case.machine.dies]
+    if (queues and queues[0].get("element_bytes") == 2
+            and all(q == queues[0] for q in queues)
+            and all("scalar_store_issue" in dict(d.rates) for d in case.machine.dies)):
+        return {"bytes_per_element": 2, "resource": "scalar_store_issue", "from_hardware": True}
+    return None
 
 
 class TargetGraphSet(dict):
@@ -95,8 +157,9 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
 def consume_target_declaration(case, target):
     """Keep caller hardware/timing; caller kernel entries override carried defaults.
 
-    A complete recipe entry replaces the corresponding entry. Recursively
-    merging, for example, an envelope override into a tiled recipe would leave
+    A complete recipe entry replaces the corresponding entry. The same GDN
+    caller retains its carried store helper when that field was omitted.
+    Recursively merging an envelope override into a tiled recipe would leave
     obsolete tile fields and change the intended implementation.
     """
     carried = getattr(target, "effective_kernels", None)
@@ -113,7 +176,11 @@ def consume_target_declaration(case, target):
     kernels = deepcopy(carried)
     for key, value in case.runtime.kernels.items():
         if key in {"recipes", "programs", "families", "lowerings"}:
-            kernels[key] = {**kernels.get(key, {}), **deepcopy(value)}
+            entries = deepcopy(value)
+            if key == "lowerings" and "gdn_decode" in entries:
+                entries["gdn_decode"] = _inherit_gdn_store(
+                    entries["gdn_decode"], carried=kernels.get(key, {}).get("gdn_decode"))
+            kernels[key] = {**kernels.get(key, {}), **entries}
         else:
             kernels[key] = deepcopy(value)
     return replace(case, runtime=replace(case.runtime, kernels=kernels))
@@ -206,21 +273,23 @@ def _gdn_default(case, phase, tokens, kernels):
         if native:
             options["recurrent_implementation"] = "arch35_fp32"
             recurrence = "arch35_fp32; source-compatible resource program, not captured dispatch"
-        queues = [dict(dict(d.store_queues).get("scalar_store_issue", ()))
-                  for d in case.machine.dies]
-        if (queues and queues[0].get("element_bytes") == 2
-                and all(q == queues[0] for q in queues)
-                and all("scalar_store_issue" in dict(d.rates) for d in case.machine.dies)):
-            options["gating_beta_store"] = {"bytes_per_element": 2,
-                                            "resource": "scalar_store_issue", "from_hardware": True}
-            store = "declared BF16 scalar store service and finite queue"
         kernels.setdefault("lowerings", {})["gdn_decode"] = {
             "implementation": "vllm_ascend_gdn_decode", "options": options}
+    lowerings = kernels.get("lowerings", {})
+    binding = lowerings.get("gdn_decode")
+    resolved = _inherit_gdn_store(
+        binding, _gdn_store_default(case, kernels) if phase == "decode" else None)
+    helper_default = resolved != binding
+    if helper_default:
+        lowerings["gdn_decode"] = resolved
+        store = "declared BF16 scalar store service and finite queue"
     return {"family": "gdn_decode", "selection": "preserved" if reason else "default_installed",
             "reason": reason or "supported_tensor_and_resource_geometry",
             "caller": "non_interleaved_qkvz_ba",
             "recurrence": "explicit_implementation_preserved" if explicit else recurrence,
-            "gating_store": "explicit_implementation_preserved" if explicit else store}
+            "gating_store": ("explicit_implementation_preserved" if explicit and not helper_default
+                             else store),
+            **({"helper_defaults": ["gating_beta_store"]} if explicit and helper_default else {})}
 
 
 def attention_defaults(case, phase, *, tokens=1):
