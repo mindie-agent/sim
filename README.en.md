@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+  <img src="assets/brand/sim-logo.png" alt="mindie-sim logo" width="128" height="128">
 </p>
 
 <h1 align="center">MindIE Agent Simulator (<code>mindie-sim</code>)</h1>
@@ -46,7 +46,7 @@ flowchart TB
 
 ## Quick Start
 
-Copy and paste the line below to Codex, Claude Code, Kimi Code, or DeepSeek Harness (DSH) so your AI Agent installs and verifies `mindie-sim` automatically:
+Copy and paste the line below to Codex, Claude Code, Kimi Code, DeepSeek Harness (DSH), or Google Antigravity (AGY) so your AI Agent installs and verifies `mindie-sim` automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/sim for me

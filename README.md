@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/mindie-agent/mindie-agent/main/assets/brand/mindie-agent-logo.png" alt="MindIE Agent logo" width="128" height="128">
+  <img src="assets/brand/sim-logo.png" alt="mindie-sim logo" width="128" height="128">
 </p>
 
 <h1 align="center">MindIE Agent Simulator (<code>mindie-sim</code>)</h1>
@@ -46,7 +46,7 @@ flowchart TB
 
 ## 快速开始
 
-直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code 或 DeepSeek Harness（DSH），由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
+直接复制下面这句话发给你的 Codex、Claude Code、Kimi Code、DeepSeek Harness（DSH）或 Google Antigravity（AGY），由 AI Agent 自动完成 `mindie-sim` 的安装与校验：
 
 ```text
 帮我安装并配置 https://github.com/mindie-agent/sim
