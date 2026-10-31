@@ -15,6 +15,7 @@ import math
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from .refill_steady import compact_periodic_pipeline
 from .paged_mla_dispatch import Dispatch
 from . import paged_mla_host_v2
 
@@ -160,10 +161,14 @@ def _plan(spec, cores):
         split_counts[sequence] = splits
         begin, end = _ends(spec, job)
         total += begin + end
-        for tile in range(count):
+        boundary_tiles = (0,) if count == 1 else (0, count - 1) if count > 1 else ()
+        for tile in boundary_tiles:
             keys = min(KEY_TILE, spec.contexts[sequence]+1-(start+tile)*KEY_TILE)
             for _, work in tile_work(keys, spec.heads, first=tile == 0, last=tile+1 == count):
                 total += work
+        if count > 2:
+            for _, work in tile_work(KEY_TILE, spec.heads, first=False, last=False):
+                total += work.scaled(count - 2)
     for count in split_counts.values():
         if count > 1:
             for work in merge_work(spec, count):
@@ -251,7 +256,8 @@ def _plan(spec, cores):
                     return cycle_template(keys, old_keys, index == 0, index == 1,
                                           index == count, index % 2)
                 return KernelProgram((stage('query', begin, owner),
-                    Stage('tiles', after=('query',), program=PipelineProgram(count+1, 3, cycle)),
+                    Stage('tiles', after=('query',), program=compact_periodic_pipeline(
+                        ctx, count + 1, 3, cycle, head=2, tail=2)),
                     stage('output', end, owner, after=('tiles',))))
 
             return PipelineProgram(len(local), 1,

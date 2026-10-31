@@ -98,8 +98,6 @@ def assignments(cfg, owner):
         if cfg.special:
             if group != cursor:
                 continue
-            # Pinned Process() continues before advancing cuGroupIdx on zero.
-            # Reject the resulting source domain hole rather than losing work.
             if not rows:
                 if any(cfg.rows[g] for g in range(group + cfg.blocks, len(cfg.rows), cfg.blocks)):
                     raise ModelingError('arch35_dequant_zero_group_stalls_later_source_owner')

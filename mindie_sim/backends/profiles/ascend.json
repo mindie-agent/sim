@@ -6,11 +6,18 @@
         "int8": 727449600000000.0,
         "bf16": 363724800000000.0,
         "fp16": 363724800000000.0,
-        "fp32": 181862400000000.0
+        "fp32": 90931200000000.0,
+        "hf32": 181862400000000.0,
+        "int4": 1454899200000000.0
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 2841600000000.0
+        "vector": 5683200000000.0,
+        "mte2_aic": 1420800000000.0,
+        "mte2_aiv": 2841600000000.0,
+        "mte3": 5683200000000.0,
+        "fixpipe": 5683200000000.0,
+        "mte1": 5683200000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -22,7 +29,12 @@
       "compute_units": 24,
       "launch_us": 0,
       "resource_units": {
-        "vector": 48
+        "vector": 48,
+        "mte1": 24,
+        "mte2_aic": 24,
+        "mte2_aiv": 48,
+        "mte3": 48,
+        "fixpipe": 24
       },
       "buffer_units": {
         "l1": 24,
@@ -30,6 +42,46 @@
         "l0b": 24,
         "l0c": 24,
         "ub": 48
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 11366400000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 5683200000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -180,7 +232,81 @@
         "configured_clock_mhz": 1850.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
-        "hbm_peak_bw_gbps": 1800.0
+        "hbm_peak_bw_gbps": 1800.0,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1850000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 11366400000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 5683200000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1420800000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2841600000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 5683200000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1800000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },
@@ -191,11 +317,18 @@
         "int8": 707788800000000.0,
         "bf16": 353894400000000.0,
         "fp16": 353894400000000.0,
-        "fp32": 176947200000000.0
+        "fp32": 88473600000000.0,
+        "hf32": 176947200000000.0,
+        "int4": 1415577600000000.0
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 2764800000000.0
+        "vector": 5529600000000.0,
+        "mte2_aic": 1382400000000.0,
+        "mte2_aiv": 2764800000000.0,
+        "mte3": 5529600000000.0,
+        "fixpipe": 5529600000000.0,
+        "mte1": 5529600000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -207,7 +340,12 @@
       "compute_units": 24,
       "launch_us": 0,
       "resource_units": {
-        "vector": 48
+        "vector": 48,
+        "mte1": 24,
+        "mte2_aic": 24,
+        "mte2_aiv": 48,
+        "mte3": 48,
+        "fixpipe": 24
       },
       "buffer_units": {
         "l1": 24,
@@ -215,6 +353,46 @@
         "l0b": 24,
         "l0c": 24,
         "ub": 48
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 11059200000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 5529600000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -365,7 +543,81 @@
         "configured_clock_mhz": 1800.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
-        "hbm_peak_bw_gbps": 1800.0
+        "hbm_peak_bw_gbps": 1800.0,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1800000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 11059200000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 5529600000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1382400000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2764800000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1800000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },
@@ -376,11 +628,18 @@
         "int8": 707788800000000.0,
         "bf16": 353894400000000.0,
         "fp16": 353894400000000.0,
-        "fp32": 176947200000000.0
+        "fp32": 88473600000000.0,
+        "hf32": 176947200000000.0,
+        "int4": 1415577600000000.0
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 2764800000000.0
+        "vector": 5529600000000.0,
+        "mte2_aic": 1382400000000.0,
+        "mte2_aiv": 2764800000000.0,
+        "mte3": 5529600000000.0,
+        "fixpipe": 5529600000000.0,
+        "mte1": 5529600000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -392,7 +651,12 @@
       "compute_units": 24,
       "launch_us": 0,
       "resource_units": {
-        "vector": 48
+        "vector": 48,
+        "mte1": 24,
+        "mte2_aic": 24,
+        "mte2_aiv": 48,
+        "mte3": 48,
+        "fixpipe": 24
       },
       "buffer_units": {
         "l1": 24,
@@ -400,6 +664,46 @@
         "l0b": 24,
         "l0c": 24,
         "ub": 48
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 11059200000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 5529600000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -550,7 +854,81 @@
         "configured_clock_mhz": 1800.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
-        "hbm_peak_bw_gbps": 1800.0
+        "hbm_peak_bw_gbps": 1800.0,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1800000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 11059200000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 5529600000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1382400000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2764800000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 48,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 5529600000000.0,
+            "units": 24,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1800000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },
@@ -561,11 +939,18 @@
         "int8": 589824000000000.0,
         "bf16": 294912000000000.0,
         "fp16": 294912000000000.0,
-        "fp32": 147456000000000.0
+        "fp32": 73728000000000.0,
+        "hf32": 147456000000000.0,
+        "int4": 1179648000000000.0
       },
       "rates": {
         "hbm": 1600000000000.0,
-        "vector": 2304000000000.0
+        "vector": 4608000000000.0,
+        "mte2_aic": 1152000000000.0,
+        "mte2_aiv": 2304000000000.0,
+        "mte3": 4608000000000.0,
+        "fixpipe": 4608000000000.0,
+        "mte1": 4608000000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -577,7 +962,12 @@
       "compute_units": 20,
       "launch_us": 0,
       "resource_units": {
-        "vector": 40
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
       },
       "buffer_units": {
         "l1": 20,
@@ -585,6 +975,46 @@
         "l0b": 20,
         "l0c": 20,
         "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 9216000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4608000000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -735,7 +1165,81 @@
         "configured_clock_mhz": 1800.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
-        "hbm_peak_bw_gbps": 1600.0
+        "hbm_peak_bw_gbps": 1600.0,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1800000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 9216000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4608000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1152000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2304000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4608000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1600000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },
@@ -746,11 +1250,18 @@
         "int8": 491520000000000.0,
         "bf16": 245760000000000.0,
         "fp16": 245760000000000.0,
-        "fp32": 122880000000000.0
+        "fp32": 61440000000000.0,
+        "hf32": 122880000000000.0,
+        "int4": 983040000000000.0
       },
       "rates": {
         "hbm": 800000000000.0,
-        "vector": 1920000000000.0
+        "vector": 3840000000000.0,
+        "mte2_aic": 960000000000.0,
+        "mte2_aiv": 1920000000000.0,
+        "mte3": 3840000000000.0,
+        "fixpipe": 3840000000000.0,
+        "mte1": 3840000000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -762,7 +1273,12 @@
       "compute_units": 20,
       "launch_us": 0,
       "resource_units": {
-        "vector": 40
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
       },
       "buffer_units": {
         "l1": 20,
@@ -770,6 +1286,46 @@
         "l0b": 20,
         "l0c": 20,
         "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 7680000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 3840000000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -921,7 +1477,81 @@
         "platform_config_hbm_mib": 32768.0,
         "l2_capacity_mib": 96.0,
         "hbm_peak_bw_gbps": 800.0,
-        "hbm_peak_bw_verified": false
+        "hbm_peak_bw_verified": false,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1500000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 3840000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 7680000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 3840000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 960000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 1920000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 3840000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 3840000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 800000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },
@@ -932,11 +1562,18 @@
         "int8": 540672000000000.0,
         "bf16": 270336000000000.0,
         "fp16": 270336000000000.0,
-        "fp32": 135168000000000.0
+        "fp32": 67584000000000.0,
+        "hf32": 135168000000000.0,
+        "int4": 1081344000000000.0
       },
       "rates": {
         "hbm": 1200000000000.0,
-        "vector": 2112000000000.0
+        "vector": 4224000000000.0,
+        "mte2_aic": 1056000000000.0,
+        "mte2_aiv": 2112000000000.0,
+        "mte3": 4224000000000.0,
+        "fixpipe": 4224000000000.0,
+        "mte1": 4224000000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -948,7 +1585,12 @@
       "compute_units": 20,
       "launch_us": 0,
       "resource_units": {
-        "vector": 40
+        "vector": 40,
+        "mte1": 20,
+        "mte2_aic": 20,
+        "mte2_aiv": 40,
+        "mte3": 40,
+        "fixpipe": 20
       },
       "buffer_units": {
         "l1": 20,
@@ -956,6 +1598,46 @@
         "l0b": 20,
         "l0c": 20,
         "ub": 40
+      },
+      "kernel_invocations": {
+        "vector": {
+          "minimum_ms": 0.0025,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              2,
+              3
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "midpoint of reported range"
+          }
+        },
+        "cube": {
+          "minimum_ms": 0.005,
+          "provenance": {
+            "basis": "arch2201_baseline_extrapolation",
+            "reported_us": [
+              5,
+              5
+            ],
+            "declared_on": "2026-10-29",
+            "boundary": "device_kernel_completion",
+            "scope": "extrapolated from Ascend910_9362 npu_arch_2201 ordinary_work_kernel_class baseline; not measured on this A2 SKU",
+            "selection": "reported approximate value"
+          }
+        }
+      },
+      "service_modes": {
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 8448000000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 4224000000000.0
+        }
       }
     },
     "architecture": "A2",
@@ -1106,7 +1788,81 @@
         "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 96.0,
-        "hbm_peak_bw_gbps": 1200.0
+        "hbm_peak_bw_gbps": 1200.0,
+        "npu_arch": "2201"
+      },
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "mte1": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "128 B/cycle * AIC * clock; conservative undifferentiated A/B supply"
+          },
+          "mte1_l0a": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 8448000000000.0,
+            "bytes_per_cycle_per_aic": 256,
+            "basis": "L1->L0A PIPE_MTE1 256 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte1_l0b": {
+            "resource": "mte1",
+            "rate_bytes_per_s": 4224000000000.0,
+            "bytes_per_cycle_per_aic": 128,
+            "basis": "L1->L0B PIPE_MTE1 128 B/cycle * AIC * clock; same physical mte1 owners"
+          },
+          "mte2_aic": {
+            "rate_bytes_per_s": 1056000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIC * clock; local AIC read path"
+          },
+          "mte2_aiv": {
+            "rate_bytes_per_s": 2112000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 32,
+            "basis": "32 B/cycle * AIV * clock; analytical per-owner mapping inherited from Ascend910_9362, not a measured physical instruction peak"
+          },
+          "mte3": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 40,
+            "bytes_per_cycle_per_owner": 64,
+            "basis": "AIV-owned UB->GM 64 B/cycle * AIV * clock; no AIC MTE3 pipe"
+          },
+          "fixpipe": {
+            "rate_bytes_per_s": 4224000000000.0,
+            "units": 20,
+            "bytes_per_cycle_per_owner": 128,
+            "basis": "128 B/cycle * AIC * clock; generic GM destination is inherited analytical assumption; direct source establishes L0C->L1 BF16/FP16 128 and INT8 64 B/cycle"
+          },
+          "hbm": {
+            "rate_bytes_per_s": 1200000000000.0,
+            "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          }
+        },
+        "provenance": {
+          "architecture_inference": "A2 npu_arch_2201 instruction-table inference shared with Ascend910_9362; not a measurement of this SKU",
+          "sku_parameters": "clock_hz and AIC/AIV come from this SKU's source.declaration; capacity, HBM, links, buffers and invocation constraints are retained from the existing SKU profile",
+          "rates": "recomputed for this SKU from byte/cycle rates and declared clock/counts; not copied from Ascend910_9362",
+          "sku_measurement": "none; source.declaration is configuration metadata, not a performance measurement",
+          "inherited_field_definitions": "mte1/mte1_l0a/mte1_l0b/mte2_aic/mte2_aiv/mte3/fixpipe semantics, owner sets and Fixpipe destination caveat inherited from Ascend910_9362"
+        },
+        "sources": {
+          "asc_devkit_revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+          "npu_arch_2201": {
+            "path": "docs/zh/guide/programming_guide/advanced_programming/hardware_implementation/architecture_spec/npu_arch_2201.md",
+            "sha256": "d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994",
+            "asserts": "AIC:AIV 1:2; independent cores communicate through GM; L1->L0A/L0B PIPE_MTE1 256/128 B/cycle"
+          },
+          "cube_instruction_summary": {
+            "path": "docs/zh/api/appendix/cube_instruction_theoretical_perf_summary.md",
+            "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
+            "asserts": "table 1 lines 40-52 A3/910b: int4 cubek64, int8 cubek32, half/bf16 cubek16, float cubek4 and HF32 cubek8; table 3 lines 99-109 direction rates; table 7 lines 192-200 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle"
+          }
+        },
+        "fixpipe_scope": "Direct instruction source establishes L0C->L1 BF16/FP16 128 B/cycle and INT8 output 64 B/cycle; generic GM destination at 128 B/cycle is an explicit analytical assumption."
       }
     }
   },

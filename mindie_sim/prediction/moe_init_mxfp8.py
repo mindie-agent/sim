@@ -69,7 +69,7 @@ def build(op, geometry):
     units = geometry.resource_units.get("vector", 0)
     ub = geometry.buffers.get("ub", 0)
     available = ub - 65536  # host reserves SIMT DCache before every tiling
-    if (min(tokens, topk, width, experts, units) < 1 or topk <= 3 or width % 256
+    if (min(tokens, topk, width, experts, units) < 1 or width % 256
             or assignments > min(available // 32 // 32 * 32, 32 * 255)):
         raise ModelingError("moe_init_mxfp8_requires_full_range_K_gt3_onecore_sort_full_256_columns")
     if any(role not in geometry.resource_units for role in ("mte2_aiv", "mte3")):
@@ -129,8 +129,15 @@ def build(op, geometry):
     # Every core reads the total count during RowIdxGather::Init, including
     # idle cores, before the active-owner guard.
     idle_index = memory(direct=4 * (units - active))
-    quantized_rows = sum(sum(1 for _ in row_runs(assignments, topk, units, owner))
-                         for owner in range(active))
+    # Source tiling sets useGatherCopy = ((expertEnd - expertStart) * k > expertNum * 3).
+    # For full expert range (expertEnd - expertStart == expertNum), useGatherCopy is (topk > 3).
+    # When topk <= 3, ScatterCopyExpandedXandMXQuant loads and quantizes each sorted
+    # assignment row individually without cross-topk input row deduplication.
+    use_gather_copy = topk > 3
+    quantized_rows = (
+        sum(sum(1 for _ in row_runs(assignments, topk, units, owner)) for owner in range(active))
+        if use_gather_copy else assignments
+    )
     row_load, row_quant = memory(read=width * 2), Work(resources={"vector": quant_vector(width)})
     row_write = memory(write=width + scales)
     total = init + sort_in + sort_vector + sort_out + idle_index
@@ -212,17 +219,26 @@ def build(op, geometry):
         def gather(owner):
             start = owner * per_owner
             end = min(assignments, start + per_owner)
-            first, last = start // topk, (end - 1) // topk
-            def row(index):
-                token = first + index
-                copies = min(end, (token + 1) * topk) - max(start, token * topk)
-                return (stage("read", row_load, owner, previous=("read",)),
-                        stage("MX_quantize", row_quant, owner, after=("read",), previous=("MX_quantize",)),
-                        stage("publish_data_and_scales", row_write.scaled(copies), owner,
-                              after=("MX_quantize",), previous=("publish_data_and_scales",)))
+            if use_gather_copy:
+                first, last = start // topk, (end - 1) // topk
+                row_count = last - first + 1
+                def row(index):
+                    token = first + index
+                    copies = min(end, (token + 1) * topk) - max(start, token * topk)
+                    return (stage("read", row_load, owner, previous=("read",)),
+                            stage("MX_quantize", row_quant, owner, after=("read",), previous=("MX_quantize",)),
+                            stage("publish_data_and_scales", row_write.scaled(copies), owner,
+                                  after=("MX_quantize",), previous=("publish_data_and_scales",)))
+            else:
+                row_count = end - start
+                def row(index):
+                    return (stage("read", row_load, owner, previous=("read",)),
+                            stage("MX_quantize", row_quant, owner, after=("read",), previous=("MX_quantize",)),
+                            stage("publish_data_and_scales", row_write, owner,
+                                  after=("MX_quantize",), previous=("publish_data_and_scales",)))
             return KernelProgram((
                 stage("read_inverse_ids", memory(read=4 * (end - start)), owner),
-                Stage("rows", after=("read_inverse_ids",), program=PipelineProgram(last - first + 1, 2, row)),
+                Stage("rows", after=("read_inverse_ids",), program=PipelineProgram(row_count, 2, row)),
             ))
         phases = KernelProgram((
             Stage("sort", program=sorting),
@@ -241,11 +257,15 @@ def build(op, geometry):
         return KernelProgram((Stage("reserve", acquire=allocation),
                               Stage("source", after=("reserve",), program=phases),
                               Stage("release", after=("source",), free=allocation)))
+    source_branch = (
+        "onecore_sort_GATHER_count_mode_full_range_useGatherCopy"
+        if use_gather_copy else "onecore_sort_GATHER_count_mode_full_range_scatterCopy"
+    )
     return OperatorPlan(total, program, metadata={
         "execution_class": "vector", "source": SOURCE, "active_aiv": active,
         "assignments": assignments, "quantized_input_rows": quantized_rows,
         "output_data_bytes": assignments * width, "output_scale_bytes": assignments * scales,
-        "source_branch": "onecore_sort_GATHER_count_mode_full_range_useGatherCopy",
+        "source_branch": source_branch,
         "sort_blocks32": sort_rows // 32,
         "primitive_services":primitive_counts.to_dict(geometry.resource_units),
         "source_operation_services": diagnostics(sort_ops,count_ops,inverse_ops,

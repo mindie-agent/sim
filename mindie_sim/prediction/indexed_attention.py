@@ -239,7 +239,7 @@ def build(op, geometry, *, scratch_policy, key_tile=512, slots=3, compact=True,
             or shape.get("sparse_block_size", 1) != 1
             or (shape["latent"], shape["rope"]) not in (
                 {(512, 64), (512, 0)} if rope0_analytic else {(512, 64)})
-            or not 1 <= shape["heads"] <= 16):
+            or not 1 <= shape["heads"] <= 128):
         raise ModelingError("indexed_attention_source_geometry_outside_reviewed_domain")
     extension = shape["rope"] == 0
     source = ({**SOURCE, "scope": "analytic latent512/rope0 geometry extension",
@@ -370,6 +370,19 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
         nominal_cache.move_to_end(signature)
         nominal = nominal_cache[signature]
 
+        hpad = _align(heads, 16)
+        m0 = (((heads + 15) // 16 + 1) // 2) * 16
+        m1 = max(0, heads - m0)
+        aiv_read_role = "mte2_aiv" if scratch_policy == "offchip" else "mte2_aiv_cached"
+
+        def _vector_weights(name, key):
+            base = dict(phase_unit_weights(name, key)) if phase_unit_weights else {}
+            if heads > 16 and name in {"softmax", "probability", "nupdate", "update", "output"}:
+                fracs = (m0 / hpad, _align(m1, 16) / hpad) if name == "nupdate" else (m0 / heads, m1 / heads)
+                for role in ("vector", aiv_read_role, "mte3"):
+                    base.setdefault(role, fracs)
+            return base
+
         def lower_owner(owner):
             def bind(phase, name=None, key=None):
                 work = ctx.bind(phase)
@@ -377,16 +390,17 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 placement = ctx.owned(
                     owner, compute_units, roles - {"hbm", "l2_read", "l2_write"})
                 # Gather splits selected KV rows across both AIVs. For <=16
-                # heads the source gives all softmax/output rows to AIV0.
-                single_roles = (set() if name in paired_vector_stages
+                # heads the source gives all softmax/output rows to AIV0; for
+                # >16 heads vecDealM splits softmax/output rows across AIV0/AIV1.
+                single_roles = (set() if heads > 16 or name in paired_vector_stages
                                 or (name is None and paired_vector_stages) else {"vector"})
-                if name not in {None, "gather", "publish"}:
+                if heads <= 16 and name not in {None, "gather", "publish"}:
                     single_roles |= {"mte2_aiv", "mte2_aiv_cached", "mte3"}
                 for role in single_roles & roles:
                     resource = ctx.resource_names[ctx.physical_role(role)]
                     placement[resource] = placement[resource][:1]
-                if phase_unit_weights and key is not None:
-                    for role, fractions in phase_unit_weights(name, key).items():
+                if (phase_unit_weights or heads > 16) and key is not None:
+                    for role, fractions in _vector_weights(name, key).items():
                         resource = ctx.resource_names[ctx.physical_role(role)]
                         if resource in placement:
                             placement[resource] = tuple(
@@ -398,8 +412,8 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 # An uneven local partition has the supply of its busiest
                 # physical unit; it cannot borrow an inactive sibling's pipe.
                 result = {}
-                if phase_unit_weights:
-                    for role, fractions in phase_unit_weights(name, key).items():
+                if phase_unit_weights or heads > 16:
+                    for role, fractions in _vector_weights(name, key).items():
                         resource = ctx.resource_names[ctx.physical_role(role)]
                         if work.get(resource, 0):
                             result[resource] = ctx.rates[resource] / (
@@ -420,10 +434,29 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 result = []
                 for name, phase in phases(key):
                     work, placement = bind(phase, name, key)
-                    result.append(Stage(
-                        name, work, after=(result[-1].name,) if result else (),
-                        previous=("partial",) if name == "nupdate" and not key[1] else (),
-                        placement=placement, caps=phase_caps(work, name, key), coupled=True))
+                    after = (result[-1].name,) if result else ()
+                    prev = ("partial",) if name == "nupdate" and not key[1] else ()
+                    if heads > 16 and name in {"softmax", "probability", "nupdate", "update", "output"} and work:
+                        first = m0 / hpad if name == "nupdate" else m0 / heads
+                        branches = []
+                        for idx, frac in enumerate((first, 1.0 - first)):
+                            if not frac:
+                                continue
+                            b_place = dict(placement)
+                            for role in ("vector", aiv_read_role, "mte3"):
+                                res = ctx.resource_names.get(ctx.physical_role(role))
+                                if res in b_place and len(b_place[res]) > idx:
+                                    b_place[res] = (b_place[res][idx],)
+                            branches.append(KernelProgram((Stage(
+                                "aiv", {k: v * frac for k, v in work.items()},
+                                placement=b_place, coupled=True),)))
+                        result.append(Stage(
+                            name, after=after, previous=prev,
+                            program=ParallelProgram(tuple(branches))))
+                    else:
+                        result.append(Stage(
+                            name, work, after=after, previous=prev,
+                            placement=placement, caps=phase_caps(work, name, key), coupled=True))
                 return tuple(result)
 
             buffers = ()
@@ -452,7 +485,7 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
             # Compact mode is a fluid approximation; the expanded control
             # retains exact phase arbitration for counterexample testing.
             all_work, all_placement = bind(owner_work[owner])
-            if phase_unit_weights:
+            if phase_unit_weights or heads > 16:
                 # The aggregate may use only units used by its real phases.
                 # A short packed-cache tail can leave the sibling vector
                 # entirely idle even though publish emits metadata on both.
@@ -493,8 +526,7 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                         work, placement = bind(phase, name, key)
                         weights = {ctx.resource_names[ctx.physical_role(role)]: tuple(
                             value for value in fractions if value)
-                            for role, fractions in (phase_unit_weights(name, key).items()
-                                                    if phase_unit_weights else ())}
+                            for role, fractions in _vector_weights(name, key).items()}
                         for resource, units in placement.items():
                             fractions = weights.get(resource, (1 / len(units),) * len(units))
                             for unit, fraction in zip(units, fractions):
@@ -504,13 +536,38 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                                 if name == resource)
                     end = max(end, amount * ctx.resource_units.get(
                         role, compute_units) / ctx.rates[resource])
-                nominal[owner] = max(end, duration(all_work, all_placement))
-            end = nominal[owner]
+                nominal[owner] = (max(end, duration(all_work, all_placement)), dict(unit_demand))
+            end, u_demand = nominal[owner]
             caps = {key: amount / end for key, amount in all_work.items()} if end else {}
+            has_two_vector_aivs = len(all_placement.get(ctx.resource_names.get("vector", "vector"), ())) == 2
+            if has_two_vector_aivs:
+                branches = []
+                for idx in range(2):
+                    b_work = {}
+                    b_place = {}
+                    for res, amt in all_work.items():
+                        units = all_placement.get(res, ())
+                        if len(units) == 2:
+                            share = u_demand.get((res, units[idx]), 0.0)
+                            if share > 0:
+                                b_work[res] = share
+                                b_place[res] = (units[idx],)
+                        else:
+                            share = amt / 2.0
+                            if share > 0:
+                                b_work[res] = share
+                                if units:
+                                    b_place[res] = units
+                    b_caps = {k: v / end for k, v in b_work.items()} if end else {}
+                    branches.append(KernelProgram((Stage(
+                        f"aiv{idx}", b_work, caps=b_caps, placement=b_place, coupled=True),)))
+                pipe_stage = Stage("pipeline", after=("reserve",), program=ParallelProgram(tuple(branches)))
+            else:
+                pipe_stage = Stage("pipeline", all_work, after=("reserve",), caps=caps,
+                                   placement=all_placement, coupled=True)
             return KernelProgram((
                 Stage("reserve", acquire=buffers),
-                Stage("pipeline", all_work, after=("reserve",), caps=caps,
-                      placement=all_placement, coupled=True),
+                pipe_stage,
                 Stage("release", after=("pipeline",), free=buffers)))
 
         if ctx.record_mapping:
@@ -531,7 +588,10 @@ def _plan(sequences, topk, heads, latent, rope, compute_units,
                 "unmodeled": ["scalar_index_response", "cross_core_flag_latency",
                               "external_cache_eviction", "atomic_response_latency"],
                 "output_accumulation": "integer_bias_update_then_atomic_fixpipe; final_vector_read_once",
-                "vector_ownership": "two_gather_AIVs; one_softmax_and_output_AIV",
+                "vector_ownership": (
+                    "two_gather_AIVs; one_softmax_and_output_AIV"
+                    if heads <= 16 else "two_gather_AIVs; two_softmax_and_output_AIVs"
+                ),
                 "paired_vector_stages": paired_vector_stages,
                 "vector_buffer_bytes_per_aiv": vector_buffer_bytes,
             })

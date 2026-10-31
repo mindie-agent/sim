@@ -35,7 +35,7 @@ def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_t
     packs several KV heads in one task and is outside this ordinary branch.
     """
     group = query_heads // kv_heads
-    if (cores is None or not 1 <= cores <= 26 or not requests
+    if (cores is None or not 1 <= cores <= 64 or not requests
             or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile
             or any(not 0 < q <= 16 or q * group > min(128, query_tile)
                    or min(max(1, (128 // q) // 2 * 2), group) != group
@@ -45,7 +45,32 @@ def host_partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_t
         return partitions(requests, query_heads, kv_heads, cores,
                           key_tile=key_tile, query_tile=query_tile)
     if all(q == 1 for q, _ in requests) and len(requests) >= cores:
-        raise ModelingError("fai_host_single_token_specialized_decoder_not_selected")
+        # SplitCoreDecodeBS1GN2 packs up to kv_block_tile KV heads per batch task,
+        # then unpacks tail tasks into single-KV-head tasks when 0 < tail <= cores // 2.
+        kv_block_tile = min(max(1, 128 // group), kv_heads)
+        tasks_per_batch = (kv_heads + kv_block_tile - 1) // kv_block_tile
+        total_tasks = len(requests) * tasks_per_batch
+        tail_tasks = total_tasks % cores
+        rework = 0 < tail_tasks <= cores // 2 and kv_block_tile > 1
+        packed_limit = total_tasks - tail_tasks if rework else total_tasks
+        result = {}
+        task_idx = 0
+        rework_idx = packed_limit
+        for batch, (query, context) in enumerate(requests):
+            tiles = (context + query + key_tile - 1) // key_tile
+            for block_idx in range(tasks_per_batch):
+                h_start = block_idx * kv_block_tile
+                h_end = min(kv_heads, h_start + kv_block_tile)
+                if task_idx < packed_limit:
+                    owner = task_idx % cores
+                    for head in range(h_start, h_end):
+                        result[(batch, head)] = ((owner, 0, tiles),)
+                else:
+                    for head in range(h_start, h_end):
+                        result[(batch, head)] = ((rework_idx % cores, 0, tiles),)
+                        rework_idx += 1
+                task_idx += 1
+        return result
     return {(batch, head): (((batch * kv_heads + head) % cores, 0,
                             (context + query + key_tile - 1) // key_tile),)
             for batch, (query, context) in enumerate(requests)
@@ -62,7 +87,7 @@ def partitions(requests, query_heads, kv_heads, cores, *, key_tile, query_tile):
     """
     group = query_heads // kv_heads
     lengths = tuple((q, context + q) for q, context in requests)
-    if (cores is None or not 1 <= cores <= 26 or not lengths
+    if (cores is None or not 1 <= cores <= 64 or not lengths
             or key_tile > HOST_KV_TILE or HOST_KV_TILE % key_tile):
         raise ModelingError("fai_decode_mapping_requires_1_to_26_cores_and_512_divisor_tile")
     if any(not 0 < q <= 16 or q * group > min(128, query_tile)

@@ -328,10 +328,11 @@ def attention_defaults(case, phase, *, tokens=1):
                 else:
                     recipes["flash_attention_decode"] = tiles
         elif not reason:
+            max_heads = 64 if case.model.quant.kv_dtype == "int8" else 128
             if (case.model.activation_dtype != "bf16" or case.model.quant.kv_dtype not in {"bf16", "int8"}
                     or any(p.cache_kind != "dense" or p.window or p.noncausal_attention
                            or (p.kv_lora_rank, p.qk_rope_head_dim) not in {(512, 64), (512, 0)}
-                           or not 1 <= p.num_heads // parallel.tp <= 16 for p in layers)):
+                           or not 1 <= p.num_heads // parallel.tp <= max_heads for p in layers)):
                 reason = "indexed_source_geometry_outside_reviewed_domain"
             else:
                 packed = case.model.quant.kv_dtype == "int8"
