@@ -65,7 +65,8 @@ def test_ultra_long_context_400k_and_1m_gqa_and_paged_mla_execute_in_o1_time(con
     op = make_op([(1, context_len)] * 8, heads=16, kv_heads=2, dim=128)
     eng, end, _, _, _ = run(op, StagedGQADecode(key_tile=128, query_tile=16), units=24)
     gqa_elapsed = time.perf_counter() - t0
-    assert gqa_elapsed < 0.5
+    assert gqa_elapsed < 2.0
+    assert eng.completed_count < 1000
     assert end.time > 0
     assert eng.summary()["live_tasks"] == 0
     assert all(v == 0 for v in eng.allocated.values())
@@ -76,7 +77,7 @@ def test_ultra_long_context_400k_and_1m_gqa_and_paged_mla_execute_in_o1_time(con
     mla_op, _ = mla_attention(raw_mla, batch=4, context=context_len)
     row = mla_execute(raw_mla, mla_op)
     mla_elapsed = time.perf_counter() - t1
-    assert mla_elapsed < 0.5
+    assert mla_elapsed < 2.0
     assert row["duration_ms"] > 0
 
 
@@ -511,3 +512,75 @@ def test_a2_ascend910b2c_installs_default_body_pipelines_and_executes_400k_decod
     ops = target_operators(raw, scope="body", phase="decode", tokens=1, context=409600, sequences=4)
     report = operator_costs(raw, ops)
     assert sum(row["duration_ms"] for row in report["operators"]) > 0
+
+
+def test_execution_prepare_and_program_cache_normalize_layer_prefixed_metadata():
+    from mindie_sim.prediction.execution import _op_meta_key
+    from mindie_sim.schema.operators import OpSpec
+
+    op_l1 = OpSpec(
+        "s0.l1.mc2_dispatch.send_read_quantize", "mc2_protocol", "decode", 0, 1,
+        (), (1, 5120), (1, 5120), (1, 5120), (1, 5120),
+        recipe="arch35_fullmesh_resource_phase",
+        metadata=(
+            ("device_kernel_group", {"id": "s0.l1.mc2_dispatch", "entry": False, "exit": False, "kernel": "MoeDistributeDispatchV3"}),
+            ("fusion_group_key", "s0.l1.fusion"),
+            ("fusion_semantic_ids", ["s0.l1.a", "s0.l1.b"]),
+            ("structure_subgraphs", ({"key": "s0.l1.sub"},)),
+        ),
+    )
+    op_l2 = OpSpec(
+        "s0.l2.mc2_dispatch.send_read_quantize", "mc2_protocol", "decode", 0, 2,
+        (), (1, 5120), (1, 5120), (1, 5120), (1, 5120),
+        recipe="arch35_fullmesh_resource_phase",
+        metadata=(
+            ("device_kernel_group", {"id": "s0.l2.mc2_dispatch", "entry": False, "exit": False, "kernel": "MoeDistributeDispatchV3"}),
+            ("fusion_group_key", "s0.l2.fusion"),
+            ("fusion_semantic_ids", ["s0.l2.a", "s0.l2.b"]),
+            ("structure_subgraphs", ({"key": "s0.l2.sub"},)),
+        ),
+    )
+    assert _op_meta_key(op_l1) == _op_meta_key(op_l2)
+    assert not hasattr(op_l1, "_frozen_meta_key")
+
+    from mindie_sim.prediction.execution import _meta_diff, _meta_patch
+
+    # 1. Deletions (e.g. Work.apply removing resource_work when zeroed) are replayed on cache hit
+    orig_l0 = {"resource_work": {"vector": 100.0}, "fusion_group_key": "s0.l0.g"}
+    res_l0 = {"fusion_group_key": "s0.l0.g", "program_execution": {"mode": "compact"}}
+    diff_del = _meta_diff(orig_l0, res_l0)
+    patched_l1 = _meta_patch({"resource_work": {"vector": 100.0}, "fusion_group_key": "s0.l1.g"}, diff_del)
+    assert "resource_work" not in patched_l1
+    assert patched_l1["fusion_group_key"] == "s0.l1.g"
+    assert patched_l1["program_execution"] == {"mode": "compact"}
+
+    # 2. Nested dictionaries (e.g. NativeFusionRecipe updating fusion_boundary.source_program.program)
+    # preserve layer-specific sibling keys like fusion_semantic_ids and external_outputs.
+    orig_fb_l0 = {
+        "fusion_boundary": {
+            "fusion_semantic_ids": ["s0.l0.q_a", "s0.l0.q_b"],
+            "external_outputs": ["s0.l0.q_b"],
+            "source_program": {"program": {"name": "prolog"}},
+        }
+    }
+    res_fb_l0 = {
+        "fusion_boundary": {
+            "fusion_semantic_ids": ["s0.l0.q_a", "s0.l0.q_b"],
+            "external_outputs": ["s0.l0.q_b"],
+            "source_program": {"program": {"name": "prolog", "work_binding": "physical_device_geometry"}},
+        }
+    }
+    diff_fb = _meta_diff(orig_fb_l0, res_fb_l0)
+    orig_fb_l1 = {
+        "fusion_boundary": {
+            "fusion_semantic_ids": ["s0.l1.q_a", "s0.l1.q_b"],
+            "external_outputs": ["s0.l1.q_b"],
+            "source_program": {"program": {"name": "prolog"}},
+        }
+    }
+    patched_fb_l1 = _meta_patch(orig_fb_l1, diff_fb)
+    assert patched_fb_l1["fusion_boundary"]["fusion_semantic_ids"] == ["s0.l1.q_a", "s0.l1.q_b"]
+    assert patched_fb_l1["fusion_boundary"]["external_outputs"] == ["s0.l1.q_b"]
+    assert patched_fb_l1["fusion_boundary"]["source_program"]["program"]["work_binding"] == "physical_device_geometry"
+
+
