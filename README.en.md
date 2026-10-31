@@ -24,7 +24,7 @@
 
 ## Why `sim`?
 
-When optimizing custom kernels or distributed LLM inference (`DP × TP × EP × PP × PCP` and disaggregated Prefill-Decode serving for DeepSeek, Qwen, GLM, or Kimi) on Ascend NPUs, the biggest waste of engineering time is **blind trial-and-error without a causal performance baseline**:
+When optimizing custom kernels or distributed LLM inference (`DP × TP × EP × PP × DCP / DSA-CP / PCP` and disaggregated Prefill-Decode serving for DeepSeek, Qwen, GLM, or Kimi) on Ascend NPUs, the biggest waste of engineering time is **blind trial-and-error without a causal performance baseline**:
 
 - **"Which hardware resource actually bottlenecks this operator or model?"** — Back-of-the-envelope `FLOPs / peak_tflops` estimates ignore on-chip `UB`/`L1` alignment, tile tails, multi-stream contention, and kernel invocation overheads (`startup_ms` / `minimum_ms`). `mindie-sim` decomposes every operator, subgraph, and network pass into **`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, and `CV_Overlap`**, pinpointing whether work is `memory_bound`, `cube_bound`, `vector_bound`, `link_bound`, or `launch_bound`.
 - **"If we fuse or tune these memory-bound kernels to reach `0.80x MBU`, how many milliseconds will end-to-end Decode drop?"** — Before writing hundreds of lines of AscendC or Triton code, counterfactual Roofline target fitting (`fit_efficiency_targets`) computes the exact latency reduction while preserving physical work conservation and kernel startup floors.
@@ -46,9 +46,7 @@ flowchart TB
 
 ## Quick Start
 
-### Option 1: Send One Sentence to Your AI Agent (Recommended)
-
-Copy and paste the line below to Codex, Claude Code, Kimi Code, or your internal agent so it installs and verifies `mindie-sim` automatically:
+Copy and paste the line below to Codex, Claude Code, Kimi Code, or DeepSeek Harness (DSH) so your AI Agent installs and verifies `mindie-sim` automatically:
 
 ```text
 Please install and configure https://github.com/mindie-agent/sim for me
@@ -72,38 +70,13 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 3. **Verify CLI & Model Catalog**:
    ```bash
    mindie-sim catalog
+   mindie-sim predict examples/quickstart.json
    ```
 4. **Agent Optimization Workflow**:
-   - Before writing or modifying custom kernels, fusion patterns, or parallel layouts (`TP`/`DP`/`EP`/`PP`/`PCP`), run `mindie-sim operators`, `mindie-sim graph`, `mindie-sim predict`, or `mindie-sim study` to quantify stage latencies and resource bottlenecks.
+   - Before writing or modifying custom kernels, fusion patterns, or parallel layouts (`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`), run `mindie-sim operators`, `mindie-sim graph`, `mindie-sim predict`, or `mindie-sim study` to quantify stage latencies and resource bottlenecks.
    - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), counterfactual `0.80x MBU` optimization headroom, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `fit_efficiency_targets`, and `solve_hardware_sla_throughput` from `mindie_sim.prediction.efficiency`.
 
 </details>
-
-### Option 2: Manual One-Line Install in Terminal (For Developers)
-
-With Python `>= 3.11` and `uv` (or `pip`), install in one command:
-
-```bash
-# Install the v0.8.1 release wheel
-uv pip install https://github.com/mindie-agent/sim/releases/download/v0.8.1/mindie_sim-0.8.1-py3-none-any.whl
-
-# Or install as a global CLI tool from GitHub
-uv tool install git+https://github.com/mindie-agent/sim@main
-```
-
-Clone the repository to run local examples and tests:
-
-```bash
-git clone https://github.com/mindie-agent/sim.git
-cd sim
-uv pip install -e ".[dev]"
-
-# Run the built-in quickstart prediction
-mindie-sim predict examples/quickstart.json
-
-# Run the offline unit test suite
-pytest -q
-```
 
 ---
 
@@ -138,14 +111,27 @@ Supports non-mutating counterfactual hardware scaling (`hbm_bw_scale`, `cube_flo
 - **SLA Latency Ceiling (`B*_SLA`)**: Monotonic binary search over batch sizes to find the largest concurrency meeting `latency_ms <= sla_ms`;
 - **Feasible Optimum (`B* = min(B*_SLA, B*_VRAM)`)**: Evaluates `DEFAULT_SLA_SCENARIOS` (`baseline`, `2x_hbm`, `2x_compute`, `2x_cube_only`, `2x_hbm_2x_compute`, `target_0.8x_mbu`) and reports peak `tokens/s` and the active limiting factor (`sla_latency` / `vram_capacity` / `sla_unachievable_at_b1`).
 
-### 4. Full-Fleet A3 / A5 Convergence Benchmarks
+### 4. Full-Dimensional Parallelism & Three Context-Parallel Strategies (`ParallelSpec`)
+
+`mindie-sim` models `DP × TP × EP × PP` alongside three distinct context-parallel strategies (`mindie_sim/catalog/context_parallel.py`), preserving the exact physical distinction between sharding KV inside the TP group vs. adding an independent query-sharding rank axis:
+
+| Parallel Axis / Plan | `ParallelSpec` Fields | Strategy Identifier | Physical Mechanism & Collective Ledger |
+| --- | --- | --- | --- |
+| **Decode Context Parallel (`DCP`)** | `cp > 1` (or alias `dcp > 1`), `cp_plan="dcp"` (or `"auto"`) | `kv_context_shard_lse_merge` | **Reuses TP ranks** (`tp % cp == 0`, adds no extra `world_size` axis): shards contiguous KV context across `cp` ranks in interleaved blocks (default `interleave=128`), keeps the sparse indexer replicated (`replicated`), and merges partial `(out, LSE)` across the CP subgroup. |
+| **DSA Context Parallel (`DSA-CP`)** | `cp > 1`, `cp_plan="dsa_cp"` | `dsa_cp_sharded_topk_lse_merge` | **Joint sparse indexer & KV sharding for DeepSeek Sparse Attention (`DSA`)** (requires `index_topk` and `tp % cp == 0`): partitions local sparse indexer TopK selection across `cp` ranks (`sharded_local_topk`), exchanges only selected candidates (`FP32 score + int32 row id` = `8 B` per candidate rather than the full `index-K` plane) for exact global TopK merge, and merges attention `(out, LSE)`. |
+| **Prefill Context Parallel (`PCP`)** | `pcp > 1`, `cp_plan="pcp"` (or `"auto"`) | `pcp_query_split_kv_gather` | **Adds an independent rank axis** (`world_size = dp * pp * tp * pcp`): splits prefill query tokens across the `PCP` group (computing exact closed-form `CpSplit` causal/windowed triangle load imbalance and zigzag partitions) and gathers full K/V with no output LSE merge. |
+| **MoE Expert Parallel & Uneven Pipeline (`EP` / `ETP` / `PP`)** | `dp`, `tp`, `ep`, `pp` (with optional `PPPlan.partition`) | `ep_domain = dp * tp` | Models `EP` across the `DP × TP` domain, derives intra-expert tensor shard width `etp = tp // ep` when `ep < tp`, and validates uneven pipeline stage partitions (e.g., Kimi-K3 `PP2` `47/46` layer split). |
+
+It also ships with **15 built-in Ascend NPU hardware profiles** (Atlas A2 `Ascend910B1`/`B2`/`B2C`/`B3`/`B4`/`B4-1`, Atlas A3 `Ascend910_9391`/`9392`/`9381`/`9382`/`9372`/`9362`, and Atlas A5 `Ascend950DT_9581`/`9582`, `Ascend950PR_9579`) and **17 standard model & architecture presets** (`deepseek-v4-10t`, `deepseek-v4-flash-0731`, `deepseek-v4-pro-0813`, `deepseek-v4.1-flash`, `glm-5.3`, `glm-5.3-flash`, `kimi-k3`, `kimi-k3-dspark`, `qwen3.8-2.4t-a95b`, `qwen3.8-27b`, `qwen3.6-27b`, `qwen3.5-35b-a3b`, plus architecture presets `longcat-flash-lite`, `minimax-m3`, `bailing-v3`, `qwen3.5-moe`, `hunyuan-video-dit`).
+
+### 5. Full-Fleet A3 / A5 Convergence Benchmarks
 
 Validated jointly with [`mindie-profiler v0.5.3`](https://github.com/mindie-agent/profiler) across real hardware captures:
 
 | Benchmark Cohort | Cases | Within `<= 15%` Error | Mean Relative Error | Coverage Highlights |
 | --- | --- | --- | --- | --- |
-| **Registered Decode Suite** | **280 cases** | **280 / 280 (100.0%)** | **2.15%** | A3 / A5, `TP`/`DP`/`EP`, 64K–128K long context, KDA/GDN, MXFP4 MoE, MLA/GQA |
-| **Registered Prefill Suite** | **15 cases** | **15 / 15 (100.0%)** | **2.21%** | Max error `8.42%`, covering chunked prefill and long-context prefill |
+| **Registered Decode Suite** | **280 cases** | **280 / 280 (100.0%)** | **2.15%** | A3 / A5, `TP`/`DP`/`EP`/`DCP`/`DSA-CP`/`PCP`, 64K–128K long context, KDA/GDN, MXFP4 MoE, MLA/GQA |
+| **Registered Prefill Suite** | **15 cases** | **15 / 15 (100.0%)** | **2.21%** | Max error `8.42%`, covering chunked prefill, PCP, and long-context prefill |
 | **Unregistered DSH Heldout Suite** | **561 cases** | **546 / 561 (97.33%)** | **3.66%** | Zero per-case tuning, generalized via `mindie-model-structure/1` |
 | **Full Comparable Fleet Total** | **856 cases** | **841 / 856 (98.25%)** | **3.14%** | Bounded working set `< 50 MiB` peak RSS |
 
@@ -161,10 +147,12 @@ Validated jointly with [`mindie-profiler v0.5.3`](https://github.com/mindie-agen
 | `mindie-sim inspect` | Parse a Case and emit normalized model structure, KV memory plan, and lowered operators | `mindie-sim inspect examples/quickstart.json` |
 | `mindie-sim operators` | Evaluate isolated device resource costs for each operator in a Prefill/Decode pass | `mindie-sim operators examples/quickstart.json --phase decode --tokens 1` |
 | `mindie-sim graph` | Compose and evaluate a target graph on shared device resources and streams | `mindie-sim graph examples/quickstart.json --phase decode --tokens 1 --sequences 8` |
-| `mindie-sim call` | Evaluate a complete declared callback and repetition protocol | `mindie-sim call examples/quickstart.json examples/calls/rmsnorm.json` |
-| `mindie-sim study` | Compare multiple candidate configurations across operator or graph probes | `mindie-sim study examples/studies/parallel_study.json` |
+| `mindie-sim call` | Evaluate a complete declared callback and repetition protocol | `mindie-sim call examples/quickstart.json examples/calls/swiglu-separate.json` |
+| `mindie-sim compare-calls` | Conditional historical event/call boundary comparison against a protocol | `mindie-sim compare-calls examples/quickstart.json protocol.json` |
+| `mindie-sim study` | Compare multiple candidate configurations across operator or graph probes | `mindie-sim study examples/studies/communication-tradeoff.json` |
 | `mindie-sim catalog` | List built-in standard model specifications or inspect a named model | `mindie-sim catalog` |
 | `mindie-sim observations` | Stream-index observation directories or attach a `mindie-profiler` kernel catalogue | `mindie-sim observations /tmp/obs.db --scan ./data` |
+| `mindie-sim profiler-rows` | Stream-inspect operator variants from a CSV or `ProfilerCatalogue` database | `mindie-sim profiler-rows /tmp/profiler_cat.db --limit 50` |
 | `mindie-sim calibrate` / `bind-profiler` | Import measured primitive samples or Profiler bindings into `PrimitiveStore` | `mindie-sim calibrate /tmp/primitives.db samples.jsonl` |
 | `mindie-sim validate` / `accuracy` | Compare predictions against observations on an explicit timing boundary | `mindie-sim validate pred.json obs.json --boundary body` |
 | `mindie-sim fit-rate` / `fit-service` | Fit a single-resource rate or primitive work-response service curve | `mindie-sim fit-service observations.json` |
