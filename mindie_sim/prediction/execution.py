@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, replace
+import re
 from typing import Any, Mapping
 
 from mindie_sim.schema.operators import IterationWork
@@ -46,16 +47,67 @@ def _freeze_key(value: Any) -> Any:
         return ("__repr__", type(value), repr(value))
 
 
+_LAYER_PREFIX_RE = re.compile(r"\bs\d+\.l\d+\.")
+_DIAGNOSTIC_ONLY_META_KEYS = frozenset({
+    "structure_subgraphs", "fusion_semantic_ids", "fusion_external_outputs",
+})
+
+
 def _op_meta_key(op) -> Any:
-    cached = getattr(op, "_frozen_meta_key", None)
-    if cached is not None:
-        return cached
-    val = _freeze_key(op.metadata)
-    try:
-        object.__setattr__(op, "_frozen_meta_key", val)
-    except Exception:
-        pass
-    return val
+    def _norm(value: Any) -> Any:
+        if isinstance(value, str):
+            return _LAYER_PREFIX_RE.sub("s_.l_.", value)
+        if isinstance(value, (int, float, bool, bytes, type(None))):
+            return value
+        if isinstance(value, tuple):
+            return tuple(_norm(item) for item in value)
+        if isinstance(value, list):
+            return ("__list__", tuple(_norm(item) for item in value))
+        if isinstance(value, (set, frozenset)):
+            return ("__set__", tuple(sorted((_norm(item) for item in value), key=repr)))
+        if isinstance(value, Mapping):
+            return ("__map__", tuple(sorted(
+                ((str(k), _norm(v)) for k, v in value.items()
+                 if k not in _DIAGNOSTIC_ONLY_META_KEYS),
+                key=lambda pair: pair[0],
+            )))
+        try:
+            hash(value)
+            return value
+        except TypeError:
+            return ("__repr__", type(value), repr(value))
+
+    return _norm(dict(op.metadata))
+
+
+def _meta_diff(orig: Any, res: Any) -> Any:
+    if isinstance(orig, Mapping) and isinstance(res, Mapping):
+        removed = frozenset(orig.keys() - res.keys())
+        updated = {
+            k: (_meta_diff(orig[k], v) if k in orig else ("__set__", v))
+            for k, v in res.items() if k not in orig or orig[k] != v
+        }
+        return ("__dict__", removed, updated)
+    if (isinstance(orig, tuple) and isinstance(res, tuple) and len(orig) == len(res)
+            and orig and all(isinstance(x, Mapping) for x in orig)
+            and all(isinstance(x, Mapping) for x in res)):
+        return ("__tuple_map__", tuple(_meta_diff(a, b) for a, b in zip(orig, res)))
+    return ("__set__", res)
+
+
+def _meta_patch(orig: Any, diff: Any) -> Any:
+    kind = diff[0]
+    if kind == "__set__":
+        return diff[1]
+    if kind == "__dict__" and isinstance(orig, Mapping):
+        _, removed, updated = diff
+        out = {k: v for k, v in orig.items() if k not in removed}
+        for k, sub in updated.items():
+            out[k] = _meta_patch(out[k], sub) if k in out else sub[1]
+        return out
+    if kind == "__tuple_map__" and isinstance(orig, tuple) and len(orig) == len(diff[1]):
+        return tuple(_meta_patch(a, sub) for a, sub in zip(orig, diff[1]))
+    return diff[-1]
 
 
 class ResourceRates(Mapping):
@@ -329,69 +381,64 @@ class Execution:
 
         def begin(_):
             op = context.op
-            if not context.group_buffers:
-                live_rates = tuple(
-                    (role, context.rates.get(res_name))
-                    for role, res_name in sorted(context.resource_names.items())
-                    if res_name in context.rates
-                )
-                inv_t = context.invocation_timing
-                prog_key = (
-                    owner, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
-                    op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
-                    op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
-                    op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
-                    op.link_scope, op.source_boundary, op.returns,
-                    _op_meta_key(op), context.setup_ms, context.minimum_ms,
-                    (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
-                    _freeze_key(context.joint_native_service),
-                    tuple(sorted(context.work.items())),
-                    live_rates,
-                )
-                cached_prog = self._program_cache.get(prog_key)
-                if cached_prog is not None:
-                    program, mapped_recs, svc_calls = cached_prog
-                    if mapped_recs and context.record_mapping is not None:
-                        for mrec in mapped_recs:
-                            context.record_mapping(deepcopy(mrec))
-                    if svc_calls and context.record_service is not None:
-                        for sargs, skwargs in svc_calls:
-                            context.record_service(*deepcopy(sargs), **deepcopy(skwargs))
-                    finish = program.start(engine, name, ready, owner=owner)
-                    engine.submit(name + ":resolve", after=(finish,), owner=owner,
-                                  on_complete=lambda _: engine.resolve(complete))
-                    return
-
-                mapped_list = []
-                svc_list = []
-                orig_rec = context.record_mapping
-                orig_svc = context.record_service
-
-                def cap_map(rec):
-                    mapped_list.append(deepcopy(rec))
-                    if orig_rec is not None:
-                        orig_rec(rec)
-
-                def cap_svc(*args, **kwargs):
-                    svc_list.append((deepcopy(args), deepcopy(kwargs)))
-                    if orig_svc is not None:
-                        orig_svc(*args, **kwargs)
-
-                run_ctx = replace(
-                    context,
-                    record_mapping=cap_map if orig_rec is not None else None,
-                    record_service=cap_svc if orig_svc is not None else None,
-                )
-                program = self.lower_program(run_ctx, recipe)
-                if len(self._program_cache) >= 1024:
-                    self._program_cache.pop(next(iter(self._program_cache)))
-                self._program_cache[prog_key] = (program, tuple(mapped_list), tuple(svc_list))
+            live_rates = tuple(
+                (role, context.rates.get(res_name))
+                for role, res_name in sorted(context.resource_names.items())
+                if res_name in context.rates
+            )
+            inv_t = context.invocation_timing
+            prog_key = (
+                owner, _freeze_key(recipe), op.family, op.recipe, op.phase, op.stage,
+                op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
+                op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
+                op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
+                op.link_scope, op.source_boundary, op.returns,
+                _op_meta_key(op), context.setup_ms, context.minimum_ms,
+                (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
+                _freeze_key(context.joint_native_service),
+                tuple(sorted(context.work.items())),
+                live_rates,
+                context.group_buffers,
+            )
+            cached_prog = self._program_cache.get(prog_key)
+            if cached_prog is not None:
+                program, mapped_recs, svc_calls = cached_prog
+                if mapped_recs and context.record_mapping is not None:
+                    for mrec in mapped_recs:
+                        context.record_mapping(deepcopy(mrec))
+                if svc_calls and context.record_service is not None:
+                    for sargs, skwargs in svc_calls:
+                        context.record_service(*deepcopy(sargs), **deepcopy(skwargs))
                 finish = program.start(engine, name, ready, owner=owner)
                 engine.submit(name + ":resolve", after=(finish,), owner=owner,
                               on_complete=lambda _: engine.resolve(complete))
                 return
 
-            finish = self.lower_program(context, recipe).start(engine, name, ready, owner=owner)
+            mapped_list = []
+            svc_list = []
+            orig_rec = context.record_mapping
+            orig_svc = context.record_service
+
+            def cap_map(rec):
+                mapped_list.append(deepcopy(rec))
+                if orig_rec is not None:
+                    orig_rec(rec)
+
+            def cap_svc(*args, **kwargs):
+                svc_list.append((deepcopy(args), deepcopy(kwargs)))
+                if orig_svc is not None:
+                    orig_svc(*args, **kwargs)
+
+            run_ctx = replace(
+                context,
+                record_mapping=cap_map if orig_rec is not None else None,
+                record_service=cap_svc if orig_svc is not None else None,
+            )
+            program = self.lower_program(run_ctx, recipe)
+            if len(self._program_cache) >= 768:
+                self._program_cache.pop(next(iter(self._program_cache)))
+            self._program_cache[prog_key] = (program, tuple(mapped_list), tuple(svc_list))
+            finish = program.start(engine, name, ready, owner=owner)
             engine.submit(name + ":resolve", after=(finish,), owner=owner,
                           on_complete=lambda _: engine.resolve(complete))
 
@@ -410,8 +457,9 @@ class Execution:
         return lower_invocation(recipe, context)
 
     def prepare(self, op, replica=0):
+        geom = self.stage_geometry[replica, op.stage]
         prep_key = (
-            id(self.recipes), replica, op.stage, op.family, op.recipe, op.phase,
+            id(self.recipes), _freeze_key(geom), op.stage, op.family, op.recipe, op.phase,
             op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
@@ -419,15 +467,23 @@ class Execution:
             _op_meta_key(op),
         )
         if prep_key in self._prepare_cache:
-            cached_op, recipe = self._prepare_cache[prep_key]
+            cached_op, meta_diff, recipe = self._prepare_cache[prep_key]
+            meta = op.metadata
+            if meta_diff is not None:
+                patched = _meta_patch(dict(op.metadata), meta_diff)
+                meta = tuple(sorted(patched.items()))
             return replace(
                 cached_op, op_id=op.op_id, layer=op.layer, deps=op.deps,
                 requests=op.requests, stream=op.stream, notes=op.notes,
+                metadata=meta,
             ), recipe
-        res_op, recipe = self.recipes.prepare(op, self.stage_geometry[replica, op.stage])
-        if len(self._prepare_cache) >= 1024:
+        res_op, recipe = self.recipes.prepare(op, geom)
+        orig_meta = dict(op.metadata)
+        res_meta = dict(res_op.metadata)
+        meta_diff = _meta_diff(orig_meta, res_meta) if orig_meta != res_meta else None
+        if len(self._prepare_cache) >= 512:
             self._prepare_cache.pop(next(iter(self._prepare_cache)))
-        self._prepare_cache[prep_key] = (res_op, recipe)
+        self._prepare_cache[prep_key] = (res_op, meta_diff, recipe)
         return res_op, recipe
 
     def _stage_context(self, key, dies):
