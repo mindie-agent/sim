@@ -58,7 +58,9 @@ def prepare_model(model, runtime, binding):
         raise ModelingError("native_keypool_requires_positive_table_and_tail_capacity_at_least_pool")
     metadata = {**dict(model.metadata), "native_keypool_caller": {
         "implementation": IMPLEMENTATION, "tail_capacity": capacity,
-        "block_table_columns": columns, "source": SOURCE}}
+        "block_table_columns": columns,
+        "block_table_columns_explicit": "block_table_columns" in options,
+        "source": SOURCE}}
     return replace(model, metadata=tuple(sorted(metadata.items())))
 
 
@@ -184,7 +186,15 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
                                    always_select_tail=plan.index_kpool_always_select_tail) for v in views)
     scanned = sum(g.scanned_pools for g in geometry)
     selected = sum(g.selected_pools for g in geometry)
-    output_width, columns = plan.index_topk + pool - 1, declaration["block_table_columns"]
+    output_width = plan.index_topk + pool - 1
+    columns = (
+        declaration["block_table_columns"]
+        if declaration.get("block_table_columns_explicit", True)
+        else max(
+            declaration["block_table_columns"],
+            math.ceil(max((v.context + v.q_len for v in views), default=0) / 128),
+        )
+    )
     # Graph padding belongs to the appended request: its start is the last
     # real cumulative end, while its new end is padded_tokens + 1.
     dummy_queries = tokens + 1 - valid

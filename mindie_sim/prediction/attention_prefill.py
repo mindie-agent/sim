@@ -37,12 +37,8 @@ from typing import Mapping
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
-from mindie_sim.prediction.program import (
-    KernelProgram,
-    PipelineProgram,
-    RecipeContext,
-    Stage,
-)
+from mindie_sim.prediction.program import KernelProgram, PipelineProgram, RecipeContext, Stage
+from mindie_sim.prediction.refill_steady import compact_periodic_pipeline
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
@@ -506,9 +502,17 @@ def _task_program(context: RecipeContext, recipe: StagedGQAPrefill,
                   placement=_placement(context, core, *vector)),
         )
 
-    stages.append(Stage("key_tiles", after=("q_load",),
-                        program=PipelineProgram(task.key_tiles, recipe.slots,
-                                                tile)))
+    use_compact = len(set(spec.requests)) <= 1
+    stages.append(Stage(
+        "key_tiles", after=("q_load",),
+        program=(
+            compact_periodic_pipeline(
+                context, task.key_tiles, recipe.slots, tile,
+                head=1, tail=1, resident=persistent)
+            if use_compact
+            else PipelineProgram(task.key_tiles, recipe.slots, tile)
+        ),
+    ))
     out_bytes = rows * dim * spec.query_bytes
     stages.append(Stage(
         "final_store", after=("key_tiles",),

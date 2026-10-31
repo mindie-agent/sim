@@ -83,7 +83,7 @@ def build(op, geometry, *, scratch_policy, compact=True, operand_modes=True):
     if (not shape or shape["query_dtype"] != "bf16" or shape["cache_dtype"] != "int8"
             or shape["latent"] != 512 or shape["rope"] not in {0, 64}
             or shape["window"] or shape["compression_ratio"] != 1 or shape["cp"] != 1
-            or shape.get("sparse_block_size", 1) != 1 or not 1 <= shape["heads"] <= 16):
+            or shape.get("sparse_block_size", 1) != 1 or not 1 <= shape["heads"] <= 64):
         raise ModelingError("packed_int8_indexed_attention_requires_bf16_q_int8_latent512_rope0_or64")
     if scratch_policy not in {"resident", "offchip"}:
         raise ModelingError("indexed_attention_scratch_policy_required")

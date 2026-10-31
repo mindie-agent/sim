@@ -39,12 +39,8 @@ from typing import Callable, Mapping
 from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
-from mindie_sim.prediction.program import (
-    KernelProgram,
-    PipelineProgram,
-    RecipeContext,
-    Stage,
-)
+from mindie_sim.prediction.program import KernelProgram, PipelineProgram, RecipeContext, Stage
+from mindie_sim.prediction.refill_steady import compact_periodic_pipeline
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
@@ -502,6 +498,12 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
 
     max_tile = min(recipe.key_tile, max(1, output.horizon))
 
+    causal_start = max(
+        0,
+        (context_len + output.token_first + 1) // recipe.key_tile - contribution.tile_start,
+    )
+    tail_count = max(2, contribution.tile_count - causal_start)
+
     def tile(index: int):
         start = (contribution.tile_start + index) * recipe.key_tile
         end = min(start + recipe.key_tile, output.horizon)
@@ -510,7 +512,7 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
             output, context_len, spec.group, start, end)
         return template(valid, pairs, active_rows, index % recipe.slots)
 
-    @lru_cache(maxsize=2 * recipe.slots)
+    @lru_cache(maxsize=4 * recipe.slots + tail_count)
     def template(valid: int, pairs: int, active_rows: int, slot: int):
         # Full tiles repeat immutable work and slot-local buffer descriptors.
         # Retain at most a full/tail pair per live slot, within this producer;
@@ -581,12 +583,19 @@ def _producer_program(context: RecipeContext, recipe: StagedGQADecode,
                   placement=_placement(context, core, *vector)),
         )
 
+    contributions = len(output.contributions)
+    use_compact = len(set(spec.requests)) <= 1 and contributions == 1
     stages.append(Stage(
         "key_tiles", after=("q_load",),
-        program=PipelineProgram(contribution.tile_count, recipe.slots, tile),
+        program=(
+            compact_periodic_pipeline(
+                context, contribution.tile_count, recipe.slots, tile,
+                head=1, tail=tail_count, resident=persistent)
+            if use_compact
+            else PipelineProgram(contribution.tile_count, recipe.slots, tile)
+        ),
     ))
 
-    contributions = len(output.contributions)
     if contributions == 1:
         out_bytes = rows * dim * spec.query_bytes
         final = Work(resources={

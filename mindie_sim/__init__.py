@@ -26,7 +26,7 @@ from .prediction.efficiency import (
     solve_hardware_sla_throughput,
 )
 
-__version__ = "0.8.1"
+__version__ = "0.8.2"
 __all__ = ["predict", "predict_pd", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
            "analyze_network_efficiency", "analyze_operator_row", "evaluate_target_efficiency",

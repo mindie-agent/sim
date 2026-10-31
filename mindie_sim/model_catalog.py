@@ -614,25 +614,61 @@ def build_model_spec(key: str, config: dict[str, Any]) -> ModelSpec:
     return _build_model_spec(key, config)
 
 
-def derive_expert_pruned(base_key: str, *, num_experts: int, top_k: int,
-                         moe_intermediate_size: int) -> ModelSpec:
+def derive_expert_pruned(
+    base_key: str | ModelSpec, *, num_experts: int, top_k: int,
+    moe_intermediate_size: int | None = None, model_id: str | None = None,
+) -> ModelSpec:
     """Immutable per-layer expert-prune of a catalog model.
 
-    Attention family, compress_ratio, indexer and KV geometry are preserved layer by
-    layer; only the routed-expert shape changes, so a pruned checkpoint keeps the
-    original 43-layer swa/csa/hca split instead of collapsing to a uniform plan.
+    Attention family, compress_ratio, indexer, dense FFN layers, and KV geometry
+    are preserved layer by layer; only MoE layers update their routed-expert shape
+    and sanitize incompatible router_groups/router_group_topk.
     """
     from dataclasses import replace
 
-    base = load_model(base_key)
-    plans = tuple(
-        replace(plan, num_experts=int(num_experts), top_k=int(top_k),
-                moe_intermediate_size=int(moe_intermediate_size))
-        for plan in base.layer_plans
+    base = base_key if isinstance(base_key, ModelSpec) else load_model(base_key)
+    e = int(num_experts)
+    k = int(top_k)
+    m_inter = int(moe_intermediate_size) if moe_intermediate_size is not None else int(base.moe_intermediate_size)
+    if e <= 0 or k <= 0 or k > e or m_inter <= 0:
+        raise ModelingError(f"derive_expert_pruned_invalid:E={e}:K={k}:inter={m_inter}")
+
+    def _prune_plan(plan: LayerPlan) -> LayerPlan:
+        if plan.ffn != "moe":
+            return plan
+        rg = plan.router_groups
+        rgt = plan.router_group_topk
+        if rg > 0 and (e % rg != 0 or not 1 <= rgt <= rg or (e // rg) * rgt < k):
+            rg = 0
+            rgt = 0
+        return replace(
+            plan, num_experts=e, top_k=k, moe_intermediate_size=m_inter,
+            router_groups=rg, router_group_topk=rgt,
+        )
+
+    plans = tuple(_prune_plan(plan) for plan in base.layer_plans)
+    aux = base.auxiliary
+    if aux is not None:
+        mtp = (
+            replace(aux.mtp, num_experts=e, top_k=k, expert_intermediate_size=m_inter)
+            if aux.mtp is not None and aux.mtp.num_experts > 0
+            else aux.mtp
+        )
+        dspark = (
+            replace(aux.dspark, num_experts=e, top_k=k, expert_intermediate_size=m_inter)
+            if aux.dspark is not None and aux.dspark.num_experts > 0
+            else aux.dspark
+        )
+        aux = replace(aux, mtp=mtp, dspark=dspark)
+    keep_routing = len(base.expert_routing) == e
+    routing = base.expert_routing if keep_routing else ()
+    routing_source = base.expert_routing_source if keep_routing else "uniform"
+    name = str(model_id) if model_id is not None else base.name
+    return replace(
+        base, name=name, layer_plans=plans, num_experts=e,
+        top_k=k, moe_intermediate_size=m_inter, expert_routing=routing,
+        expert_routing_source=routing_source, auxiliary=aux,
     )
-    derived = replace(base, layer_plans=plans, num_experts=int(num_experts),
-                      top_k=int(top_k), moe_intermediate_size=int(moe_intermediate_size))
-    return derived
 
 
 def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
@@ -716,6 +752,7 @@ __all__ = [
     "ARCHITECTURE_PRESET_ALIASES", "CONFIG_DIR", "LayerPlan",
     "ModelArchitectureProfile", "build_architecture_profile",
     "load_architecture_profile", "list_architecture_profiles",
-    "load_model", "list_models", "sharded_weight_bytes", "model_weight_detail",
+    "derive_expert_pruned", "load_model", "list_models",
+    "sharded_weight_bytes", "model_weight_detail",
     "stage_weight_terms", "body_weight_bytes", "body_parameter_count",
 ]

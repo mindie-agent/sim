@@ -15,6 +15,7 @@ from functools import lru_cache
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from .refill_steady import compact_periodic_pipeline
 from .paged_mla_arch22_dispatch import Dispatch, source_dispatch
 from .paged_mla_arch22_matrix import matrix_program
 
@@ -152,12 +153,18 @@ def _plan(spec, cores):
     total = Work()
     for jobs in owners:
         for seq,start,count,splits in jobs:
-            for tile in range(count):
+            boundary_tiles = (0,) if count == 1 else (0, count - 1) if count > 1 else ()
+            for tile in boundary_tiles:
                 keys = min(KEY_TILE,spec.contexts[seq]+1-(start+tile)*KEY_TILE)
                 for work in tile_work(keys,spec.heads,first=tile==0,last=tile+1==count,
                                       splits=splits,page_size=spec.page_size,
                                       retained_kv_rows=spec.retained_kv_rows).values():
                     total += work
+            if count > 2:
+                for work in tile_work(KEY_TILE,spec.heads,first=False,last=False,
+                                      splits=splits,page_size=spec.page_size,
+                                      retained_kv_rows=spec.retained_kv_rows).values():
+                    total += work.scaled(count - 2)
     for jobs in spec.dispatch.merges:
         for _,_,heads,splits in jobs:
             for work in merge_work(heads,splits):
@@ -255,7 +262,10 @@ def _plan(spec, cores):
                                   after=('output_write',)),
                         ))
                 return tuple(steps)
-            return PipelineProgram(count+2,3,cycle)
+            if len(jobs) == 1:
+                return compact_periodic_pipeline(
+                    ctx, count + 2, 3, cycle, head=4, tail=3)
+            return PipelineProgram(count + 2, 3, cycle)
 
         def merge_program(aiv,jobs):
             def sequence(index):
