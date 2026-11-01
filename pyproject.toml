@@ -25,6 +25,7 @@ mindie_sim = ["model_configs/*.json", "backends/profiles/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
     "live_npu: standing A2/A3 Ascend NPU non-destructive live integration",
 ]

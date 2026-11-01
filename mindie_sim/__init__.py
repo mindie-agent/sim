@@ -18,6 +18,7 @@ from .study import study
 from .prediction.call import call_costs
 from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
+from .advise import advise_case, load_case_from_profile
 from .model_catalog import customize_model_spec
 from .prediction.efficiency import (
     analyze_network_efficiency,
@@ -43,6 +44,7 @@ __version__ = "0.9.0"
 __all__ = ["predict", "predict_pd", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
            "compose_case", "resolve_hardware_sku", "customize_model_spec",
+           "advise_case", "load_case_from_profile",
            "analyze_network_efficiency", "analyze_operator_row", "evaluate_target_efficiency",
            "fit_efficiency_targets", "scale_case_hardware", "solve_hardware_sla_throughput",
            "analyze_multi_dp_barrier_skew", "analyze_moe_routing_imbalance",

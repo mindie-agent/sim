@@ -139,26 +139,44 @@ def parser():
     alignment.add_argument("--max-conditions", type=int, default=4096)
     alignment.add_argument("--output", "-o")
     compose = sub.add_parser("compose", help="deterministically synthesize a complete simulation Case")
-    compose.add_argument("--model", required=True)
-    compose.add_argument("--hardware", default="a3")
+    compose.add_argument("--model")
+    compose.add_argument("--from-profile", help="exported Case, Wave 5 capture, or C7 profile")
+    compose.add_argument("--hardware")
     for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp", "--concurrency"):
-        compose.add_argument(flag, type=int, default=1)
+        compose.add_argument(flag, type=int)
     compose.add_argument("--sp", action="store_true")
     for flag in ("--num-devices", "--ranks-per-node", "--layers", "--max-num-seqs", "--max-num-batched-tokens", "--max-model-len"):
         compose.add_argument(flag, type=int)
     compose.add_argument("--quant")
     compose.add_argument("--experts", type=int, dest="experts")
     compose.add_argument("--top-k", type=int, dest="top_k")
-    compose.add_argument("--prompt-tokens", type=int, default=4096)
-    compose.add_argument("--output-tokens", type=int, default=128)
-    compose.add_argument("--prefix-tokens", type=int, default=0)
-    compose.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=False)
-    compose.add_argument("--graph-mode", choices=("none", "full", "piecewise"), default="none")
-    compose.add_argument("--mtp-tokens", type=int, default=0)
-    compose.add_argument("--mtp-accept", type=float, default=1.0)
-    compose.add_argument("--ttft-slo-ms", type=float, default=5000.0)
-    compose.add_argument("--tpot-slo-ms", type=float, default=50.0)
+    compose.add_argument("--prompt-tokens", type=int)
+    compose.add_argument("--output-tokens", type=int)
+    compose.add_argument("--prefix-tokens", type=int)
+    compose.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=None)
+    compose.add_argument("--graph-mode", choices=("none", "full", "piecewise"))
+    compose.add_argument("--mtp-tokens", type=int)
+    compose.add_argument("--mtp-accept", type=float)
+    compose.add_argument("--ttft-slo-ms", type=float)
+    compose.add_argument("--tpot-slo-ms", type=float)
     compose.add_argument("--output", "-o")
+    advise = sub.add_parser("advise", help="attribute a Case and rank guarded counterfactual interventions")
+    advise.add_argument("case", nargs="?")
+    advise.add_argument("--from-profile", help="exported Case, Wave 5 capture, or C7 profile")
+    advise.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    advise.add_argument("--scope", choices=("body", "model"), default="body")
+    advise.add_argument("--context", type=int)
+    advise.add_argument("--sequences", type=int)
+    advise.add_argument("--tokens", type=int)
+    advise.add_argument("--sla-ms", type=float, dest="sla_tpot_ms")
+    advise.add_argument("--ttft-sla-ms", type=float, dest="sla_ttft_ms")
+    advise.add_argument("--hardware")
+    advise.add_argument("--model")
+    advise.add_argument("--tp", type=int)
+    advise.add_argument("--dp", type=int)
+    advise.add_argument("--ep", type=int)
+    advise.add_argument("--max-interventions", type=int, default=10)
+    advise.add_argument("--output", "-o")
     sweep = sub.add_parser("sweep", help="multi-topology parallel sharding and P/D disaggregation Pareto solver")
     sweep.add_argument("case")
     sweep.add_argument("--mode", choices=("topology", "pd"), default="topology")
@@ -356,19 +374,61 @@ def run(args):
         return fit_service_curve(read_json(args.observations))
     if args.command == "compose":
         from .compose import compose_case
+        if args.from_profile:
+            from .advise import load_case_from_profile
+            profile_overrides = {
+                "model": args.model, "hardware": args.hardware, "tp": args.tp, "dp": args.dp,
+                "ep": args.ep, "pp": args.pp, "pcp": args.pcp, "dcp": args.dcp,
+                "num_devices": args.num_devices, "ranks_per_node": args.ranks_per_node,
+                "sp": args.sp if args.sp else None, "quant": args.quant, "layers": args.layers,
+                "experts": args.experts, "top_k": args.top_k,
+                "prompt_tokens": args.prompt_tokens, "output_tokens": args.output_tokens,
+                "concurrency": args.concurrency, "prefix_tokens": args.prefix_tokens,
+                "max_num_seqs": args.max_num_seqs,
+                "max_num_batched_tokens": args.max_num_batched_tokens,
+                "max_model_len": args.max_model_len,
+                "async_scheduling": args.async_scheduling, "graph_mode": args.graph_mode,
+                "mtp_proposal_tokens": args.mtp_tokens,
+                "mtp_acceptance_length": args.mtp_accept,
+                "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
+            }
+            return load_case_from_profile(
+                args.from_profile,
+                **{key: value for key, value in profile_overrides.items() if value is not None},
+            )
+        if not args.model:
+            raise ValueError("compose_requires_model_or_from_profile")
         return compose_case(
-            model=args.model, hardware=args.hardware, tp=args.tp, dp=args.dp, ep=args.ep,
-            pp=args.pp, pcp=args.pcp, dcp=args.dcp, sp=args.sp,
-            num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
+            model=args.model, hardware=args.hardware or "a3",
+            tp=1 if args.tp is None else args.tp, dp=1 if args.dp is None else args.dp,
+            ep=1 if args.ep is None else args.ep, pp=1 if args.pp is None else args.pp,
+            pcp=1 if args.pcp is None else args.pcp, dcp=1 if args.dcp is None else args.dcp,
+            sp=args.sp, num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
             quant=args.quant, layers=args.layers, n_routed_experts=args.experts,
-            num_experts_per_tok=args.top_k, prompt_tokens=args.prompt_tokens,
-            output_tokens=args.output_tokens, concurrency=args.concurrency,
-            prefix_tokens=args.prefix_tokens, max_num_seqs=args.max_num_seqs,
+            num_experts_per_tok=args.top_k,
+            prompt_tokens=4096 if args.prompt_tokens is None else args.prompt_tokens,
+            output_tokens=128 if args.output_tokens is None else args.output_tokens,
+            concurrency=1 if args.concurrency is None else args.concurrency,
+            prefix_tokens=0 if args.prefix_tokens is None else args.prefix_tokens,
+            max_num_seqs=args.max_num_seqs,
             max_num_batched_tokens=args.max_num_batched_tokens,
-            max_model_len=args.max_model_len, async_scheduling=args.async_scheduling,
-            graph_capture_mode=args.graph_mode, mtp_proposal_tokens=args.mtp_tokens,
-            mtp_acceptance_length=args.mtp_accept, ttft_slo_ms=args.ttft_slo_ms,
-            tpot_slo_ms=args.tpot_slo_ms,
+            max_model_len=args.max_model_len,
+            async_scheduling=False if args.async_scheduling is None else args.async_scheduling,
+            graph_capture_mode=args.graph_mode or "none",
+            mtp_proposal_tokens=0 if args.mtp_tokens is None else args.mtp_tokens,
+            mtp_acceptance_length=1.0 if args.mtp_accept is None else args.mtp_accept,
+            ttft_slo_ms=5000.0 if args.ttft_slo_ms is None else args.ttft_slo_ms,
+            tpot_slo_ms=50.0 if args.tpot_slo_ms is None else args.tpot_slo_ms,
+        )
+    if args.command == "advise":
+        from .advise import advise_case
+        overrides = {key: getattr(args, key) for key in ("hardware", "model", "tp", "dp", "ep")
+                     if getattr(args, key, None) is not None}
+        return advise_case(
+            args.case, from_profile=args.from_profile, phase=args.phase, scope=args.scope,
+            context=args.context, sequences=args.sequences, tokens=args.tokens,
+            sla_tpot_ms=args.sla_tpot_ms, sla_ttft_ms=args.sla_ttft_ms,
+            max_interventions=args.max_interventions, **overrides,
         )
     if args.command == "sweep":
         from .sweep import sweep_pd_disaggregation_ratios, sweep_topology_grid
@@ -479,6 +539,8 @@ def main(argv=None):
         emit(result, args.output)
         if args.command in {"study", "compare-calls"} and result["status"] != "completed":
             return 2
+    except TimeoutError:
+        raise
     except (ValueError, OSError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
