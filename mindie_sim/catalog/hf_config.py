@@ -8,11 +8,96 @@
 """
 from __future__ import annotations
 
-from typing import Mapping
+from typing import Mapping, Sequence
 
 from .config import flatten_config
 from .types import QuantSpec
 from mindie_sim.schema.common import ModelingError
+
+_NON_LINEAR_EXCLUSION_ROLES = frozenset({"lm_head", "embedding", "norm", "router"})
+_REGEX_META_CHARS = frozenset("|()[]?+{}")
+
+_ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
+    ("lm_head", ("lm_head",), frozenset({"lm_head"})),
+    (
+        "embedding",
+        ("embed_tokens", "embedding", "wte", "word_embeddings"),
+        frozenset({"embed_tokens", "embedding", "wte", "word_embeddings"}),
+    ),
+    (
+        "norm",
+        (
+            "norm", "layernorm", "input_layernorm", "post_attention_layernorm",
+            "q_a_layernorm", "kv_a_layernorm", "rms_norm",
+        ),
+        frozenset({
+            "norm", "layernorm", "input_layernorm", "post_attention_layernorm",
+            "q_a_layernorm", "kv_a_layernorm", "rms_norm", "self_attn",
+        }),
+    ),
+    (
+        "router",
+        (
+            "mlp.gate", "mlp.shared_expert_gate", "shared_expert_gate",
+            "mlp.gate.e_score_correction_bias", "router",
+        ),
+        frozenset({
+            "mlp", "gate", "shared_expert_gate", "e_score_correction_bias", "router",
+        }),
+    ),
+    ("attention", ("self_attn", "attention"), frozenset({"self_attn", "attention"})),
+    (
+        "shared_expert",
+        ("shared_experts", "shared_expert"),
+        frozenset({"mlp", "shared_experts", "shared_expert"}),
+    ),
+    (
+        "routed_expert",
+        ("mlp.experts", "experts", "routed_expert"),
+        frozenset({"mlp", "experts", "routed_expert"}),
+    ),
+)
+
+
+def _classify_exclusion_pattern(pattern: str) -> str | None:
+    raw = str(pattern).strip()
+    if not raw or any(ch in raw for ch in _REGEX_META_CHARS):
+        return None
+    cleaned = raw[3:] if raw.startswith("re:") else raw
+    lower = cleaned.lower().replace("\\.", ".")
+    if "\\" in lower:
+        return None
+    segments = [
+        seg for seg in lower.strip("^$").replace("*", ".").split(".")
+        if seg and seg not in {"model", "layers"} and not seg.isdigit()
+    ]
+    if not segments:
+        return None
+    joined = ".".join(segments)
+    seg_set = set(segments)
+    matched: list[str] = []
+    for role, triggers, allowed in _ROLE_EXCLUSION_RULES:
+        if seg_set.issubset(allowed) and (
+            joined in triggers or any(seg in triggers for seg in segments)
+        ):
+            matched.append(role)
+    return matched[0] if len(matched) == 1 else None
+
+
+def resolve_role_exclusions(
+    patterns: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Map unambiguous standard HF module exclusion patterns to simulator roles."""
+    roles: list[str] = []
+    unresolved: list[str] = []
+    for item in patterns or ():
+        pattern = str(item)
+        role = _classify_exclusion_pattern(pattern)
+        if role is None:
+            unresolved.append(pattern)
+        elif role not in roles:
+            roles.append(role)
+    return tuple(roles), tuple(unresolved)
 
 
 ALIASES = {
@@ -123,9 +208,11 @@ def _native_quant_gaps(c, quant):
                 gaps.append("native_quant_config_groups_unresolved:retained_plan_proxy")
         if raw.get("kv_cache_scheme"):
             gaps.append("native_quant_kv_cache_scheme_unresolved:retained_plan_proxy")
-    # A module-name exclusion list is not a structural role mapping.
-    if raw.get("modules_to_not_convert") or raw.get("ignore"):
-        gaps.append("quant_module_exclusions_unresolved")
+    excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
+    if excluded:
+        resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
+        if unresolved_patterns or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES):
+            gaps.append("quant_module_exclusions_unresolved")
     return gaps
 
 
@@ -243,11 +330,16 @@ def resolve_quant(c):
             if scale not in {"fp32", "fp8_e8m0"}:
                 gaps.append(f"quant_scale_format_unmodeled:{scale}:{native}_proxy")
                 return base, gaps
-            excluded = tuple(raw.get("modules_to_not_convert") or ())
-            # Module-path exclusions need structural role resolution. Never
-            # pretend their arbitrary string paths match internal categories.
-            if excluded:
+            excluded = tuple(str(v) for v in (raw.get("modules_to_not_convert") or raw.get("ignore") or ()))
+            resolved_roles, unresolved_patterns = resolve_role_exclusions(excluded)
+            exclusions_unresolved = bool(excluded) and (
+                bool(unresolved_patterns)
+                or not set(resolved_roles).issubset(_NON_LINEAR_EXCLUSION_ROLES)
+            )
+            if exclusions_unresolved:
                 gaps.append("quant_module_exclusions_unresolved")
+            base_exclusions = ("norm", "router", "embedding", "lm_head")
+            merged_exclusions = tuple(dict.fromkeys((*base_exclusions, *resolved_roles)))
             quant = QuantSpec(
                 name="hf_fp8_block", weight_format="fp8_e4m3",
                 expert_weight_format="fp8_e4m3", activation_format="fp8_e4m3",
@@ -256,9 +348,9 @@ def resolve_quant(c):
                 activation_group_size=int(block[1]), activation_scale_format=scale,
                 kv_dtype=base.kv_dtype, index_dtype=base.index_dtype,
                 index_scale_dtype="none", native_format=native,
-                exclusions=("norm", "router", "embedding", "lm_head"),
+                exclusions=merged_exclusions,
             )
-            if excluded:
+            if exclusions_unresolved:
                 # Preserve the model with an explicit whole-matrix native
                 # proxy until exclusions can be attached to concrete roles.
                 return base, gaps

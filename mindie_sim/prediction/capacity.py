@@ -27,6 +27,9 @@ class MemoryPolicy:
     runtime_bytes: float = 0
     derive_workspace: bool = True
     cache_page_groups: tuple[dict, ...] = ()
+    async_delayed_release_steps: int | None = None
+    async_in_flight_lookahead_steps: int | None = None
+    async_workspace_buffer_multiplier: float | None = None
 
     @property
     def reserved(self) -> float:
@@ -65,9 +68,28 @@ class Memory:
             include_engram_tables=not case.runtime.engram_cpu_offload,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
         )
+        async_enabled = bool(case.runtime.async_scheduling)
+        self.async_delayed_release_steps = (
+            (1 if async_enabled else 0) if self.policy.async_delayed_release_steps is None
+            else max(0, int(self.policy.async_delayed_release_steps))
+        )
+        self.async_in_flight_lookahead_steps = (
+            (1 if async_enabled else 0) if self.policy.async_in_flight_lookahead_steps is None
+            else max(0, int(self.policy.async_in_flight_lookahead_steps))
+        )
+        self.async_workspace_buffer_multiplier = (
+            (1.0 if async_enabled else 0.0) if self.policy.async_workspace_buffer_multiplier is None
+            else max(0.0, float(self.policy.async_workspace_buffer_multiplier))
+        )
         width = p.tp * p.pcp
-        self.workspace = (self._workspace(workspace_tokens) if self.policy.derive_workspace
+        self.async_workspace = (
+            self._async_inflight_workspace(workspace_tokens)
+            if self.policy.derive_workspace and self.async_workspace_buffer_multiplier > 0
+            else [0.0] * p.pp
+        )
+        base_workspace = (self._workspace(workspace_tokens) if self.policy.derive_workspace
                           else [0.0] * p.pp)
+        self.workspace = [base + extra for base, extra in zip(base_workspace, self.async_workspace)]
         self.capacity = [
             [
                 min(d.hbm_bytes * case.runtime.gpu_memory_utilization
@@ -81,16 +103,41 @@ class Memory:
         self.peak = [[0.0] * p.pp for _ in range(p.dp)]
         self.live = [[0.0] * p.pp for _ in range(p.dp)]
         self.owners: dict[tuple[int, str], tuple[float, ...]] = {}
+        self.delayed_owners: dict[tuple[int, str], tuple[int, tuple[float, ...]]] = {}
+        self.peak_delayed_release = [[0.0] * p.pp for _ in range(p.dp)]
+
+    def _resolve_workspace_tokens(self, tokens=None) -> int:
+        runtime = self.case.runtime
+        if tokens is None:
+            return min(runtime.max_num_batched_tokens, sum(
+                max(1, min(r.prompt_tokens, runtime.max_num_batched_tokens)) for r in self.case.workload.requests))
+        if type(tokens) is not int or tokens < 0:
+            raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
+        return tokens
+
+    def _async_inflight_workspace(self, tokens=None) -> list[float]:
+        """Ping-pong step input/residual/output buffer retained across overlapped async steps."""
+        model, runtime = self.case.model, self.case.runtime
+        p = runtime.parallel
+        resolved = self._resolve_workspace_tokens(tokens)
+        result = [0.0] * p.pp
+        for layer in model.layer_plans:
+            stage = self.layer_stage[layer.index]
+            residual = model.hidden_size * (2 + max(1, layer.hc_mult))
+            step_buffer = resolved * residual * dtype_bytes(model.activation_dtype)
+            result[stage] = max(result[stage], step_buffer)
+        if self.draft_kind and model.auxiliary:
+            from mindie_sim.catalog.draft import optional_draft_spec
+            draft = optional_draft_spec(model, self.draft_kind)
+            feature_bytes = resolved * model.hidden_size * len(draft.target_layer_ids) * dtype_bytes(model.activation_dtype)
+            result = [value + feature_bytes for value in result]
+        return [value * self.async_workspace_buffer_multiplier for value in result]
 
     def _workspace(self, tokens=None):
         """Resident simultaneous tensors for one layer, not lifetime traffic."""
         model, runtime = self.case.model, self.case.runtime
         p = runtime.parallel
-        if tokens is None:
-            tokens = min(runtime.max_num_batched_tokens, sum(
-                max(1, min(r.prompt_tokens, runtime.max_num_batched_tokens)) for r in self.case.workload.requests))
-        elif type(tokens) is not int or tokens < 0:
-            raise ValueError("memory_workspace_tokens_require_nonnegative_integer")
+        tokens = self._resolve_workspace_tokens(tokens)
         result = [0.0] * p.pp
         for layer in model.layer_plans:
             residual = model.hidden_size * (2 + max(1, layer.hc_mult))
@@ -163,8 +210,41 @@ class Memory:
         return True
 
     def release(self, replica: int, request: str) -> None:
+        self.delayed_owners.pop((replica, request), None)
         sizes = self.owners.pop((replica, request), (0.0,) * len(self.weights))
         self.live[replica] = [live - size for live, size in zip(self.live[replica], sizes)]
+
+    def defer_release(self, replica: int, request: str, steps: int | None = None) -> None:
+        """Retain KV ownership for finished requests across async scheduling lookahead steps."""
+        delay = self.async_delayed_release_steps if steps is None else max(0, int(steps))
+        if delay <= 0 or (replica, request) not in self.owners:
+            self.release(replica, request)
+            return
+        self.delayed_owners[replica, request] = (delay, self.owners[replica, request])
+        pinned = [0.0] * len(self.weights)
+        for (rep, _), (_, sizes) in self.delayed_owners.items():
+            if rep == replica:
+                pinned = [cur + sz for cur, sz in zip(pinned, sizes)]
+        self.peak_delayed_release[replica] = [
+            max(old, new) for old, new in zip(self.peak_delayed_release[replica], pinned)
+        ]
+
+    def has_delayed_releases(self, replica: int) -> bool:
+        return any(rep == replica for rep, _ in self.delayed_owners)
+
+    def step_delayed_releases(self, replica: int) -> None:
+        for (rep, req), (rem, sizes) in list(self.delayed_owners.items()):
+            if rep != replica:
+                continue
+            if rem <= 1:
+                self.release(replica, req)
+            else:
+                self.delayed_owners[rep, req] = (rem - 1, sizes)
+
+    def flush_delayed_releases(self, replica: int | None = None) -> None:
+        for rep, req in list(self.delayed_owners):
+            if replica is None or rep == replica:
+                self.release(rep, req)
 
     def to_dict(self) -> dict:
         return {
@@ -173,6 +253,11 @@ class Memory:
             "weights_bytes_per_stage_rank": self.weights,
             "reserve_bytes_per_rank": self.policy.reserved,
             "activation_workspace_bytes_per_stage_rank": self.workspace,
+            "async_scheduling": bool(self.case.runtime.async_scheduling),
+            "async_workspace_overhead_bytes_per_stage_rank": self.async_workspace,
+            "async_delayed_release_steps": self.async_delayed_release_steps,
+            "async_in_flight_lookahead_steps": self.async_in_flight_lookahead_steps,
+            "peak_delayed_release_cache_bytes_per_replica_stage": self.peak_delayed_release,
             "kv_capacity_bytes_per_replica_stage": self.capacity,
             "peak_cache_bytes_per_replica_stage": self.peak,
             "live_cache_bytes_per_replica_stage": self.live,

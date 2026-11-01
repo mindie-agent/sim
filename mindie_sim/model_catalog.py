@@ -48,19 +48,16 @@ CATALOG: dict[str, str] = {
     "deepseek-v4-flash-0731": "deepseek-v4-flash-0731.json",
     "deepseek-v4-pro-0813": "deepseek-v4-pro-0813.json",
     "deepseek-v4.1-flash": "deepseek-v4.1-flash.json",
+    "deepseek-v2-lite": "deepseek-v2-lite.json",
+    "deepseek-v3.2-prune-3l": "deepseek-v3.2-prune-3l.json",
     "glm-5.3": "glm-5.3.json",
-    # The measured A5 GLM-5.3-Flash-BF16 served checkpoint is a distinct
-    # 45-layer hybrid (11 DSA + 34 KDA) release, not a rewrite of the 78-layer
-    # GLM-5.3 catalog entry.  It gets its own config so neither model is
-    # misrepresented by the other's geometry.
     "glm-5.3-flash": "glm-5.3-flash.json",
     "kimi-k3": "kimi-k3.json",
     "kimi-k3-dspark": "kimi-k3-dspark.json",
+    "qwen3-30b-a3b": "qwen3-30b-a3b.json",
+    "qwen3.5-27b": "qwen3.5-27b.json",
     "qwen3.8-2.4t-a95b": "qwen3.8-2.4t-a95b.json",
     "qwen3.8-27b": "qwen3.8-27b.json",
-    # Qwen3.6-27B-W8A8 publishes the same body geometry as qwen3.8-27b but is
-    # a distinct measured checkpoint/identity; keep a separate config so the
-    # true128k row8 case cannot silently resolve to the Qwen3.8 model.
     "qwen3.6-27b": "qwen3.6-27b.json",
     "qwen3.5-35b-a3b": "qwen3.5-35b-a3b.json",
 }
@@ -74,35 +71,29 @@ MODEL_ALIASES = {
     "DeepSeek-V4-Flash-0731": "deepseek-v4-flash-0731",
     "DeepSeek-V4-Pro-0813": "deepseek-v4-pro-0813",
     "DeepSeek-V4.1-Flash": "deepseek-v4.1-flash",
+    "DeepSeek-V2-Lite": "deepseek-v2-lite",
+    "dsv2lite": "deepseek-v2-lite",
+    "DeepSeek-V3.2-Prune-3L": "deepseek-v3.2-prune-3l",
+    "dsv32prune_L3": "deepseek-v3.2-prune-3l",
     "GLM-5.3": "glm-5.3",
     "GLM-5.3-Flash": "glm-5.3-flash",
     "glm53-flash": "glm-5.3-flash",
-    # The measured A3 GLM-5.3-W4A8-INT checkpoint publishes the same 78-layer
-    # / hidden 6144 / 256-expert top-8 / MLA 512-2048 / index_topk 2048 body
-    # as the `glm-5.3` catalog entry, so the A3 case binds that config by
-    # identity instead of forking a byte-identical model file.  Only the
-    # quantization preset differs: the checkpoint is W4A8_DYNAMIC routed
-    # experts + W8A8_DYNAMIC attention/shared/dense, declared by the case.
     "GLM-5.3-W4A8": "glm-5.3",
     "GLM-5.3-W4A8-INT": "glm-5.3",
     "glm-5.3-w4a8": "glm-5.3",
     "Kimi-K3": "kimi-k3",
     "Kimi-K3-DSpark": "kimi-k3-dspark",
+    "Qwen3-30B-A3B": "qwen3-30b-a3b",
+    "qwen30ba3b": "qwen3-30b-a3b",
+    "Qwen3.5-27B": "qwen3.5-27b",
+    "qwen35_27b": "qwen3.5-27b",
     "Qwen3.8-2.4T-A95B": "qwen3.8-2.4t-a95b",
     "Qwen3.8-27B": "qwen3.8-27b",
-    # Qwen3.6-27B-W8A8 has the same body dimensions but a distinct measured
-    # identity; the row8 case must not resolve to qwen3.8-27b.
     "Qwen3.6-27B": "qwen3.6-27b",
     "qwen3.6-27b": "qwen3.6-27b",
     "Qwen3.5-35B-A3B": "qwen3.5-35b-a3b",
     "qwen3.5-35b-a3b": "qwen3.5-35b-a3b",
     "qwen3_5_moe_a3b": "qwen3.5-35b-a3b",
-    # The measured Qwen3.6-35B-A3B-W8A8 checkpoint publishes the same
-    # 40-layer / 30-GDN + 10-GQA / 256-expert-top-8 / hidden-2048 MoE config
-    # as the Qwen3.5-35B-A3B entry (byte-identical geometry; only the weights
-    # and the MTP recipe differ).  The A3 case binds that config by identity
-    # instead of forking a byte-identical model file; the 5120-hidden body
-    # belongs to the dense 27B model, not this MoE checkpoint.
     "Qwen3.6-35B-A3B": "qwen3.5-35b-a3b",
     "qwen3.6-35b-a3b": "qwen3.5-35b-a3b",
 }
@@ -504,56 +495,25 @@ def build_architecture_profile(config: Mapping[str, Any], *, key: str | None = N
     routed_expert_weight_bytes = float(num_routed * single_expert_weight_bytes)
 
     return ModelArchitectureProfile(
-        key=model_key,
-        name=name,
-        model_type=model_type,
-        family=family,
-        num_layers=num_layers,
-        hidden_size=hidden_size,
-        vocab_size=vocab_size,
-        num_attention_heads=num_heads,
-        num_key_value_heads=num_kv_heads,
-        head_dim=head_dim,
-        attention_type=attn_type,
-        layer_attention_schedule=schedule,
-        recurrent_layer_indices=recurrent_indices,
-        token_kv_layer_indices=token_kv_indices,
-        physical_kv_owner_layers=tuple(ordered_owners),
-        consumer_shared_kv_layers=tuple(consumers),
-        kv_consumer_to_owner=tuple(consumer_pairs),
-        ffn_type=ffn_type,
-        ffn_hidden_size=ffn_hidden,
-        moe_intermediate_size=moe_inter,
-        num_routed_experts=num_routed,
-        zero_expert_num=zero_experts,
-        num_shared_experts=num_shared,
-        top_k=top_k,
-        first_k_dense_layers=first_k_dense,
-        latent_moe_hidden_size=latent_moe,
-        q_lora_rank=q_lora,
-        kv_lora_rank=kv_lora,
-        qk_nope_head_dim=qk_nope,
-        qk_rope_head_dim=qk_rope,
-        v_head_dim=v_dim,
-        index_head_dim=index_dim,
-        recurrent_variant=rec_variant,
-        recurrent_num_k_heads=rec_k_heads,
-        recurrent_num_v_heads=rec_v_heads,
-        recurrent_head_k_dim=rec_k_dim,
-        recurrent_head_v_dim=rec_v_dim,
-        conv_kernel_size=conv_kernel,
-        visual_tokens=visual_tokens,
-        text_tokens=text_tokens,
-        total_dit_tokens=total_dit_tokens,
-        dit_cache_method=dit_cache_method,
-        sparse_attention_method=sparse_method,
-        ulysses_degree=ulysses_deg,
-        ring_degree=ring_deg,
-        ulysses_anything=ulysses_any,
-        weight_dtype=weight_dtype,
-        kv_dtype=kv_dtype,
-        activation_dtype=act_dtype,
-        dense_weight_bytes=dense_weight_bytes,
+        key=model_key, name=name, model_type=model_type, family=family,
+        num_layers=num_layers, hidden_size=hidden_size, vocab_size=vocab_size,
+        num_attention_heads=num_heads, num_key_value_heads=num_kv_heads, head_dim=head_dim,
+        attention_type=attn_type, layer_attention_schedule=schedule,
+        recurrent_layer_indices=recurrent_indices, token_kv_layer_indices=token_kv_indices,
+        physical_kv_owner_layers=tuple(ordered_owners), consumer_shared_kv_layers=tuple(consumers),
+        kv_consumer_to_owner=tuple(consumer_pairs), ffn_type=ffn_type, ffn_hidden_size=ffn_hidden,
+        moe_intermediate_size=moe_inter, num_routed_experts=num_routed, zero_expert_num=zero_experts,
+        num_shared_experts=num_shared, top_k=top_k, first_k_dense_layers=first_k_dense,
+        latent_moe_hidden_size=latent_moe, q_lora_rank=q_lora, kv_lora_rank=kv_lora,
+        qk_nope_head_dim=qk_nope, qk_rope_head_dim=qk_rope, v_head_dim=v_dim,
+        index_head_dim=index_dim, recurrent_variant=rec_variant,
+        recurrent_num_k_heads=rec_k_heads, recurrent_num_v_heads=rec_v_heads,
+        recurrent_head_k_dim=rec_k_dim, recurrent_head_v_dim=rec_v_dim,
+        conv_kernel_size=conv_kernel, visual_tokens=visual_tokens, text_tokens=text_tokens,
+        total_dit_tokens=total_dit_tokens, dit_cache_method=dit_cache_method,
+        sparse_attention_method=sparse_method, ulysses_degree=ulysses_deg,
+        ring_degree=ring_deg, ulysses_anything=ulysses_any, weight_dtype=weight_dtype,
+        kv_dtype=kv_dtype, activation_dtype=act_dtype, dense_weight_bytes=dense_weight_bytes,
         routed_expert_weight_bytes=routed_expert_weight_bytes,
         single_expert_weight_bytes=single_expert_weight_bytes,
     )
@@ -578,26 +538,17 @@ def load_architecture_profile(
             plan.index for plan in model.layer_plans
             if plan.attention in _TOKEN_KV_KINDS and (plan.owns_long_kv or plan.attention == "gqa" or plan.compress_ratio == 0)
         ]
+        profile_name = dict(model.catalog_facts).get("profile", resolved)
         return build_architecture_profile(
             {
-                "model_key": resolved,
-                "name": model.name,
-                "model_type": dict(model.catalog_facts).get("profile", resolved),
-                "family": dict(model.catalog_facts).get("profile", resolved),
-                "num_layers": model.layers,
-                "hidden_size": model.hidden_size,
-                "vocab_size": model.vocab_size,
-                "num_attention_heads": model.num_heads,
-                "num_key_value_heads": model.num_kv_heads,
-                "head_dim": model.head_dim,
-                "attention_type": model.attention,
-                "layer_attention_schedule": schedule,
-                "kv_owner_layers": owners,
-                "ffn_type": model.ffn,
-                "ffn_hidden_size": model.intermediate_size,
-                "moe_intermediate_size": model.moe_intermediate_size,
-                "num_routed_experts": model.num_experts,
-                "top_k": model.top_k,
+                "model_key": resolved, "name": model.name, "model_type": profile_name,
+                "family": profile_name, "num_layers": model.layers, "hidden_size": model.hidden_size,
+                "vocab_size": model.vocab_size, "num_attention_heads": model.num_heads,
+                "num_key_value_heads": model.num_kv_heads, "head_dim": model.head_dim,
+                "attention_type": model.attention, "layer_attention_schedule": schedule,
+                "kv_owner_layers": owners, "ffn_type": model.ffn,
+                "ffn_hidden_size": model.intermediate_size, "moe_intermediate_size": model.moe_intermediate_size,
+                "num_routed_experts": model.num_experts, "top_k": model.top_k,
                 "kv_lora_rank": model.mla.kv_lora_rank if model.mla else 0,
                 "qk_rope_head_dim": model.mla.qk_rope_head_dim if model.mla else 0,
             },
@@ -618,17 +569,11 @@ def derive_expert_pruned(
     base_key: str | ModelSpec, *, num_experts: int, top_k: int,
     moe_intermediate_size: int | None = None, model_id: str | None = None,
 ) -> ModelSpec:
-    """Immutable per-layer expert-prune of a catalog model.
-
-    Attention family, compress_ratio, indexer, dense FFN layers, and KV geometry
-    are preserved layer by layer; only MoE layers update their routed-expert shape
-    and sanitize incompatible router_groups/router_group_topk.
-    """
+    """Immutable per-layer expert-prune of a catalog model."""
     from dataclasses import replace
 
     base = base_key if isinstance(base_key, ModelSpec) else load_model(base_key)
-    e = int(num_experts)
-    k = int(top_k)
+    e, k = int(num_experts), int(top_k)
     m_inter = int(moe_intermediate_size) if moe_intermediate_size is not None else int(base.moe_intermediate_size)
     if e <= 0 or k <= 0 or k > e or m_inter <= 0:
         raise ModelingError(f"derive_expert_pruned_invalid:E={e}:K={k}:inter={m_inter}")
@@ -636,39 +581,118 @@ def derive_expert_pruned(
     def _prune_plan(plan: LayerPlan) -> LayerPlan:
         if plan.ffn != "moe":
             return plan
-        rg = plan.router_groups
-        rgt = plan.router_group_topk
+        rg, rgt = plan.router_groups, plan.router_group_topk
         if rg > 0 and (e % rg != 0 or not 1 <= rgt <= rg or (e // rg) * rgt < k):
-            rg = 0
-            rgt = 0
-        return replace(
-            plan, num_experts=e, top_k=k, moe_intermediate_size=m_inter,
-            router_groups=rg, router_group_topk=rgt,
-        )
+            rg, rgt = 0, 0
+        return replace(plan, num_experts=e, top_k=k, moe_intermediate_size=m_inter, router_groups=rg, router_group_topk=rgt)
 
     plans = tuple(_prune_plan(plan) for plan in base.layer_plans)
     aux = base.auxiliary
     if aux is not None:
-        mtp = (
-            replace(aux.mtp, num_experts=e, top_k=k, expert_intermediate_size=m_inter)
-            if aux.mtp is not None and aux.mtp.num_experts > 0
-            else aux.mtp
-        )
-        dspark = (
-            replace(aux.dspark, num_experts=e, top_k=k, expert_intermediate_size=m_inter)
-            if aux.dspark is not None and aux.dspark.num_experts > 0
-            else aux.dspark
-        )
+        mtp = replace(aux.mtp, num_experts=e, top_k=k, expert_intermediate_size=m_inter) if aux.mtp and aux.mtp.num_experts > 0 else aux.mtp
+        dspark = replace(aux.dspark, num_experts=e, top_k=k, expert_intermediate_size=m_inter) if aux.dspark and aux.dspark.num_experts > 0 else aux.dspark
         aux = replace(aux, mtp=mtp, dspark=dspark)
-    keep_routing = len(base.expert_routing) == e
-    routing = base.expert_routing if keep_routing else ()
-    routing_source = base.expert_routing_source if keep_routing else "uniform"
-    name = str(model_id) if model_id is not None else base.name
+    keep = len(base.expert_routing) == e
     return replace(
-        base, name=name, layer_plans=plans, num_experts=e,
-        top_k=k, moe_intermediate_size=m_inter, expert_routing=routing,
-        expert_routing_source=routing_source, auxiliary=aux,
+        base, name=str(model_id) if model_id is not None else base.name,
+        layer_plans=plans, num_experts=e, top_k=k, moe_intermediate_size=m_inter,
+        expert_routing=base.expert_routing if keep else (),
+        expert_routing_source=base.expert_routing_source if keep else "uniform", auxiliary=aux,
     )
+
+
+def customize_model_spec(
+    model: str | Mapping[str, Any] | ModelSpec, *,
+    layers: int | None = None,
+    n_routed_experts: int | None = None,
+    num_experts_per_tok: int | None = None,
+) -> ModelSpec:
+    """Deterministically scale body layer count and MoE expert geometry."""
+    from dataclasses import replace
+    from mindie_sim.prediction.structure import normalize_model
+    from mindie_sim.catalog.specs import _set_facts, _model_weight_totals
+    from mindie_sim.catalog.weights import cache_row_bytes_by_layer
+
+    base = (model if isinstance(model, ModelSpec)
+            else ModelSpec.from_mapping(model) if isinstance(model, Mapping)
+            else load_model(str(model)))
+    base = normalize_model(base)
+    plans = list(base.layer_plans)
+    if layers is not None:
+        target_l = int(layers)
+        if target_l <= 0:
+            raise ModelingError(f"customize_model_spec_layers_invalid:{target_l}")
+        if target_l <= len(plans):
+            plans = plans[:target_l]
+        else:
+            cycle_pool = [p for p in plans if p.ffn == "moe"] or plans
+            while len(plans) < target_l:
+                plans.append(cycle_pool[(len(plans) - len(base.layer_plans)) % len(cycle_pool)])
+        plans = [
+            replace(
+                p, index=idx, native_layer_id=idx,
+                kv_owner_layer_id=idx if p.kv_owner_layer_id == p.index else (min(p.kv_owner_layer_id, idx) if p.kv_owner_layer_id >= 0 else -1),
+                index_k_owner_layer_id=idx if p.index_k_owner_layer_id == p.index else (min(p.index_k_owner_layer_id, idx) if p.index_k_owner_layer_id >= 0 else -1),
+                topk_owner_layer_id=idx if p.topk_owner_layer_id == p.index else (min(p.topk_owner_layer_id, idx) if p.topk_owner_layer_id >= 0 else -1),
+                candidate_source_layer_id=p.candidate_source_layer_id if p.candidate_source_layer_id < idx else -1,
+                index_source_layer_id=idx if p.index_source_layer_id == p.index else (min(p.index_source_layer_id, idx) if p.index_source_layer_id >= 0 else -1),
+            )
+            for idx, p in enumerate(plans)
+        ]
+
+    e = int(n_routed_experts) if n_routed_experts is not None else int(base.num_experts)
+    k = int(num_experts_per_tok) if num_experts_per_tok is not None else int(base.top_k)
+    if n_routed_experts is not None or num_experts_per_tok is not None:
+        if e <= 0 or k <= 0 or k > e:
+            raise ModelingError(f"customize_model_spec_moe_invalid:E={e}:K={k}")
+        for idx, p in enumerate(plans):
+            if p.ffn == "moe" and p.num_experts > 0:
+                rg, rgt = p.router_groups, p.router_group_topk
+                if rg > 0:
+                    if e < rg:
+                        rg, rgt = e, (min(rgt, e) if rgt > 0 else 1)
+                    if e % rg != 0 or not 1 <= rgt <= rg or (e // rg) * rgt < k:
+                        rg, rgt = 0, 0
+                plans[idx] = replace(p, num_experts=e, top_k=k, router_groups=rg, router_group_topk=rgt)
+
+    n_l = len(plans)
+    aux = base.auxiliary
+    if aux is not None:
+        def _adj_draft(d):
+            if d is None:
+                return None
+            t_len = len(d.target_layer_ids)
+            t_ids = (tuple(i for i in d.target_layer_ids if i < n_l)
+                     if t_len and max(d.target_layer_ids) < n_l
+                     else tuple(range(max(0, n_l - t_len), n_l)) if t_len else ())
+            return replace(d, num_experts=e if d.num_experts > 0 else 0,
+                           top_k=k if d.num_experts > 0 else 0, target_layer_ids=t_ids)
+        aux = replace(aux, mtp=_adj_draft(aux.mtp), dspark=_adj_draft(aux.dspark))
+    engram = base.engram
+    if engram is not None and layers is not None:
+        tables = tuple(t for t in engram.tables if t.layer_id < n_l)
+        engram = replace(engram, tables=tables) if tables else None
+        plans = [replace(p, engram=any(t.layer_id == p.index for t in (engram.tables if engram else ()))) for p in plans]
+    keep_routing = len(base.expert_routing) == e
+    has_moe = any(p.ffn == "moe" for p in plans)
+    spec = replace(
+        base, layers=n_l, body_layers=n_l, layer_plans=tuple(plans),
+        num_experts=e if has_moe else 0, top_k=k if has_moe else 0,
+        expert_routing=base.expert_routing if keep_routing else (),
+        expert_routing_source=base.expert_routing_source if keep_routing else "uniform",
+        state_bytes_per_request=float(sum(p.state_bytes_total for p in plans)),
+        auxiliary=aux, engram=engram,
+    )
+    params, weights, draft_p, draft_w = _model_weight_totals(spec)
+    facts = dict(spec.catalog_facts)
+    facts.update({
+        "body_layers": n_l, "parameter_count_body": params, "resident_weight_bytes_body": weights,
+        "parameter_count_optional_draft": draft_p, "optional_draft_weight_bytes": draft_w,
+        "cache_row_bytes_by_layer": cache_row_bytes_by_layer(spec),
+        "kv_owner_layers": tuple(p.index for p in plans if p.owns_long_kv or (p.kv_owner_layer_id == p.index and p.compress_ratio == 0)),
+    })
+    _set_facts(spec, list(facts.items()))
+    return spec
 
 
 def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
@@ -752,7 +776,7 @@ __all__ = [
     "ARCHITECTURE_PRESET_ALIASES", "CONFIG_DIR", "LayerPlan",
     "ModelArchitectureProfile", "build_architecture_profile",
     "load_architecture_profile", "list_architecture_profiles",
-    "derive_expert_pruned", "load_model", "list_models",
+    "derive_expert_pruned", "customize_model_spec", "load_model", "list_models",
     "sharded_weight_bytes", "model_weight_detail",
     "stage_weight_terms", "body_weight_bytes", "body_parameter_count",
 ]

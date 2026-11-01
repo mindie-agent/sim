@@ -121,6 +121,28 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                     steps = submit_batch(case, schedulers[name], plans, execution[name], lowerers[name], engine.now)
                     flights.update({(name, replica): step for replica, step in steps.items()})
                     iterations += len(steps)
+                else:
+                    for r in group:
+                        if not schedulers[name][r].done and memory[name].has_delayed_releases(r):
+                            pool_exec = execution[name]
+                            prep = pool_exec.prepared.pop(r, None)
+                            sched_ms = pool_exec.submission.scheduler_ms if pool_exec.include_submission else 0.0
+                            comp_ms = pool_exec.submission.completion_ms if pool_exec.include_submission else 0.0
+                            sched_ev = engine.submit(
+                                f"{pool_exec.namespace}r{r}:retire_schedule:{iterations}",
+                                {f"{pool_exec.namespace}scheduler@r{r}": sched_ms},
+                                after=(prep,) if prep is not None else (),
+                                release=engine.now, owner=f"replica:{r}",
+                            )
+                            comp_ev = engine.submit(
+                                f"{pool_exec.namespace}r{r}:retire_complete:{iterations}",
+                                after=(sched_ev,), latency=comp_ms, release=engine.now, owner=f"replica:{r}",
+                            )
+                            from .execution import ScheduledIteration
+                            flights[name, r] = ScheduledIteration(
+                                r, schedulers[name][r].iteration, comp_ev, engine.now,
+                                "retire", 0, 0, None, "none", 0, {}, comp_ev, {}, {}, (),
+                            )
         arrivals = [time for name, group in schedulers.items() for replica, scheduler in enumerate(group)
                     if (name, replica) not in flights if (time := scheduler.next_arrival(engine.now)) is not None]
         horizon = min(arrivals, default=math.inf)
@@ -148,7 +170,7 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                 for state in scheduler.states:
                     if not state.done and state.first_token_ms is not None and state.location == "prefill":
                         state.location = "waiting_transfer"
-            if len(traces) < trace_limit:
+            if step.mode != "retire" and len(traces) < trace_limit:
                 traces.append({"pool": name, **step.to_dict()})
             del flights[key]
         for request, event in list(transfers.items()):
@@ -158,6 +180,8 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
                 del transfers[request]
     serving_end = engine.now
     engine.advance()
+    for ledger in memory.values():
+        ledger.flush_delayed_releases()
     rows, boundaries = serving_boundaries(
         states, cases["prefill"].slo,
         host_results=any(pool.serving_io.enabled for pool in execution.values()),

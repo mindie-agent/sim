@@ -138,6 +138,91 @@ def parser():
     alignment.add_argument("--max-predictions", type=int, default=512)
     alignment.add_argument("--max-conditions", type=int, default=4096)
     alignment.add_argument("--output", "-o")
+    compose = sub.add_parser("compose", help="deterministically synthesize a complete simulation Case")
+    compose.add_argument("--model", required=True)
+    compose.add_argument("--hardware", default="a3")
+    for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp", "--concurrency"):
+        compose.add_argument(flag, type=int, default=1)
+    compose.add_argument("--sp", action="store_true")
+    for flag in ("--num-devices", "--ranks-per-node", "--layers", "--max-num-seqs", "--max-num-batched-tokens", "--max-model-len"):
+        compose.add_argument(flag, type=int)
+    compose.add_argument("--quant")
+    compose.add_argument("--experts", type=int, dest="experts")
+    compose.add_argument("--top-k", type=int, dest="top_k")
+    compose.add_argument("--prompt-tokens", type=int, default=4096)
+    compose.add_argument("--output-tokens", type=int, default=128)
+    compose.add_argument("--prefix-tokens", type=int, default=0)
+    compose.add_argument("--async-scheduling", action=argparse.BooleanOptionalAction, default=False)
+    compose.add_argument("--graph-mode", choices=("none", "full", "piecewise"), default="none")
+    compose.add_argument("--mtp-tokens", type=int, default=0)
+    compose.add_argument("--mtp-accept", type=float, default=1.0)
+    compose.add_argument("--ttft-slo-ms", type=float, default=5000.0)
+    compose.add_argument("--tpot-slo-ms", type=float, default=50.0)
+    compose.add_argument("--output", "-o")
+    sweep = sub.add_parser("sweep", help="multi-topology parallel sharding and P/D disaggregation Pareto solver")
+    sweep.add_argument("case")
+    sweep.add_argument("--mode", choices=("topology", "pd"), default="topology")
+    sweep.add_argument("--decode-case")
+    sweep.add_argument("--num-devices", type=int)
+    sweep.add_argument("--sla-ms", type=float, default=30.0)
+    sweep.add_argument("--ttft-sla-ms", type=float, default=2000.0)
+    sweep.add_argument("--tpot-sla-ms", type=float, default=30.0)
+    sweep.add_argument("--context", type=int, default=32768)
+    sweep.add_argument("--prompt-tokens", type=int, default=4096)
+    sweep.add_argument("--output-tokens", type=int, default=1024)
+    sweep.add_argument("--output-budget", type=int, default=1024)
+    sweep.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    sweep.add_argument("--scope", choices=("body", "model"), default="body")
+    sweep.add_argument("--allow-pp", action="store_true")
+    sweep.add_argument("--allow-pcp", action="store_true")
+    sweep.add_argument("--output", "-o")
+    skew = sub.add_parser("skew", help="multi-DP barrier skew, MoE routing imbalance, and chunked-prefill interference")
+    skew.add_argument("case")
+    skew.add_argument("--mode", choices=("dp-barrier", "moe-imbalance", "chunked-prefill"), default="dp-barrier")
+    skew.add_argument("--dp-contexts", type=int, nargs="+")
+    skew.add_argument("--dp-sequences", type=int, nargs="+")
+    skew.add_argument("--context", type=int, default=32768)
+    skew.add_argument("--sequences", type=int, default=16)
+    skew.add_argument("--tokens-per-seq", type=int, default=1)
+    skew.add_argument("--imbalance-factor", type=float, default=1.0)
+    skew.add_argument("--redundant-experts-per-rank", type=int, default=0)
+    skew.add_argument("--chunk-tokens", type=int, nargs="+", default=[0, 512, 1024, 2048, 4096])
+    skew.add_argument("--tpot-sla-ms", type=float)
+    skew.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    skew.add_argument("--scope", choices=("body", "model"), default="body")
+    skew.add_argument("--output", "-o")
+    eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
+    eff.add_argument("case")
+    eff.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    eff.add_argument("--tokens", type=int, default=1)
+    eff.add_argument("--context", type=int, default=4096)
+    eff.add_argument("--sequences", type=int, default=1)
+    eff.add_argument("--scope", choices=("body", "model"), default="body")
+    for flag in ("--target-mbu", "--target-cube-mfu", "--target-vec-mfu", "--target-link-util", "--fixed-launch-us"):
+        eff.add_argument(flag, type=float)
+    eff.add_argument("--mode", choices=("clamp_to_target", "exact_target"), default="clamp_to_target")
+    eff.add_argument("--fit-targets", action="store_true")
+    eff.add_argument("--observed-durations")
+    eff.add_argument("--pmu")
+    eff.add_argument("--skip-graph", action="store_true")
+    eff.add_argument("--output", "-o")
+    sla = sub.add_parser("sla", help="SLA-constrained concurrency and hardware scaling solver")
+    sla.add_argument("case")
+    sla.add_argument("--sla-ms", type=float, default=30.0)
+    sla.add_argument("--context", type=int, default=126000)
+    sla.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    sla.add_argument("--scope", choices=("body", "model"), default="body")
+    sla.add_argument("--tokens-per-seq", type=int)
+    sla.add_argument("--emitted-tokens-per-seq", type=float)
+    sla.add_argument("--max-sequences-per-dp", type=int, default=256)
+    sla.add_argument("--output-budget", type=int, default=1024)
+    sla.add_argument("--target-mbu", type=float, default=0.80)
+    sla.add_argument("--target-cube-mfu", type=float, default=0.75)
+    sla.add_argument("--target-vec-mfu", type=float, default=0.65)
+    for flag in ("--hbm-bw-scale", "--cube-flops-scale", "--vector-ops-scale", "--link-bw-scale", "--hbm-capacity-scale"):
+        sla.add_argument(flag, type=float)
+    sla.add_argument("--scenarios")
+    sla.add_argument("--output", "-o")
     return root
 
 
@@ -269,6 +354,121 @@ def run(args):
     if args.command == "fit-service":
         from .observations.service_fitting import fit_service_curve
         return fit_service_curve(read_json(args.observations))
+    if args.command == "compose":
+        from .compose import compose_case
+        return compose_case(
+            model=args.model, hardware=args.hardware, tp=args.tp, dp=args.dp, ep=args.ep,
+            pp=args.pp, pcp=args.pcp, dcp=args.dcp, sp=args.sp,
+            num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
+            quant=args.quant, layers=args.layers, n_routed_experts=args.experts,
+            num_experts_per_tok=args.top_k, prompt_tokens=args.prompt_tokens,
+            output_tokens=args.output_tokens, concurrency=args.concurrency,
+            prefix_tokens=args.prefix_tokens, max_num_seqs=args.max_num_seqs,
+            max_num_batched_tokens=args.max_num_batched_tokens,
+            max_model_len=args.max_model_len, async_scheduling=args.async_scheduling,
+            graph_capture_mode=args.graph_mode, mtp_proposal_tokens=args.mtp_tokens,
+            mtp_acceptance_length=args.mtp_accept, ttft_slo_ms=args.ttft_slo_ms,
+            tpot_slo_ms=args.tpot_slo_ms,
+        )
+    if args.command == "sweep":
+        from .sweep import sweep_pd_disaggregation_ratios, sweep_topology_grid
+        case_data = read_json(args.case)
+        if args.mode == "pd":
+            decode_data = read_json(args.decode_case) if args.decode_case else case_data
+            return sweep_pd_disaggregation_ratios(
+                case_data, decode_data, total_dies=args.num_devices or 16,
+                prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
+                ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
+            )
+        return sweep_topology_grid(
+            case_data, num_devices=args.num_devices, sla_ms=args.sla_ms,
+            context=args.context, output_budget=args.output_budget,
+            phase=args.phase, scope=args.scope,
+            allow_pp=args.allow_pp, allow_pcp=args.allow_pcp,
+        )
+    if args.command == "skew":
+        from .prediction.skew_analysis import (
+            analyze_chunked_prefill_decode_interference,
+            analyze_moe_routing_imbalance,
+            analyze_multi_dp_barrier_skew,
+        )
+        case_data = read_json(args.case)
+        if args.mode == "moe-imbalance":
+            return analyze_moe_routing_imbalance(
+                case_data, context=args.context, sequences=args.sequences,
+                tokens=args.tokens_per_seq, expert_imbalance_factor=args.imbalance_factor,
+                eplb_redundant_experts=args.redundant_experts_per_rank,
+                phase=args.phase, scope=args.scope,
+            )
+        if args.mode == "chunked-prefill":
+            return analyze_chunked_prefill_decode_interference(
+                case_data, decode_sequences=args.sequences, decode_context=args.context,
+                prefill_chunk_tokens=tuple(args.chunk_tokens),
+                sla_tpot_ms=50.0 if args.tpot_sla_ms is None else args.tpot_sla_ms,
+                scope=args.scope,
+            )
+        return analyze_multi_dp_barrier_skew(
+            case_data, dp_contexts=tuple(args.dp_contexts) if args.dp_contexts else (args.context,),
+            dp_sequences=tuple(args.dp_sequences) if args.dp_sequences else args.sequences,
+            tokens=args.tokens_per_seq, phase=args.phase, scope=args.scope,
+        )
+    if args.command == "efficiency":
+        from .prediction.efficiency import analyze_network_efficiency, fit_efficiency_targets
+        case_data = read_json(args.case)
+        if args.fit_targets or any(
+            v is not None for v in (args.target_mbu, args.target_cube_mfu, args.target_vec_mfu, args.target_link_util)
+        ):
+            fit_res = fit_efficiency_targets(
+                case_data, phase=args.phase, tokens=args.tokens, context=args.context,
+                sequences=args.sequences, scope=args.scope,
+                target_mbu=0.80 if args.target_mbu is None else args.target_mbu,
+                target_cube_mfu=0.75 if args.target_cube_mfu is None else args.target_cube_mfu,
+                target_vec_mfu=0.65 if args.target_vec_mfu is None else args.target_vec_mfu,
+                target_link_util=args.target_link_util, fixed_launch_us=args.fixed_launch_us,
+                mode=args.mode,
+            )
+            return {**fit_res["baseline_analysis"], **fit_res, "schema": "mindie-sim.efficiency/1"}
+        return analyze_network_efficiency(
+            case_data, phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            observed_durations_ms=read_json(args.observed_durations) if args.observed_durations else None,
+            pmu_by_op=read_json(args.pmu) if args.pmu else None, run_graph=not args.skip_graph,
+        )
+    if args.command == "sla":
+        from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_hardware_sla_throughput
+        case_data = read_json(args.case)
+        has_custom_scale = any(
+            v is not None
+            for v in (args.hbm_bw_scale, args.cube_flops_scale, args.vector_ops_scale, args.link_bw_scale, args.hbm_capacity_scale)
+        )
+        if args.scenarios:
+            scenarios = read_json(args.scenarios)
+        elif has_custom_scale:
+            scenarios = [
+                {
+                    "id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0,
+                    "cube_flops_scale": 1.0, "vector_ops_scale": 1.0,
+                    "link_bw_scale": 1.0, "hbm_capacity_scale": 1.0,
+                },
+                {
+                    "id": "scaled", "label": "Custom Scaled",
+                    "hbm_bw_scale": 1.0 if args.hbm_bw_scale is None else args.hbm_bw_scale,
+                    "cube_flops_scale": 1.0 if args.cube_flops_scale is None else args.cube_flops_scale,
+                    "vector_ops_scale": 1.0 if args.vector_ops_scale is None else args.vector_ops_scale,
+                    "link_bw_scale": 1.0 if args.link_bw_scale is None else args.link_bw_scale,
+                    "hbm_capacity_scale": 1.0 if args.hbm_capacity_scale is None else args.hbm_capacity_scale,
+                },
+            ]
+        else:
+            scenarios = DEFAULT_SLA_SCENARIOS
+        return solve_hardware_sla_throughput(
+            case_data, sla_ms=args.sla_ms, context=args.context,
+            tokens_per_seq=args.tokens_per_seq, emitted_tokens_per_seq=args.emitted_tokens_per_seq,
+            max_sequences_per_dp=args.max_sequences_per_dp, phase=args.phase,
+            scope=args.scope, output_budget=args.output_budget, target_mbu=args.target_mbu,
+            target_cube_mfu=args.target_cube_mfu, target_vec_mfu=args.target_vec_mfu,
+            scenarios=scenarios,
+        )
     raise ValueError("unknown_command")
 
 
