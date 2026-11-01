@@ -85,6 +85,25 @@ def predict(
                 continue
             plans = {r: schedulers[r].schedule(engine.now) if not schedulers[r].done else None for r in cohort}
             if not any(plans.values()):
+                for r in cohort:
+                    if not schedulers[r].done and memory.has_delayed_releases(r):
+                        prep = execution.prepared.pop(r, None)
+                        sched_ms = execution.submission.scheduler_ms if execution.include_submission else 0.0
+                        comp_ms = execution.submission.completion_ms if execution.include_submission else 0.0
+                        sched_ev = engine.submit(
+                            f"{execution.namespace}r{r}:retire_schedule:{iterations}",
+                            {f"{execution.namespace}scheduler@r{r}": sched_ms},
+                            after=(prep,) if prep is not None else (),
+                            release=engine.now, owner=f"replica:{r}",
+                        )
+                        comp_ev = engine.submit(
+                            f"{execution.namespace}r{r}:retire_complete:{iterations}",
+                            after=(sched_ev,), latency=comp_ms, release=engine.now, owner=f"replica:{r}",
+                        )
+                        in_flight[r] = ScheduledIteration(
+                            r, schedulers[r].iteration, comp_ev, engine.now,
+                            "retire", 0, 0, None, "none", 0, {}, comp_ev, {}, {}, (),
+                        )
                 continue
             steps = submit_batch(case, schedulers, plans, execution, lower, engine.now)
             for replica, step in steps.items():
@@ -113,13 +132,14 @@ def predict(
                 continue
             schedulers[replica].commit(step.completion.time,
                                       {key: event.time for key, event in step.commits.items()})
-            if len(traces) < trace_limit:
+            if step.mode != "retire" and len(traces) < trace_limit:
                 traces.append(step.to_dict())
             del in_flight[replica]
     serving_end = engine.now
     # Async scheduling can leave an unused finite CPU preparation after an
     # admission failure. Drain actual work without extending the token window.
     engine.advance()
+    memory.flush_delayed_releases()
     states = [state for scheduler in schedulers for state in scheduler.states]
     rows, boundaries = serving_boundaries(
         states, case.slo, host_results=execution.serving_io.enabled,

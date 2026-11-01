@@ -173,6 +173,9 @@ class Hardware:
     dies_per_package: int = 1
     sku: str = ""
     assumptions: tuple[tuple[str, str], ...] = ()
+    transfer_channels: tuple[tuple[str, tuple[tuple[str, object], ...]], ...] = field(
+        default=(), compare=False, repr=False
+    )
 
     @property
     def compute_peaks(self):
@@ -286,7 +289,12 @@ class Hardware:
                    arch_family=raw.get("architecture", raw.get("arch_family", "generic")),
                    hardware_key=raw.get("hardware_key", raw.get("name", "")),
                    ranks_per_node=ranks_per_node, dies_per_package=package, sku=raw.get("sku", ""),
-                   assumptions=tuple(sorted(raw.get("assumptions", {}).items())))
+                   assumptions=tuple(sorted(raw.get("assumptions", {}).items())),
+                   transfer_channels=tuple(sorted(
+                       (str(k), tuple(sorted(v.items())))
+                       for k, v in (raw.get("transfer_channels") or {}).items()
+                       if isinstance(v, Mapping)
+                   )))
 
     def to_dict(self):
         return {"name": self.name, "architecture": self.arch_family, "hardware_key": self.hardware_key,

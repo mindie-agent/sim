@@ -502,14 +502,45 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
     return replace(parsed, machine=Hardware.from_mapping(machine_dict), runtime=replace(parsed.runtime, kernels=new_kernels))
 
 
-def _vram_max_sequences_per_dp(case: CaseSpec, *, context: int, tokens_per_seq: int, output_budget: int, hbm_capacity_scale: float = 1.0) -> int:
-    """Solve max concurrent sequences per DP replica jointly with batch-dependent workspace and KV."""
-    scaled, q_tokens = (scale_case_hardware(case, hbm_capacity_scale=hbm_capacity_scale) if hbm_capacity_scale != 1.0 else case), max(1, int(tokens_per_seq))
-    rt_cap, seq_len = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens)), max(1, context + max(q_tokens, output_budget))
+def _vram_max_sequences_per_dp(
+    case: CaseSpec, *, context: int, tokens_per_seq: int, output_budget: int,
+    hbm_capacity_scale: float = 1.0, emitted_tokens_per_seq: float | None = None,
+    async_scheduling: bool | None = None,
+) -> int:
+    """Solve max concurrent sequences per DP replica jointly with workspace, KV, and async delayed release."""
+    base_case = replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling))) if async_scheduling is not None else case
+    scaled = scale_case_hardware(base_case, hbm_capacity_scale=hbm_capacity_scale) if hbm_capacity_scale != 1.0 else base_case
+    q_tokens = max(1, int(tokens_per_seq))
+    emit_tokens = float(q_tokens) if emitted_tokens_per_seq is None else max(1e-6, float(emitted_tokens_per_seq))
+    rt_cap = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens))
+    probe_mem = Memory(scaled, workspace_tokens=q_tokens)
+    lookahead_tokens = probe_mem.async_in_flight_lookahead_steps * q_tokens
+    delayed_steps = probe_mem.async_delayed_release_steps
+    steps_per_wave = max(1, math.ceil(max(1, output_budget) / emit_tokens))
+    retiring_waves = max(1, math.ceil(delayed_steps / steps_per_wave)) if delayed_steps > 0 else 0
+    seq_len_active = max(1, context + max(q_tokens, output_budget) + lookahead_tokens)
+    seq_len_retiring = max(1, context + max(q_tokens, output_budget))
+    seq_len_wave = max(1, context + min(max(q_tokens, output_budget), max(1, delayed_steps) * q_tokens) + lookahead_tokens)
+    kv_active = probe_mem.cache_bytes(seq_len_active, padded=True)
+    kv_retiring = probe_mem.cache_bytes(seq_len_retiring, padded=True)
+    kv_wave = probe_mem.cache_bytes(seq_len_wave, padded=True)
 
     def fits(b: int) -> bool:
         mem = Memory(scaled, workspace_tokens=b * q_tokens)
-        return all(min(mem.capacity[r][st] for r in range(len(mem.capacity))) >= b * ps for st, ps in enumerate(mem.cache_bytes(seq_len, padded=True)))
+        if b >= 2 and delayed_steps > 0 and output_budget > 0:
+            staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
+            wave_delayed_b = retiring_waves * b
+            return all(
+                min(mem.capacity[r][st] for r in range(len(mem.capacity))) >= max(
+                    b * kv_active[st] + staggered_delayed_b * kv_retiring[st],
+                    b * kv_wave[st] + wave_delayed_b * kv_retiring[st],
+                )
+                for st in range(len(kv_active))
+            )
+        return all(
+            min(mem.capacity[r][st] for r in range(len(mem.capacity))) >= b * kv_active[st]
+            for st in range(len(kv_active))
+        )
 
     if not fits(1):
         return 0
@@ -584,7 +615,7 @@ def solve_hardware_sla_throughput(
 
     scaled_cases: dict[tuple[float, ...], CaseSpec] = {}
     graphs_by_b: dict[int, Any] = {}
-    vram_by_cap: dict[float, int] = {}
+    vram_by_cap: dict[float, tuple[int, int, int]] = {}
     graph_cache: dict[tuple[tuple[float, ...], int], tuple[Any, CaseSpec, dict[str, Any]]] = {}
     analysis_cache: dict[tuple[tuple[float, ...], int], dict[str, Any]] = {}
 
@@ -643,8 +674,13 @@ def solve_hardware_sla_throughput(
         nonlocal base_b_hint
         s_key = tuple(float(scen.get(k, 1.0)) for k in _SCALE_KEYS)
         if s_key[4] not in vram_by_cap:
-            vram_by_cap[s_key[4]] = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4])
-        b_vram, b1_ms = vram_by_cap[s_key[4]], eval_at(scen, s_key, 1, full=False)["step_ms"]
+            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False)
+            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True)
+            b_cfg = b_async if parsed.runtime.async_scheduling else b_sync
+            if parsed.runtime.memory:
+                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens)
+            vram_by_cap[s_key[4]] = (b_cfg, b_sync, b_async)
+        (b_vram, b_vram_sync, b_vram_async), b1_ms = vram_by_cap[s_key[4]], eval_at(scen, s_key, 1, full=False)["step_ms"]
         eff_max = min(b_max, domain_cap)
         if b1_ms > sla_ms:
             b_sla, eval_sla = 0, eval_at(scen, s_key, 1, full=True)
@@ -680,7 +716,9 @@ def solve_hardware_sla_throughput(
         tps_sla = (b_sla * dp * emit_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0
         return {
             "scenario_id": scen.get("id", "custom"), "label": scen.get("label", scen.get("id", "custom")), "scales": dict(zip(_SCALE_KEYS, s_key)),
-            "b_sla": b_sla, "b_vram_max": b_vram, "b_feasible": b_feas, "domain_max_b": domain_cap, "domain_limit_reason": domain_reason,
+            "b_sla": b_sla, "b_vram_max": b_vram, "b_vram_max_sync": b_vram_sync, "b_vram_max_async": b_vram_async,
+            "delta_b_vram_from_disabling_async": max(0, b_vram_sync - b_vram_async), "hbm_bound": bool(b_vram < b_sla),
+            "b_feasible": b_feas, "domain_max_b": domain_cap, "domain_limit_reason": domain_reason,
             "total_concurrency": b_sla * dp, "total_feasible_concurrency": b_feas * dp,
             "step_ms_at_b1": b1_ms, "tps_at_b1": (dp * emit_tokens * 1000.0) / b1_ms, "step_ms_at_sla": eval_sla["step_ms"], "tps_at_sla": tps_sla,
             "target_step_tps_at_sla": (b_sla * dp * q_tokens * 1000.0) / eval_sla["step_ms"] if b_sla > 0 else 0.0,
@@ -697,4 +735,20 @@ def solve_hardware_sla_throughput(
     for row in results:
         eff_tps, eff_feas = (row["tps_at_sla"] if base_r["tps_at_sla"] > 0 else row["tps_at_b1"]), (row["tps_feasible"] if base_r["tps_feasible"] > 0 else row["tps_at_b1"])
         row["tps_gain_vs_baseline"], row["tps_feasible_gain_vs_baseline"], row["concurrency_gain_vs_baseline"] = ((eff_tps / base_tps) if base_tps > 0 else 1.0), ((eff_feas / base_feas_tps) if base_feas_tps > 0 else 1.0), ((row["b_sla"] / base_b) if base_r["b_sla"] > 0 else (base_r["step_ms_at_b1"] / row["step_ms_at_b1"]))
-    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "dp": dp, "max_sequences_per_dp": b_max, "scenarios": results}
+    mem_async_b1 = Memory(replace(parsed, runtime=replace(parsed.runtime, async_scheduling=True)), workspace_tokens=q_tokens)
+    seq_sync_len = max(1, context + max(q_tokens, output_budget))
+    seq_async_len = max(1, seq_sync_len + mem_async_b1.async_in_flight_lookahead_steps * q_tokens)
+    async_mem_summary = {
+        "configured_async_scheduling": bool(parsed.runtime.async_scheduling),
+        "b_vram_max_sync": base_r["b_vram_max_sync"],
+        "b_vram_max_async": base_r["b_vram_max_async"],
+        "delta_b_vram_from_disabling_async": base_r["delta_b_vram_from_disabling_async"],
+        "delayed_release_steps_async": mem_async_b1.async_delayed_release_steps,
+        "in_flight_lookahead_tokens_async": mem_async_b1.async_in_flight_lookahead_steps * q_tokens,
+        "kv_bytes_per_seq_sync_per_stage": list(mem_async_b1.cache_bytes(seq_sync_len, padded=True)),
+        "kv_bytes_per_seq_async_per_stage": list(mem_async_b1.cache_bytes(seq_async_len, padded=True)),
+        "async_workspace_overhead_bytes_at_b1_per_stage": list(mem_async_b1.async_workspace),
+        "hbm_bound_at_baseline": bool(base_r["b_vram_max"] < base_r["b_sla"]),
+        "disabling_async_unlocks_concurrency": bool(base_r["b_vram_max_sync"] > base_r["b_vram_max_async"] and base_r["b_vram_max_async"] < base_r["b_sla"]),
+    }
+    return {"schema": "mindie-sim.hardware-sla/1", "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope, "timing_boundary": "target_body_only" if scope == "body" else "full_model_step", "tokens_per_seq": q_tokens, "emitted_tokens_per_seq": emit_tokens, "dp": dp, "max_sequences_per_dp": b_max, "async_scheduling_memory": async_mem_summary, "scenarios": results}

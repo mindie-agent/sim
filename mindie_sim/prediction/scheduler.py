@@ -261,7 +261,12 @@ class Scheduler:
             if q <= 0:
                 continue
             allocation = q + proposal
-            if not self.memory.resize(self.replica, state.request.request_id, state.computed + allocation):
+            lookahead = (
+                min(max(0, remaining - allocation), self.memory.async_in_flight_lookahead_steps * allocation)
+                if decode and self.memory.async_in_flight_lookahead_steps > 0
+                else 0
+            )
+            if not self.memory.resize(self.replica, state.request.request_id, state.computed + allocation + lookahead):
                 continue
             if not state.started:
                 state.started = True
@@ -283,9 +288,9 @@ class Scheduler:
             if not decode:
                 input_budget -= q
         if not views:
-            # A PD transfer owns source cache until completion. That event can
-            # release capacity without evicting or failing a waiting request.
-            if defer_capacity_failure:
+            # A PD transfer or async delayed release owns cache until completion.
+            # That event can release capacity without evicting or failing a waiting request.
+            if defer_capacity_failure or self.memory.has_delayed_releases(self.replica):
                 return None
             running = [state for state in arrived if state.started]
             if len(running) > 1:
@@ -313,17 +318,23 @@ class Scheduler:
         return result
 
     def commit(self, at_ms: float, times: Mapping[str, float] | None = None) -> None:
+        self.memory.step_delayed_releases(self.replica)
         for view in self.in_flight:
             state = self.by_id[view.request_id]
             state.commit(view, (times or {}).get(view.request_id, at_ms))
             if state.done:
-                self.memory.release(self.replica, view.request_id)
+                if self.memory.async_delayed_release_steps > 0 and not self.done:
+                    self.memory.defer_release(self.replica, view.request_id)
+                else:
+                    self.memory.release(self.replica, view.request_id)
                 successor = self.successors.get(view.request_id)
                 if successor is not None and not self.case.runtime.serving_io:
                     successor.release_ms = max(successor.request.arrival_ms,
                                                state.finish_ms + successor.request.gap_ms)
             else:
                 self.memory.resize(self.replica, view.request_id, state.computed)
+        if self.done:
+            self.memory.flush_delayed_releases(self.replica)
         self.in_flight = ()
 
     def next_runtime(self, plan: IterationPlan):
