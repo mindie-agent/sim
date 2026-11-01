@@ -7,10 +7,29 @@
 [Side-Effect Policy] Writes only the explicitly writable PrimitiveStore.
 """
 from mindie_sim.prediction.primitives import PrimitiveKey
-from .store import ProfilerCatalogue
+from .a5_comm_calibration import (
+    A5_ARCH_FAMILY, A5_HARDWARE_KEY, A5_SKU,
+    EMBEDDED_A5_CAMPAIGNS, EMBEDDED_A5_MC2_CAMPAIGNS,
+    A5CommCalibrationBundle, bind_service_curve, build_a5_comm_recipe,
+    build_a5_followup_manifest, compute_a5_contention_slowdown,
+    evaluate_a5_mc2_chains, fit_a5_service_curves, ingest_a5_campaign_data,
+    resolve_expansion_regime, to_service_regime,
+)
+
+
+__all__ = [
+    "A5_ARCH_FAMILY", "A5_HARDWARE_KEY", "A5_SKU",
+    "EMBEDDED_A5_CAMPAIGNS", "EMBEDDED_A5_MC2_CAMPAIGNS",
+    "A5CommCalibrationBundle", "bind_service_curve", "build_a5_comm_recipe",
+    "build_a5_followup_manifest", "compute_a5_contention_slowdown",
+    "evaluate_a5_mc2_chains", "fit_a5_service_curves", "import_profiler",
+    "ingest_a5_campaign_data", "resolve_expansion_regime", "to_service_regime",
+]
 
 
 def import_profiler(catalogue, store, bindings, *, max_samples=1000):
+    from .store import ProfilerCatalogue
+
     imported = 0
     with ProfilerCatalogue(catalogue) as source:
         for binding in bindings:

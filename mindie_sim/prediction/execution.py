@@ -529,6 +529,7 @@ class Execution:
             _freeze_key(meta.get("implementation")),
             _freeze_key(meta.get("service_axes")),
             bool(meta.get("hccl_selection")),
+            _freeze_key(meta),
         )
         sid = self._service_identity_cache.get(sid_key)
         if sid is None:
