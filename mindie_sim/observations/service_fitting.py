@@ -61,9 +61,16 @@ def fit_service_curve(packet):
     knots = tuple((work, median(median(values) for values in runs.values()))
                   for work, runs in sorted(groups.items()))
     startup, rate = nonnegative_affine(knots)
+    # A multi-regime ladder (small OneShot plateau + asymptotic large-payload
+    # slope) can put the affine intercept above the smallest measured duration.
+    # The curve startup must remain below every served duration, so cap it at
+    # the tightest per-knot residual. The affine reference keeps the raw fit.
+    curve_startup = startup
+    if curve_startup >= min(t for _, t in knots):
+        curve_startup = max(0.0, min(t - x / rate for x, t in knots))
     model = ServiceCurve(
         packet["resource"], packet["work_unit"], packet["identity"], packet["boundary"],
-        packet["active_units"], startup, knots, {
+        packet["active_units"], curve_startup, knots, {
             **packet.get("provenance", {}),
             "training_sources": sorted(training_sources),
             "training_trials": sum(len(runs) for runs in groups.values()),

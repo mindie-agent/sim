@@ -20,6 +20,18 @@ from mindie_sim.schema.common import ModelingError
 from .program import KernelProgram, ResourceEnvelope, Stage
 
 
+_COMMUNICATION_FAMILIES = frozenset({
+    "collective", "alltoall", "alltoallv", "allreduce", "allgather",
+    "all_to_all", "all_to_allv", "all_reduce", "all_gather",
+    "reduce_scatter", "reducescatter", "broadcast", "send", "recv",
+    "send_recv", "p2p", "p2p_send_recv"})
+_COMMUNICATION_KEYS = (
+    "collective", "a5_collective", "group_axis", "steps", "world_size",
+    "group_size", "ranks", "group_ranks", "placement_scope", "p2p_pair",
+    "expansion_mode", "expansion_regime", "algorithm", "protocol",
+    "stack", "cann")
+
+
 def service_identity(case, op, scope="none", *, device=None):
     metadata = dict(op.metadata)
     device = device or case.machine.dies[
@@ -40,19 +52,37 @@ def service_identity(case, op, scope="none", *, device=None):
         "layout": op.layout, "replay_scope": scope or "none",
         "axes": metadata.get("service_axes", {}),
     }
-    if (op.family in {"collective", "alltoall", "alltoallv", "allreduce", "allgather",
-                      "reduce_scatter", "broadcast", "send", "recv"}
-            or metadata.get("hccl_selection")):
+    if (op.family in _COMMUNICATION_FAMILIES
+            or metadata.get("hccl_selection")
+            or any(key in metadata for key in _COMMUNICATION_KEYS)):
         # A native communication envelope includes the declared physical
         # transport domain. Equal SKU/local pipes do not identify changed
         # link bandwidth, latency, framing, hops or rank placement.
+        parallel = case.runtime.parallel
         identity["transport"] = {
             "links": [link.to_dict() for link in case.machine.links],
             "placements": [{"rank": die.rank, "node": die.node, "package": die.package}
                            for die in case.machine.dies],
             "ranks_per_node": case.machine.ranks_per_node,
             "dies_per_package": case.machine.dies_per_package,
+            # The declared parallel decomposition decides which ranks share a
+            # link.  A curve bound at one axis split cannot describe another,
+            # even when the SKU and die set are identical.
+            "parallel": {
+                "tp": parallel.tp, "dp": parallel.dp, "pp": parallel.pp,
+                "ep": parallel.ep, "cp": parallel.cp, "pcp": parallel.pcp,
+                "sp": bool(getattr(parallel, "sp", dict(
+                    getattr(case.runtime, "metadata", ()) or ()).get("sp", False))),
+            },
         }
+        for key in _COMMUNICATION_KEYS:
+            if key in metadata:
+                identity["transport"][key] = metadata[key]
+        if (op.family in _COMMUNICATION_FAMILIES
+                and not metadata.get("device_kernel_group")
+                and "collective" not in identity["transport"]
+                and "a5_collective" not in identity["transport"]):
+            identity["transport"]["collective"] = op.family
     return json.loads(json.dumps(identity, sort_keys=True, allow_nan=False))
 
 
@@ -164,6 +194,38 @@ class ResourceService:
             if len(portions) != 1 or next(iter(portions)) != curve.identity["dtype"]:
                 raise ModelingError("service_curve_requires_one_compute_precision")
             work = Work(matrix=portions)
+        elif role == "link" and role not in context.resource_names:
+            expected = {name: val for name, val in context.work.items()
+                        if name not in context.resource_names.values()}
+            if not expected or expected != context.work:
+                raise ModelingError("service_curve_requires_one_explicit_resource_phase")
+            owner_count = context.resource_units.get(
+                context.physical_role(role), context.core_count)
+            active_units = len(self.units) if self.units else owner_count
+            if active_units != curve.active_units:
+                raise ModelingError("service_active_units_mismatch")
+            estimate = curve.estimate(amount)
+            if estimate is None and self.outside_domain == "error":
+                raise ModelingError(f"service_work_outside_domain:{amount}")
+            caps = ({res: val / estimate.service_ms for res, val in expected.items()}
+                    if estimate else {})
+            capacity_limited = estimate is not None and any(
+                caps[res] > context.rates[res] * active_units / owner_count
+                for res in expected)
+            if context.record_service is not None:
+                context.record_service(
+                    curve, estimate.basis if estimate else "analytic_outside_domain",
+                    capacity_limited=capacity_limited,
+                )
+            if estimate is None:
+                return KernelProgram((
+                    Stage("setup", latency=context.setup_ms),
+                    Stage("service", context.work, after=("setup",)),
+                ), minimum_ms=context.minimum_ms)
+            return KernelProgram((
+                Stage("setup", latency=context.setup_ms + estimate.startup_ms),
+                Stage("service", context.work, after=("setup",), caps=caps),
+            ), minimum_ms=context.minimum_ms)
         else:
             work = Work(resources={role: amount})
         expected = context.bind(work)
