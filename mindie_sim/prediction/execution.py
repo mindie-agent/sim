@@ -204,7 +204,7 @@ class Execution:
         engine: Engine | None = None, namespace: str = "",
         include_submission: bool = True, on_operator=None,
         include_serving_io: bool = False,
-        client_tails=None,
+        client_tails=None, memory_policy=None,
     ):
         self.case, self.cost = case, cost
         self.namespace = namespace
@@ -219,6 +219,9 @@ class Execution:
         self.submission_source = "api.submission" if submission is not None else "runtime.submission"
         self.serving_io = ServingIO(case.runtime.serving_io if include_serving_io else {},
                                     namespace, case.runtime.parallel.dp, client_tails)
+        from .offload import offload_resources, resolve_case_offload_policy
+        self.offload_policy = resolve_case_offload_policy(case, memory_policy)
+        self._offload_memory = None
         self.step_summary = StepSummary()
         self.stage_names: dict[tuple[int, int], dict[str, str]] = {}
         self.stage_dies: dict[tuple[int, int], tuple[Any, ...]] = {}
@@ -229,6 +232,8 @@ class Execution:
         self.schedules = {}
         resources, pools, pool_units = [], {}, {}
         resources.extend(self.serving_io.resources())
+        resources.extend(offload_resources(
+            self.offload_policy, namespace, case.runtime.parallel.dp, case.runtime.parallel.pp))
         p = case.runtime.parallel
         width = p.tp * p.pcp
         for replica in range(p.dp):
@@ -610,6 +615,13 @@ class Execution:
         self.schedules[replica] = schedule
         prepared, input_ready = self.serving_io.input(self, prefix, replica, schedule, work)
         graph_launch: dict[int, Event] = {}
+        layer_entries: dict[int, Event] = {}
+        expert_layer_events: dict[tuple[int, int], Event | None] = {}
+        last_expert_done: dict[int, Event] = {}
+        kv_layer_events: dict[tuple[int, int], tuple[Event, ...]] = {}
+        last_kv_done: dict[int, Event] = {}
+        kv_writeback_layers: set[tuple[int, int]] = set()
+        kv_writeback_events: list[Event] = []
         physical_ops = self.recipes.expand(work.ops)
         from .kernel_groups import KernelGroups, declaration
         kernel_groups = KernelGroups(self, physical_ops, replica, prefix)
@@ -620,6 +632,27 @@ class Execution:
             name = prefix + ":" + op.op_id
             names = self.stage_names[stage_key]
             deps = [input_ready, *(ids[key] for key in op.deps)]
+            if self.offload_policy is not None and self.offload_policy.expert_ddr_ratio > 0.0:
+                from .offload import is_routed_expert_entry_op, schedule_expert_layer_offload
+                if is_routed_expert_entry_op(op):
+                    exp_key = (op.stage, op.layer)
+                    if exp_key not in expert_layer_events:
+                        expert_layer_events[exp_key] = schedule_expert_layer_offload(
+                            self, prefix, replica, op.stage, op.layer, work.valid_tokens,
+                            last_expert_done.get(op.stage, input_ready), op=op)
+                    if expert_layer_events[exp_key] is not None:
+                        deps.append(expert_layer_events[exp_key])
+            if (self.offload_policy is not None
+                    and (self.offload_policy.kvc_ddr_ratio + self.offload_policy.kvc_ssd_ratio) > 0.0):
+                from .offload import is_kv_or_state_entry_op, schedule_kv_layer_offload
+                if is_kv_or_state_entry_op(op):
+                    kv_key = (op.stage, op.layer)
+                    if kv_key not in kv_layer_events:
+                        kv_layer_events[kv_key] = schedule_kv_layer_offload(
+                            self, prefix, replica, op.stage, op.layer, work,
+                            input_ready, tuple(deps), layer_entries,
+                            prev_kv_done=last_kv_done.get(op.stage))
+                    deps.extend(kv_layer_events[kv_key])
             deps.extend(kernel_groups.entry_dependencies(op, ids))
             stream_key = replica, op.stage, op.stream or "main"
             stream_tail = kernel_groups.stream_tail(op, stream_key)
@@ -651,6 +684,8 @@ class Execution:
                         graph_launch[capture_key] = launch
                 deps.append(launch)
             ready = engine.submit(name + ":ready", after=tuple(deps) or (schedule,), owner=owner)
+            if op.layer >= 0 and op.layer not in layer_entries:
+                layer_entries[op.layer] = ready
             ready = kernel_groups.phase_ready(op, ready, name)
             recipe_name = op.recipe or type(recipe).__name__
             self.recipes_used[recipe_name] = self.recipes_used.get(recipe_name, 0) + 1
@@ -667,6 +702,20 @@ class Execution:
                 complete = self._start_program(context, recipe, name, ready, owner=owner)
             complete = kernel_groups.finish(op, context, recipe, complete, stream_key)
             ids[op.op_id] = complete
+            if self.offload_policy is not None and self.offload_policy.expert_ddr_ratio > 0.0:
+                from .offload import is_routed_expert_entry_op
+                if is_routed_expert_entry_op(op) or op.recipe in {"grouped_down", "balanced_grouped_down"}:
+                    last_expert_done[op.stage] = complete
+            if (self.offload_policy is not None
+                    and (self.offload_policy.kvc_ddr_ratio + self.offload_policy.kvc_ssd_ratio) > 0.0):
+                from .offload import is_kv_or_state_entry_op, schedule_kv_layer_writeback
+                if is_kv_or_state_entry_op(op):
+                    last_kv_done[op.stage] = complete
+                    wb_key = (op.stage, op.layer)
+                    if wb_key not in kv_writeback_layers:
+                        kv_writeback_layers.add(wb_key)
+                        kv_writeback_events.extend(schedule_kv_layer_writeback(
+                            self, prefix, replica, op.stage, op.layer, work, complete))
             if self.on_operator is not None:
                 self.on_operator(original, replica, "JointNativeService" if context.joint_native_service
                                  is not None else type(recipe).__name__, ready, complete)
@@ -674,9 +723,17 @@ class Execution:
                 commits.update((request, complete) for request in op.requests)
             for key in self.work:
                 self.work[key] += float(getattr(op, key))
-        device_complete = engine.submit(prefix + ":device_complete",
-                                        after=tuple(ids[op.op_id] for op in physical_ops) or (input_ready,),
-                                        owner=f"replica:{replica}")
+        offload_tails: tuple[Event, ...] = tuple(
+            ev for evs in kv_layer_events.values() for ev in evs
+        ) + tuple(kv_writeback_events)
+        if self.offload_policy is not None and not offload_tails:
+            from .offload import schedule_kv_iteration_offload
+            offload_tails = schedule_kv_iteration_offload(
+                self, prefix, replica, work, input_ready, physical_ops, ids,
+                scheduled_layers=set(kv_layer_events) | kv_writeback_layers)
+        device_complete = engine.submit(
+            prefix + ":device_complete", owner=f"replica:{replica}",
+            after=(tuple(ids[op.op_id] for op in physical_ops) + offload_tails) or (input_ready,))
         completion = engine.submit(prefix + ":complete", after=(device_complete,),
                                    latency=self.submission.completion_ms if self.include_submission else 0,
                                    owner=f"replica:{replica}")

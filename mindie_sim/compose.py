@@ -6,8 +6,9 @@
   mappings alongside explicit parallelism, workload, runtime, and SLO inputs.
 
 [Invariants]
-  * All hardware SKUs resolve against registered Ascend profiles; unknown SKUs
-    raise ``ModelingError("unknown_hardware_sku:...")``.
+  * Hardware SKUs resolve against registered public Ascend and NVIDIA profiles;
+    topology aliases only add an explicit multi-tier preset. Unknown SKUs raise
+    ``ModelingError("unknown_hardware_sku:...")``.
   * Parallelism dimensions and structural overrides are validated explicitly;
     invalid dimensions raise ``ModelingError`` or ``ValueError`` without silent
     fallback.
@@ -30,8 +31,13 @@ from pathlib import Path
 from typing import Any
 
 from mindie_sim.backends.ascend import (
+    ASCEND_TOPOLOGY_PRESETS,
     materialize as materialize_ascend,
     profiles as ascend_profiles,
+)
+from mindie_sim.backends.nvidia import (
+    materialize as materialize_nvidia,
+    profiles as nvidia_profiles,
 )
 from mindie_sim.catalog.specs import build_model_spec
 from mindie_sim.catalog.types import QuantSpec
@@ -56,6 +62,27 @@ HARDWARE_ALIASES: dict[str, str] = {
     "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
     "910_9382": "Ascend910_9382",
     "a5": "Ascend910_9599", "950": "Ascend910_9599", "910_9599": "Ascend910_9599",
+    "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
+    "b300": "NVIDIA_B300",
+    "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
+    "800i-a3-8p": "Ascend910_9392", "800i-a3-16p": "Ascend910_9392",
+    "a3-pod": "Ascend910_9392",
+    "a5-pod-dt": "Ascend950DT_9581", "a5-pod-pr": "Ascend950PR_9579",
+    "a5-server-dt": "Ascend950DT_9581", "a5-server-pr": "Ascend950PR_9579",
+    "a5-server-pr-pcie-16p": "Ascend950PR_9579",
+}
+
+HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
+    "800i-a2": ("Ascend910B4", "a2_standard"),
+    "800i-a3": ("Ascend910_9392", "a3_16p"),
+    "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
+    "800i-a3-16p": ("Ascend910_9392", "a3_16p"),
+    "a3-pod": ("Ascend910_9392", "a3_superpod"),
+    "a5-pod-dt": ("Ascend950DT_9581", "a5_pod"),
+    "a5-pod-pr": ("Ascend950PR_9579", "a5_pod"),
+    "a5-server-dt": ("Ascend950DT_9581", "a5_server"),
+    "a5-server-pr": ("Ascend950PR_9579", "a5_server"),
+    "a5-server-pr-pcie-16p": ("Ascend950PR_9579", "a5_pcie_16p"),
 }
 
 _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
@@ -89,7 +116,7 @@ def resolve_hardware_sku(hardware: str) -> str:
     """Resolve a hardware alias or exact SKU name against registered profiles."""
     if not isinstance(hardware, str) or not hardware.strip():
         raise ModelingError(f"unknown_hardware_sku:{hardware}")
-    reg = _ensure_registered_profiles()
+    reg = {**_ensure_registered_profiles(), **nvidia_profiles()}
     raw = hardware.strip()
     lower = raw.lower()
     if lower in HARDWARE_ALIASES:
@@ -101,7 +128,47 @@ def resolve_hardware_sku(hardware: str) -> str:
     for registered_sku in reg:
         if registered_sku.lower() == lower:
             return registered_sku
+    from mindie_sim.custom_hardware import resolve_custom_hardware_sku
+    custom = resolve_custom_hardware_sku(raw)
+    if custom is not None:
+        return str(custom["sku"])
     raise ModelingError(f"unknown_hardware_sku:{hardware}")
+
+
+def _hardware_backend(sku: str) -> str:
+    if sku in nvidia_profiles():
+        return "nvidia"
+    if sku in _ensure_registered_profiles():
+        return "ascend"
+    from mindie_sim.custom_hardware import resolve_custom_hardware_sku
+    if resolve_custom_hardware_sku(sku) is not None:
+        return "custom"
+    raise ModelingError(f"unknown_hardware_sku:{sku}")
+
+
+def _resolve_hardware(hardware: str | Mapping[str, Any]) -> tuple[str, str, str]:
+    """Return the canonical SKU, vendor adapter and any alias topology preset."""
+    if isinstance(hardware, Mapping):
+        raw = dict(hardware)
+        requested = raw.get("sku", "a3")
+        preset = str(raw.get("topology_preset")) if raw.get("topology_preset") else ""
+        lower_req = str(requested).strip().lower()
+        if lower_req in HARDWARE_TOPOLOGY_ALIASES:
+            sku, alias_preset = HARDWARE_TOPOLOGY_ALIASES[lower_req]
+            return sku, _hardware_backend(sku), (preset or alias_preset)
+        try:
+            sku = resolve_hardware_sku(str(requested))
+            return sku, _hardware_backend(sku), preset
+        except ModelingError:
+            if any(k in raw for k in ("archetype", "hbm_gb", "hbm_bw_gbps", "cube_fp16_tflops")):
+                return str(requested).strip() or "CUSTOM_INLINE_SKU", "custom", preset
+            raise
+    lower = str(hardware).strip().lower()
+    if lower in HARDWARE_TOPOLOGY_ALIASES:
+        sku, preset = HARDWARE_TOPOLOGY_ALIASES[lower]
+        return sku, _hardware_backend(sku), preset
+    sku = resolve_hardware_sku(str(hardware))
+    return sku, _hardware_backend(sku), ""
 
 
 def _read_config_json(path: Path) -> dict[str, Any]:
@@ -253,6 +320,21 @@ def compose_case(
     mtp_acceptance_length: float = 1.0,
     ttft_slo_ms: float = 5000.0,
     tpot_slo_ms: float = 50.0,
+    inter_node_bw_gbps: float | None = None,
+    intra_node_bw_gbps: float | None = None,
+    intra_package_bw_gbps: float | None = None,
+    inter_node_bw_util: float | None = None,
+    intra_node_bw_util: float | None = None,
+    intra_package_bw_util: float | None = None,
+    inter_node_latency_us: float | None = None,
+    intra_node_latency_us: float | None = None,
+    intra_package_latency_us: float | None = None,
+    topology_preset: str | None = None,
+    superpod_size: int | None = None,
+    superpod_bw_gbps: float | None = None,
+    inter_pod_bw_gbps: float | None = None,
+    intra_bw_4p_gbps: float | None = None,
+    intra_bw_8p_gbps: float | None = None,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -272,22 +354,99 @@ def compose_case(
 
     required_devices = dp * tp * pp * pcp
     hw_raw = dict(hardware) if isinstance(hardware, Mapping) else {}
-    sku = resolve_hardware_sku(str(hw_raw.get("sku", "a3")) if hw_raw else str(hardware))
+    sku, backend, alias_preset = _resolve_hardware(hardware)
+    preset = str(topology_preset or alias_preset or hw_raw.get("topology_preset") or "")
+    if preset and backend != "ascend":
+        raise ModelingError(f"hardware_topology_preset_unsupported:{backend}:{preset}")
+    if preset and preset not in ASCEND_TOPOLOGY_PRESETS:
+        raise ModelingError(f"ascend_topology_preset_unknown:{preset}")
+    preset_defaults = ASCEND_TOPOLOGY_PRESETS.get(preset, {})
     resolved_devices = int(
         num_devices if num_devices is not None else hw_raw.get("num_devices", required_devices)
     )
     if resolved_devices < required_devices:
         raise ModelingError(f"insufficient_num_devices:{resolved_devices}:required:{required_devices}")
     default_rpn = min(resolved_devices, 16 if sku.startswith("Ascend910_93") else 8)
+    if preset_defaults:
+        # A preset owns its topology geometry even when fewer ranks are placed;
+        # placement then stays on the first declared node.
+        default_rpn = int(preset_defaults.get("ranks_per_node", default_rpn))
     resolved_rpn = int(
         ranks_per_node if ranks_per_node is not None else hw_raw.get("ranks_per_node", default_rpn)
     )
-    machine_input = {**hw_raw, "sku": sku, "num_devices": resolved_devices, "ranks_per_node": resolved_rpn}
-    machine = (
-        machine_input
-        if "device" in machine_input and "links" in machine_input
-        else materialize_ascend(machine_input)
-    )
+    network: dict[str, Any] = {}
+    for kind, value in (
+        ("inter_node", inter_node_bw_gbps),
+        ("intra_node", intra_node_bw_gbps),
+        ("intra_package", intra_package_bw_gbps),
+    ):
+        if value is not None:
+            # compose_case declares GB/s; the adapter's convenience alias uses
+            # bytes/s to retain that unit independently of its legacy Gb/s path.
+            network[f"{kind}_bw_bytes_per_s"] = float(value) * 1e9
+    for name, value in (
+        ("inter_node_bw_util", inter_node_bw_util),
+        ("intra_node_bw_util", intra_node_bw_util),
+        ("intra_package_bw_util", intra_package_bw_util),
+        ("inter_node_latency_us", inter_node_latency_us),
+        ("intra_node_latency_us", intra_node_latency_us),
+        ("intra_package_latency_us", intra_package_latency_us),
+        ("superpod_size", superpod_size),
+        ("superpod_bw_gbps", superpod_bw_gbps),
+        ("inter_pod_bw_gbps", inter_pod_bw_gbps),
+        ("intra_bw_4p_gbps", intra_bw_4p_gbps),
+        ("intra_bw_8p_gbps", intra_bw_8p_gbps),
+    ):
+        if value is not None:
+            network[name] = value
+    machine_input = {**hw_raw, **network, "sku": sku,
+                     "num_devices": resolved_devices, "ranks_per_node": resolved_rpn}
+    if preset:
+        machine_input["topology_preset"] = preset
+    if "device" in machine_input and "links" in machine_input:
+        from mindie_sim.schema.hardware import Link, apply_network_overrides
+        parsed_links = tuple(
+            Link.from_mapping(l, default_members=range(resolved_devices))
+            for l in machine_input["links"]
+        )
+        parsed_links = apply_network_overrides(parsed_links, network)
+        machine = {**machine_input, "links": [l.to_dict() for l in parsed_links]}
+    elif backend == "custom":
+        from mindie_sim.custom_hardware import (
+            build_custom_hardware_machine,
+            resolve_custom_hardware_sku,
+        )
+        custom_spec = resolve_custom_hardware_sku(sku) or {}
+        custom_overrides = {
+            k: v for k, v in (
+                ("ranks_per_node", ranks_per_node),
+                ("inter_node_bw_gbps", inter_node_bw_gbps),
+                ("intra_node_bw_gbps", intra_node_bw_gbps),
+                ("intra_package_bw_gbps", intra_package_bw_gbps),
+                ("inter_node_bw_util", inter_node_bw_util),
+                ("intra_node_bw_util", intra_node_bw_util),
+                ("intra_package_bw_util", intra_package_bw_util),
+                ("inter_node_latency_us", inter_node_latency_us),
+                ("intra_node_latency_us", intra_node_latency_us),
+                ("intra_package_latency_us", intra_package_latency_us),
+                ("superpod_size", superpod_size),
+                ("superpod_bw_gbps", superpod_bw_gbps),
+                ("inter_pod_bw_gbps", inter_pod_bw_gbps),
+                ("intra_bw_4p_gbps", intra_bw_4p_gbps),
+                ("intra_bw_8p_gbps", intra_bw_8p_gbps),
+            ) if v is not None
+        }
+        merged_spec = {**custom_spec, **hw_raw, "sku": sku}
+        merged_spec.pop("num_devices", None)
+        machine = build_custom_hardware_machine(
+            merged_spec, num_devices=resolved_devices, **custom_overrides,
+        )
+    elif backend == "nvidia":
+        machine = materialize_nvidia(machine_input)
+    else:
+        machine = materialize_ascend(machine_input)
+    if preset:
+        machine = {**machine, "topology_preset": preset}
 
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
@@ -386,4 +545,5 @@ def compose_case(
     return case_dict
 
 
-__all__ = ["HARDWARE_ALIASES", "compose_case", "resolve_hardware_sku"]
+__all__ = ["HARDWARE_ALIASES", "HARDWARE_TOPOLOGY_ALIASES",
+           "compose_case", "resolve_hardware_sku"]

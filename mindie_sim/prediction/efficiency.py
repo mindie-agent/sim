@@ -76,6 +76,25 @@ def _validate_efficiency_param(name: str, value: float | None) -> None:
         raise ValueError(f"efficiency_target_must_be_in_0_1:{name}={value}")
 
 
+def _resolve_link_bw_bytes_per_ms(case: CaseSpec, scope: str) -> float:
+    """Effective machine-wide link bandwidth in bytes/ms (slowest configured link)."""
+    links = parse_case(case).machine.links
+    if not links:
+        return 0.0
+    return float(min(link.capacity_bytes_per_ms for link in links))
+
+
+def _resolve_link_peak_bw_bytes_per_ms(case: CaseSpec, scope: str) -> float:
+    """Peak machine-wide link bandwidth before configured utilization is applied."""
+    links = parse_case(case).machine.links
+    if not links:
+        return 0.0
+    return float(min(
+        getattr(link, "effective_peak_capacity_bytes_per_ms", link.capacity_bytes_per_ms)
+        for link in links
+    ))
+
+
 def _role_scale_factor(role: str, *, hbm_bw_scale: float, cube_flops_scale: float, vector_ops_scale: float, link_bw_scale: float) -> float:
     r = str(role or "").strip()
     if r in _HBM_ROLES or r.startswith(("hbm", "mte2", "mte3", "l2")):
@@ -210,6 +229,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
             cv_overlap_ratio = _clamp((denom_comp - max(duration_ms - fixed_ms, max(t_cube_ideal_ms, t_vec_ideal_ms))) / min(t_cube_ideal_ms, t_vec_ideal_ms), 0.0, 1.0)
     return {
         "physical_id": row.get("physical_id", ""), "op_id": op.get("op_id", ""), "family": op.get("family", ""), "recipe": op.get("recipe", ""),
+        "structure_block": str(dict(op.get("metadata") or ()).get("structure_block", "")),
         "program": row.get("program", ""), "phase": op.get("phase", ""), "stage": stage, "layer": int(op.get("layer", 0)), "dtype": dtype,
         "local_shape": tuple(op.get("local_shape") or ()), "occurrences": count, "duration_ms": duration_ms, "total_ms": total_ms,
         "fixed_ms": fixed_ms, "minimum_ms": minimum_ms, "work_basis": "analytical_reference" if has_jn else "executed_service",
@@ -493,7 +513,7 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
                 elif svc_spec.get("issue_ns") is not None:
                     svc_spec["issue_ns"] = float(svc_spec["issue_ns"]) / sf
     for lnk in machine_dict.get("links", ()):
-        for lk in ("capacity_bytes_per_ms", "switch_capacity_bytes_per_ms"):
+        for lk in ("capacity_bytes_per_ms", "switch_capacity_bytes_per_ms", "peak_capacity_bytes_per_ms"):
             if lnk.get(lk) is not None:
                 lnk[lk] = float(lnk[lk]) * link_bw_scale
     new_kernels = deepcopy(parsed.runtime.kernels)

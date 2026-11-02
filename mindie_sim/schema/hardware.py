@@ -3,17 +3,19 @@
 [Role] Describe compute rates, memory, buffers, submission and physical links.
 [Invariants] Vendor names are labels. The declared resource graph, rates and
   storage capacities determine execution. Precision peaks are never inferred
-  from a vendor or a model name.
+  from a vendor or a model name. A link's effective capacity is always
+  ``peak_capacity * bw_utilization``; serialized links omit the utilization
+  keys when utilization is unity so calibration identities stay stable.
 [Timeouts & Locks] Pure metadata parsing, no driver calls or device contexts.
 [Side-Effect Policy] Immutable input records.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import math
 from typing import Mapping
 
-from .common import ModelingError
+from .common import ModelingError, _positive_float, _unknown
 from .device_input import machine_device_defaults, merge_device_inputs
 from .invocation import InvocationTiming
 from .compute_arch import ComputeArchSpec
@@ -123,6 +125,8 @@ class Link:
     switch_hops: int = 0
     switch_hop_latency_us: float = 0
     switch_capacity_bytes_per_ms: float | None = None
+    bw_utilization: float = 1.0
+    peak_capacity_bytes_per_ms: float | None = None
 
     def __post_init__(self):
         for field_name, minimum in (("transaction_bytes", 1), ("alignment_bytes", 1),
@@ -142,24 +146,265 @@ class Link:
                 and (not math.isfinite(self.switch_capacity_bytes_per_ms)
                      or self.switch_capacity_bytes_per_ms <= 0)):
             raise ModelingError(f"link_switch_capacity_invalid:{self.name}")
+        utilization = self.bw_utilization
+        if (not isinstance(utilization, (int, float)) or isinstance(utilization, bool)
+                or not math.isfinite(float(utilization)) or float(utilization) <= 0):
+            raise ModelingError(f"link_bw_utilization_invalid:{self.name}")
+        if float(utilization) > 1.0:
+            raise ModelingError("link_bw_utilization_exceeds_unity")
+        if self.peak_capacity_bytes_per_ms is not None:
+            peak = self.peak_capacity_bytes_per_ms
+            if (not isinstance(peak, (int, float)) or isinstance(peak, bool)
+                    or not math.isfinite(float(peak)) or float(peak) <= 0):
+                raise ModelingError(f"link_peak_capacity_invalid:{self.name}")
 
     @property
     def propagation_us(self):
         return self.latency_us + self.switch_hops * self.switch_hop_latency_us
 
+    @property
+    def effective_peak_capacity_bytes_per_ms(self) -> float:
+        if self.peak_capacity_bytes_per_ms is not None:
+            return float(self.peak_capacity_bytes_per_ms)
+        return float(self.capacity_bytes_per_ms)
+
     def to_dict(self):
-        return {"name": self.name, "capacity_bytes_per_ms": self.capacity_bytes_per_ms,
-                "members": self.members, "latency_us": self.latency_us,
-                "channel": self.channel, "semantics": self.semantics,
-                **({"switch_hops": self.switch_hops,
-                    "switch_hop_latency_us": self.switch_hop_latency_us}
-                   if self.switch_hops or self.switch_hop_latency_us else {}),
-                **({"switch_capacity_bytes_per_ms": self.switch_capacity_bytes_per_ms}
-                   if self.switch_capacity_bytes_per_ms is not None else {}),
-                **({"transaction_bytes": self.transaction_bytes,
-                    "alignment_bytes": self.alignment_bytes,
-                    "protocol_overhead_bytes": self.protocol_overhead_bytes}
-                   if self.transaction_bytes is not None else {})}
+        result = {"name": self.name, "capacity_bytes_per_ms": self.capacity_bytes_per_ms,
+                  "members": self.members, "latency_us": self.latency_us,
+                  "channel": self.channel, "semantics": self.semantics,
+                  **({"switch_hops": self.switch_hops,
+                      "switch_hop_latency_us": self.switch_hop_latency_us}
+                     if self.switch_hops or self.switch_hop_latency_us else {}),
+                  **({"switch_capacity_bytes_per_ms": self.switch_capacity_bytes_per_ms}
+                     if self.switch_capacity_bytes_per_ms is not None else {}),
+                  **({"transaction_bytes": self.transaction_bytes,
+                      "alignment_bytes": self.alignment_bytes,
+                      "protocol_overhead_bytes": self.protocol_overhead_bytes}
+                     if self.transaction_bytes is not None else {})}
+        # Utilization and peak are only serialized when they add information.
+        # Existing calibration identities hash this dictionary, so unity must
+        # keep the historical key set byte-for-byte.
+        if not math.isclose(self.bw_utilization, 1.0):
+            result["bw_utilization"] = self.bw_utilization
+            result["peak_capacity_bytes_per_ms"] = self.effective_peak_capacity_bytes_per_ms
+        return result
+
+    @classmethod
+    def from_mapping(cls, value: Mapping, *, default_members=()) -> "Link":
+        if not isinstance(value, Mapping):
+            raise ModelingError("link_mapping_required")
+        allowed = {
+            "name", "capacity_bytes_per_ms", "capacity_gbps", "gbps", "members",
+            "latency_us", "channel", "semantics", "transport_semantics",
+            "transaction_bytes", "alignment_bytes", "protocol_overhead_bytes",
+            "switch_hops", "switch_hop_latency_us", "switch_capacity_bytes_per_ms",
+            "bw_utilization", "bw_ratio", "utilization",
+            "peak_capacity_bytes_per_ms", "protocol", "transport_mode", "notes",
+            "bandwidth_provenance", "channel_semantics", "alpha_us",
+            "uni_peak_bw_gbps", "bi_peak_bw_gbps", "calibrated_uni_bw_gbps",
+            "calibrated_bi_bw_gbps", "derived_uni_bw_gbps", "derived_bi_bw_gbps",
+            "effective_uni_bw_gbps", "effective_bi_bw_gbps",
+            "pageable_uni_bw_gbps",
+        }
+        _unknown(value, allowed, "link")
+        name = value.get("name", "link")
+        if not isinstance(name, str) or not name:
+            raise ModelingError(f"link_name_invalid:{name}")
+        utilization = 1.0
+        for alias in ("bw_utilization", "bw_ratio", "utilization"):
+            if alias not in value:
+                continue
+            candidate = _positive_float(value[alias], "link_bw_utilization_invalid",
+                                        allow_zero=False)
+            if candidate > 1.0:
+                raise ModelingError("link_bw_utilization_exceeds_unity")
+            utilization = candidate
+            break
+        peak = value.get("peak_capacity_bytes_per_ms")
+        if peak is not None:
+            peak = _positive_float(peak, f"link_peak_capacity_invalid:{name}")
+        if "capacity_bytes_per_ms" in value:
+            capacity = _positive_float(value["capacity_bytes_per_ms"],
+                                       f"link_rate_invalid:{name}")
+            if peak is None and not math.isclose(utilization, 1.0):
+                # The declared byte capacity is already the effective value.
+                peak = capacity / utilization
+        elif "capacity_gbps" in value or "gbps" in value:
+            rate = value.get("capacity_gbps", value.get("gbps"))
+            declared_peak = _positive_float(rate, f"link_rate_invalid:{name}") * 1e6
+            peak = declared_peak if peak is None else peak
+            capacity = declared_peak * utilization
+        elif peak is not None:
+            capacity = peak * utilization
+        else:
+            raise ModelingError(f"link_rate_invalid:{name}")
+        semantics = value.get("semantics", value.get("transport_semantics", "shared"))
+        semantics = {"switched": "per_port"}.get(semantics, semantics)
+        return cls(
+            name=name, capacity_bytes_per_ms=capacity,
+            members=tuple(value.get("members", default_members)),
+            latency_us=float(value.get("latency_us", 0)),
+            channel=value.get("channel", "fabric"), semantics=semantics,
+            transaction_bytes=value.get("transaction_bytes"),
+            alignment_bytes=value.get("alignment_bytes", 1),
+            protocol_overhead_bytes=value.get("protocol_overhead_bytes", 0),
+            switch_hops=value.get("switch_hops", 0),
+            switch_hop_latency_us=value.get("switch_hop_latency_us", 0),
+            switch_capacity_bytes_per_ms=value.get("switch_capacity_bytes_per_ms"),
+            bw_utilization=utilization,
+            peak_capacity_bytes_per_ms=peak,
+        )
+
+
+_NETWORK_OVERRIDE_CHANNELS = {
+    "inter_node": frozenset({"d2d_inter_node", "inter_node"}),
+    "intra_node": frozenset({"d2d_intra_node", "intra_node"}),
+    "intra_package": frozenset({"d2d_intra_package", "intra_package"}),
+}
+_NETWORK_OVERRIDE_SUFFIXES = ("bw_gbps", "bw_bytes_per_s", "bw_util", "latency_us")
+_PRESERVED_TOPOLOGY_KEYS = (
+    "intra_bw_4p_gbps", "intra_bw_8p_gbps", "superpod_size", "max_dies",
+    "superpod_bw_gbps", "inter_pod_bw_gbps", "superpod_latency_us",
+    "inter_pod_latency_us", "topology_preset",
+)
+
+
+def _network_override_keys(raw: Mapping) -> set[str]:
+    return {f"{kind}_{suffix}" for kind in _NETWORK_OVERRIDE_CHANNELS
+            for suffix in _NETWORK_OVERRIDE_SUFFIXES if f"{kind}_{suffix}" in raw}
+
+
+def apply_network_overrides(links, raw: Mapping, *,
+                            gbps_to_bytes_per_ms: float = 1e6):
+    """Apply machine-level bandwidth, utilization and latency overrides.
+
+    ``gbps_to_bytes_per_ms`` is the unit conversion for the ``*_bw_gbps``
+    fields. Ascend's legacy convenience fields declare decimal Gb/s and pass a
+    smaller scale from the adapter; neutral link declarations use GB/s.
+    """
+    keys = _network_override_keys(raw)
+    if not keys:
+        return tuple(links)
+    result = list(links)
+    for kind, channels in _NETWORK_OVERRIDE_CHANNELS.items():
+        bw_key, bytes_key, util_key, latency_key = (
+            f"{kind}_{suffix}" for suffix in _NETWORK_OVERRIDE_SUFFIXES
+        )
+        if not any(key in raw for key in (bw_key, bytes_key, util_key, latency_key)):
+            continue
+        if raw.get(bytes_key) is not None:
+            bandwidth = _positive_float(raw[bytes_key], f"{bytes_key}_invalid",
+                                        allow_zero=False) * 1e-3
+        elif raw.get(bw_key) is not None:
+            kind_scale = 1e6 if kind == "intra_package" else gbps_to_bytes_per_ms
+            bandwidth = _positive_float(raw[bw_key], f"{bw_key}_invalid",
+                                        allow_zero=False) * kind_scale
+        else:
+            bandwidth = None
+        utilization = None
+        if raw.get(util_key) is not None:
+            utilization = _positive_float(raw[util_key], f"{util_key}_invalid",
+                                          allow_zero=False)
+            if utilization > 1.0:
+                raise ModelingError("link_bw_utilization_exceeds_unity")
+        latency = None
+        if raw.get(latency_key) is not None:
+            latency = _positive_float(raw[latency_key], f"{latency_key}_invalid",
+                                      allow_zero=True)
+        for index, link in enumerate(result):
+            if link.channel not in channels:
+                continue
+            link_util = link.bw_utilization if utilization is None else utilization
+            if bandwidth is None:
+                peak = link.effective_peak_capacity_bytes_per_ms
+            else:
+                peak = bandwidth
+            capacity = peak * link_util
+            link_latency = link.latency_us if latency is None else latency
+            result[index] = replace(
+                link, capacity_bytes_per_ms=capacity, latency_us=link_latency,
+                bw_utilization=link_util,
+                peak_capacity_bytes_per_ms=(peak if not math.isclose(link_util, 1.0)
+                                            else None),
+            )
+    return tuple(result)
+
+
+def _transfer_channel(channel: Mapping, name: str = "transfer") -> Link:
+    """Build one link from a transfer-channel declaration.
+
+    Channel ``gbps`` retains the historical GB/s meaning; ``bw_utilization``
+    (or its aliases) scales it to the effective capacity while the declared
+    peak remains available for diagnostics.
+    """
+    if not isinstance(channel, Mapping):
+        raise ModelingError(f"transfer_channel_record_invalid:{name}")
+    allowed = {
+        "channel", "channel_name", "gbps", "capacity_bytes_per_ms",
+        "capacity_gbps", "members", "latency_us", "channel_semantics",
+        "semantics", "transport_semantics", "transaction_bytes",
+        "alignment_bytes", "protocol_overhead_bytes", "switch_hops",
+        "switch_hop_latency_us", "switch_capacity_bytes_per_ms",
+        "bw_utilization", "bw_ratio", "utilization",
+        "peak_capacity_bytes_per_ms", "effective_uni_bw_gbps",
+        "uni_peak_bw_gbps", "bi_peak_bw_gbps", "calibrated_uni_bw_gbps",
+        "calibrated_bi_bw_gbps", "derived_uni_bw_gbps", "derived_bi_bw_gbps",
+        "effective_bi_bw_gbps", "pageable_uni_bw_gbps", "alpha_us",
+        "protocol", "transport_mode", "notes", "bandwidth_provenance",
+    }
+    _unknown(channel, allowed, f"transfer_channel.{name}")
+    utilization = 1.0
+    for alias in ("bw_utilization", "bw_ratio", "utilization"):
+        if alias in channel:
+            utilization = _positive_float(channel[alias],
+                                          "transfer_channel_bw_utilization_invalid",
+                                          allow_zero=False)
+            if utilization > 1.0:
+                raise ModelingError("transfer_channel_bw_utilization_invalid")
+            break
+    if channel.get("gbps") is not None:
+        peak = _positive_float(channel.get("gbps"),
+                               "transfer_channel_requires_positive_gbps") * 1e6
+    elif channel.get("peak_capacity_bytes_per_ms") is not None:
+        peak = _positive_float(channel["peak_capacity_bytes_per_ms"],
+                               "transfer_channel_requires_positive_gbps")
+    elif channel.get("capacity_bytes_per_ms") is not None:
+        peak = (_positive_float(channel["capacity_bytes_per_ms"],
+                                "transfer_channel_requires_positive_gbps")
+                / utilization)
+    elif channel.get("capacity_gbps") is not None:
+        peak = (_positive_float(channel["capacity_gbps"],
+                                "transfer_channel_requires_positive_gbps")
+                * 1e6 / utilization)
+    elif channel.get("effective_uni_bw_gbps") is not None:
+        peak = (_positive_float(channel["effective_uni_bw_gbps"],
+                                "transfer_channel_requires_positive_gbps")
+                * 1e6 / utilization)
+    elif channel.get("uni_peak_bw_gbps") is not None:
+        peak = (_positive_float(channel["uni_peak_bw_gbps"],
+                                "transfer_channel_requires_positive_gbps")
+                * 1e6)
+    else:
+        raise ModelingError("transfer_channel_requires_positive_gbps")
+    effective = peak * utilization
+    channel_name = channel.get("channel", channel.get("channel_name", name))
+    semantics = channel.get("semantics", channel.get("channel_semantics",
+                                                      channel.get("transport_semantics", "shared")))
+    semantics = {"switched": "per_port"}.get(semantics, semantics)
+    return Link(
+        name=str(channel_name), capacity_bytes_per_ms=effective,
+        members=tuple(channel.get("members", ())),
+        latency_us=float(channel.get("latency_us", channel.get("alpha_us", 0))),
+        channel=str(channel_name), semantics=semantics,
+        transaction_bytes=channel.get("transaction_bytes"),
+        alignment_bytes=channel.get("alignment_bytes", 1),
+        protocol_overhead_bytes=channel.get("protocol_overhead_bytes", 0),
+        switch_hops=channel.get("switch_hops", 0),
+        switch_hop_latency_us=channel.get("switch_hop_latency_us", 0),
+        switch_capacity_bytes_per_ms=channel.get("switch_capacity_bytes_per_ms"),
+        bw_utilization=utilization,
+        peak_capacity_bytes_per_ms=peak,
+    )
 
 
 @dataclass(frozen=True)
@@ -174,6 +419,9 @@ class Hardware:
     sku: str = ""
     assumptions: tuple[tuple[str, str], ...] = ()
     transfer_channels: tuple[tuple[str, tuple[tuple[str, object], ...]], ...] = field(
+        default=(), compare=False, repr=False
+    )
+    topology_options: tuple[tuple[str, object], ...] = field(
         default=(), compare=False, repr=False
     )
 
@@ -196,6 +444,7 @@ class Hardware:
     @classmethod
     def from_mapping(cls, raw: Mapping):
         from mindie_sim.backends import materialize
+        backend = raw.get("backend")
         raw = materialize(raw)
         count = int(raw.get("num_devices", len(raw.get("devices", raw.get("dies", ()))) or 1))
         ranks_per_node = int(raw.get("ranks_per_node", count))
@@ -262,22 +511,14 @@ class Hardware:
                     if (s.scale_with or s.clock_hz is not None)
                     and s.name in data.get("resource_units", {}))),
             ))
-        links = tuple(Link(
-            name=link["name"],
-            capacity_bytes_per_ms=float(link.get("capacity_bytes_per_ms",
-                                                 link.get("capacity_gbps", 0) * 1e6)),
-            members=tuple(link.get("members", range(len(devices)))),
-            latency_us=float(link.get("latency_us", 0)), channel=link.get("channel", "fabric"),
-            semantics={"switched": "per_port"}.get(
-                link.get("semantics", link.get("transport_semantics", "shared")),
-                link.get("semantics", link.get("transport_semantics", "shared"))),
-            transaction_bytes=link.get("transaction_bytes"),
-            alignment_bytes=link.get("alignment_bytes", 1),
-            protocol_overhead_bytes=link.get("protocol_overhead_bytes", 0),
-            switch_hops=link.get("switch_hops", 0),
-            switch_hop_latency_us=link.get("switch_hop_latency_us", 0),
-            switch_capacity_bytes_per_ms=link.get("switch_capacity_bytes_per_ms"),
-        ) for link in raw.get("links", ()))
+        links = tuple(Link.from_mapping(link, default_members=range(len(devices)))
+                      for link in raw.get("links", ()))
+        if not backend or _network_override_keys(raw):
+            # Compiled backends strip convenience units when generating links;
+            # pre-materialized link declarations still honor explicit overrides.
+            scale = (1e6 / 8 if backend == "ascend" and not raw.get("topology_preset")
+                     else 1e6)
+            links = apply_network_overrides(links, raw, gbps_to_bytes_per_ms=scale)
         for link in links:
             if link.semantics not in {"shared", "per_port", "per_pair", "direct", "fully_connected", "mesh"}:
                 raise ModelingError(f"link_semantics_unknown:{link.semantics}")
@@ -294,6 +535,10 @@ class Hardware:
                        (str(k), tuple(sorted(v.items())))
                        for k, v in (raw.get("transfer_channels") or {}).items()
                        if isinstance(v, Mapping)
+                   )),
+                   topology_options=tuple(sorted(
+                       (str(k), raw[k]) for k in _PRESERVED_TOPOLOGY_KEYS
+                       if raw.get(k) is not None
                    )))
 
     def to_dict(self):
@@ -302,3 +547,42 @@ class Hardware:
                 "devices": [device.to_dict() for device in self.dies],
                 "links": [link.to_dict() for link in self.links], "ranks_per_node": self.ranks_per_node,
                 "dies_per_package": self.dies_per_package, "assumptions": dict(self.assumptions)}
+
+
+def _neutral_transfer_channel_links(raw: Mapping) -> list[dict]:
+    declaration = raw.get("transfer_channels")
+    if not isinstance(declaration, Mapping):
+        return []
+    links = []
+    for name, channel in declaration.items():
+        if not isinstance(channel, Mapping):
+            continue
+        try:
+            link = _transfer_channel(channel, str(name))
+        except ModelingError:
+            # Registered channels without a declared rate stay metadata.
+            continue
+        record = link.to_dict()
+        record["name"] = str(name)
+        if not link.members:
+            record.pop("members", None)
+        links.append(record)
+    return links
+
+
+def parse_hardware(raw: Mapping) -> Hardware:
+    """Parse a hardware declaration, including top-level network overrides.
+
+    Neutral declarations may list ``transfer_channels`` instead of explicit
+    ``links``. Compiling backends own their channel registries; this helper
+    materializes only channels that already declare a usable rate so a standalone
+    hardware document remains inspectable without importing a vendor adapter.
+    """
+    if not isinstance(raw, Mapping):
+        raise ModelingError("hardware_mapping_required")
+    if raw.get("backend") or raw.get("links"):
+        return Hardware.from_mapping(raw)
+    links = _neutral_transfer_channel_links(raw)
+    if not links:
+        return Hardware.from_mapping(raw)
+    return Hardware.from_mapping({**raw, "links": links})

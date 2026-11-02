@@ -44,6 +44,15 @@ def _peer_rows_at_reverse_width(forward, widths):
     if forward.get("kind") == "uniform_peers":
         source = forward.get("source_bytes")
         return {**forward, "source_bytes": [float(value) * ratio for value in source]}
+    if forward.get("kind") == "two_tier":
+        updated = dict(forward)
+        if "source_bytes" in updated:
+            updated["source_bytes"] = [float(value) * ratio for value in updated["source_bytes"]]
+        if "intra_row_bytes" in updated:
+            updated["intra_row_bytes"] = float(updated["intra_row_bytes"]) * ratio
+        if "inter_row_bytes" in updated:
+            updated["inter_row_bytes"] = float(updated["inter_row_bytes"]) * ratio
+        return updated
     if forward.get("kind") == "matrix":
         rows = forward.get("payload_bytes")
         return {**forward, "payload_bytes": [
@@ -93,9 +102,30 @@ def bind_cohort_traffic(case, graphs):
                 raise ModelingError("dispatch_peer_traffic_row_widths_differ")
             explicit = [dict(op.metadata).get("peer_traffic") for op in source_ops]
             if any(value is not None for value in explicit):
-                if any(value != explicit[0] for value in explicit):
-                    raise ModelingError("dispatch_peer_traffic_declarations_differ")
-                forward = explicit[0]
+                if all(isinstance(v, dict) and v.get("kind") == "two_tier" for v in explicit):
+                    sig0 = (explicit[0].get("ranks_per_node"),
+                            explicit[0].get("intra_share"),
+                            explicit[0].get("inter_share"))
+                    if any((v.get("ranks_per_node"), v.get("intra_share"), v.get("inter_share")) != sig0
+                           for v in explicit):
+                        raise ModelingError("dispatch_peer_traffic_declarations_differ")
+                    if sig0[1] is not None and sig0[2] is not None:
+                        forward = {
+                            "kind": "two_tier",
+                            "ranks_per_node": int(sig0[0]),
+                            "intra_share": float(sig0[1]),
+                            "inter_share": float(sig0[2]),
+                            "source_bytes": [op.link_bytes for op in source_ops],
+                            "direction": "forward",
+                        }
+                    else:
+                        if any(value != explicit[0] for value in explicit):
+                            raise ModelingError("dispatch_peer_traffic_declarations_differ")
+                        forward = explicit[0]
+                else:
+                    if any(value != explicit[0] for value in explicit):
+                        raise ModelingError("dispatch_peer_traffic_declarations_differ")
+                    forward = explicit[0]
             else:
                 if any(op.family == "alltoallv" for op in source_ops):
                     raise ModelingError("alltoallv_requires_explicit_peer_matrix")

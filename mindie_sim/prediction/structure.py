@@ -150,6 +150,14 @@ def parse_case(value: Case | Mapping) -> Case:
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:
         metadata["media_tokens_by_request"] = media
+    moe_cfg = case.runtime.kernels.get("moe_transport")
+    deepep_enabled = (
+        (isinstance(moe_cfg, Mapping) and moe_cfg.get("mode") == "deepep")
+        or bool(metadata.get("enable_deepep", False))
+    )
+    if (deepep_enabled and "deepep_ranks_per_node" not in metadata
+            and not (isinstance(moe_cfg, Mapping) and moe_cfg.get("ranks_per_node"))):
+        metadata["deepep_ranks_per_node"] = int(case.machine.ranks_per_node)
     return replace(case, model=model, runtime=replace(
         case.runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
 

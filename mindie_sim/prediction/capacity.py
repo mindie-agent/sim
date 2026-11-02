@@ -9,12 +9,15 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 import math
 
 from mindie_sim.catalog.cache import layer_cache_components, local_kv_heads
 from mindie_sim.catalog.cache_pages import CachePages
-from mindie_sim.catalog.weights import stage_weight_bytes
+from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.catalog.weight_terms import term_bytes
+from mindie_sim.catalog.weights import layer_weight_terms, stage_weight_bytes
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.case import Case as CaseSpec
 
@@ -30,11 +33,78 @@ class MemoryPolicy:
     async_delayed_release_steps: int | None = None
     async_in_flight_lookahead_steps: int | None = None
     async_workspace_buffer_multiplier: float | None = None
+    expert_ddr_ratio: float = 0.0
+    kvc_ddr_ratio: float = 0.0
+    kvc_ssd_ratio: float = 0.0
 
     @property
     def reserved(self) -> float:
         return sum((self.workspace_bytes, self.graph_pool_bytes,
                     self.communication_buffer_bytes, self.runtime_bytes))
+
+
+def _offload_ratio(name: str, value) -> float:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+        raise ValueError(f"memory_offload_invalid_ratio:{name}:{value}")
+    ratio = float(value)
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError(f"memory_offload_invalid_ratio:{name}:{value}")
+    return ratio
+
+
+def _resolve_offload_ratios(case: CaseSpec, policy: MemoryPolicy) -> dict[str, float]:
+    """Prefer explicit policy ratios, then the case's offload metadata."""
+    raw = dict(case.runtime.metadata).get("offload", {})
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, Mapping):
+        raise ValueError("memory_offload_metadata_mapping_required")
+    metadata = dict(raw)
+
+    def pick(name: str) -> float:
+        declared = getattr(policy, name)
+        if declared != 0.0:
+            return _offload_ratio(name, declared)
+        if name in metadata:
+            return _offload_ratio(name, metadata[name])
+        return 0.0
+
+    ratios = {name: pick(name) for name in
+              ("expert_ddr_ratio", "kvc_ddr_ratio", "kvc_ssd_ratio")}
+    if ratios["kvc_ddr_ratio"] + ratios["kvc_ssd_ratio"] > 1.0 + 1e-12:
+        raise ValueError("memory_offload_kvc_ratios_exceed_unity")
+    return ratios
+
+
+def _routed_expert_bytes_by_stage(
+    case: CaseSpec, layer_stage: tuple[int, ...], *, workspace_tokens: int = 1,
+) -> tuple[list[float], list[float]]:
+    """Routed-expert total and single-layer active staging bytes per PP stage."""
+    parallel = case.runtime.parallel
+    quant = case.model.quant or QuantSpec("bf16")
+    result = [0.0] * max(1, parallel.pp)
+    staging = [0.0] * max(1, parallel.pp)
+    ep = max(1, int(parallel.ep))
+    tokens = max(1, int(workspace_tokens))
+    for plan in case.model.layer_plans:
+        if plan.ffn != "moe" or int(plan.num_experts) <= 0 or int(plan.moe_intermediate_size) <= 0:
+            continue
+        stage = layer_stage[plan.index] if plan.index < len(layer_stage) else 0
+        routed = float(sum(
+            term_bytes(term, quant, parallel, case.machine.ranks_per_node)
+            for term in layer_weight_terms(plan, case.model)
+            if term.category == "routed_expert"
+        ))
+        result[stage] += routed
+        num_exp = int(plan.num_experts)
+        k = min(num_exp, max(1, int(plan.top_k)))
+        active_total = float(num_exp) if k >= num_exp else float(num_exp) * (
+            1.0 - ((1.0 - float(k) / float(num_exp)) ** float(tokens))
+        )
+        local_exp = max(1, (num_exp + ep - 1) // ep)
+        active_layer_bytes = (active_total / float(ep)) * (routed / float(local_exp))
+        staging[stage] = max(staging[stage], min(routed, active_layer_bytes))
+    return result, staging
 
 
 class Memory:
@@ -63,11 +133,33 @@ class Memory:
                             or dict(case.runtime.metadata).get("speculative")
                             else ""))
         draft = bool(self.draft_kind)
-        self.weights = stage_weight_bytes(
+        self.offload = _resolve_offload_ratios(case, self.policy)
+        self.kvc_hbm_ratio = max(
+            0.0, 1.0 - self.offload["kvc_ddr_ratio"] - self.offload["kvc_ssd_ratio"]
+        )
+        self.gross_weights = stage_weight_bytes(
             case.model, p, case.machine.ranks_per_node, include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
         )
+        resolved_ws_tokens = self._resolve_workspace_tokens(workspace_tokens)
+        if self.offload["expert_ddr_ratio"] > 0.0:
+            self.routed_expert_bytes, stage_staging_base = _routed_expert_bytes_by_stage(
+                case, self.layer_stage, workspace_tokens=max(1, resolved_ws_tokens),
+            )
+            self.expert_staging_workspace = [
+                self.offload["expert_ddr_ratio"] * value for value in stage_staging_base
+            ]
+        else:
+            self.routed_expert_bytes = [0.0] * p.pp
+            self.expert_staging_workspace = [0.0] * p.pp
+        self.expert_hbm_saved = [
+            self.offload["expert_ddr_ratio"] * value for value in self.routed_expert_bytes
+        ]
+        self.weights = [
+            max(0.0, gross - saved)
+            for gross, saved in zip(self.gross_weights, self.expert_hbm_saved)
+        ]
         async_enabled = bool(case.runtime.async_scheduling)
         self.async_delayed_release_steps = (
             (1 if async_enabled else 0) if self.policy.async_delayed_release_steps is None
@@ -89,7 +181,12 @@ class Memory:
         )
         base_workspace = (self._workspace(workspace_tokens) if self.policy.derive_workspace
                           else [0.0] * p.pp)
-        self.workspace = [base + extra for base, extra in zip(base_workspace, self.async_workspace)]
+        staging_workspace = (self.expert_staging_workspace if self.policy.derive_workspace
+                             else [0.0] * p.pp)
+        self.workspace = [
+            base + extra + stage_buf
+            for base, extra, stage_buf in zip(base_workspace, self.async_workspace, staging_workspace)
+        ]
         self.capacity = [
             [
                 min(d.hbm_bytes * case.runtime.gpu_memory_utilization
@@ -197,12 +294,30 @@ class Memory:
             result[-1] += draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
         return tuple(result)
 
+    def _max_layer_cache_bytes(self, tokens: int) -> tuple[float, ...]:
+        model, p = self.case.model, self.case.runtime.parallel
+        result = [0.0] * p.pp
+        for layer in model.layer_plans:
+            comps = layer_cache_components(
+                model, layer, p, tokens, capacity_padded=False,
+                interleave=self.case.runtime.kv_block_size)
+            st = self.layer_stage[layer.index]
+            result[st] = max(result[st], float(sum(comps.values())))
+        return tuple(result)
+
     def resize(self, replica: int, request: str, tokens: int) -> bool:
         key = replica, request
         before = self.owners.get(key, (0.0,) * len(self.weights))
         after = self.cache_bytes(tokens)
+        staging = (0.0,) * len(self.weights)
+        if self.kvc_hbm_ratio != 1.0:
+            staging = tuple(
+                val * (1.0 - self.kvc_hbm_ratio)
+                for val in self._max_layer_cache_bytes(tokens)
+            )
+            after = tuple(value * self.kvc_hbm_ratio for value in after)
         needed = [live - old + new for live, old, new in zip(self.live[replica], before, after)]
-        if any(value > capacity for value, capacity in zip(needed, self.capacity[replica])):
+        if any(val + stg > cap for val, stg, cap in zip(needed, staging, self.capacity[replica])):
             return False
         self.owners[key] = after
         self.live[replica] = needed
@@ -247,7 +362,7 @@ class Memory:
                 self.release(rep, req)
 
     def to_dict(self) -> dict:
-        return {
+        result = {
             "status": "feasible" if all(value >= 0 for row in self.capacity for value in row) else "oom",
             "basis": "declared_geometry_and_live_allocations",
             "weights_bytes_per_stage_rank": self.weights,
@@ -269,3 +384,14 @@ class Memory:
             "layer_partition": self.layers,
             "workspace_basis": "simultaneous_layer_tensors_plus_explicit_reserves",
         }
+        if any(value > 0.0 for value in self.offload.values()):
+            result["offload"] = {
+                "expert_ddr_ratio": self.offload["expert_ddr_ratio"],
+                "kvc_ddr_ratio": self.offload["kvc_ddr_ratio"],
+                "kvc_ssd_ratio": self.offload["kvc_ssd_ratio"],
+                "kvc_hbm_ratio": self.kvc_hbm_ratio,
+                "gross_weights_bytes_per_stage_rank": self.gross_weights,
+                "routed_expert_bytes_per_stage_rank": self.routed_expert_bytes,
+                "expert_hbm_saved_bytes_per_stage_rank": self.expert_hbm_saved,
+            }
+        return result

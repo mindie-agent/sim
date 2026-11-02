@@ -18,7 +18,7 @@ import math
 
 
 _DIRECTIONS = frozenset({"forward", "transpose"})
-_KINDS = frozenset({"uniform_peers", "matrix"})
+_KINDS = frozenset({"uniform_peers", "matrix", "two_tier"})
 
 
 def _number(value, reason):
@@ -50,7 +50,9 @@ class PeerTraffic:
             raise ModelingError(f"peer_traffic_group_size_invalid:{size}")
         if not isinstance(raw, Mapping):
             raise ModelingError("peer_traffic_must_be_mapping")
-        allowed = {"kind", "source_bytes", "payload_bytes", "direction"}
+        allowed = {"kind", "source_bytes", "payload_bytes", "ranks_per_node",
+                   "intra_row_bytes", "inter_row_bytes", "intra_share",
+                   "inter_share", "direction"}
         unknown = sorted(set(raw) - allowed)
         if unknown:
             raise ModelingError(f"peer_traffic_unknown_field:{unknown[0]}")
@@ -80,6 +82,31 @@ class PeerTraffic:
                     raise ModelingError(
                         "peer_traffic_singleton_requires_zero_source_bytes")
                 return cls(kind, size, source, direction)
+
+            if kind == "two_tier":
+                if "payload_bytes" in raw:
+                    raise ModelingError("peer_traffic_two_tier_forbids_dense_fields")
+                rpn = raw.get("ranks_per_node")
+                if not isinstance(rpn, int) or isinstance(rpn, bool) or not 1 <= rpn <= size:
+                    raise ModelingError(f"peer_traffic_ranks_per_node_invalid:{rpn}")
+                if "source_bytes" in raw:
+                    source = values(raw["source_bytes"], "source_bytes")
+                    if size == 1 and any(source):
+                        raise ModelingError("peer_traffic_singleton_requires_zero_source_bytes")
+                    intra_s = _number(raw.get("intra_share", 0.0), "peer_traffic_intra_share_invalid")
+                    inter_s = _number(raw.get("inter_share", 0.0), "peer_traffic_inter_share_invalid")
+                    if any(source) and rpn == 1 and intra_s:
+                        raise ModelingError("peer_traffic_two_tier_singleton_node_forbids_intra_bytes")
+                    if any(source) and size <= rpn and inter_s:
+                        raise ModelingError("peer_traffic_two_tier_single_node_forbids_inter_bytes")
+                    return cls(kind, size, (float(rpn), intra_s, inter_s, *source), direction)
+                intra = _number(raw.get("intra_row_bytes"), "peer_traffic_intra_row_bytes_invalid")
+                inter = _number(raw.get("inter_row_bytes"), "peer_traffic_inter_row_bytes_invalid")
+                if rpn == 1 and intra:
+                    raise ModelingError("peer_traffic_two_tier_singleton_node_forbids_intra_bytes")
+                if size <= rpn and inter:
+                    raise ModelingError("peer_traffic_two_tier_single_node_forbids_inter_bytes")
+                return cls(kind, size, (float(rpn), intra, inter), direction)
 
             if "source_bytes" in raw:
                 raise ModelingError("peer_traffic_matrix_forbids_source_bytes")
@@ -123,6 +150,20 @@ class PeerTraffic:
         if self.kind == "uniform_peers":
             owner = source if forward else destination
             return self.values[owner] / (self.size - 1)
+        if self.kind == "two_tier":
+            rpn = int(self.values[0])
+            orig_src = source if forward else destination
+            if len(self.values) == 3 + self.size:
+                row_b = self.values[3 + orig_src]
+                intra_row = row_b * self.values[1]
+                inter_row = row_b * self.values[2]
+            else:
+                intra_row, inter_row = self.values[1], self.values[2]
+            node_peers = min(rpn, self.size - (orig_src // rpn) * rpn)
+            if (source // rpn) == (destination // rpn):
+                return intra_row / (node_peers - 1) if node_peers > 1 else 0.0
+            inter_peers = self.size - node_peers
+            return inter_row / inter_peers if inter_peers > 0 else 0.0
         original_source, original_destination = (
             (source, destination) if forward else (destination, source))
         return self.values[original_source * self.size + original_destination]
@@ -137,6 +178,23 @@ class PeerTraffic:
                 return self.values[source]
             return (math.fsum(value for index, value in enumerate(self.values)
                               if index != source) / (self.size - 1))
+        if self.kind == "two_tier":
+            rpn = int(self.values[0])
+            node_peers = min(rpn, self.size - (source // rpn) * rpn)
+            if len(self.values) == 3 + self.size:
+                if self.direction == "forward":
+                    row_b = self.values[3 + source]
+                    intra = row_b * self.values[1] if node_peers > 1 else 0.0
+                    inter = row_b * self.values[2] if self.size > node_peers else 0.0
+                    return intra + inter
+                return math.fsum(
+                    self.payload(source, destination)
+                    for destination in range(self.size)
+                    if destination != source
+                )
+            intra = self.values[1] if node_peers > 1 else 0.0
+            inter = self.values[2] if self.size > node_peers else 0.0
+            return intra + inter
         if self.direction == "forward":
             return math.fsum(
                 self.values[source * self.size + destination]
