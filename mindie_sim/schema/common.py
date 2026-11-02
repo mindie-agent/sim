@@ -24,12 +24,16 @@ _DTYPE_BYTES = {
     "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
     "int8": 1.0, "int4": 0.5, "int32": 4.0, "int64": 8.0,
     "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
+    # MXFP8 transports 32 E4M3 elements plus one E8M0 block scale byte:
+    # 32 payload bytes + 1 scale byte per 32 elements = 33/32 B per element.
+    "mxfp8": 33.0 / 32.0, "mx_fp8": 33.0 / 32.0, "mxfp8_e4m3": 33.0 / 32.0,
 }
 
 _DTYPE_PEAK = {
     "bf16": 1.0, "bfloat16": 1.0, "fp16": 1.0, "float16": 1.0,
     "fp32": 0.5, "float32": 0.5, "fp8": 2.0, "fp8_e4m3": 2.0,
     "fp8_e5m2": 2.0, "int8": 2.0, "int4": 4.0,
+    "mxfp8": 2.0, "mx_fp8": 2.0, "mxfp8_e4m3": 2.0,
 }
 
 FP8_PEAK_DTYPES = frozenset({
@@ -40,6 +44,9 @@ _PEAK_DTYPE_ALIASES = {
     "fp8": ("fp8", "fp8_e4m3", "fp8_e5m2"),
     "fp8_e4m3": ("fp8_e4m3", "fp8"),
     "fp8_e5m2": ("fp8_e5m2", "fp8"),
+    "mxfp8": ("mxfp8", "fp8_e4m3", "fp8"),
+    "mx_fp8": ("mxfp8", "fp8_e4m3", "fp8"),
+    "mxfp8_e4m3": ("mxfp8", "fp8_e4m3", "fp8"),
     "bf16": ("bf16", "bfloat16"),
     "bfloat16": ("bfloat16", "bf16"),
     "fp16": ("fp16", "float16"),

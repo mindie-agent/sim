@@ -24,6 +24,7 @@ import math
 from typing import Any
 
 from mindie_sim.backends.ascend import materialize as ascend_materialize, profiles as ascend_profiles
+from mindie_sim.prediction.afd import solve_afd_pareto
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
     DEFAULT_SLA_SCENARIOS,
@@ -45,6 +46,12 @@ _BASELINE_SCENARIO: tuple[dict[str, Any], ...] = (
 _TRANSFER_OVERRIDE_KEYS = (
     "transfer_channels", "inter_node_bw_gbps", "intra_node_bw_gbps",
     "inter_node_bw_bytes_per_s", "intra_node_bw_bytes_per_s",
+    "intra_package_bw_gbps", "intra_package_bw_bytes_per_s",
+    "inter_node_bw_util", "intra_node_bw_util", "intra_package_bw_util",
+    "inter_node_latency_us", "intra_node_latency_us", "intra_package_latency_us",
+    "intra_bw_4p_gbps", "intra_bw_8p_gbps", "superpod_size", "max_dies",
+    "superpod_bw_gbps", "inter_pod_bw_gbps", "superpod_latency_us",
+    "inter_pod_latency_us", "topology_preset",
 )
 
 
@@ -167,6 +174,12 @@ def _resolve_ranks_per_node(parsed: CaseSpec, num_devices: int) -> int:
     orig_rpn = int(parsed.machine.ranks_per_node)
     if orig_rpn >= 1:
         return min(num_devices, orig_rpn)
+    from mindie_sim.backends.ascend import ASCEND_TOPOLOGY_PRESETS
+    topo_opts = dict(getattr(parsed.machine, "topology_options", ()))
+    preset_name = topo_opts.get("topology_preset")
+    preset_rpn = int(ASCEND_TOPOLOGY_PRESETS.get(str(preset_name), {}).get("ranks_per_node", 0) or 0)
+    if preset_rpn >= 1:
+        return min(num_devices, preset_rpn)
     sku_default = 16 if (parsed.machine.arch_family == "A3" or parsed.machine.dies_per_package >= 2) else 8
     return min(num_devices, sku_default)
 
@@ -185,25 +198,43 @@ def _materialize_machine_for_devices(
 
     ranks_per_node = _resolve_ranks_per_node(parsed, num_devices)
     sku = parsed.machine.sku
-    if sku and sku in ascend_profiles():
+    from mindie_sim.backends.nvidia import materialize as nvidia_materialize, profiles as nvidia_profiles
+    is_ascend = bool(sku and sku in ascend_profiles())
+    is_nvidia = bool(sku and sku in nvidia_profiles())
+    if is_ascend or is_nvidia:
         raw_m: dict[str, Any] = {
-            "backend": "ascend", "name": parsed.machine.name, "hardware_key": parsed.machine.hardware_key,
+            "backend": "ascend" if is_ascend else "nvidia",
+            "name": parsed.machine.name, "hardware_key": parsed.machine.hardware_key,
             "sku": sku, "num_devices": num_devices, "ranks_per_node": ranks_per_node,
             "dies_per_package": parsed.machine.dies_per_package, "device": base_dev,
         }
+        for k, v in getattr(parsed.machine, "topology_options", ()):
+            raw_m[k] = deepcopy(v)
         ch_patch: dict[str, dict[str, Any]] = {
             k: dict(v) for k, v in getattr(parsed.machine, "transfer_channels", ())
+            if k not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}
         }
         seen_links: set[str] = set()
         for lnk in parsed.machine.links:
             if lnk.channel in {"d2d_intra_package", "d2d_intra_node", "d2d_inter_node"} and lnk.channel not in seen_links:
                 seen_links.add(lnk.channel)
                 rec = dict(ch_patch.get(lnk.channel, {}))
-                rec.update(
-                    effective_uni_bw_gbps=float(lnk.capacity_bytes_per_ms) / 1e6,
-                    latency_us=float(lnk.latency_us),
-                    semantics=str(lnk.semantics),
-                )
+                util = float(getattr(lnk, "bw_utilization", 1.0) or 1.0)
+                if not math.isclose(util, 1.0):
+                    peak_gbps = float(lnk.effective_peak_capacity_bytes_per_ms) / 1e6
+                    rec.pop("effective_uni_bw_gbps", None)
+                    rec.update(
+                        uni_peak_bw_gbps=peak_gbps,
+                        bw_utilization=util,
+                        latency_us=float(lnk.latency_us),
+                        semantics=str(lnk.semantics),
+                    )
+                else:
+                    rec.update(
+                        effective_uni_bw_gbps=float(lnk.capacity_bytes_per_ms) / 1e6,
+                        latency_us=float(lnk.latency_us),
+                        semantics=str(lnk.semantics),
+                    )
                 for fn in ("transaction_bytes", "alignment_bytes", "protocol_overhead_bytes", "switch_hops", "switch_hop_latency_us", "switch_capacity_bytes_per_ms"):
                     val = getattr(lnk, fn, None)
                     if val is not None:
@@ -215,8 +246,15 @@ def _materialize_machine_for_devices(
             src_m = raw_case["machine"]
             for k in _TRANSFER_OVERRIDE_KEYS:
                 if k in src_m:
-                    raw_m[k] = deepcopy(src_m[k])
-        return Hardware.from_mapping(ascend_materialize(raw_m))
+                    if k == "transfer_channels" and isinstance(src_m[k], Mapping):
+                        raw_m[k] = {
+                            ck: deepcopy(cv) for ck, cv in src_m[k].items()
+                            if ck not in {"d2d_intra_4p", "d2d_intra_8p", "d2d_inter_pod"}
+                        }
+                    else:
+                        raw_m[k] = deepcopy(src_m[k])
+        mat_fn = ascend_materialize if is_ascend else nvidia_materialize
+        return Hardware.from_mapping(mat_fn(raw_m))
 
     m_dict = deepcopy(parsed.machine.to_dict())
     m_dict["num_devices"], m_dict["ranks_per_node"] = num_devices, ranks_per_node
@@ -577,4 +615,4 @@ def sweep_pd_disaggregation_ratios(
     }
 
 
-__all__ = ["compute_pareto_frontier", "enumerate_parallel_candidates", "sweep_pd_disaggregation_ratios", "sweep_topology_grid"]
+__all__ = ["compute_pareto_frontier", "enumerate_parallel_candidates", "solve_afd_pareto", "sweep_pd_disaggregation_ratios", "sweep_topology_grid"]

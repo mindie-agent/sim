@@ -54,7 +54,8 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
     client_tails = {}
     execution = {name: Execution(case, CostModel(case, primitives), recipes=recipes,
                                 submission=submission, engine=engine, namespace=name + ":",
-                                include_serving_io=True, client_tails=client_tails)
+                                include_serving_io=True, client_tails=client_tails,
+                                memory_policy=memory[name].policy)
                  for name, case in cases.items()}
     lowerers = {name: lower or Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
                 for name, case in cases.items()}

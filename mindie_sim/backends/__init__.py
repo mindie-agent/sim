@@ -4,9 +4,10 @@
 [Side-Effect Policy] No I/O.
 """
 from mindie_sim.schema.common import ModelingError
-from .ascend import materialize as ascend
+from .ascend import materialize as ascend, normalize_ascend_machine
+from .nvidia import materialize as nvidia, normalize_nvidia_machine
 
-ADAPTERS = {"ascend": ascend}
+ADAPTERS = {"ascend": normalize_ascend_machine, "nvidia": normalize_nvidia_machine}
 
 
 def materialize(raw):

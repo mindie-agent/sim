@@ -71,7 +71,7 @@ def predict(
                   for replica, group in enumerate(groups)]
     cost = CostModel(case, primitives)
     execution = Execution(case, cost, recipes=recipes, submission=submission, trace_limit=event_limit,
-                          include_serving_io=True)
+                          include_serving_io=True, memory_policy=memory.policy)
     engine = execution.engine
     engine.now = min((r.arrival_ms for r in case.workload.requests), default=0)
     in_flight: dict[int, ScheduledIteration] = {}
