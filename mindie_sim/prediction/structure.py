@@ -119,6 +119,14 @@ def parse_case(value: Case | Mapping) -> Case:
     elif "prepared_mx32_matrix" in dict(model.metadata):
         model = replace(model, metadata=tuple((key, value) for key, value in model.metadata
                                              if key != "prepared_mx32_matrix"))
+    runtime = case.runtime
+    sparse_offload = select(runtime.kernels.get("lowerings", {}), "sparse_kv_offload")
+    if sparse_offload:
+        model, runtime = sparse_offload.module.prepare_case(
+            model, runtime, case.machine, case.workload, sparse_offload)
+    elif "sparse_kv_offload" in dict(model.metadata) or "sparse_kv_offload" in dict(runtime.metadata):
+        from .sparse_kv_offload import strip_case
+        model, runtime = strip_case(model, runtime)
     for index, layer in enumerate(model.layer_plans):
         if layer.index != index:
             raise ModelingError("layer_indices_must_be_contiguous")
@@ -126,8 +134,8 @@ def parse_case(value: Case | Mapping) -> Case:
                       layer.topk_owner_layer_id, layer.candidate_source_layer_id):
             if owner > index:
                 raise ModelingError(f"layer_owner_must_precede_consumer:{index}:{owner}")
-    p = case.runtime.parallel
-    counts = case.runtime.pp_layer_partition or tuple(
+    p = runtime.parallel
+    counts = runtime.pp_layer_partition or tuple(
         model.layers // p.pp + int(stage < model.layers % p.pp) for stage in range(p.pp)
     )
     p.validate(model, layer_partition=counts)
@@ -145,8 +153,8 @@ def parse_case(value: Case | Mapping) -> Case:
                         degraded_submodules=tuple(sorted(degraded)))
         model = replace(model, metadata=tuple(sorted(metadata.items())))
     case.machine.validate_placement(p)
-    case.workload.validate_model(model, case.runtime)
-    metadata = dict(case.runtime.metadata)
+    case.workload.validate_model(model, runtime)
+    metadata = dict(runtime.metadata)
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:
         metadata["media_tokens_by_request"] = media
@@ -159,7 +167,7 @@ def parse_case(value: Case | Mapping) -> Case:
             and not (isinstance(moe_cfg, Mapping) and moe_cfg.get("ranks_per_node"))):
         metadata["deepep_ranks_per_node"] = int(case.machine.ranks_per_node)
     return replace(case, model=model, runtime=replace(
-        case.runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
+        runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
 
 
 def stage_map(model, runtime) -> tuple[int, ...]:

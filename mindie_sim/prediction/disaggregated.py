@@ -95,12 +95,16 @@ def predict_pd(raw, *, primitives=None, recipes=None, submission=None, memory_po
             if not memory["decode"].resize(target, request, state.computed + 1):
                 continue
             p = cases["decode"].runtime.parallel
-            volume = sum(memory["decode"].cache_bytes(state.computed, padded=False)) * p.tp * p.pcp
+            if memory["decode"].sparse_offload:
+                volume, decode_local = memory["decode"].pd_handoff_volume_and_stage_hbm(state.computed)
+            else:
+                decode_local = memory["decode"].cache_bytes(state.computed, padded=False)
+                volume = sum(decode_local) * p.tp * p.pcp
             demands = {}
             for pool in ("prefill", "decode"):
                 replica = placement[pool, request]
-                parallel = cases[pool].runtime.parallel
-                local = memory[pool].cache_bytes(state.computed, padded=False)
+                local = (decode_local if pool == "decode"
+                         else memory[pool].cache_bytes(state.computed, padded=False))
                 for stage, stage_bytes in enumerate(local):
                     roles = execution[pool].stage_names[replica, stage]
                     demands[roles["hbm"]] = stage_bytes

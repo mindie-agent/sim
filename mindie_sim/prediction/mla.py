@@ -330,6 +330,19 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if head_contract:
         q_ready, rotary = mla_head_padding.query_inputs(
             b, declaration=head_contract, tokens=q, query=q_ready, rotary=rotary, plan=plan)
+    sparse_offload = (select(runtime.kernels.get("lowerings", {}), "sparse_kv_offload")
+                      if runtime else None)
+    offload_budget = dict(model.metadata).get("sparse_kv_offload") if sparse_offload else None
+    offload_info = None
+    if offload_budget and plan.index in offload_budget.get("offload_layers", ()):
+        if any(v.phase == "prefill" for v in views) and offload_budget["options"].get("layerwise_kv_offload"):
+            sparse_offload.module.lower_prefill_offload(
+                b, plan=plan, views=views, store_id=store, budget=offload_budget)
+        elif any(v.phase == "decode" for v in views):
+            store, topk, offload_info = sparse_offload.module.lower_decode_offload(
+                b, plan=plan, views=views, store_id=store, topk_id=topk, budget=offload_budget)
+            if plan.cache_kind == "dense":
+                long_store = store
     outputs = []
     metadata_ready = None
     metadata_source = (select(runtime.kernels.get("lowerings", {}), "sparse_mla_metadata")
@@ -413,8 +426,17 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             metadata=(("query_tile", query_tile), ("logical_pairs", pairs), ("kv_sweeps", sweeps))
                      + selection_metadata
                      + _attention_tensor_view(plan, view, heads, model, quant, parallel)
-                     + ((("mla_head_contract", dict(head_contract)),) if head_contract else ()),
+                     + ((("mla_head_contract", dict(head_contract)),) if head_contract else ())
+                     + ((("sparse_kv_offload", offload_info),) if offload_info else ()),
         )
+        if offload_info and offload_info.get("use_fused_overlap"):
+            from dataclasses import replace as _replace_op
+            b.ops[-1] = _replace_op(
+                b.ops[-1],
+                recipe="fused_sparse_attention_overlap",
+                source_boundary="kernel",
+                metadata=b.ops[-1].metadata + (("sparse_offload_sfa", offload_info),),
+            )
         if (runtime and view.phase == "prefill" and topk
                 and plan.cache_kind == "window_compressed"
                 and plan.mla_variant == "latent_mqa"):

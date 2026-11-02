@@ -183,9 +183,16 @@ class Memory:
                           else [0.0] * p.pp)
         staging_workspace = (self.expert_staging_workspace if self.policy.derive_workspace
                              else [0.0] * p.pp)
+        self.sparse_offload = dict(case.runtime.metadata).get("sparse_kv_offload")
+        static_offload = (
+            list(self.sparse_offload.get("static_npu_bytes_per_stage_rank", (0.0,) * p.pp))
+            if self.sparse_offload else [0.0] * p.pp
+        )
         self.workspace = [
-            base + extra + stage_buf
-            for base, extra, stage_buf in zip(base_workspace, self.async_workspace, staging_workspace)
+            base + extra + stage_buf + offload
+            for base, extra, stage_buf, offload in zip(
+                base_workspace, self.async_workspace, staging_workspace, static_offload
+            )
         ]
         self.capacity = [
             [
@@ -202,6 +209,13 @@ class Memory:
         self.owners: dict[tuple[int, str], tuple[float, ...]] = {}
         self.delayed_owners: dict[tuple[int, str], tuple[int, tuple[float, ...]]] = {}
         self.peak_delayed_release = [[0.0] * p.pp for _ in range(p.dp)]
+        self.host_dram_capacity = [
+            float(self.sparse_offload["usable_dram_bytes_per_dp"]) if self.sparse_offload else math.inf
+            for _ in range(p.dp)
+        ]
+        self.host_dram_live = [0.0 for _ in range(p.dp)]
+        self.host_dram_peak = [0.0 for _ in range(p.dp)]
+        self.host_dram_owners: dict[tuple[int, str], float] = {}
 
     def _resolve_workspace_tokens(self, tokens=None) -> int:
         runtime = self.case.runtime
@@ -305,6 +319,41 @@ class Memory:
             result[st] = max(result[st], float(sum(comps.values())))
         return tuple(result)
 
+    def host_dram_cache_bytes(self, tokens: int, *, padded=True) -> float:
+        if not self.sparse_offload:
+            return 0.0
+        block_size = int(self.sparse_offload["block_size"])
+        eff_tokens = math.ceil(tokens / block_size) * block_size if padded else tokens
+        offload_layers = len(self.sparse_offload["offload_layers"])
+        return float(eff_tokens * int(self.sparse_offload["kv_row_bytes"]) * offload_layers)
+
+    def pd_handoff_volume_and_stage_hbm(self, tokens: int) -> tuple[float, tuple[float, ...]]:
+        """Compute SfaRemoteD2HConnector wire volume (D2D index_k + 1x RD2H mla_kv) and stage HBM write."""
+        p = self.case.runtime.parallel
+        if not self.sparse_offload or self.sparse_offload["options"].get("keep_device_kv_cache"):
+            local = self.cache_bytes(tokens, padded=False)
+            return sum(local) * p.tp * p.pcp, local
+        offload_set = set(self.sparse_offload["offload_layers"])
+        topk_buf = int(self.sparse_offload["topk_buffer_size"])
+        use_copy_sfa = bool(self.sparse_offload["options"].get("use_fused_copy_sfa", True))
+        hot_tokens = min(tokens, topk_buf) if use_copy_sfa else 0
+        stage_hbm = [0.0] * p.pp
+        rd2h_bytes = 0.0
+        for layer in self.case.model.layer_plans:
+            components = layer_cache_components(
+                self.case.model, layer, p, tokens, capacity_padded=False,
+                interleave=self.case.runtime.kv_block_size,
+            )
+            st = self.layer_stage[layer.index]
+            for name, val in components.items():
+                if name == "mla_kv" and layer.index in offload_set:
+                    rd2h_bytes += val
+                    if hot_tokens > 0 and tokens > 0:
+                        stage_hbm[st] += val * (hot_tokens / tokens)
+                else:
+                    stage_hbm[st] += val
+        wire_volume = sum(stage_hbm) * p.tp * p.pcp + rd2h_bytes
+        return wire_volume, tuple(stage_hbm)
     def resize(self, replica: int, request: str, tokens: int) -> bool:
         key = replica, request
         before = self.owners.get(key, (0.0,) * len(self.weights))
@@ -319,6 +368,15 @@ class Memory:
         needed = [live - old + new for live, old, new in zip(self.live[replica], before, after)]
         if any(val + stg > cap for val, stg, cap in zip(needed, staging, self.capacity[replica])):
             return False
+        if self.sparse_offload:
+            dram_before = self.host_dram_owners.get(key, 0.0)
+            dram_after = self.host_dram_cache_bytes(tokens)
+            dram_needed = self.host_dram_live[replica] - dram_before + dram_after
+            if dram_needed > self.host_dram_capacity[replica]:
+                return False
+            self.host_dram_owners[key] = dram_after
+            self.host_dram_live[replica] = dram_needed
+            self.host_dram_peak[replica] = max(self.host_dram_peak[replica], dram_needed)
         self.owners[key] = after
         self.live[replica] = needed
         self.peak[replica] = [max(old, new) for old, new in zip(self.peak[replica], needed)]
@@ -328,6 +386,9 @@ class Memory:
         self.delayed_owners.pop((replica, request), None)
         sizes = self.owners.pop((replica, request), (0.0,) * len(self.weights))
         self.live[replica] = [live - size for live, size in zip(self.live[replica], sizes)]
+        if self.sparse_offload:
+            dram_size = self.host_dram_owners.pop((replica, request), 0.0)
+            self.host_dram_live[replica] = max(0.0, self.host_dram_live[replica] - dram_size)
 
     def defer_release(self, replica: int, request: str, steps: int | None = None) -> None:
         """Retain KV ownership for finished requests across async scheduling lookahead steps."""
@@ -393,5 +454,31 @@ class Memory:
                 "gross_weights_bytes_per_stage_rank": self.gross_weights,
                 "routed_expert_bytes_per_stage_rank": self.routed_expert_bytes,
                 "expert_hbm_saved_bytes_per_stage_rank": self.expert_hbm_saved,
+            }
+        if self.sparse_offload:
+            block_size = int(self.sparse_offload["block_size"])
+            idx_row_bytes = int(self.sparse_offload["index_row_bytes"])
+            full_idx_layers = len(self.sparse_offload["full_indexer_layers"])
+            npu_per_block = max(1, block_size * idx_row_bytes * max(1, full_idx_layers))
+            min_stage_cap = max(0.0, min(val for row in self.capacity for val in row))
+            npu_limit_blocks = int(min_stage_cap // npu_per_block)
+            dram_limit_blocks = int(self.sparse_offload["dram_limit_blocks"])
+            workload_limit_blocks = int(self.sparse_offload["workload_limit_blocks"])
+            limits = {
+                "npu_hbm": npu_limit_blocks,
+                "host_dram": dram_limit_blocks,
+                "workload": workload_limit_blocks,
+            }
+            limiting_factor = min(limits, key=limits.__getitem__)
+            result["sparse_kv_offload"] = {
+                **self.sparse_offload,
+                "npu_limit_blocks": npu_limit_blocks,
+                "dram_limit_blocks": dram_limit_blocks,
+                "workload_limit_blocks": workload_limit_blocks,
+                "effective_blocks": limits[limiting_factor],
+                "limiting_factor": limiting_factor,
+                "host_dram_capacity_bytes_per_replica": self.host_dram_capacity,
+                "peak_host_dram_bytes_per_replica": self.host_dram_peak,
+                "live_host_dram_bytes_per_replica": self.host_dram_live,
             }
         return result

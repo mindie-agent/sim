@@ -392,6 +392,7 @@ class RecipeBook:
         from .implementations import recipes as implementation_recipes
         from .mc2_graph import recipes as native_moe_recipes
         from .hccl_graph import recipes as hccl_recipes
+        from .sparse_kv_offload import recipes as sparse_kv_offload_recipes
         from .matrix import TiledMatmul, HierarchicalMatmul
         from .matrix_mapping import MappedMatmul
         from .matrix_phase import PhaseMatmul
@@ -430,6 +431,7 @@ class RecipeBook:
             return {name: factories[value["kind"]](**{k: v for k, v in value.items() if k != "kind"})
                     for name, value in values.items()}
         explicit = {**native_moe_recipes(raw), **hccl_recipes(raw),
+                    **sparse_kv_offload_recipes(),
                     **implementation_recipes(raw.get("lowerings", {})),
                     **build(raw.get("recipes", {}))}
         return cls(explicit, families=build(raw.get("families", {})),
