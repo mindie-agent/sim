@@ -141,6 +141,117 @@ IMPLEMENTATIONS = {
     "triton_moe_fused_mul_sum": Implementation(
         "mindie_sim.prediction.family_moe", operators=("route_unpack",),
         options=("compute_capability", "weight_dtype")),
+    "xllm_custom_xllm_math": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=(
+            "smla_va", "sparse_flash_attention_lse", "moe_grouped_matmul_swiglu_quant",
+            "mega_gdn_decode", "onerec_final_beam_select", "reshape_and_cache_a5",
+            "mla_attention", "paged_mla_attention", "indexed_attention", "grouped_gemm",
+            "gdn_decode", "beam_select", "elementwise", "kv_cache_write",
+        ),
+        options=("op_name", "soc_family", "return_lse", "beam_width", "kv_page_size")),
+    "xllm_smla_va": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("smla_va", "mla_attention", "paged_mla_attention"),
+        options=("op_name", "soc_family")),
+    "xllm_sparse_flash_attention_lse": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("sparse_flash_attention_lse", "indexed_attention", "mla_attention"),
+        options=("op_name", "soc_family", "return_lse")),
+    "xllm_moe_grouped_matmul_swiglu_quant": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("moe_grouped_matmul_swiglu_quant", "grouped_gemm"),
+        options=("op_name", "soc_family")),
+    "xllm_mega_gdn_decode": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("mega_gdn_decode", "gdn_decode"),
+        options=("op_name", "soc_family")),
+    "xllm_onerec_final_beam_select": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("onerec_final_beam_select", "beam_select", "elementwise"),
+        options=("op_name", "soc_family", "beam_width")),
+    "xllm_reshape_and_cache_a5": Implementation(
+        "mindie_sim.prediction.family_xllm_ops",
+        operators=("reshape_and_cache_a5", "kv_cache_write"),
+        options=("op_name", "soc_family", "kv_page_size")),
+    "mindie_sd_custom_ops": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=(
+            "rainfusion", "ada_bsa", "eagle_bsa", "eagle_qbsa", "adalayernorm",
+            "norm_rope_concat", "laurel", "quant_four_over_six_a5", "eagle_ffn",
+            "mindie_sd_rainfusion", "mindie_sd_ada_bsa", "mindie_sd_eagle_bsa",
+            "mindie_sd_eagle_qbsa", "mindie_sd_adalayernorm", "mindie_sd_norm_rope_concat",
+            "mindie_sd_laurel", "mindie_sd_quant_four_over_six_a5", "mindie_sd_eagle_ffn",
+            "indexed_attention", "gqa_attention", "rmsnorm", "add_rmsnorm",
+            "elementwise", "quantize", "gemm", "ffn",
+        ),
+        options=("op_name", "soc_family", "sparsity_ratio", "low_rank", "block_size")),
+    "mindie_sd_rainfusion": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("rainfusion", "mindie_sd_rainfusion", "indexed_attention", "gqa_attention"),
+        options=("op_name", "soc_family", "sparsity_ratio", "block_size")),
+    "mindie_sd_ada_bsa": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("ada_bsa", "mindie_sd_ada_bsa", "indexed_attention", "gqa_attention"),
+        options=("op_name", "soc_family", "sparsity_ratio", "block_size")),
+    "mindie_sd_eagle_bsa": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("eagle_bsa", "mindie_sd_eagle_bsa", "indexed_attention", "gqa_attention"),
+        options=("op_name", "soc_family", "sparsity_ratio", "block_size")),
+    "mindie_sd_eagle_qbsa": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("eagle_qbsa", "mindie_sd_eagle_qbsa", "indexed_attention", "gqa_attention"),
+        options=("op_name", "soc_family", "sparsity_ratio", "block_size")),
+    "mindie_sd_adalayernorm": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("adalayernorm", "mindie_sd_adalayernorm", "rmsnorm", "add_rmsnorm"),
+        options=("op_name", "soc_family")),
+    "mindie_sd_norm_rope_concat": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("norm_rope_concat", "mindie_sd_norm_rope_concat", "rmsnorm", "elementwise"),
+        options=("op_name", "soc_family")),
+    "mindie_sd_laurel": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("laurel", "mindie_sd_laurel", "gemm", "elementwise"),
+        options=("op_name", "soc_family", "low_rank")),
+    "mindie_sd_quant_four_over_six_a5": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("quant_four_over_six_a5", "mindie_sd_quant_four_over_six_a5", "quantize", "elementwise"),
+        options=("op_name", "soc_family")),
+    "mindie_sd_eagle_ffn": Implementation(
+        "mindie_sim.prediction.family_mindie_sd_ops",
+        operators=("eagle_ffn", "mindie_sd_eagle_ffn", "gemm", "ffn"),
+        options=("op_name", "soc_family")),
+    "vllm_ascend_sparse_kv_offload": Implementation(
+        "mindie_sim.prediction.sparse_kv_offload",
+        blocks=("sparse_kv_offload",),
+        operators=(
+            "memfabric_sparse_copy_d2h", "memfabric_sparse_copy_h2d",
+            "memfabric_kv_exchange", "memfabric_entry_gather",
+            "fused_lightning_indexer_manage", "copy_sfa_attention",
+            "fused_sparse_attention_overlap",
+        ),
+        options=(
+            "dram_size_per_dp_gb", "topk_buffer_size", "miss_rate",
+            "use_fused_copy_sfa", "use_fused_overlap", "keep_device_kv_cache",
+            "store_index_k_on_host", "layerwise_kv_offload", "num_shared_layers",
+            "soc_family", "page_size",
+        )),
+    "hisparse_kv_offload": Implementation(
+        "mindie_sim.prediction.sparse_kv_offload",
+        blocks=("sparse_kv_offload",),
+        operators=(
+            "memfabric_sparse_copy_d2h", "memfabric_sparse_copy_h2d",
+            "memfabric_kv_exchange", "memfabric_entry_gather",
+            "fused_lightning_indexer_manage", "copy_sfa_attention",
+            "fused_sparse_attention_overlap",
+        ),
+        options=(
+            "dram_size_per_dp_gb", "topk_buffer_size", "miss_rate",
+            "use_fused_copy_sfa", "use_fused_overlap", "keep_device_kv_cache",
+            "store_index_k_on_host", "layerwise_kv_offload", "num_shared_layers",
+            "soc_family", "page_size",
+        )),
 }
 
 
@@ -167,6 +278,10 @@ def select(bindings, selector):
     if selector not in (*registered.operators, *registered.blocks):
         raise ModelingError(f"implementation_selector_mismatch:{selector}:{name}")
     options = dict(declaration.get("options", {}))
+    if isinstance(name, str) and name.startswith("xllm_") and name != "xllm_custom_xllm_math":
+        options.setdefault("op_name", name.removeprefix("xllm_"))
+    elif isinstance(name, str) and name.startswith("mindie_sd_") and name != "mindie_sd_custom_ops":
+        options.setdefault("op_name", name.removeprefix("mindie_sd_"))
     unknown_options = options.keys() - set(registered.options)
     if unknown_options:
         raise ModelingError(
