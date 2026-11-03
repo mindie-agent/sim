@@ -192,18 +192,20 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     serv_mte1, serv_mte2, serv_mte3 = (sum(float(v) for k, v in serviced.items() if k.startswith("mte1@")) if not has_jn else 0.0), (sum(float(v) for k, v in serviced.items() if k.startswith("mte2")) if not has_jn else 0.0), (sum(float(v) for k, v in serviced.items() if k.startswith("mte3@")) if not has_jn else 0.0)
     comm_info = dict(row.get("communication") or {})
     comm_wire = comm_info.get("wire_by_resource") or {}
+    comm_res = dict(comm_info.get("resources") or {})
     _non_lnk = ("memory@", "vector@", "matrix@", "mte", "fixpipe@", "l2@", "ub", "reg_", "sreg_", "vreg_", "scalar_", "vbitsort", "host", "scheduler@", "native_call_service")
     if has_jn:
         serv_link = 0.0
     elif comm_wire:
         serv_link = sum(float(v) for v in comm_wire.values())
     elif comm_info.get("wire_bytes") is not None:
-        rank_div = max(1, len(comm_info.get("useful_bytes_by_rank") or ()) or len(dies))
+        is_per_port = any(":tx:port" in k or ":rx:port" in k for k in comm_res)
+        rank_div = (max(1, len(comm_info.get("useful_bytes_by_rank") or ()) or len(dies)) if is_per_port else 1)
         serv_link = float(comm_info["wire_bytes"]) / rank_div
     else:
         lnk_items = {k: float(v) for k, v in serviced.items() if not any(k.startswith(p) for p in _non_lnk) and not k.endswith(":switch_plane")}
         tx_items = [v for k, v in lnk_items.items() if ":tx:port" in k]
-        serv_link = (sum(tx_items) if tx_items else sum(lnk_items.values())) / max(1, len(dies))
+        serv_link = (sum(tx_items) / max(1, len(dies))) if tx_items else sum(lnk_items.values())
 
     m_raw = op.get("matrix_flops") or ()
     matrix_flops = {str(k): float(v) for k, v in (m_raw.items() if isinstance(m_raw, Mapping) else m_raw) if v}

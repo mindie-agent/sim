@@ -348,4 +348,8 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
         assert comb["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_comb_ideal_us, rel=1e-3)
         assert disp["duration_ms"] * 1000.0 < max_disp_us
         assert comb["duration_ms"] * 1000.0 < max_comb_us
+        op_ids = [row["op_id"] for row in eff["operators"]]
+        assert any(oid.endswith(".pack.quantize") for oid in op_ids)
+        assert not any(oid.endswith(".expert_up.quantize") for oid in op_ids)
+
 

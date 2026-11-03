@@ -333,20 +333,22 @@ def default_dispatch_spec(model, plan=None, width=None):
     }
 
 
-def default_exchange_contract(model, runtime, plan, transport, latent):
-    """Return (dispatch_row_bytes, combine_row_bytes, dispatch_meta, combine_meta)."""
+def default_exchange_contract(model, runtime, plan, transport, latent, *,
+                              ep=1, prefix="", stage=0, requests=(), pack=None,
+                              tokens=0, partitions=1, mode="decode"):
+    """Return (dispatch_row_bytes, combine_row_bytes, dispatch_meta, combine_meta, pack_quant_op)."""
     default_row = float(latent * dtype_bytes(model.activation_dtype))
     follow = (
-        transport is None
+        transport is None and ep > 1
         and dict(getattr(runtime, "metadata", ()) or ()).get("moe_dispatch_quantization")
         == "routed_expert"
     )
     if not follow:
-        return default_row, default_row, (), ()
+        return default_row, default_row, (), (), None
     spec = default_dispatch_spec(model, plan=plan, width=latent)
     d_row, c_row = float(spec["dispatch_row_bytes"]), float(spec["combine_row_bytes"])
     if not spec["quantized"]:
-        return d_row, c_row, (), ()
+        return d_row, c_row, (), (), None
     row_fmt = (("peer_traffic_row_format", {"forward_bytes": int(round(d_row)), "reverse_bytes": int(round(c_row))}),)
     d_meta = (
         ("dispatch_dtype", spec["dispatch_dtype"]), ("payload_dtype", spec["payload_dtype"]),
@@ -357,7 +359,30 @@ def default_exchange_contract(model, runtime, plan, transport, latent):
         ("dispatch_dtype", spec["dispatch_dtype"]), ("combine_dtype", spec["combine_dtype"]),
         ("payload_dtype", spec["combine_dtype"]), ("row_bytes", c_row),
     ) + row_fmt
-    return d_row, c_row, d_meta, c_meta
+    pack_quant = None
+    if pack is not None and tokens > 0:
+        rows = source_rows(tokens, plan.top_k, partitions)
+        rows_int = _ceil_rows(rows)
+        group = spec["scale_group"] or latent
+        groups = max(1, math.ceil(latent / group))
+        scale_bytes = rows * spec["scale_bytes_per_row"]
+        scale_shape = (rows_int, groups) if groups > 1 else (rows_int,)
+        pack_quant = vector_op(
+            op_id=prefix + ".pack.quantize", deps=(pack.op_id,), stage=stage,
+            layer=plan.index, requests=requests, elements=rows_int * latent,
+            ops_per_element=0, vector_ops_override=4 * rows * latent + 2 * rows * groups,
+            dtype=pack.dtype, family="quantize", phase=mode, recipe="dynamic_quantize",
+            shape=(rows_int, latent),
+            read_bytes_override=rows * latent * dtype_bytes(pack.dtype),
+            write_bytes_override=rows * d_row, returns=("activation_scales",),
+            metadata=(
+                ("input_format", pack.dtype), ("output_format", spec["payload_dtype"]),
+                ("activation_group_size", group), ("activation_scale_format", spec["scale_dtype"]),
+                ("activation_scale_shape", scale_shape), ("activation_scale_bytes", scale_bytes),
+                ("source_rows", rows), ("quantization_scope", "moe_dispatch_expert_input"),
+            ),
+        )
+    return d_row, c_row, d_meta, c_meta, pack_quant
 
 
 def select(runtime, *, layer_scope="body"):
