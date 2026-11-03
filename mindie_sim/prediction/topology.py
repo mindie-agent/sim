@@ -403,7 +403,7 @@ class Topology:
         volume = op.link_bytes if volume is None else volume
         useful_by_rank, useful, wire, transactions = {}, {}, {}, {}
         transaction_frames = {}
-        latency, count = 0.0, 0
+        latency, max_path_latency, count = 0.0, 0.0, 0
         routed_useful, physical_wire = 0.0, 0.0
         for flow, rounds in self.messages(op, replica, volume):
             useful_by_rank[flow.source] = useful_by_rank.get(flow.source, 0) + flow.useful_bytes
@@ -420,10 +420,11 @@ class Topology:
                     if hop.transaction_frame is not None:
                         transaction_frames[resource] = hop.transaction_frame
                 path_latency += hop.latency_ms
+            max_path_latency = max(max_path_latency, path_latency)
             latency = max(latency, path_latency * rounds)
         return CommunicationWork(
             useful_by_rank, useful, wire, transactions, transaction_frames, count, latency,
-            routed_useful, physical_wire,
+            routed_useful, physical_wire, max_path_latency,
         )
 
     def demand(self, op, replica, *, volume=None):

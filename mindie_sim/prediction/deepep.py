@@ -395,7 +395,12 @@ def _resolve_dispatch_dtype(case, dispatch_dtype):
     if dispatch_dtype is not None:
         return str(dispatch_dtype).strip().lower()
     cfg = dict(case.runtime.kernels.get("moe_transport") or {})
-    return str(cfg.get("dispatch_dtype", cfg.get("payload_dtype", "bf16"))).strip().lower()
+    if "dispatch_dtype" in cfg or "payload_dtype" in cfg:
+        return str(cfg.get("dispatch_dtype", cfg.get("payload_dtype", "bf16"))).strip().lower()
+    if dict(getattr(case.runtime, "metadata", ()) or ()).get("moe_dispatch_quantization") == "routed_expert":
+        from mindie_sim.prediction.moe_transport import default_dispatch_spec
+        return str(default_dispatch_spec(case.model)["payload_dtype"]).strip().lower()
+    return "bf16"
 
 
 def analyze_deepep_collectives(

@@ -163,11 +163,36 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                            or sp_padding == "right_to_tp"):
         from .balanced_routing import cohort_padded_tokens
         padded_cohort = cohort_padded_tokens(views.values(), case.runtime)
-    graphs = bind_cohort_traffic(case, {
-        r: _target_ops(case, group, scope, global_views=global_views,
-                       resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
-                       phase=phase, replica=r)
-        for r, group in views.items()})
+    uniform_replicas = (
+        len(set(counts.values())) <= 1
+        and case.runtime.routing.get("policy") != "balanced"
+        and not any(
+            isinstance(item, Mapping) and "replica" in item
+            for item in (case.runtime.routing.get("realizations") or ())
+        )
+    )
+    if uniform_replicas and participants:
+        first_r = participants[0]
+        base_ops = _target_ops(
+            case, views[first_r], scope, global_views=global_views,
+            resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+            phase=phase, replica=first_r,
+        )
+        raw_graphs = {first_r: base_ops}
+        for r in participants[1:]:
+            req_ids = tuple(v.request_id for v in views[r])
+            raw_graphs[r] = tuple(
+                replace(op, requests=req_ids) if op.requests else op
+                for op in base_ops
+            )
+    else:
+        raw_graphs = {
+            r: _target_ops(case, group, scope, global_views=global_views,
+                           resource_fusion=resource_fusion, cohort_tokens=padded_cohort,
+                           phase=phase, replica=r)
+            for r, group in views.items()
+        }
+    graphs = bind_cohort_traffic(case, raw_graphs)
     return (TargetGraphSet(graphs, kernels=case.runtime.kernels, selection=selection)
             if scope == "body" else graphs)
 

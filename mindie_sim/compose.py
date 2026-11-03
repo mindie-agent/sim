@@ -498,7 +498,10 @@ def compose_case(
         }
         for idx in range(int(concurrency))
     ]
-    runtime_meta: dict[str, Any] = {"sp": bool(sp)}
+    runtime_meta: dict[str, Any] = {
+        "sp": bool(sp),
+        "moe_dispatch_quantization": "routed_expert",
+    }
     if int(mtp_proposal_tokens) > 0:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)

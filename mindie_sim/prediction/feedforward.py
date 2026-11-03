@@ -371,8 +371,15 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     source_partitions = partitions
     routing_basis = (routing_realization.basis
                      if routing_realization is not None else "probability_moments")
-    exchange_bytes = tokens * plan.top_k * latent * dtype_bytes(model.activation_dtype) \
-        * (parallel.ep - 1) / parallel.ep / source_partitions
+    dispatch_row_bytes, combine_row_bytes, dispatch_quant_meta, combine_quant_meta = (
+        moe_transport.default_exchange_contract(model, runtime, plan, transport, latent)
+    )
+    dispatch_exchange_bytes = (
+        tokens * plan.top_k * dispatch_row_bytes * (parallel.ep - 1) / parallel.ep / source_partitions
+    )
+    combine_exchange_bytes = (
+        tokens * plan.top_k * combine_row_bytes * (parallel.ep - 1) / parallel.ep / source_partitions
+    )
     collective_meta = (
         ("group_axis", "ep"), ("steps", max(0, parallel.ep - 1)),
         ("source_assignment_partitions", source_partitions),
@@ -382,8 +389,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     def masked_collective(op, reverse=False):
         if source_traffic is None:
             return op
-        matrix = source_traffic.payload_matrix(latent * dtype_bytes(model.activation_dtype),
-                                               reverse=reverse)
+        row_width = combine_row_bytes if reverse else dispatch_row_bytes
+        matrix = source_traffic.payload_matrix(row_width, reverse=reverse)
         meta = dict(op.metadata)
         meta.pop("reverse_of_collective", None)
         meta.update(peer_volume_basis="group_mean",
@@ -396,8 +403,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         dispatch = comm_op(
             op_id=prefix + ".dispatch", deps=(last,), stage=stage, layer=plan.index,
             requests=requests, family="alltoall", phase=mode, recipe="expert_dispatch",
-            link_bytes=exchange_bytes, shape=(tokens * plan.top_k, latent),
-            metadata=collective_meta + (("collective_id", prefix + ".dispatch"),),
+            link_bytes=dispatch_exchange_bytes, shape=(tokens * plan.top_k, latent),
+            metadata=collective_meta + (("collective_id", prefix + ".dispatch"),) + dispatch_quant_meta,
         )
         dispatch = masked_collective(dispatch)
         dispatch = scale_exchange_operator(
@@ -604,9 +611,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             combine = comm_op(
                 op_id=prefix + ".combine", deps=(last,), stage=stage, layer=plan.index,
                 requests=requests, family="alltoall", phase=mode, recipe="expert_combine",
-                link_bytes=exchange_bytes, shape=(tokens * plan.top_k, latent),
+                link_bytes=combine_exchange_bytes, shape=(tokens * plan.top_k, latent),
                 metadata=collective_meta + (("collective_id", prefix + ".combine"),
-                                           ("reverse_of_collective", prefix + ".dispatch")),
+                                           ("reverse_of_collective", prefix + ".dispatch")) + combine_quant_meta,
             )
         if transport is None:
             combine = masked_collective(combine, reverse=True)

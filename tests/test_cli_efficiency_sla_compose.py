@@ -315,3 +315,37 @@ def test_cli_sweep_and_skew_modes(tmp_path: Path) -> None:
         "--context", "2048", "--sequences", "2", "-o", str(cp_out),
     ]) == 0
     assert json.loads(cp_out.read_text(encoding="utf-8"))["schema"] == "mindie-sim.chunked-prefill-interference/1"
+
+
+def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
+    from mindie_sim.prediction.efficiency import analyze_network_efficiency
+
+    for hw, exp_disp_ideal_us, exp_comb_ideal_us, max_disp_us, max_comb_us in (
+        ("a5-pod-dt", 8.3649, 16.2229, 12.0, 20.0),
+        ("a5-server-dt", 35.5509, 68.9472, 40.0, 72.0),
+    ):
+        case = compose_case(
+            model="glm5.3", hardware=hw, dp=64, tp=1, ep=64,
+            prompt_tokens=131072, output_tokens=1024, concurrency=1216,
+            mtp_proposal_tokens=5, mtp_acceptance_length=4.5, tpot_slo_ms=20.0,
+        )
+        eff = analyze_network_efficiency(
+            case, phase="decode", tokens=6, context=131072,
+            sequences=19, scope="body", run_graph=False,
+        )
+        by_recipe = {
+            row["recipe"]: row for row in eff["operators"]
+            if row.get("recipe") in ("expert_dispatch", "expert_combine")
+        }
+        disp = by_recipe["expert_dispatch"]
+        comb = by_recipe["expert_combine"]
+        # 114 tokens/rank * top_k=8 * (63/64) = 897.75 remote rows/rank.
+        # Dispatch uses FP8 payload (6144 B) + FP32 block-128 scales (48*4=192 B) = 6336 B/row.
+        # Combine uses BF16 (6144 * 2 = 12288 B/row). Neither is double-counted by per_port Tx+Rx.
+        assert disp["link_bytes"] == pytest.approx(897.75 * 6336.0)
+        assert comb["link_bytes"] == pytest.approx(897.75 * 12288.0)
+        assert disp["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_disp_ideal_us, rel=1e-3)
+        assert comb["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_comb_ideal_us, rel=1e-3)
+        assert disp["duration_ms"] * 1000.0 < max_disp_us
+        assert comb["duration_ms"] * 1000.0 < max_comb_us
+

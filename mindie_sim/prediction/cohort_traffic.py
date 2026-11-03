@@ -77,15 +77,27 @@ def bind_cohort_traffic(case, graphs):
                     raise ModelingError(f"cohort_traffic_duplicate_collective_identity:{key}")
                 declarations[key] = op
     replacements = {}
+    owner_by_stage = {}
+    group_plan_cache = {}
     for replica, reverse in inverse:
         meta = dict(reverse.metadata)
         stage = int(meta.get("source_stage", reverse.stage))
         axis = meta.get("group_axis", "ep")
         source_id = meta["reverse_of_collective"]
-        owner = {rank: r for r in graphs for rank in topology.ranks(r, stage)}
+        owner = owner_by_stage.get(stage)
+        if owner is None:
+            owner = {rank: r for r in graphs for rank in topology.ranks(r, stage)}
+            owner_by_stage[stage] = owner
         own_ranks = set(topology.ranks(replica, stage))
         descriptors, totals = [], []
         for group in topology.groups(axis, replica, stage):
+            cache_key = (stage, axis, source_id, group, _peer_row_widths(meta))
+            cached = group_plan_cache.get(cache_key)
+            if cached is not None:
+                backward, return_plan = cached
+                descriptors.append(backward)
+                totals.extend(return_plan.row_total(i) for i, rank in enumerate(group) if rank in own_ranks)
+                continue
             source_ops = []
             for rank in group:
                 if rank not in owner or (owner[rank], stage, source_id) not in declarations:
@@ -152,6 +164,7 @@ def bind_cohort_traffic(case, graphs):
             backward = {**routed_forward, "direction": (
                 "transpose" if routed_forward.get("direction", "forward") == "forward" else "forward")}
             return_plan = PeerTraffic.from_mapping(backward, len(group))
+            group_plan_cache[cache_key] = (backward, return_plan)
             descriptors.append(backward)
             totals.extend(return_plan.row_total(i) for i, rank in enumerate(group) if rank in own_ranks)
         if any(item != descriptors[0] for item in descriptors):

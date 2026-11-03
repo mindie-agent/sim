@@ -230,7 +230,7 @@ def _parse(raw, metadata, layer_scope):
             dispatch = "int8"
         else:
             normalized = str(payload).strip().lower().replace("-", "_")
-            if normalized != "int8":
+            if normalized not in ({"int8"} | _FP8 | _MXFP8):
                 raise ModelingError(
                     "moe_transport_unsupported:payload_dtype="
                     f"{payload!r};expected='int8'")
@@ -280,6 +280,84 @@ def _parse(raw, metadata, layer_scope):
         deepep_overlap_ratio=_overlap_ratio(raw, metadata),
         ranks_per_node=_ranks_per_node(raw, metadata),
     )
+
+
+def default_dispatch_spec(model, plan=None, width=None):
+    """Resolve the vllm-ascend dispatch wire format from the routed-expert quant spec."""
+    from mindie_sim.catalog.ops import activation_scales, compute_dtype_for
+
+    scope = getattr(plan, "scope", "body") if plan is not None else "body"
+    latent = int(
+        width
+        or (getattr(plan, "expert_latent_size", 0) if plan is not None else 0)
+        or model.hidden_size
+    )
+    combine_dtype = model.activation_dtype
+    combine_row_bytes = float(latent * dtype_bytes(combine_dtype))
+    if scope in model.quant.exclusions:
+        return {
+            "dispatch_dtype": combine_dtype,
+            "payload_dtype": combine_dtype,
+            "combine_dtype": combine_dtype,
+            "quantized": False,
+            "scale_dtype": "",
+            "scale_group": 0,
+            "payload_bytes_per_row": combine_row_bytes,
+            "scale_bytes_per_row": 0.0,
+            "dispatch_row_bytes": combine_row_bytes,
+            "combine_row_bytes": combine_row_bytes,
+            "element_bytes": float(dtype_bytes(combine_dtype)),
+        }
+    quant = model.quant.for_category("routed_expert")
+    _, act = compute_dtype_for(quant, "routed_expert")
+    group, scale_format, _, scale_bytes_per_row = activation_scales(quant, act, 1, latent)
+    quantized = act not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
+    if act in _FP8 and group == 32 and scale_format in {"fp8_e8m0", "e8m0"}:
+        dispatch_dtype = "mxfp8"
+    else:
+        dispatch_dtype = act
+    payload_bytes_per_row = float(latent * dtype_bytes(act))
+    dispatch_row_bytes = payload_bytes_per_row + (float(scale_bytes_per_row) if quantized else 0.0)
+    return {
+        "dispatch_dtype": dispatch_dtype,
+        "payload_dtype": act,
+        "combine_dtype": combine_dtype,
+        "quantized": quantized,
+        "scale_dtype": scale_format if quantized else "",
+        "scale_group": int(group) if quantized else 0,
+        "payload_bytes_per_row": payload_bytes_per_row,
+        "scale_bytes_per_row": float(scale_bytes_per_row) if quantized else 0.0,
+        "dispatch_row_bytes": dispatch_row_bytes,
+        "combine_row_bytes": combine_row_bytes,
+        "element_bytes": dispatch_row_bytes / float(latent) if latent > 0 else float(dtype_bytes(act)),
+    }
+
+
+def default_exchange_contract(model, runtime, plan, transport, latent):
+    """Return (dispatch_row_bytes, combine_row_bytes, dispatch_meta, combine_meta)."""
+    default_row = float(latent * dtype_bytes(model.activation_dtype))
+    follow = (
+        transport is None
+        and dict(getattr(runtime, "metadata", ()) or ()).get("moe_dispatch_quantization")
+        == "routed_expert"
+    )
+    if not follow:
+        return default_row, default_row, (), ()
+    spec = default_dispatch_spec(model, plan=plan, width=latent)
+    d_row, c_row = float(spec["dispatch_row_bytes"]), float(spec["combine_row_bytes"])
+    if not spec["quantized"]:
+        return d_row, c_row, (), ()
+    row_fmt = (("peer_traffic_row_format", {"forward_bytes": int(round(d_row)), "reverse_bytes": int(round(c_row))}),)
+    d_meta = (
+        ("dispatch_dtype", spec["dispatch_dtype"]), ("payload_dtype", spec["payload_dtype"]),
+        ("scale_dtype", spec["scale_dtype"]), ("scale_group", spec["scale_group"]),
+        ("row_bytes", d_row),
+    ) + row_fmt
+    c_meta = (
+        ("dispatch_dtype", spec["dispatch_dtype"]), ("combine_dtype", spec["combine_dtype"]),
+        ("payload_dtype", spec["combine_dtype"]), ("row_bytes", c_row),
+    ) + row_fmt
+    return d_row, c_row, d_meta, c_meta
 
 
 def select(runtime, *, layer_scope="body"):
@@ -624,6 +702,6 @@ def combine(*, prefix, plan, stage, requests, deps, transport, rows, width, ep,
 
 
 __all__ = [
-    "Transport", "select", "_transport_format", "validate_contract",
+    "Transport", "default_dispatch_spec", "select", "_transport_format", "validate_contract",
     "source_partitions", "source_rows", "histogram", "quantize", "dispatch", "combine",
 ]
