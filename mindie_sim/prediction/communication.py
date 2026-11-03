@@ -72,6 +72,7 @@ class CommunicationWork:
     setup_ms: float
     routed_useful_bytes: float = 0
     physical_wire_bytes: float = 0
+    path_latency_ms: float = 0.0
 
     def to_dict(self):
         return {
@@ -83,6 +84,7 @@ class CommunicationWork:
             "resource_boundary": "simultaneous_capacity_demands_not_additional_transmissions",
             "messages": self.messages,
             "setup_ms": self.setup_ms,
+            "path_latency_ms": self.path_latency_ms,
             "useful_bytes_by_rank": {str(rank): value for rank, value in self.useful_by_rank.items()},
             "resources": {
                 name: {
