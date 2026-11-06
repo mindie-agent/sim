@@ -156,17 +156,21 @@ def gemm_op(
     if (fmt in {"int8", "w8a8"} and act == "int8" and group >= k
             and out_dtype in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}):
         # Per-row dynamic quantization rescales the completed INT32 reduction.
-        # Retain the declared scale+offset storage traffic, but do not invent
-        # offset arithmetic: the dynamic caller passes weight/row scales only.
-        column_metadata = weight_bytes * (2 * quant.scale_bytes) / (
-            int(weight_cols or k) + 2 * quant.scale_bytes)
+        # Retain only the declared column inputs; an absent offset must not
+        # double the scale traffic or become a synthetic matrix operand.
+        metadata_columns = 1 if quant.int8_weight_metadata == "scale_only" else 2
+        column_width = metadata_columns * quant.scale_bytes
+        column_metadata = weight_bytes * column_width / (int(weight_cols or k) + column_width)
         operations = 3 if out_dtype in {"fp32", "float32"} else 4
         vector_ops = float(operations * m * n)
         meta += (("matrix_epilogue", {
             "kind": "row_column_scale", "row_scale_bytes": float(scale_bytes),
             "column_scale_bytes": column_metadata, "operations_per_output": operations,
         }), ("matrix_output_contract", "int32_cast_row_scale_column_scale_output_cast"),
-            ("column_metadata_policy", "retains_declared_scale_and_offset_storage_traffic"))
+            ("int8_weight_metadata", quant.int8_weight_metadata),
+            ("column_metadata_policy", "declared_scale_only_storage_traffic"
+             if quant.int8_weight_metadata == "scale_only"
+             else "retains_declared_scale_and_offset_storage_traffic"))
     return OpSpec(
         op_id=op_id, family=family, phase=phase, stage=stage, layer=layer,
         requests=requests,

@@ -22,7 +22,7 @@ from mindie_sim.schema.workload import selected_mode
 from .attention import ATTENTION_BUILDERS, AttentionPolicy
 from .blocks import RESIDUAL_BUILDERS, norm
 from .feedforward import FFN_BUILDERS, RoutingPolicy
-from .graph import GraphPolicy
+from .graph import GraphPolicy, annotate_geometry
 from .routing_realizations import select_realization
 from .structure import normalize_model, stage_map
 from . import family_attnres, sequence_parallel
@@ -442,6 +442,10 @@ class Frontend:
                 self, model, declared_runtime, preparation_views, committed.op_id,
                 global_views=global_preparation if global_views else None, prefill=True,
                 replica=replica, replay_scope=scope)
+        # A capture descriptor is distinct from each kernel's active/sliced
+        # tensor. Preserve both so native responses cannot alias two buckets
+        # merely because their logical attention shapes are equal.
+        ops = annotate_geometry(ops, active_rows=valid, physical_rows=padded)
         regions = (*before, LoweringRegion(tuple(ops), runtime, model.activation_dtype,
                                           local_tokens, selections), *after)
         ops, selections = lower_regions(

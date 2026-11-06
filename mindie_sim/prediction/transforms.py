@@ -81,7 +81,8 @@ def activation_quantization(ops, source_dtype):
                 **{key: meta[key] for key in (
                     "activation_group_size", "activation_scale_shape",
                     "activation_scale_format", "activation_scale_bytes")},
-                **{key: meta[key] for key in ("structure_block", "structure_role") if key in meta},
+                **{key: meta[key] for key in ("structure_block", "structure_role",
+                    "graph_active_query_rows", "graph_physical_query_rows") if key in meta},
             }
             if meta.get("input_conversion_subgraphs"):
                 quant_meta["structure_subgraph_memberships"] = meta["input_conversion_subgraphs"]

@@ -2,7 +2,8 @@
 
 [Role] Bind update convolution, gating, Q/K normalization and state recurrence.
 [Invariants] Caller copies replace generic work. Query rows do not shrink with
-  speculative acceptance; graph padding stops before the active native core.
+  speculative acceptance; full capture retains physical buffers while dummy
+  zero-length sequences perform no convolution or recurrent state work.
   Each named copy/fill is a declared vector invocation, not an extra host gap.
 [Timeouts & Locks] O(sequence descriptors), lazily executed physical kernels.
 [Side-Effect Policy] Builds operators only; no measurements or device contexts.
@@ -16,6 +17,7 @@ from .call_gdn import GATING_SOURCE
 from . import gdn_recurrent
 from .gdn_decode_programs import CONV, GATING, CONV_SOURCE, conv_plan, gating_plan
 from .gdn_prefill import decode_core, rearrange_qkv
+from .graph import GraphPolicy
 from .lowering import Builder
 from .mechanism import PlannedRecipe
 from .tensors import TensorLowering
@@ -43,6 +45,14 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     b = Builder(prefix, plan, stage, views, model, mode)
     tensors = TensorLowering(b, runtime.tensor_layouts)
     tp, tokens, actual = parallel.tp, padded_tokens, sum(view.q_len for view in views)
+    _, capture_scope = GraphPolicy().select(views, runtime)
+    core_tokens = tokens if capture_scope == "full" else actual
+    lengths = tuple(view.q_len for view in views)
+    # The captured Python slices retain their capture-time extent. The source
+    # metadata builder pads query_start_loc with its last offset, so these
+    # physical request slots have zero logical length during replay.
+    slots = max(len(views), math.ceil(core_tokens / lengths[0])) if capture_scope == "full" else len(views)
+    physical_lengths = lengths + (0,) * (slots - len(views))
     keys = math.ceil((plan.linear_key_heads or plan.linear_heads) / tp)
     heads = math.ceil((plan.linear_value_heads or plan.linear_heads) / tp)
     dk, dv = plan.linear_key_head_dim or plan.linear_head_dim, plan.linear_head_dim
@@ -59,28 +69,30 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     zero = b.work("core_output_zero", (deps,), (tokens, heads, dv),
                   vector=tokens * value_width, write=tokens * value_width * 2,
                   family="tensor_fill", dtype="bf16")
-    conv_input = tensors.contiguous(projection.narrow(0, 0, actual).narrow(1, 0, width),
+    conv_input = tensors.contiguous(projection.narrow(0, 0, core_tokens).narrow(1, 0, width),
                                     "convolution_input_contiguous", reason="causal_conv1d_update.contiguous")
-    lengths = tuple(view.q_len for view in views)
     speculative = any(length > 1 for length in lengths)
     if speculative and any(length == 1 for length in lengths):
         raise ModelingError("gdn_decode_mixed_spec_non_spec_caller_not_selected")
     # The caller selects one state index per request before normalizing the
     # view. Proposal-table stride is independent of query count and padding.
-    cache_indices = tensors.result(deps, (len(views), cache_index_row_stride), "int32",
+    cache_indices = tensors.result(deps, (slots, cache_index_row_stride), "int32",
                                     output="causal_cache_indices").narrow(1, 0, 1)
     cache_indices = tensors.contiguous(cache_indices, "state_indices_contiguous",
                                        reason="_normalize_causal_cache_indices.contiguous")
     conv = b.work("short_convolution", tuple(dict.fromkeys((conv_input.producer, cache_indices.producer))), (actual, width),
                   family="short_convolution", dtype="bf16",
                   metadata=(("sequence_tokens", lengths), ("kernel_width", plan.conv_kernel),
+                            ("physical_sequence_tokens", physical_lengths),
+                            ("physical_query_rows", core_tokens),
                             ("speculative", speculative), ("state_history_slots", plan.conv_kernel - 1 + max(lengths) - 1),
                             ("cache_index_row_stride", cache_index_row_stride),
                             ("cache_index_dtype", "int32"),
                             ("cache_index_source", {**SOURCE, "caller_lines": ((138, 143), (435, 445))}),
                             ("bias", False), ("source", CONV_SOURCE)))
-    b.ops[-1] = replace(b.ops[-1], recipe=CONV, source_boundary="kernel")
-    values = rearrange_qkv(tensors, conv, actual, heads, keys, dk, dv)
+    b.ops[-1] = replace(b.ops[-1], recipe=CONV, source_boundary="kernel",
+                        padded_shape=(core_tokens, width))
+    values = rearrange_qkv(tensors, conv, core_tokens, heads, keys, dk, dv)
     if gating_beta_store is None:
         declared = runtime.kernels.get("families", {}).get("gdn_gating", {})
         outputs = declared.get("outputs", ()) if declared.get("kind") == "tiled_pointwise" else ()
@@ -107,7 +119,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     if gating_programs is not None and (not isinstance(gating_programs, int) or isinstance(gating_programs, bool) or gating_programs < 1):
         raise ModelingError("gdn_decode_gating_programs_requires_positive_integer")
     beta_store = {key: value for key, value in gating_beta_store.items() if key != "bytes_per_element"}
-    gated = b.work("delta_gates", tuple(value.producer for value in gate_inputs), (actual, heads),
+    gated = b.work("delta_gates", tuple(value.producer for value in gate_inputs), (core_tokens, heads),
                    family="gdn_gating", dtype="bf16",
                    metadata=(("source", GATING_SOURCE), ("beta_store", beta_store),
                              ("logical_programs", gating_programs),
@@ -115,9 +127,10 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                              ("compiled_identity", "new_capture_binary_unverified"),
                              ("outputs", ("fp32_decay", "bf16_beta"))))
     b.ops[-1] = replace(b.ops[-1], recipe=GATING, source_boundary="kernel")
-    gate_values = (tensors.result(gated, (1, actual, heads), "fp32", output="decay"),
-                   tensors.result(gated, (1, actual, heads), "bf16", output="beta"))
-    core = decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv)
+    gate_values = (tensors.result(gated, (1, core_tokens, heads), "fp32", output="decay"),
+                   tensors.result(gated, (1, core_tokens, heads), "bf16", output="beta"))
+    core = decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv,
+                       physical_tokens=core_tokens, physical_sequence_tokens=physical_lengths)
     scan = b.ops[-1]
     if recurrent_implementation == "arch35_fp32":
         b.ops[-1] = replace(scan, recipe=gdn_recurrent.IMPLEMENTATION, source_boundary="kernel",
@@ -131,7 +144,7 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                            "recurrence_selection": recurrent_implementation}.items()))
     else:
         raise ModelingError("gdn_decode_recurrent_implementation_unknown:" + recurrent_implementation)
-    copied = tensors.copy_into(core, tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, actual),
+    copied = tensors.copy_into(core, tensors.result(zero, (tokens, heads, dv)).narrow(0, 0, core_tokens),
                                "core_output_copy")
     # gdn.py flattens token and head axes before norm. This crosses the
     # QKVZ row gap for multi-token/multi-head z and needs a materialization;

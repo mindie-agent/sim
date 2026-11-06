@@ -103,3 +103,22 @@ def test_valid_requests_capture_bucket_and_sp_padding_are_distinct_public_geomet
     capacity = report['capacity']
     assert capacity['graph_query_tokens_by_replica'] == {0:8}
     assert capacity['ranks'][0]['cache_bytes'] == 6 * capacity['cache_bytes_per_sequence_stage'][0]
+
+
+@pytest.mark.parametrize("scope", ("body", "model"))
+def test_native_response_axes_distinguish_capture_bucket_from_active_attention_rows(scope):
+    from mindie_sim import target_operators
+    raw = case()
+    raw['model']['quant'] = {'name': 'int8', 'weight_format': 'int8', 'activation_format': 'int8'}
+    raw['runtime'].update(graph_mode='auto', graph_capture_mode='full', graph_capture_keys=[8])
+    first = target_operators(raw, phase='decode', tokens=1, sequences=6, context=32, scope=scope)
+    raw['runtime']['graph_capture_keys'] = [16]
+    second = target_operators(raw, phase='decode', tokens=1, sequences=6, context=32, scope=scope)
+    attention = [op for op in first if op.family == 'attention']
+    other = [op for op in second if op.family == 'attention']
+    assert attention and len(attention) == len(other)
+    assert any(op.recipe == 'dynamic_quantize' for op in first)
+    assert [op.local_shape for op in attention] == [op.local_shape for op in other]
+    for operators, physical in ((first, 8), (second, 16)):
+        assert all(dict(op.metadata)['graph_active_query_rows'] == 6 for op in operators)
+        assert all(dict(op.metadata)['graph_physical_query_rows'] == physical for op in operators)

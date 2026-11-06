@@ -316,7 +316,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                          metadata=(("selection_output_dtype", "int32"),))
             declare_indexer(
                 b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model, quant=quant,
-                tokens=valid, scores=scores, topk=topk)
+                views=views, padded_tokens=q, scores=scores, topk=topk)
         if shard > 1:
             gathered = b.communicate("candidate_gather", (topk,), valid * plan.index_topk * 8 * (cp - 1),
                                      "allgather", "cp")

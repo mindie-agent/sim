@@ -19,6 +19,7 @@ from .execution import CollectiveParticipant, Execution
 from .structure import parse_case
 from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_declaration,
                             effective_body_declaration)
+from .graph import annotate_geometry
 
 
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
@@ -115,6 +116,8 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     if resource_fusion:
         from .native_fusion import lower_native_fusions
         ops = lower_native_fusions(ops, case.runtime, local_tokens=local_tokens)
+    ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),
+                            physical_rows=padded_tokens)
     return annotate(tuple(replace(op, metadata=op.metadata + (("graph_replay_scope", replay_scope),))
                           for op in ops), selections)
 
