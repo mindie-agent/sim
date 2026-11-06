@@ -22,6 +22,10 @@ GDN_KINDS = {"gdn_prepare": "ChunkGatedDeltaRuleFwdPrepare",
 
 def quant_contract(op):
     meta, shape, family = op["metadata"], tuple(op["local_shape"]), op["family"]
+    if "mc2_unfused_storage" in meta:
+        shape = tuple(meta.get("physical_shape", ()))
+        if shape != tuple(op["padded_shape"]):
+            return None
     required = {"input_format", "output_format", "activation_scale_shape",
                 "activation_scale_format"}
     if not required <= meta.keys() or len(shape) != 2:
@@ -242,6 +246,10 @@ def predicted_contract(op):
     family = op["family"]
     if op.get("source_boundary") == "call":
         return None
+    if (family == "cast" and op["recipe"] == "expert_weight_scale_cast"
+            and "mc2_unfused_storage" in meta):
+        return ("native_tensor_abi", "Cast", ((shape, "fp32", "ND"),),
+                ((shape, "bf16", "ND"),))
     if (family == "tensor_materialization" and op["recipe"] == "tensor_copy"
             and meta.get("native_kind") == "TensorMove"
             and meta.get("native_tensor_layout") == "ND"):
@@ -302,6 +310,10 @@ def predicted_contract(op):
             return gemma_norm_contract(op)
         return family, shape, op["dtype"], bool(semantic["norm_has_weight"])
     if family == "swiglu" and shape:
+        if "mc2_unfused_storage" in meta:
+            shape = tuple(meta.get("physical_shape", ()))
+            if shape != tuple(op["padded_shape"]):
+                return None
         return "swiglu", shape, op["dtype"]
     if family == "relu" and shape:
         return "relu", shape, op["dtype"]
