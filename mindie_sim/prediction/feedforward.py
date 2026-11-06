@@ -232,7 +232,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     )
     ops = [*router_prefix, router, *partition_views, select] if tokens else []
     selection_members = [select.op_id]
-    if tokens and plan.router_groups and not hash_table:
+    if tokens and plan.router_groups > 1 and not hash_table:
         group_select = vector_op(
             op_id=prefix + ".group_select", deps=(logits_input,), stage=stage, layer=plan.index,
             requests=requests, elements=tokens * plan.num_experts, ops_per_element=2,
@@ -591,7 +591,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             reduce = comm_op(
                 op_id=prefix + ".expert_reduce", deps=(last,), stage=stage, layer=plan.index,
                 requests=requests, family="allreduce", phase=mode, recipe="expert_tensor_reduce",
-                link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent * 2,
+                link_bytes=2 * (parallel.etp - 1) / parallel.etp * local_rows * latent
+                           * dtype_bytes(model.activation_dtype),
                 shape=(math.ceil(local_rows), latent), metadata=(("group_axis", "etp"),))
             ops.append(reduce)
             last = reduce.op_id
@@ -636,12 +637,13 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     ]
     if routing_realization is not None:
         unpack_metadata.append(("input_rows", int(local_rows)))
+    act_bytes = dtype_bytes(model.activation_dtype)
     unpermute = vector_op(
         op_id=prefix + ".unpack", deps=unpack_inputs, stage=stage, layer=plan.index,
         requests=requests, elements=tokens * latent, ops_per_element=2 * plan.top_k,
         dtype=model.activation_dtype, family="routing", phase=mode, recipe="route_unpack",
-        read_bytes_override=tokens * plan.top_k * (latent * 2 + 4),
-        write_bytes_override=tokens * latent * 2, shape=(tokens, plan.top_k, latent),
+        read_bytes_override=tokens * plan.top_k * (latent * act_bytes + dtype_bytes("fp32")),
+        write_bytes_override=tokens * latent * act_bytes, shape=(tokens, plan.top_k, latent),
         metadata=tuple(unpack_metadata),
     )
     ops.append(unpermute)

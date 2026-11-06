@@ -14,11 +14,13 @@ from .config import flatten_config
 from .types import QuantSpec
 from mindie_sim.schema.common import ModelingError
 
-_NON_LINEAR_EXCLUSION_ROLES = frozenset({"lm_head", "embedding", "norm", "router"})
+_NON_LINEAR_EXCLUSION_ROLES = frozenset({
+    "lm_head", "embedding", "norm", "router", "indexer_weights", "mtp",
+})
 _REGEX_META_CHARS = frozenset("|()[]?+{}")
 
 _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] = (
-    ("lm_head", ("lm_head",), frozenset({"lm_head"})),
+    ("lm_head", ("lm_head", "shared_head.head"), frozenset({"lm_head", "shared_head", "head"})),
     (
         "embedding",
         ("embed_tokens", "embedding", "wte", "word_embeddings"),
@@ -28,11 +30,13 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         "norm",
         (
             "norm", "layernorm", "input_layernorm", "post_attention_layernorm",
-            "q_a_layernorm", "kv_a_layernorm", "rms_norm",
+            "q_a_layernorm", "kv_a_layernorm", "rms_norm", "k_norm", "q_norm",
+            "enorm", "hnorm", "shared_head.norm",
         ),
         frozenset({
             "norm", "layernorm", "input_layernorm", "post_attention_layernorm",
             "q_a_layernorm", "kv_a_layernorm", "rms_norm", "self_attn",
+            "k_norm", "q_norm", "enorm", "hnorm", "shared_head", "indexer",
         }),
     ),
     (
@@ -44,6 +48,16 @@ _ROLE_EXCLUSION_RULES: tuple[tuple[str, tuple[str, ...], frozenset[str]], ...] =
         frozenset({
             "mlp", "gate", "shared_expert_gate", "e_score_correction_bias", "router",
         }),
+    ),
+    (
+        "indexer_weights",
+        ("self_attn.indexers_proj", "indexers_proj", "indexer.weights_proj", "weights_proj"),
+        frozenset({"self_attn", "indexer", "indexers_proj", "weights_proj"}),
+    ),
+    (
+        "mtp",
+        ("eh_proj",),
+        frozenset({"eh_proj", "mtp"}),
     ),
     ("attention", ("self_attn", "attention"), frozenset({"self_attn", "attention"})),
     (
@@ -128,7 +142,26 @@ router_aux_loss_coef aux_loss_alpha seq_aux router_jitter_noise
 max_position_embeddings max_seq_len max_position_embedding model_max_length
 rope_theta rms_norm_eps layer_norm_epsilon _from_model_config z_loss_weight
 attention_bias mlp_bias torchscript pretraining_tp
+ep_size rope_interleave indexer_rope_interleave rope_parameters provenance
+compress_rope_theta dspark_noise_token_id hc_eps mtp_use_dedicated_embeddings
+language_model_only vision_start_token_id vision_end_token_id vision_token_id
+image_placeholder ignore_index bad_words_ids
+begin_suppress_tokens decoder_start_token_id diversity_penalty do_sample early_stopping
+encoder_no_repeat_ngram_size exponential_decay_length_penalty finetuning_task
+forced_bos_token_id forced_eos_token_id id2label
+label2id length_penalty max_length min_length no_repeat_ngram_size
+num_beam_groups num_beams num_return_sequences output_scores prefix
+problem_type remove_invalid_values repetition_penalty
+return_dict_in_generate sep_token_id suppress_tokens task_specific_params
+temperature tf_legacy_loss tokenizer_class top_p
+typical_p use_bfloat16
 """.split())
+
+_FALSY_DEFAULT_FIELDS = frozenset({
+    "add_cross_attention", "chunk_size_feed_forward",
+    "cross_attention_hidden_size", "is_decoder", "is_encoder_decoder",
+    "pruned_heads", "tie_encoder_decoder",
+})
 
 STRUCTURAL_FIELDS = set(ALIASES) | {v for names in ALIASES.values() for v in names} | set("""
 head_dim intermediate_size moe_intermediate_size q_lora_rank kv_lora_rank
@@ -140,11 +173,16 @@ mtp_num_hidden_layers num_mtp_layers shared_expert_intermediate_size
 shared_expert_gate latent_moe_hidden_size routed_expert_hidden_size
 linear_attention_config linear_attn_config linear_num_key_heads
 linear_num_value_heads linear_key_head_dim linear_value_head_dim
-linear_conv_kernel_dim attn_output_gate qk_norm use_qk_norm
+linear_conv_kernel_dim attn_output_gate output_gate_type
+full_attention_interval mamba_ssm_dtype qk_norm use_qk_norm
 sliding_window use_sliding_window max_window_layers decoder_sparse_step
 kv_owner_layers kv_source_layer_ids kv_consumer_to_owner
 quantization_config quantization text_config vision_config
 rope_scaling qkv_bias partial_rotary_factor
+qk_head_dim moe_renormalize moe_router_activation_func num_expert_group
+use_grouped_topk block_size markov_rank num_target_layers
+sparse_attention_config ngram_embedding zero_expert_num dit_config
+double_stream_layers single_stream_layers swiglu_limit
 """.split())
 
 NATIVE_ADAPTER_FIELDS = set("""
@@ -159,7 +197,9 @@ index_head_dim index_n_heads index_source_layer_ids index_topk indexer_types
 index_kpool index_kpool_compress index_kpool_always_select_tail
 latent_moe_use_norm media_placeholder_token_id mhc mla_use_output_gate
 mlp_layer_types moe_router_dtype num_hash_layers o_groups o_lora_rank
-video_token_id
+video_token_id mla_use_nope index_share_for_mtp_iteration
+index_skip_topk_offset index_topk_freq index_topk_pattern engram_vocab_size
+engram_compressed_vocab_size confidence_head_with_markov markov_head_type
 """.split())
 
 
@@ -249,15 +289,23 @@ def native_coverage(config, gaps, *, plans, quant):
     for key in ("attention_bias", "mlp_bias", "qkv_bias"):
         if c.get(key):
             omitted(f"projection_bias_not_in_native_layer_plan:{key}", key)
-    if float(c.get("partial_rotary_factor", 1.0)) != 1.0:
+    rope_params = c.get("rope_parameters") if isinstance(c.get("rope_parameters"), Mapping) else {}
+    partial_rotary = c.get("partial_rotary_factor")
+    if partial_rotary is None:
+        partial_rotary = rope_params.get("partial_rotary_factor")
+    if float(partial_rotary if partial_rotary is not None else 1.0) != 1.0:
         omitted("native_partial_rotary_dimensions_unresolved:retained_plan_proxy",
-                "partial_rotary_factor")
+                "partial_rotary_factor", "rope_parameters")
     if c.get("rope_scaling"):
         omitted("rope_scaling_variant", "rope_scaling")
     if c.get("sliding_window") and not any(plan.window for plan in plans):
         omitted("native_sliding_window_unresolved:full_attention_proxy",
                 "sliding_window", "use_sliding_window", "max_window_layers")
-    elif c.get("use_sliding_window") or c.get("max_window_layers") is not None:
+    elif c.get("use_sliding_window") or (
+        c.get("use_sliding_window") is not False
+        and c.get("max_window_layers") is not None
+        and not any(plan.window for plan in plans)
+    ):
         omitted("native_window_schedule_unresolved:retained_plan_proxy",
                 "sliding_window", "use_sliding_window", "max_window_layers")
     for gap in _native_quant_gaps(c, quant):
@@ -361,7 +409,11 @@ def resolve_quant(c):
 
 def unrecognized_fields(config, *, consumed=()):
     c, _, _ = flatten_config(config)
-    return tuple(sorted(set(c) - PASSIVE_FIELDS - STRUCTURAL_FIELDS - set(consumed)))
+    passive = set(PASSIVE_FIELDS)
+    for field in _FALSY_DEFAULT_FIELDS:
+        if field in c and not c[field]:
+            passive.add(field)
+    return tuple(sorted(set(c) - passive - STRUCTURAL_FIELDS - set(consumed)))
 
 
 def positive(c, key, default=None):

@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.3-blue" alt="Release v0.9.3">
+  <img src="https://img.shields.io/badge/Release-v0.9.4-blue" alt="Release v0.9.4">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20910B%20%7C%20A3%20910C%20%7C%20A5%20950)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v093-核心特性与全量收敛基准">v0.9.3 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v094-核心特性与全量收敛基准">v0.9.4 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.3`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.4`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.3/mindie_sim-0.9.3-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.4/mindie_sim-0.9.4-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash
@@ -80,9 +80,9 @@ flowchart TB
 
 ---
 
-## `v0.9.3` 核心特性与全量收敛基准
+## `v0.9.4` 核心特性与全量收敛基准
 
-`mindie-sim v0.9.3` 在统一因果资源引擎之上，提供完整的**四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 DT 多级拓扑与 MoE 量化通信（`routed_expert` `dispatch` / `bf16` `combine`）建模、AFD 分离流水线 Pareto 求解与分层卸载建模**，并在昇腾 A2 / A3 / A5 全量长序列矩阵上完成了收敛验证（详见 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)、[`docs/releases/sim-0.9.2.md`](./docs/releases/sim-0.9.2.md) 与 [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)）：
+`mindie-sim v0.9.4` 在统一因果资源引擎之上，提供完整的**四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 DT 多级拓扑与 MoE 量化通信（`routed_expert` `dispatch` / `bf16` `combine`）建模、AFD 分离流水线 Pareto 求解与分层卸载建模**，并在昇腾 A2 / A3 / A5 全量长序列矩阵上完成了收敛验证（详见 [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md)、[`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) 与 [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)）：
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -126,7 +126,7 @@ flowchart TB
 
 ### 5. 全量 A3 / A5 模型与长序列矩阵收敛基准
 
-搭配 [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) 联合验证，`mindie-sim v0.9.3` 在真实采集矩阵上达到以下收敛精度：
+搭配 [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) 联合验证，`mindie-sim v0.9.4` 在真实采集矩阵上达到以下收敛精度：
 
 | 评估数据集 | 样本规模 | `<= 15%` 误差达标率 | 平均相对误差 | 覆盖特性 |
 | --- | --- | --- | --- | --- |
@@ -273,7 +273,7 @@ sim/
 
 | 主题 | 文档链接 |
 | --- | --- |
-| **`v0.9.3` / `v0.9.2` / `v0.8.1` 版本发布说明** | [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) · [`docs/releases/sim-0.9.2.md`](./docs/releases/sim-0.9.2.md) · [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md) |
+| **`v0.9.4` / `v0.9.3` / `v0.8.1` 版本发布说明** | [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) · [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) · [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md) |
 | **统一因果建模架构与资源时间语义** | [`docs/architecture.md`](./docs/architecture.md) |
 | **建模保真度、边界与设计原则** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
 | **输入 Case 契约与硬件/并行配置说明** | [`docs/inputs.md`](./docs/inputs.md) |

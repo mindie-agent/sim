@@ -383,7 +383,10 @@ def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec) -> floa
     for plan in model.layer_plans:
         if plan.attention in {"kda", "gdn"}:
             recurrent, conv = _local_state_sharded(plan, parallel.tp)
-            total += recurrent * 4.0 + conv * 2.0
+            total += (
+                recurrent * dtype_bytes(plan.recurrent_state_dtype)
+                + conv * dtype_bytes(plan.conv_state_dtype)
+            )
     return float(total)
 
 

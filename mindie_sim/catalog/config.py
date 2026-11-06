@@ -69,7 +69,8 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
         return ("standard_glm" if model_type in {"glm4", "glm4_moe", "chatglm"}
                 else "generic")
     if "qwen" in model_type or "Qwen" in archs:
-        return ("qwen" if "linear_attention" in (merged.get("layer_types") or ())
+        return ("qwen" if ("linear_attention" in (merged.get("layer_types") or ())
+                           or _int(merged, "full_attention_interval") > 0)
                 and merged.get("linear_num_key_heads") else
                 "standard_qwen" if model_type in {"qwen2", "qwen2_moe", "qwen3", "qwen3_moe"}
                 else "generic")

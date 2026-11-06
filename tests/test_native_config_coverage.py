@@ -136,3 +136,29 @@ def test_native_catalog_roundtrip_preserves_nested_facts_and_all_geometry(name):
     restored = ModelSpec.from_mapping(json.loads(json.dumps(model.to_dict())))
     assert restored == model
     assert restored.parameter_count() == model.parameter_count()
+
+
+def test_multi_family_catalog_configs_preserve_clean_coverage_invariants():
+    for key in ("glm-5.3", "glm-5", "deepseek-v4-flash", "deepseek-v4.1-flash",
+                "kimi-k3", "kimi-k3-dspark", "qwen3.5-moe", "qwen3-30b-a3b",
+                "bailing-v3", "minimax-m3"):
+        model = load_model(key)
+        meta = dict(model.metadata)
+        gaps = meta.get("unmodeled_features", ())
+        assert meta.get("unrecognized_config_fields", {}) == {}
+        assert "native_window_schedule_unresolved:retained_plan_proxy" not in gaps
+        assert not any("kv_sharing_for_unsupported_core" in g for g in gaps)
+        assert not any(g.startswith("native_quant_ignored_modules_unresolved") for g in gaps)
+
+    fp16_ssm = ModelSpec.from_mapping(hybrid_config(mamba_ssm_dtype="fp16", attn_output_gate=False))
+    assert fp16_ssm.layer_plans[0].state_bytes == fp16_ssm.layer_plans[0].state_bytes_total
+    assert not fp16_ssm.layer_plans[0].q_output_gate
+
+    active_cross = ModelSpec.from_mapping(hybrid_config(add_cross_attention=True, max_window_layers=1))
+    active_meta = dict(active_cross.metadata)
+    assert "unrecognized_config_field:add_cross_attention" in active_meta["unmodeled_features"]
+    assert "native_window_schedule_unresolved:retained_plan_proxy" in active_meta["unmodeled_features"]
+
+    nested_rope = ModelSpec.from_mapping(hybrid_config(
+        partial_rotary_factor=None, rope_parameters={"partial_rotary_factor": 0.25}))
+    assert "native_partial_rotary_dimensions_unresolved:retained_plan_proxy" in dict(nested_rope.metadata)["unmodeled_features"]
