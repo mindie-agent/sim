@@ -118,7 +118,14 @@ class RoutingPolicy:
 
 @dataclass(frozen=True)
 class LocalBankRouting:
-    """One native contiguous expert bank projected from a full expert ledger."""
+    """One native contiguous expert bank projected from a full expert ledger.
+
+    ``expert_rows`` is the original global ledger. ``local_expert_rows`` is the
+    selected contiguous bank's valid rows. ``local_weight_expert_ids`` address
+    the local weight tensor; ``representative_expert_ids`` are the physical
+    global ids. These are deliberately distinct: source lowering must not use
+    global rows or global weight ids for a local bank.
+    """
 
     expert_rows: tuple[int, ...]
     local_expert_rows: tuple[int, ...]
@@ -137,18 +144,59 @@ class LocalBankRouting:
     def active(self):
         return sum(value > 0 for value in self.local_expert_rows)
 
-    def to_dict(self):
+    @property
+    def bank_size(self) -> int:
+        return len(self.local_expert_rows)
+
+    @property
+    def local_weight_expert_ids(self) -> tuple[int, ...]:
+        """Indices into the selected contiguous weight bank, never global ids."""
+        return tuple(range(self.bank_size))
+
+    @property
+    def representative_expert_ids(self) -> tuple[int, ...]:
+        """Physical global expert ids represented by this contiguous bank."""
+        start = self.representative_rank * self.bank_size
+        return tuple(range(start, start + self.bank_size))
+
+    def __post_init__(self):
         bank = len(self.local_expert_rows)
+        if bank == 0 or len(self.expert_rows) != bank * self.ep:
+            raise ModelingError(
+                "local_bank_routing_global_ledger_must_have_ep_contiguous_banks")
+        if len(self.rank_rows) != self.ep:
+            raise ModelingError("local_bank_routing_rank_rows_must_match_ep")
+        if not 0 <= self.representative_rank < self.ep:
+            raise ModelingError("local_bank_routing_representative_rank_out_of_range")
+        if any(type(value) is not int or value < 0 for value in self.expert_rows):
+            raise ModelingError("local_bank_routing_global_rows_must_be_nonnegative_integers")
+        if any(type(value) is not int or value < 0 for value in self.local_expert_rows):
+            raise ModelingError("local_bank_routing_local_rows_must_be_nonnegative_integers")
+        start = self.representative_rank * bank
+        if tuple(self.expert_rows[start:start + bank]) != tuple(self.local_expert_rows):
+            raise ModelingError("local_bank_routing_local_rows_must_be_global_bank_slice")
+        if tuple(sum(self.expert_rows[rank * bank:(rank + 1) * bank])
+                 for rank in range(self.ep)) != tuple(self.rank_rows):
+            raise ModelingError("local_bank_routing_rank_rows_must_match_global_ledger")
+
+    def to_dict(self):
+        bank = self.bank_size
         payload = dict(self.parent)
         active = [value for value in self.local_expert_rows if value > 0]
+        physical_ids = self.representative_expert_ids
+        local_weight_ids = self.local_weight_expert_ids
         payload.update(
             basis=self.basis,
             expert_placement="contiguous_ep",
+            expert_rows_basis="global_expert_ledger",
+            local_expert_rows_basis="contiguous_ep_bank",
+            physical_expert_ids_basis="global_expert_id",
+            expert_rows=self.expert_rows,
             global_expert_rows=self.expert_rows,
             local_expert_rows=self.local_expert_rows,
             rank_assignment_rows=self.rank_rows,
-            representative_expert_ids=tuple(
-                range(self.representative_rank * bank, (self.representative_rank + 1) * bank)),
+            representative_expert_ids=physical_ids,
+            local_weight_expert_ids=local_weight_ids,
             representative_rank=self.representative_rank,
             represented_ep_ranks=tuple(range(self.ep)),
             rank_timing_assumption="heaviest_contiguous_bank_upper_bound",

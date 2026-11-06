@@ -8,8 +8,11 @@ import pytest
 from mindie_sim import graph_costs, target_graphs, target_operators
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.prediction.balanced_routing import BalancedRouting
+from mindie_sim.prediction.family_grouped_gemm import lower_op
 from mindie_sim.prediction.feedforward import MOE_RECIPES
-from mindie_sim.prediction.moe_callers import LOCAL_EXPERT_REDUCE, local_expert_reduce_recipe
+from mindie_sim.prediction.moe_callers import (
+    LOCAL_EXPERT_REDUCE, LocalBankRouting, local_expert_reduce_recipe)
+from mindie_sim.prediction.operator_analysis import operator_costs
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from test_balanced_experts import balanced_case
@@ -42,6 +45,19 @@ def expected_case(*, top_k=1, tokens=8):
                         expert_routing=[.5, .5, 0, 0, 0, 0, 0, 0])
     raw["runtime"].update(moe_recipe=LOCAL_EXPERT_REDUCE,
                           max_num_batched_tokens=max(16, tokens))
+    return raw
+
+
+def source_bank_case(counts, *, tokens=8):
+    raw = case(tp=4, ep=4, prompt=tokens, output=1)
+    raw["model"].update(layers=1, ffn="moe", num_experts=8, top_k=2,
+                        moe_intermediate_size=64)
+    raw["runtime"].update(
+        moe_recipe=LOCAL_EXPERT_REDUCE, max_num_batched_tokens=16,
+        routing={"realizations": [{
+            "scope": "body", "layer": 0, "phase": "prefill", "tokens": tokens,
+            "expert_rows": list(counts)}]},
+        kernels={"lowerings": {"grouped_gemm": "ascendc_grouped_nd_bf16"}})
     return raw
 
 
@@ -107,6 +123,72 @@ def test_replicated_source_routes_full_tokens_and_builds_no_phantom_exchange():
     assert graph["s0.l0.expert_act"].mte3_bytes == 64 * 64 * 2
     assert not any(".shared.tp" in op.op_id or op.recipe == "expert_tensor_reduce"
                    for op in ops)
+
+
+@pytest.mark.parametrize(("counts", "local_rows", "physical_ids"), (
+    ((4, 8, 4, 0, 0, 0, 0, 0), (4, 8), (0, 1)),
+    ((0, 0, 4, 8, 4, 0, 0, 0), (4, 8), (2, 3)),
+    ((8, 0, 8, 0, 0, 0, 0, 0), (8, 0), (0, 1)),
+    ((0, 0, 0, 0, 8, 0, 8, 0), (8, 0), (4, 5)),
+))
+def test_source_grouped_lowering_uses_each_local_contiguous_bank(counts, local_rows, physical_ids):
+    raw = source_bank_case(counts)
+    graph = {op.op_id: op for op in target_operators(raw, phase="prefill", tokens=8)}
+    assert graph["s0.l0.expert_act"].local_shape[0] == 16
+    for op_id, n, k in (("s0.l0.expert_up", 128, 32),
+                        ("s0.l0.expert_down", 32, 64)):
+        op = graph[op_id]
+        metadata = dict(op.metadata)
+        assert metadata["local_expert_rows"] == local_rows
+        assert metadata["expert_rows"] == local_rows
+        assert metadata["group_ids"] == (0, 1)
+        assert metadata["local_weight_expert_ids"] == (0, 1)
+        assert metadata["representative_expert_ids"] == physical_ids
+        assert metadata["global_expert_rows"] == counts
+        assert metadata["routing_rows_basis"] == "contiguous_local_bank"
+        assert tuple(metadata["semantic_metadata"]["routing_realization"]["expert_rows"]) == counts
+        parent = metadata["semantic_metadata"]["routing_realization"]
+        assert tuple(parent["local_expert_rows"]) == local_rows
+        row = operator_costs(raw, [op])["operators"][0]["operator"]
+        rows = sum(local_rows)
+        assert tuple(row["local_shape"]) == (rows, n, k)
+        assert row["flops"] == 2 * rows * n * k
+        n_tiles = (n + 255) // 256
+        expected_mte2 = (rows * k * 2 * n_tiles
+                         + sum((value + 127) // 128 for value in local_rows) * k * n * 2)
+        assert row["mte2_bytes"] == expected_mte2
+        assert row["mte3_bytes"] == rows * n * 2
+        assert row["hbm_bytes"] == expected_mte2 + rows * n * 2
+    assert dict(graph["s0.l0.expert_act"].metadata)["activation_rows"] == 16
+
+
+def test_source_grouped_lowering_accepts_forced_balanced_contiguous_bank():
+    raw = local_case()
+    raw["runtime"]["kernels"] = {
+        "lowerings": {"grouped_gemm": "ascendc_grouped_nd_bf16"}}
+    graph = {op.op_id: op for op in target_operators(raw, phase="prefill", tokens=32)}
+    metadata = dict(graph["s0.l0.expert_up"].metadata)
+    assert metadata["routing_basis"] == "forced_balanced_integer_counts"
+    assert metadata["expert_rows"] == (8, 8)
+    assert metadata["local_expert_rows"] == (8, 8)
+    assert metadata["representative_expert_ids"] == (0, 1)
+    assert len(metadata["global_expert_rows"]) == 8
+    assert sum(metadata["global_expert_rows"]) == 64
+
+
+def test_source_grouped_lowering_rejects_empty_local_bank_without_global_substitution():
+    base = by_id(local_case())["s0.l0.expert_up"]
+    realization = LocalBankRouting(
+        expert_rows=(0,) * 8, local_expert_rows=(0, 0),
+        rank_rows=(0, 0, 0, 0), representative_rank=0,
+        basis="declared_integer_counts", ep=4, parent={})
+    metadata = dict(base.metadata)
+    metadata.update(routing_basis="declared_integer_counts",
+                    routing_realization=realization.to_dict())
+    op = replace(base, local_shape=(0, base.local_shape[1], base.local_shape[2]),
+                 flops=0.0, metadata=tuple(metadata.items()))
+    with pytest.raises(ModelingError, match="local_bank_has_no_valid_rows"):
+        lower_op(op)
 
 
 def test_expected_routing_projects_the_native_contiguous_bank_not_strided_ranks():
