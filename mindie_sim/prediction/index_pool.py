@@ -170,18 +170,24 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             write=scanned * 4, family="indexer", dtype=quant.index_dtype, metadata=common)
         entries.append(scores)
     members.append(scores)
+    fp32_bytes = dtype_bytes("fp32")
+    int32_bytes = dtype_bytes("int32")
     topk = b.work(
         "index_pool_topk", (scores,), (tokens, pool_topk),
         vector=scanned * math.log2(max(2, pool_topk)),
-        read=scanned * 4, write=tokens * pool_topk * 4,
+        read=scanned * fp32_bytes,
+        write=tokens * pool_topk * int32_bytes,
         family="topk", dtype="fp32", metadata=common + (("selection_output_dtype", "int32"),))
+    tail_rows = sum(g.causal_tail_tokens for g in geometry)
+    has_output = (selected > 0 or tail_rows > 0) and tokens > 0
     packed = b.work(
         "index_topk", (topk,), (tokens, output_width),
-        vector=selected * plan.index_kpool * 2 + tokens * output_width,
-        read=tokens * pool_topk * 4, write=tokens * output_width * 4,
+        vector=selected * plan.index_kpool * 2 + (tokens * output_width if has_output else 0),
+        read=tokens * pool_topk * int32_bytes if (selected > 0 and tokens > 0) else 0,
+        write=tokens * output_width * int32_bytes if has_output else 0,
         family="topk", dtype="int32", metadata=common + (
             ("selection_output_dtype", "int32"), ("selection_capacity", output_width),
-            ("causal_tail_rows", sum(g.causal_tail_tokens for g in geometry)),
+            ("causal_tail_rows", tail_rows),
             ("selection_layout", "selected_pool_ids_expanded_then_contiguous_valid_causal_tail")))
     members.extend((topk, packed))
     declare_group(

@@ -300,7 +300,11 @@ def _glm_alias_int(c: Mapping[str, Any], *keys: str) -> int:
 
 
 def _glm_rope_split(c: Mapping[str, Any], head_dim: int) -> tuple[int, int]:
-    factor = float(c.get("partial_rotary_factor", 1.0))
+    rope_params = c.get("rope_parameters") if isinstance(c.get("rope_parameters"), Mapping) else {}
+    partial_rotary = c.get("partial_rotary_factor")
+    if partial_rotary is None:
+        partial_rotary = rope_params.get("partial_rotary_factor")
+    factor = float(partial_rotary if partial_rotary is not None else 1.0)
     rope = int(head_dim * factor)
     if rope < 0 or rope > head_dim:
         raise ModelingError(f"model_config_glm_partial_rope_invalid:{factor}")
@@ -399,9 +403,8 @@ def _standard_glm_gaps(c: Mapping[str, Any]) -> tuple[str, ...]:
             gaps.append("residual_connection_post_layernorm_not_modeled")
         return tuple(gaps)
     head_dim = _int(c, "head_dim")
-    factor = float(c.get("partial_rotary_factor", 1.0))
-    rope = int(head_dim * factor)
-    if factor != 1.0:
+    _, rope = _glm_rope_split(c, head_dim)
+    if rope != head_dim:
         gaps.append(f"partial_rope_{rope}_of_{head_dim}_not_in_attention_plan")
     if bool(c.get("attention_bias", False)):
         gaps.append("attention_bias_qkv_not_in_layer_plan")

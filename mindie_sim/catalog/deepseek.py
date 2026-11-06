@@ -239,6 +239,10 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     scoring = str(c.get("scoring_func", "softmax"))
     if scoring not in {"softmax", "sigmoid"}:
         raise ModelingError(f"model_config_deepseek_scoring_func_unsupported:{scoring}")
+    idx_topk = _int(c, "index_topk")
+    idx_heads = _int(c, "index_n_heads")
+    idx_dim = _int(c, "index_head_dim")
+    has_indexer = bool(idx_topk > 0 and idx_heads > 0 and idx_dim > 0 and q_rank > 0)
     plans: list[LayerPlan] = []
     for index in range(layers):
         moe = experts_raw is not None and index >= first_dense and index % freq == 0
@@ -252,6 +256,14 @@ def _standard_deepseek_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
             qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
             mla_variant="latent_mla", kv_cache_elements=kv_rank + rope,
             kv_owner_layer_id=index, owns_long_kv=True,
+            indexer=has_indexer, indexer_type="full" if has_indexer else "none",
+            index_topk=idx_topk if has_indexer else 0,
+            index_heads=idx_heads if has_indexer else 0,
+            index_dim=idx_dim if has_indexer else 0,
+            owns_index_k=has_indexer, owns_topk=has_indexer,
+            index_k_owner_layer_id=index if has_indexer else -1,
+            topk_owner_layer_id=index if has_indexer else -1,
+            index_query_per_layer=has_indexer,
             intermediate_size=0 if moe else dense_i,
             num_experts=experts if moe else 0,
             top_k=top_k if moe else 0,

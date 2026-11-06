@@ -141,7 +141,11 @@ def generic_plans(c):
             gaps.append(f"custom_submodule:{name}")
     if c.get("hidden_act", "silu") not in {"silu", "swiglu"}:
         gaps.append(f"ffn_activation:{c['hidden_act']}:silu_proxy")
-    if float(c.get("partial_rotary_factor", 1.0)) != 1:
+    rope_params = c.get("rope_parameters") if isinstance(c.get("rope_parameters"), Mapping) else {}
+    partial_rotary = c.get("partial_rotary_factor")
+    if partial_rotary is None:
+        partial_rotary = rope_params.get("partial_rotary_factor")
+    if float(partial_rotary if partial_rotary is not None else 1.0) != 1:
         gaps.append("partial_rotary_dimensions:full_width_proxy")
     if c.get("qkv_bias"):
         gaps.append("custom_submodule:qkv_bias")
@@ -163,7 +167,7 @@ def shared_owners(c, plans, gaps):
         if index in owners:
             previous = index
         if sources is None:
-            owner = previous
+            owner = index if plan.attention in {"gdn", "kda"} else previous
         elif isinstance(sources, Mapping):
             owner = sources.get(str(index), sources.get(index, index))
         else:
@@ -221,7 +225,11 @@ def build_composable(key, config, family="generic"):
     gaps.extend(quant_gaps)
     if c.get("hidden_act", "silu") not in {"silu", "swiglu", "situ"}:
         gaps.append(f"ffn_activation:{c['hidden_act']}:silu_proxy")
-    unknown = unrecognized_fields(config)
+    consumed_extra = (
+        {"index_topk", "index_n_heads", "index_head_dim"}
+        if family in {"standard_deepseek", "standard_glm"} else ()
+    )
+    unknown = unrecognized_fields(config, consumed=consumed_extra)
     gaps.extend("unrecognized_config_field:" + field for field in unknown)
     _, text, vision = flatten_config(config)
     if vision or config.get("vision_tower"):
@@ -238,8 +246,11 @@ def build_composable(key, config, family="generic"):
     metadata = {
         "model_coverage": "partial" if gaps else "complete",
         "unmodeled_features": gaps,
-        "degraded_submodules": tuple(gap for gap in gaps if "proxy" in gap or
-                                    "unmodeled" in gap or "unresolved" in gap or "core" in gap),
+        "degraded_submodules": tuple(
+            gap for gap in gaps
+            if "proxy" in gap or "unmodeled" in gap or "unresolved" in gap
+            or "_core" in gap or gap.startswith("core_")
+        ),
         "unrecognized_config_fields": {field: c[field] for field in unknown},
         "source_config_sha256": hashlib.sha256(json.dumps(
             config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),

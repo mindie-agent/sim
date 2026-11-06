@@ -25,7 +25,7 @@ from typing import Any, Mapping
 from mindie_sim.catalog.config import _int, _require, flatten_config
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
 def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
@@ -55,7 +55,11 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     heads = int(_require(c, "num_attention_heads"))
     kv_heads = int(_require(c, "num_key_value_heads"))
     head_dim = int(_require(c, "head_dim"))
-    layer_types = [str(v) for v in (c.get("layer_types") or ())]
+    interval = _int(c, "full_attention_interval")
+    layer_types = [str(v) for v in (c.get("layer_types") or (
+        ["full_attention" if (i + 1) % interval == 0 else "linear_attention" for i in range(layers)]
+        if interval > 0 else ()
+    ))]
     if len(layer_types) != layers:
         raise ModelingError(f"model_config_qwen_layer_types_mismatch:{len(layer_types)}!={layers}")
     dense_i = _int(c, "intermediate_size")
@@ -69,7 +73,18 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     value_dim = int(_require(c, "linear_value_head_dim"))
     conv_k = int(_require(c, "linear_conv_kernel_dim"))
     conv_width = 2 * key_heads * key_dim + value_heads * value_dim
-    gate = bool(c.get("attn_output_gate", False))
+    gate_type = str(c.get("output_gate_type") or "").strip().lower()
+    gate = (
+        bool(c["attn_output_gate"])
+        if c.get("attn_output_gate") is not None
+        else gate_type not in {"", "none", "false", "0"}
+    )
+    ssm_raw = str(c.get("mamba_ssm_dtype") or "fp32").lower()
+    ssm_dtype = {
+        "float32": "fp32", "fp32": "fp32",
+        "bfloat16": "bf16", "bf16": "bf16",
+        "float16": "fp16", "fp16": "fp16",
+    }.get(ssm_raw, ssm_raw)
     moe = experts > 0
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
@@ -90,10 +105,11 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 linear_value_heads=value_heads,
                 conv_kernel=conv_k, conv_width=conv_width,
                 recurrent_state_elements=value_heads * key_dim * value_dim,
-                recurrent_state_dtype="fp32",
+                recurrent_state_dtype=ssm_dtype,
                 conv_state_elements=conv_width * (conv_k - 1),
                 conv_state_dtype="bf16",
-                state_bytes=float(value_heads * key_dim * value_dim * 4 + conv_width * (conv_k - 1) * 2),
+                state_bytes=float(value_heads * key_dim * value_dim * dtype_bytes(ssm_dtype)
+                                  + conv_width * (conv_k - 1) * dtype_bytes("bf16")),
                 q_output_gate=gate,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",
@@ -128,7 +144,12 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     heads = int(c["num_attention_heads"])
     kv_heads = int(c["num_key_value_heads"])
     head_dim = int(c["head_dim"])
-    gate = bool(c.get("attn_output_gate", False))
+    gate_type = str(c.get("output_gate_type") or "").strip().lower()
+    gate = (
+        bool(c["attn_output_gate"])
+        if c.get("attn_output_gate") is not None
+        else gate_type not in {"", "none", "false", "0"}
+    )
     experts = _int(c, "num_experts")
     moe_i = _int(c, "moe_intermediate_size") if experts else _int(c, "intermediate_size")
     mtp = DraftSpec(

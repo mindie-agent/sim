@@ -78,6 +78,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
             None if c.get("activation_situ_linear_beta") is None
             else float(c["activation_situ_linear_beta"])),
     }
+    router_mode = str(c.get("moe_router_activation_func", c.get("scoring_func", "sigmoid")))
+    router_norm_topk = bool(c.get("moe_renormalize", c.get("norm_topk_prob", False)))
+    router_groups = _int(c, "num_expert_group", _int(c, "n_group"))
+    router_group_topk = _int(c, "topk_group")
     plans: list[LayerPlan] = []
     for index in range(layers):
         ffn = "dense" if index < dense_first else "moe"
@@ -94,7 +98,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 expert_latent_norm_position="post" if c.get("latent_moe_use_norm", False) else "none",
                 router_input_size=h,
                 shared_intermediate_size=shared * moe_i if ffn == "moe" else 0,
-                router_mode="sigmoid",
+                router_mode=router_mode,
+                router_norm_topk=router_norm_topk,
+                router_groups=router_groups if ffn == "moe" else 0,
+                router_group_topk=router_group_topk if ffn == "moe" else 0,
                 linear_heads=kda_heads, linear_head_dim=kda_dim,
                 linear_key_heads=kda_heads, linear_key_head_dim=kda_dim,
                 linear_value_heads=kda_heads,
@@ -126,7 +133,10 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
                 expert_latent_norm_position="post" if c.get("latent_moe_use_norm", False) else "none",
                 router_input_size=h,
                 shared_intermediate_size=shared * moe_i if ffn == "moe" else 0,
-                router_mode="sigmoid",
+                router_mode=router_mode,
+                router_norm_topk=router_norm_topk,
+                router_groups=router_groups if ffn == "moe" else 0,
+                router_group_topk=router_group_topk if ffn == "moe" else 0,
                 residual_block_size=_int(c, "attn_res_block_size"),
                 native_layer_id=index + 1, scope="body",
                 kv_owner_layer_id=index, **activation,

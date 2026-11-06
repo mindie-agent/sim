@@ -24,6 +24,7 @@ ROOTS = {"hardware", "runtime", "revision", "format", "kernel", "implementation"
          "dtype", "layout", "replay_scope", "recipe", "family", "phase",
          "local_shape", "semantic_shape", "padded_shape", "launch_shape",
          "metadata", "work", "resource_units", "core_count", "physical_rates", "transport"}
+_TOPOLOGY_TRANSPORT_KEYS = {"dies_per_package", "links", "placements", "ranks_per_node"}
 REDUCERS = {"sum": sum, "max": max, "min": min, "len": len,
             "product": math.prod, "positive_count": lambda x: sum(v > 0 for v in x)}
 MISSING = object()
@@ -206,8 +207,15 @@ class RegimePolicy:
             selectors = raw.get("match", {})
             if any(axes.get(k) != selectors[k] for k in ("recipe", "kernel", "family") if k in selectors):
                 continue
-            mismatches = [path for path, value in selectors.items()
-                          if not axis_equal(lookup(axes, path), value)]
+            mismatches = [
+                path for path, value in selectors.items()
+                if not axis_equal(
+                    {k: v for k, v in actual.items() if k in _TOPOLOGY_TRANSPORT_KEYS}
+                    if path == "transport" and isinstance(value, Mapping) and set(value) == _TOPOLOGY_TRANSPORT_KEYS and isinstance(actual := lookup(axes, path), Mapping)
+                    else lookup(axes, path),
+                    value,
+                )
+            ]
             if mismatches:
                 # Report a related operator's physical-domain miss, without
                 # creating per-invocation logs for unrelated kernel families.
