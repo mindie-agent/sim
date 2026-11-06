@@ -82,7 +82,7 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 ## `v0.9.4` Highlights & Full-Fleet Convergence
 
-`mindie-sim v0.9.4` extends the unified causal engine with **4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 DT hierarchical topology & quantized MoE transport (`routed_expert` `dispatch` / `bf16` `combine`), AFD disaggregated pipeline Pareto solving, and tiered offload modeling**, backed by full-fleet convergence across Ascend A2, A3, and A5 long-context workloads (see [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md), and [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)):
+`mindie-sim v0.9.4` extends the unified causal engine with **4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 DT hierarchical topology & quantized MoE transport (`routed_expert` `dispatch` / `bf16` `combine`), AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md), and [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)). Historical accuracy results and their limits are described below:
 
 ### 1. 4D Efficiency Decomposition & Bottleneck Attribution (`analyze_operator_row` / `analyze_network_efficiency`)
 
@@ -126,7 +126,7 @@ It also ships with **15 built-in Ascend NPU hardware profiles** (Atlas A2 `Ascen
 
 ### 5. Full-Fleet A3 / A5 Convergence Benchmarks
 
-Validated jointly with [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) across real hardware captures:
+The table below is a historical report paired with [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler), not a fresh acceptance result for the current source. Review on 2026-11-06 found that old prediction caches tracked only part of the runtime; they cannot certify accuracy after source changes. Fresh replay already contains cases above 10% error. Current-version claims require predictions tied to the complete runtime identity. Wave5 uses in-sample calibration, and replaying historical deployment settings does not independently validate vLLM Ascend recommended configurations.
 
 | Benchmark Cohort | Cases | Within `<= 15%` Error | Mean Relative Error | Coverage Highlights |
 | --- | --- | --- | --- | --- |

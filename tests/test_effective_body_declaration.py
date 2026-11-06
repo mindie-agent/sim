@@ -8,6 +8,7 @@ from mindie_sim.cohort_comparison import compare_cohorts
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
 from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_structure
 from mindie_sim.study import study
 from test_body_gdn_defaults import case as gdn_case
@@ -101,6 +102,29 @@ def test_explicit_book_does_not_install_structural_caller_and_model_scope_is_unc
     assert target_graphs(raw, **model) == target_graphs(raw, apply_body_defaults=False, **model)
     assert export_structure(raw, **model)["graph_id"] == export_structure(
         raw, apply_body_defaults=False, **model)["graph_id"]
+
+
+def test_plain_source_subset_requires_its_explicit_book_and_never_inherits_other_ops():
+    raw = gdn_case("Ascend950DT_9582")
+    graphs = target_graphs(raw, **GEOMETRY)
+    native = [op for op in graphs[0] if op.recipe == "ascend_gdn_decode_gating"]
+    assert len(native) == 1
+    with pytest.raises(ModelingError, match="source_plan_binding_required:ascend_gdn_decode_gating"):
+        operator_costs(raw, native)
+    book = RecipeBook.from_mapping(graphs.effective_kernels)
+    extracted = operator_costs(raw, native, recipes=book)["operators"]
+    carried = [row for row in operator_costs(raw, graphs[0])["operators"]
+               if row["operator"]["recipe"] == "ascend_gdn_decode_gating"]
+    assert extracted == carried
+
+
+def test_rank_map_rejects_different_or_missing_effective_declarations():
+    raw = _gqa_case()
+    selected = target_graphs(raw, **GEOMETRY)[0]
+    control = target_graphs(raw, apply_body_defaults=False, **GEOMETRY)[0]
+    for other in (control, tuple(selected)):
+        with pytest.raises(ValueError, match="body_target_kernel_declarations_differ_between_ranks"):
+            operator_costs(raw, {0: selected, 1: other})
 
 
 def test_profiler_cohort_replays_effective_body_and_rejects_unmarked_legacy_graph(profiler_api):

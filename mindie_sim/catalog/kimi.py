@@ -202,7 +202,7 @@ def _standard_kimi_gaps(config: Mapping[str, Any]) -> tuple[str, ...]:
 
     c, vision = _standard_kimi_flat(config)
     gaps = list(_standard_deepseek_gaps(c))
-    if vision is not None or str(c.get("model_type", "")) == "kimi_vl":
+    if vision is not None or str(c.get("model_type", "")) in {"kimi_vl", "kimi_k25"}:
         gaps.extend(("vision_tower_unmodeled", "vision_projector_unmodeled"))
     if any(key in c for key in (
         "linear_attn_config", "kda_layers", "linear_num_key_heads",

@@ -65,6 +65,39 @@ def test_undeclared_granule_keeps_fractional_analytic_routing_volume():
     assert operator_costs(raw, (exchange(10),))["operator_sum_ms"] == pytest.approx(.04)
 
 
+@pytest.mark.parametrize("rounds", (1, 3))
+def test_envelope_exchange_honors_rounds_independently_of_family_label(rounds):
+    raw = case(tp=4)
+    raw["machine"]["links"][0].update(
+        semantics="per_pair", capacity_bytes_per_ms=1000, latency_us=1000)
+    results = []
+    for family, extra in (("alltoall", ()), ("transport", (("collective", "alltoall"),))):
+        op = exchange(30, family=family, metadata=(("steps", rounds),) + extra)
+        result = graph_costs(raw, (op,))
+        results.append(result["duration_ms"])
+        assert result["duration_ms"] == pytest.approx(.01 + rounds)
+        ledger = result["isolated"]["operators"][0]["communication"]
+        assert ledger["setup_ms"] == rounds
+        assert ledger["wire_bytes"] == 120
+    assert results[0] == results[1]
+
+
+@pytest.mark.parametrize("kind,options,expected", (
+    ("pairwise_collective", {}, 3.03),
+    ("direct_peer_collective", {"max_inflight_per_rank": 3}, 1.01),
+))
+def test_explicit_exchange_programs_charge_their_own_hop_arrivals(kind, options, expected):
+    raw = case(tp=4)
+    raw["machine"]["links"][0].update(
+        semantics="per_pair", capacity_bytes_per_ms=1000, latency_us=1000)
+    raw["runtime"]["kernels"] = {"families": {"alltoall": {"kind": kind, **options}}}
+    result = graph_costs(raw, (exchange(30, metadata=(("steps", 3),)),))
+    assert result["duration_ms"] == pytest.approx(expected)
+    assert sum(v for k, v in result["execution"]["serviced"].items()
+               if k.startswith("link:")) == 120
+    assert result["execution"]["live_tasks"] == 0
+
+
 def test_alignment_and_framing_reapply_to_useful_payload_at_each_hop():
     raw = case(pp=2)
     raw["machine"]["num_devices"] = 3

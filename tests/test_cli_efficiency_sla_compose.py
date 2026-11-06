@@ -320,9 +320,9 @@ def test_cli_sweep_and_skew_modes(tmp_path: Path) -> None:
 def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
     from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
-    for hw, exp_disp_ideal_us, exp_comb_ideal_us, max_disp_us, max_comb_us in (
-        ("a5-pod-dt", 8.3649, 16.2229, 12.0, 20.0),
-        ("a5-server-dt", 35.5509, 68.9472, 40.0, 72.0),
+    for hw, exp_disp_ideal_us, exp_comb_ideal_us, hop_us, slow_peers in (
+        ("a5-pod-dt", 8.3649, 16.2229, 1.5, 63),
+        ("a5-server-dt", 35.5509, 68.9472, 5.0, 56),
     ):
         case = compose_case(
             model="glm5.3", hardware=hw, dp=64, tp=1, ep=64,
@@ -346,10 +346,54 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
         assert comb["link_bytes"] == pytest.approx(897.75 * 12288.0)
         assert disp["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_disp_ideal_us, rel=1e-3)
         assert comb["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_comb_ideal_us, rel=1e-3)
-        assert disp["duration_ms"] * 1000.0 < max_disp_us
-        assert comb["duration_ms"] * 1000.0 < max_comb_us
+        # The generic envelope declares EP-1 propagation rounds. Removing
+        # those dependencies requires an explicit direct-peer/HCCL program.
+        # On eight 8-rank servers only 56 peers use the slow inter-node port;
+        # its service excludes the seven local destinations.
+        assert disp["duration_ms"] * 1000.0 == pytest.approx(
+            exp_disp_ideal_us * slow_peers / 63 + 63 * hop_us, rel=1e-3)
+        assert comb["duration_ms"] * 1000.0 == pytest.approx(
+            exp_comb_ideal_us * slow_peers / 63 + 63 * hop_us, rel=1e-3)
         op_ids = [row["op_id"] for row in eff["operators"]]
         assert any(oid.endswith(".pack.quantize") for oid in op_ids)
         assert not any(oid.endswith(".expert_up.quantize") for oid in op_ids)
 
 
+def test_va_recommended_compose_and_apply_helper() -> None:
+    from mindie_sim import target_graphs
+    from mindie_sim.compose import apply_va_recommended, va_recommended_config
+
+    cfg_ds_a3 = va_recommended_config("deepseek-v3.2", "a3")
+    assert cfg_ds_a3["quant"] == "w8a8"
+    assert cfg_ds_a3["graph_capture_mode"] == "full"
+    assert cfg_ds_a3["sp"] is True
+    assert cfg_ds_a3["env"]["VLLM_ASCEND_ENABLE_MLAPO"] == "1"
+
+    cfg_kimi_a5 = va_recommended_config("kimi-k3", "a5")
+    assert cfg_kimi_a5["quant"] is None
+
+    ds_case = compose_case("deepseek-v3.2", hardware="a3", tp=4, dp=2, ep=8, layers=4, va_recommended=True)
+    assert ds_case["runtime"]["graph_capture_mode"] == "full"
+    assert ds_case["runtime"]["metadata"]["va_recommended"] is True
+    assert ds_case["runtime"]["metadata"]["va_env"]["VLLM_ASCEND_ENABLE_MLAPO"] == "1"
+    ds_low = ds_case["runtime"]["kernels"]["lowerings"]
+    assert ds_low.get("mla_prolog") == "vllm_ascend_mla_prolog_v3"
+    assert ds_low.get("add_rmsnorm") == "vllm_ascend_native_norm"
+    assert target_graphs(ds_case, phase="decode", tokens=1, context=1024, sequences=4)[0]
+
+    kimi_case = compose_case("kimi-k3", hardware="a5", tp=4, dp=2, ep=8, layers=8, va_recommended=True)
+    assert kimi_case["model"]["quant"] == compose_case(
+        "kimi-k3", hardware="a5", tp=4, dp=2, ep=8, layers=8)["model"]["quant"]
+    assert kimi_case["runtime"]["metadata"]["sp"] is True
+    assert "sequence_parallel" in kimi_case["runtime"]["kernels"]
+    kimi_low = kimi_case["runtime"]["kernels"]["lowerings"]
+    assert kimi_low["kda"]["cases"][0]["binding"] == "vllm_ascend_recurrent_kda_arch35"
+    assert kimi_low.get("attention_residual") == "vllm_ascend_attn_res_prefix"
+    assert target_graphs(kimi_case, phase="decode", tokens=1, context=1024, sequences=4)[0]
+
+    raw_glm = compose_case("glm-5.3", hardware="a3", tp=4, dp=2, ep=8, layers=4)
+    enriched_glm = apply_va_recommended(raw_glm)
+    assert enriched_glm["runtime"]["graph_capture_mode"] == "full"
+    assert enriched_glm["runtime"]["metadata"]["va_recommended"] is True
+    assert enriched_glm["runtime"]["kernels"]["lowerings"].get("mla_prolog") == "vllm_ascend_mla_prolog_v3"
+    assert target_graphs(enriched_glm, phase="decode", tokens=1, context=1024, sequences=4)[0]

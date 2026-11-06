@@ -81,6 +81,10 @@ IMPLEMENTATIONS = {
         "mindie_sim.prediction.family_kda_recurrent", blocks=("kda",),
         options=("safe_gate", "use_beta_sigmoid", "gate_dtype", "beta_dtype",
                  "has_a_log", "has_dt_bias", "allow_neg_eigval", "state_selection")),
+    "vllm_ascend_fla_kda_recurrent": Implementation(
+        "mindie_sim.prediction.family_kda_recurrent", blocks=("kda",),
+        options=("safe_gate", "use_beta_sigmoid", "gate_dtype", "beta_dtype",
+                 "has_a_log", "has_dt_bias", "allow_neg_eigval", "state_selection")),
     "vllm_ascend_gdn_decode": Implementation(
         "mindie_sim.prediction.gdn_decode", blocks=("gdn_decode",),
         options=("gating_beta_store", "gating_programs", "recurrent_implementation", "cache_index_row_stride")),

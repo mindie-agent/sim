@@ -3823,7 +3823,8 @@
         "reg_alu_lanes": 13516800000000.0,
         "reg_special_lanes": 3379200000000.0,
         "reg_reduce_lanes": 6758400000000.0,
-        "reg_shuffle_lanes": 6758400000000.0
+        "reg_shuffle_lanes": 6758400000000.0,
+        "scalar_store_issue": 5657458563.535912
       },
       "buffers": {
         "l1": 524288,
@@ -3847,7 +3848,8 @@
         "reg_alu_lanes": 64,
         "reg_special_lanes": 64,
         "reg_reduce_lanes": 64,
-        "reg_shuffle_lanes": 64
+        "reg_shuffle_lanes": 64,
+        "scalar_store_issue": 64
       },
       "buffer_units": {
         "l1": 32,
@@ -3855,6 +3857,102 @@
         "l0b": 32,
         "l0c": 32,
         "ub": 64
+      },
+      "kernel_invocations": {
+        "vector": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001312,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 1.312,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "ordinary nonempty vector class default extrapolated across arch3510 A5 SKUs; not a universal hardware lower bound",
+            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+            "excludes": [
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        },
+        "cube": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001578,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 1.578,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "ordinary nonempty Cube default extrapolated across arch3510 A5 SKUs; not a universal hardware bound or measured startup",
+            "excludes": [
+              "empty_aic",
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "6_to_7us_matrix_residual"
+            ]
+          }
+        },
+        "empty_aic": {
+          "startup_ms": 0,
+          "minimum_ms": 0.000439,
+          "provenance": {
+            "basis": "conservative_empty_task_envelope",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 0.439,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "inclusive conservative completion envelope extrapolated across arch3510 A5 SKUs",
+            "excludes": [
+              "32MiB_weight_matmul_latency",
+              "host_submission",
+              "6_to_7us_matrix_residual",
+              "additive_startup"
+            ]
+          }
+        },
+        "w8a8_nd_bf16": {
+          "startup_ms": 0,
+          "minimum_ms": 0.003037,
+          "provenance": {
+            "basis": "declared_execution_class",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 3.037,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "explicit w8a8_nd_bf16 invocation class extrapolated across arch3510 A5 SKUs; ordinary format metadata alone does not establish ND dispatch",
+            "excludes": [
+              "NZ",
+              "W4A8",
+              "MXFP8",
+              "grouped_gemm",
+              "INT32_output",
+              "host_submission",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        }
+      },
+      "work_units": {
+        "scalar_store_issue": "stores"
+      },
+      "store_queues": {
+        "scalar_store_issue": {
+          "element_bytes": 2,
+          "outstanding": 8,
+          "granule_bytes": 128,
+          "response_ms": 9.125e-05,
+          "row_control_ms": 7e-06
+        }
       },
       "service_modes": {
         "ub_copy": {
@@ -4378,7 +4476,8 @@
         "reg_alu_lanes": 13516800000000.0,
         "reg_special_lanes": 3379200000000.0,
         "reg_reduce_lanes": 6758400000000.0,
-        "reg_shuffle_lanes": 6758400000000.0
+        "reg_shuffle_lanes": 6758400000000.0,
+        "scalar_store_issue": 5657458563.535912
       },
       "buffers": {
         "l1": 524288,
@@ -4402,7 +4501,8 @@
         "reg_alu_lanes": 64,
         "reg_special_lanes": 64,
         "reg_reduce_lanes": 64,
-        "reg_shuffle_lanes": 64
+        "reg_shuffle_lanes": 64,
+        "scalar_store_issue": 64
       },
       "buffer_units": {
         "l1": 32,
@@ -4410,6 +4510,102 @@
         "l0b": 32,
         "l0c": 32,
         "ub": 64
+      },
+      "kernel_invocations": {
+        "vector": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001312,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 1.312,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "ordinary nonempty vector class default extrapolated across arch3510 A5 SKUs; not a universal hardware lower bound",
+            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
+            "excludes": [
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        },
+        "cube": {
+          "startup_ms": 0,
+          "minimum_ms": 0.001578,
+          "provenance": {
+            "basis": "declared_engineering_extrapolation",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 1.578,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "ordinary nonempty Cube default extrapolated across arch3510 A5 SKUs; not a universal hardware bound or measured startup",
+            "excludes": [
+              "empty_aic",
+              "host_submission",
+              "stream_launch_cadence",
+              "additive_startup",
+              "6_to_7us_matrix_residual"
+            ]
+          }
+        },
+        "empty_aic": {
+          "startup_ms": 0,
+          "minimum_ms": 0.000439,
+          "provenance": {
+            "basis": "conservative_empty_task_envelope",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "empty_aic, AI_CORE, BlockDim1, minimum across 500 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 0.439,
+            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
+            "scope": "inclusive conservative completion envelope extrapolated across arch3510 A5 SKUs",
+            "excludes": [
+              "32MiB_weight_matmul_latency",
+              "host_submission",
+              "6_to_7us_matrix_residual",
+              "additive_startup"
+            ]
+          }
+        },
+        "w8a8_nd_bf16": {
+          "startup_ms": 0,
+          "minimum_ms": 0.003037,
+          "provenance": {
+            "basis": "declared_execution_class",
+            "declared_on": "2026-10-30",
+            "boundary": "device_kernel_completion",
+            "observed_scope": "INT8 ND QuantBatchMatmulV3 [1,128]@[128,128], FP32 per-token and per-channel scales, BF16 output, MIX_AIC AIC8/AIV16, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
+            "observed_us": 3.037,
+            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
+            "scope": "explicit w8a8_nd_bf16 invocation class extrapolated across arch3510 A5 SKUs; ordinary format metadata alone does not establish ND dispatch",
+            "excludes": [
+              "NZ",
+              "W4A8",
+              "MXFP8",
+              "grouped_gemm",
+              "INT32_output",
+              "host_submission",
+              "additive_startup",
+              "body_residual_fit"
+            ]
+          }
+        }
+      },
+      "work_units": {
+        "scalar_store_issue": "stores"
+      },
+      "store_queues": {
+        "scalar_store_issue": {
+          "element_bytes": 2,
+          "outstanding": 8,
+          "granule_bytes": 128,
+          "response_ms": 9.125e-05,
+          "row_control_ms": 7e-06
+        }
       },
       "service_modes": {
         "ub_copy": {

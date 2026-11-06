@@ -82,7 +82,7 @@ flowchart TB
 
 ## `v0.9.4` 核心特性与全量收敛基准
 
-`mindie-sim v0.9.4` 在统一因果资源引擎之上，提供完整的**四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 DT 多级拓扑与 MoE 量化通信（`routed_expert` `dispatch` / `bf16` `combine`）建模、AFD 分离流水线 Pareto 求解与分层卸载建模**，并在昇腾 A2 / A3 / A5 全量长序列矩阵上完成了收敛验证（详见 [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md)、[`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) 与 [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)）：
+`mindie-sim v0.9.4` 在统一因果资源引擎之上，提供完整的**四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 DT 多级拓扑与 MoE 量化通信（`routed_expert` `dispatch` / `bf16` `combine`）建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md)、[`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) 与 [`docs/releases/sim-0.8.1.md`](./docs/releases/sim-0.8.1.md)）。历史精度结果及其适用边界见下文：
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -126,7 +126,7 @@ flowchart TB
 
 ### 5. 全量 A3 / A5 模型与长序列矩阵收敛基准
 
-搭配 [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) 联合验证，`mindie-sim v0.9.4` 在真实采集矩阵上达到以下收敛精度：
+下表是与 [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) 配套的历史报告快照，不是当前源码的重新验收结果。2026-11-06 复核发现旧预测缓存只跟踪部分运行时文件，不能证明改动后的全量误差仍达标；当前重算已有超过 10% 的样本。使用完整运行时身份重新预测后才可作当前版本结论。Wave5 数据使用了样本内校准，历史部署配置的重放也不代表 vLLM Ascend 推荐配置的独立验证。
 
 | 评估数据集 | 样本规模 | `<= 15%` 误差达标率 | 平均相对误差 | 覆盖特性 |
 | --- | --- | --- | --- | --- |

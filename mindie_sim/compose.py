@@ -54,6 +54,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
+from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES, simulation_config
 
 
 HARDWARE_ALIASES: dict[str, str] = {
@@ -93,6 +94,79 @@ _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
         scale_format="fp8_e8m0", scale_bytes=1.0, kv_dtype="bf16",
     ),
 }
+
+def _arch_key(sku: str) -> str:
+    if sku.startswith(("Ascend950", "Ascend910_95")):
+        return "a5"
+    return "a3" if sku.startswith("Ascend910_93") else ("a2" if sku.startswith("Ascend910B") else "other")
+
+
+def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
+    """Return a source-scoped simulation subset, not a complete vLLM launch file."""
+    key = str(model).strip()
+    canonical = MODEL_ALIASES.get(key, ARCHITECTURE_PRESET_ALIASES.get(key, key))
+    sku, _, _ = _resolve_hardware(hardware)
+    return simulation_config(canonical, sku, _arch_key(sku))
+
+
+def _resolve_va_lowerings(
+    model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
+) -> dict[str, Any]:
+    from mindie_sim.schema.parallel import ParallelSpec
+    is_a5 = _arch_key(sku) == "a5"
+    p_cfg = ParallelSpec(
+        dp=int(parallel.get("dp", 1)), tp=int(parallel.get("tp", 1)),
+        pp=int(parallel.get("pp", 1)), ep=int(parallel.get("ep", 1)),
+        cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
+    )
+    lowerings: dict[str, Any] = {}
+    if any(p.attention == "kda" for p in model_spec.layer_plans) and p_cfg.pcp == 1:
+        # This source kernel owns complete decode batches with q1-q8. Prefill,
+        # mixed batches and longer queries retain explicit semantic work.
+        lowerings["kda"] = {
+            "cases": [{
+                "domain": {"phases": ["decode"], "max_query_tokens": {"min": 1, "max": 8}},
+                "binding": ("vllm_ascend_recurrent_kda_arch35" if is_a5
+                            else "vllm_ascend_recurrent_kda_arch22"),
+            }],
+            "otherwise": "analytical",
+        }
+    if any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp == 1:
+        lowerings["attention_residual"] = "vllm_ascend_attn_res_prefix"
+    if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp == 1:
+        opts = {"recurrent_implementation": "arch35_fp32"} if is_a5 else {}
+        binding = {"implementation": "vllm_ascend_gdn_decode", "options": opts}
+        # The source caller has separate ordinary and speculative paths. A
+        # heterogeneous q1/q>1 batch must retain the semantic implementation.
+        lowerings["gdn_decode"] = {
+            "cases": [
+                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 1},
+                            "max_query_tokens": {"max": 1}},
+                 "binding": binding},
+                {"domain": {"phases": ["decode"], "min_query_tokens": {"min": 2},
+                            **({"max_query_tokens": {"max": 8}} if is_a5 else {})},
+                 "binding": binding},
+            ],
+            "otherwise": "analytical",
+        }
+    mla_layers = [p for p in model_spec.layer_plans if p.attention == "mla" and p.q_lora_rank > 0]
+    if mla_layers:
+        from mindie_sim.prediction.family_mla_prolog import validate as validate_mla_prolog
+        try:
+            for plan in mla_layers:
+                validate_mla_prolog(plan=plan, parallel=p_cfg, model=model_spec,
+                                    quant=model_spec.quant, lowering_passes=lowering_passes)
+            lowerings["mla_prolog"] = "vllm_ascend_mla_prolog_v3"
+        except ModelingError:
+            pass
+    normalization = dict(model_spec.catalog_facts).get("normalization", {})
+    if (model_spec.activation_dtype == "bf16"
+            and not normalization.get("norm_weight_offset", 0.0)
+            and not any(p.qk_norm for p in model_spec.layer_plans)):
+        lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
+        if "activation_quantization" in lowering_passes and model_spec.quant.activation_format == "int8":
+            lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+    return lowerings
 
 
 def _to_jsonable(value: Any) -> Any:
@@ -335,6 +409,7 @@ def compose_case(
     inter_pod_bw_gbps: float | None = None,
     intra_bw_4p_gbps: float | None = None,
     intra_bw_8p_gbps: float | None = None,
+    va_recommended: bool = False,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -450,6 +525,18 @@ def compose_case(
 
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
+    va_profile: dict[str, Any] | None = None
+    if va_recommended and backend == "ascend":
+        model_id = str(model) if isinstance(model, str) else str(model_spec.name)
+        va_profile = va_recommended_config(model_id, sku)
+        va_profile["quantization_action"] = (
+            "explicit_quant_preserved" if quant is not None else
+            "documented_alternative_applied" if va_profile["quant"] is not None else
+            "no_profile_override")
+        if quant is None:
+            quant = va_profile["quant"]
+        if graph_capture_mode == "none":
+            graph_capture_mode = str(va_profile.get("graph_capture_mode", "full"))
     model_spec = _apply_quant_override(model_spec, quant, machine)
     model_spec = _apply_structural_overrides(
         model_spec,
@@ -457,6 +544,14 @@ def compose_case(
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
     )
+    if (va_profile is not None and not sp and va_profile.get("sp", True)
+            and pp == 1 and pcp == 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
+        from mindie_sim.prediction.sequence_parallel import _validate_model
+        try:
+            _validate_model(model_spec)
+            sp = True
+        except ModelingError:
+            pass
 
     if int(mtp_proposal_tokens) > 0:
         has_mtp = getattr(model_spec.auxiliary, "mtp", None) is not None
@@ -536,6 +631,23 @@ def compose_case(
         runtime_dict["kernels"] = {
             "sequence_parallel": dict(DECLARATION, padding="right_to_tp")
         }
+    if va_profile is not None:
+        runtime_meta["va_recommended"] = True
+        runtime_meta["va_profile"] = deepcopy(va_profile)
+        runtime_meta["va_env"] = dict(va_profile["env"])
+        runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
+        passes: tuple[str, ...] = ()
+        if str(model_spec.quant.activation_format) != str(model_spec.activation_dtype):
+            passes = ("activation_quantization", "norm_quant")
+            runtime_dict["lowering_passes"] = list(passes)
+        lowerings = _resolve_va_lowerings(
+            model_spec, runtime_dict["parallel"], sku, passes,
+        )
+        if lowerings:
+            kernels_dict = dict(runtime_dict.get("kernels", {}))
+            existing_low = dict(kernels_dict.get("lowerings", {}))
+            kernels_dict["lowerings"] = {**lowerings, **existing_low}
+            runtime_dict["kernels"] = kernels_dict
 
     case_dict: dict[str, Any] = {
         "model": model_dict,
@@ -548,5 +660,57 @@ def compose_case(
     return case_dict
 
 
-__all__ = ["HARDWARE_ALIASES", "HARDWARE_TOPOLOGY_ALIASES",
-           "compose_case", "resolve_hardware_sku"]
+def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Apply the supported execution subset while preserving supplied model quantization."""
+    out = deepcopy(dict(case))
+    parsed = parse_case(out)
+    sku = str(out.get("machine", {}).get("sku", "Ascend910_9392"))
+    va_profile = va_recommended_config(str(parsed.model.name), sku)
+    va_profile["quantization_action"] = "existing_case_preserved"
+    rt = dict(out.get("runtime", {}))
+    par = dict(rt.get("parallel", {
+        "dp": parsed.runtime.parallel.dp, "tp": parsed.runtime.parallel.tp,
+        "pp": parsed.runtime.parallel.pp, "ep": parsed.runtime.parallel.ep,
+        "cp": parsed.runtime.parallel.cp, "dcp": parsed.runtime.parallel.dcp,
+        "pcp": parsed.runtime.parallel.pcp,
+    }))
+    if rt.get("graph_capture_mode", "none") == "none":
+        rt["graph_mode"] = "full"
+        rt["graph_capture_mode"] = "full"
+        max_seqs = int(rt.get("max_num_seqs", 16))
+        rt["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max(1, max_seqs)})
+    meta = dict(rt.get("metadata", {}))
+    meta["va_recommended"] = True
+    meta["va_profile"] = deepcopy(va_profile)
+    meta["va_env"] = dict(va_profile["env"])
+    meta.setdefault("moe_dispatch_quantization", "routed_expert")
+    kernels = dict(rt.get("kernels", {}))
+    tp, ep, pp, pcp = int(par.get("tp", 1)), int(par.get("ep", 1)), int(par.get("pp", 1)), int(par.get("pcp", 1))
+    if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
+            and pp == 1 and pcp == 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
+        from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
+        try:
+            _validate_model(parsed.model)
+            kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
+            meta["sp"] = True
+        except ModelingError:
+            pass
+    passes = tuple(rt.get("lowering_passes", ()))
+    if not passes and str(parsed.model.quant.activation_format) != str(parsed.model.activation_dtype):
+        passes = ("activation_quantization", "norm_quant")
+        rt["lowering_passes"] = list(passes)
+    lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes)
+    if lowerings:
+        existing_low = dict(kernels.get("lowerings", {}))
+        kernels["lowerings"] = {**lowerings, **existing_low}
+    if kernels:
+        rt["kernels"] = kernels
+    rt["metadata"] = meta
+    out["runtime"] = rt
+    parse_case(out)
+    return out
+
+
+__all__ = ["HARDWARE_ALIASES", "HARDWARE_TOPOLOGY_ALIASES", "VA_RECOMMENDED_PROFILES",
+           "apply_va_recommended", "compose_case", "resolve_hardware_sku",
+           "va_recommended_config"]
