@@ -125,8 +125,10 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
             matching.append(item)
     if not matching:
         return None
-    if (runtime.parallel.ep != 1 or runtime.parallel.pcp != 1
-            or runtime.moe_recipe not in {"alltoall", "tp_join_reduce"}):
+    local_caller = runtime.moe_recipe == "local_expert_reduce"
+    if ((runtime.parallel.ep != 1 and not local_caller) or runtime.parallel.pcp != 1
+            or runtime.moe_recipe not in {"alltoall", "tp_join_reduce",
+                                           "local_expert_reduce"}):
         raise ModelingError("routing_realization_requires_ep1_pcp1_unchunked_alltoall")
     if layer.router_groups > 1 and layer.router_group_topk < layer.router_groups:
         raise ModelingError("routing_realization_requires_unrestricted_expert_groups")

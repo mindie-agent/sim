@@ -2,6 +2,37 @@
 
 Development-run reports cited below are historical context and are not shipped. Current acceptance is documented in [verification](../verification.md).
 
+## Replicated input with local expert banks
+
+`runtime.moe_recipe = "local_expert_reduce"` selects the eager ALLGATHER caller's
+DP=1 branch, where every EP rank sees all input tokens and filters a contiguous
+local expert bank. It emits no expert dispatch/combine exchange or TP token-slice
+gather. Routed output joins TP-sharded shared output before one final TP
+AllReduce; that reduction is also present when there is no shared expert.
+
+The supported domain is DP=CP=PCP=ETP=1, EP=TP>1, divisible expert banks, and
+BF16 or FP16 expert weights matching activation dtype. Quantized or mixed expert
+formats, sequence parallelism, transport/token-partition declarations,
+shared-expert data parallelism and nonlinear routed-output transforms are
+rejected explicitly. Existing recipes retain their own domains.
+
+The complete routing ledger is preserved. Expected routing remains fractional;
+explicit integer counts retain empty banks and optional top-k IDs. The modeled
+representative is the heaviest contiguous bank, an explicit upper-bound
+assumption rather than a measured per-rank route. GMM work uses its valid local
+rows. Eager InitRouting allocates `tokens * top_k` rows and unfused SwiGlu visits
+that complete capacity. Packing and weighted unpermutation distinguish index
+and probability scans from valid payload traffic; capacity does not invent
+valid GMM rows or payload values.
+
+The source branch is `vllm-project/vllm-ascend` at
+`175ef4d49c2072f9233619636f0309f4f88b4e2c`: `token_dispatcher.py` owns contiguous
+bank filtering, and `fused_moe.py:185-197` owns the final joined-output reduction.
+This establishes source semantics, not captured binary identity. Structural,
+byte-accounting and old-recipe parity tests do not establish timing accuracy.
+
+## TP-only joined reduction
+
 `runtime.moe_recipe = "tp_join_reduce"` explicitly selects a TP-only,
 non-sequence-parallel schedule. Routed experts retain their partial TP outputs
 through weighted unpermute. TP-sharded shared experts also retain their local

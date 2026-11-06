@@ -70,7 +70,8 @@ class BalancedRouting:
 def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
                          token_shards=1, valid_source_tokens=None, replica=0):
     p = runtime.parallel
-    if p.pcp != 1 or runtime.moe_recipe not in {"alltoall", "tp_join_reduce"}:
+    if p.pcp != 1 or runtime.moe_recipe not in {
+            "alltoall", "tp_join_reduce", "local_expert_reduce"}:
         raise ModelingError("balanced_routing_requires_pcp1_unchunked_alltoall")
     width = p.ep // p.tp if p.ep_spans_dp else 1
     if width > 1 and global_tokens is None:
