@@ -301,73 +301,17 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              views=views, plan=plan, quant=quant, padded_tokens=q,
                              **(pool_binding.options if pool_binding else {}))
         else:
-            stride = max(1, plan.compress_ratio)
-            limit = plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0
-            fp32_bytes = dtype_bytes("fp32")
-            idx_bytes = dtype_bytes(quant.index_dtype)
-            row_bytes = index_row_bytes(model, plan.index_dim)
-            log_k = math.log2(max(2, plan.index_topk))
-            rows = 0
-            score_read = 0.0
-            score_write = 0.0
-            score_flops = 0.0
-            score_vector = 0.0
-            topk_vector = 0.0
-            topk_read = 0.0
-            decode_views = []
-            for v in views:
-                if v.q_len <= 0:
-                    continue
-                v_rows = _long_selected_pairs(v.q_len, v.context, stride, limit)
-                rows += v_rows
-                score_flops += 2 * v_rows * plan.index_heads * plan.index_dim / shard
-                if v.phase == "prefill" or plan.candidate_filter or stride > 1:
-                    score_read += v_rows * row_bytes / shard
-                    score_write += v_rows * fp32_bytes / shard
-                    score_vector += v_rows * plan.index_heads * 2 / shard
-                    if v.phase == "prefill" and not plan.candidate_filter and stride <= 1:
-                        sel_limit = min(limit, plan.index_topk) if limit else plan.index_topk
-                        sel_rows = _long_selected_pairs(v.q_len, v.context, stride, sel_limit)
-                        act_rows = max(0.0, v_rows - sel_rows)
-                        topk_vector += (sel_rows * 7 + act_rows * 2.5) * log_k / shard
-                    else:
-                        topk_vector += v_rows * log_k / shard
-                    topk_read += v_rows * fp32_bytes / shard
-                else:
-                    decode_views.append((v, v_rows))
-            if decode_views:
-                # Decode LightningIndexer: each sequence's index_k cache is read once from HBM;
-                # Cube computes q_h * k^T per head, AIV reduces H heads with ReLU + weights and
-                # merges local top-K candidate buffers across AIV cores over max_q steps.
-                decode_rows = sum(v_rows for _, v_rows in decode_views)
-                unique_kv_rows = sum(
-                    min(completed_rows(v.context + v.q_len, stride),
-                        limit or completed_rows(v.context + v.q_len, stride))
-                    for v, _ in decode_views
-                )
-                max_q = max(v.q_len for v, _ in decode_views)
-                max_seq_kv = max(
-                    (min(completed_rows(v.context + v.q_len, stride),
-                         limit or completed_rows(v.context + v.q_len, stride))
-                     for v, _ in decode_views),
-                    default=0,
-                )
-                eff_topk = min(max_seq_kv, plan.index_topk)
-                score_read += (
-                    unique_kv_rows * row_bytes
-                    + decode_rows * plan.index_heads * (idx_bytes + fp32_bytes)
-                ) / shard
-                score_write += decode_rows * (plan.index_heads + 1) * fp32_bytes / shard
-                score_vector += decode_rows * (plan.index_heads + 1) * 4 / shard
-                merge_candidates = (48 + 8 * max_q) * eff_topk if decode_rows > 0 else 0
-                topk_vector += (merge_candidates + decode_rows * 2) * log_k * (log_k + 1) / 2 * 6 / shard
-                topk_read += (decode_rows * (plan.index_heads + 1) + merge_candidates) * fp32_bytes / shard
+            rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
+                       plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
+                       for v in views)
             scores = b.work("index_scores", selection_deps, (valid, plan.index_heads, plan.index_dim),
-                            flops=score_flops, vector=score_vector,
-                            read=score_read, write=score_write,
-                            family="indexer", dtype=quant.index_dtype)
+                            flops=2 * rows * plan.index_heads * plan.index_dim / shard,
+                            vector=rows * plan.index_heads * 2 / shard,
+                            read=rows * index_row_bytes(model, plan.index_dim) / shard,
+                            write=rows * 4 / shard, family="indexer", dtype=quant.index_dtype)
             topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
-                         vector=topk_vector, read=topk_read, write=valid * plan.index_topk * dtype_bytes("int32"),
+                         vector=rows * math.log2(max(2, plan.index_topk)) / shard,
+                         read=rows * 4 / shard, write=valid * plan.index_topk * 4,
                          family="topk", dtype="fp32",
                          metadata=(("selection_output_dtype", "int32"),))
             declare_indexer(

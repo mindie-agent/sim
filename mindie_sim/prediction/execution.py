@@ -526,11 +526,16 @@ class Execution:
         if additional:
             peaks = {**peaks, **{dtype: min(d.peak(dtype) for d in dies) for dtype in additional}}
         meta = dict(op.metadata)
-        sid_key = (replica, op.stage, dies[0].rank, dies[0].compute_units,
-                   _freeze_key(dict(dies[0].resource_units)), op.family, op.recipe, op.dtype,
-                   op.layout, scope, meta.get("kernel"), meta.get("kernel_name"),
-                   _freeze_key(meta.get("implementation")), _freeze_key(meta.get("service_axes")),
-                   bool(meta.get("hccl_selection")), _freeze_key(meta))
+        sid_key = (
+            replica, op.stage, dies[0].rank, dies[0].compute_units,
+            _freeze_key(dict(dies[0].resource_units)),
+            op.family, op.recipe, op.dtype, op.layout, scope,
+            meta.get("kernel"), meta.get("kernel_name"),
+            _freeze_key(meta.get("implementation")),
+            _freeze_key(meta.get("service_axes")),
+            bool(meta.get("hccl_selection")),
+            _freeze_key(meta),
+        )
         sid = self._service_identity_cache.get(sid_key)
         if sid is None:
             sid = service_identity(self.case, op, scope, device=dies[0])
@@ -550,8 +555,7 @@ class Execution:
                 routed = self.topology.accounting(op, replica, volume=amount)
                 demands.update(routed.wire_by_resource)
                 frames.update(routed.transaction_frames)
-                routed_q = dict(self.case.runtime.metadata).get("moe_dispatch_quantization") == "routed_expert"
-                setup = min(routed.setup_ms, routed.path_latency_ms) if op.family in {"alltoall", "alltoallv"} and routed_q else routed.setup_ms
+                setup = routed.path_latency_ms if op.family in {"alltoall", "alltoallv"} else routed.setup_ms
                 continue
             if resource == "cube":
                 portions = op.matrix_flops or ((op.dtype or self.case.model.compute_dtype, amount),)
