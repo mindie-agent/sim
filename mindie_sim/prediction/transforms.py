@@ -81,7 +81,8 @@ def activation_quantization(ops, source_dtype):
                 **{key: meta[key] for key in (
                     "activation_group_size", "activation_scale_shape",
                     "activation_scale_format", "activation_scale_bytes")},
-                **{key: meta[key] for key in ("structure_block", "structure_role") if key in meta},
+                **{key: meta[key] for key in ("structure_block", "structure_role",
+                    "graph_active_query_rows", "graph_physical_query_rows") if key in meta},
             }
             if meta.get("input_conversion_subgraphs"):
                 quant_meta["structure_subgraph_memberships"] = meta["input_conversion_subgraphs"]
@@ -239,8 +240,9 @@ def lower_implementations(ops, runtime, source_dtype, *, passes=None, resource_f
                               activation_quantized=activation_quantized)
     ops = lower_operators(ops, bindings, activation_quantized=activation_quantized, final=True)
     ops = lower_shared_experts(ops, bindings)
-    from .family_grouped_quant import lower as lower_grouped_int8
-    ops = lower_grouped_int8(ops, bindings)
+    grouped_int8 = select(bindings, "grouped_int8_caller")
+    if grouped_int8:
+        ops = grouped_int8.module.lower(ops, bindings)
     from .moe_group_list import lower as lower_group_list
     ops = lower_group_list(ops, bindings)
     wrapper = select(bindings, "matrix_wrapper")

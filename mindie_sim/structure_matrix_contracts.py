@@ -45,6 +45,15 @@ def matrix_contract(op):
                 return None
         if "expected_rows" in meta and meta["expected_rows"] != shape[0]:
             return None
+        if "mc2_unfused_storage" in meta:
+            storage = meta["mc2_unfused_storage"]
+            capacity = storage["capacity_rows"]
+            if (storage["valid_rows"] != shape[0] or capacity < shape[0]
+                    or tuple(meta.get("input_capacity_shape", ())) != (capacity, shape[2])
+                    or tuple(meta.get("output_capacity_shape", ())) != (capacity, shape[1])
+                    or tuple(meta.get("activation_scale_capacity_shape", ())) != (capacity,)):
+                return None
+            shape, scales = (capacity, *shape[1:]), ((capacity,), scales[1])
         return "grouped_matrix", (bank, *shape), *precision, *scales
     if meta.get("matrix_groups", 1) != 1:
         # The generic shape stores aggregate M; it does not encode batch axes.
@@ -89,6 +98,13 @@ def matrix_comparison_scope(op):
         scope["work_assumption"] = (
             "Total rows constrain GEMM FLOPs, but the expert histogram and active weight "
             "reads remain those declared by the case.")
+    if "mc2_unfused_storage" in meta:
+        scope["kind"] = "grouped_matrix_allocated_tensor_geometry"
+        scope["compared"][0] = "allocated_M_and_matrix_N_K"
+        scope["not_compared"].append("valid_grouped_rows_not_proven_by_tensor_capacity")
+        scope["work_assumption"] = (
+            "MC2 determines allocated tensor rows. Declared integer group-list values "
+            "alone determine matrix FLOPs and active weight reads; allocation is not valid work.")
     if meta.get("matrix_mapping_domain") == "single_group_dense_wrapper":
         declaration = meta["matrix_wrapper"]
         scope["kind"] = "source_selected_single_bank_matrix_geometry"

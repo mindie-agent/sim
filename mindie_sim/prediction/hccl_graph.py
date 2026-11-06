@@ -140,9 +140,16 @@ def lower(ops, runtime, source_dtype):
         for phase in plan.phases:
             deps = tuple(x for parent in phase.after for x in
                          (ids[parent],*((netids[parent],) if parent in netids else ()))) or (entry,)
+            # Local-only phases have no native peer direction.  Keep exchange
+            # and signal directions from the source plan; never export the
+            # dataclass default "send" for a copy/sync/reduce phase.
+            native_direction = (phase.native_direction
+                                if phase.exchange or phase.signals else "local")
             result.append(op(ids[phase.name],deps,{
                 'device_kernel_group':info(),
-                'hccl_phase':{'selection':selection.to_dict(),'rank':0,'phase':phase.name},
+                'hccl_phase':{'selection':selection.to_dict(),'rank':0,
+                              'phase':phase.name,
+                              'native_direction':native_direction},
                 **({'invocation_class':'vector'} if selection.expansion == 'AIV' else {}),
             },family='hccl_local',recipe=module.RECIPE,source_boundary='kernel',
                 stream=ids[phase.name]))

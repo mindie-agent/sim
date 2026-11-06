@@ -89,8 +89,11 @@ class QuantSpec:
     activation_scale_pack: int = 1
     category_overrides: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] = ()
     native_format: str = "bf16"
+    int8_weight_metadata: str = "scale_offset"
 
     def __post_init__(self):
+        if self.int8_weight_metadata not in {"scale_only", "scale_offset"}:
+            raise ModelingError("int8_weight_metadata_requires_scale_only_or_scale_offset")
         # JSON mappings become immutable records before they enter model IDs.
         for key in ("weight_block", "exclusions", "notes"):
             object.__setattr__(self, key, tuple(getattr(self, key)))
@@ -100,6 +103,7 @@ class QuantSpec:
             "weight_format", "activation_format", "weight_block", "expert_block",
             "scale_format", "scale_bytes", "activation_group_size",
             "activation_scale_format", "activation_scale_pack",
+            "int8_weight_metadata",
         }
         entries = (self.category_overrides.items() if isinstance(self.category_overrides, Mapping)
                    else self.category_overrides)
@@ -263,8 +267,10 @@ class QuantSpec:
             # Payload only; the shared expert's scale is charged once.
             return float(rows * cols)
         if fmt in {"int8", "w8a8"}:
-            # W8A8 keeps one fp32 scale+offset pair per output channel.
-            return float(rows * cols + rows * int(self.scale_bytes) * 2)
+            # Native INT8 callers may provide one scale or a scale/offset pair.
+            # This declaration also owns residency; an absent offset has no bytes.
+            metadata_columns = 1 if self.int8_weight_metadata == "scale_only" else 2
+            return float(rows * cols + rows * self.scale_bytes * metadata_columns)
         raise ModelingError(f"catalog_weight_format_unsupported:{fmt}")
 
     @property
@@ -283,6 +289,7 @@ class QuantSpec:
         return {
             "name": self.name, "weight_format": self.weight_format,
             "native_format": self.native_format,
+            "int8_weight_metadata": self.int8_weight_metadata,
             "activation_format": self.activation_format,
             "expert_weight_format": self.expert_weight_format,
             "weight_block": list(self.weight_block),

@@ -53,6 +53,9 @@ IMPLEMENTATIONS = {
     "ascend_grouped_int32_dequant_swiglu": Implementation(
         "mindie_sim.prediction.family_grouped_quant", blocks=("grouped_int8_caller",),
         options=("dequant_program", "input_capacity_rows")),
+    "vllm_ascend_mc2_unfused_w8a8": Implementation(
+        "mindie_sim.prediction.family_mc2_unfused", blocks=("grouped_int8_caller",),
+        options=("global_bs",)),
     "ascend_prepared_mx32_matrix": Implementation(
         "mindie_sim.prediction.family_mx_matrix", blocks=("mx_matrix",),
         options=("projection_recipes", "scale_storage")),

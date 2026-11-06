@@ -15,6 +15,22 @@ SOURCE_REVISION = "c2d6790464654ccf58aca39448de4b65fdc7b184"
 SOURCE = "https://github.com/hicann/hccl/tree/" + SOURCE_REVISION
 
 
+def exact_positive_int(value, label):
+    """Reject bool, non-finite, fractional and non-positive source integers."""
+    import math
+    if isinstance(value, bool):
+        raise ModelingError(f"{label}_requires_exact_positive_integer:{value!r}")
+    if isinstance(value, int):
+        number = value
+    elif isinstance(value, float) and math.isfinite(value) and value.is_integer():
+        number = int(value)
+    else:
+        raise ModelingError(f"{label}_requires_exact_positive_integer:{value!r}")
+    if number <= 0:
+        raise ModelingError(f"{label}_requires_exact_positive_integer:{value!r}")
+    return number
+
+
 @dataclass(frozen=True)
 class HcclSelection:
     expansion: str
@@ -36,9 +52,22 @@ class HcclSelection:
     # Source channel endpoint owner, indexed [source rank][peer rank].
     # The diagonal has no channel; these are CCU dies, not NPU-rank packages.
     channel_die_map: tuple[tuple[int | None, ...], ...] = ()
+    # Explicit ordered native repeat/segment byte sequence.  Required by
+    # rs_mesh_chunk and z_axis_detour_*; never inferred from a shape or time.
+    segments: tuple[int, ...] = ()
+    # Explicit level-1 channel byte-share weights (channels = 1 + len).
+    # Required by z_axis_detour_*; not a hardware bandwidth inventory.
+    level1_weights: tuple[int, ...] = ()
 
     def to_dict(self):
-        return asdict(self)
+        value = asdict(self)
+        # Keep existing selections' content identity stable when the new
+        # optional fields are unused.
+        if not self.segments:
+            value.pop("segments", None)
+        if not self.level1_weights:
+            value.pop("level1_weights", None)
+        return value
 
 
 @dataclass(frozen=True)
@@ -55,6 +84,13 @@ class HcclPhase:
     control_counts: tuple[tuple[str, int], ...] = ()
     # Directed remote notify endpoints, distinct from payload and local waits.
     signals: tuple[tuple[int, int], ...] = ()
+    # Native primitive view: send/write, read, or local-only.  The exchange
+    # matrix stays a physical send matrix; this field is provenance.
+    native_direction: str = "send"
+
+    def __post_init__(self):
+        if self.native_direction not in {"send", "read", "local"}:
+            raise ModelingError("hccl_phase_native_direction_unknown")
 
 
 @dataclass(frozen=True)
@@ -72,12 +108,18 @@ def select(raw, *, collective, ranks, payload_bytes):
     """Validate an explicit physical contract; never infer an engine by SKU."""
     allowed = {"expansion", "template", "dtype_bytes", "topology", "topology_levels",
                "source_revision", "block_limit", "buffer_mode", "level0_size",
-               "max_loop_bytes", "signal_bytes", "channel_die_map"}
+               "max_loop_bytes", "signal_bytes", "channel_die_map",
+               "segments", "level1_weights"}
     if set(raw) - allowed or not {"expansion", "template"} <= set(raw):
         raise ModelingError("hccl_source_requires_explicit_expansion_and_template")
     raw = dict(raw)
     if 'channel_die_map' in raw:
         raw['channel_die_map'] = tuple(map(tuple, raw['channel_die_map']))
+    for name in ('segments', 'level1_weights'):
+        if name in raw:
+            raw[name] = tuple(raw[name])
+            raw[name] = tuple(exact_positive_int(value, 'hccl_' + name)
+                              for value in raw[name])
     result = HcclSelection(collective=collective, ranks=ranks, payload_bytes=payload_bytes, **raw)
     if (isinstance(ranks, bool) or not isinstance(ranks, int) or ranks < 1
             or not isinstance(payload_bytes, int) or payload_bytes < 0
@@ -108,6 +150,17 @@ def select(raw, *, collective, ranks, payload_bytes):
     if (result.signal_bytes is not None
             and result.template not in {'parallel_mesh_nhr_route0', 'mesh_2die_broadcast_v1'}):
         raise ModelingError('hccl_source_signal_bytes_require_explicit_notify_template')
+    segmented = {'rs_mesh_chunk', 'z_axis_detour_allgather',
+                 'z_axis_detour_reduce_scatter'}
+    weighted = {'z_axis_detour_allgather', 'z_axis_detour_reduce_scatter'}
+    if result.segments and result.template not in segmented:
+        raise ModelingError('hccl_source_segments_not_supported_by_template')
+    if result.level1_weights and result.template not in weighted:
+        raise ModelingError('hccl_source_level1_weights_not_supported_by_template')
+    if result.template in segmented and not result.segments:
+        raise ModelingError('hccl_source_requires_explicit_segments')
+    if result.template in weighted and not result.level1_weights:
+        raise ModelingError('hccl_source_requires_explicit_level1_weights')
     return result
 
 

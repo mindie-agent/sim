@@ -11,6 +11,13 @@ from __future__ import annotations
 from dataclasses import replace
 
 
+def annotate_geometry(ops, *, active_rows, physical_rows):
+    """Capture dimensions describe the call, independently of kernel slicing."""
+    return tuple(replace(op, metadata=tuple({**dict(op.metadata),
+        "graph_active_query_rows": active_rows,
+        "graph_physical_query_rows": physical_rows}.items())) for op in ops)
+
+
 class GraphPolicy:
     def select(self, views, runtime):
         tokens = sum(view.q_len for view in views)

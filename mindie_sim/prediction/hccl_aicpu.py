@@ -41,11 +41,12 @@ def _sync(name, after, threads):
                      control_counts=(("notify", notifies), ("wait", notifies)))
 
 
-def _exchange(name, after, matrix, rank):
+def _exchange(name, after, matrix, rank, *, native_direction="send"):
     sent = sum(matrix[rank])
     received = sum(row[rank] for row in matrix)
     return HcclPhase(name, after, (("hbm", sent + received),), exchange=matrix,
-                     control_counts=(("directed_peer_messages", sum(v > 0 for v in matrix[rank])),))
+                     control_counts=(("directed_peer_messages", sum(v > 0 for v in matrix[rank])),),
+                     native_direction=native_direction)
 
 
 def _mesh(values, *, destination):
@@ -76,6 +77,15 @@ def contract(selection: HcclSelection, rank=0):
     if s.template == "nhr":
         from .hccl_nhr import contract as nhr_contract
         return nhr_contract(s, rank)
+    if s.template == "mesh_chunk_twoshot":
+        from .hccl_aicpu_mesh_chunk import contract as mesh_chunk_contract
+        return mesh_chunk_contract(s, rank)
+    if s.template == "rs_mesh_chunk":
+        from .hccl_rs_mesh_chunk import contract as rs_mesh_chunk_contract
+        return rs_mesh_chunk_contract(s, rank)
+    if s.template in {"z_axis_detour_allgather", "z_axis_detour_reduce_scatter"}:
+        from .hccl_z_axis_detour import contract as detour_contract
+        return detour_contract(s, rank)
     if (s.expansion != "AICPU_TS" or s.topology != "MESH_1D"
             or s.topology_levels != 1 or not 0 <= rank < s.ranks):
         raise ModelingError("hccl_aicpu_source_requires_single_mesh_rank")
@@ -124,7 +134,8 @@ def contract(selection: HcclSelection, rank=0):
             phases.extend((scatter, _sync("rs_post_sync", ("scatter",), threads),
                 HcclPhase("rs_result_to_output", ("rs_post_sync",), _copy(own)),
                 _sync("ag_pre_sync", ("rs_result_to_output",), threads),
-                _exchange("gather", ("ag_pre_sync",), _mesh(chunks, destination=False), rank),
+                _exchange("gather", ("ag_pre_sync",), _mesh(chunks, destination=False), rank,
+                          native_direction="read"),
                 _sync("ag_post_sync", ("gather",), threads)))
             scratch = 0
         else:
@@ -135,7 +146,8 @@ def contract(selection: HcclSelection, rank=0):
                 HcclPhase("local_reduce", ("rs_post_sync",), _sum(steps), steps),
                 _sync("ag_pre_sync", ("local_reduce",), threads),
                 HcclPhase("ag_local_copy", ("ag_pre_sync",), _copy(own)),
-                _exchange("gather", ("ag_pre_sync",), _mesh(chunks, destination=False), rank),
+                _exchange("gather", ("ag_pre_sync",), _mesh(chunks, destination=False), rank,
+                          native_direction="read"),
                 _sync("ag_post_sync", ("ag_local_copy", "gather"), threads)))
         coeff = (("selector_kernel_count", 20), ("selector_task_count", 16 * (r - 1) + 10))
     elif s.collective == "allgather":
@@ -148,7 +160,8 @@ def contract(selection: HcclSelection, rank=0):
         phases.extend((
             HcclPhase("local_copies", work=_sum(steps), steps=steps),
             _sync("pre_sync", ("local_copies",), threads),
-            _exchange("gather", ("pre_sync",), _mesh((n,) * r, destination=False), rank),
+            _exchange("gather", ("pre_sync",), _mesh((n,) * r, destination=False), rank,
+                      native_direction="read"),
             _sync("post_sync", ("gather",), threads),
         ))
     else:

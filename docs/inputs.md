@@ -80,13 +80,17 @@ Runtime mechanisms include:
 - `pp_layer_partition`, `pipeline_microbatches`, `async_scheduling`.
 - `graph_mode`, `graph_capture_mode`, `graph_capture_keys`, `graph_buckets`,
   `piecewise_capture_keys`, `mixed_mode`, `splitting_ops`, `invalid_full_modes`.
-- `moe_recipe` (`alltoall` or `mc2`), `mc2_chunks`,
+- `moe_recipe` (`alltoall`, `mc2`, `tp_join_reduce`, or `local_expert_reduce`), `mc2_chunks`,
   `multistream_overlap_shared_expert`, `deepep_high_throughput` (eager graph policy).
+  The two explicit joined-output recipes and their supported domains are described
+  in [MoE output reduction](operators/moe-output-reduction.md).
 - `routing.realizations`: optional integer expert-row counts keyed by scope,
   layer, phase and token count. Counts are execution inputs, independent of
   implementation choice or calibration. The first domain is EP=1, PCP=1,
   unpadded all-to-all with unrestricted expert groups; probability moments
-  remain the default. See `operator-family-selection.md`.
+  remain the default. `local_expert_reduce` additionally supports a complete
+  global integer ledger projected onto contiguous EP banks; missing counts remain
+  expected routing, never observed counts. See `operator-family-selection.md`.
 - `submission` (`scheduler_ms`, `graph_replay_ms`, `completion_ms`),
 - `serving_io` (explicit host preparation/results, H2D/D2H payloads and capacities,
   optional client delivery; see [Serving I/O](serving-io.md)),

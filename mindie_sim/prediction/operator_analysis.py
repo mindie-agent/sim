@@ -19,6 +19,7 @@ from .execution import CollectiveParticipant, Execution
 from .structure import parse_case
 from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_declaration,
                             effective_body_declaration)
+from .graph import annotate_geometry
 
 
 def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
@@ -109,12 +110,18 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
                           tokens=local_tokens, mode=views[0].phase if views else phase,
                           global_tokens=global_tokens, replica=replica)
+    # Source lowerings consume the same active/storage distinction as the
+    # model path, including MC2's mask over padded graph inputs.
+    ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),
+                            physical_rows=padded_tokens)
     ops = frontend.graph.apply(lower_implementations(
         ops, case.runtime, case.model.activation_dtype, resource_fusion=False,
         local_tokens=local_tokens), replay_scope, case.runtime)
     if resource_fusion:
         from .native_fusion import lower_native_fusions
         ops = lower_native_fusions(ops, case.runtime, local_tokens=local_tokens)
+    ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),
+                            physical_rows=padded_tokens)
     return annotate(tuple(replace(op, metadata=op.metadata + (("graph_replay_scope", replay_scope),))
                           for op in ops), selections)
 

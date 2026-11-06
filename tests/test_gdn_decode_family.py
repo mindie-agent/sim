@@ -116,6 +116,30 @@ def test_padded_gate_copies_precede_actual_slice_and_core_stays_unpadded():
     assert dict(next(op for op in ops if op.family == "recurrent_vector").metadata)["tokens"] == 1
 
 
+def test_full_capture_keeps_physical_buffers_without_work_for_dummy_sequences():
+    parsed, views, _ = source_case(lengths=(4,) * 7, heads=12, keys=4)
+    parsed = replace(parsed, runtime=replace(parsed.runtime, graph_mode="auto",
+                     graph_capture_mode="full", graph_capture_keys=(32,)))
+    ops, _ = Frontend().body(parsed.model, parsed.runtime, views, mode="decode", tokens=32)
+    conv = next(op for op in ops if op.recipe == CONV)
+    scan = next(op for op in ops if op.family == "recurrent_vector")
+    assert conv.local_shape == (28, 2560) and conv.padded_shape == (32, 2560)
+    assert dict(conv.metadata)["physical_sequence_tokens"] == (4,) * 7 + (0,)
+    assert dict(scan.metadata)["sequence_tokens"] == (4,) * 7
+    assert dict(scan.metadata)["state_checkpoints"] == 28
+    assert scan.local_shape[0] == 28 and scan.padded_shape[0] == 32
+    assert next(op for op in ops if op.recipe == GATING).local_shape == (32, 12)
+    norms = [op for op in ops if "decode_q_l2norm" in op.recipe or "decode_k_l2norm" in op.recipe]
+    assert len(norms) == 2 and all(op.local_shape == (1, 32, 4, 128) for op in norms)
+    # Source rejects the repeated final offset before weight/history loads.
+    # Both live queries and state writes retain seven requests, not eight.
+    engine, _ = execute_one(parsed, views, conv)
+    assert engine.serviced["mte2_aiv@r0:s0"] == pytest.approx(7 * (4 + 3 + 4 + 2 + 4) * 2560 * 2)
+    assert engine.serviced["mte3@r0:s0"] == pytest.approx(7 * (4 + 2 + 4) * 2560 * 2)
+    copy = next(op for op in ops if op.recipe == "core_output_copy")
+    assert copy.mte2_bytes == copy.mte3_bytes == 32 * 12 * 128 * 2
+
+
 def test_logical_gating_grid_reuses_physical_owners_without_borrowing_cores():
     parsed, views, ops = source_case(lengths=(4,), units=40)
     op = next(op for op in ops if op.recipe == GATING)

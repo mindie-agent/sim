@@ -9,7 +9,7 @@
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import replace
 import math
 
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
@@ -21,38 +21,8 @@ from .deepep import (deepep_exchange_factor, resolve_exchange_options,
                      scale_exchange_operator, split_deepep_combine_overlap,
                      split_deepep_dispatch_overlap, split_deepep_down_overlap,
                      split_deepep_up_overlap)
+from .moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
 from . import moe_transport, moe_token_partition
-
-
-@dataclass(frozen=True)
-class RoutingPolicy:
-    tile_rows: int = 1
-
-    def local(self, model, layer, parallel, tokens: int) -> tuple[float, float]:
-        probabilities = model.expert_routing or (1 / layer.num_experts,) * layer.num_experts
-        if len(probabilities) != layer.num_experts:
-            raise ValueError("routing_probabilities_do_not_match_layer_experts")
-        if (any(value < 0 or not math.isfinite(value) for value in probabilities)
-                or sum(value > 0 for value in probabilities) < layer.top_k):
-            raise ValueError("routing_support_must_cover_top_k")
-        # Weighted sampling without replacement: saturate certain selections,
-        # then redistribute remaining probability mass. Sum inclusions = top-k.
-        remaining, available = float(layer.top_k), math.fsum(probabilities)
-        inclusions = [0.0] * layer.num_experts
-        for index in sorted(range(layer.num_experts), key=lambda i: probabilities[i], reverse=True):
-            probability = probabilities[index]
-            inclusion = min(1.0, remaining * probability / available) if available else 0
-            inclusions[index] = inclusion
-            remaining -= inclusion
-            available -= probability
-        rows, active = [], []
-        for inclusion in inclusions:
-            rows.append(tokens * inclusion)
-            active.append(-math.expm1(tokens * math.log1p(-inclusion))
-                          if 0 < inclusion < 1 else float(tokens > 0 and inclusion > 0))
-        rank_rows = [math.fsum(rows[index::parallel.ep]) for index in range(parallel.ep)]
-        slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
-        return rank_rows[slowest], math.fsum(active[slowest::parallel.ep])
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -114,7 +84,10 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
 
 def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         global_tokens=None, routing=RoutingPolicy(), routing_realization=None,
-        overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None, **_):
+        overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
+        caller=None, **_):
+    exchange = caller is None or caller.exchange
+    reduce_after_join = reduce_after_join or (caller is not None and caller.reduce_after_join)
     hidden = model.hidden_size
     token_partition = moe_token_partition.select(
         runtime, parallel=parallel, plan=plan, model=model, tokens=tokens,
@@ -136,21 +109,32 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
                           min(parallel.tp, parallel.ep)))
-    if token_partition:
+    if caller is not None:
+        # One replicated source owns the complete token selection; the native
+        # ledger is projected onto this rank's contiguous expert bank.
+        projected = caller.prepare(
+            routing, model, plan, parallel, group_tokens, routing_realization)
+        routing_realization = projected.routing_realization
+        local_rows, active = projected.local_rows, projected.active
+        routing_metadata = projected.routing_metadata
         partitions = 1
-        if routing_realization is not None:
-            # Keep the cohort's integer expert counts; only source ownership
-            # changes from implicit replicated assignment division to TP views.
-            routing_realization = replace(routing_realization, source_partitions=1)
-    local_rows, active = (
-        routing.local(model, plan, parallel, group_tokens) if routing_realization is None
-        else (routing_realization.rows, routing_realization.active))
-    routing_metadata = (
-        (("routing_basis", "probability_moments"), ("expected_rows", local_rows),
-         ("expected_active_experts", active))
-        if routing_realization is None else
-        (("routing_basis", routing_realization.basis),
-         ("routing_realization", routing_realization.to_dict())))
+    else:
+        if token_partition:
+            partitions = 1
+            if routing_realization is not None:
+                # Keep the cohort's integer expert counts; only source ownership
+                # changes from implicit replicated assignment division to TP views.
+                routing_realization = replace(routing_realization, source_partitions=1)
+        local_rows, active = (
+            routing.local(model, plan, parallel, group_tokens)
+            if routing_realization is None
+            else (routing_realization.rows, routing_realization.active))
+        routing_metadata = (
+            (("routing_basis", "probability_moments"), ("expected_rows", local_rows),
+             ("expected_active_experts", active))
+            if routing_realization is None else
+            (("routing_basis", routing_realization.basis),
+             ("routing_realization", routing_realization.to_dict())))
     if token_partition:
         routing_metadata += token_partition.metadata()
     balanced = (routing_realization is not None
@@ -311,14 +295,22 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 prefix, source, stage, plan, requests, tokens, latent, model, mode)
             ops.append(latent_norm)
             source = latent_norm.op_id
+    pack_read = payload_tokens * (latent * 2 + plan.top_k * 4)
+    pack_write = payload_tokens * plan.top_k * (latent * 2 + 4)
+    pack_ops = pack_extra = None
+    if caller is not None:
+        pack_read, pack_write, pack_ops = caller.pack_work(
+            rows=tokens, latent=latent, local_rows=local_rows,
+            weight_bytes=weight_bytes, act_bytes=dtype_bytes(model.activation_dtype))
+        pack_extra = caller.pack_metadata(local_rows)
     packing = vector_op(
         op_id=prefix + ".pack",
         deps=tuple(dict.fromkeys((source, select.op_id, ids_producer))) if tokens else (deps,),
         stage=stage, layer=plan.index, requests=requests,
         elements=payload_tokens * plan.top_k, ops_per_element=1,
+        vector_ops_override=pack_ops,
         dtype=model.activation_dtype, family="routing", phase=mode, recipe="route_pack",
-        read_bytes_override=payload_tokens * (latent * 2 + plan.top_k * 4),
-        write_bytes_override=payload_tokens * plan.top_k * (latent * 2 + 4),
+        read_bytes_override=pack_read, write_bytes_override=pack_write,
         shape=(tokens, plan.top_k),
         metadata=(
             ("topk_ids_producer", ids_producer),
@@ -327,6 +319,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             ("top_k", plan.top_k),
             ("topk_ids_dtype", "int32"),
             ("packed_layout", "expert_grouped"),
+            *((pack_extra or ())),
             *routing_metadata,
         ),
     )
@@ -392,7 +385,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                     traffic_model=source_traffic.basis, source_token_mask=source_traffic.to_dict())
         return replace(op, family="alltoallv", link_bytes=sum(map(sum, matrix)) / parallel.ep,
                        metadata=tuple(meta.items()))
-    if parallel.ep > 1 and transport is None:
+    if parallel.ep > 1 and transport is None and exchange:
         dispatch = comm_op(
             op_id=prefix + ".dispatch", deps=(last,), stage=stage, layer=plan.index,
             requests=requests, family="alltoall", phase=mode, recipe="expert_dispatch",
@@ -512,11 +505,14 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         gate_ops, gate_last = split_deepep_up_overlap(
             gate, exchange_options, dispatch_overlap_id=dispatch_overlap_id,
             allow_split=allow_up_split)
+        activation_rows = local_rows if caller is None else caller.activation_rows()
         activation = gated_activation(
-            plan=plan, rows=local_rows, width=expert_width,
+            plan=plan, rows=activation_rows, width=expert_width,
             op_id=prefix + ".expert_act", deps=(gate_last,), stage=stage,
             requests=requests, dtype=model.activation_dtype, phase=mode, recipe="grouped_swiglu",
         )
+        if caller is not None:
+            activation = caller.tag_activation(activation, local_rows)
         ops.extend((*gate_ops, activation, down))
         if (dict(down.metadata).get("activation_scale_bytes") and runtime
                 and "activation_quantization" in runtime.lowering_passes):
@@ -599,7 +595,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             down_mid_id = reduce.op_id
     else:
         down_mid_id = None
-    if parallel.ep > 1:
+    if parallel.ep > 1 and exchange:
         if transport is not None:
             combine = moe_transport.combine(
                 prefix=prefix, plan=plan, stage=stage, requests=requests,
@@ -638,13 +634,22 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     if routing_realization is not None:
         unpack_metadata.append(("input_rows", int(local_rows)))
     act_bytes = dtype_bytes(model.activation_dtype)
+    unpack_read = tokens * plan.top_k * (latent * act_bytes + dtype_bytes("fp32"))
+    unpack_write = tokens * latent * act_bytes
+    unpack_ops = unpack_extra = None
+    if caller is not None:
+        unpack_read, unpack_write, unpack_ops = caller.unpack_work(
+            tokens=tokens, latent=latent, local_rows=local_rows,
+            weight_bytes=weight_bytes, act_bytes=act_bytes)
+        unpack_extra = caller.unpack_metadata(local_rows, weight_dtype)
     unpermute = vector_op(
         op_id=prefix + ".unpack", deps=unpack_inputs, stage=stage, layer=plan.index,
         requests=requests, elements=tokens * latent, ops_per_element=2 * plan.top_k,
+        vector_ops_override=unpack_ops,
         dtype=model.activation_dtype, family="routing", phase=mode, recipe="route_unpack",
-        read_bytes_override=tokens * plan.top_k * (latent * act_bytes + dtype_bytes("fp32")),
-        write_bytes_override=tokens * latent * act_bytes, shape=(tokens, plan.top_k, latent),
-        metadata=tuple(unpack_metadata),
+        read_bytes_override=unpack_read, write_bytes_override=unpack_write,
+        shape=(tokens, plan.top_k, latent),
+        metadata=tuple(unpack_metadata) + (unpack_extra or ()),
     )
     ops.append(unpermute)
     last = unpermute.op_id
@@ -729,6 +734,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             metadata=(("group_axis", "tp"), ("steps", 2 * (parallel.tp - 1)),
                       ("reduction_boundary", "token_rows_after_routed_shared_join")),
         )
+        if caller is not None:
+            reduction = caller.tag_reduce(reduction)
         ops.append(reduction)
         last = reduction.op_id
     from .mc2_graph import lower as lower_native_mc2
@@ -738,20 +745,6 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         source_partitions=partitions, received_assignments=local_rows,
         dtype=model.activation_dtype, source_routing=source_traffic)
     return ops, last
-
-
-def tp_join_reduce(*, plan, parallel, model, **kwargs):
-    """TP-sharded experts and shared output reduce once after linear combine."""
-    from mindie_sim.schema.common import ModelingError
-
-    if parallel.ep != 1 or parallel.dp != 1 or parallel.cp != 1 or parallel.pcp != 1:
-        raise ModelingError("tp_join_reduce_requires_tp_only_non_sequence_parallel")
-    if plan.expert_latent_size not in (0, None, model.hidden_size):
-        raise ModelingError("tp_join_reduce_cannot_defer_across_routed_output_transform")
-    # This explicit recipe declares TP-sharded shared weights and replicated
-    # router/shared gates. Their linear combine commutes with the final sum.
-    return alltoall(plan=plan, parallel=parallel, model=model,
-                   reduce_after_join=True, **kwargs)
 
 
 def mc2(*, prefix, tokens, global_tokens=None, chunks=4, **kwargs):
@@ -789,7 +782,8 @@ def mc2(*, prefix, tokens, global_tokens=None, chunks=4, **kwargs):
     return ops, joined.op_id
 
 
-MOE_RECIPES = {"alltoall": alltoall, "mc2": mc2, "tp_join_reduce": tp_join_reduce}
+MOE_RECIPES = {"alltoall": alltoall, "mc2": mc2, "tp_join_reduce": tp_join_reduce,
+               "local_expert_reduce": local_expert_reduce_recipe}
 
 
 def moe(*, moe_recipe="alltoall", mc2_chunks=4, **kwargs):

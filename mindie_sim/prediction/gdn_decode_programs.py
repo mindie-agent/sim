@@ -53,6 +53,10 @@ def conv_task_runs(lengths, dim, tile_width, columns, blocks, owner, *, compact=
     previous, repeat = None, 0
     for task in range(owner, len(lengths) * columns, blocks):
         seq, col = divmod(task, columns)
+        # Source ResolveSeqTaskWindow rejects repeated offsets before loading
+        # weights or state. The slot still participates in the host grid.
+        if lengths[seq] == 0:
+            continue
         descriptor = lengths[seq], min(tile_width, dim - col * tile_width)
         if previous is not None and (not compact or descriptor != previous):
             yield *previous, repeat
@@ -74,15 +78,16 @@ def conv_schedule(lengths, dim, units, *, width, bias, speculative, compact=True
         "owner_cycles": counts, "active_aiv": blocks, "tile_channels": tile_width,
         "channel_tiles": columns,
         "read_descriptors": columns * sum(width + int(bias) + width - 1 + q
-                                           + (2 + q if speculative else 0) for q in lengths),
-        "write_descriptors": columns * sum(q + (2 + q if speculative else width - 1) for q in lengths),
+                                           + (2 + q if speculative else 0) for q in lengths if q > 0),
+        "write_descriptors": columns * sum(q + (2 + q if speculative else width - 1) for q in lengths if q > 0),
         "contention_approximation": "serial_cycle_fluid_rephasing" if compact else "none",
     }
 
 
 def conv_plan(op, geometry, *, compact=True):
     meta = dict(op.metadata)
-    lengths, width = tuple(meta["sequence_tokens"]), meta["kernel_width"]
+    lengths = tuple(meta.get("physical_sequence_tokens", meta["sequence_tokens"]))
+    width = meta["kernel_width"]
     dim, dtype = op.local_shape[1], op.dtype
     if dtype not in {"bf16", "fp16"} or width not in {2, 3, 4}:
         raise ValueError("gdn_decode_convolution_requires_16bit_width2to4")
@@ -100,9 +105,9 @@ def conv_plan(op, geometry, *, compact=True):
     # Source reloads weights per (sequence, channel tile), and recasts each
     # window tap before the multiply/add. SiLU is neg/exp/add/div/multiply.
     reads = sum((width + int(bias) + width - 1 + q + (2 + q if speculative else 0))
-                * dim * 2 for q in lengths)
-    writes = sum((q + (2 + q if speculative else width - 1)) * dim * 2 for q in lengths)
-    vector = sum((width + 1 + q * (3 * width + 5 + 2 * int(bias))) * dim for q in lengths)
+                * dim * 2 for q in lengths if q > 0)
+    writes = sum((q + (2 + q if speculative else width - 1)) * dim * 2 for q in lengths if q > 0)
+    vector = sum((width + 1 + q * (3 * width + 5 + 2 * int(bias))) * dim for q in lengths if q > 0)
     work = Work(resources={"hbm": reads + writes, read: reads, "mte3": writes, "vector": vector})
 
     def program(context):

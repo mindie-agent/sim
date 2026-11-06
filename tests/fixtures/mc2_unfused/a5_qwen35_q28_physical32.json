@@ -1,0 +1,116 @@
+{
+  "source": {
+    "path": "/Volumes/data/mindie-sim-data/a5/heldout_engine_20261031/a5_qwen35_tp4_ep4_mtp3_decode_4k_c8/kernel_details.csv",
+    "sha256": "574701a0c62eaf05dbfe93c90877cd809db5820e2b26ae092fe77931b16f0eee"
+  },
+  "extraction_cache_sha256_basis": "source identity previously verified against retained CSV; no tensor values captured",
+  "case_id": "a5_qwen35_tp4_ep4_mtp3_decode_4k_c8",
+  "active_query_rows": 28,
+  "physical_query_rows": 32,
+  "native": [
+    {
+      "abi": {
+        "type": "MoeDistributeDispatchV3",
+        "input_shapes": "\"4100;8,2048;8,8;;8;;;\"",
+        "input_dtypes": "INT32;DT_BF16;INT32;DT_UNDEFINED;BOOL;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+        "input_formats": "ND;ND;ND;NULL;ND;NULL;NULL;NULL",
+        "output_shapes": "\"256,2048;256;32768;64;256;1;256\"",
+        "output_dtypes": "INT8;FLOAT;INT32;INT64;INT32;INT32;FLOAT",
+        "output_formats": "ND;ND;ND;ND;ND;ND;ND"
+      },
+      "first_csv_line": 81474,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "Cast",
+        "input_shapes": "\"64,1024\"",
+        "input_dtypes": "FLOAT",
+        "input_formats": "ND",
+        "output_shapes": "\"64,1024\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81475,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "GroupedMatmul",
+        "input_shapes": "\"256,2048;64,32,128,16,32;;64,1024;;;;64;256\"",
+        "input_dtypes": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+        "input_formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+        "output_shapes": "\"256,1024\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81476,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "SwiGlu",
+        "input_shapes": "\"256,1024\"",
+        "input_dtypes": "DT_BF16",
+        "input_formats": "ND",
+        "output_shapes": "\"256,512\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81477,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "DynamicQuantV2",
+        "input_shapes": "\"256,512\"",
+        "input_dtypes": "DT_BF16",
+        "input_formats": "ND",
+        "output_shapes": "\"256,512;256;256\"",
+        "output_dtypes": "INT8;FLOAT;FLOAT",
+        "output_formats": "ND;ND;ND"
+      },
+      "first_csv_line": 81478,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "GroupedMatmul",
+        "input_shapes": "\"256,512;64,64,32,16,32;;64,2048;;;;64;256\"",
+        "input_dtypes": "INT8;INT8;INT32;DT_BF16;FLOAT;FLOAT16;FLOAT16;INT64;FLOAT",
+        "input_formats": "ND;FRACTAL_NZ;ND;ND;ND;ND;ND;ND;ND",
+        "output_shapes": "\"256,2048\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81479,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "MoeDistributeCombineV3",
+        "input_shapes": "\"4100;256,2048;8,8;32768;256;8,8;1;8;;;;256;;;;;;;\"",
+        "input_dtypes": "INT32;DT_BF16;INT32;INT32;INT32;FLOAT;INT32;BOOL;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;FLOAT;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED;DT_UNDEFINED",
+        "input_formats": "ND;ND;ND;ND;ND;ND;ND;ND;NULL;NULL;NULL;ND;NULL;NULL;NULL;NULL;NULL;NULL;NULL",
+        "output_shapes": "\"8,2048\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81480,
+      "count_per_forward": 40.0
+    },
+    {
+      "abi": {
+        "type": "ForeachAddList",
+        "input_shapes": "\"32,2048;32,2048;\"",
+        "input_dtypes": "DT_BF16;DT_BF16;FLOAT",
+        "input_formats": "ND;ND;ND",
+        "output_shapes": "\"32,2048\"",
+        "output_dtypes": "DT_BF16",
+        "output_formats": "ND"
+      },
+      "first_csv_line": 81491,
+      "count_per_forward": 40.0
+    }
+  ]
+}

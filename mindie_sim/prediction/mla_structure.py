@@ -9,18 +9,22 @@
 from .structure_groups import declare_group
 
 
-def declare_indexer(ops, *, prefix, plan, parallel, model, quant, tokens,
-                    scores, topk):
+def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
+                    padded_tokens, scores, topk):
     if parallel.cp != 1 or parallel.pcp != 1 or plan.candidate_filter:
         return
     selection = next(op for op in ops if op.op_id == topk)
     quantized = quant.index_dtype not in {"bf16", "fp16"}
     role = "quant_lightning_indexer" if quantized else "lightning_indexer"
+    partition = tuple({"query": view.q_len, "context": view.context,
+                       "kv_length": view.kv_len} for view in views)
     declare_group(
         ops, key=prefix + "." + role, role=role,
         family="dsa", members=(scores, topk), entries=(scores,), anchor=topk,
         view={
-            "tokens": tokens, "heads": plan.index_heads, "width": plan.index_dim,
+            "tokens": sum(view.q_len for view in views), "physical_tokens": padded_tokens,
+            "sequence_partition": partition, "compression_ratio": max(1, plan.compress_ratio),
+            "heads": plan.index_heads, "width": plan.index_dim,
             "topk": plan.index_topk, "query_dtype": quant.index_dtype,
             "weight_dtype": "fp16" if quant.index_dtype == "int8" else model.activation_dtype,
             "cache_dtype": quant.index_dtype,

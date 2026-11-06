@@ -80,12 +80,15 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
     return composite.output
 
 
-def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv):
+def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
+                physical_tokens=None, physical_sequence_tokens=None):
     """Explicit analytical decode until the native recurrence is accepted."""
     tokens = sum(view.q_len for view in views)
+    physical = tokens if physical_tokens is None else physical_tokens
+    lengths = tuple(view.q_len for view in views)
     normalized = [b.vector(
-        "decode_" + name + "_l2norm", (value.producer,), tokens * keys * dk, 5,
-        shape=(1, tokens, keys, dk),
+        "decode_" + name + "_l2norm", (value.producer,), physical * keys * dk, 5,
+        shape=(1, physical, keys, dk),
         metadata=(("source_layout", value.layout.to_dict()),
                   ("implementation_scope", "analytical_decode_l2norm")))
         for name, value in zip(("q", "k"), values[:2])]
@@ -98,13 +101,16 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv):
         read=len(views) * state_bytes + tokens * heads * ((2 * dk + dv) * 2 + 6),
         write=tokens * (state_bytes + heads * dv * 2),
         metadata=(("tokens", tokens), ("heads", heads), ("key_heads", keys),
-                  ("dk", dk), ("dv", dv), ("sequence_tokens", tuple(v.q_len for v in views)),
+                  ("dk", dk), ("dv", dv), ("sequence_tokens", lengths),
+                  ("physical_query_rows", physical),
+                  ("physical_sequence_tokens", physical_sequence_tokens or lengths),
                   ("state_dtype", b.plan.recurrent_state_dtype),
                   ("state_element_bytes", dtype_bytes(b.plan.recurrent_state_dtype)),
                   ("state_checkpoints", tokens),
                   ("source_layouts", tuple(v.layout.to_dict() for v in values)),
                   ("implementation_scope", "analytical_decode_recurrent_vector")))
-    return tensors.result(output, (tokens, heads, dv))
+    b.ops[-1] = replace(b.ops[-1], padded_shape=(physical, heads, dk, dv))
+    return tensors.result(output, (physical, heads, dv))
 
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,

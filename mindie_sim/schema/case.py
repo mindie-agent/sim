@@ -108,7 +108,8 @@ class Software:
         if any(getattr(result, key) < 1 for key in (
             "max_num_batched_tokens", "max_num_seqs", "max_model_len", "kv_block_size", "pipeline_microbatches")):
             raise ModelingError("scheduler_capacities_must_be_positive")
-        if result.moe_recipe not in {"alltoall", "mc2", "tp_join_reduce"} or result.mc2_chunks < 1:
+        if result.moe_recipe not in {"alltoall", "mc2", "tp_join_reduce",
+                                     "local_expert_reduce"} or result.mc2_chunks < 1:
             raise ModelingError("moe_requires_registered_recipe_and_positive_mc2_chunks")
         if result.final_norm_scope not in {"all", "selected"}:
             raise ModelingError("final_norm_scope_requires_all_or_selected")
