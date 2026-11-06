@@ -13,7 +13,7 @@ from itertools import islice
 from mindie_sim.schema.common import ModelingError
 
 
-_GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "max_query_tokens",
+_GEOMETRY = {"valid_tokens", "padded_tokens", "sequences", "min_query_tokens", "max_query_tokens",
              "max_context_tokens"}
 _STATIC_SELECTORS = {"mla_prolog", "mx_matrix"}
 _CATEGORIES = {"phases": {"prefill", "decode"},
@@ -115,6 +115,7 @@ def resolve(runtime, views, *, padded_tokens, replay_scope, global_views=None,
         "valid_tokens": sum(view.q_len for view in views),
         "padded_tokens": padded_tokens,
         "sequences": len(views),
+        "min_query_tokens": min((view.q_len for view in views), default=0),
         "max_query_tokens": max((view.q_len for view in views), default=0),
         "max_context_tokens": max((view.context for view in views), default=0),
         "replay_scope": replay_scope,

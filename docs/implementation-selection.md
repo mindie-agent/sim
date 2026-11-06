@@ -1,5 +1,24 @@
 # Explicit implementation domains
 
+## vLLM Ascend simulation presets
+
+`compose_case(..., va_recommended=True)` and CLI `compose --va-recommended`
+apply a supported simulation subset from revision-pinned model documents.
+`va_recommended_config(model, hardware)` exposes the source, quantization basis,
+and limits. Explicit quantization takes precedence; a hardware family without
+a documented alternative keeps the catalog format. The caller still supplies
+TP/DP/EP/PP topology, checkpoint-specific formats, and MTP workload choices.
+Environment settings are recorded as metadata and are not executed.
+
+`apply_va_recommended(case)` returns a new case while preserving its existing
+quantization and explicit lowerings. KDA uses native recurrent execution for
+pure decode queries of one to eight tokens. GDN separates ordinary and
+speculative decode batches; mixed query domains retain explicit analytical
+work. Source validation errors propagate after selection. A selected preset
+does not establish accuracy against captures from a different deployment.
+
+## Per-call domains
+
 `runtime.kernels.lowerings` can select a different implementation for each
 target or draft call. A conditional declaration contains `cases`, each with
 `domain` and `binding`. A binding uses the existing implementation/options/recipes
@@ -40,6 +59,7 @@ domains use inclusive `min` and/or `max` bounds:
 | `valid_tokens` | Actual query rows on this replica; target includes verification rows and draft uses its own query block |
 | `padded_tokens` | Target rows after graph-bucket padding; draft retains its actual caller allocation |
 | `sequences` | Active requests on this replica |
+| `min_query_tokens` | Smallest target query length for one request (zero for an idle replica) |
 | `max_query_tokens` | Largest target query length for one request |
 | `max_context_tokens` | Largest incoming context length for one request |
 | `replay_scopes` | Allowed `none`, `full`, or `piecewise` capture scopes |

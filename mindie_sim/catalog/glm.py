@@ -65,18 +65,29 @@ def _glm_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         raise ModelingError(f"model_config_glm_qk_split_mismatch:{qk_nope}+{rope}!={qk_head}")
     mlp_types = [str(v) for v in (c.get("mlp_layer_types") or ())]
     index_types = [str(v) for v in (c.get("indexer_types") or ())]
+    first_dense = _int(c, "first_k_dense_replace")
     dense_i = _int(c, "intermediate_size")
     experts = _int(c, "n_routed_experts")
     top_k = _int(c, "num_experts_per_tok")
     moe_i = _int(c, "moe_intermediate_size")
     shared = _int(c, "n_shared_experts")
-    full_layers = [index for index, kind in enumerate(index_types) if kind == "full"]
+    full_layers = (
+        [index for index, kind in enumerate(index_types) if kind == "full"]
+        if index_types else list(range(layers))
+    )
     if len(index_types) > layers:
         index_types = index_types[:layers]
     plans: list[LayerPlan] = []
     for index in range(layers):
-        ffn = "dense" if (index < len(mlp_types) and mlp_types[index] == "dense") else "moe"
-        indexer_type = index_types[index] if index < len(index_types) else "shared"
+        if mlp_types:
+            ffn = "dense" if (index < len(mlp_types) and mlp_types[index] == "dense") else "moe"
+        else:
+            ffn = "dense" if index < first_dense else "moe"
+        indexer_type = (
+            index_types[index]
+            if index < len(index_types)
+            else ("full" if not index_types else "shared")
+        )
         indexer = indexer_type == "full"
         owner = max((v for v in full_layers if v <= index), default=-1)
         plans.append(LayerPlan(

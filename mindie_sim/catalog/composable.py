@@ -241,7 +241,9 @@ def build_composable(key, config, family="generic"):
     first = plans[0]
     mla_plan = next((p for p in plans if p.attention == "mla"), None)
     mla = (MlaSpec(mla_plan.q_lora_rank, mla_plan.kv_lora_rank,
-                   mla_plan.qk_nope_head_dim, mla_plan.qk_rope_head_dim, mla_plan.v_head_dim)
+                   mla_plan.qk_nope_head_dim, mla_plan.qk_rope_head_dim, mla_plan.v_head_dim,
+                   index_topk=mla_plan.index_topk, index_head_dim=mla_plan.index_dim,
+                   index_n_heads=mla_plan.index_heads)
            if mla_plan else None)
     metadata = {
         "model_coverage": "partial" if gaps else "complete",

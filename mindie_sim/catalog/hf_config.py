@@ -134,6 +134,7 @@ ALIASES = {
 # unconsumed keys are retained as gaps; an adapter can explicitly claim a key.
 PASSIVE_FIELDS = set("""
 architectures model_type name model_key family _name_or_path _commit_hash
+_attn_implementation _attn_implementation_autoset
 auto_map transformers_version torch_dtype dtype activation_dtype weight_dtype
 kv_dtype tie_word_embeddings bos_token_id eos_token_id pad_token_id
 initializer_range attention_dropout hidden_dropout classifier_dropout use_cache
@@ -154,7 +155,7 @@ num_beam_groups num_beams num_return_sequences output_scores prefix
 problem_type remove_invalid_values repetition_penalty
 return_dict_in_generate sep_token_id suppress_tokens task_specific_params
 temperature tf_legacy_loss tokenizer_class top_p
-typical_p use_bfloat16
+typical_p use_bfloat16 use_unified_vision_chunk video_placeholder media_placeholder_token_id
 """.split())
 
 _FALSY_DEFAULT_FIELDS = frozenset({
@@ -200,6 +201,7 @@ mlp_layer_types moe_router_dtype num_hash_layers o_groups o_lora_rank
 video_token_id mla_use_nope index_share_for_mtp_iteration
 index_skip_topk_offset index_topk_freq index_topk_pattern engram_vocab_size
 engram_compressed_vocab_size confidence_head_with_markov markov_head_type
+apply_layernorm_1p linear_expand_v
 """.split())
 
 

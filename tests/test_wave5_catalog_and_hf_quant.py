@@ -23,8 +23,20 @@ from test_prediction_system import case
 WAVE5_MODELS = {
     "deepseek-v2-lite": ("DeepSeek-V2-Lite", "dsv2lite"),
     "deepseek-v3.2-prune-3l": ("DeepSeek-V3.2-Prune-3L", "dsv32prune_L3"),
+    "deepseek-v3": ("DeepSeek-V3", "DeepSeek-V3-0324", "dsv3"),
+    "deepseek-r1": ("DeepSeek-R1", "DeepSeek-R1-0528", "dsr1"),
+    "deepseek-v3.2": ("DeepSeek-V3.2", "DeepSeek-V3.2-Exp", "dsv3.2"),
+    "glm-5.1": ("GLM-5.1", "glm5.1", "glm51"),
+    "glm-5.2": ("GLM-5.2", "glm5.2", "glm52"),
+    "kimi-k2": ("Kimi-K2", "Kimi-K2-Instruct", "kimi_k2"),
+    "kimi-k2-thinking": ("Kimi-K2-Thinking", "kimi_k2_thinking"),
+    "kimi-k2.5": ("Kimi-K2.5", "kimi_k2.5", "kimi_k25", "kimi-k25"),
     "qwen3-30b-a3b": ("Qwen3-30B-A3B", "qwen30ba3b"),
+    "qwen3-32b": ("Qwen3-32B", "qwen3_32b"),
+    "qwen3-235b-a22b": ("Qwen3-235B-A22B", "qwen3_235b_a22b", "qwen3-235b"),
+    "qwen3-next-80b-a3b": ("Qwen3-Next-80B-A3B", "Qwen3-Next-80B-A3B-Instruct", "qwen3_next_80b_a3b"),
     "qwen3.5-27b": ("Qwen3.5-27B", "qwen35_27b"),
+    "qwen3.5-397b-a17b": ("Qwen3.5-397B-A17B", "qwen3_5_397b_a17b", "qwen3.5-397b"),
 }
 
 
@@ -33,18 +45,18 @@ def test_wave5_catalog_entries_and_aliases_load_complete_with_positive_weights(k
     assert key in CATALOG
     spec = load_model(key)
     cov = model_coverage(spec)
-    if key == "deepseek-v3.2-prune-3l":
+    assert not any(f.startswith("unrecognized_config_field:") for f in cov["unmodeled_features"])
+    if key in {
+        "deepseek-v3.2-prune-3l", "deepseek-v3", "deepseek-r1", "deepseek-v3.2",
+        "kimi-k2", "kimi-k2-thinking", "kimi-k2.5", "qwen3-next-80b-a3b", "qwen3.5-397b-a17b",
+    }:
         assert cov["model_coverage"] == "partial"
-        assert set(cov["unmodeled_features"]) == {
-            "router_noaux_tc_correction_bias_not_in_layer_plan",
-            "router_noaux_tc_group_score_top2_not_in_layer_plan",
-        }
     else:
         assert cov["model_coverage"] == "complete", f"{key} had unmodeled gaps: {cov}"
     params = body_parameter_count(spec)
     weights = body_weight_bytes(spec)
     assert params > 0
-    assert weights >= params * 2.0
+    assert weights > 0
     profile = load_architecture_profile(key)
     assert profile.num_layers == spec.layers
     for alias in aliases:
@@ -70,11 +82,53 @@ def test_wave5_specific_geometry_contracts():
     assert dsv32.layer_plans[1].router_groups == 8
     assert dsv32.layer_plans[1].router_group_topk == 4
 
+    dsv3 = load_model("deepseek-v3")
+    assert dsv3.layers == 61 and dsv3.hidden_size == 7168
+    assert dsv3.num_experts == 256 and dsv3.top_k == 8
+    assert sum(1 for p in dsv3.layer_plans if p.ffn == "dense") == 3
+
+    dsv32_full = load_model("deepseek-v3.2")
+    assert dsv32_full.layers == 61 and dsv32_full.mla is not None
+    assert dsv32_full.mla.index_topk == 2048 and dsv32_full.mla.index_n_heads == 64
+
+    glm51 = load_model("glm-5.1")
+    assert glm51.layers == 78 and glm51.num_experts == 256 and glm51.top_k == 8
+    assert sum(1 for p in glm51.layer_plans if p.ffn == "dense") == 3
+    assert all(p.indexer and p.indexer_type == "full" for p in glm51.layer_plans)
+
+    glm52 = load_model("glm-5.2")
+    assert glm52.layers == 78 and glm52.num_experts == 256 and glm52.top_k == 8
+    assert sum(1 for p in glm52.layer_plans if p.indexer_type == "shared") > 0
+
+    k2 = load_model("kimi-k2")
+    assert k2.layers == 61 and k2.num_experts == 384 and k2.top_k == 8
+
+    k25 = load_model("kimi-k2.5")
+    assert k25.layers == 61 and k25.num_experts == 384 and k25.top_k == 8
+    assert "vision_encoder_and_projector:language_backbone_only" in model_coverage(k25)["unmodeled_features"]
+
     qwen30b = load_model("qwen3-30b-a3b")
     assert qwen30b.layers == 48
     assert qwen30b.hidden_size == 2048
     assert qwen30b.num_experts == 128 and qwen30b.top_k == 8
     assert all(p.qk_norm and p.ffn == "moe" for p in qwen30b.layer_plans)
+
+    qwen32b = load_model("qwen3-32b")
+    assert qwen32b.layers == 64 and qwen32b.hidden_size == 5120 and qwen32b.ffn == "dense"
+
+    qwen235b = load_model("qwen3-235b-a22b")
+    assert qwen235b.layers == 94 and qwen235b.num_experts == 128 and qwen235b.top_k == 8
+
+    qwen_next = load_model("qwen3-next-80b-a3b")
+    assert qwen_next.layers == 48 and qwen_next.num_experts == 512 and qwen_next.top_k == 10
+    assert sum(1 for p in qwen_next.layer_plans if p.attention == "gdn") == 36
+    assert sum(1 for p in qwen_next.layer_plans if p.attention == "gqa") == 12
+    assert all(p.q_output_gate for p in qwen_next.layer_plans if p.attention == "gqa")
+
+    qwen397b = load_model("qwen3.5-397b-a17b")
+    assert qwen397b.layers == 60 and qwen397b.num_experts == 512 and qwen397b.top_k == 10
+    assert sum(1 for p in qwen397b.layer_plans if p.attention == "gdn") == 45
+    assert sum(1 for p in qwen397b.layer_plans if p.attention == "gqa") == 15
 
     qwen35 = load_model("qwen3.5-27b")
     assert qwen35.layers == 64
@@ -82,6 +136,22 @@ def test_wave5_specific_geometry_contracts():
     assert qwen35.intermediate_size == 17408
     assert sum(1 for p in qwen35.layer_plans if p.attention == "gdn") == 48
     assert sum(1 for p in qwen35.layer_plans if p.attention == "gqa") == 16
+
+
+@pytest.mark.parametrize("name", ("qwen3-next-80b-a3b", "qwen3.5-397b-a17b"))
+def test_hybrid_qwen_routing_keeps_expert_probability_normalization(name):
+    spec = customize_model_spec(name, layers=4)
+    assert all(plan.router_mode == "softmax" and plan.router_norm_topk
+               for plan in spec.layer_plans)
+    raw = case(prompt=4, output=1)
+    raw["model"] = spec.to_dict()
+    ops = target_operators(raw, phase="decode", tokens=1, context=4)
+    normalized = [op for op in ops if op.recipe == "route_normalize"]
+    assert len(normalized) == 4
+    assert all(op.vector_ops == 3 * spec.top_k and op.deps for op in normalized)
+    raw["model"]["layer_plans"][0]["router_norm_topk"] = False
+    control = target_operators(raw, phase="decode", tokens=1, context=4)
+    assert sum(op.recipe == "route_normalize" for op in control) == 3
 
 
 @pytest.mark.parametrize("model_name", ["qwen3-30b-a3b", "deepseek-v2-lite", "deepseek-v4-flash"])

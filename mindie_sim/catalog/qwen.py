@@ -30,7 +30,10 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
     """The model class declares Gemma's weight shift independently of hardware."""
-    if c.get("model_type") not in {"qwen3_5_text", "qwen3_5_moe_text"}:
+    if (
+        c.get("model_type") not in {"qwen3_5_text", "qwen3_5_moe_text", "qwen3_next"}
+        and not bool(c.get("apply_layernorm_1p"))
+    ):
         return {}
     return {
         "norm_weight_offset": 1.0,
@@ -47,6 +50,15 @@ def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
             "boundary": "declared_model_semantics; not_capture_binary_identity",
         },
     }
+
+
+def _qwen_output_gate(c: Mapping[str, Any]) -> bool:
+    if c.get("attn_output_gate") is not None:
+        return bool(c["attn_output_gate"])
+    gate_type = str(c.get("output_gate_type") or "").strip().lower()
+    if gate_type:
+        return gate_type not in {"none", "false", "0"}
+    return str(c.get("model_type") or "").strip().lower() == "qwen3_next"
 
 
 def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
@@ -73,12 +85,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     value_dim = int(_require(c, "linear_value_head_dim"))
     conv_k = int(_require(c, "linear_conv_kernel_dim"))
     conv_width = 2 * key_heads * key_dim + value_heads * value_dim
-    gate_type = str(c.get("output_gate_type") or "").strip().lower()
-    gate = (
-        bool(c["attn_output_gate"])
-        if c.get("attn_output_gate") is not None
-        else gate_type not in {"", "none", "false", "0"}
-    )
+    gate = _qwen_output_gate(c)
     ssm_raw = str(c.get("mamba_ssm_dtype") or "fp32").lower()
     ssm_dtype = {
         "float32": "fp32", "fp32": "fp32",
@@ -86,6 +93,10 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
         "float16": "fp16", "fp16": "fp16",
     }.get(ssm_raw, ssm_raw)
     moe = experts > 0
+    # Qwen3-Next and Qwen3.5 MoE share SharedFusedMoE's softmax router
+    # and normalize the selected expert weights, including omitted HF defaults.
+    router_mode = str(c.get("scoring_func", "softmax"))
+    router_norm_topk = bool(c.get("norm_topk_prob", True))
     plans: list[LayerPlan] = []
     for index, kind in enumerate(layer_types):
         if kind == "linear_attention":
@@ -99,7 +110,8 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 num_shared_experts=1 if moe else 0,
                 shared_intermediate_size=shared_i if moe else 0,
                 shared_expert_gate=bool(moe),
-                router_input_size=h, router_mode="sigmoid",
+                router_input_size=h, router_mode=router_mode,
+                router_norm_topk=router_norm_topk,
                 linear_heads=value_heads, linear_head_dim=value_dim,
                 linear_key_heads=key_heads, linear_key_head_dim=key_dim,
                 linear_value_heads=value_heads,
@@ -125,7 +137,8 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 num_shared_experts=1 if moe else 0,
                 shared_intermediate_size=shared_i if moe else 0,
                 shared_expert_gate=bool(moe),
-                router_input_size=h, router_mode="sigmoid",
+                router_input_size=h, router_mode=router_mode,
+                router_norm_topk=router_norm_topk,
                 q_output_gate=gate,
                 kv_cache_elements=2 * kv_heads * head_dim,
                 kv_owner_layer_id=index,
@@ -144,12 +157,7 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     heads = int(c["num_attention_heads"])
     kv_heads = int(c["num_key_value_heads"])
     head_dim = int(c["head_dim"])
-    gate_type = str(c.get("output_gate_type") or "").strip().lower()
-    gate = (
-        bool(c["attn_output_gate"])
-        if c.get("attn_output_gate") is not None
-        else gate_type not in {"", "none", "false", "0"}
-    )
+    gate = _qwen_output_gate(c)
     experts = _int(c, "num_experts")
     moe_i = _int(c, "moe_intermediate_size") if experts else _int(c, "intermediate_size")
     mtp = DraftSpec(

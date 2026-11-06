@@ -555,7 +555,9 @@ class Execution:
                 routed = self.topology.accounting(op, replica, volume=amount)
                 demands.update(routed.wire_by_resource)
                 frames.update(routed.transaction_frames)
-                setup = routed.path_latency_ms if op.family in {"alltoall", "alltoallv"} else routed.setup_ms
+                # Envelope transport honors the declared round count. Explicit
+                # collective programs own their hop arrivals and ignore setup.
+                setup = routed.setup_ms
                 continue
             if resource == "cube":
                 portions = op.matrix_flops or ((op.dtype or self.case.model.compute_dtype, amount),)

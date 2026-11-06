@@ -159,6 +159,8 @@ def parser():
     compose.add_argument("--mtp-accept", type=float)
     compose.add_argument("--ttft-slo-ms", type=float)
     compose.add_argument("--tpot-slo-ms", type=float)
+    compose.add_argument("--va-recommended", action="store_true",
+                         help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
     compose.add_argument("--output", "-o")
     advise = sub.add_parser("advise", help="attribute a Case and rank guarded counterfactual interventions")
     advise.add_argument("case", nargs="?")
@@ -419,6 +421,7 @@ def run(args):
             mtp_acceptance_length=1.0 if args.mtp_accept is None else args.mtp_accept,
             ttft_slo_ms=5000.0 if args.ttft_slo_ms is None else args.ttft_slo_ms,
             tpot_slo_ms=50.0 if args.tpot_slo_ms is None else args.tpot_slo_ms,
+            va_recommended=bool(getattr(args, "va_recommended", False)),
         )
     if args.command == "advise":
         from .advise import advise_case

@@ -60,10 +60,10 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
         return "glm"
     if "kimi" in model_type or "Kimi" in archs:
         return ("kimi" if merged.get("linear_attn_config") else
-                "standard_kimi" if model_type in {"kimi_k2", "kimi_vl", "deepseek_v3"}
+                "standard_kimi" if model_type in {"kimi_k2", "kimi_k25", "kimi_vl", "deepseek_v3"}
                 else "generic")
     if "deepseek" in model_type or "Deepseek" in archs:
-        return ("standard_deepseek" if model_type in {"deepseek_v2", "deepseek_v3"}
+        return ("standard_deepseek" if model_type in {"deepseek_v2", "deepseek_v3", "deepseek_v32"}
                 and merged.get("kv_lora_rank") else "generic")
     if "glm" in model_type or "Glm" in archs or "ChatGLM" in archs:
         return ("standard_glm" if model_type in {"glm4", "glm4_moe", "chatglm"}
