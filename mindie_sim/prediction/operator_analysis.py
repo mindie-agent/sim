@@ -225,6 +225,19 @@ def requires_collective_cohort(case, op, recipe):
         and dict(op.metadata).get("group_axis") == "ep")
 
 
+def _service_regime_row(context, duration):
+    """Selected response evidence, with response and executed duration distinct."""
+    selected = context.service_regime or context.joint_native_service
+    if not selected:
+        return {}
+    fields = ("rule_id", "continuity_group", "execution_mode", "response_basis",
+              "coordinate_values", "response_duration_ms", "exterior_policy",
+              "reference_program", "reference_primitive_ms")
+    row = {key: selected[key] for key in fields if key in selected}
+    row["executed_duration_ms"] = duration
+    return {"service_regime": row}
+
+
 def _cost_row(execution, op, recipe, context, *, identity, count, duration,
               input_ready_ms, serviced, early_service):
     engine = execution.engine
@@ -238,6 +251,7 @@ def _cost_row(execution, op, recipe, context, *, identity, count, duration,
             "analytical_reference_work": dict(context.native_work),
             "work_basis": "native_joint_service; operator_work_is_unexecuted_analytical_reference"}
            if context.joint_native_service is not None else {}),
+        **_service_regime_row(context, duration),
         "service_delta": {key: serviced.get(key, 0) - context.work.get(key, 0)
                           for key in serviced.keys() | context.work.keys()
                           if serviced.get(key, 0) != context.work.get(key, 0)},

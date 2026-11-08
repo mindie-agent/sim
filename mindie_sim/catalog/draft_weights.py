@@ -31,11 +31,14 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
         # has head_dim == kv_lora_rank == v_head_dim (V4/V4.1 DSA).
         latent_mla = draft.mla_variant == "latent_mla"
         if latent_mla:
+            wkv_rows = draft.kv_lora_rank + (
+                draft.qk_rope_head_dim if draft.qk_rope_head_dim > 0 else 0)
+            o_cols = draft.num_heads * (draft.v_head_dim or draft.head_dim)
             terms.extend([
                 _t("draft_q_a", draft.q_lora_rank, h, "mla"),
                 _t("draft_q_b", draft.num_heads * qk, draft.q_lora_rank,
                    "mla", "out_tp"),
-                _t("draft_wkv", draft.kv_lora_rank, h, "mla"),
+                _t("draft_wkv", wkv_rows, h, "mla"),
                 _t("draft_kv_b", draft.num_heads * (draft.qk_nope_head_dim + draft.v_head_dim),
                    draft.kv_lora_rank, "mla", "out_tp"),
             ])
@@ -48,7 +51,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
                        "mla", "group_in", groups=draft.o_groups),
                 ])
             else:
-                terms.append(_t("draft_o", h, draft.num_heads * draft.head_dim, "mla", "in_tp"))
+                terms.append(_t("draft_o", h, o_cols, "mla", "in_tp"))
         else:
             terms.extend([
                 _t("draft_q_a", draft.q_lora_rank, h, "mla"),

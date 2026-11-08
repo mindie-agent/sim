@@ -28,6 +28,28 @@ from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import compute_dtype_for
 
 
+def _semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
+                              shard, prefix, padded_tokens):
+    valid = sum(view.q_len for view in views)
+    rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
+               plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
+               for v in views)
+    scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
+                    flops=2 * rows * plan.index_heads * plan.index_dim / shard,
+                    vector=rows * plan.index_heads * 2 / shard,
+                    read=rows * index_row_bytes(model, plan.index_dim) / shard,
+                    write=rows * 4 / shard, family="indexer", dtype=quant.index_dtype)
+    topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
+                 vector=rows * math.log2(max(2, plan.index_topk)) / shard,
+                 read=rows * 4 / shard, write=valid * plan.index_topk * 4,
+                 family="topk", dtype="fp32",
+                 metadata=(("selection_output_dtype", "int32"),))
+    declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
+                    quant=quant, views=views, padded_tokens=padded_tokens,
+                    scores=scores, topk=topk)
+    return topk
+
+
 def _attention_tensor_view(plan, view, heads, model, quant, parallel):
     """Declare active latent tensors separately from paged cache allocation."""
     if parallel.cp != 1 or parallel.pcp != 1:
@@ -301,22 +323,16 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                              views=views, plan=plan, quant=quant, padded_tokens=q,
                              **(pool_binding.options if pool_binding else {}))
         else:
-            rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
-                       plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
-                       for v in views)
-            scores = b.work("index_scores", selection_deps, (valid, plan.index_heads, plan.index_dim),
-                            flops=2 * rows * plan.index_heads * plan.index_dim / shard,
-                            vector=rows * plan.index_heads * 2 / shard,
-                            read=rows * index_row_bytes(model, plan.index_dim) / shard,
-                            write=rows * 4 / shard, family="indexer", dtype=quant.index_dtype)
-            topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
-                         vector=rows * math.log2(max(2, plan.index_topk)) / shard,
-                         read=rows * 4 / shard, write=valid * plan.index_topk * 4,
-                         family="topk", dtype="fp32",
-                         metadata=(("selection_output_dtype", "int32"),))
-            declare_indexer(
-                b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model, quant=quant,
-                views=views, padded_tokens=q, scores=scores, topk=topk)
+            quant_indexer = (select(runtime.kernels.get("lowerings", {}), "quant_lightning_indexer")
+                             if runtime else None)
+            if quant_indexer:
+                topk = quant_indexer.module.declare(
+                    b, deps=selection_deps, views=views, plan=plan,
+                    quant=quant, parallel=parallel, **quant_indexer.options)
+            else:
+                topk = _semantic_index_selection(
+                    b, deps=selection_deps, views=views, plan=plan, model=model,
+                    quant=quant, parallel=parallel, shard=shard, prefix=prefix, padded_tokens=q)
         if shard > 1:
             gathered = b.communicate("candidate_gather", (topk,), valid * plan.index_topk * 8 * (cp - 1),
                                      "allgather", "cp")

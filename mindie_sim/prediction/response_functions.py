@@ -2,8 +2,12 @@
 
 [Role] Evaluate physical supply responses and declared interpolation surfaces.
 [Invariants] Knots are supplied parameters, never learned from query timings.
-  Numerical work/shape axes may vary; execution identity stays fixed. A grid
-  requires every corner. Extrapolation never clamps an invalid duration.
+  Every coordinate, scaled coordinate, coefficient, knot, grid value and rate
+  is finite and nonnegative; booleans are never numbers and rates are strictly
+  positive before division. A grid requires every corner. Extrapolation never
+  clamps an invalid duration. Response dependencies, knot support and cell
+  breakpoints are exposed for static coverage compilation; continuity never
+  implies global monotonicity.
 [Timeouts & Locks] Bounded parameter tables and binary search; no waits or locks.
 [Side-Effect Policy] No I/O, fitting, global mutation or device execution.
 """
@@ -17,9 +21,34 @@ from mindie_sim.schema.common import ModelingError
 
 
 def nonnegative(value):
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+    """Return a finite nonnegative float; booleans and non-numbers are invalid."""
+    if (isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(value) or value < 0):
         raise ModelingError("service_regime_requires_finite_nonnegative_parameters")
     return float(value)
+
+
+def positive(value):
+    """Return a finite strictly positive rate; zero and negatives are invalid."""
+    result = nonnegative(value)
+    if result == 0:
+        raise ModelingError("service_regime_requires_positive_rate")
+    return result
+
+
+def scaled_coordinate(value, scale=1):
+    """Apply an explicit recipe scale without silently overflowing to infinity."""
+    result = nonnegative(value) * nonnegative(scale)
+    if not math.isfinite(result):
+        raise ModelingError("service_regime_coordinate_scaling_overflow")
+    return result
+
+
+def _duration(value):
+    result = nonnegative(value)
+    if not math.isfinite(result):
+        raise ModelingError("service_regime_response_not_finite")
+    return result
 
 
 @dataclass(frozen=True)
@@ -49,53 +78,102 @@ class ResponseFunction:
             return {name for name, _ in self.grid}
         return {term["coordinate"] for term in self.terms}
 
+    @property
+    def dependencies(self):
+        """Physical coordinates the response actually consumes."""
+        return frozenset(self.varying_coordinates)
+
+    @property
+    def breakpoints(self):
+        """Declared cell breakpoints per varying coordinate (empty if analytic)."""
+        if self.kind == "piecewise_linear":
+            return {self.coordinate: self.coordinates}
+        if self.kind == "multilinear":
+            return {name: points for name, points in self.grid}
+        return {}
+
+    @property
+    def knot_support(self):
+        """Calibrated knot interval per coordinate; analytic kinds are unbounded."""
+        return {name: (points[0], points[-1])
+                for name, points in self.breakpoints.items() if points}
+
     @classmethod
     def from_mapping(cls, raw, coordinate_names):
         """Validate declared parameters without consuming any observation rows."""
+        if not isinstance(raw, Mapping):
+            raise ModelingError("service_regime_response_requires_mapping")
+        if not isinstance(coordinate_names, Mapping):
+            raise ModelingError("service_regime_coordinates_require_mapping")
         kind = raw.get("kind", "affine")
+        if not isinstance(kind, str):
+            raise ModelingError("service_regime_response_kind_unknown")
         if kind == "roofline":
             if set(raw) - {"kind", "fixed_us", "services"}:
                 raise ModelingError("service_regime_response_unknown_fields")
-            services = []
-            for term in raw["services"]:
+            services = raw.get("services")
+            if not isinstance(services, (list, tuple)) or not services:
+                raise ModelingError("service_regime_roofline_requires_service")
+            resolved = []
+            for term in services:
+                if not isinstance(term, Mapping):
+                    raise ModelingError("service_regime_roofline_requires_coordinate_and_resource")
                 if (set(term) - {"coordinate", "resource", "dtype", "utilization"}
-                        or term["coordinate"] not in coordinate_names or not term.get("resource")):
+                        or term.get("coordinate") not in coordinate_names
+                        or not term.get("resource")):
                     raise ModelingError("service_regime_roofline_requires_coordinate_and_resource")
                 utilization = nonnegative(term.get("utilization", 1))
-                if not 0 < utilization <= 1 or (term["resource"] == "cube" and not term.get("dtype")):
+                if not 0 < utilization <= 1:
                     raise ModelingError("service_regime_roofline_requires_positive_utilization_and_precision")
-                services.append({**term, "utilization": utilization})
-            if not services:
-                raise ModelingError("service_regime_roofline_requires_service")
-            return cls(kind, nonnegative(raw.get("fixed_us", 0)), tuple(services))
+                if term["resource"] == "cube" and not term.get("dtype"):
+                    raise ModelingError("service_regime_roofline_requires_positive_utilization_and_precision")
+                resolved.append({**term, "utilization": utilization})
+            return cls(kind, nonnegative(raw.get("fixed_us", 0)), tuple(resolved))
         if kind == "affine":
             if set(raw) - {"kind", "fixed_us", "terms"}:
                 raise ModelingError("service_regime_response_unknown_fields")
             fixed = nonnegative(raw.get("fixed_us", 0))
+            declared = raw.get("terms", ())
+            if not isinstance(declared, (list, tuple)):
+                raise ModelingError("service_regime_affine_terms_require_sequence")
             terms = []
-            for term in raw.get("terms", ()):
-                if set(term) - {"coordinate", "us_per_unit", "scale_with"}:
+            for term in declared:
+                if not isinstance(term, Mapping) or set(term) - {"coordinate", "us_per_unit", "scale_with"}:
                     raise ModelingError("service_regime_term_unknown_fields")
-                if term["coordinate"] not in coordinate_names:
+                if term.get("coordinate") not in coordinate_names:
                     raise ModelingError("service_regime_term_requires_declared_coordinate")
-                nonnegative(term["us_per_unit"])
+                nonnegative(term.get("us_per_unit"))
                 scaling = term.get("scale_with")
                 if scaling:
-                    if set(scaling) - {"resource", "reference_rate", "dtype"} or not scaling.get("resource"):
+                    if (not isinstance(scaling, Mapping)
+                            or set(scaling) - {"resource", "reference_rate", "dtype"}
+                            or not scaling.get("resource")
+                            or "reference_rate" not in scaling):
                         raise ModelingError("service_regime_invalid_rate_scaling")
-                    if nonnegative(scaling["reference_rate"]) == 0:
+                    if positive(scaling["reference_rate"]) == 0:
                         raise ModelingError("service_regime_reference_rate_must_be_positive")
                 terms.append({**term, **({"scale_with": dict(scaling)} if scaling else {})})
             return cls(kind, fixed, tuple(terms))
         if kind == "multilinear":
             if set(raw) - {"kind", "grid", "values_us", "outside"}:
                 raise ModelingError("service_regime_response_unknown_fields")
-            grid = tuple((axis["coordinate"], _ordered_knots(axis["knots"])) for axis in raw["grid"])
-            if (not grid or len({name for name, _ in grid}) != len(grid)
-                    or any(name not in coordinate_names for name, _ in grid)
-                    or any(set(axis) != {"coordinate", "knots"} for axis in raw["grid"])):
+            declared = raw.get("grid")
+            if not isinstance(declared, (list, tuple)) or not declared:
                 raise ModelingError("service_regime_grid_requires_declared_coordinates")
-            values = tuple(nonnegative(value) for value in raw["values_us"])
+            grid = []
+            for axis in declared:
+                if (not isinstance(axis, Mapping)
+                        or set(axis) != {"coordinate", "knots"}
+                        or axis.get("coordinate") not in coordinate_names):
+                    raise ModelingError("service_regime_grid_requires_declared_coordinates")
+                grid.append((axis["coordinate"], _ordered_knots(axis["knots"])))
+            grid = tuple(grid)
+            if len({name for name, _ in grid}) != len(grid):
+                raise ModelingError("service_regime_grid_requires_declared_coordinates")
+            raw_values = raw.get("values_us")
+            if not isinstance(raw_values, (list, tuple)):
+                raise ModelingError("service_regime_grid_requires_every_corner")
+            values = tuple(nonnegative(value) for value in raw_values)
             shape = tuple(len(points) for _, points in grid)
             if len(values) != math.prod(shape):
                 raise ModelingError("service_regime_grid_requires_every_corner")
@@ -105,44 +183,51 @@ class ResponseFunction:
             raise ModelingError("service_regime_response_kind_unknown:" + kind)
         if set(raw) - {"kind", "coordinate", "knots", "outside"}:
             raise ModelingError("service_regime_response_unknown_fields")
-        coordinate = raw["coordinate"]
+        coordinate = raw.get("coordinate")
         if coordinate not in coordinate_names:
             raise ModelingError("service_regime_curve_requires_declared_coordinate")
-        knots = tuple(tuple(nonnegative(value) for value in pair) for pair in raw["knots"])
-        if len(knots) < 2 or any(len(pair) != 2 for pair in knots):
-            raise ModelingError("service_regime_curve_requires_coordinate_duration_pairs")
+        knots = _pairs(raw.get("knots"))
         xs = _ordered_knots(pair[0] for pair in knots)
         return cls(kind, coordinate=coordinate, knots=knots, outside=_outside(raw), coordinates=xs)
 
     def evaluate(self, values, *, rate_for=None, resource_for=None):
         """Return the numerical response, not an Engine completion prediction."""
+        if not isinstance(values, Mapping):
+            raise ModelingError("service_regime_response_requires_coordinate_values")
         if self.kind == "roofline":
             if rate_for is None:
                 raise ModelingError("service_regime_scaled_response_requires_physical_rates")
             service = {}
             for term in self.terms:
                 resource = resource_for(term) if resource_for is not None else term["resource"]
-                duration = (nonnegative(values[term["coordinate"]]) * 1e6
-                            / (rate_for(term) * term["utilization"]))
+                rate = positive(rate_for(term))
+                duration = _value(values, term["coordinate"]) * 1e6 / (rate * term["utilization"])
+                if not math.isfinite(duration):
+                    raise ModelingError("service_regime_roofline_service_overflow")
                 service[resource] = service.get(resource, 0) + duration
             # Distinct instruction modes and compute precisions can consume
             # the same physical pipe; their service adds before pipe overlap.
             duration = self.fixed_us + max(service.values())
-            return ResponseValue(nonnegative(duration), "physical_supply")
+            return ResponseValue(_duration(duration), "physical_supply")
         if self.kind == "affine":
             duration = self.fixed_us
             for term in self.terms:
-                time = values[term["coordinate"]] * term["us_per_unit"]
+                time = _value(values, term["coordinate"]) * term["us_per_unit"]
                 if term.get("scale_with"):
                     if rate_for is None:
                         raise ModelingError("service_regime_scaled_response_requires_physical_rates")
-                    time *= term["scale_with"]["reference_rate"] / rate_for(term["scale_with"])
+                    rate = positive(rate_for(term["scale_with"]))
+                    time *= term["scale_with"]["reference_rate"] / rate
+                if not math.isfinite(time) or time < 0:
+                    raise ModelingError("service_regime_affine_response_invalid_term")
                 duration += time
-            return ResponseValue(nonnegative(duration), "affine")
+                if not math.isfinite(duration):
+                    raise ModelingError("service_regime_affine_response_overflow")
+            return ResponseValue(_duration(duration), "affine")
         if self.kind == "multilinear":
             brackets, outside, anchor = [], False, True
             for name, points in self.grid:
-                x = nonnegative(values[name])
+                x = nonnegative(_value(values, name))
                 right = bisect_left(points, x)
                 if right < len(points) and points[right] == x:
                     brackets.append(((right, 1.0),))
@@ -151,6 +236,8 @@ class ResponseFunction:
                 outside |= right == 0 or right == len(points)
                 right = min(max(right, 1), len(points) - 1)
                 weight = (x - points[right - 1]) / (points[right] - points[right - 1])
+                if not math.isfinite(weight):
+                    raise ModelingError("service_regime_grid_cell_weight_invalid")
                 brackets.append(((right - 1, 1 - weight), (right, weight)))
             if outside and self.outside == "analytic":
                 return ResponseValue(None, "analytic_outside_knots")
@@ -162,7 +249,7 @@ class ResponseFunction:
             if duration < 0 or not math.isfinite(duration):
                 raise ModelingError("service_regime_curve_extrapolation_invalid_duration")
             return ResponseValue(duration, "extrapolated" if outside else "anchor" if anchor else "interpolated")
-        x = nonnegative(values[self.coordinate])
+        x = nonnegative(_value(values, self.coordinate))
         right = bisect_left(self.coordinates, x)
         if right < len(self.knots) and self.coordinates[right] == x:
             return ResponseValue(self.knots[right][1], "anchor")
@@ -180,8 +267,30 @@ class ResponseFunction:
         return ResponseValue(duration, "extrapolated" if outside else "interpolated")
 
 
+def _value(values, name):
+    if name not in values:
+        raise ModelingError("service_regime_response_missing_coordinate:" + name)
+    return nonnegative(values[name])
+
+
+def _pairs(values):
+    if not isinstance(values, (list, tuple)) or len(values) < 2:
+        raise ModelingError("service_regime_curve_requires_coordinate_duration_pairs")
+    pairs = []
+    for pair in values:
+        if not isinstance(pair, (list, tuple)) or len(pair) != 2:
+            raise ModelingError("service_regime_curve_requires_coordinate_duration_pairs")
+        pairs.append((nonnegative(pair[0]), nonnegative(pair[1])))
+    return tuple(pairs)
+
+
 def _ordered_knots(values):
-    points = tuple(nonnegative(value) for value in values)
+    if values is None or isinstance(values, (str, bytes)):
+        raise ModelingError("service_regime_curve_requires_strictly_ordered_coordinates")
+    try:
+        points = tuple(nonnegative(value) for value in values)
+    except TypeError as exc:
+        raise ModelingError("service_regime_curve_requires_strictly_ordered_coordinates") from exc
     if len(points) < 2 or any(right <= left for left, right in zip(points, points[1:])):
         raise ModelingError("service_regime_curve_requires_strictly_ordered_coordinates")
     return points

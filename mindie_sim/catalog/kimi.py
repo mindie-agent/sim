@@ -146,6 +146,33 @@ def _kimi_plans(config: Mapping[str, Any]) -> list[LayerPlan]:
 
 def _aux_kimi(c: Mapping[str, Any], config: Mapping[str, Any]) -> AuxiliarySpec:
     h = int(c["hidden_size"])
+    mla_block = c.get("dspark_attention_kind") == "mla" or c.get("dspark_block_size") == 5
+    if mla_block:
+        markov = _int(c, "dspark_markov_rank", 256)
+        target_ids = tuple(int(v) for v in (
+            c.get("dspark_target_layer_ids") or (2, 23, 47, 71, 89)))
+        block = _int(c, "dspark_block_size", 5)
+        dspark = DraftSpec(
+            kind="dspark", layers=5, hidden_size=h, intermediate_size=14336,
+            num_heads=64, num_kv_heads=1, head_dim=192,
+            q_lora_rank=1536, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64, v_head_dim=128,
+            kv_cache_elements=576, q_width=64 * 192, kv_width=576,
+            attention_kind="mla", mla_variant="latent_mla",
+            target_layer_ids=target_ids, block_size=block, markov_rank=markov,
+            confidence_enabled=True, confidence_executes=False,
+            confidence_input_width=h + markov,
+            target_shared_embedding=True, target_shared_lm_head=True,
+            base_logits=True, markov_replicated=True,
+            noncausal_query_block=True, pp_capability=(1,),
+            vocab_size=int(c.get("vocab_size", 163840)), num_experts=0, top_k=0,
+            source=merge_source({"kind": "external_kimi_k3_dspark"}),
+            notes=("external five-layer MLA dense draft; selected via explicit draft mode",),
+        )
+        return AuxiliarySpec(
+            dspark=dspark, external_draft_key="kimi-k3-dspark",
+            notes=("native K3 num_nextn_predict_layers=0 does not remove selected external DSpark",),
+        )
     target_ids = (7, 23, 51, 67, 83)
     block = 7
     markov = 256

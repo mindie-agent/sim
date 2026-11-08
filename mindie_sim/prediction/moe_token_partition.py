@@ -36,6 +36,15 @@ ALLTOALL_SOURCE = {
     "prepare_lines": (158, 180), "finalize_lines": (210, 225),
     "scope": "TP-divisible input; independent_source_semantics; not_capture_binary_identity",
 }
+PAD_V3_SOURCE = {
+    "repository": ALLTOALL_SOURCE["repository"],
+    "revision": ALLTOALL_SOURCE["revision"],
+    "path": ALLTOALL_SOURCE["path"],
+    "sha256": ALLTOALL_SOURCE["sha256"],
+    "symbol": "PrepareAndFinalizeWithMC2.prepare",
+    "prepare_lines": (279, 294),
+    "scope": "functional constant-zero padding; not_capture_binary_identity",
+}
 
 
 @dataclass(frozen=True)
@@ -46,6 +55,7 @@ class TokenPartition:
     gather_output_materialization: str = "view"
     padding: str = "none"
     kind: str = KIND
+    padding_implementation: str = "concat"
 
     @property
     def caller(self):
@@ -71,6 +81,8 @@ class TokenPartition:
             "routing_realization_token_scope": "replica_before_caller_tp_slice",
             "source_partitions": 1, "padding": self.padding,
             "allocated_rows": self.allocated_rows, "valid_rows": self.full_rows,
+            **({"padding_implementation": self.padding_implementation}
+               if self.padding_implementation != "concat" else {}),
             "valid_rows_per_rank": self.valid_per_rank,
             "gather_output_materialization": self.gather_output_materialization,
             "source": self.source,
@@ -81,23 +93,31 @@ class TokenPartition:
         prepared = []
         def view(suffix, dependency, columns, element_dtype):
             if self.allocated_rows != self.full_rows:
-                # The source concatenates a persistent zero tensor. Its read
-                # and the full output write are real; zero creation is outside
-                # this repeated caller boundary.
+                # Source revisions use either a persistent zero tensor or
+                # functional padding. Only concatenation reads the zero rows;
+                # functional padding zero-initializes the full allocation and
+                # copies the valid slice inside one caller operator boundary.
                 pad_id = prefix + suffix.replace("_view", "_pad")
                 payload = self.allocated_rows * columns * dtype_bytes(element_dtype)
+                functional = self.padding_implementation == "pad_v3"
+                source_bytes = self.full_rows * columns * dtype_bytes(element_dtype)
                 prepared.append(vector_op(
                     op_id=pad_id, deps=(dependency,), stage=stage, layer=layer,
                     requests=requests, phase=phase, family="tensor_materialization",
-                    recipe="tensor_concat", dtype=element_dtype,
-                    elements=self.allocated_rows * columns, ops_per_element=0,
-                    shape=(self.allocated_rows, columns), read_bytes_override=payload,
+                    recipe="tensor_pad" if functional else "tensor_concat", dtype=element_dtype,
+                    elements=self.allocated_rows * columns,
+                    ops_per_element=0,
+                    shape=(self.allocated_rows, columns),
+                    read_bytes_override=source_bytes if functional else payload,
                     write_bytes_override=payload,
-                    metadata=self.metadata() + (("native_kind", "ConcatD"),
-                        ("input_shapes", ((self.full_rows, columns),
-                                         (self.allocated_rows-self.full_rows, columns))),
+                    metadata=self.metadata() + (("native_kind", "PadV3" if functional else "ConcatD"),
+                        ("input_shapes", (((self.full_rows, columns), (4,), ()) if functional
+                            else ((self.full_rows, columns),
+                                  (self.allocated_rows-self.full_rows, columns)))),
                         ("output_shape", (self.allocated_rows, columns)),
-                        ("padding_value", 0), ("invocation_class", "vector"))))
+                        ("padding_value", 0),
+                        ("padding_source", PAD_V3_SOURCE if functional else SOURCE),
+                        ("invocation_class", "vector"))))
                 dependency = pad_id
             return replace(barrier_op(
                 op_id=prefix + suffix, deps=(dependency,), stage=stage, layer=layer,
@@ -193,7 +213,8 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     if raw is None:
         return None
     if (not isinstance(raw, dict) or raw.get("kind") not in {KIND, ALLTOALL_KIND}
-            or set(raw) - {"kind", "gather_output_materialization", "padding", "layer_scopes"}):
+            or set(raw) - {"kind", "gather_output_materialization", "padding", "layer_scopes",
+                           "padding_implementation"}):
         raise ModelingError("moe_token_partition_requires_explicit_vllm_ascend_tp_slice")
     scopes = raw.get("layer_scopes")
     if scopes is not None:
@@ -214,6 +235,11 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
             or (raw["kind"] == KIND and kernels.get("moe_transport"))):
         raise ModelingError("mc2_tp_slice_requires_direct_hidden_rows_without_separate_transport")
     padding = raw.get("padding", "none")
+    padding_implementation = raw.get("padding_implementation", "concat")
+    if padding_implementation not in {"concat", "pad_v3"}:
+        raise ModelingError("mc2_padding_implementation_requires_concat_or_pad_v3")
+    if padding_implementation == "pad_v3" and (raw["kind"] != KIND or padding != "right_to_tp"):
+        raise ModelingError("pad_v3_requires_mc2_right_to_tp_padding")
     if raw["kind"] == ALLTOALL_KIND and padding != "none":
         raise ModelingError("alltoall_tp_slice_requires_divisible_rows_without_padding")
     if padding not in {"none", "right_to_tp"}:
@@ -221,4 +247,5 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     if tokens <= 0 or (tokens % parallel.tp and padding == "none"):
         raise ModelingError("mc2_tp_slice_requires_positive_tp_divisible_physical_rows")
     local = (tokens + parallel.tp - 1) // parallel.tp
-    return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"])
+    return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"],
+                          padding_implementation)

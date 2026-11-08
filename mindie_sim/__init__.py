@@ -71,7 +71,7 @@ from .sweep import (
     sweep_topology_grid,
 )
 
-__version__ = "0.9.4"
+__version__ = "0.9.5"
 __all__ = ["predict", "predict_pd", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
            "compose_case", "resolve_hardware_sku", "customize_model_spec",

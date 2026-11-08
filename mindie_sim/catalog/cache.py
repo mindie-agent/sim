@@ -344,7 +344,8 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
 
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
-    *, capacity_padded: bool = True,
+    *, capacity_padded: bool = True, draft_kind: str | None = None,
+    interleave: int = 128,
 ) -> list[dict[str, float]]:
     pp = max(1, parallel.pp)
     stages = [dict() for _ in range(pp)]
@@ -353,16 +354,29 @@ def stage_cache_components(
         stage = min(pp - 1, plan.index // per) if pp > 1 else 0
         for key, value in layer_cache_components(
             model, plan, parallel, sequence_tokens,
-            capacity_padded=capacity_padded,
+            capacity_padded=capacity_padded, interleave=interleave,
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
+    if draft_kind and getattr(model, "auxiliary", None) is not None:
+        from mindie_sim.catalog.draft import optional_draft_spec
+        draft = optional_draft_spec(model, draft_kind)
+        row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
+               if draft.attention_kind == "mla"
+               else 2 * local_kv_heads(draft.num_kv_heads, parallel.tp) * draft.head_dim)
+        seq = block_round(max(0, int(sequence_tokens)), interleave) if capacity_padded else max(0, int(sequence_tokens))
+        stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
+            seq * row * kv_element_bytes(model) * draft.layers
+        )
     return stages
 
 
 def request_cache_breakdown(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
+    *, draft_kind: str | None = None, interleave: int = 128,
 ) -> dict[str, Any]:
-    stages = stage_cache_components(model, parallel, sequence_tokens)
+    stages = stage_cache_components(
+        model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=interleave,
+    )
     totals: dict[str, float] = {}
     for stage in stages:
         for key, value in stage.items():
@@ -392,10 +406,13 @@ def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec) -> floa
 
 def cache_bytes_per_token_estimate(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
+    *, draft_kind: str | None = None, interleave: int = 128,
 ) -> tuple[float, float]:
     """(max-stage cache bytes per token, total cache bytes at sequence)."""
     seq = max(1, int(sequence_tokens))
-    stages = stage_cache_components(model, parallel, seq)
+    stages = stage_cache_components(
+        model, parallel, seq, draft_kind=draft_kind, interleave=interleave,
+    )
     stage_bytes = [float(sum(stage.values())) for stage in stages]
     total = float(sum(stage_bytes))
     return (max(stage_bytes) / seq if stage_bytes else 0.0), total

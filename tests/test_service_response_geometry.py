@@ -1,4 +1,10 @@
-"""Unseen TP and token geometry use the real frontend and one physical Engine."""
+"""Unseen TP and token geometry use the real frontend and one physical Engine.
+
+[Role] Verify service response geometry generalization across unseen TP and token shapes.
+[Invariants] Unseen geometries traverse the real frontend and single physical Engine.
+[Timeouts & Locks] Tier 0 (<5s), no external locks.
+[Side-Effect Policy] Pure read-only in-memory unit tests.
+"""
 from copy import deepcopy
 from dataclasses import replace
 from itertools import product
@@ -185,3 +191,53 @@ def test_empirical_grid_does_not_cross_changed_execution_identity(field):
     analytical = graph_costs(raw, (op,), isolated=False)
     assert changed["duration_ms"] == analytical["duration_ms"]
     assert changed["parameters"]["service_regimes"][0]["queries"] == {"physical_identity_mismatch": 1}
+
+
+def test_frozen_response_surface_prices_all_prefill_chunks_without_per_chunk_reinstallation():
+    raw = geometry_case(8)
+    oracle = lambda q, kv: 850.0 + 0.08 * q + 0.068 * kv
+    q_knots = [4096, 8192]
+    kv_knots = [8192, 32768, 65536]
+    rule = {
+        "id": "prefill-chunk-fa-surface",
+        "match": {"phase": "prefill", "recipe": "flash_attention"},
+        "coordinates": {
+            "q": {"path": "semantic_shape.0"},
+            "kv_len": {"path": "semantic_shape.1"},
+        },
+        "domain": {
+            "q": {"min": 4096, "max": 8192},
+            "kv_len": {"min": 8192, "max": 65536},
+        },
+        "continuity": {
+            "group": "prefill-chunk-fa",
+            "support": {
+                "q": {"min": 4096, "max": 8192},
+                "kv_len": {"min": 8192, "max": 65536},
+            },
+            "outside": "analytic",
+        },
+        "response": {
+            "kind": "multilinear",
+            "grid": [
+                {"coordinate": "q", "knots": q_knots},
+                {"coordinate": "kv_len", "knots": kv_knots},
+            ],
+            "values_us": [oracle(q, kv) for q in q_knots for kv in kv_knots],
+            "outside": "analytic",
+        },
+        "execution": {
+            "kind": "joint_native",
+            "resource": "matrix_service",
+            "reference_rate": 1e9,
+            "native_kernel": "FlashAttentionScore",
+        },
+    }
+    bind(raw, rule)
+    frozen = deepcopy(raw)
+    for chunk_index in range(1, 9):
+        kv_len = 8192 * chunk_index
+        op = lowered(raw, "flash_attention", 8192, context=kv_len - 8192)
+        result = graph_costs(raw, (op,), input_ready_ms=3, isolated=False)
+        assert result["duration_ms"] == pytest.approx(oracle(8192, kv_len) / 1000)
+        assert raw == frozen

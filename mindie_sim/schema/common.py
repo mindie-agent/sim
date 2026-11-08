@@ -22,18 +22,22 @@ _IGNORED_DOCUMENT_FIELDS = {
 _DTYPE_BYTES = {
     "fp32": 4.0, "float32": 4.0, "bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0,
     "float16": 2.0, "fp8": 1.0, "fp8_e4m3": 1.0, "fp8_e5m2": 1.0,
-    "int8": 1.0, "int4": 0.5, "int32": 4.0, "int64": 8.0,
+    "int8": 1.0, "w8a8": 1.0, "int4": 0.5, "w4a8": 0.5, "fp4": 0.5,
+    "fp4_e2m1": 0.5, "int32": 4.0, "int64": 8.0,
     "bool": 1.0, "fp8_e8m0": 1.0, "e8m0": 1.0,
     # MXFP8 transports 32 E4M3 elements plus one E8M0 block scale byte:
     # 32 payload bytes + 1 scale byte per 32 elements = 33/32 B per element.
     "mxfp8": 33.0 / 32.0, "mx_fp8": 33.0 / 32.0, "mxfp8_e4m3": 33.0 / 32.0,
+    # MXFP4 transports 32 E2M1 elements (16 B) plus one E8M0 scale byte (1 B):
+    "mxfp4": 17.0 / 32.0, "mx_fp4": 17.0 / 32.0, "mxfp4_e2m1": 17.0 / 32.0,
 }
 
 _DTYPE_PEAK = {
     "bf16": 1.0, "bfloat16": 1.0, "fp16": 1.0, "float16": 1.0,
     "fp32": 0.5, "float32": 0.5, "fp8": 2.0, "fp8_e4m3": 2.0,
-    "fp8_e5m2": 2.0, "int8": 2.0, "int4": 4.0,
-    "mxfp8": 2.0, "mx_fp8": 2.0, "mxfp8_e4m3": 2.0,
+    "fp8_e5m2": 2.0, "int8": 2.0, "w8a8": 2.0, "int4": 4.0, "w4a8": 2.0,
+    "fp4": 4.0, "fp4_e2m1": 4.0, "mxfp4": 4.0, "mx_fp4": 4.0,
+    "mxfp4_e2m1": 4.0, "mxfp8": 2.0, "mx_fp8": 2.0, "mxfp8_e4m3": 2.0,
 }
 
 FP8_PEAK_DTYPES = frozenset({

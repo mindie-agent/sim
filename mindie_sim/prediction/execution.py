@@ -547,8 +547,7 @@ class Execution:
             service_boundary="resource_phase" if declaration(op) else "device_kernel")
         demands, frames, setup = {}, {}, 0.0
         if "peer_traffic" in dict(op.metadata) and not cost.work.get("link", 0):
-            # A zero sender still participates and receives. Validate its row
-            # even though CostModel omits zero work from the demand mapping.
+            # A zero sender still participates and receives; validate its row.
             self.topology.accounting(op, replica, volume=cost.work.get("link", 0))
         for resource, amount in cost.work.items():
             if resource == "link":
@@ -568,9 +567,8 @@ class Execution:
                 demands[name] = demands.get(name, 0) + value
         measured = cost.timing.duration_ms if cost.timing is not None else 0
         physical = max((value / self.engine.resources[key].rate for key, value in demands.items()), default=0)
-        # Context binding also serves independently constructed source phases.
-        # Invocation callers pass their selected recipe; binding native work
-        # must not require an unrelated source-dispatch registration.
+        # Context binding also serves independently constructed source phases;
+        # native binding must not require an unrelated source-dispatch registration.
         algorithm = getattr(recipe, "algorithm", "ring")
         context = replace(context, work=demands, minimum_ms=measured, setup_ms=setup,
                           transaction_frames=frames,
@@ -578,12 +576,12 @@ class Execution:
                               op, {replica: cost.work.get("link", 0)}, algorithm=algorithm,
                               **collective_options(recipe, op)))
         response = self.regimes.resolve(context, self.cost.record_regime)
-        if response is not None and response.execution is not None:
+        if response is not None and response.mode == "joint_native":
             if getattr(recipe, "algorithm", None):
                 raise ModelingError("joint_native_service_requires_single_local_kernel")
             demand = response.bind_joint(context)
-            self.cost.record_joint_native(response.execution, cost)
-            declaration = {**response.execution,
+            self.cost.record_joint_native(response, cost)
+            declaration = {**response.execution, **response.diagnostics(),
                            "reference_program": type(recipe).__name__,
                            "reference_primitive_ms": measured if cost.timing is not None else None}
             return replace(context, work=demand, minimum_ms=0, setup_ms=0,
@@ -595,7 +593,8 @@ class Execution:
             self.cost.record_invocation(record)
             context = replace(context, invocation_timing=timing)
         if response is not None:
-            context = replace(context, minimum_ms=max(context.minimum_ms, response.duration_ms))
+            context = replace(context, minimum_ms=max(context.minimum_ms, response.duration_ms),
+                              service_regime=response.diagnostics())
         return context
 
     def add(self, work: IterationWork, replica: int, release_ms: float, *,

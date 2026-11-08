@@ -45,7 +45,7 @@ def flatten_config(config: Mapping[str, Any]) -> tuple[dict[str, Any], Mapping[s
 def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
     archs = " ".join(str(v) for v in config.get("architectures", ()) or ())
     model_type = str(merged.get("model_type", config.get("model_type", ""))).lower()
-    if "DSparkDraftModel" in archs:
+    if "DSparkDraftModel" in archs or "K3DSpark" in archs or model_type == "k3_dspark":
         return "kimi_dspark"
     if "num_layers" in merged and "num_hidden_layers" not in merged:
         return "generic"

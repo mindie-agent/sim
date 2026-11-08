@@ -1,4 +1,10 @@
-"""Unseen physical points traverse the same Engine and explicit identity gates."""
+"""Unseen physical points traverse the same Engine and explicit identity gates.
+
+[Role] Verify piecewise-linear service response knots and identity gates on unseen points.
+[Invariants] Interior and exterior points evaluate deterministically without lookup tables.
+[Timeouts & Locks] Tier 0 (<5s), no external locks.
+[Side-Effect Policy] Pure read-only in-memory unit tests.
+"""
 from copy import deepcopy
 from dataclasses import replace
 
@@ -14,17 +20,16 @@ from test_resource_services import copy_op
 def curve_case(*, outside="analytic", joint=True):
     raw = joint_case()
     rule = raw["runtime"]["kernels"]["service_regimes"][0]
-    rule.update(match={"hardware": "arbitrary", "recipe": "copy", "dtype": "bf16",
-        "layout": "contiguous", "replay_scope": "none", "implementation": {},
-        "runtime": "", "revision": "", "format": "",
-        "metadata.protocol": "retained"},
+    rule.update(match={"recipe": "copy", "dtype": "bf16",
+                       "metadata.protocol": "retained"},
         coordinates={"bytes": {"path": "work.hbm"},
                      "context": {"path": "metadata.context_tokens"}},
-        domain={"bytes": {"min": 500, "max": 8000}, "context": {"min": 4096, "max": 4096}},
+        domain={"bytes": {"min": 500, "max": 8000},
+                "context": {"min": 2048, "max": 8192}},
         response={"kind": "piecewise_linear", "coordinate": "bytes",
                   "knots": [[1000, 4000], [2000, 6000], [4000, 9000]], "outside": outside})
     if not joint:
-        del rule["execution"]
+        rule.pop("execution", None)
     return raw
 
 
@@ -63,7 +68,7 @@ def test_explicit_extrapolation_is_distinct_from_analytic_outside_curve_and_appl
 
 
 def test_fixed_context_and_protocol_misses_never_borrow_a_response_from_another_domain():
-    context_miss = graph_costs(curve_case(), (operation(1500, context=4097),), isolated=False)
+    context_miss = graph_costs(curve_case(), (operation(1500, context=1024),), isolated=False)
     assert context_miss["duration_ms"] == 1.5
     assert context_miss["parameters"]["service_regimes"][0]["queries"] == {"analytic_outside_domain": 1}
     changed = replace(operation(1500), metadata=(("protocol", "different"), ("context_tokens", 4096)))
@@ -122,3 +127,34 @@ def test_pure_response_evaluation_matches_engine_but_does_not_consume_observed_v
         assert error == 7500 - observed_us
     result = graph_costs(raw, (operation(3000),), isolated=False)
     assert result["duration_ms"] * 1000 == model.evaluate({"bytes": 3000}).duration_us
+
+
+def test_recipe_only_curve_is_accepted_without_manufactured_identity_values():
+    raw = curve_case()
+    raw["runtime"]["kernels"]["service_regimes"][0]["match"] = {"recipe": "copy"}
+    result = graph_costs(raw, (operation(1500),), isolated=False)
+    assert result["duration_ms"] == 5
+    assert result["parameters"]["service_regimes"][0]["queries"] == {"joint_native_service": 1}
+
+
+def test_family_only_curve_is_accepted_without_empty_identity_values():
+    raw = curve_case()
+    raw["runtime"]["kernels"]["service_regimes"][0]["match"] = {"family": "copy"}
+    result = graph_costs(raw, (operation(1500),), isolated=False)
+    assert result["duration_ms"] == 5
+    assert result["parameters"]["service_regimes"][0]["queries"] == {"joint_native_service": 1}
+
+
+def test_declared_identity_guard_still_rejects_changed_precision():
+    changed = replace(operation(1500), dtype="fp16")
+    result = graph_costs(curve_case(), (changed,), isolated=False)
+    assert result["duration_ms"] == 1.5
+    record = result["parameters"]["service_regimes"][0]
+    assert record["queries"] == {"physical_identity_mismatch": 1}
+    assert record["mismatched_axes"] == {"dtype": 1}
+
+
+def test_unused_non_singleton_guard_is_accepted_and_enforced():
+    for context, duration in ((6000, 5), (1024, 1.5)):
+        result = graph_costs(curve_case(), (operation(1500, context=context),), isolated=False)
+        assert result["duration_ms"] == duration

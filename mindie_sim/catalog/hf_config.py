@@ -133,7 +133,7 @@ ALIASES = {
 # Training/tokenizer/provenance settings do not add inference work. Other
 # unconsumed keys are retained as gaps; an adapter can explicitly claim a key.
 PASSIVE_FIELDS = set("""
-architectures model_type name model_key family _name_or_path _commit_hash
+architectures model_type name model_key family _name_or_path _commit_hash _torchspec_version
 _attn_implementation _attn_implementation_autoset
 auto_map transformers_version torch_dtype dtype activation_dtype weight_dtype
 kv_dtype tie_word_embeddings bos_token_id eos_token_id pad_token_id
@@ -202,6 +202,8 @@ video_token_id mla_use_nope index_share_for_mtp_iteration
 index_skip_topk_offset index_topk_freq index_topk_pattern engram_vocab_size
 engram_compressed_vocab_size confidence_head_with_markov markov_head_type
 apply_layernorm_1p linear_expand_v
+target_hidden_size target_num_hidden_layers target_layer_ids mask_token_id
+draft_vocab_size full_attention_causal sample_from_anchor
 """.split())
 
 

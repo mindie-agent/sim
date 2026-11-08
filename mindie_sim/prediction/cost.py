@@ -143,7 +143,8 @@ class CostModel:
         self.invocations[key]["invocations"] += 1
 
     def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
-                      response_basis=None, mismatched_axes=()):
+                      response_basis=None, mismatched_axes=(), continuity_group=None,
+                      execution_mode=None, exterior_policy=None):
         record = self.regimes.setdefault(key, {
             "model_id": key, **model, "queries": {}, "response_us_min": None,
             "response_us_max": None})
@@ -151,6 +152,17 @@ class CostModel:
         if response_basis is not None:
             counts = record.setdefault("response_relations", {})
             counts[response_basis] = counts.get(response_basis, 0) + 1
+            bases = record.setdefault("response_bases", {})
+            bases[response_basis] = bases.get(response_basis, 0) + 1
+        if continuity_group is not None:
+            groups = record.setdefault("continuity_groups", {})
+            groups[continuity_group] = groups.get(continuity_group, 0) + 1
+        if execution_mode is not None:
+            modes = record.setdefault("execution_modes", {})
+            modes[execution_mode] = modes.get(execution_mode, 0) + 1
+        if exterior_policy is not None:
+            policies = record.setdefault("exterior_policies", {})
+            policies[exterior_policy] = policies.get(exterior_policy, 0) + 1
         for axis in mismatched_axes:
             counts = record.setdefault("mismatched_axes", {})
             counts[axis] = counts.get(axis, 0) + 1
@@ -161,8 +173,11 @@ class CostModel:
         if duration_us is not None:
             for field, select in (("response_us_min", min), ("response_us_max", max)):
                 record[field] = duration_us if record[field] is None else select(record[field], duration_us)
+            record["response_ms_total"] = record.get("response_ms_total", 0.0) + duration_us / 1000
+            record["response_ms_max"] = max(record.get("response_ms_max", 0.0), duration_us / 1000)
 
-    def record_joint_native(self, declaration, reference_cost):
+    def record_joint_native(self, selection, reference_cost):
+        declaration = dict(selection.execution or {})
         self.counts[reference_cost.basis] -= 1
         self.counts["joint_native_service"] = self.counts.get("joint_native_service", 0) + 1
         key = declaration["native_kernel"], declaration["resource"]
@@ -173,6 +188,34 @@ class CostModel:
             "unmodeled": ["internal_resource_occupancy", "internal_buffer_occupancy"]})
         row["invocations"] += 1
         row["replaced_primitive_count"] += int(reference_cost.timing is not None)
+        rule_counts = dict(row.get("rule_counts", {}))
+        if selection.rule_id is not None:
+            rule_counts[selection.rule_id] = rule_counts.get(selection.rule_id, 0) + 1
+        row["rule_counts"] = {k: rule_counts[k] for k in sorted(rule_counts)}
+        row["rule_ids"] = sorted(rule_counts)
+        row["rule_id"] = row["rule_ids"][0] if len(row["rule_ids"]) == 1 else None
+        row["continuity_group"] = (selection.continuity_group if row["invocations"] == 1
+                                   or row.get("continuity_group") == selection.continuity_group
+                                   else None)
+        row["execution_mode"] = selection.mode
+        bases = dict(row.get("response_bases", {}))
+        if selection.response_basis is not None:
+            bases[selection.response_basis] = bases.get(selection.response_basis, 0) + 1
+        row["response_bases"] = {k: bases[k] for k in sorted(bases)}
+        row["response_basis"] = next(iter(row["response_bases"])) if len(row["response_bases"]) == 1 else None
+        coords = dict(selection.coordinate_values or {})
+        row["coordinate_values"] = (coords if row["invocations"] == 1
+                                    or row.get("coordinate_values") == coords else None)
+        ranges = row.setdefault("coordinate_ranges", {})
+        for name, value in coords.items():
+            bounds = ranges.setdefault(name, {"min": value, "max": value})
+            bounds["min"], bounds["max"] = min(bounds["min"], value), max(bounds["max"], value)
+        duration = selection.duration_ms
+        row["response_duration_ms"] = (duration if row["invocations"] == 1
+                                       or row.get("response_duration_ms") == duration else None)
+        row["response_ms_min"] = min(row.get("response_ms_min", duration), duration)
+        row["response_ms_max"] = max(row.get("response_ms_max", duration), duration)
+        row["response_ms_total"] = row.get("response_ms_total", 0.0) + duration
         for role, value in reference_cost.work.items():
             row["analytical_reference_work"][role] = row["analytical_reference_work"].get(role, 0) + value
 
@@ -186,7 +229,9 @@ class CostModel:
         if self.services:
             calibration.append("resource_service_curves")
         selected_regimes = {r["id"] for r in self.regimes.values()
-                            if r["queries"].get("observable_response") or r["queries"].get("joint_native_service")}
+                            if (r["queries"].get("observable_response")
+                                or r["queries"].get("joint_native_service")
+                                or r["queries"].get("linear_outside_support"))}
         queried_regimes = {r["id"] for r in self.regimes.values()
                            if set(r["queries"]) - {"physical_identity_mismatch"}}
         if any(r["id"] in selected_regimes and r["response"].get("kind") != "roofline"

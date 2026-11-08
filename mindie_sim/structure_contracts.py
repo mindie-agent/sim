@@ -146,6 +146,10 @@ def comparison_scope(op):
     if op["metadata"].get("native_tensor_view", {}).get("kind") == "transpose_batchmatmul":
         return ("canonical_batch_matrix_geometry_and_operand_precision; "
                 "physical_permutation_and_native_dispatch_not_compared")
+    if op["metadata"].get("native_tensor_view", {}).get("kind") == "quant_lightning_indexer_v2":
+        return ("quantized_query_weights_scales_cache_head_and_indices_shape_dtype; "
+                "cache_capacity_blocksize_sequence_metadata_values_and_scalar_modes_not_compared; "
+                "no_dispatch_or_occurrence_proof")
     if op["metadata"].get("program_kind") == "matmul":
         return matrix_comparison_scope(op)
     if family == "layernorm":
@@ -257,6 +261,24 @@ def predicted_contract(op):
         return "native_tensor_abi", "TensorMove", (tensor,), (tensor,)
     if meta.get("native_tensor_view", {}).get("kind") == "transpose_batchmatmul":
         return transpose_batchmatmul_contract(op)
+    if meta.get("native_tensor_view", {}).get("kind") == "quant_lightning_indexer_v2":
+        view = meta["native_tensor_view"]
+        if (view.get("query_dtype") != "int8" or view.get("cache_dtype") != "int8"
+                or view.get("layout") != "ND" or view.get("output_dtype") != "int32"
+                or len(view.get("query_shape", ())) != 3
+                or len(view.get("cache_head_shape", ())) != 2
+                or len(view.get("output_shape", ())) != 3):
+            return None
+        rows, heads, width = tuple(view["query_shape"])
+        return (
+            "quant_lightning_indexer_active", "VllmAscendQuantLightningIndexerV2",
+            (((rows, heads, width), view["query_dtype"], "ND"),
+             ((rows, heads), view["weight_dtype"], "ND"),
+             ((rows, heads), view["scale_dtype"], "ND")),
+            ((tuple(view["cache_head_shape"]), view["cache_dtype"], "ND"),
+             ((1,), view["scale_dtype"], "ND")),
+            (tuple(view["output_shape"]), view["output_dtype"], "ND"),
+        )
     if family == "layernorm":
         return layer_norm_contract(op)
     if op["recipe"] == "linear_output_norm_gate":

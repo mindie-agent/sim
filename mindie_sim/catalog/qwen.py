@@ -139,6 +139,9 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 shared_expert_gate=bool(moe),
                 router_input_size=h, router_mode=router_mode,
                 router_norm_topk=router_norm_topk,
+                # Qwen3NextAttention normalizes Q and K per head before RoPE;
+                # Qwen3.5 reuses this attention class for its full-attention layers.
+                qk_norm=True,
                 q_output_gate=gate,
                 kv_cache_elements=2 * kv_heads * head_dim,
                 kv_owner_layer_id=index,
@@ -179,13 +182,41 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     return AuxiliarySpec(mtp=mtp, notes=("qwen_mtp_is_optional",))
 
 
+def _dspark_mla_rank(c: Mapping[str, Any]) -> int:
+    return int(c.get("kv_lora_rank") or 0)
+
+
 def _dspark_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
-    h = int(_require(c, "hidden_size"))
     layers = int(_require(c, "num_hidden_layers"))
     heads = int(_require(c, "num_attention_heads"))
+    dense_i = int(_require(c, "intermediate_size"))
+    kv_lora = _dspark_mla_rank(c)
+    if kv_lora > 0:
+        q_lora = int(_require(c, "q_lora_rank"))
+        nope = int(_require(c, "qk_nope_head_dim"))
+        rope = int(_require(c, "qk_rope_head_dim"))
+        v_dim = int(c.get("v_head_dim", 128) or 128)
+        head_dim = nope + rope
+        kv_heads = int(c.get("num_key_value_heads", 1) or 1)
+        causal = bool((c.get("dflash_config") or {}).get(
+            "causal", c.get("full_attention_causal", False)))
+        return [
+            LayerPlan(
+                index=index, attention="mla", architecture="mla", ffn="dense",
+                num_heads=heads, num_kv_heads=kv_heads,
+                q_lora_rank=q_lora, kv_lora_rank=kv_lora,
+                qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
+                head_dim=head_dim, mla_variant="latent_mla",
+                mla_output_gate=bool(c.get("mla_use_output_gate", False)),
+                kv_cache_elements=kv_lora + rope, intermediate_size=dense_i,
+                noncausal_attention=not causal,
+                kv_owner_layer_id=index, native_layer_id=index, scope="body",
+            )
+            for index in range(layers)
+        ]
+    h = int(_require(c, "hidden_size"))
     kv_heads = int(_require(c, "num_key_value_heads"))
     head_dim = int(_require(c, "head_dim"))
-    dense_i = int(_require(c, "intermediate_size"))
     return [
         LayerPlan(
             index=index, attention="gqa", architecture="gqa", ffn="dense",
@@ -202,9 +233,45 @@ def _dspark_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
 
 def _aux_dspark(c: Mapping[str, Any]) -> AuxiliarySpec:
     h = int(c["hidden_size"])
+    markov = _int(c, "markov_rank", 256)
+    kv_lora = _dspark_mla_rank(c)
+    if kv_lora > 0:
+        nope = int(_require(c, "qk_nope_head_dim"))
+        rope = int(_require(c, "qk_rope_head_dim"))
+        v_dim = int(c.get("v_head_dim", 128) or 128)
+        heads = int(_require(c, "num_attention_heads"))
+        q_lora = int(_require(c, "q_lora_rank"))
+        head_dim = nope + rope
+        targets = tuple(int(v) for v in (
+            c.get("target_layer_ids")
+            or (c.get("dflash_config") or {}).get("target_layer_ids")
+            or (2, 23, 47, 71, 89)
+        ))
+        causal = bool((c.get("dflash_config") or {}).get(
+            "causal", c.get("full_attention_causal", False)))
+        spec = DraftSpec(
+            kind="standalone_draft", layers=int(c["num_hidden_layers"]),
+            hidden_size=h, intermediate_size=int(c["intermediate_size"]),
+            num_heads=heads, num_kv_heads=1, head_dim=head_dim,
+            q_lora_rank=q_lora, kv_lora_rank=kv_lora,
+            qk_nope_head_dim=nope, qk_rope_head_dim=rope, v_head_dim=v_dim,
+            kv_cache_elements=kv_lora + rope,
+            q_width=heads * head_dim, kv_width=kv_lora + rope,
+            attention_kind="mla", mla_variant="latent_mla",
+            target_layer_ids=targets, block_size=_int(c, "block_size", 5),
+            markov_rank=markov,
+            confidence_enabled=bool(c.get("enable_confidence_head", False)),
+            confidence_executes=False, confidence_input_width=h + markov,
+            target_shared_embedding=True, target_shared_lm_head=True,
+            base_logits=True, markov_replicated=True,
+            noncausal_query_block=not causal, pp_capability=(1,),
+            vocab_size=int(c["vocab_size"]),
+            source=merge_source({"kind": "standalone_dspark_draft"}),
+            notes=("DSpark MLA draft model is its own body; target features are model inputs",),
+        )
+        return AuxiliarySpec(dspark=spec, standalone_draft=True)
     targets = tuple(int(v) for v in (c.get("dflash_config", {}) or {}).get("target_layer_ids", ()) or ())
     block = _int(c, "block_size", 7)
-    markov = _int(c, "markov_rank", 256)
     spec = DraftSpec(
         kind="standalone_draft", layers=int(c["num_hidden_layers"]),
         hidden_size=h, intermediate_size=int(c["intermediate_size"]),

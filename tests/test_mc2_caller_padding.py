@@ -1,4 +1,10 @@
-"""MC2 padding stays after full-row router/shared work and is masked on wire."""
+"""MC2 padding stays after full-row router/shared work and is masked on wire.
+
+[Role] Verify MC2 caller padding boundaries across router, shared expert, and wire.
+[Invariants] Full-row router/shared work precedes padding; wire masks padded rows.
+[Timeouts & Locks] Tier 0 (<5s), no external locks.
+[Side-Effect Policy] Pure read-only in-memory unit tests.
+"""
 from copy import deepcopy
 
 import pytest
@@ -74,6 +80,36 @@ def test_rank_copy_materialization_precedes_trim_and_preserves_allocation_bytes(
     assert len(copies)==4
     assert sum(o.mte2_bytes for o in copies)==sum(o.mte3_bytes for o in copies)==4*32*2
     assert by_id['s0.l0.mc2_output_trim'].deps==('s0.l0.mc2_gather_complete',)
+
+
+def test_functional_padding_reads_valid_rows_and_writes_the_full_allocation():
+    raw = padded_case()
+    raw['runtime']['kernels']['moe_token_partition']['padding_implementation'] = 'pad_v3'
+    ops = graph(raw, 3)
+    by_id = {op.op_id: op for op in ops}
+    for role, width in (('input', 32), ('logits', 16)):
+        op = by_id[f's0.l0.mc2_{role}_pad']
+        assert op.recipe == 'tensor_pad'
+        assert op.mte2_bytes == 3 * width * 2
+        assert op.mte3_bytes == 4 * width * 2
+        assert op.hbm_bytes == 7 * width * 2
+        assert dict(op.metadata)['input_shapes'] == ((3, width), (4,), ())
+        assert dict(op.metadata)['native_kind'] == 'PadV3'
+        assert by_id[f's0.l0.mc2_{role}_view'].deps == (op.op_id,)
+    assert not any(op.recipe == 'tensor_concat' for op in ops)
+    # A divisible caller performs no padding, regardless of implementation.
+    divisible_ops = graph(raw, 4)
+    assert not any(op.recipe == 'tensor_pad' for op in divisible_ops)
+
+
+def test_functional_padding_is_an_explicit_mc2_alignment_implementation():
+    from mindie_sim.schema.common import ModelingError
+
+    raw = padded_case()
+    raw['runtime']['kernels']['moe_token_partition'].update(
+        padding='none', padding_implementation='pad_v3')
+    with pytest.raises(ModelingError, match='pad_v3_requires_mc2_right_to_tp_padding'):
+        graph(raw, 4)
 
 
 def test_tp16_m12_valid_counts_do_not_turn_into_16_routed_tokens():

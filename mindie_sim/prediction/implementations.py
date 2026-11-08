@@ -34,6 +34,8 @@ class Selection:
 
 
 IMPLEMENTATIONS = {
+    "cann_quant_lightning_indexer_v2_complete": Implementation(
+        "mindie_sim.prediction.family_quant_indexer", blocks=("quant_lightning_indexer",)),
     "vllm_ascend_group_list_prefix": Implementation(
         "mindie_sim.prediction.moe_group_list", blocks=("group_list_prefix",)),
     "vllm_ascend_cann_keypool_caller": Implementation(

@@ -1,4 +1,10 @@
-"""Native adapter omissions stay visible without changing retained work."""
+"""Native adapter omissions stay visible without changing retained work.
+
+[Role] Verify model catalog and native config coverage across hybrid architectures.
+[Invariants] Omitted optional config keys never silently alter retained operator work.
+[Timeouts & Locks] Tier 0 (<5s), no external locks.
+[Side-Effect Policy] Pure read-only in-memory unit tests.
+"""
 from copy import deepcopy
 import json
 from pathlib import Path
@@ -29,6 +35,31 @@ def physical_work(config):
     raw["model"] = config
     return [(op.family, op.flops, op.vector_ops, op.hbm_bytes, op.dtype)
             for op in target_operators(raw, phase="prefill", tokens=3)]
+
+
+@pytest.mark.parametrize("source_type", ["qwen3_5_text", "qwen3_next"])
+def test_hybrid_full_attention_keeps_source_qk_norm_before_rope(source_type):
+    config = hybrid_config()
+    config["model_type"] = source_type
+    model = ModelSpec.from_mapping(config)
+    assert not model.layer_plans[0].qk_norm
+    assert model.layer_plans[1].qk_norm
+    raw = case(prompt=3, output=2)
+    raw["model"] = config
+    ops = target_operators(raw, phase="prefill", tokens=3)
+    normalizations = [op for op in ops if op.recipe == "qk_norm"]
+    assert len(normalizations) == 1
+    norm = normalizations[0]
+    rope = next(op for op in ops if op.layer == norm.layer and op.recipe == "rotary")
+    assert norm.op_id in rope.deps
+    assert norm.vector_ops > 0 and norm.mte2_bytes > 0 and norm.mte3_bytes > 0
+
+    # An explicitly serialized custom plan is a declaration, not an HF default.
+    explicit = model.to_dict()
+    explicit["layer_plans"][1]["qk_norm"] = False
+    raw["model"] = explicit
+    assert not any(op.recipe == "qk_norm"
+                   for op in target_operators(raw, phase="prefill", tokens=3))
 
 
 @pytest.mark.parametrize("changes", [

@@ -210,6 +210,9 @@ class RecipeContext:
     # analysis leaves this empty and must retain its own buffer requirements.
     group_buffers: tuple[str, ...] = ()
     joint_native_service: Mapping | None = None
+    # Selected observable regime, including continuity group, execution mode,
+    # response basis and the distinct response/executed durations.
+    service_regime: Mapping | None = None
 
     def for_phase(self, work, *, kernel, dtype=None, layout=None, axes=None):
         """Bind explicitly identified phase work without repeating kernel setup."""

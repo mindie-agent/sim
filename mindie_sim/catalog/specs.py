@@ -80,7 +80,8 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     elif family == "kimi_dspark":
         plans = _dspark_plans(c)
         quant = _quant_bf16(c, name="bf16_dspark")
-        attention, ffn = "gqa", "dense"
+        attention = plans[0].attention if plans else "gqa"
+        ffn = "dense"
         aux = _aux_dspark(c)
         vision = None
         engram = None
