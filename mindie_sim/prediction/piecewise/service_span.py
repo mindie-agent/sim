@@ -6,10 +6,13 @@
 [Invariants]
   * Operator and subgraph durations (L1–L3) remain strictly free of L4 host
     queueing or multi-wave scheduling adjustments.
-  * When ``local_batch = ceil(concurrency / dp) >= 2`` and ``prompt_tokens >=
-    max_num_batched_tokens (8192)``, chunked prefill executes ``N = local_batch``
-    sequential waves per DP rank, so the arithmetic mean TTFT across requests is
-    ``T_total * (N + 1) / (2 * N)``.
+  * ``chunked_prefill_mean_ttft_ms`` models multi-chunk FCFS chunked-prefill
+    scheduling across DP ranks.  When one rank executes ``N`` serial chunks, the
+    arithmetic mean TTFT across its requests is ``T_total * (N + 1) / (2 * N)``.
+  * ``ttft_wave_scale`` models only single-step concurrent-wave contention.  It
+    is not the chunked-prefill queue formula: for prefill it scales with prompt
+    length and concurrency, and it additionally honors ``max_batched_tokens``
+    when a prompt exceeds one chunk.
 [Timeouts & Locks] Pure arithmetic; no I/O or locks.
 [Side-Effect Policy] Stateless functions only.
 """
@@ -48,6 +51,20 @@ def chunked_prefill_mean_ttft_ms(
     for index, prompt in enumerate(prompts):
         ranks[index % len(ranks)].append(max(1, int(prompt)))
     finishes: list[float] = []
+    target_fn: Any = body_one
+    bound_pos = 0
+    bound_kw: set[str] = set()
+    while hasattr(target_fn, "func"):
+        bound_pos += len(getattr(target_fn, "args", ()) or ())
+        bound_kw.update((getattr(target_fn, "keywords", None) or {}).keys())
+        target_fn = target_fn.func
+    if not hasattr(target_fn, "__code__") and hasattr(target_fn, "__call__"):
+        target_fn = target_fn.__call__
+    code = getattr(target_fn, "__code__", None)
+    if getattr(target_fn, "__self__", None) is not None:
+        bound_pos += 1
+    rem_pos = (code.co_argcount - bound_pos - sum(1 for n in code.co_varnames[bound_pos:code.co_argcount] if n in bound_kw)) if code is not None else 1
+    two_arg = bool(code is not None and ((code.co_flags & 4) != 0 or rem_pos >= 2))
     for rank in ranks:
         clock = 0.0
         for prompt in rank:
@@ -56,10 +73,7 @@ def chunked_prefill_mean_ttft_ms(
             while left > 0:
                 take = min(budget, left)
                 done += take
-                try:
-                    step_ms = float(body_one(take, done))
-                except TypeError:
-                    step_ms = float(body_one(take))
+                step_ms = float(body_one(take, done)) if two_arg else float(body_one(take))
                 clock += step_ms
                 left -= take
             finishes.append(clock)
@@ -75,29 +89,28 @@ def ttft_wave_scale(
     layers: int,
     graph_buckets: tuple[int, ...],
     prompt_tokens: int = 0,
-    max_batched_tokens: int = 8192,
+    max_batched_tokens: int | None = None,
 ) -> float:
     """Scale single-step prefill body to mean L4 TTFT under concurrent waves."""
+    del layers, graph_buckets
     c, dp_n, ep_n = max(1, int(concurrency)), max(1, int(dp)), max(1, int(ep))
     if phase == "prefill":
-        waves = math.ceil(c / dp_n)
-        if waves >= 2 and int(prompt_tokens) >= max(1, int(max_batched_tokens)):
-            return (waves + 1) / (2.0 * waves)
-        return 1.0
+        if max_batched_tokens is not None and int(max_batched_tokens) > 0:
+            budget = int(max_batched_tokens)
+            waves = max(1, math.ceil(c / dp_n) * math.ceil(max(1, int(prompt_tokens)) / budget))
+            return (waves + 1.0) / (2.0 * waves)
+        t_p = max(0.0, min(1.0, (float(prompt_tokens) - 2048.0) / 2048.0))
+        t_c = max(0.0, min(1.0, (float(c) - 2.0) / 2.0))
+        return 1.0 if ep_n < 16 else (1.0 + 0.045 * t_p * t_c)
     if ep_n == 1:
-        return (1.0 + 0.01 * (c - 1)) if c <= dp_n else (1.07 + 0.65 * (c / dp_n - 1.0))
-    em = 1.18 if (not graph_buckets and c >= 4) else 1.0
+        at_dp = 1.0 + 0.01 * (dp_n - 1)
+        return (1.0 + 0.01 * (c - 1)) if c <= dp_n else (at_dp + 0.65 * (c / dp_n - 1.0))
     if dp_n <= 4:
-        return (1.0 + (1.15 / dp_n) * (min(c, 16) - 1) + 0.115 * max(0, c - 16)) * em
-    if layers <= 40:
-        slope = 1.92 / dp_n
-    elif dp_n >= 32:
-        slope = 1.70 / dp_n
-    elif layers <= 64:
-        slope = (0.45 / dp_n) if c <= dp_n // 4 else (1.16 / dp_n)
-    else:
-        slope = 1.31 / dp_n
-    return (1.0 + slope * (c - 1)) * em
+        return 1.0 + (1.15 / dp_n) * (min(c, 16) - 1) + 0.115 * max(0, c - 16)
+    dp_t = max(0.0, min(1.0, (dp_n - 16.0) / 16.0))
+    num = 0.81 * (1.0 + 0.295 * dp_t)
+    slope = num / dp_n
+    return 1.0 + slope * (c - 1)
 
 
 def service_ttft_overhead_ms(
@@ -108,10 +121,15 @@ def service_ttft_overhead_ms(
     short_ep_host_ms: float = 95.0,
 ) -> float:
     """Host tokenization, IPC, and first-step scheduler overhead for short prompts."""
-    prompt = max(1, int(prompt_tokens))
-    if prompt > 2048:
+    prompt = float(max(1, int(prompt_tokens)))
+    if prompt >= 4096.0:
         return 0.0
-    scale = 1.0 if prompt <= 1024 else 0.45
+    if prompt <= 1024.0:
+        scale = 1.0
+    elif prompt <= 2048.0:
+        scale = 1.0 - 0.55 * ((prompt - 1024.0) / 1024.0)
+    else:
+        scale = 0.45 * (1.0 - (prompt - 2048.0) / 2048.0)
     if int(tp) >= 8:
         base = 145.0
     elif int(ep) > 1:

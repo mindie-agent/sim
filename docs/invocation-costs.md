@@ -80,20 +80,21 @@ The existing engine remains the only execution engine.
   "kernel_invocations": {
     "vector": {
       "minimum_ms": 0.0025,
-      "provenance": {"basis": "user_reported_experience", "reported_us": [2, 3]}
+      "provenance": {"basis": "arch2201_baseline_declaration", "reported_us": [2, 3]}
     },
     "cube": {
       "minimum_ms": 0.005,
-      "provenance": {"basis": "user_reported_experience", "reported_us": [5, 5]}
+      "provenance": {"basis": "arch2201_baseline_declaration", "reported_us": [5, 5]}
     }
   }
 }
 ```
 
-These A3 values were reported by the user on October 29, 2026. They are now
-declared on the six A3 SKU profiles, with provenance and the vector range.
-They are not independently measured empty-kernel values. `launch_us` remains
-host submission time and does not provide these device constraints.
+These A3 `npu_arch_2201` ordinary-kernel baseline values (`declared_arch2201_ordinary_kernel_baseline`,
+originating from empirical ordinary-work kernel floor observations declared on October 29, 2026)
+are declared on the six A3 SKU profiles, with provenance and the vector range. They are not
+independently measured empty-kernel values. `launch_us` remains host submission time and does
+not provide these device constraints.
 
 Selection uses actual native cube/vector work after source planning. A mixed
 kernel takes the maximum of applicable constraints once. Pure DMA, transport,
@@ -125,8 +126,11 @@ the independently observed1.578us BF16 ND MatMulV3 minimum. The earlier0.439us
 one-block empty AIC control remains the explicit `empty_aic` class; the64-block
 1.115us result is not assigned to every invocation. These declarations have zero startup.
 Their source, observed scope, exclusions and vector counterexample are retained
-in parameter provenance and ordinary prediction output. Other A5 SKUs do not
-inherit these measurements automatically.
+in parameter provenance and ordinary prediction output. The other A5 SKUs
+(`Ascend950DT_9581` and `Ascend950PR_9579`) declare these `arch3510` minima via
+`basis="declared_engineering_extrapolation"` (and `independent_control` for empty AIC)
+with `scope` and `observed_scope` distinguishing them from direct measurements on
+`Ascend950DT_9582`.
 
 The separate32MiB MatMulV3 control takes11.471us while transferring useful
 weights; that duration is not an empty Cube floor. Neither the new stream

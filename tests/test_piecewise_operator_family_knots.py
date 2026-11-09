@@ -141,7 +141,7 @@ def _ridge(supply: PipeSupply, tokens: int, present: frozenset[str]):
     peaks = dict(supply.flops_by_dtype)
     refs = {
         "cube": 865_075_200_000.0,
-        "vector": 10_560_000_000.0,
+        "vector": 6_758_400_000.0,
         "hbm": 1_600_000_000.0,
         "mte1": 13_516_800_000.0,
         "mte2": 4_224_000_000.0,
@@ -285,11 +285,11 @@ def test_balance_ratios_and_ridge_knots_track_binding_pipes():
             ridges.append(env["CM_RIDGE_SHIFT"])
         assert ridges[0] * 2 == ridges[1] and ridges[1] * 2 == ridges[2]
 
-    # Vector 0.5x doubles VEC tokens; 2x hands the min to the memory pipes.
+    # Vector 0.5x doubles VEC tokens; 2x is capped by the memory pipes.
     slow_vec = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("vector",)))[1])
     fast_vec = _knots(_evaluate(OPERATORS["attention"], _scale(base, 2.0, ("vector",)))[1])
     assert slow_vec[2] == nominal[2] * 2
-    assert fast_vec[2] == Fraction(tokens) < nominal[2]
+    assert fast_vec[2] == Fraction(tokens) == nominal[2]
     slow_mte3 = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("mte3",)))[1])
     assert slow_mte3[0] == nominal[0] and slow_mte3[2] > nominal[2]
     # Link is outside the cube/memory ridge.  Its knot is the guard root

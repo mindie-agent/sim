@@ -322,3 +322,58 @@ def test_undeclared_host_has_no_launch_service_and_explicit_declaration_is_addit
         else:
             assert explicit["execution"]["serviced"][role] == pytest.approx(work)
     assert explicit["execution"]["live_tasks"] == explicit["execution"]["live_programs"] == 0
+
+
+@pytest.mark.parametrize("sku", tuple(profiles()))
+def test_all_skus_unify_official_vector_rates_and_declarations(sku):
+    from mindie_sim.prediction.efficiency import extract_hardware_peaks
+
+    raw_profile = profiles()[sku]
+    decl = raw_profile["source"]["declaration"]
+    vec_field = raw_profile["source"]["pipeline"]["fields"]["vector"]
+    arch = decl["arch_family"]
+    assert arch in {"A2", "A3", "A5"}
+    assert decl["npu_arch"] == ("2201" if arch in {"A2", "A3"} else "3510")
+    aiv = int(decl["aiv_count_per_die"])
+    clock_hz = float(decl["configured_clock_mhz"]) * 1e6
+    lanes_per_cyc = 32 if arch in {"A2", "A3"} else 64
+    vec_bytes = 128 if arch in {"A2", "A3"} else 256
+    expected_fp32_lane_rate = lanes_per_cyc * aiv * clock_hz
+    expected_fp32_fma_tflops = round(2 * expected_fp32_lane_rate / 1e12, 4)
+    expected_fp16_lane_rate = 2 * expected_fp32_lane_rate
+    expected_fp16_fma_tflops = round(4 * expected_fp32_lane_rate / 1e12, 4)
+    expected_cann_fma_fp32 = round(128 * aiv * clock_hz / 1e12, 4)
+    expected_cann_fma_fp16 = round(256 * aiv * clock_hz / 1e12, 4)
+
+    case = sku_case(sku)
+    device = case.machine.dies[0]
+    assert dict(device.rates)["vector"] == pytest.approx(expected_fp32_lane_rate)
+    for record in (decl, vec_field):
+        assert record["vec_execution_bytes_per_cycle_per_aiv"] == vec_bytes
+        assert record["vector_fp32_lane_ops_per_s_per_die"] == pytest.approx(expected_fp32_lane_rate)
+        assert record["vector_fp32_fma_tflops_per_die"] == pytest.approx(expected_fp32_fma_tflops)
+        assert record["vector_fp16_lane_ops_per_s_per_die"] == pytest.approx(expected_fp16_lane_rate)
+        assert record["vector_fp16_fma_tflops_per_die"] == pytest.approx(expected_fp16_fma_tflops)
+        assert record["cann_fused_mul_add_fp32_tflops_per_die"] == pytest.approx(expected_cann_fma_fp32)
+        assert record["cann_fused_mul_add_fp16_tflops_per_die"] == pytest.approx(expected_cann_fma_fp16)
+    assert vec_field["rate_ops_per_s"] == pytest.approx(expected_fp32_lane_rate)
+    assert vec_field["units"] == aiv
+    assert vec_field["ops_per_cycle_per_aiv"] == lanes_per_cyc
+    hw_peaks = extract_hardware_peaks(case)
+    assert hw_peaks["vector_peak_ops_per_s"] == pytest.approx(expected_fp32_lane_rate)
+    assert hw_peaks["vector_fp32_fma_flops_per_s"] == pytest.approx(2 * expected_fp32_lane_rate)
+    assert hw_peaks["vector_fp16_fma_flops_per_s"] == pytest.approx(4 * expected_fp32_lane_rate)
+    for inv in raw_profile["device"].get("kernel_invocations", {}).values():
+        assert inv.get("provenance", {}).get("basis") != "user_reported_experience"
+
+
+def test_nvidia_efficiency_peaks_preserve_declared_fp32_vector_rate():
+    from mindie_sim.prediction.efficiency import extract_hardware_peaks
+
+    nv_case = Case.from_mapping({
+        "machine": {"backend": "nvidia", "sku": "NVIDIA_H200"},
+        "model": MODEL, "workload": WORKLOAD, "runtime": {},
+    })
+    hw_peaks = extract_hardware_peaks(nv_case)
+    assert hw_peaks["vector_peak_ops_per_s"] == pytest.approx(67e12)
+    assert hw_peaks["vector_fp32_fma_flops_per_s"] == pytest.approx(67e12)

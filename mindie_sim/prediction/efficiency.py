@@ -131,9 +131,11 @@ def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = 0
     intra_bw = max((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links if "intra_package" in lnk.channel or len(lnk.members) <= parsed.machine.dies_per_package), default=0.0)
     inter_bw = min((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links), default=0.0)
     link_peak = (intra_bw if max(p.tp, p.ep if p.ep > 1 else 1) <= parsed.machine.dies_per_package and intra_bw > 0 else inter_bw) if links else 0.0
+    is_lane_issue = "lane operation per cycle" in str(dict(parsed.machine.assumptions).get("vector_issue", ""))
     return {
         "die": dies[0], "dies": dies, "compute_peaks": compute_peaks, "default_dtype": parsed.model.compute_dtype or "bf16",
-        "vector_peak_ops_per_s": vec_peak, "hbm_peak_bytes_per_s": hbm_peak, "mte1_peak_bytes_per_s": mte1_peak, "mte2_peak_bytes_per_s": mte2_peak,
+        "vector_peak_ops_per_s": vec_peak, "vector_fp32_fma_flops_per_s": (2.0 if is_lane_issue else 1.0) * vec_peak, "vector_fp16_fma_flops_per_s": (4.0 if is_lane_issue else 1.0) * vec_peak,
+        "hbm_peak_bytes_per_s": hbm_peak, "mte1_peak_bytes_per_s": mte1_peak, "mte2_peak_bytes_per_s": mte2_peak,
         "mte3_peak_bytes_per_s": mte3_peak, "fixpipe_peak_bytes_per_s": fixpipe_peak, "link_peak_bytes_per_s": float(link_peak),
         "intra_package_link_bytes_per_s": float(intra_bw or link_peak), "inter_package_link_bytes_per_s": float(inter_bw or link_peak), "dies_per_package": parsed.machine.dies_per_package,
     }

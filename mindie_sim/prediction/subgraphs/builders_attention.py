@@ -133,17 +133,22 @@ def _build_n0(ctx: _Ctx) -> _Built:
     if role in {"attn_residual", "attn_norm"}:
         specs.append(("residual_add", "elementwise", "residual"))
         elements = ctx.hidden
-        signatures["residual_add"] = _elementwise( "residual", ctx, elements=elements, ops=2,
-            read_bytes=2 * elements * act_bytes, write_bytes=elements * act_bytes)
+        signatures["residual_add"] = _elementwise(
+            "residual", ctx, elements=elements, ops=2,
+            read_bytes=2 * elements * act_bytes, write_bytes=elements * act_bytes,
+        )
     if role != "attn_residual":
         specs.append(("rmsnorm", "elementwise", "norm"))
         elements = ctx.hidden
         facts = _gemma_facts(ctx)
-        signatures["rmsnorm"] = _elementwise( "norm", ctx, elements=elements, ops=5, read_bytes=elements * act_bytes,
-            write_bytes=elements * act_bytes, extra=(("norm_eps", ctx.model.norm_eps),
+        signatures["rmsnorm"] = _elementwise(
+            "norm", ctx, elements=elements, ops=5, read_bytes=elements * act_bytes,
+            write_bytes=elements * act_bytes,
+            extra=(("norm_eps", ctx.model.norm_eps),
                    ("layernorm", int(variant == "layernorm")),
                    ("norm_weight_offset", float(facts.get("norm_weight_offset", 0.0))),
-                   ("norm_arch", "gemma" if facts.get("gemma4") else "rmsnorm")))
+                   ("norm_arch", "gemma" if facts.get("gemma4") else "rmsnorm")),
+        )
     # Q/K normalization belongs to the attention producer after the projected
     # Q/K exist; N0 never emits a pre-projection copy.
     fusions = ()

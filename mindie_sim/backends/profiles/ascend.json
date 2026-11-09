@@ -12,7 +12,7 @@
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 5683200000000.0,
+        "vector": 2841600000000.0,
         "mte2_aic": 1420800000000.0,
         "mte2_aiv": 2841600000000.0,
         "mte3": 5683200000000.0,
@@ -233,7 +233,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1800.0,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2841600000000.0,
+        "vector_fp32_fma_tflops_per_die": 5.6832,
+        "vector_fp16_lane_ops_per_s_per_die": 5683200000000.0,
+        "vector_fp16_fma_tflops_per_die": 11.3664,
+        "cann_fused_mul_add_fp32_tflops_per_die": 11.3664,
+        "cann_fused_mul_add_fp16_tflops_per_die": 22.7328
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -284,6 +291,19 @@
           "hbm": {
             "rate_bytes_per_s": 1800000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2841600000000.0,
+            "units": 48,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2841600000000.0,
+            "vector_fp32_fma_tflops_per_die": 5.6832,
+            "vector_fp16_lane_ops_per_s_per_die": 5683200000000.0,
+            "vector_fp16_fma_tflops_per_die": 11.3664,
+            "cann_fused_mul_add_fp32_tflops_per_die": 11.3664,
+            "cann_fused_mul_add_fp16_tflops_per_die": 22.7328,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -323,7 +343,7 @@
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 5529600000000.0,
+        "vector": 2764800000000.0,
         "mte2_aic": 1382400000000.0,
         "mte2_aiv": 2764800000000.0,
         "mte3": 5529600000000.0,
@@ -544,7 +564,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1800.0,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+        "vector_fp32_fma_tflops_per_die": 5.5296,
+        "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+        "vector_fp16_fma_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp16_tflops_per_die": 22.1184
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -595,6 +622,19 @@
           "hbm": {
             "rate_bytes_per_s": 1800000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2764800000000.0,
+            "units": 48,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+            "vector_fp32_fma_tflops_per_die": 5.5296,
+            "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+            "vector_fp16_fma_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp16_tflops_per_die": 22.1184,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -634,7 +674,7 @@
       },
       "rates": {
         "hbm": 1800000000000.0,
-        "vector": 5529600000000.0,
+        "vector": 2764800000000.0,
         "mte2_aic": 1382400000000.0,
         "mte2_aiv": 2764800000000.0,
         "mte3": 5529600000000.0,
@@ -855,7 +895,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1800.0,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+        "vector_fp32_fma_tflops_per_die": 5.5296,
+        "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+        "vector_fp16_fma_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp16_tflops_per_die": 22.1184
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -906,6 +953,19 @@
           "hbm": {
             "rate_bytes_per_s": 1800000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2764800000000.0,
+            "units": 48,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+            "vector_fp32_fma_tflops_per_die": 5.5296,
+            "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+            "vector_fp16_fma_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp16_tflops_per_die": 22.1184,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -945,7 +1005,7 @@
       },
       "rates": {
         "hbm": 1600000000000.0,
-        "vector": 4608000000000.0,
+        "vector": 2304000000000.0,
         "mte2_aic": 1152000000000.0,
         "mte2_aiv": 2304000000000.0,
         "mte3": 4608000000000.0,
@@ -1166,7 +1226,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1600.0,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2304000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.608,
+        "vector_fp16_lane_ops_per_s_per_die": 4608000000000.0,
+        "vector_fp16_fma_tflops_per_die": 9.216,
+        "cann_fused_mul_add_fp32_tflops_per_die": 9.216,
+        "cann_fused_mul_add_fp16_tflops_per_die": 18.432
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -1217,6 +1284,19 @@
           "hbm": {
             "rate_bytes_per_s": 1600000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2304000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2304000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.608,
+            "vector_fp16_lane_ops_per_s_per_die": 4608000000000.0,
+            "vector_fp16_fma_tflops_per_die": 9.216,
+            "cann_fused_mul_add_fp32_tflops_per_die": 9.216,
+            "cann_fused_mul_add_fp16_tflops_per_die": 18.432,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -1256,7 +1336,7 @@
       },
       "rates": {
         "hbm": 800000000000.0,
-        "vector": 3840000000000.0,
+        "vector": 1920000000000.0,
         "mte2_aic": 960000000000.0,
         "mte2_aiv": 1920000000000.0,
         "mte3": 3840000000000.0,
@@ -1478,7 +1558,14 @@
         "l2_capacity_mib": 96.0,
         "hbm_peak_bw_gbps": 800.0,
         "hbm_peak_bw_verified": false,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
+        "vector_fp32_fma_tflops_per_die": 3.84,
+        "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
+        "vector_fp16_fma_tflops_per_die": 7.68,
+        "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
+        "cann_fused_mul_add_fp16_tflops_per_die": 15.36
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -1529,6 +1616,19 @@
           "hbm": {
             "rate_bytes_per_s": 800000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 1920000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 1920000000000.0,
+            "vector_fp32_fma_tflops_per_die": 3.84,
+            "vector_fp16_lane_ops_per_s_per_die": 3840000000000.0,
+            "vector_fp16_fma_tflops_per_die": 7.68,
+            "cann_fused_mul_add_fp32_tflops_per_die": 7.68,
+            "cann_fused_mul_add_fp16_tflops_per_die": 15.36,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -1568,7 +1668,7 @@
       },
       "rates": {
         "hbm": 1200000000000.0,
-        "vector": 4224000000000.0,
+        "vector": 2112000000000.0,
         "mte2_aic": 1056000000000.0,
         "mte2_aiv": 2112000000000.0,
         "mte3": 4224000000000.0,
@@ -1789,7 +1889,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 96.0,
         "hbm_peak_bw_gbps": 1200.0,
-        "npu_arch": "2201"
+        "npu_arch": "2201",
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -1840,6 +1947,19 @@
           "hbm": {
             "rate_bytes_per_s": 1200000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2112000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -1914,7 +2034,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -1928,7 +2048,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -1958,7 +2078,7 @@
       "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
       "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
       "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
       "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1850 MHz and 24 AIC/48 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
       "mte1": "one physical MTE1 resource with 24 AIC owners; generic aggregate supply 128 B/cycle*24*1.85 GHz=5.6832e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*24=1.13664e+13 B/s and L1->L0B 128 B/cycle*24=5.6832e+12 B/s. No independent mte1_a/mte1_b resources.",
       "mte2": "AIC read 32 B/cycle*24*1.85 GHz=1.4208e+12 B/s; AIV read 32 B/cycle*48*1.85 GHz=2.8416e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
@@ -2109,7 +2229,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1600.0,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2841600000000.0,
+        "vector_fp32_fma_tflops_per_die": 5.6832,
+        "vector_fp16_lane_ops_per_s_per_die": 5683200000000.0,
+        "vector_fp16_fma_tflops_per_die": 11.3664,
+        "cann_fused_mul_add_fp32_tflops_per_die": 11.3664,
+        "cann_fused_mul_add_fp16_tflops_per_die": 22.7328
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -2160,6 +2287,19 @@
           "hbm": {
             "rate_bytes_per_s": 1600000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2841600000000.0,
+            "units": 48,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2841600000000.0,
+            "vector_fp32_fma_tflops_per_die": 5.6832,
+            "vector_fp16_lane_ops_per_s_per_die": 5683200000000.0,
+            "vector_fp16_fma_tflops_per_die": 11.3664,
+            "cann_fused_mul_add_fp32_tflops_per_die": 11.3664,
+            "cann_fused_mul_add_fp16_tflops_per_die": 22.7328,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -2234,7 +2374,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -2248,7 +2388,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -2278,7 +2418,7 @@
       "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
       "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
       "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
       "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1800 MHz and 24 AIC/48 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
       "mte1": "one physical MTE1 resource with 24 AIC owners; generic aggregate supply 128 B/cycle*24*1.80 GHz=5.5296e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*24=1.10592e+13 B/s and L1->L0B 128 B/cycle*24=5.5296e+12 B/s. No independent mte1_a/mte1_b resources.",
       "mte2": "AIC read 32 B/cycle*24*1.80 GHz=1.3824e+12 B/s; AIV read 32 B/cycle*48*1.80 GHz=2.7648e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
@@ -2429,7 +2569,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1600.0,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+        "vector_fp32_fma_tflops_per_die": 5.5296,
+        "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+        "vector_fp16_fma_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+        "cann_fused_mul_add_fp16_tflops_per_die": 22.1184
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -2480,6 +2627,19 @@
           "hbm": {
             "rate_bytes_per_s": 1600000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2764800000000.0,
+            "units": 48,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2764800000000.0,
+            "vector_fp32_fma_tflops_per_die": 5.5296,
+            "vector_fp16_lane_ops_per_s_per_die": 5529600000000.0,
+            "vector_fp16_fma_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp32_tflops_per_die": 11.0592,
+            "cann_fused_mul_add_fp16_tflops_per_die": 22.1184,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -2554,7 +2714,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -2568,7 +2728,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -2598,7 +2758,7 @@
       "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
       "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
       "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
       "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1800 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
       "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.80 GHz=4.608e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=9.216e+12 B/s and L1->L0B 128 B/cycle*20=4.608e+12 B/s. No independent mte1_a/mte1_b resources.",
       "mte2": "AIC read 32 B/cycle*20*1.80 GHz=1.152e+12 B/s; AIV read 32 B/cycle*40*1.80 GHz=2.304e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
@@ -2749,7 +2909,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1600.0,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2304000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.608,
+        "vector_fp16_lane_ops_per_s_per_die": 4608000000000.0,
+        "vector_fp16_fma_tflops_per_die": 9.216,
+        "cann_fused_mul_add_fp32_tflops_per_die": 9.216,
+        "cann_fused_mul_add_fp16_tflops_per_die": 18.432
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -2800,6 +2967,19 @@
           "hbm": {
             "rate_bytes_per_s": 1600000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2304000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2304000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.608,
+            "vector_fp16_lane_ops_per_s_per_die": 4608000000000.0,
+            "vector_fp16_fma_tflops_per_die": 9.216,
+            "cann_fused_mul_add_fp32_tflops_per_die": 9.216,
+            "cann_fused_mul_add_fp16_tflops_per_die": 18.432,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -2874,7 +3054,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -2888,7 +3068,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -2918,7 +3098,7 @@
       "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
       "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
       "memory_path": "one shared HBM at 1.6e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
       "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1650 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
       "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e+12 B/s and L1->L0B 128 B/cycle*20=4.224e+12 B/s. No independent mte1_a/mte1_b resources.",
       "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e+12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
@@ -3069,7 +3249,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1600.0,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -3120,6 +3307,19 @@
           "hbm": {
             "rate_bytes_per_s": 1600000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2112000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -3194,7 +3394,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -3208,7 +3408,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -3238,7 +3438,7 @@
       "vector_issue": "one FP32 lane operation per cycle unless explicitly overridden",
       "launch_us": "host submission is undeclared, so launch_us=0 is the device-path baseline, not a measured host launch; runtime.submission.kernel_launch_ms or an explicit device.launch_us can declare host submission; an empty-task duration is not used as a host parameter",
       "memory_path": "one shared HBM at 1.4e12 B/s; AIC/AIV split read roles are local path supplies and actual GM transfers also charge shared HBM; no pair-shared private AIC/AIV rate is declared",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch",
       "pipeline_rates": "nominal analytical supply derived from this SKU's source.declaration clock 1650 MHz and 20 AIC/40 AIV using pinned A3 npu_arch_2201 instruction tables; the SKU clock/counts are declared configuration, not measured performance, and these rates do not replace the clock or fit observed model gaps",
       "mte1": "one physical MTE1 resource with 20 AIC owners; generic aggregate supply 128 B/cycle*20*1.65 GHz=4.224e+12 B/s is a conservative undifferentiated A/B supply. mte1_l0a and mte1_l0b both bind to this same resource and owner set: L1->L0A 256 B/cycle*20=8.448e+12 B/s and L1->L0B 128 B/cycle*20=4.224e+12 B/s. No independent mte1_a/mte1_b resources.",
       "mte2": "AIC read 32 B/cycle*20*1.65 GHz=1.056e+12 B/s; AIV read 32 B/cycle*40*1.65 GHz=2.112e+12 B/s. The AIV 32 B/cycle is an explicit analytical per-owner mapping inherited from Ascend910_9362 and is not a measured physical instruction peak. No generic third mte2 read pipe is declared; split roles are local supplies.",
@@ -3389,7 +3589,14 @@
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 192.0,
         "hbm_peak_bw_gbps": 1400.0,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -3440,6 +3647,19 @@
           "hbm": {
             "rate_bytes_per_s": 1400000000000.0,
             "basis": "existing SKU shared HBM rate retained; split read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2112000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "provenance": {
@@ -3524,7 +3744,7 @@
         "vector": {
           "minimum_ms": 0.0025,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               2,
               3
@@ -3538,7 +3758,7 @@
         "cube": {
           "minimum_ms": 0.005,
           "provenance": {
-            "basis": "user_reported_experience",
+            "basis": "arch2201_baseline_declaration",
             "reported_us": [
               5,
               5
@@ -3567,7 +3787,7 @@
       "source_discrepancy": "the read-only CANN 9.2.0 ini reports only AICoreMemoryRates l1_to_l0_a/l1_to_l0_b at 512/256 B/cycle, while the pinned public instruction table documents 256/128 B/cycle. The profile chooses the documented instruction 256/128 and preserves this discrepancy; no measurement is implied.",
       "pipeline_provenance": "asc-devkit pinned revision 56500ea0dc219380f50f4a17ce73ef5264f830fc: npu_arch_2201.md SHA d16edc43d897cc4eba425802e0b7d1f61b1bc76fb50768f336d458ddd4927994 (AIC:AIV 1:2, independent cores, GM communication, PIPE_MTE1 256/128 B/cycle); cube_instruction_theoretical_perf_summary.md SHA 3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728 (table 3 direction rates, table 7 Fixpipe L0C->L1 BF16/FP16 128 B/cycle and INT8 64 B/cycle). The read-only sim-runner CANN 9.2.0 ini SHA ffd0e8d061db7fa8b3877bcbaf8151edac77abcf3a50df95b42b21e2332a9ca3 confirms 20 AIC/40 AIV, 64 GiB, ddr_read 32, ub_to_ddr 64, cube_freq 1500 and has only AICoreMemoryRates, with no AIV-specific rates; the retained CANN 9.1beta1 ini SHA 5135cf6bc5e2eb56811917c9010341eb3946b5a3c2b51baab7fa775ffffc315c is preserved in data/verification/a3-9362-platform-metadata-20261029.json.",
       "accuracy": "nominal analytical resource profile; no accuracy claim",
-      "kernel_invocations": "A3 user-reported device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch"
+      "kernel_invocations": "declared_arch2201_ordinary_kernel_baseline: A3 device Vector 2-3us (midpoint 2.5), Cube about 5us; completion minimum, independent of host launch"
     },
     "transfer_channels": {
       "d2d_intra_package": {
@@ -3712,7 +3932,14 @@
         "l2_capacity_mib": 168.0,
         "hbm_peak_bw_gbps": 1200.0,
         "hbm_peak_bw_verified": false,
-        "intra_package_die_bw_gbps": 448.0
+        "intra_package_die_bw_gbps": 448.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 128,
+        "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+        "vector_fp32_fma_tflops_per_die": 4.224,
+        "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+        "vector_fp16_fma_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+        "cann_fused_mul_add_fp16_tflops_per_die": 16.896
       },
       "pipeline": {
         "status": "nominal_analytical_not_measured",
@@ -3763,6 +3990,19 @@
           "hbm": {
             "rate_bytes_per_s": 1200000000000.0,
             "basis": "existing single shared HBM rate retained; split AIC/AIV read paths do not create independent global memory"
+          },
+          "vector": {
+            "rate_ops_per_s": 2112000000000.0,
+            "units": 40,
+            "ops_per_cycle_per_aiv": 32,
+            "vec_execution_bytes_per_cycle_per_aiv": 128,
+            "vector_fp32_lane_ops_per_s_per_die": 2112000000000.0,
+            "vector_fp32_fma_tflops_per_die": 4.224,
+            "vector_fp16_lane_ops_per_s_per_die": 4224000000000.0,
+            "vector_fp16_fma_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp32_tflops_per_die": 8.448,
+            "cann_fused_mul_add_fp16_tflops_per_die": 16.896,
+            "basis": "32 FP32 lane-ops/cycle * AIV * clock (npu_arch_2201 vec_calc_size 128 B/cycle / 4 B FP32, matching CANN vector_instruction_theoretical_perf_summary.md Tables 6/8/9 MulAddDst(float), GatherMask(float), and Exp/Ln/Sqrt/Div at 32 elements/cycle/AIV; MulAddDst(half) and Add/Sub/Mul(float) are 2x at 64 elements/cycle/AIV; full-register 256 B Add/Sub/Mul(half) and FusedMulAdd(float/half, FP16 only on A2/A3) reach 64 FP32 / 128 FP16 elements/cycle/AIV)"
           }
         },
         "sources": {
@@ -4117,9 +4357,35 @@
         "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 147456.0,
         "l2_capacity_mib": 128.0,
-        "hbm_peak_bw_gbps": 4000.0
+        "hbm_peak_bw_gbps": 4000.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 256,
+        "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+        "vector_fp32_fma_tflops_per_die": 13.5168,
+        "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+        "vector_fp16_fma_tflops_per_die": 27.0336,
+        "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+        "cann_fused_mul_add_fp16_tflops_per_die": 27.0336
       },
-      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json",
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "vector": {
+            "rate_ops_per_s": 6758400000000.0,
+            "units": 64,
+            "ops_per_cycle_per_aiv": 64,
+            "vec_execution_bytes_per_cycle_per_aiv": 256,
+            "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+            "vector_fp32_fma_tflops_per_die": 13.5168,
+            "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+            "vector_fp16_fma_tflops_per_die": 27.0336,
+            "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+            "cann_fused_mul_add_fp16_tflops_per_die": 27.0336,
+            "basis": "64 FP32 single-instruction lane-ops/cycle * AIV * clock (official CANN npu_arch_3510 256 B/cycle / 4 B FP32); FP32 FMA or FP16/BF16 128-lane rate (reg_alu_lanes) is 2x (128 ops/cycle/AIV = 13.5168 TFLOPS), and FP16/BF16 FMA peak is 4x (256 FLOPs/cycle/AIV = 27.0336 TFLOPS)"
+          }
+        }
+      }
     }
   },
   "Ascend950DT_9582": {
@@ -4445,9 +4711,35 @@
         "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 98304.0,
         "l2_capacity_mib": 128.0,
-        "hbm_peak_bw_gbps": 4000.0
+        "hbm_peak_bw_gbps": 4000.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 256,
+        "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+        "vector_fp32_fma_tflops_per_die": 13.5168,
+        "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+        "vector_fp16_fma_tflops_per_die": 27.0336,
+        "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+        "cann_fused_mul_add_fp16_tflops_per_die": 27.0336
       },
-      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json",
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "vector": {
+            "rate_ops_per_s": 6758400000000.0,
+            "units": 64,
+            "ops_per_cycle_per_aiv": 64,
+            "vec_execution_bytes_per_cycle_per_aiv": 256,
+            "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+            "vector_fp32_fma_tflops_per_die": 13.5168,
+            "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+            "vector_fp16_fma_tflops_per_die": 27.0336,
+            "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+            "cann_fused_mul_add_fp16_tflops_per_die": 27.0336,
+            "basis": "64 FP32 single-instruction lane-ops/cycle * AIV * clock (official CANN npu_arch_3510 256 B/cycle / 4 B FP32); FP32 FMA or FP16/BF16 128-lane rate (reg_alu_lanes) is 2x (128 ops/cycle/AIV = 13.5168 TFLOPS), and FP16/BF16 FMA peak is 4x (256 FLOPs/cycle/AIV = 27.0336 TFLOPS)"
+          }
+        }
+      }
     }
   },
   "Ascend950PR_9579": {
@@ -4770,9 +5062,35 @@
         "configured_clock_mhz": 1650.0,
         "platform_config_hbm_mib": 65536.0,
         "l2_capacity_mib": 128.0,
-        "hbm_peak_bw_gbps": 1600.0
+        "hbm_peak_bw_gbps": 1600.0,
+        "vec_execution_bytes_per_cycle_per_aiv": 256,
+        "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+        "vector_fp32_fma_tflops_per_die": 13.5168,
+        "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+        "vector_fp16_fma_tflops_per_die": 27.0336,
+        "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+        "cann_fused_mul_add_fp16_tflops_per_die": 27.0336
       },
-      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json"
+      "onchip_rates": "data/observations/sources/arch3510-physical-services/manifest.json",
+      "pipeline": {
+        "status": "nominal_analytical_not_measured",
+        "clock_hz": 1650000000.0,
+        "fields": {
+          "vector": {
+            "rate_ops_per_s": 6758400000000.0,
+            "units": 64,
+            "ops_per_cycle_per_aiv": 64,
+            "vec_execution_bytes_per_cycle_per_aiv": 256,
+            "vector_fp32_lane_ops_per_s_per_die": 6758400000000.0,
+            "vector_fp32_fma_tflops_per_die": 13.5168,
+            "vector_fp16_lane_ops_per_s_per_die": 13516800000000.0,
+            "vector_fp16_fma_tflops_per_die": 27.0336,
+            "cann_fused_mul_add_fp32_tflops_per_die": 13.5168,
+            "cann_fused_mul_add_fp16_tflops_per_die": 27.0336,
+            "basis": "64 FP32 single-instruction lane-ops/cycle * AIV * clock (official CANN npu_arch_3510 256 B/cycle / 4 B FP32); FP32 FMA or FP16/BF16 128-lane rate (reg_alu_lanes) is 2x (128 ops/cycle/AIV = 13.5168 TFLOPS), and FP16/BF16 FMA peak is 4x (256 FLOPs/cycle/AIV = 27.0336 TFLOPS)"
+          }
+        }
+      }
     }
   }
 }

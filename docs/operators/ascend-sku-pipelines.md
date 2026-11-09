@@ -143,6 +143,45 @@ hf32 = bf16 / 2
 the HF32 value in `fp32`; their `fp32` is corrected to `bf16 / 16` and `hf32`
 is set explicitly to `bf16 / 2`.
 
+## Official Vector (`AIV`) & Cube (`AIC`) compute specification table (15 SKUs)
+
+To align external SKU specifications with official CANN & DaVinci architecture parameters (`npu_arch_2201` `vec_calc_size = 128 B/cycle/AIV` on A2/A3; `npu_arch_3510` `256 B/cycle/AIV` on A5) and avoid ambiguity against vendor datasheets or GPU SIMT peak tables, four accounting rules govern Ascend Vector (`AIV`) and Cube (`AIC`) declarations in `mindie_sim/backends/profiles/ascend.json`:
+
+1. **Unified Single-Instruction FP32 Execution Width Basis (`device.rates.vector`)**:
+   - Across all 15 Ascend SKUs, `device.rates.vector` is unified to the single-instruction FP32 lane throughput derived from `vec_execution_bytes_per_cycle_per_aiv / 4 B * N_aiv * clock`:
+     - **A2 & A3 (`npu_arch_2201`, `vec_calc_size = 128 B/cycle/AIV`)**: **`32` FP32 lanes/cycle/AIV** (`32 * N_aiv * f`), matching `MulAddDst(float)`, `GatherMask(float)`, and `Exp`/`Ln`/`Sqrt`/`Div` (`32 elements/cycle/AIV`) in CANN `vector_instruction_theoretical_perf_summary.md` (Tables 6, 8, 9).
+     - **A5 (`npu_arch_3510`, `256 B/cycle/AIV`)**: **`64` FP32 lanes/cycle/AIV** (`64 * N_aiv * f`), a 2× per-AIV progression over `npu_arch_2201`.
+2. **Instruction-Specific & Datasheet Vector FMA TFLOPS (`source.declaration` & `source.pipeline.fields.vector`)**:
+   - Every SKU in `ascend.json` explicitly records both the `vec_calc_size` lane/FMA rates and the CANN Table 8 `FusedMulAdd` theoretical peaks in `source.declaration` and `source.pipeline.fields.vector`:
+     - `vector_fp32_fma_tflops_per_die = 2 * rates.vector / 1e12` (`64 FLOPs/cycle/AIV` on A2/A3 from `32-lane MulAddDst(float)` FMA or `64-element Add/Mul(float)`; `128 FLOPs/cycle/AIV = 13.5168 TFLOPS` on A5).
+     - `vector_fp16_lane_ops_per_s_per_die = 2 * rates.vector` (`64 FP16 lanes/cycle/AIV` on A2/A3 matching `MulAddDst(half)` and `GatherMask(half/bfloat16_t)`; `128 FP16/BF16 lanes/cycle/AIV = reg_alu_lanes = 13.5168e12` on A5).
+     - `vector_fp16_fma_tflops_per_die = 4 * rates.vector / 1e12` (`128 FLOPs/cycle/AIV` on A2/A3 from `64-lane MulAddDst(half)` FMA or `128-element Add/Mul(half)`; `256 FLOPs/cycle/AIV = 27.0336 TFLOPS` on A5).
+     - `cann_fused_mul_add_fp32_tflops_per_die` & `cann_fused_mul_add_fp16_tflops_per_die`: CANN Table 8 `FusedMulAdd` on A2/A3 (`npu_arch_2201`) issues across the full `256 B` vector register (`64 FP32 elements/cycle = 128 FLOPs/cycle/AIV`, `128 FP16 (half) elements/cycle = 256 FLOPs/cycle/AIV`; note A2/A3 `FusedMulAdd` supports `half` FP16 and `float` FP32, whereas A5 `reg_alu_lanes` supports both `half` FP16 and `bfloat16_t` BF16 at `128 elements/cycle/AIV = 27.0336 TFLOPS`).
+3. **`device.compute_peaks.fp32` is AIC Cube Matrix FP32, not AIV Vector FP32**:
+   - Unlike GPU profiles (`nvidia.json`) where `compute_peaks.fp32` represents SIMT vector FP32 throughput, `device.compute_peaks.fp32` in `ascend.json` represents **AIC Cube matrix FP32 throughput** (`cubek4 = bf16 / 4` on A2/A3 `npu_arch_2201`; `cubek1 = bf16 / 16 = 27.0336 TFLOPS` native FP32 vs `cubek8 = bf16 / 2 = 216.2688 TFLOPS` HF32 on A5 `npu_arch_3510`).
+4. **Per-Die vs Per-Package (Dual-Die A3)**:
+   - In `ascend.json`, `device.*` fields describe **one NPU Die** (`dies_per_package = 1` on A2 and A5; `dies_per_package = 2` on A3 `Ascend910_93*`). Full-package A3 card totals are `2 × per-Die`.
+
+| SKU | Family / Arch | Dies / Pkg | AIC / AIV (per Die) | Clock (MHz) | `rates.vector` FP32 Lane/s (per Die) | `vec_calc_size` Vec FP32 / FP16 FMA (TFLOPS / Die) | CANN Table 8 `FusedMulAdd` FP32 / FP16* FMA (TFLOPS / Die) | Cube BF16/FP16 (TFLOPS / Die) | Cube Native FP32 / HF32 (TFLOPS / Die) |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `Ascend910B1` | A2 (`2201`) | 1 | 24 / 48 | 1850 | `2.8416e12` | `5.6832` / `11.3664` | `11.3664` / `22.7328` | `363.7248` | `90.9312` / `181.8624` |
+| `Ascend910B2` | A2 (`2201`) | 1 | 24 / 48 | 1800 | `2.7648e12` | `5.5296` / `11.0592` | `11.0592` / `22.1184` | `353.8944` | `88.4736` / `176.9472` |
+| `Ascend910B2C` | A2 (`2201`) | 1 | 24 / 48 | 1800 | `2.7648e12` | `5.5296` / `11.0592` | `11.0592` / `22.1184` | `353.8944` | `88.4736` / `176.9472` |
+| `Ascend910B3` | A2 (`2201`) | 1 | 20 / 40 | 1800 | `2.3040e12` | `4.6080` / `9.2160` | `9.2160` / `18.4320` | `294.9120` | `73.7280` / `147.4560` |
+| `Ascend910B4-1` | A2 (`2201`) | 1 | 20 / 40 | 1650 | `2.1120e12` | `4.2240` / `8.4480` | `8.4480` / `16.8960` | `270.3360` | `67.5840` / `135.1680` |
+| `Ascend910B4` | A2 (`2201`) | 1 | 20 / 40 | 1500 | `1.9200e12` | `3.8400` / `7.6800` | `7.6800` / `15.3600` | `245.7600` | `61.4400` / `122.8800` |
+| `Ascend910_9391` | A3 (`2201`) | 2 | 24 / 48 | 1850 | `2.8416e12` | `5.6832` / `11.3664` | `11.3664` / `22.7328` | `363.7248` | `90.9312` / `181.8624` |
+| `Ascend910_9392` | A3 (`2201`) | 2 | 24 / 48 | 1800 | `2.7648e12` | `5.5296` / `11.0592` | `11.0592` / `22.1184` | `353.8944` | `88.4736` / `176.9472` |
+| `Ascend910_9381` | A3 (`2201`) | 2 | 20 / 40 | 1800 | `2.3040e12` | `4.6080` / `9.2160` | `9.2160` / `18.4320` | `294.9120` | `73.7280` / `147.4560` |
+| `Ascend910_9382` | A3 (`2201`) | 2 | 20 / 40 | 1650 | `2.1120e12` | `4.2240` / `8.4480` | `8.4480` / `16.8960` | `270.3360` | `67.5840` / `135.1680` |
+| `Ascend910_9372` | A3 (`2201`) | 2 | 20 / 40 | 1650 | `2.1120e12` | `4.2240` / `8.4480` | `8.4480` / `16.8960` | `270.3360` | `67.5840` / `135.1680` |
+| `Ascend910_9362` | A3 (`2201`) | 2 | 20 / 40 | 1650 | `2.1120e12` | `4.2240` / `8.4480` | `8.4480` / `16.8960` | `270.3360` | `67.5840` / `135.1680` |
+| `Ascend950PR_9579` | A5 (`3510`) | 1 | 32 / 64 | 1650 | `6.7584e12` | `13.5168` / `27.0336` | `13.5168` / `27.0336` | `432.5376` | `27.0336` / `216.2688` |
+| `Ascend950DT_9581` | A5 (`3510`) | 1 | 32 / 64 | 1650 | `6.7584e12` | `13.5168` / `27.0336` | `13.5168` / `27.0336` | `432.5376` | `27.0336` / `216.2688` |
+| `Ascend950DT_9582` | A5 (`3510`) | 1 | 32 / 64 | 1650 | `6.7584e12` | `13.5168` / `27.0336` | `13.5168` / `27.0336` | `432.5376` | `27.0336` / `216.2688` |
+
+*\*Note: On A2/A3 (`npu_arch_2201`), CANN Table 8 `FusedMulAdd` supports `half` (FP16) and `float` (FP32); on A5 (`npu_arch_3510`), `reg_alu_lanes` supports `float` (FP32) as well as both `half` (FP16) and `bfloat16_t` (BF16). For dual-die A3 SKUs (`dies_per_package = 2`), full-package totals are `2 × per-Die`.*
+
 ## Provenance
 
 Pinned `asc-devkit` revision
@@ -191,7 +230,7 @@ MHz `cube_freq` is still not substituted for the configured 1650 MHz.
   It is not evidence that host submission is free. The stated
   `runtime.submission.kernel_launch_ms`/`device.launch_us` declaration path is a
   policy statement; no host-launch measurement is included.
-- No A2 peaks, capacities or links were changed.
+- No A2 matrix peaks, capacities or links were changed; A2 `device.rates.vector` was unified from `64` to `32` FP32 lanes/cycle/AIV (`vec_calc_size = 128 B/cycle/AIV`) to match A3 `npu_arch_2201`.
 
 ## Focused checks
 
@@ -218,9 +257,10 @@ suite, device workload, remote job or automation was run.
 Independent acceptance replaced two prose-matching checks with 15 real
 host-submission controls. For every profile, undeclared host submission serves
 zero launch work; an explicit 7 us declaration adds exactly 7 us and preserves
-device work. The reviewer also compared all profiles against the parent commit:
-existing memory, clocks, owner counts, buffers, HBM/vector rates, links,
-invocation constraints and BF16/FP16/INT8/FP8 peaks are unchanged.
+device work. Existing memory, clocks, owner counts, buffers, HBM rates, links,
+invocation constraints and BF16/FP16/INT8/FP8 matrix peaks are unchanged, while
+`device.rates.vector` is unified across A2/A3 (`32` FP32 lanes/cycle/AIV) and
+A5 (`64` FP32 lanes/cycle/AIV).
 
 The final focused set passes 126 tests in 2.80 seconds: 34 SKU controls,
 51 model/quantization alias and ordinary-serving controls, the existing A3

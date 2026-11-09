@@ -26,6 +26,8 @@ def local_batch(concurrency: int, dp: int) -> int:
 def ep_batch(concurrency: int, dp: int, ep: int) -> int:
     """Total requests participating in one expert-parallel AllToAll cohort."""
     dp_n, ep_n = max(1, int(dp)), max(1, int(ep))
+    if ep_n <= 1:
+        return local_batch(concurrency, dp_n)
     return max(1, math.ceil(max(1, int(concurrency)) * min(dp_n, ep_n) / dp_n))
 
 
@@ -36,7 +38,8 @@ def clamp_graph_bucket(bucket: int, batch: int, dp: int, buckets: tuple[int, ...
         return 0
     lb = max(1, int(batch))
     if buckets:
-        for b in sorted(int(x) for x in buckets if int(x) > 0):
+        valid = {int(x) for x in buckets if int(x) > 0}
+        for b in sorted(valid):
             if b >= lb:
                 return b
         return 0
@@ -240,9 +243,7 @@ class WorkloadGeometry:
 
     @property
     def effective_tokens(self) -> int:
-        if self.graph_bucket:
-            return max(self.tokens, self.graph_bucket)
-        return self.physical_tokens or self.tokens
+        return max(self.tokens, self.physical_tokens or 0, self.graph_bucket or 0)
 
     @property
     def phase_name(self) -> str:

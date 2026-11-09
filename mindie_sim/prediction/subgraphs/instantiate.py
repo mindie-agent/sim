@@ -318,7 +318,7 @@ def _parallel(ctx: _Ctx) -> tuple[tuple[str, Any], ...]:
     return (("tp", ctx.tp), ("ep", ctx.ep), ("etp", ctx.etp),
             ("pp", ctx.features.pp), ("dp", ctx.features.dp),
             ("cp", ctx.features.cp), ("pcp", ctx.features.pcp),
-            ("world", ctx.features.world_size))
+            ("world", ctx.features.world_size), ("ranks_per_node", int(dict(ctx.features.metadata).get("ranks_per_node", 8) or 8)))
 
 def _tiles(ctx: _Ctx) -> tuple[tuple[str, Any], ...]:
     features = ctx.features

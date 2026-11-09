@@ -41,7 +41,7 @@ from mindie_sim.prediction.piecewise.geometry import (
 )
 from mindie_sim.prediction.piecewise.model_pipeline import assemble_model
 from mindie_sim.prediction.piecewise.service_span import (
-    service_ttft_overhead_ms, ttft_wave_scale,
+    chunked_prefill_mean_ttft_ms, service_ttft_overhead_ms, ttft_wave_scale,
 )
 from mindie_sim.prediction.subgraphs import FeatureConfig
 from mindie_sim.prediction.subgraphs.builders_attention import gemma4_model_spec
@@ -263,15 +263,18 @@ def test_l4_cohort_batch_and_wave_conservation():
     assert ep_batch(8, 8, 2) == 2
     assert ep_batch(7, 4, 2) == 4
     assert ep_batch(1, 1, 1) == 1
+    assert ep_batch(8, 4, 1) == 2
     for waves, dp in ((2, 1), (3, 2), (4, 4), (8, 8)):
-        scale = ttft_wave_scale(
-            phase="prefill", concurrency=waves * dp, dp=dp, ep=1, layers=40,
-            graph_buckets=(), prompt_tokens=8192,
+        mean_ttft = chunked_prefill_mean_ttft_ms(
+            [8192] * (waves * dp), dp=dp, max_batched_tokens=8192, body_one=lambda tok: 1.0,
         )
-        assert scale == pytest.approx((waves + 1) / (2.0 * waves))
-        assert scale * waves == pytest.approx((waves + 1) / 2.0)
+        assert mean_ttft == pytest.approx((waves + 1) / 2.0)
+        assert mean_ttft / waves == pytest.approx((waves + 1) / (2.0 * waves))
     assert ttft_wave_scale(
         phase="prefill", concurrency=8, dp=4, ep=1, layers=2, graph_buckets=(), prompt_tokens=8191,
+    ) == 1.0
+    assert ttft_wave_scale(
+        phase="prefill", concurrency=8, dp=4, ep=1, layers=2, graph_buckets=(), prompt_tokens=8192,
     ) == 1.0
     assert ttft_wave_scale(
         phase="prefill", concurrency=4, dp=4, ep=1, layers=2, graph_buckets=(), prompt_tokens=9000,
@@ -307,10 +310,9 @@ def test_l4_cohort_batch_and_wave_conservation():
     body = float(prediction.total_ms)
     overhead = service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=4)
     waves = local
-    scale = ttft_wave_scale(
-        phase="prefill", concurrency=8, dp=4, ep=4, layers=model.layers,
-        graph_buckets=(), prompt_tokens=8192,
-    )
+    scale = chunked_prefill_mean_ttft_ms(
+        [8192] * 8, dp=4, max_batched_tokens=8192, body_one=lambda tok: 1.0,
+    ) / waves
     assert overhead == 95.0
     assert scale * waves == pytest.approx((waves + 1) / 2.0)
     assert body * scale + overhead > body
