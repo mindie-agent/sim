@@ -43,22 +43,16 @@ from .guards import PipeDemand
 
 @dataclass(frozen=True)
 class SerialResult:
-    costs: tuple[OperatorCost, ...]
-    total_ms: Fraction
-    state: Any
-    gaps_ms: tuple[Fraction, ...] = ()
-    fused: tuple[str, ...] = ()
+    costs: tuple[OperatorCost, ...]; total_ms: Fraction; state: Any
+    gaps_ms: tuple[Fraction, ...] = (); fused: tuple[str, ...] = ()
     readiness: tuple[tuple[str, Fraction], ...] = ()
     fusion_results: tuple["FusionResult", ...] = ()
     contention: "ContentionEnvelope | None" = None
-
     @property
-    def gap_ms(self) -> Fraction:
-        return sum(self.gaps_ms, Fraction(0))
+    def gap_ms(self) -> Fraction: return sum(self.gaps_ms, Fraction(0))
     def by_name(self, name: str) -> OperatorCost:
         for cost in self.costs:
-            if cost.name == name:
-                return cost
+            if cost.name == name: return cost
         raise ModelingError(f"serial_cost_missing:{name}")
     def to_dict(self) -> dict[str, Any]:
         return { "total_ms": str(self.total_ms), "gap_ms": str(self.gap_ms), "fused": list(self.fused),
@@ -66,17 +60,11 @@ class SerialResult:
 
 @dataclass(frozen=True)
 class FusionResult:
-    name: str
-    semantic: tuple[OperatorCost, ...]
-    fused: OperatorCost
-    removed: tuple[tuple[str, Fraction], ...]
-    kept: tuple[tuple[str, Fraction], ...]
-    startup_count: int = 1
-    isolated_ms: Fraction = Fraction(0)
-
+    name: str; semantic: tuple[OperatorCost, ...]; fused: OperatorCost
+    removed: tuple[tuple[str, Fraction], ...]; kept: tuple[tuple[str, Fraction], ...]
+    startup_count: int = 1; isolated_ms: Fraction = Fraction(0)
     @property
-    def removed_bytes(self) -> Fraction:
-        return sum((value for _, value in self.removed), Fraction(0))
+    def removed_bytes(self) -> Fraction: return sum((value for _, value in self.removed), Fraction(0))
     def to_dict(self) -> dict[str, Any]:
         return { "name": self.name, "members": [cost.name for cost in self.semantic], "fused": self.fused.to_dict(),
             "removed": {key: str(value) for key, value in self.removed},
@@ -87,16 +75,11 @@ class FusionResult:
 class ForkJoinResult:
     prefix_ms: Fraction; join_ms: Fraction; isolated_max_ms: Fraction
     contention_ms: Fraction; engine_ms: Fraction
-    branches: tuple[tuple[str, Fraction], ...]
-    resources: tuple[tuple[str, Fraction], ...] = ()
-
+    branches: tuple[tuple[str, Fraction], ...]; resources: tuple[tuple[str, Fraction], ...] = ()
     @property
-    def total_ms(self) -> Fraction:
-        return self.prefix_ms + self.contention_ms + self.join_ms
-
+    def total_ms(self) -> Fraction: return self.prefix_ms + self.contention_ms + self.join_ms
     @property
-    def rejected_isolated_max(self) -> bool:
-        return self.contention_ms != self.isolated_max_ms
+    def rejected_isolated_max(self) -> bool: return self.contention_ms != self.isolated_max_ms
     def to_dict(self) -> dict[str, Any]:
         return { "prefix_ms": str(self.prefix_ms), "join_ms": str(self.join_ms),
             "isolated_max_ms": str(self.isolated_max_ms), "contention_ms": str(self.contention_ms),
@@ -113,27 +96,15 @@ class ContentionEnvelope:
     the per-resource lower bound ``sum(work_p)/rate_p``.  Two HBM-only streams
     therefore add their bytes; disjoint Cube/Link streams may overlap.
     """
-
-    makespan_ms: Fraction
-    isolated_max_ms: Fraction
-    isolated_sum_ms: Fraction
-    resource_work: tuple[tuple[str, Fraction], ...]
-    resource_bounds: tuple[tuple[str, Fraction], ...]
-    shared_pipes: tuple[str, ...]
-    disjoint_pipes: tuple[str, ...]
-    branches: tuple[tuple[str, Fraction], ...]
-
+    makespan_ms: Fraction; isolated_max_ms: Fraction; isolated_sum_ms: Fraction
+    resource_work: tuple[tuple[str, Fraction], ...]; resource_bounds: tuple[tuple[str, Fraction], ...]
+    shared_pipes: tuple[str, ...]; disjoint_pipes: tuple[str, ...]; branches: tuple[tuple[str, Fraction], ...]
     @property
-    def additivity_gap_ms(self) -> Fraction:
-        return self.makespan_ms - self.isolated_sum_ms
-
+    def additivity_gap_ms(self) -> Fraction: return self.makespan_ms - self.isolated_sum_ms
     @property
-    def lower_bound_ms(self) -> Fraction:
-        return max((value for _, value in self.resource_bounds), default=Fraction(0))
-
+    def lower_bound_ms(self) -> Fraction: return max((value for _, value in self.resource_bounds), default=Fraction(0))
     @property
-    def rejected_isolated_max(self) -> bool:
-        return self.makespan_ms != self.isolated_max_ms
+    def rejected_isolated_max(self) -> bool: return self.makespan_ms != self.isolated_max_ms
     def to_dict(self) -> dict[str, Any]:
         return { "makespan_ms": str(self.makespan_ms), "isolated_max_ms": str(self.isolated_max_ms),
             "isolated_sum_ms": str(self.isolated_sum_ms), "lower_bound_ms": str(self.lower_bound_ms),
@@ -207,7 +178,7 @@ def contention_envelope( branches: Mapping[str, Sequence[Sequence[tuple[str, Fra
             for pipe, amount in stage:
                 if amount > 0:
                     coalesced[pipe] = coalesced.get(pipe, Fraction(0)) + amount
-            stage_time = max((amount / supply.effective(pipe) for pipe, amount in coalesced.items()), default=Fraction(0))
+            stage_time = max((amount / as_fraction(supply.effective(pipe)) for pipe, amount in coalesced.items()), default=Fraction(0))
             total += stage_time
             for pipe, amount in coalesced.items():
                 work[pipe] = work.get(pipe, Fraction(0)) + amount
@@ -425,20 +396,26 @@ def lower_fusion(instance: SubgraphInstance, costs: Sequence[OperatorCost],
         if slices is not None and name in {"qkv_activation", "q_projection_output"}:
             # Only the projection's intermediate Q/K write disappears; the
             # gate and V slices stay stored, and norm/rotary republish Q/K.
-            removed_here += _subtract_stage(stages_by_member[owner], "mte3",
-                                            slices["qk_input"], reverse=True)
-            _subtract_stage(stages_by_member[owner], "hbm", slices["qk_input"], reverse=True)
+            # HBM is paired with the MTE bytes actually removed so a narrower
+            # consumer cannot eat the producer's weight traffic or its own
+            # surviving store.
+            wrote = _subtract_stage(stages_by_member[owner], "mte3", slices["qk_input"], reverse=True)
+            _subtract_stage(stages_by_member[owner], "hbm", wrote, reverse=True)
+            removed_here += wrote
             if owner < len(members) - 1:
-                removed_here += _subtract_stage(stages_by_member[owner + 1], "mte2", produced)
-                _subtract_stage(stages_by_member[owner + 1], "hbm", produced)
+                read = _subtract_stage(stages_by_member[owner + 1], "mte2", produced)
+                _subtract_stage(stages_by_member[owner + 1], "hbm", read)
+                removed_here += read
             removed[name] = removed.get(name, Fraction(0)) + removed_here
             continue
         if name in write_removed:
-            removed_here += _subtract_stage(stages_by_member[owner], "mte3", produced, reverse=True)
-            _subtract_stage(stages_by_member[owner], "hbm", produced, reverse=True)
+            wrote = _subtract_stage(stages_by_member[owner], "mte3", produced, reverse=True)
+            _subtract_stage(stages_by_member[owner], "hbm", wrote, reverse=True)
+            removed_here += wrote
         if owner < len(members) - 1:
-            removed_here += _subtract_stage(stages_by_member[owner + 1], "mte2", produced)
-            _subtract_stage(stages_by_member[owner + 1], "hbm", produced)
+            read = _subtract_stage(stages_by_member[owner + 1], "mte2", produced)
+            _subtract_stage(stages_by_member[owner + 1], "hbm", read)
+            removed_here += read
         if removed_here > 0:
             removed[name] = removed.get(name, Fraction(0)) + removed_here
 
@@ -589,9 +566,18 @@ def evaluate_serial_split( compiled: CompiledSubgraph, geometry: WorkloadGeometr
     if not waits and "aux" in streams.values():
         fork_ops = {"qkvz_projection", "qkv_projection", "ba_projection", "gate_projection", "conv", "prepare",
                     "window_attention", "compressed_attention"}
+        # A fused kernel replaces its members in place and keeps their stream.
+        # Dropping it onto the serial tail would undo the overlap and could
+        # make the fused schedule slower than the unfused one.
+        fork_names = set(fork_ops)
+        for result in fusion_results:
+            member_streams = {streams.get(cost.name, "main") for cost in result.semantic}
+            streams[result.fused.name] = next(iter(member_streams)) if len(member_streams) == 1 else "main"
+            if any(cost.name in fork_ops for cost in result.semantic):
+                fork_names.add(result.fused.name)
         branches: dict[str, list[list[tuple[str, Fraction]]]] = {"main": [], "aux": []}
         for cost in costs:
-            if cost.name in fork_ops:
+            if cost.name in fork_names:
                 target = branches["aux" if streams.get(cost.name) == "aux" else "main"]
                 target.extend([list(s) for s in cost.stage_work] if cost.stage_work else ([list(cost.work)] if cost.work else []))
             else:

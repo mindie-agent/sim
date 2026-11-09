@@ -390,7 +390,7 @@ class CompiledOperator:
         self._raw_stages, self._has_hw_service = base_program.stages, bool(self.supply.invocations or self.supply.resource_units)
         if self._has_hw_service and base_program.stages:
             pipes = {d.pipe for s in base_program.stages for d in s}
-            t_pipe = ("vector" if self.family in {"collective", "transport"} and "vector" in pipes else ("link" if self.family in {"collective", "transport"} and "link" in pipes else ("cube" if "cube" in pipes else ("vector" if "vector" in pipes else next(iter(pipes), "hbm")))))
+            t_pipe = ("vector" if self.family in {"collective", "transport"} and "vector" in pipes else ("link" if self.family in {"collective", "transport"} and "link" in pipes else ("cube" if "cube" in pipes else ("vector" if "vector" not in getattr(self.supply, "undeclared_pipes", ()) else (sorted(pipes)[0] if pipes else "hbm")))))
             scaled = tuple(tuple(PipeDemand(d.pipe, simplify(d.work * Var(f"HW_SCALE_{d.pipe.upper()}")), d.supply, d.unit) for d in s) for s in base_program.stages)
             span_stage = (PipeDemand(t_pipe, Var("HW_SPAN_WORK"), self.supply.effective(t_pipe), _PIPE_UNITS.get(t_pipe, "work")),)
             self.program = replace(base_program, stages=(*scaled, span_stage))
@@ -521,7 +521,9 @@ class CompiledOperator:
                                 for name, expr in self.program.materialization)
         internal = tuple((name, evaluate(expr, env))
                          for name, expr in self.program.internal)
-        derived = tuple((name, evaluate(expr, env)) for name, expr in self.program.derived)
+        derived = tuple((name, evaluate(expr, env)) for name, expr in self.program.derived) + (
+            (("kv_bf16", Fraction(1)),) if int(env.get("KV_BF16", 0) or 0) > 0 else ()
+        )
         cells = tuple(axis.cell(env[axis.name]) for axis in self.program.axes)
         regime = tuple((axis.name, int(env[axis.name])) for axis in self.program.axes)
         return OperatorCost(

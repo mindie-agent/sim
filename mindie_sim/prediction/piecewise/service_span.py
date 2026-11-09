@@ -16,6 +16,54 @@
 from __future__ import annotations
 
 import math
+from typing import Callable, Sequence
+
+from .lowering import lower_layer_predictions
+
+__all__ = [
+    "attribute_rope",
+    "chunked_prefill_mean_ttft_ms",
+    "lower_layer_predictions",
+    "service_ttft_overhead_ms",
+    "ttft_wave_scale",
+]
+
+
+def chunked_prefill_mean_ttft_ms(
+    prompts: Sequence[int],
+    *,
+    dp: int,
+    max_batched_tokens: int = 8192,
+    body_one: Callable[..., float],
+) -> float:
+    """Mean TTFT under FCFS chunked prefill across ``dp`` data-parallel ranks.
+
+    Requests are placed round-robin onto ``dp`` ranks. Each request stays on its
+    assigned rank, and chunks of up to ``max_batched_tokens`` on that rank run
+    serially, priced by ``body_one(chunk_tokens, kv_context_tokens)`` (or
+    ``body_one(chunk_tokens)`` for 1-argument callbacks).
+    """
+    budget = max(1, int(max_batched_tokens))
+    ranks: list[list[int]] = [[] for _ in range(max(1, int(dp)))]
+    for index, prompt in enumerate(prompts):
+        ranks[index % len(ranks)].append(max(1, int(prompt)))
+    finishes: list[float] = []
+    for rank in ranks:
+        clock = 0.0
+        for prompt in rank:
+            left = prompt
+            done = 0
+            while left > 0:
+                take = min(budget, left)
+                done += take
+                try:
+                    step_ms = float(body_one(take, done))
+                except TypeError:
+                    step_ms = float(body_one(take))
+                clock += step_ms
+                left -= take
+            finishes.append(clock)
+    return sum(finishes) / max(1, len(finishes))
 
 
 def ttft_wave_scale(

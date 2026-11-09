@@ -1,4 +1,10 @@
-"""Explicit configuration changes must reach actual physical service."""
+"""Explicit configuration changes must reach actual physical service.
+
+[Role] Verify machine/device/per-die override precedence across rates, peaks, and cores.
+[Invariants] Explicit user declarations override SKU defaults without mutating input mappings.
+[Timeouts & Locks] Tier 0 (<5s), pure in-memory evaluation without locks.
+[Side-Effect Policy] Read-only in-memory study and operator_costs verification.
+"""
 from copy import deepcopy
 from dataclasses import replace
 

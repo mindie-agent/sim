@@ -132,9 +132,24 @@ def test_software_tile_is_not_the_mmad_fractal_and_cores_stay_a3_by_default():
 
 
 def test_missing_invocation_classes_use_declared_minima_not_ratios():
-    supply = PipeSupply(
+    empty_supply = PipeSupply(
         (("cube", 1.0e6), ("vector", 1.0e6), ("hbm", 1.0e6), ("mte2", 1.0e6)),
         resource_units=(("compute_units", 32), ("vector", 64)),
+    )
+    empty_times = [Fraction(1)]
+    apply_hardware_service(
+        _Op(empty_supply), _Geometry(), {}, [{"cube": Fraction(1)}], empty_times,
+        {"cube": Fraction(1)}, {"cube": Fraction(1)}, {"cube": Fraction(1)},
+    )
+    assert empty_times[-1] == Fraction(1)
+    hw_9579 = PipeSupply.from_hardware(Hardware.from_mapping({
+        "backend": "ascend", "sku": "Ascend950PR_9579", "num_devices": 1,
+    }))
+    supply = PipeSupply(
+        (("cube", 1.0e6), ("vector", 1.0e6), ("hbm", 1.0e6), ("mte2", 1.0e6)),
+        invocations=hw_9579.invocations,
+        resource_units=hw_9579.resource_units,
+        flops_by_dtype=hw_9579.flops_by_dtype,
     )
     stage_times = [Fraction(1)]
     apply_hardware_service(

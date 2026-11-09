@@ -185,6 +185,7 @@ class WorkloadGeometry:
     media_tokens: int = 0
     routing: tuple[tuple[int, tuple[int, ...]], ...] = ()
     phase: str = ""
+    local_batch: int = 0
 
     def __post_init__(self) -> None:
         requests = tuple(self.requests)
@@ -193,7 +194,7 @@ class WorkloadGeometry:
         if not all(isinstance(request, RequestGeometry) for request in requests):
             raise ModelingError("workload_request_record_invalid")
         object.__setattr__(self, "requests", requests)
-        for name in ("graph_bucket", "cohort_batch", "physical_tokens", "media_tokens"):
+        for name in ("graph_bucket", "cohort_batch", "physical_tokens", "media_tokens", "local_batch"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ModelingError(f"workload_geometry_invalid:{name}")
@@ -262,15 +263,16 @@ class WorkloadGeometry:
         if batch == self.batch:
             return self
         shapes = {(r.q_len, r.context, r.phase, r.query_ranges, r.draft_len) for r in self.requests}
+        loc = self.local_batch or self.batch
         if len(shapes) > 1:
             if batch < self.batch or batch % self.batch != 0:
                 raise ModelingError(f"workload_ragged_cohort_expansion_ambiguous:{self.batch}->{batch}")
             reps = batch // self.batch
             return replace(self, requests=tuple(replace(r) for _ in range(reps) for r in self.requests),
-                           cohort_batch=batch)
+                           cohort_batch=batch, local_batch=loc)
         proto = self.requests[0]
         return replace(self, requests=tuple(replace(proto) for _ in range(batch)),
-                       cohort_batch=batch)
+                       cohort_batch=batch, local_batch=loc)
 
     def for_subgraph(self, kind: str) -> "WorkloadGeometry":
         """Lift EP-wide subgraphs (routed MoE F3 and prefill F2) to cohort batch."""

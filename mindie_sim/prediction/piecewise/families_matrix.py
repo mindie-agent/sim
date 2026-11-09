@@ -75,7 +75,7 @@ def _aiv_quantum(elem_bytes: Any) -> int:
 
 def _aiv_floor(rows: Expr, tile: int, cores: int, elem_bytes: Any) -> Expr:
     waves = CeilDiv(rows, Const(max(1, int(tile))))
-    c = max(1, int(cores))
+    c = min(max(1, int(cores)), 32)
     return Mul((waves, Const(c * _aiv_quantum(elem_bytes))))
 
 
@@ -445,7 +445,7 @@ def _compile_elementwise(ctx: CompiledOperator, operator: BoundOperator) -> Fami
                         StepGuard("token_tiles", "tokens", mt), "max_tokens"),)
 
     def binder(geometry: WorkloadGeometry, state: StateView) -> dict[str, Any]:
-        rows = geometry.effective_tokens
+        rows, explicit_routing = geometry.effective_tokens, 0
         if f3_domain:
             # Routed activation lives on the same local-expert domain as the
             # adjacent grouped GEMM: an explicit local shard is consumed as
@@ -461,11 +461,14 @@ def _compile_elementwise(ctx: CompiledOperator, operator: BoundOperator) -> Fami
             if counts is None:
                 counts = _counts_for(ctx, geometry, state, moe_local,
                                      moe_top_k, experts)
-            elif len(counts) == experts and experts != moe_local:
-                counts = tuple(counts)[:moe_local]
+            else:
+                explicit_routing = 1
+                if len(counts) == experts and experts != moe_local:
+                    counts = tuple(counts)[:moe_local]
             rows = sum(int(value) for value in counts)
         return {"elements_per_token": elements, "routed_rows": rows,
-                "ROUTED_ROWS": rows, "vector_ops_per_token": elements * ops,
+                "ROUTED_ROWS": rows, "EXPLICIT_ROUTING": explicit_routing,
+                "vector_ops_per_token": elements * ops,
                 "read_per_token": read, "write_per_token": write}
 
     tokens = Var("ROUTED_ROWS") if f3_domain else Var("T")

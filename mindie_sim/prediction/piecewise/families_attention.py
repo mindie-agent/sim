@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import math
 from fractions import Fraction
 from typing import Any
@@ -147,6 +148,8 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
         if not query:
             continue
         ranges = request.query_ranges
+        if ranges and sum(max(0, end - start) for start, end in ranges) > 1_048_576:
+            raise ModelingError("workload_domain_exceeded:max_tokens")
         # Physical tile bounds follow the selected positions in token order;
         # caller range order must never shrink the causal KV horizon.
         positions = (tuple(sorted(position for start, end in ranges
@@ -164,6 +167,8 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
         rows_total = selected_q_len * group
         max_rows = max(max_rows, rows_total)
         n_qt = max(1, _ceil_div(rows_total, mt))
+        if n_qt > 262_144:
+            raise ModelingError("workload_domain_exceeded:max_query_tiles")
         if compressed:
             compressed_new += req_mult * k1_new_rows(request.kv_len, selected_q_len,
                                                      s["ratio"])
@@ -250,11 +255,11 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
         t_period = math.lcm(mt, group * math.lcm(max(1, page), max(1, nt))) // mt if positions is None else 1
         rem_tiles = full_tiles - sat_tile
         full_p, rem_p = divmod(rem_tiles, t_period) if rem_tiles > 0 else (0, 0)
-        tile_iter = (
-            [(t, 1) for t in range(sat_tile)]
-            + [(sat_tile + j, full_p + (1 if j < rem_p else 0))
-               for j in range(min(rem_tiles, t_period))]
-            + [(t, 1) for t in range(full_tiles, n_qt)]
+        tile_iter = itertools.chain(
+            ((t, 1) for t in range(sat_tile)),
+            ((sat_tile + j, full_p + (1 if j < rem_p else 0))
+             for j in range(min(rem_tiles, t_period))),
+            ((t, 1) for t in range(full_tiles, n_qt)),
         )
         for tile, w in tile_iter:
             if not w:
@@ -400,11 +405,19 @@ def _split_expressions(ctx: CompiledOperator, static: dict[str, Any],
         ("split_partial_bytes", Mul((Const(2), partial_write))),
         ("split_merge_vector", merge_vector),
         ("kv_reads_reuse_factor", CeilDiv(rows, Const(mt))),
+        # Raw pre-service single-tile roofline balance diagnostics; actual
+        # segment axes are QUERY_TILES/KV_TILES/SPLITS and runtime service
+        # transitions use RIDGE_EFFECTIVE_TOKENS and VEC_EFFECTIVE_TOKENS.
         ("cube_mte2_balance_rows", Const(static["balance_cube_mte2"])),
         ("cube_mte2_wave_rows",
          Const(static["balance_cube_mte2"] / static["cores"])),
         ("vector_mte2_balance_rows", Const(static["balance_vec_mte2"])),
+        ("balance_cube_mte2", Const(static["balance_cube_mte2"])),
+        ("balance_vec_mte2", Const(static["balance_vec_mte2"])),
         ("cube_vector_ratio", Const(static["cube_vector_ratio"])),
+        ("raw_roofline_balance_cube_mte2", Const(static["balance_cube_mte2"])),
+        ("raw_roofline_balance_vec_mte2", Const(static["balance_vec_mte2"])),
+        ("raw_roofline_cube_vector_ratio", Const(static["cube_vector_ratio"])),
         ("group_heads", Const(static["group"])),
         ("query_heads", Const(static["heads"])),
         ("kv_heads", Const(static["kv_heads"])),
@@ -454,7 +467,9 @@ def _compile_attention(ctx: CompiledOperator, operator) -> FamilyTemplate:
                      ("dv_cube", str(static["cube_v"])),
                      ("window", str(int(operator.theta.find("window", 0) or 0))),
                      ("causal", str(int(operator.theta.find("causal", 1)))),
-                     ("page", str(static["page"]))),
+                     ("page", str(static["page"])),
+                     ("balance_semantics", "raw_pre_service_roofline_diagnostic"),
+                     ("timing_selector_coordinates", "RIDGE_EFFECTIVE_TOKENS,VEC_EFFECTIVE_TOKENS")),
     )
 
 
@@ -491,7 +506,9 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
                      ("dn", str(static["dn"])), ("dr", str(static["dr"])),
                      ("dv", str(static["dv"])),
                      ("latent_width", str(static["rkv"] + static["dr"])),
-                     ("absorb", "1")),
+                     ("absorb", "1"),
+                     ("balance_semantics", "raw_pre_service_roofline_diagnostic"),
+                     ("timing_selector_coordinates", "RIDGE_EFFECTIVE_TOKENS,VEC_EFFECTIVE_TOKENS")),
     )
 
 

@@ -15,12 +15,14 @@ from mindie_sim.prediction.piecewise.compiler import (CompiledSubgraph, Implemen
     PipeSupply)
 from mindie_sim.prediction.piecewise.composition import (ContentionEnvelope, SerialResult, advance_state,
     contention_envelope, evaluate_serial_split, p2p_transfer_cost)
-from mindie_sim.prediction.piecewise.geometry import RequestGeometry, WorkloadGeometry
+from mindie_sim.prediction.piecewise.geometry import AnalysisDomain, RequestGeometry, WorkloadGeometry
 from mindie_sim.prediction.subgraphs.builders_attention import gemma4_model_spec, _gemma_config, _gemma_global
 from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, InstantiatedModel, LayerInstances, instantiate_model
 from mindie_sim.prediction.subgraphs.registry import TemplateRegistry
 from mindie_sim.prediction.subgraphs.state import (CompressionState, MoeRoutingState, ResidualSlotState,
     SharedKvContract, StateView)
+_PIPELINE_DOMAIN = AnalysisDomain(max_tokens=1_048_576, max_q=1_048_576, max_s_kv=1_048_576, max_seq=1_048_576, max_moe_rows=8_388_608,
+    max_query_tiles=262_144, max_kv_tiles=262_144, max_index_rows=134_217_728, max_work=10**15)
 _ACTIVE_KINDS = frozenset({"A0", "A1", "A2", "A3", "A4", "K0", "K1", "I0", "I1", "F1", "F2", "F3", "D0"})
 _ATTENTION = frozenset({"attention", "mla"})
 _FAST_FIELDS = ( "attention", "ffn", "architecture", "compress_ratio", "indexer", "window",
@@ -114,13 +116,15 @@ class _CachedLayer:
 class ModelPipeline:
     """A compiled model walk with layer-template aggregation and state ports."""
     def __init__(self, model: ModelSpec, features: FeatureConfig, supply: PipeSupply,
-                 policy: ImplementationPolicy | None = None, *, registry: TemplateRegistry | None = None):
+                 policy: ImplementationPolicy | None = None, *, registry: TemplateRegistry | None = None,
+                 domain: AnalysisDomain | None = None):
         if not isinstance(supply, PipeSupply):
             raise ModelingError("model_pipeline_requires_pipe_supply")
-        self.model, self.features, self.supply = model, features, supply
-        self.policy = policy or ImplementationPolicy()
-        self.instantiated: InstantiatedModel = instantiate_model( model, features, registry=registry)
-        self.compiler = OperatorPiecewiseCompiler(supply, self.policy)
+        if policy is None:
+            policy = ImplementationPolicy(cores=features.cores)
+        self.model, self.features, self.supply, self.policy = model, features, supply, policy
+        self.instantiated: InstantiatedModel = instantiate_model(model, features, registry=registry)
+        self.compiler = OperatorPiecewiseCompiler(supply, self.policy, domain or _PIPELINE_DOMAIN)
         self._compiled: dict[tuple, CompiledSubgraph] = {}
         self._cache: dict[tuple, _CachedLayer] = {}
         self.groups = self._build_groups()
@@ -445,30 +449,24 @@ def geometry_key(geometry: WorkloadGeometry | None) -> tuple:
                    request.query_ranges, request.replica, request.draft_len) for request in geometry.requests),
             tuple((layer, tuple(counts)) for layer, counts in geometry.routing))
 def assemble_model(model: ModelSpec | Mapping[str, Any], *, supply: PipeSupply, features: FeatureConfig | None = None,
-                   policy: ImplementationPolicy | None = None,
-                   registry: TemplateRegistry | None = None) -> ModelPipeline:
+                   policy: ImplementationPolicy | None = None, registry: TemplateRegistry | None = None,
+                   domain: AnalysisDomain | None = None) -> ModelPipeline:
     """Zero-parameter entry: config -> templates -> compiled model walk."""
     if isinstance(model, Mapping):
         family = str(model.get("model_type", "")).lower()
         spec = (gemma4_model_spec(model) if family.startswith("gemma") else ModelSpec.from_mapping(model))
     elif isinstance(model, ModelSpec):
         spec = model
-    else:
-        raise ModelingError("model_pipeline_requires_model_spec_or_mapping")
-    return ModelPipeline(spec, features or FeatureConfig.from_model(spec), supply, policy, registry=registry)
+    else: raise ModelingError("model_pipeline_requires_model_spec_or_mapping")
+    if features is None:
+        features = FeatureConfig.from_model(spec, **({"cores": policy.cores} if policy is not None else {}))
+    return ModelPipeline(spec, features, supply, policy, registry=registry, domain=domain)
 @dataclass(frozen=True)
 class FrameworkConfig:
-    supply: PipeSupply
-    policy: ImplementationPolicy = field(default_factory=ImplementationPolicy)
-    graph_buckets: tuple[int, ...] = ()
-    max_batch: int = 8
-    max_prefill_tokens: int = 0
-    mtp_draft_len: int = 0
-    mtp_accept: int = 0
-    routing: tuple[tuple[int, tuple[int, ...]], ...] = ()
-    graph_replay_ms: Fraction = Fraction(0)
-    max_steps: int = 4096
-    max_retained_steps: int = 256
+    supply: PipeSupply; policy: ImplementationPolicy = field(default_factory=ImplementationPolicy)
+    graph_buckets: tuple[int, ...] = (); max_batch: int = 8; max_prefill_tokens: int = 0
+    mtp_draft_len: int = 0; mtp_accept: int = 0; routing: tuple[tuple[int, tuple[int, ...]], ...] = ()
+    graph_replay_ms: Fraction = Fraction(0); max_steps: int = 4096; max_retained_steps: int = 256
     def __post_init__(self) -> None:
         if self.max_batch < 1 or self.max_steps < 1 or self.max_prefill_tokens < 0:
             raise ModelingError("framework_scheduler_geometry_invalid")

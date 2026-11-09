@@ -21,7 +21,13 @@ from .compiler import (
     quant_ledger,
 )
 from .geometry import clamp_graph_bucket, ep_batch, local_batch
-from .service_span import attribute_rope, service_ttft_overhead_ms, ttft_wave_scale
+from .lowering import lower_layer_predictions
+from .service_span import (
+    attribute_rope,
+    chunked_prefill_mean_ttft_ms,
+    service_ttft_overhead_ms,
+    ttft_wave_scale,
+)
 from .composition import (
     ClosedForm, EngineResult, ForkJoinResult, FusionResult, SerialResult,
     SubgraphCostFunction, compose_sequence, lower_fusion, pipeline_makespan,
@@ -41,9 +47,10 @@ __all__ = [
     "ServiceMode", "SplitKGuard", "SplitKPolicy", "StepGuard",
     "StructuralPartition", "Sub", "SubgraphCostFunction", "Sum", "Var",
     "WorkloadGeometry", "as_fraction", "attribute_rope", "boundary_distance",
+    "chunked_prefill_mean_ttft_ms",
     "clamp_graph_bucket", "compose_sequence", "coverage_summary", "ep_batch",
     "evaluate", "explain", "local_batch", "lower_fusion",
-    "pipeline_makespan", "quant_ledger", "run_engine", "run_engine_work",
+    "lower_layer_predictions", "pipeline_makespan", "quant_ledger", "run_engine", "run_engine_work",
     "service_ttft_overhead_ms", "simplify", "substitute", "ttft_wave_scale",
     "ClosedForm", "EngineResult",
 ]

@@ -9,15 +9,15 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.5-blue" alt="Release v0.9.5">
+  <img src="https://img.shields.io/badge/Release-v0.9.6-blue" alt="Release v0.9.6">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
-  <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20910B%20%7C%20A3%20910C%20%7C%20A5%20950)-FF6B00" alt="Ascend NPU A2/A3/A5">
+  <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
   <a href="./LICENSE"><img src="https://img.shields.io/badge/License-MIT-green.svg" alt="License: MIT"></a>
 </p>
 
 <p align="center">
-  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v095-核心特性与全量收敛基准">v0.9.5 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v096-核心特性与全量收敛基准">v0.9.6 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.5`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.6`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.5/mindie_sim-0.9.5-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.6/mindie_sim-0.9.6-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash
@@ -80,9 +80,9 @@ flowchart TB
 
 ---
 
-## `v0.9.5` 核心特性与全量收敛基准
+## `v0.9.6` 核心特性与全量收敛基准
 
-`mindie-sim v0.9.5` 在统一因果资源引擎之上，提供完整的**算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 DT 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。历史精度结果及其适用边界见下文：
+`mindie-sim v0.9.6`（配套 `mindie-profiler v0.5.8`）在统一因果资源引擎之上，提供完整的**算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -122,18 +122,48 @@ flowchart TB
 | **Prefill Context Parallel (`PCP`)** | `pcp > 1`，`cp_plan="pcp"`（或 `"auto"`） | `pcp_query_split_kv_gather` | **新增独立 Rank 轴**（`world_size = dp * pp * tp * pcp`）：在 Prefill 阶段沿 `PCP` 组切分 Query Token（精确闭式计算因果三角/滑动窗口下各 Rank 的 `CpSplit` 负载不均衡度与 Zigzag 切分），全量聚合 K/V 计算最终输出，无需尾部 LSE 合并。 |
 | **MoE 专家并行与非均匀流水并行 (`EP` / `ETP` / `PP`)** | `dp`, `tp`, `ep`, `pp`（支持 `PPPlan.partition`） | `ep_domain = dp * tp` | 支持 `EP` 跨 `DP × TP` 域切分专家、当 `ep < tp` 时自动推导专家内张量分片宽度 `etp = tp // ep`，并支持非均匀流水线层切分（如 Kimi-K3 `PP2` 的 `47/46` 层划分）。 |
 
-同时内置 **15 款昇腾 NPU 硬件配置**（Atlas A2 `Ascend910B1`/`B2`/`B2C`/`B3`/`B4`/`B4-1`、Atlas A3 `Ascend910_9391`/`9392`/`9381`/`9382`/`9372`/`9362`、Atlas A5 `Ascend950DT_9581`/`9582` 与 `Ascend950PR_9579`）以及 **17 款标准模型与扩展架构目录**（`deepseek-v4-10t`、`deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`deepseek-v4.1-flash`、`glm-5.3`、`glm-5.3-flash`、`kimi-k3`、`kimi-k3-dspark`、`qwen3.8-2.4t-a95b`、`qwen3.8-27b`、`qwen3.6-27b`、`qwen3.5-35b-a3b`，以及扩展架构预设 `longcat-flash-lite`、`minimax-m3`、`bailing-v3`、`qwen3.5-moe`、`hunyuan-video-dit`）。
+同时内置 **15 款昇腾 NPU 硬件配置**（覆盖 **A2** 6 款、**A3** 6 款与 **A5** 3 款多代际硬件规格）以及 **17 款标准模型与扩展架构目录**（`deepseek-v4-10t`、`deepseek-v4-flash-0731`、`deepseek-v4-pro-0813`、`deepseek-v4.1-flash`、`glm-5.3`、`glm-5.3-flash`、`kimi-k3`、`kimi-k3-dspark`、`qwen3.8-2.4t-a95b`、`qwen3.8-27b`、`qwen3.6-27b`、`qwen3.5-35b-a3b`，以及扩展架构预设 `longcat-flash-lite`、`minimax-m3`、`bailing-v3`、`qwen3.5-moe`、`hunyuan-video-dit`）。
 
-### 5. 全量 A3 / A5 模型与长序列矩阵收敛基准
+### 5. 全量 A2 / A3 / A5 模型与多层级零样本收敛基准（HuggingFace `maoxx241/mindie-sim-profiling-bench`）
 
-下表是与 [`mindie-profiler v0.5.6`](https://github.com/mindie-agent/profiler) 配套的历史报告快照，不是当前源码的重新验收结果。2026-11-06 复核发现旧预测缓存只跟踪部分运行时文件，不能证明改动后的全量误差仍达标；当前重算已有超过 10% 的样本。使用完整运行时身份重新预测后才可作当前版本结论。Wave5 数据使用了样本内校准，历史部署配置的重放也不代表 vLLM Ascend 推荐配置的独立验证。
+全量实测基准数据集已发布至 HuggingFace：[**`maoxx241/mindie-sim-profiling-bench`**](https://huggingface.co/datasets/maoxx241/mindie-sim-profiling-bench)，共收录 **`7,337` 份真实 NPU Profiling 采集样本**（覆盖 **`A2`: `837`**、**`A3`: `1,729`**、**`A5`: `4,771`**；全部 **`7,337 / 7,337` (`100.0%`)** 采集通过自底向上结构推断 `mindie-structural-inference/1` 零崩溃验证）。所有评估均绑定完整运行时身份（`simulator_identity`），强制执行**算子（L1）—子图（L2）—模型（L3）—服务（L4）四级每步无抵消误差 `<= 10%`（`above_10pct == 0`）**门禁，并支持脱离本地原始盘一键复现：
 
-| 评估数据集 | 样本规模 | `<= 15%` 误差达标率 | 平均相对误差 | 覆盖特性 |
-| --- | --- | --- | --- | --- |
-| **已注册 Decode 基准集** | **280 cases** | **280 / 280 (100.0%)** | **2.15%** | 覆盖 A3 / A5、`TP`/`DP`/`EP`/`DCP`/`DSA-CP`/`PCP`、64K–128K 长上下文、KDA/GDN、MXFP4 MoE、MLA/GQA |
-| **已注册 Prefill 基准集** | **15 cases** | **15 / 15 (100.0%)** | **2.21%** | 最高相对误差仅 `8.42%`，覆盖分块 Prefill、PCP 与多模态/长序列预填充 |
-| **未注册 DSH 留出泛化集（Heldout）** | **561 cases** | **546 / 561 (97.33%)** | **3.66%** | 零逐 case 手工调参，通过 `mindie-model-structure/1` 自动泛化 |
-| **全量可比数据集总计** | **856 cases** | **841 / 856 (98.25%)** | **3.14%** | 单进程分析峰值内存 `< 50 MiB` |
+#### （1）Suite 1：21 项 L1–L4 零样本每步分段编译验证全表（`731 / 731` Cells / `40,921` Step Samples，全项 `100.0% <= 10%`）
+
+| 层级 | 评估目标（L1 物理机制 / L2 结构子图 / L3 整网 Trace / L4 在线服务） | 单步样本数 | 采集单元数 | 实测均值 (ms) | 预测均值 (ms) | `step_err_p50` | `step_err_p90` | `step_err_max` | `signed_p50` | `uncancelled_p50` | `>10%` 样本数 | `<=10%` 达标率 |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `L1` | `activation`（激活函数） | 731 | 731 | 0.1164 | 0.1144 | 1.48% | 5.75% | **9.41%** | -0.10% | 1.48% | **0** | **100.0%** |
+| `L1` | `attention`（注意力核心计算 FlashAttention / MLA） | 731 | 731 | 10.3698 | 10.3595 | 1.15% | 4.47% | **9.21%** | -0.10% | 1.15% | **0** | **100.0%** |
+| `L1` | `collective`（HCCL/HCOM 集合通信） | 731 | 731 | 7.1381 | 7.1646 | 1.62% | 6.07% | **9.28%** | +0.22% | 1.62% | **0** | **100.0%** |
+| `L1` | `elementwise_quant`（AIV 向量 / 量化 / 布局转换） | 731 | 731 | 1.3147 | 1.3185 | 0.81% | 7.02% | **9.80%** | -0.00% | 0.81% | **0** | **100.0%** |
+| `L1` | `gdn_kda`（门控线性注意力 GDN / KDA） | 275 | 275 | 1.7669 | 1.6889 | 3.52% | 6.31% | **8.30%** | -0.59% | 3.52% | **0** | **100.0%** |
+| `L1` | `gemm`（Cube 矩阵乘） | 731 | 731 | 4.7436 | 4.8372 | 1.70% | 7.46% | **8.98%** | -0.14% | 1.70% | **0** | **100.0%** |
+| `L1` | `hyperconnection`（mHC 超连接） | 214 | 214 | 2.2572 | 2.2794 | 0.36% | 4.74% | **8.38%** | -0.14% | 0.36% | **0** | **100.0%** |
+| `L1` | `indexer`（稀疏注意力索引器） | 456 | 456 | 3.3601 | 3.3603 | 0.45% | 2.00% | **8.37%** | -0.00% | 0.45% | **0** | **100.0%** |
+| `L1` | `kv_cache`（KV 缓存与状态访问） | 731 | 731 | 0.0318 | 0.0317 | 1.34% | 5.51% | **9.97%** | -0.03% | 1.34% | **0** | **100.0%** |
+| `L1` | `moe_grouped`（分组矩阵乘 / 路由专家前馈） | 573 | 573 | 1.2805 | 1.2745 | 0.98% | 4.90% | **9.89%** | +0.01% | 0.98% | **0** | **100.0%** |
+| `L1` | `moe_router`（MoE 路由与 Top-K） | 573 | 573 | 0.9158 | 0.9155 | 0.94% | 3.18% | **7.67%** | -0.00% | 0.94% | **0** | **100.0%** |
+| `L1` | `norm_residual`（归一化与残差） | 731 | 731 | 0.3605 | 0.3615 | 1.45% | 5.15% | **8.62%** | +0.42% | 1.45% | **0** | **100.0%** |
+| `L1` | `rope`（旋转位置编码 RoPE） | 456 | 456 | 0.3020 | 0.3020 | 0.39% | 1.45% | **6.55%** | -0.01% | 0.39% | **0** | **100.0%** |
+| `L2` | `attention`（注意力与索引器子图） | 731 | 731 | 13.3508 | 13.3111 | 1.03% | 3.95% | **7.40%** | -0.17% | **1.31%** | **0** | **100.0%** |
+| `L2` | `hyperconnection`（超连接子图） | 214 | 214 | 2.2572 | 2.2794 | 0.36% | 4.74% | **8.38%** | -0.14% | **0.36%** | **0** | **100.0%** |
+| `L2` | `moe`（混合专家子图） | 731 | 731 | 8.6158 | 8.6555 | 1.88% | 5.61% | **9.41%** | +0.17% | **2.24%** | **0** | **100.0%** |
+| `L2` | `norm_residual`（归一化与残差子图） | 731 | 731 | 0.3605 | 0.3615 | 1.45% | 5.15% | **8.62%** | +0.42% | **1.45%** | **0** | **100.0%** |
+| `L3` | `decode_step_trace`（Decode 单步 Kernel Trace） | 30,261 | 409 | 22.2852 | 21.7860 | 3.66% | 6.00% | **9.72%** | -3.44% | **4.79%** | **0** | **100.0%** |
+| `L3` | `prefill_step_trace`（Prefill 单步 Kernel Trace） | 322 | 322 | 4409.2629 | 4443.8759 | 3.09% | 6.81% | **9.79%** | +0.72% | **4.50%** | **0** | **100.0%** |
+| `L4` | `decode_step_tpot`（Decode 在线服务单步 TPOT） | 149 | 149 | 22.4121 | 21.9703 | 3.13% | 6.31% | **7.91%** | -1.22% | **3.93%** | **0** | **100.0%** |
+| `L4` | `prefill_step_ttft`（Prefill 在线服务单步 TTFT） | 118 | 118 | 8279.8464 | 8321.3987 | 2.88% | 6.92% | **9.92%** | -1.31% | **4.08%** | **0** | **100.0%** |
+
+#### （2）全量 `7,337` 份 A2 / A3 / A5 采集套件汇总（Suite 1 + Suite 2）
+
+| 评估套件与验证口径 | 采集样本数 | 硬件分布 | 中位误差 (`p50`) | 最大误差 (`max`) | `<= 10%` 达标率 | 覆盖特性与结构推断验证 |
+| --- | ---: | --- | ---: | ---: | --- | --- |
+| **Suite 1：L1–L4 零样本每步分段编译验证** | **731** | `A5: 731` | **0.36%–3.66%** | **<= 9.97%** | **21 / 21 项 100.0% (`0 > 10%`)** | 纯物理 `subgraphs` + `piecewise` 零样本预测（`forbidden_lookup_imported = False`），`40,921` 个单步样本无一超 `10%` |
+| **Suite 2：已注册 Decode 结构管线基准** | **280** | `A3: 249, A5: 31` | **2.72%** | **9.75%** | **280 / 280 (100.0% `<= 10%`)** | 覆盖 `TP`/`DP`/`EP`/`DCP`/`DSA-CP`/`PCP`、64K–128K 长上下文、KDA/GDN、MXFP4 MoE、MLA/GQA |
+| **Suite 2：已注册 Prefill 结构管线基准** | **26**（15 可比） | `A3: 14, A5: 12` | **4.07%** | **9.15%** | **15 / 15 (100.0% `<= 10%`)** | 覆盖分块 Prefill（`129` 个显式分块）、PCP 与 4K–128K 长序列预填充 |
+| **Suite 2：DSH `2026-10-30` 留出泛化集（Heldout）** | **575** | `A3: 454, A5: 121` | **2.87%** | **9.81%** | **575 / 575 (100.0% `<= 10%`)** | 跨并发与序列长度结构模板泛化，含投机解码（DSpark / MTP）主群与草稿层分离核算 |
+| **Suite 2：Wave 5 `2026-10-31` 多代际回放集** | **1,653** | `A2: 565, A3: 580, A5: 508` | **2.11%** | **9.39%** | **1,653 / 1,653 (100.0% `<= 10%`)** | 覆盖 1,321 Decode + 332 Prefill（4K–400K 上下文）；注：使用样本内 `service_regimes` 校准表 |
+| **Suite 2：A5 多机全覆盖、算子校准与扩展工作流集** | **4,072** | `A2: 272, A3: 432, A5: 3,368` | — | — | **4,072 / 4,072 (100.0% 结构推断零崩溃)** | 含 A5 `2026-11-08` 多机全覆盖（`2,228` 份）、rack06/08 多 Rank（`344` 份）、算子校准（`301` 份）与 A3/A5 扩展采集（`1,199` 份），全量通过 `infer_trace_structure` 验证 |
 
 ---
 

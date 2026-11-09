@@ -444,8 +444,15 @@ class Hardware:
     @classmethod
     def from_mapping(cls, raw: Mapping):
         from mindie_sim.backends import materialize
-        backend = raw.get("backend")
-        raw = materialize(raw)
+        raw_in = _normalize_core_aliases(raw)
+        backend = raw_in.get("backend")
+        base_aic = base_aiv = 0
+        if backend and raw_in.get("sku") and _has_core_override(raw):
+            base_dev = materialize({"backend": backend, "sku": raw_in["sku"]}).get("device", {})
+            base_aic = int(base_dev.get("compute_units", 0) or 0)
+            base_aiv = int((base_dev.get("resource_units") or {}).get("vector", base_aic * 2) or (base_aic * 2))
+        raw_records = raw_in.get("devices", raw_in.get("dies", ()))
+        raw = materialize(raw_in)
         count = int(raw.get("num_devices", len(raw.get("devices", raw.get("dies", ()))) or 1))
         ranks_per_node = int(raw.get("ranks_per_node", count))
         package = int(raw.get("dies_per_package", 1))
@@ -456,7 +463,55 @@ class Hardware:
             raise ModelingError("num_devices_differs_from_explicit_device_records")
         devices = []
         for index, record in enumerate(records):
+            raw_rec = raw_records[index] if index < len(raw_records) and isinstance(raw_records[index], Mapping) else {}
             data = merge_device_inputs(defaults, record)
+            raw_cu = data.get("compute_units")
+            if raw_cu is not None and (isinstance(raw_cu, bool) or int(raw_cu) < 1):
+                raise ModelingError("compute_units_must_be_positive")
+            new_aic = int(raw_cu or 1)
+            if base_aic > 0:
+                scale_aic = new_aic / base_aic
+                explicit_units = _explicit_unit_keys(raw_in, raw_rec)
+                cur_units = dict(data.get("resource_units", {}))
+                new_aiv = int(cur_units.get("vector", base_aiv) or base_aiv)
+                scale_aiv = (new_aiv / base_aiv) if base_aiv > 0 else 1.0
+                if scale_aic != 1.0 or scale_aiv != 1.0:
+                    explicit_peaks = _explicit_peak_keys(raw_in, raw_rec)
+                    data["compute_peaks"] = {
+                        k: (float(v) if k in explicit_peaks else float(v) * scale_aic)
+                        for k, v in data.get("compute_peaks", {}).items()
+                    }
+                    aic_u = {"cube", "mte1", "mte2_aic", "fixpipe"}
+                    data["resource_units"] = {
+                        k: (int(v) if k in explicit_units else max(1, int(round(int(v) * (scale_aic if k in aic_u else scale_aiv)))))
+                        for k, v in cur_units.items()
+                    }
+                    explicit_buf_u, explicit_modes = _explicit_buf_and_mode_keys(raw_in, raw_rec)
+                    aic_b = {"l1", "l0a", "l0b", "l0c"}
+                    data["buffer_units"] = {
+                        k: (int(v) if k in explicit_buf_u else max(1, int(round(int(v) * (scale_aic if k in aic_b else (scale_aiv if k == "ub" else 1.0))))))
+                        for k, v in data.get("buffer_units", {}).items()
+                    }
+                    explicit_rates = _explicit_rate_keys(raw_in, raw_rec)
+                    aic_r = {"mte1", "mte2_aic", "fixpipe"}
+                    aiv_r = {"vector", "mte2_aiv", "mte3", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores",
+                             "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes", "scalar_store_issue"}
+                    scaled_r = {
+                        k: (float(v) * scale_aic if k in aic_r and k not in explicit_rates
+                            else (float(v) * scale_aiv if k in aiv_r and k not in explicit_rates else float(v)))
+                        for k, v in data.get("rates", {}).items()
+                    }
+                    if "mte2" in scaled_r and "mte2" not in explicit_rates:
+                        scaled_r["mte2"] = (min(scaled_r["mte2_aic"], scaled_r["mte2_aiv"])
+                                            if "mte2_aic" in scaled_r and "mte2_aiv" in scaled_r
+                                            else scaled_r["mte2"] * min(scale_aic, scale_aiv))
+                    data["rates"] = scaled_r
+                    data["service_modes"] = {
+                        k: ({**m, "rate": float(m["rate"]) * (scale_aic if m.get("resource") in aic_r else scale_aiv)}
+                            if k not in explicit_modes and "rate" in m and m.get("resource") in (aic_r | aiv_r) and m.get("resource") not in explicit_rates
+                            else dict(m))
+                        for k, m in data.get("service_modes", {}).items()
+                    }
             arch = ComputeArchSpec.from_mapping(data.get("compute_arch", {}))
             arch_rates, arch_units, arch_work_units, arch_modes = arch.supplies(
                 int(data.get("compute_units", 1)), data.get("resource_units", {}),
@@ -547,6 +602,92 @@ class Hardware:
                 "devices": [device.to_dict() for device in self.dies],
                 "links": [link.to_dict() for link in self.links], "ranks_per_node": self.ranks_per_node,
                 "dies_per_package": self.dies_per_package, "assumptions": dict(self.assumptions)}
+
+
+def _alias_cores(mapping: Mapping) -> dict:
+    out = dict(mapping)
+    if "compute_units" not in out and "aic_count" not in out:
+        for key in ("num_cores", "cores"):
+            if out.get(key) is not None:
+                out["compute_units"] = int(out[key])
+                break
+    return out
+
+
+def _normalize_core_aliases(raw: Mapping) -> dict:
+    out = _alias_cores(raw)
+    if isinstance(out.get("device"), Mapping):
+        out["device"] = _alias_cores(out["device"])
+    for key in ("devices", "dies"):
+        if isinstance(out.get(key), (list, tuple)):
+            out[key] = [_alias_cores(d) if isinstance(d, Mapping) else d for d in out[key]]
+    return out
+
+
+def _iter_device_scopes(raw: Mapping, record: Mapping | None = None):
+    yield raw
+    if isinstance(raw.get("device"), Mapping):
+        yield raw["device"]
+    if isinstance(record, Mapping):
+        yield record
+
+
+def _has_core_override(raw: Mapping) -> bool:
+    keys = {"num_cores", "cores", "compute_units", "aic_count", "aiv_count", "resource_units"}
+    scopes = list(_iter_device_scopes(raw))
+    for key in ("devices", "dies"):
+        scopes.extend(d for d in (raw.get(key) or ()) if isinstance(d, Mapping))
+    return any(bool(keys & set(scope)) for scope in scopes)
+
+
+def _explicit_peak_keys(raw: Mapping, record: Mapping | None = None) -> set[str]:
+    out: set[str] = set()
+    for s in _iter_device_scopes(raw, record):
+        if "cube_flops_per_s" in s:
+            out.update(("bf16", "fp16"))
+        if isinstance(s.get("compute_peaks"), Mapping):
+            out.update(str(k) for k in s["compute_peaks"])
+    return out
+
+
+def _explicit_buf_and_mode_keys(raw: Mapping, record: Mapping | None = None) -> tuple[set[str], set[str]]:
+    buf_u, modes = set(), set()
+    for s in _iter_device_scopes(raw, record):
+        if isinstance(s.get("buffer_units"), Mapping):
+            buf_u.update(str(k) for k in s["buffer_units"])
+        if isinstance(s.get("service_modes"), Mapping):
+            modes.update(str(k) for k, v in s["service_modes"].items() if isinstance(v, Mapping) and "rate" in v)
+    return buf_u, modes
+
+
+def _explicit_unit_keys(raw: Mapping, record: Mapping | None = None) -> set[str]:
+    out: set[str] = set()
+    for s in _iter_device_scopes(raw, record):
+        if isinstance(s.get("resource_units"), Mapping):
+            out.update(str(k) for k in s["resource_units"])
+        if s.get("aiv_count") is not None:
+            out.add("vector")
+    return out
+
+
+def _explicit_rate_keys(raw: Mapping, record: Mapping | None = None) -> set[str]:
+    out: set[str] = set()
+    aliases = {"memory": ("hbm",), "read": ("mte2",), "write": ("mte3",)}
+    fields = {
+        "vector_flops_per_s": ("vector",), "vector_ops_per_s": ("vector",),
+        "hbm_bw_bytes_per_s": ("hbm",), "mte_bw_bytes_per_s": ("mte2", "mte2_aic", "mte2_aiv", "mte3"),
+        "mte1_bw_bytes_per_s": ("mte1",), "mte2_bw_bytes_per_s": ("mte2",),
+        "mte2_aic_bw_bytes_per_s": ("mte2_aic",), "mte2_aiv_bw_bytes_per_s": ("mte2_aiv",),
+        "mte3_bw_bytes_per_s": ("mte3",), "fixpipe_bw_bytes_per_s": ("fixpipe",),
+    }
+    for s in _iter_device_scopes(raw, record):
+        if isinstance(s.get("rates"), Mapping):
+            for k in s["rates"]:
+                out.update(aliases.get(str(k), (str(k),)))
+        for nk, rks in fields.items():
+            if nk in s:
+                out.update(rks)
+    return out
 
 
 def _neutral_transfer_channel_links(raw: Mapping) -> list[dict]:
