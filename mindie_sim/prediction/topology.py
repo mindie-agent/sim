@@ -103,7 +103,7 @@ class Topology:
         return tuple(device.rank for device in self.machine.dies[start:start + width])
 
     def groups(self, axis, replica, stage):
-        """Rank axes are independent; expert groups never absorb PCP copies."""
+        """Rank axes are independent; EP absorbs PCP copies only when it spans them."""
         p = self.parallel
         sources = self.ranks(replica, stage)
         if axis == "cp":
@@ -116,15 +116,23 @@ class Topology:
         if axis == "pcp":
             return tuple(sources[i::p.tp] for i in range(p.tp))
         if axis == "ep":
-            if not p.ep_spans_dp:
+            if p.ep_spans_dp:
+                if p.ep_spans_pcp:
+                    count = p.ep_dp_width
+                    first = replica // count * count
+                    return (tuple(rank for r in range(first, first + count)
+                                  for rank in self.ranks(r, stage)),)
+                count = p.ep // p.tp
+                first = replica // count * count
+                return tuple(
+                    tuple(rank for r in range(first, first + count)
+                          for rank in self.ranks(r, stage)[copy * p.tp:(copy + 1) * p.tp])
+                    for copy in range(p.pcp)
+                )
+            if p.ep_spans_pcp:
+                sources = self.ranks(replica, stage)
                 return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
-            count = p.ep // p.tp
-            first = replica // count * count
-            return tuple(
-                tuple(rank for r in range(first, first + count)
-                      for rank in self.ranks(r, stage)[copy * p.tp:(copy + 1) * p.tp])
-                for copy in range(p.pcp)
-            )
+            return tuple(sources[i:i + p.ep] for i in range(0, len(sources), p.ep))
         if axis == "tp":
             return tuple(sources[i:i + p.tp] for i in range(0, len(sources), p.tp))
         raise ModelingError(f"communication_group_axis_unknown:{axis}")

@@ -67,8 +67,40 @@ def _check_pos_float(name: str, val: Any) -> float:
     return float(val)
 
 
+_PCP_ATTENTION_TYPES = {"gqa", "mla", "kda", "gdn", "projection_only"}
+
+
 def _divisors(n: int) -> list[int]:
     return [d for d in range(1, n + 1) if n % d == 0]
+
+
+def _attention_types(model: ModelSpec) -> set[str]:
+    plans = getattr(model, "layer_plans", ()) or ()
+    if plans:
+        kinds = {str(plan.attention).strip().lower() for plan in plans if str(plan.attention).strip()}
+        if kinds:
+            return kinds
+    facts = dict(getattr(model, "catalog_facts", ()) or ())
+    declared = facts.get("attention_types")
+    if isinstance(declared, Mapping):
+        kinds = {str(kind).strip().lower() for kind, count in declared.items() if count}
+        if kinds:
+            return kinds
+    return {str(getattr(model, "attention", "gqa") or "gqa").strip().lower()}
+
+
+def _ep_layout_valid(spec: ParallelSpec) -> bool:
+    """EP divisor rules from ParallelSpec.validate, without a model."""
+    if spec.ep > spec.ep_domain or spec.ep_domain % spec.ep != 0:
+        return False
+    if not spec.ep_spans_pcp:
+        return not (spec.ep > 1 and spec.ep <= spec.tp and spec.tp % spec.ep != 0)
+    local_domain = spec.tp * spec.pcp
+    if spec.ep <= local_domain and local_domain % spec.ep != 0:
+        return False
+    if spec.ep > local_domain and spec.ep % local_domain != 0:
+        return False
+    return True
 
 
 def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, Any]) -> dict[str, Any]:
@@ -76,11 +108,13 @@ def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, A
         return _extract_model_geometry(case_or_model.model)
     if isinstance(case_or_model, ModelSpec):
         meta = dict(case_or_model.metadata)
+        attention = str(case_or_model.attention).strip().lower()
         return {
             "num_heads": int(case_or_model.num_heads),
             "num_kv_heads": int(case_or_model.num_kv_heads or case_or_model.num_heads),
             "num_experts": int(case_or_model.num_experts),
-            "attention": str(case_or_model.attention).strip().lower(),
+            "attention": attention,
+            "attention_types": _attention_types(case_or_model),
             "layers": int(case_or_model.layers),
             "mla_replicate": bool(meta.get("mla_replicate", False)),
         }
@@ -108,7 +142,8 @@ def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, A
             attn = str(canon.get("attention") or ("mla" if ("mla" in canon or "kv_lora_rank" in canon) else "gqa")).strip().lower()
             return {
                 "num_heads": heads, "num_kv_heads": kv_heads, "num_experts": experts,
-                "attention": attn, "layers": int(canon.get("layers", 1) or 1), "mla_replicate": mla_rep,
+                "attention": attn, "attention_types": {attn},
+                "layers": int(canon.get("layers", 1) or 1), "mla_replicate": mla_rep,
             }
     raise TypeError(f"unsupported_case_or_model_type:{type(case_or_model).__name__}")
 
@@ -123,7 +158,8 @@ def enumerate_parallel_candidates(
     n_dev = _check_pos_int("num_devices", num_devices, minimum=1)
     geom = _extract_model_geometry(case_or_model)
     num_heads, num_kv_heads, num_experts = geom["num_heads"], geom["num_kv_heads"], geom["num_experts"]
-    attention, layers, mla_replicate = geom["attention"], geom["layers"], geom["mla_replicate"]
+    attention_types = set(geom["attention_types"])
+    layers, mla_replicate = geom["layers"], geom["mla_replicate"]
 
     all_divs = _divisors(n_dev)
     allowed_tps = {_check_pos_int("candidate_tp", t, minimum=1) for t in candidate_tps} if candidate_tps is not None else None
@@ -151,14 +187,17 @@ def enumerate_parallel_candidates(
                 else [1]
             )
             for pcp in pcps:
-                if pcp > 1 and attention != "gqa":
+                if pcp > 1 and not attention_types <= _PCP_ATTENTION_TYPES:
                     continue
                 dp = rem_pp // pcp
                 if not allow_dp and dp != 1:
                     continue
+                dcp = 1
                 ep_options = (
-                    [d for d in _divisors(dp * tp) if num_experts % d == 0 and (d > tp or tp % d == 0)]
-                    if (num_experts > 0 and allow_ep and pcp == 1) else [1]
+                    [d for d in _divisors(dp * tp * pcp)
+                     if num_experts % d == 0 and _ep_layout_valid(
+                         ParallelSpec(dp=dp, tp=tp, pp=pp, ep=d, cp=dcp, dcp=dcp, pcp=pcp))]
+                    if (num_experts > 0 and allow_ep) else [1]
                 )
                 if allowed_eps is not None:
                     ep_options = [e for e in ep_options if e in allowed_eps]

@@ -56,6 +56,7 @@ class TokenPartition:
     padding: str = "none"
     kind: str = KIND
     padding_implementation: str = "concat"
+    ep: int = 0
 
     @property
     def caller(self):
@@ -195,9 +196,10 @@ class MaskedTraffic:
 
     def payload_matrix(self, row_bytes, *, reverse=False):
         p = self.partition
+        ep = p.ep or p.tp
         return tuple(tuple(0 if src == dst else row_bytes * self.top_k
-                           * p.valid_per_rank[dst if reverse else src] / p.tp
-                           for dst in range(p.tp)) for src in range(p.tp))
+                           * p.valid_per_rank[(dst if reverse else src) % p.tp] / ep
+                           for dst in range(ep)) for src in range(ep))
 
     def to_dict(self):
         return {"basis": self.basis, "valid_tokens_per_rank": self.partition.valid_per_rank,
@@ -226,8 +228,8 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     materialization = raw.get("gather_output_materialization", "view")
     if materialization not in {"view", "per_rank_copy"}:
         raise ModelingError("mc2_gather_output_materialization_requires_view_or_per_rank_copy")
-    if (parallel.dp != 1 or parallel.ep != parallel.tp or parallel.tp < 2
-            or parallel.etp != 1 or parallel.cp != 1 or parallel.pcp != 1
+    if (parallel.tp < 2 or parallel.ep < parallel.tp or parallel.ep % parallel.tp != 0
+            or parallel.etp != 1 or parallel.cp != 1
             or sequence_plan is not None or reduce_after_join
             or getattr(runtime, "moe_recipe", "alltoall") != "alltoall"):
         raise ModelingError("mc2_tp_slice_requires_dp1_ep_equals_tp_without_sequence_parallel")
@@ -248,4 +250,4 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
         raise ModelingError("mc2_tp_slice_requires_positive_tp_divisible_physical_rows")
     local = (tokens + parallel.tp - 1) // parallel.tp
     return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"],
-                          padding_implementation)
+                          padding_implementation, ep=parallel.ep)

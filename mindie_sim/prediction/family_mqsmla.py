@@ -28,7 +28,7 @@ def validate(*, views, plan, parallel, model, padded_tokens,
              metadata_support_fd=False, addressing="scalar", return_softmax_lse=False):
     if metadata_support_fd or addressing != "scalar" or return_softmax_lse:
         raise ModelingError("mqsmla_supported_branch_is_whole_row_scalar_address_no_lse")
-    if (parallel.cp != 1 or parallel.pcp != 1 or plan.num_heads // parallel.tp != 64
+    if (parallel.cp != 1 or plan.num_heads // parallel.tp != 64
             or plan.num_kv_heads != 1 or plan.head_dim != 512
             or plan.qk_rope_head_dim != 64 or model.activation_dtype != "bf16"):
         raise ModelingError("mqsmla_requires_bf16_64_heads_d512_rope64_unsharded_cache")

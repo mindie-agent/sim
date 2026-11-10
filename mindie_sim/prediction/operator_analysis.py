@@ -82,7 +82,8 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
 
     frontend = Frontend(attention_policy=AttentionPolicy(**case.runtime.attention_policy))
     global_tokens = (cohort_tokens if cohort_tokens is not None else
-                     sum(v.q_len for v in global_views) if global_views is not None else None)
+                     sum(v.q_len + v.draft_proposal_tokens for v in global_views)
+                     if global_views is not None else None)
     if scope == "model":
         work = frontend(IterationPlan(views), case.model, case.runtime, case.machine,
                         global_tokens=global_tokens, global_views=global_views,
@@ -100,16 +101,24 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
                 if op.op_id == "iteration_input" else op.metadata
             result.append(replace(op, deps=dependencies, metadata=metadata))
         return tuple(result)
+    views = tuple(replace(v, q_len=v.q_len + v.draft_proposal_tokens) for v in views)
     bucket, replay_scope = frontend.graph.select(views, case.runtime) if views else (None, "none")
     padded_tokens = max(sum(v.q_len for v in views), bucket or 0)
     runtime, selections = resolve(case.runtime, views, padded_tokens=padded_tokens,
                                   replay_scope=replay_scope, global_views=global_views)
     case = replace(case, runtime=runtime)
-    local, local_tokens, _ = frontend.partition_views(
+    local, local_tokens, pcp_prefill = frontend.partition_views(
         views, case.runtime, padded_tokens)
+    pcp_cohort = case.runtime.parallel.pcp > 1 and any(
+        v.phase == "prefill" for v in (global_views or views))
+    body_global_tokens = (
+        frontend.pcp_cohort_tokens(views, local, local_tokens, case.runtime,
+                                   global_tokens=global_tokens, global_views=global_views)
+        if pcp_cohort else global_tokens
+    )
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
                           tokens=local_tokens, mode=views[0].phase if views else phase,
-                          global_tokens=global_tokens, replica=replica)
+                          global_tokens=body_global_tokens, replica=replica)
     # Source lowerings consume the same active/storage distinction as the
     # model path, including MC2's mask over padded graph inputs.
     ops = annotate_geometry(ops, active_rows=sum(v.q_len for v in views),

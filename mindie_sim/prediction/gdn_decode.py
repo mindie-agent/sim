@@ -37,8 +37,8 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           recurrent_implementation="analytical", cache_index_row_stride=1):
     if not views or any(view.phase != "decode" for view in views):
         raise ModelingError("gdn_decode_selected_caller_requires_decode_only")
-    if parallel.pcp != 1 or model.activation_dtype != "bf16" or plan.recurrent_state_dtype != "fp32":
-        raise ModelingError("gdn_decode_requires_pcp1_bf16_inputs_fp32_state")
+    if model.activation_dtype != "bf16" or plan.recurrent_state_dtype != "fp32":
+        raise ModelingError("gdn_decode_requires_bf16_inputs_fp32_state")
     if (not isinstance(cache_index_row_stride, int) or isinstance(cache_index_row_stride, bool)
             or cache_index_row_stride < 1):
         raise ModelingError("gdn_decode_cache_index_row_stride_requires_positive_integer")

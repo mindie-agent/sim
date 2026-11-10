@@ -137,10 +137,13 @@ class Memory:
         self.kvc_hbm_ratio = max(
             0.0, 1.0 - self.offload["kvc_ddr_ratio"] - self.offload["kvc_ssd_ratio"]
         )
+        shared_expert_dp = bool(dict(case.runtime.metadata).get(
+            "enable_shared_expert_dp", False))
         self.gross_weights = stage_weight_bytes(
             case.model, p, case.machine.ranks_per_node, include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
+            enable_shared_expert_dp=shared_expert_dp,
         )
         resolved_ws_tokens = self._resolve_workspace_tokens(workspace_tokens)
         if self.offload["expert_ddr_ratio"] > 0.0:

@@ -44,6 +44,7 @@ ROLE = "grouped_gate_up_activation_quant"
 PROFILE = "ascend_w4a8_msd"
 SUPPORTED_EXPERT_ROW_BASES = {
     "declared_integer_counts", "forced_balanced_integer_counts",
+    "source_force_eplb_masked_integer_counts",
 }
 
 SOURCE = {
@@ -182,7 +183,7 @@ def config_from_group(declaration, members):
         raise ModelingError("w4a8_msd_requires_explicit_integer_expert_rows")
     if realization.get("basis") not in SUPPORTED_EXPERT_ROW_BASES:
         raise ModelingError("w4a8_msd_rejects_probability_moment_routing")
-    rows = realization.get("expert_rows", realization.get("local_expert_rows"))
+    rows = realization.get("local_expert_rows", realization.get("expert_rows"))
     if isinstance(rows, (str, bytes)) or not isinstance(rows, (list, tuple)):
         raise ModelingError("w4a8_msd_requires_explicit_integer_expert_rows")
     rows = tuple(_require_int(value, "expert_rows") for value in rows)

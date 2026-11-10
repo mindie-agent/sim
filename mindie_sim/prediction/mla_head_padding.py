@@ -48,7 +48,7 @@ def prepare_model(model, runtime):
         if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
                 or plan.index_topk or plan.window or plan.noncausal_attention
                 or not plan.q_lora_rank or not plan.qk_rope_head_dim
-                or runtime.parallel.cp != 1 or runtime.parallel.pcp != 1
+                or runtime.parallel.cp != 1
                 or model.activation_dtype != "bf16" or quant.kv_dtype != "bf16"
                 or any(compute_dtype_for(quant, category)[:2] != ("bf16", "bf16")
                        for category in ("mla.q_a", "mla.q_b", "mla.kv_a", "mla_absorb"))):

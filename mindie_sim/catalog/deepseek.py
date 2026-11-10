@@ -199,7 +199,7 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         mla_variant=d["variant"], kv_cache_elements=d["kv_cache_elements"],
         input_mode="dual_normalized" if _int(c, "hc_mult") else "concat",
         base_logits=True, markov_replicated=True,
-        noncausal_query_block=True, pp_capability=(1,),
+        noncausal_query_block=True, pp_capability=(1, 2, 4, 8, 16),
         vocab_size=_int(c, "vocab_size"),
         mhc_mult=_int(c, "hc_mult"), mhc_sinkhorn_iters=_int(c, "hc_sinkhorn_iters"),
         input_projection_category="dspark_input",

@@ -540,7 +540,7 @@ def scale_case_hardware(case: CaseSpec | Mapping[str, Any], *, hbm_bw_scale: flo
 def _vram_max_sequences_per_dp(
     case: CaseSpec, *, context: int, tokens_per_seq: int, output_budget: int,
     hbm_capacity_scale: float = 1.0, emitted_tokens_per_seq: float | None = None,
-    async_scheduling: bool | None = None,
+    async_scheduling: bool | None = None, phase: str = "decode",
 ) -> int:
     """Solve max concurrent sequences per DP replica jointly with workspace, KV, and async delayed release."""
     base_case = replace(case, runtime=replace(case.runtime, async_scheduling=bool(async_scheduling))) if async_scheduling is not None else case
@@ -549,20 +549,21 @@ def _vram_max_sequences_per_dp(
     emit_tokens = float(q_tokens) if emitted_tokens_per_seq is None else max(1e-6, float(emitted_tokens_per_seq))
     rt_cap = min(int(scaled.runtime.max_num_seqs), max(1, int(scaled.runtime.max_num_batched_tokens) // q_tokens))
     probe_mem = Memory(scaled, workspace_tokens=q_tokens)
-    lookahead_tokens = probe_mem.async_in_flight_lookahead_steps * q_tokens
+    # Prefill KV is the prompt only (context + q_tokens): no decode output and no async lookahead waves.
+    output_budget_eff, lookahead_tokens = (0, 0) if phase == "prefill" else (output_budget, probe_mem.async_in_flight_lookahead_steps * q_tokens)
     delayed_steps = probe_mem.async_delayed_release_steps
-    steps_per_wave = max(1, math.ceil(max(1, output_budget) / emit_tokens))
+    steps_per_wave = max(1, math.ceil(max(1, output_budget_eff) / emit_tokens))
     retiring_waves = max(1, math.ceil(delayed_steps / steps_per_wave)) if delayed_steps > 0 else 0
-    seq_len_active = max(1, context + max(q_tokens, output_budget) + lookahead_tokens)
-    seq_len_retiring = max(1, context + max(q_tokens, output_budget))
-    seq_len_wave = max(1, context + min(max(q_tokens, output_budget), max(1, delayed_steps) * q_tokens) + lookahead_tokens)
+    seq_len_active = max(1, context + max(q_tokens, output_budget_eff) + lookahead_tokens)
+    seq_len_retiring = max(1, context + max(q_tokens, output_budget_eff))
+    seq_len_wave = max(1, context + min(max(q_tokens, output_budget_eff), max(1, delayed_steps) * q_tokens) + lookahead_tokens)
     kv_active = probe_mem.cache_bytes(seq_len_active, padded=True)
     kv_retiring = probe_mem.cache_bytes(seq_len_retiring, padded=True)
     kv_wave = probe_mem.cache_bytes(seq_len_wave, padded=True)
 
     def fits(b: int) -> bool:
         mem = Memory(scaled, workspace_tokens=b * q_tokens)
-        if b >= 2 and delayed_steps > 0 and output_budget > 0:
+        if b >= 2 and delayed_steps > 0 and output_budget_eff > 0:
             staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
             wave_delayed_b = retiring_waves * b
             return all(
@@ -709,11 +710,11 @@ def solve_hardware_sla_throughput(
         nonlocal base_b_hint
         s_key = tuple(float(scen.get(k, 1.0)) for k in _SCALE_KEYS)
         if s_key[4] not in vram_by_cap:
-            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False)
-            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True)
+            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase)
+            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase)
             b_cfg = b_async if parsed.runtime.async_scheduling else b_sync
             if parsed.runtime.memory:
-                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens)
+                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase)
             vram_by_cap[s_key[4]] = (b_cfg, b_sync, b_async)
         (b_vram, b_vram_sync, b_vram_async), b1_ms = vram_by_cap[s_key[4]], eval_at(scen, s_key, 1, full=False)["step_ms"]
         eff_max = min(b_max, domain_cap)

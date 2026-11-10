@@ -86,12 +86,15 @@ def validate(*, key_heads, value_heads, key_width, value_width, model):
 
 def bind_prefill_scans(scans, *, lengths, heads, key_heads, dk, dv, chunk,
                        dtype, state_dtype, requests, pcp=1, speculative=False):
-    """Replace the prefill scan members with one actual varlen FWD_H op."""
+    """Replace the prefill scan members with one actual varlen FWD_H op.
+
+    ``pcp >= 1`` is accepted. Inter-chunk state transfer is a caller collective.
+    """
     scans = tuple(scans)
     if not scans:
         raise ModelingError("kda_state_prefill_scan_missing")
-    if pcp != 1:
-        raise ModelingError("kda_state_requires_pcp1")
+    if pcp < 1:
+        raise ModelingError("kda_state_requires_pcp")
     if speculative:
         raise ModelingError("kda_state_speculative_prefill_not_supported")
     params = {

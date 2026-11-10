@@ -188,20 +188,25 @@ def test_actual_kimi_case_retains_tp_shards_and_unique_cross_dp_rows():
     assert {plan.source_partitions for plan in plans} == {1}
 
 
-@pytest.mark.parametrize("field,value,match", [
-    ("pp", 2, "requires_pp1"),
-    ("cp", 2, "requires_cp1"),
-    ("pcp", 2, "requires_pcp1"),
-])
-def test_source_selected_branch_rejects_unsupported_parallel_axes(field, value, match):
+def test_source_selected_branch_rejects_context_parallel():
     parsed = source_case(tp=2)
-    changes = {field: value}
-    if field == "pcp":
-        changes["cp_plan"] = "pcp"
-    runtime = replace(parsed.runtime, parallel=replace(
-        parsed.runtime.parallel, **changes))
-    with pytest.raises(ModelingError, match=match):
+    runtime = replace(parsed.runtime, parallel=replace(parsed.runtime.parallel, cp=2))
+    with pytest.raises(ModelingError, match="requires_cp1"):
         select(runtime, parsed.model, views(8), tokens=8)
+
+
+def test_source_selected_branch_accepts_pipeline_and_prefill_context_parallel():
+    parsed = source_case(tp=2)
+    runtime = replace(parsed.runtime, parallel=replace(parsed.runtime.parallel, pp=2))
+    plan = select(runtime, parsed.model, views(8), tokens=8)
+    assert plan.tp == 2
+    assert plan.tokens_local == 4
+    assert plan.tokens_global == 8
+    pcp_runtime = replace(parsed.runtime, parallel=replace(
+        parsed.runtime.parallel, pcp=2, cp_plan="pcp"))
+    pcp_plan = select(pcp_runtime, parsed.model, views(8), tokens=8)
+    assert pcp_plan.tokens_local == 4
+    assert pcp_plan.tokens_global == 8
 
 
 def test_declaration_and_structural_domain_are_exact():

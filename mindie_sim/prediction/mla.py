@@ -13,7 +13,7 @@ from mindie_sim.catalog.attention_common import (
     AttentionResult, _causal_pairs, _long_selected_pairs, _group_plan, dcp_partial_merge_ops,
 )
 from mindie_sim.catalog.cache import completed_rows, index_selection_cost, index_row_bytes
-from mindie_sim.catalog.context_parallel import split_causal_pairs
+from mindie_sim.catalog.context_parallel import split_causal_pairs, split_pcp_pairs
 from mindie_sim.schema.common import dtype_bytes, ModelingError
 from .implementations import select
 from .lowering import Builder
@@ -31,8 +31,8 @@ from mindie_sim.catalog.ops import compute_dtype_for
 def _semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                               shard, prefix, padded_tokens):
     valid = sum(view.q_len for view in views)
-    rows = sum(_long_selected_pairs(v.q_len, v.context, max(1, plan.compress_ratio),
-               plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0)
+    cand_window = plan.candidate_topk_blocks * plan.candidate_block_size if plan.candidate_filter else 0
+    rows = sum(_selected_pairs(_visible_parts(v), max(1, plan.compress_ratio), cand_window)
                for v in views)
     scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
                     flops=2 * rows * plan.index_heads * plan.index_dim / shard,
@@ -88,6 +88,78 @@ def _attention_tensor_view(plan, view, heads, model, quant, parallel):
             "compressed_cache": plan.compress_ratio > 0,
         }),)
     return ()
+
+
+def _view_causal_pairs(view, query, context, window):
+    """Causal pairs for a full query, or for one prefill rank's query_ranges.
+
+    Owned spans sum ``_causal_pairs(end - start, context + start, window)``.
+    ``split_pcp_pairs`` degree 1 is that closed form. An empty range list is
+    the whole query.
+    """
+    ranges = getattr(view, "query_ranges", ()) if view.phase == "prefill" else ()
+    window_arg = window
+    if not ranges:
+        return _causal_pairs(query, context, window_arg)
+    counted = sum(
+        _causal_pairs(end - start, context + start, window_arg)
+        for start, end in ranges if end > start
+    )
+    # Degree 1 is the same span closed form. Refuse a drift between the two.
+    catalog = sum(
+        split_pcp_pairs(end - start, context + start, 1, window=max(0, int(window_arg))).total
+        for start, end in ranges if end > start
+    )
+    if counted != catalog:
+        raise ModelingError(f"pcp_query_range_pairs_diverged:{counted}!={catalog}")
+    return counted
+
+
+def _visible_parts(view):
+    """(query, context) spans whose global starts set the visible KV rows.
+
+    Empty ``query_ranges`` is the whole local query at ``view.context``.
+    A PCP rank owns several DualChunkSwap spans; later spans see earlier keys.
+    """
+    ranges = getattr(view, "query_ranges", ()) or ()
+    if not ranges:
+        return ((view.q_len, view.context),)
+    return tuple((hi - lo, view.context + lo) for lo, hi in ranges if hi > lo)
+
+
+def _selected_pairs(parts, ratio, topk):
+    return sum(_long_selected_pairs(query, context, ratio, topk) for query, context in parts)
+
+
+def _kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
+    """Tile sweeps. Each span's horizon is ``context_before_span + tile_end``."""
+    sweeps = 0
+    long_cap = plan.index_topk if topk else view.kv_len
+    for query, context in parts:
+        for start in range(0, query, query_tile):
+            horizon = view.kv_len if plan.noncausal_attention else context + min(query, start + query_tile)
+            if dense:
+                sweeps += min(horizon, plan.index_topk or plan.window or view.kv_len)
+            else:
+                window_rows = min(horizon, plan.window) if plan.window else 0
+                sweeps += window_rows + min(completed_rows(horizon, plan.compress_ratio), long_cap)
+    return sweeps
+
+
+def _sparse_over_parts(parts, plan, query_tile, *, dense):
+    from .sparse_attention import SparseAttentionTraffic, sparse_attention_traffic
+    gather = window = reads = 0
+    for query, context in parts:
+        traffic = sparse_attention_traffic(
+            query, context, plan.index_topk,
+            compression_ratio=1 if dense else plan.compress_ratio,
+            window=0 if dense else plan.window,
+            query_tile=query_tile, index_pool_size=plan.index_kpool,
+            index_pool_tail=plan.index_kpool_always_select_tail)
+        gather += traffic.gather_rows
+        window += traffic.window_sweep_rows
+        reads += traffic.index_read_bytes
+    return SparseAttentionTraffic(gather, window, reads)
 
 
 def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
@@ -162,6 +234,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     else:
         rotary = b.vector("rotary", (kv, q_ready), q * (heads + 1) * plan.qk_rope_head_dim, 6)
     valid = sum(v.q_len for v in views)
+    pcp_prefill = parallel.pcp > 1 and any(view.phase == "prefill" for view in views)
     packed_store = (prolog.module.cache_store(
         b, deps=(kv, rotary), rows=math.ceil(valid / cp), plan=plan, **prolog.options)
         if prolog else None)
@@ -170,6 +243,21 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
              if plan.cache_kind == "window_compressed" else
              b.store("kv_store", (rotary,), math.ceil(valid / cp),
                      plan.cache_row_elements * dtype_bytes(quant.kv_dtype), quant.kv_dtype))
+    # This lowering writes the local KV row. Shared long-KV consumers still do.
+    produced, owns_kv = store, store is not None
+    if pcp_prefill and owns_kv:
+        rows = sum(view.global_q_len or view.q_len for view in views if view.phase == "prefill")
+        if packed_store is not None:
+            from .mla_prolog_packed import view as packed_kv_view
+            kv_row = packed_kv_view(plan.kv_lora_rank, plan.qk_rope_head_dim)["row_bytes"]
+        elif plan.cache_kind == "window_compressed":
+            kv_row = cache_format(model, "window").row_bytes(plan.cache_row_elements)
+        else:
+            kv_row = plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
+        store = b.communicate(
+            "pcp_kv_gather", (produced,),
+            rows * kv_row * (parallel.pcp - 1) / parallel.pcp,
+            "allgather", "pcp")
     if latent:
         q_ready = b.matrix("q_absorb", (q_ready,), q * heads, plan.kv_lora_rank,
                            plan.qk_nope_head_dim, weight_count=heads,
@@ -180,7 +268,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if prolog:
         prolog.module.declare(
             b.ops, prefix=prefix, plan=plan, model=model, parallel=parallel, quant=quant,
-            tokens=q, members=(q_a, q_norm, q_b, kv_a, kv, rotary, store, q_ready),
+            tokens=q, members=(q_a, q_norm, q_b, kv_a, kv, rotary, produced, q_ready),
             q_a=q_a, q_b=q_b, kv_a=kv_a, q_absorb=q_ready, **prolog.options)
     long_store = store if plan.cache_kind == "dense" else None
     compressed_latent = None
@@ -199,8 +287,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
 
     if plan.cache_kind == "window_compressed" and plan.compress_ratio:
         if plan.owns_long_kv:
-            new_rows = sum(completed_rows(v.context + v.q_len, plan.compress_ratio)
-                           - completed_rows(v.context, plan.compress_ratio) for v in views)
+            new_rows = sum(completed_rows(c + q_len, plan.compress_ratio)
+                           - completed_rows(c, plan.compress_ratio)
+                           for v in views for q_len, c in _visible_parts(v))
             compressed_latent, rotated = compressor(
                 b, name="compress", source=deps, tokens=valid, padded_tokens=q,
                 valid_rows=new_rows, width=plan.head_dim, plan=plan, model=model,
@@ -208,13 +297,24 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             long_store = representation_store(
                 b, "compressed_store", (rotated,), math.ceil(new_rows / cp),
                 plan.cache_row_elements, "compressed_kv")
+            if pcp_prefill:
+                global_comp_rows = sum(
+                    completed_rows(v.context + (v.global_q_len or v.q_len), plan.compress_ratio)
+                    - completed_rows(v.context, plan.compress_ratio)
+                    for v in views if v.phase == "prefill")
+                if global_comp_rows > 0:
+                    comp_row_bytes = cache_format(model, "compressed_kv").row_bytes(plan.cache_row_elements)
+                    long_store = b.communicate(
+                        "pcp_compressed_kv_gather", (long_store,),
+                        global_comp_rows * comp_row_bytes * (parallel.pcp - 1) / parallel.pcp / cp,
+                        "allgather", "pcp")
         else:
             rows = sum(completed_rows(v.kv_len, plan.compress_ratio) for v in views)
             long_store = owner(cache_ids, plan.kv_owner_layer_id, "compressed_cache",
                                rows * cache_format(model, "compressed_kv").row_bytes(
                                    plan.cache_row_elements) / cp)
 
-    if plan.index_kpool > 1 and (parallel.cp != 1 or parallel.pcp != 1):
+    if plan.index_kpool > 1 and parallel.cp != 1:
         raise ModelingError("pooled_indexer_context_partition_not_declared")
     pool_binding = (select(runtime.kernels.get("lowerings", {}), "pool_key_indexer")
                     if runtime and plan.index_kpool > 1 else None)
@@ -235,8 +335,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             # Quantized, post-RoPE cache bytes cannot masquerade as the
             # compressor's pre-RoPE BF16 latent for the index projection.
             index_source = compressed_latent
-        index_rows = sum(completed_rows(v.kv_len, max(1, plan.compress_ratio))
-                         - completed_rows(v.context, max(1, plan.compress_ratio)) for v in views)
+        index_rows = sum(completed_rows(c + q_len, max(1, plan.compress_ratio))
+                         - completed_rows(c, max(1, plan.compress_ratio))
+                         for v in views for q_len, c in _visible_parts(v))
         input_rows = index_rows if plan.index_input == "compressed" else valid
         input_width = plan.head_dim if plan.index_input == "compressed" else h
         if plan.compress_ratio > 1 and plan.index_input == "hidden":
@@ -261,6 +362,21 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             quant=quant, model=model, rotate_basis=plan.compress_ratio > 1)
         index_store = b.store("index_store", (normalized,), index_rows,
                               index_row_bytes(model, plan.index_dim), quant.index_dtype)
+    if pcp_prefill and plan.indexer and plan.owns_index_k and index_store is not None:
+        # One stored index vector is index_dim wide, not index_heads copies of it.
+        if plan.index_kpool > 1:
+            rows = sum((v.context + (v.global_q_len or v.q_len)) // plan.index_kpool
+                       - v.context // plan.index_kpool
+                       for v in views if v.phase == "prefill")
+        else:
+            ratio = max(1, plan.compress_ratio)
+            rows = sum(completed_rows(v.context + (v.global_q_len or v.q_len), ratio)
+                       - completed_rows(v.context, ratio)
+                       for v in views if v.phase == "prefill")
+        index_store = b.communicate(
+            "pcp_index_gather", (index_store,),
+            rows * index_row_bytes(model, plan.index_dim) * (parallel.pcp - 1) / parallel.pcp,
+            "allgather", "pcp")
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
         if index_store is None:
             index_store = owner(index_cache_ids, plan.index_k_owner_layer_id, "index_cache",
@@ -377,28 +493,28 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             **selected.options))
     for index, view in enumerate(() if selected else views):
         context, query = view.context, view.q_len
+        parts = _visible_parts(view)
         if plan.cache_kind == "dense":
-            pairs = query * (context + query) if plan.noncausal_attention else _causal_pairs(query, context, plan.window)
+            pairs = (query * view.kv_len if plan.noncausal_attention
+                     else _view_causal_pairs(view, query, context, plan.window))
             if topk:
-                pairs = _long_selected_pairs(query, context, 1, plan.index_topk)
-            sweeps = sum(min(context + min(query, start + query_tile), plan.index_topk or plan.window or view.kv_len)
-                         for start in range(0, query, query_tile))
+                pairs = _selected_pairs(parts, 1, plan.index_topk)
+            sweeps = _kv_sweeps(parts, plan, view, query_tile, dense=True, topk=bool(topk))
         else:
-            pairs = _causal_pairs(query, context, plan.window) if plan.window else 0
-            pairs += _long_selected_pairs(query, context, plan.compress_ratio, plan.index_topk if topk else 0)
-            sweeps = sum((min(context + min(query, start + query_tile), plan.window) if plan.window else 0)
-                         + min(completed_rows(context + min(query, start + query_tile), plan.compress_ratio),
-                               plan.index_topk if topk else view.kv_len)
-                         for start in range(0, query, query_tile))
+            if plan.noncausal_attention:
+                long_cap = plan.index_topk if topk else view.kv_len
+                pairs = query * (
+                    (min(view.kv_len, plan.window) if plan.window else 0)
+                    + min(completed_rows(view.kv_len, plan.compress_ratio), long_cap)
+                )
+            else:
+                pairs = (_view_causal_pairs(view, query, context, plan.window) if plan.window else 0)
+                pairs += _selected_pairs(parts, plan.compress_ratio, plan.index_topk if topk else 0)
+            sweeps = _kv_sweeps(parts, plan, view, query_tile, dense=False, topk=bool(topk))
         selection_reads, selection_metadata = 0, ()
         if topk:
-            from .sparse_attention import sparse_attention_traffic
-            traffic = sparse_attention_traffic(
-                query, context, plan.index_topk,
-                compression_ratio=1 if plan.cache_kind == "dense" else plan.compress_ratio,
-                window=0 if plan.cache_kind == "dense" else plan.window,
-                query_tile=query_tile, index_pool_size=plan.index_kpool,
-                index_pool_tail=plan.index_kpool_always_select_tail)
+            traffic = _sparse_over_parts(
+                parts, plan, query_tile, dense=plan.cache_kind == "dense")
             if plan.index_kpool > 1:
                 pairs = traffic.total_cache_rows
             sweeps = traffic.total_cache_rows
@@ -407,6 +523,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 ("program_kind", "indexed_attention"),
                 ("indexed_attention_geometry", {
                     "query": query, "context": context, "topk": plan.index_topk,
+                    **({"sequences": parts} if parts != ((query, context),) else {}),
                     "compression_ratio": 1 if plan.cache_kind == "dense" else plan.compress_ratio,
                     "window": 0 if plan.cache_kind == "dense" else plan.window,
                     "heads": heads, "latent": latent_dim,
@@ -419,14 +536,25 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             )
         local_pairs = pairs / cp
         if cp > 1 and plan.cache_kind == "dense" and not topk:
-            local_pairs = split_causal_pairs(query, context, cp, cp_interleave_size,
-                                             window=plan.window,
-                                             noncausal=plan.noncausal_attention).max_rank
+            if plan.noncausal_attention:
+                local_pairs = split_causal_pairs(
+                    query, view.kv_len - query, cp, cp_interleave_size,
+                    window=plan.window, noncausal=True).max_rank
+            else:
+                local_pairs = max(
+                    sum(split_causal_pairs(q_part, c_part, cp, cp_interleave_size,
+                                           window=plan.window, noncausal=False).per_rank[r]
+                        for q_part, c_part in parts)
+                    for r in range(cp)
+                )
         transfer = query * heads * (qk_dim + latent_dim) * dtype_bytes(model.activation_dtype)
         cache_read = sweeps * plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
         if plan.cache_kind == "window_compressed":
-            original_rows = sum(min(context + min(query, start + query_tile), plan.window)
-                                for start in range(0, query, query_tile)) if plan.window else 0
+            original_rows = sum(
+                min(view.kv_len if plan.noncausal_attention else c_part + min(q_part, start + query_tile), plan.window)
+                for q_part, c_part in parts
+                for start in range(0, q_part, query_tile)
+            ) if plan.window else 0
             cache_read = (original_rows * cache_format(model, "window").row_bytes(plan.cache_row_elements)
                           + (sweeps - original_rows) * cache_format(
                               model, "compressed_kv").row_bytes(plan.cache_row_elements))

@@ -422,7 +422,7 @@ class AttnResPrefixState:
     @classmethod
     def start(cls, *, model, runtime, ready, tokens,
               mode, requests, optimize_prefill=False):
-        if runtime.parallel.pp != 1:
+        if runtime.parallel.pp < 1:
             raise ModelingError("attn_res_source_caller_requires_pp1")
         block = next((plan.residual_block_size for plan in model.layer_plans
                       if plan.residual_block_size), 0)
@@ -447,7 +447,7 @@ class AttnResPrefixState:
 
     def prepare(self, *, prefix, layer, stage, materialize=False):
         block = self.block_size
-        boundary = layer.index % block == 0
+        boundary = layer.index == 0 or layer.index % self.block_size == 0
         valid = _ceil_div(layer.index, block)
         slot = layer.index // block if boundary else None
         result = attn_res_point(

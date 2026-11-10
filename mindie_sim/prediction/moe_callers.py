@@ -111,6 +111,16 @@ class RoutingPolicy:
 
     def local(self, model, layer, parallel, tokens: int) -> tuple[float, float]:
         rows, active = self.expert_moments(model, layer, tokens)
+        if parallel.ep > len(rows) and len(rows) > 0:
+            replicas = parallel.ep // len(rows)
+            rank_rows = [rows[index % len(rows)] / replicas for index in range(parallel.ep)]
+            slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
+            expert_idx = slowest % len(rows)
+            inclusion = (rows[expert_idx] / tokens) if tokens > 0 else 0.0
+            rep_tokens = tokens / replicas
+            act_val = (-math.expm1(rep_tokens * math.log1p(-inclusion))
+                       if 0 < inclusion < 1 else float(rep_tokens > 0 and inclusion > 0))
+            return rank_rows[slowest], act_val
         rank_rows = [math.fsum(rows[index::parallel.ep]) for index in range(parallel.ep)]
         slowest = max(range(parallel.ep), key=rank_rows.__getitem__)
         return rank_rows[slowest], math.fsum(active[slowest::parallel.ep])
@@ -439,7 +449,9 @@ def select(runtime, plan, parallel, model, tokens: int, *,
         raise ModelingError(
             f"local_expert_reduce_requires_divisible_expert_banks:"
             f"{plan.num_experts}%{parallel.ep}")
-    if parallel.cp != 1 or parallel.pcp != 1:
+    # PCP/PP do not change the replicated token view inside one EP=TP group.
+    # CP still shards the KV context this caller does not model.
+    if parallel.cp != 1 or parallel.pcp < 1 or parallel.pp < 1:
         raise ModelingError(
             f"local_expert_reduce_requires_cp_pcp1:{parallel.cp},{parallel.pcp}")
     if sequence_plan is not None:
@@ -478,7 +490,10 @@ def tp_join_reduce(*, plan, parallel, model, **kwargs):
     """TP-sharded experts and shared output reduce once after linear combine."""
     from .feedforward import alltoall
 
-    if parallel.ep != 1 or parallel.dp != 1 or parallel.cp != 1 or parallel.pcp != 1:
+    # PP stages the same token rows; PCP has already split them. The deferred
+    # TP reduce stays inside the TP group either way.
+    if (parallel.ep != 1 or parallel.dp != 1 or parallel.cp != 1
+            or parallel.pcp < 1 or parallel.pp < 1):
         raise ModelingError("tp_join_reduce_requires_tp_only_non_sequence_parallel")
     if plan.expert_latent_size not in (0, None, model.hidden_size):
         raise ModelingError("tp_join_reduce_cannot_defer_across_routed_output_transform")

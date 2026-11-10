@@ -46,7 +46,7 @@ def rearrange_qkv(tensors, conv, tokens, heads, key_heads, dk, dv):
 
 
 def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
-          chunk, gate_values=None, qkv_values=None, **_):
+          chunk, gate_values=None, qkv_values=None, pcp=1, **_):
     b = builder
     tokens = sum(view.q_len for view in views)
     dtype = b.model.activation_dtype
@@ -77,7 +77,14 @@ def core(*, builder, tensors, conv, gated, views, heads, key_heads, dk, dv,
            read=state_elements * 4 + len(views) * state_blocks * 4, write=state_elements * 4,
            family="state_scatter", dtype="fp32", metadata=(("state_layout", "V,K"),
                   ("index_dtype", "int32"), ("metadata_cache_reuse", False)))
-    return composite.output
+    out_id = composite.output
+    if pcp > 1:
+        state_bytes = heads * dk * dv * dtype_bytes(b.plan.recurrent_state_dtype or "fp32")
+        for idx in range(len(views)):
+            out_id = b.communicate(
+                f"pcp_recurrent_state_step{idx}", (out_id,),
+                state_bytes * (2 * pcp - 1) / pcp, "allgather", "pcp")
+    return out_id
 
 
 def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
@@ -115,8 +122,6 @@ def decode_core(b, tensors, values, gate_values, views, heads, keys, dk, dv, *,
 
 def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
           padded_tokens, policy, runtime):
-    if parallel.pcp != 1:
-        raise ValueError("gdn_prefill_arch35_selected_caller_branch_requires_pcp1")
     if plan.recurrent_state_dtype != "fp32":
         raise ValueError("gdn_prefill_arch35_state_precision_branch_not_implemented:"
                          + plan.recurrent_state_dtype)
@@ -167,6 +172,11 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
     })
     conv = b.add(replace(conv_op, op_id=prefix + ".short_convolution",
                          deps=(conv_input.producer,), **b.common))
+    if parallel.pcp > 1:
+        conv = b.communicate(
+            "pcp_conv_state_step", (conv,),
+            len(prefill) * max(0, plan.conv_kernel - 1) * width * 2 * (2 * parallel.pcp - 1) / parallel.pcp,
+            "allgather", "pcp")
     gated = b.vector(
         "delta_gates", tuple(value.producer for value in gate_inputs), actual * heads, 12,
         family="gdn_gating", shape=(actual, heads),
@@ -187,7 +197,8 @@ def lower(*, prefix, plan, views, stage, deps, model, parallel, mode,
                   heads=heads, key_heads=keys, dk=dk, dv=dv,
                   chunk=policy.recurrent_chunk if policy else 64,
                   qkv_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in qkv),
-                  gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values))
+                  gate_values=tuple(v.narrow(1, decode_tokens, prefill_tokens) for v in gate_values),
+                  pcp=parallel.pcp)
     outputs.append(tensors.result(output, (prefill_tokens, heads, dv)))
     if decode:
         flat = [tensors.reshape(value, (value.layout.elements,), name="mixed_output_view")

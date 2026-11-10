@@ -295,7 +295,7 @@ def _aux_glm(c: Mapping[str, Any]) -> AuxiliarySpec:
         expert_intermediate_size=moe_i, num_shared_experts=shared,
         block_size=1, markov_rank=0, confidence_enabled=False,
         target_shared_embedding=True, target_shared_lm_head=True,
-        base_logits=True, pp_capability=(1,),
+        base_logits=True, pp_capability=(1, 2, 4, 8, 16),
         vocab_size=int(c["vocab_size"]),
         source=merge_source({"kind": "glm_mtp"}),
         notes=("GLM body is 78 layers; MTP is one optional layer",),

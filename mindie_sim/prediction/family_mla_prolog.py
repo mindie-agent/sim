@@ -63,7 +63,7 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
         if compute_dtype_for(quant, "mla")[1] != "int8" or quant.format_for("mla") != "int8":
             raise ModelingError("mla_prolog_packed_requires_int8_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
-            or parallel.cp != 1 or parallel.pcp != 1
+            or parallel.cp != 1 or parallel.pcp < 1
             or model.activation_dtype != "bf16" or (quant.kv_dtype != "bf16" and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")

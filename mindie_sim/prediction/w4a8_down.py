@@ -58,6 +58,7 @@ PHASES = ("pre", "matrix", "post_dequant", "output")
 SUPPORTED_RECIPES = ("grouped_down", "balanced_grouped_down")
 SUPPORTED_EXPERT_ROW_BASES = {
     "declared_integer_counts", "forced_balanced_integer_counts",
+    "source_force_eplb_masked_integer_counts",
 }
 LIMITATIONS = (
     "explicit_coarse_phase_order_does_not_claim_native_workspace_pipeline_overlap",
@@ -142,7 +143,7 @@ def _routing(metadata):
         _error("rejects_probability_moment_routing")
     if raw.get("basis") != basis:
         _error("routing_basis_disagrees_with_realization")
-    rows = raw.get("expert_rows", raw.get("local_expert_rows"))
+    rows = raw.get("local_expert_rows", raw.get("expert_rows"))
     rows = tuple(_require_int(value, "expert_rows")
                  for value in _sequence(rows, "expert_rows"))
     if not rows:

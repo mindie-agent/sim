@@ -31,6 +31,9 @@ CP_PLAN_NONE = "none"
 CP_PLAN_KINDS = (CP_PLAN_DCP, CP_PLAN_PCP, CP_PLAN_DSA_CP)
 CP_INDEXER_POLICY = "replicated"
 DSA_CP_INDEXER_POLICY = "sharded_local_topk"
+#: Attention kinds that own a PCP query-shard schedule. Projection-only layers
+#: may sit beside them; a model still needs one real query-shard builder.
+_CP_ATTENTION_TYPES = {"gqa", "mla", "kda", "gdn", "projection_only"}
 CP_UNMODELED_SCHEDULES = ("compact_kv_gather", "query_token_shard")
 DEFAULT_CP_INTERLEAVE = 128
 _FP32_BYTES = 4.0
@@ -524,22 +527,15 @@ def validate_cp_geometry(parallel: ParallelSpec) -> None:
 def validate_pcp_geometry(parallel: ParallelSpec) -> None:
     """PCP adds a rank axis and owns a prefill-only schedule.
 
-    DCP reuses TP, PCP multiplies the world, so having both at once would need a
-    2-D KV layout this model does not declare.  Refuse it instead of quietly
-    dropping one axis.  The same applies to PP (stage chain) and DP (replicas):
-    PP and DP compose through placement; recurrent PCP needs a separate state-transfer schedule.
+    CP reuses the TP group, so ``cp > 1`` is allowed beside PCP when
+    ``tp % cp == 0``. PP and DP compose through placement. Recurrent PCP
+    carries its own inter-chunk state transfer.
     """
     pcp = int(getattr(parallel, "pcp", 1) or 1)
     if pcp <= 1:
         return
-    cp = int(getattr(parallel, "cp", 1) or 1)
-    if cp > 1:
-        raise ModelingError(f"cp_pcp_combination_unmodeled:cp={cp},pcp={pcp}")
-    if int(parallel.ep) > 1:
-        # EP's group would span the PCP axis in the deployed layout; this
-        # simulator's EP domain is dp*tp only, so the combination is refused
-        # instead of priced with the wrong group.
-        raise ModelingError(f"pcp_with_ep_unmodeled:ep={parallel.ep},pcp={pcp}")
+    if int(getattr(parallel, "cp", 1) or 1) > 1:
+        validate_cp_geometry(parallel)
 
 
 def validate_cp_plan(model: ModelSpec, parallel: ParallelSpec) -> None:
@@ -548,9 +544,11 @@ def validate_cp_plan(model: ModelSpec, parallel: ParallelSpec) -> None:
     if plan == CP_PLAN_PCP:
         validate_pcp_geometry(parallel)
         verify_pcp_model(model, parallel)
+        if int(getattr(parallel, "cp", 1) or 1) > 1:
+            verify_cp_model(model, parallel)
     elif plan == CP_PLAN_DSA_CP:
-        if int(parallel.pcp) > 1:
-            raise ModelingError("dsa_cp_with_pcp_unmodeled")
+        if int(getattr(parallel, "pcp", 1) or 1) > 1:
+            validate_pcp_geometry(parallel)
         validate_cp_geometry(parallel)
         verify_cp_model(model, parallel)
         verify_dsa_cp_model(model, parallel)
@@ -595,20 +593,15 @@ def _verify_gqa_kv_domain(num_kv_heads: int, tp: int, cp: int) -> None:
 
 
 def verify_pcp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
-    """PCP requires a prefill-capable context attention and no recurrent state.
+    """PCP requires a declared prefill query-shard attention.
 
-    Splitting a prefill sequence across ranks is safe for context-addressed
-    attention because each query's visible prefix is gathered.  It is not safe
-    for a KDA/GDN scan: the recurrent state depends on the exact token order,
-    so a rank holding a middle chunk cannot reconstruct the state without
-    another schedule.  Catalog layer-plan models are refused explicitly until
-    that lowering is declared.
+    GQA, MLA, KDA, and GDN own that schedule. Projection-only layers may sit
+    beside them. A model whose kinds miss that set, or that declares some
+    other attention, has no query-shard builder.
     """
     kinds = _attention_kinds(model)
-    recurrent = sorted(kinds & {"kda", "gdn"})
-    if recurrent:
-        raise ModelingError(f"pcp_recurrent_state_unmodeled:{'+'.join(recurrent)}")
-    if kinds != {"gqa"}:
+    allowed = _CP_ATTENTION_TYPES
+    if not kinds <= allowed or not (kinds & {"gqa", "mla", "kda", "gdn"}):
         raise ModelingError(
             f"pcp_requires_declared_query_shard_builder:{'+'.join(sorted(kinds))}"
         )

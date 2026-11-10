@@ -127,6 +127,15 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     if state_copy:
         conv = state_copy.module.wrap(b, conv=conv, views=views, width=conv_width,
                                       **state_copy.options)
+    # DualChunkSwap owns 2*pcp chunks. Conv history crosses each boundary, so
+    # each prefill request pays (2*pcp-1)/pcp of one state all-gather.
+    if parallel.pcp > 1 and any(view.phase == "prefill" for view in views):
+        conv = b.communicate(
+            "pcp_conv_state_step", (conv,),
+            sum(1 for view in views if view.phase == "prefill")
+            * max(0, plan.conv_kernel - 1) * conv_width * 2
+            * (2 * parallel.pcp - 1) / parallel.pcp,
+            "allgather", "pcp")
     norm_rows = sum(view.q_len for view in views) if conv_source else tokens
     normalized = b.vector("qk_l2norm", (conv,), norm_rows * 2 * key_width, 5)
     if plan.attention == "gdn":
@@ -205,6 +214,16 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             )
             if view.phase == "prefill":
                 prefill_scan_ids.append(last)
+                if parallel.pcp > 1:
+                    # The output projection must wait until this request's state
+                    # has crossed the other DualChunkSwap chunks.
+                    state_bytes = heads * dk * dv * dtype_bytes(
+                        plan.recurrent_state_dtype or "fp32")
+                    step_comm = b.communicate(
+                        f"pcp_recurrent_state_step{index}", (last,),
+                        state_bytes * (2 * parallel.pcp - 1) / parallel.pcp,
+                        "allgather", "pcp")
+                    last = step_comm
         else:
             last = b.work(
                 f"recurrent_scan{index}", (gated, normalized), (q, heads, dk, dv),
@@ -233,7 +252,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     decode_binder = (getattr(decode_source.module, "bind_decode_scans", None)
                      if decode_source else None)
     if decode_binder is not None and any(view.phase == "decode" for view in views):
-        if any(view.phase != "decode" for view in views) or parallel.pcp != 1:
+        if any(view.phase != "decode" for view in views):
             raise ModelingError("kda_source_recurrent_requires_decode_only_pcp1")
         options = dict(decode_source.options)
         # This caller provides raw Q/K and decay. The selected kernel owns
@@ -312,6 +331,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             ids = {op.op_id for op in scans}
             anchor = scans[-1].op_id
             rewritten, deferred_outputs = [], []
+            deferred_ids = set()
             inserted = False
             for op in b.ops:
                 if op.op_id in ids:
@@ -321,11 +341,14 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                     continue
                 updated = replace(op, deps=tuple(
                     fused.op_id if dep in ids else dep for dep in op.deps))
-                # Every sequence's WY operands precede the one fused FWD_H.
-                # Earlier sequence outputs must move behind that launch too.
-                if (not inserted and op.family == "recurrent_output"
-                        and any(dep in ids for dep in op.deps)):
+                # WY operands precede the one fused FWD_H. Earlier outputs and
+                # the PCP state transfers that feed them move behind that launch.
+                waits_for_scan = any(dep in ids or dep in deferred_ids for dep in op.deps)
+                if not inserted and waits_for_scan and (
+                        op.family == "recurrent_output"
+                        or op.recipe.startswith("pcp_recurrent_state_step")):
                     deferred_outputs.append(updated)
+                    deferred_ids.add(op.op_id)
                 else:
                     rewritten.append(updated)
             b.ops = rewritten

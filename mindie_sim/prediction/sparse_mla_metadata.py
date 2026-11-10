@@ -55,7 +55,7 @@ def lower(b, *, views, plan, parallel, quant, deps, padded_tokens, stage_of,
         return key + '.publish'
     if (plan.mla_variant != 'latent_mla' or plan.cache_kind != 'dense'
             or plan.qk_rope_head_dim or not plan.index_topk
-            or quant.kv_dtype != 'bf16' or parallel.cp != 1 or parallel.pcp != 1
+            or quant.kv_dtype != 'bf16' or parallel.cp != 1
             or not views or any(v.phase != 'decode' for v in views)):
         raise ModelingError('sparse_mla_metadata_requires_nope_bf16_paged_decode')
     batch, rows = len(views), padded_tokens

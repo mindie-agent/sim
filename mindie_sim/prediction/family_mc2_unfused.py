@@ -85,7 +85,8 @@ def _contract(gate, down, dispatch):
         raise ModelingError("mc2_unfused_requires_owned_mc2_int8_receiver")
     ep, top_k, experts = phase["ep"], phase["top_k"], phase["experts"]
     source_rows = caller["local_rows"]
-    if (experts % ep or experts // ep != len(counts) or ep != caller["tp"]
+    if (experts % ep or experts // ep != len(counts)
+            or ep < caller["tp"] or ep % caller["tp"] != 0
             or phase["source_tokens"] != source_rows or phase["received_assignments"] != rows
             or tuple(source.get("activation_payload_shape", ())) != (rows, hidden)
             or tuple(source.get("activation_scale_shape", ())) != (rows,)):

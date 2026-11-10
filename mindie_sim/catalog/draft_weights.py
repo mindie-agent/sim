@@ -9,8 +9,29 @@ from dataclasses import replace
 from mindie_sim.catalog.types import DraftSpec, QuantSpec
 from mindie_sim.catalog.draft import draft_quant
 from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _t, term_bytes
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
+
+
+def _local_draft_experts(num_experts: int, ep: int) -> int:
+    """Experts held on one EP rank.
+
+    An exact split requires ``num_experts % ep == 0``.  A smaller expert set
+    is also legal when ``ep % num_experts == 0`` (DeepSeek-V4.1-Flash DSpark
+    with 16 experts under EP32/EP64): each rank holds
+    ``max(1, num_experts // ep)`` and that expert is replicated across
+    ``ep // num_experts`` ranks.
+    """
+    experts = int(num_experts)
+    width = max(1, int(ep))
+    if experts <= 0:
+        return 0
+    if experts % width != 0 and width % experts != 0:
+        raise ModelingError(
+            f"draft_experts_not_divisible_by_ep:{experts}%{width}")
+    return max(1, experts // width)
+
 
 def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTerm]:
     h = draft.hidden_size
@@ -87,10 +108,17 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
     return terms
 
 
-def _draft_ffn_terms(draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
+def _draft_ffn_terms(
+    draft: DraftSpec, model: ModelSpec, *, ep: int = 1,
+) -> list[WeightTerm]:
     h = draft.hidden_size
     terms: list[WeightTerm] = []
     if draft.num_experts > 0:
+        # Per-rank banks are max(1, num_experts // ep).  The term keeps the
+        # global population so residency sharding applies EP once.  When
+        # ep > num_experts and ep % num_experts == 0, each rank holds one
+        # expert replicated across ep // num_experts ranks.
+        _local_draft_experts(draft.num_experts, ep)
         terms.extend([
             _t("draft_router", draft.num_experts, h, "router"),
             _t("draft_expert_gate", draft.expert_intermediate_size, h,
@@ -126,6 +154,7 @@ def _draft_ffn_terms(draft: DraftSpec, model: ModelSpec) -> list[WeightTerm]:
 
 def draft_terms(
     draft: DraftSpec, model: ModelSpec, *, standalone_heads_only: bool = False,
+    ep: int = 1,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
     terms: list[WeightTerm] = []
@@ -161,7 +190,7 @@ def draft_terms(
                             draft.input_projection_category, "out_tp"))
         for _ in range(max(0, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
-            terms.extend(_draft_ffn_terms(draft, model))
+            terms.extend(_draft_ffn_terms(draft, model, ep=ep))
     if draft.kind == "mtp" and draft.target_shared_lm_head:
         terms.append(WeightTerm(
             "target_lm_head_alias", draft.vocab_size, h,
@@ -199,7 +228,10 @@ def draft_weight_summary(
     params = 0.0
     weights = 0.0
     for draft in drafts:
-        for term in draft_terms(draft, model, standalone_heads_only=standalone_heads_only):
+        for term in draft_terms(
+            draft, model, standalone_heads_only=standalone_heads_only,
+            ep=parallel.ep,
+        ):
             if not term.source_owned:
                 continue
             params += term.logical_parameters

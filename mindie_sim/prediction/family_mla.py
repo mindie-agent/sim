@@ -23,7 +23,7 @@ def recipes():
 
 
 def validate(*, views, plan, parallel, model, quant, padded_tokens, num_kv_splits=None):
-    if (parallel.cp != 1 or parallel.pcp != 1
+    if (parallel.cp != 1
             or any(view.phase != "decode" or view.q_len != 1 for view in views)
             or padded_tokens != len(views)):
         raise ModelingError("mla_decode_requires_unpartitioned_unpadded_single_token_decode_batch")

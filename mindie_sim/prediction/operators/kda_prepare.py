@@ -594,9 +594,12 @@ def bind_gate_prepare(ops, *, gate, local_ops, lengths, heads, key_heads, dk, dv
                       chunk, dtype, raw_g_dtype="bf16", gate_dtype="fp32",
                       beta_dtype="fp32", requests=(), pcp=1,
                       speculative=False):
-    """Replace generic prefill gate and local chunk math with one source call."""
-    if pcp != 1:
-        raise ModelingError("kda_prepare_requires_pcp1")
+    """Replace generic prefill gate and local chunk math with one source call.
+
+    ``pcp >= 1`` is accepted. Inter-chunk state transfer is a caller collective.
+    """
+    if pcp < 1:
+        raise ModelingError("kda_prepare_requires_pcp")
     if speculative:
         raise ModelingError("kda_prepare_speculative_prefill_not_supported")
     local_ids = {op.op_id for op in local_ops}

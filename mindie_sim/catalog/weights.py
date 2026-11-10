@@ -51,11 +51,23 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 
 
+def _resident_parallel(term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool) -> ParallelSpec:
+    """Placement used for one resident term.
+
+    Shared-expert DP executes those matrices with ``tp=1``. Each rank keeps
+    the full shared-expert copy instead of a TP shard.
+    """
+    if shared_expert_dp and term.category == "shared_expert":
+        return replace(parallel, tp=1)
+    return parallel
+
+
 def stage_weight_decomposition(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
+    enable_shared_expert_dp: bool = False,
 ) -> list[dict[str, float]]:
     """Per-PP-stage weight bytes split into payload and quant metadata.
 
@@ -75,8 +87,9 @@ def stage_weight_decomposition(
         total = 0.0
         payload = 0.0
         for term in terms:
-            total += term_bytes(term, quant, parallel, node_ranks)
-            payload += term_payload_bytes(term, quant, parallel, node_ranks)
+            placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
+            total += term_bytes(term, quant, placed, node_ranks)
+            payload += term_payload_bytes(term, quant, placed, node_ranks)
         stages.append({
             "total_bytes": float(total),
             "payload_bytes": float(payload),
@@ -638,7 +651,7 @@ def stage_weight_bytes(
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
     source: bool = False, layer_partition: Sequence[int] | None = None,
-    draft_kind: str | None = None,
+    draft_kind: str | None = None, enable_shared_expert_dp: bool = False,
 ) -> list[float]:
     quant = model.quant or QuantSpec("bf16")
     result: list[float] = []
@@ -650,7 +663,8 @@ def stage_weight_bytes(
         layer_partition=layer_partition,
     ):
         result.append(float(sum(
-            term_bytes(term, quant, parallel, node_ranks, source=source)
+            term_bytes(term, quant, _resident_parallel(
+                term, parallel, enable_shared_expert_dp), node_ranks, source=source)
             for term in terms
         )))
     return result
@@ -659,12 +673,13 @@ def stage_weight_bytes(
 def sharded_weight_bytes(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_draft: bool = False, include_engram: bool = True,
-    include_engram_tables: bool = True,
+    include_engram_tables: bool = True, enable_shared_expert_dp: bool = False,
 ) -> float:
     return float(max(stage_weight_bytes(
         model, parallel, node_ranks, include_draft=include_draft,
         include_engram=include_engram,
         include_engram_tables=include_engram_tables,
+        enable_shared_expert_dp=enable_shared_expert_dp,
     )))
 
 
@@ -693,6 +708,7 @@ def weight_breakdown(
     model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
+    enable_shared_expert_dp: bool = False,
 ) -> dict[str, float]:
     quant = model.quant or QuantSpec("bf16")
     groups: dict[str, float] = {}
@@ -702,8 +718,9 @@ def weight_breakdown(
         layer_partition=layer_partition,
     ):
         for term in terms:
+            placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
             groups[term.category] = groups.get(term.category, 0.0) + term_bytes(
-                term, quant, parallel, node_ranks,
+                term, quant, placed, node_ranks,
             )
     return groups
 

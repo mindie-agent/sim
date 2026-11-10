@@ -134,11 +134,21 @@ class ParallelSpec:
 
     @property
     def ep_domain(self) -> int:
-        return self.dp * self.tp
+        return self.dp * self.tp * self.pcp
+
+    @property
+    def ep_spans_pcp(self) -> bool:
+        return self.pcp > 1 and (self.ep > self.dp * self.tp or (self.dp * self.tp) % self.ep != 0)
 
     @property
     def ep_spans_dp(self) -> bool:
-        return self.ep > self.tp
+        return (self.ep > self.tp * self.pcp) if self.ep_spans_pcp else (self.ep > self.tp)
+
+    @property
+    def ep_dp_width(self) -> int:
+        if not self.ep_spans_dp:
+            return 1
+        return self.ep // (self.tp * self.pcp) if self.ep_spans_pcp else self.ep // self.tp
 
     @property
     def etp(self) -> int:
@@ -186,8 +196,15 @@ class ParallelSpec:
                 raise ModelingError(f"pp_partition_empty_stage:{list(counts)}")
         if model.num_heads % self.tp != 0:
             raise ModelingError(f"heads_not_divisible_by_tp:{model.num_heads}%{self.tp}")
-        if self.ep > 1 and self.ep <= self.tp and self.tp % self.ep != 0:
-            raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{self.tp}")
+        if not self.ep_spans_pcp:
+            if self.ep > 1 and self.ep <= self.tp and self.tp % self.ep != 0:
+                raise ModelingError(f"ep_not_divisor_of_tp:{self.ep}%{self.tp}")
+        else:
+            local_domain = self.tp * self.pcp
+            if self.ep <= local_domain and local_domain % self.ep != 0:
+                raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
+            if self.ep > local_domain and self.ep % local_domain != 0:
+                raise ModelingError(f"ep_not_multiple_of_tp_pcp:{self.ep}%{local_domain}")
         if self.cp > 1 or self.pcp > 1:
             # DCP reuses TP devices (``tp % cp == 0``); PCP is a separate rank
             # axis with its own prefill schedule.  The plan decides which guards

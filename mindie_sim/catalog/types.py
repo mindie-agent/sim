@@ -444,7 +444,7 @@ class DraftSpec:
     base_logits: bool = False
     markov_replicated: bool = True
     noncausal_query_block: bool = False
-    pp_capability: tuple[int, ...] = (1,)
+    pp_capability: tuple[int, ...] = (1, 2, 4, 8, 16)
     vocab_size: int = 0
     mhc_mult: int = 0
     mhc_sinkhorn_iters: int = 0

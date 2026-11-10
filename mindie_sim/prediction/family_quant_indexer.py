@@ -58,28 +58,38 @@ def _build(op, geometry):
         })
 
 
+def _owned_spans(view):
+    """Owned query spans. Empty ``query_ranges`` is the whole local query."""
+    ranges = view.query_ranges
+    if not ranges:
+        return ((0, view.q_len),)
+    return tuple((start, end) for start, end in ranges if end > start)
+
+
 def declare(builder, *, deps, views, plan, quant, parallel):
     """Declare the supported complete boundary without inferring native owners."""
-    if (parallel.cp != 1 or parallel.pcp != 1 or plan.candidate_filter
+    if (parallel.cp != 1 or parallel.pcp < 1 or plan.candidate_filter
             or plan.index_kpool != 1 or plan.compress_ratio != 4
             or (plan.index_heads, plan.index_dim, plan.index_topk) != (64, 128, 512)
             or quant.index_dtype != "int8" or quant.index_scale_dtype != "fp16"):
         raise ModelingError("quant_lightning_indexer_v2_complete_domain_mismatch")
     tokens = sum(view.q_len for view in views)
-    # The actual causal compressed-key count belongs to each query; graph
-    # padding and cache allocation do not create valid index work.
+    # Causal compressed-key counts follow each owned span. PCP chunks pass
+    # query_ranges; padding and cache allocation do not create index work.
     ratio = plan.compress_ratio
-    pairs = sum(_floor_sum(view.q_len, ratio, 1, view.context + 1) for view in views)
+    spans = tuple((view, start, end) for view in views for start, end in _owned_spans(view))
+    pairs = sum(_floor_sum(end - start, ratio, 1, view.context + start + 1)
+                for view, start, end in spans)
     heads, width = plan.index_heads, plan.index_dim
     sentinel_fills = sum(
-        short * plan.index_topk - _floor_sum(short, ratio, 1, view.context + 1)
-        for view in views
-        if (short := max(0, min(view.q_len, plan.index_topk * ratio - (view.context + 1))))
+        short * plan.index_topk - _floor_sum(short, ratio, 1, view.context + start + 1)
+        for view, start, end in spans
+        if (short := max(0, min(end - start, plan.index_topk * ratio - (view.context + start + 1))))
     )
     # QueryNd2Nz, ProcessVec0 and WeightDmaCopy all execute under the same
     # isFirstS2InnerLoop guard for queries with at least one compressed key.
     active_query_rows = sum(
-        view.q_len for view in views if (view.context + view.q_len) // ratio > 0
+        end - start for view, start, end in spans if (view.context + end) // ratio > 0
     )
     query_bytes = active_query_rows * heads * width
     key_bytes = pairs * width

@@ -584,12 +584,13 @@ def test_wrong_chunk_and_pcp_are_rejected_by_the_source_hook():
                deps="input", model=model, parallel=ParallelSpec(),
                quant=model.quant, mode="prefill", padded_tokens=64,
                policy=AttentionPolicy(recurrent_chunk=32), runtime=runtime)
-    with pytest.raises(ModelingError, match="kda_state_requires_pcp1"):
-        linear(prefix="pcp", plan=layer,
-               views=(RequestView("r", 64, 0, False, "prefill"),), stage=0,
-               deps="input", model=model, parallel=ParallelSpec(pcp=2),
-               quant=model.quant, mode="prefill", padded_tokens=64,
-               policy=AttentionPolicy(recurrent_chunk=64), runtime=runtime)
+    pcp_res = linear(prefix="pcp", plan=layer,
+                     views=(RequestView("r", 64, 0, False, "prefill"),), stage=0,
+                     deps="input", model=model, parallel=ParallelSpec(pcp=2),
+                     quant=model.quant, mode="prefill", padded_tokens=64,
+                     policy=AttentionPolicy(recurrent_chunk=64), runtime=runtime)
+    assert any("pcp_conv_state_step" in op.op_id for op in pcp_res.ops)
+    assert any("pcp_recurrent_state_step" in op.op_id for op in pcp_res.ops)
 
 
 def test_state_and_snapshot_addresses_are_disjoint_per_stream():

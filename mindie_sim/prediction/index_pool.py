@@ -10,7 +10,7 @@
 import math
 
 from mindie_sim.catalog.cache import index_row_bytes
-from mindie_sim.catalog.index_pool import pool_selection
+from mindie_sim.catalog.index_pool import PoolSelection, pool_selection
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 from .indexer_representation import index_representation
@@ -36,10 +36,44 @@ def recipes():
     return {}
 
 
+def _selection_for(view, plan):
+    """One request ledger. PCP DualChunkSwap sums each owned query span."""
+    tail = plan.index_kpool_always_select_tail
+    ranges = getattr(view, "query_ranges", ()) or ()
+    if not ranges:
+        return pool_selection(view.q_len, view.context, plan.index_topk, plan.index_kpool,
+                              always_select_tail=tail)
+    parts = [pool_selection(end - start, view.context + start, plan.index_topk, plan.index_kpool,
+                            always_select_tail=tail) for start, end in ranges]
+    # The request-owned tail ring stays one pool, not one tail per span.
+    retained = min(sum(end - start for start, end in ranges), plan.index_kpool)
+    return PoolSelection(
+        sum(part.scanned_pools for part in parts),
+        sum(part.selected_pools for part in parts),
+        sum(part.selected_tokens for part in parts),
+        sum(part.causal_tail_tokens for part in parts),
+        sum(part.completed_pools for part in parts),
+        sum(part.historical_pool_rows for part in parts),
+        retained)
+
+
 def _geometry(views, plan):
-    return tuple(pool_selection(v.q_len, v.context, plan.index_topk, plan.index_kpool,
-                                always_select_tail=plan.index_kpool_always_select_tail)
-                 for v in views)
+    return tuple(_selection_for(view, plan) for view in views)
+
+
+def _causal_token_pairs(views):
+    """Visible token pairs. Owned spans use their global start, not q_len at context."""
+    total = 0
+    for view in views:
+        ranges = getattr(view, "query_ranges", ()) or ()
+        if ranges:
+            total += sum((end - start) * (view.context + start)
+                         + (end - start) * (end - start + 1) // 2
+                         for start, end in ranges)
+        else:
+            query = view.q_len
+            total += query * view.context + query * (query + 1) // 2
+    return total
 
 
 def producer(b, *, source, views, plan, model, quant, padded_tokens):
@@ -131,8 +165,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     output_width = plan.index_topk + (plan.index_kpool - 1 if plan.index_kpool_always_select_tail else 0)
     common = (("pool_size", plan.index_kpool), ("score_mode", score_mode),
               ("valid_query_rows", valid), ("padded_query_rows", tokens),
-              ("causal_token_pairs", sum(v.q_len * v.context + v.q_len * (v.q_len + 1) // 2
-                                          for v in views)),
+              ("causal_token_pairs", _causal_token_pairs(views)),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
               ("native_owner_schedule", "not_selected"),

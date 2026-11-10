@@ -313,12 +313,20 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         ranges = view.query_ranges or ((0, q),)
         pairs = (q * view.kv_len if plan.noncausal_attention else
                  sum(_causal_pairs(end - start, context + start, plan.window) for start, end in ranges if end > start))
-        local_pairs, local_rows = pairs, context + q
+        local_pairs, local_rows = pairs, view.kv_len
         if parallel.cp > 1:
-            split = split_causal_pairs(q, context, parallel.cp, cp_interleave_size,
-                                       window=plan.window, noncausal=plan.noncausal_attention)
-            local_pairs = split.max_rank
-            local_rows = max(owned_positions(0, context + q - 1, parallel.cp, cp_interleave_size, rank)
+            if plan.noncausal_attention:
+                local_pairs = split_causal_pairs(
+                    q, view.kv_len - q, parallel.cp, cp_interleave_size,
+                    window=plan.window, noncausal=True).max_rank
+            else:
+                local_pairs = max(
+                    sum(split_causal_pairs(end - start, context + start, parallel.cp, cp_interleave_size,
+                                           window=plan.window, noncausal=False).per_rank[r]
+                        for start, end in ranges if end > start)
+                    for r in range(parallel.cp)
+                )
+            local_rows = max(owned_positions(0, view.kv_len - 1, parallel.cp, cp_interleave_size, rank)
                              for rank in range(parallel.cp))
         # One K/V sweep per query tile, cropped to each tile's causal horizon.
         # The final tile is real work, not a full padded sequence.
@@ -332,7 +340,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         streams = kv_heads if policy.reuse_kv_across_query_heads else heads
         kv_bytes = max(sweeps) * 2 * streams * width * dtype_bytes(quant.kv_dtype)
         input_bytes = q * heads * width * dtype_bytes(model.activation_dtype)
-        shape = (q, context + q, heads, width)
+        shape = (q, view.kv_len, heads, width)
         op = OpSpec(
             op_id=f"{prefix}.attention.{index}", family="attention", phase=mode,
             stage=stage, layer=plan.index, requests=(view.request_id,),
@@ -363,7 +371,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 prefix=f"{prefix}.request{index}", view=view, cp=parallel.cp,
                 local_heads=heads, v_dim=width, stage=stage, layer=plan.index, mode=mode,
                 deps=(last,), total_pairs=pairs, local_pairs=local_pairs,
-                total_rows=context + q, local_rows=local_rows, interleave=cp_interleave_size,
+                total_rows=view.kv_len, local_rows=local_rows, interleave=cp_interleave_size,
             )
             ops.extend(merged)
         attention.append(last)

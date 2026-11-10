@@ -85,7 +85,7 @@ def _typed_expert(gate, dispatch_id, width, rows, capacity):
 
 def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
           source_partitions, received_assignments, dtype, source_routing=None):
-    if (source_partitions != 1 or ep < 2 or experts % ep or dtype not in {"bf16", "fp16"}
+    if (source_partitions < 1 or ep < 2 or experts % ep or dtype not in {"bf16", "fp16"}
             or runtime.moe_recipe != "alltoall"):
         raise ModelingError("arch22_v2_requires_float_rows_and_unpartitioned_ep_alltoall")
     if runtime.kernels.get("moe_transport"):
@@ -95,6 +95,13 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
         for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
     # InferShape: a = globalBsReal * min(localExpertNum, topK). Capacity is
     # neither an observed group_list nor permission to load all padded rows.
+    # TPxDP without an explicit slice still publishes one source rank's rows.
+    if source_partitions > 1:
+        valid_source_tokens = ((tokens / source_partitions) if source_routing is None
+                               else source_routing.valid_local_tokens)
+        tokens = math.ceil(tokens / source_partitions)
+    else:
+        valid_source_tokens = tokens if source_routing is None else source_routing.valid_local_tokens
     global_bs = selected.get("global_bs", 0) or tokens * ep
     capacity = global_bs * min(experts // ep, top_k)
     if received_assignments > capacity:
@@ -113,7 +120,7 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
             m.update(native_output_capacity_shape=(capacity, width if name == ".expert_down"
                                                    else op.local_shape[-1]))
             by_id[op.op_id] = replace(op, metadata=tuple(m.items()))
-    valid = tokens if source_routing is None else source_routing.valid_local_tokens
+    valid = valid_source_tokens
     assignments, received = valid * top_k, received_assignments
     float_bytes = int(width * dtype_bytes(dtype))
     forward_row, reverse_row = width + 4 + 12, float_bytes
@@ -210,7 +217,7 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
 
         entry = local(entry_id, deps, entry_work, valid if dispatching else received, entry=True)
         channel_meta = {**metadata(), "group_axis": "ep", "steps": ep - 1,
-            "collective_id": network_id, "source_assignment_partitions": 1,
+            "collective_id": network_id, "source_assignment_partitions": source_partitions,
             "traffic_model": "uniform_peer_payload", "channel": "logical_payload",
             "peer_traffic_row_format": {"forward_bytes": forward_row, "reverse_bytes": reverse_row}}
         if not dispatching:
@@ -233,7 +240,7 @@ def lower(ops, *, selected, runtime, prefix, tokens, top_k, width, experts, ep,
             # This prices only the logical INT32 counts, not padded status slots.
             count_id = original.op_id + ".count_network"
             counts_meta = {**metadata(), "group_axis": "ep", "steps": ep - 1,
-                "collective_id": count_id, "source_assignment_partitions": 1,
+                "collective_id": count_id, "source_assignment_partitions": source_partitions,
                 "traffic_model": "uniform_peer_payload", "channel": "logical_counts"}
             count = Work(resources={"link": experts * 4 * (ep - 1) / ep}).apply(replace(
                 original, op_id=count_id, deps=(entry_id,), recipe=NETWORK,

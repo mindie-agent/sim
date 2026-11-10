@@ -12,7 +12,7 @@ from mindie_sim.schema.workload import IterationPlan
 
 
 def cohorts(parallel):
-    width = parallel.ep // parallel.tp if parallel.ep_spans_dp else 1
+    width = parallel.ep_dp_width
     return [tuple(range(first, first + width)) for first in range(0, parallel.dp, width)]
 
 

@@ -63,16 +63,16 @@ class Frontend:
             if tokens:
                 shard = sequence_parallel.input_shard(
                     plan=sp, op_id=prefix + "sp_shard", deps=(previous,),
-                    stage=0, layer=-1, requests=requests, phase=mode,
+                    stage=stages[0] if stages else 0, layer=-1, requests=requests, phase=mode,
                     width=model.hidden_size, dtype=model.activation_dtype)
                 ops.append(shard)
                 previous = shard.op_id
         caches, indices, topks, candidates = {}, {}, {}, {}
         residual_sources = []
-        attnres = family_attnres.selection(runtime) if tokens else None
+        attnres = family_attnres.selection(runtime) if (tokens and mode not in {"draft", "draft_prefill"}) else None
         attn_state = None
         if attnres is not None:
-            if len(set(stages)) != 1:
+            if len(set(stages)) != 1 and runtime.parallel.pp == 1:
                 raise ModelingError("attn_res_source_caller_requires_pp1")
             attn_state = family_attnres.AttnResPrefixState.start(
                 model=model, runtime=runtime, ready=previous, tokens=tokens,
@@ -219,6 +219,33 @@ class Frontend:
                 )
                 ops.append(transfer)
                 previous = transfer.op_id
+                if attn_state is not None:
+                    if attn_state.pending_mlp_id is not None:
+                        attn_state.pending_mlp_id = previous
+                        ptx = comm_op(
+                            op_id=f"{name}.prefix_pp", deps=(attn_state.prefix_id,),
+                            stage=stage, layer=index, requests=requests, family="pp_p2p",
+                            phase=mode, recipe="pipeline_residual_send",
+                            link_bytes=tokens * model.hidden_size * dtype_bytes(model.activation_dtype),
+                            shape=(tokens, model.hidden_size),
+                            metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])))
+                        ops.append(ptx)
+                        attn_state.prefix_id = ptx.op_id
+                    else:
+                        attn_state.prefix_id = previous
+                    moved_banks = list(attn_state.bank_ids)
+                    for slot_idx, bank_id in enumerate(moved_banks):
+                        if bank_id is not None:
+                            btx = comm_op(
+                                op_id=f"{name}.residual_pp{slot_idx}", deps=(bank_id,),
+                                stage=stage, layer=index, requests=requests, family="pp_p2p",
+                                phase=mode, recipe="pipeline_residual_send",
+                                link_bytes=tokens * model.hidden_size * dtype_bytes(model.activation_dtype),
+                                shape=(tokens, model.hidden_size),
+                                metadata=(("group_axis", "pp"), ("destination_stage", stages[index + 1])))
+                            ops.append(btx)
+                            moved_banks[slot_idx] = btx.op_id
+                    attn_state.bank_ids = tuple(moved_banks)
                 moved = []
                 for source_index, source in enumerate(residual_sources):
                     transfer = comm_op(
@@ -240,14 +267,14 @@ class Frontend:
         if sp and tokens:
             gathered = sequence_parallel.allgather(
                 plan=sp, op_id=prefix + "sp_output_gather", deps=(previous,),
-                stage=0, layer=-1, requests=requests, phase=mode,
+                stage=stages[-1] if stages else 0, layer=-1, requests=requests, phase=mode,
                 width=model.hidden_size, dtype=model.activation_dtype)
             ops.append(gathered)
             previous = gathered.op_id
             if sp.physical_global > sp.input_rows:
                 trimmed = sequence_parallel.output_trim(
                     plan=sp, op_id=prefix + "sp_output_trim", deps=(previous,),
-                    stage=0, layer=-1, requests=requests, phase=mode,
+                    stage=stages[-1] if stages else 0, layer=-1, requests=requests, phase=mode,
                     width=model.hidden_size, dtype=model.activation_dtype)
                 ops.append(trimmed)
                 previous = trimmed.op_id
@@ -337,6 +364,31 @@ class Frontend:
                       if view.phase == "prefill" else view for view, parts in zip(views, ranges))
         return local, sum(view.q_len for view in local), True
 
+    @staticmethod
+    def pcp_cohort_tokens(views, local_views, local_tokens, runtime, global_tokens=None, global_views=None):
+        p = runtime.parallel
+        if global_tokens is None and not getattr(p, "ep_spans_pcp", False):
+            return None
+        pcp_in_ep = min(p.pcp, max(1, p.ep // p.tp)) if getattr(p, "ep_spans_pcp", False) else 1
+        gviews = global_views if global_views is not None else views
+        expand = global_views is not None and (
+            global_tokens is None or sum(v.q_len for v in gviews) < global_tokens)
+        q_of = lambda v: v.q_len + (v.draft_proposal_tokens if expand else 0)
+        dec_g = sum(q_of(v) for v in gviews if v.phase != "prefill")
+        pf_views = tuple(v for v in gviews if v.phase == "prefill")
+        pf_unpadded = sum(q_of(v) for v in pf_views)
+        rank_totals = [
+            sum(sum(e - s for s, e in pcp_rank_chunk_ranges(q_of(v), p.pcp, r))
+                for v in pf_views)
+            for r in range(p.pcp)
+        ]
+        pf_local_sum = max(
+            (sum(rank_totals[g:g + pcp_in_ep]) for g in range(0, p.pcp, pcp_in_ep)),
+            default=0,
+        )
+        pad_extra = max(0, (global_tokens - dec_g - pf_unpadded) if global_tokens is not None else 0)
+        return max(local_tokens, dec_g + pf_local_sum + (pad_extra * pcp_in_ep + p.pcp - 1) // p.pcp)
+
     def __call__(self, plan, model, runtime, machine, *, global_tokens=None, global_views=None,
                  resource_fusion=True, replica=0):
         model = normalize_model(model)
@@ -389,8 +441,15 @@ class Frontend:
             )
             ops.append(embedding)
             previous = embedding.op_id
+        pcp_cohort = runtime.parallel.pcp > 1 and any(
+            v.phase == "prefill" for v in (global_views or views))
+        body_global_tokens = (
+            self.pcp_cohort_tokens(views, local_views, local_tokens, runtime,
+                                   global_tokens=global_tokens, global_views=global_views)
+            if pcp_cohort else global_tokens
+        )
         body, previous = self.body(model, runtime, local_views, ready=previous, tokens=local_tokens,
-                                   mode=mode, global_tokens=global_tokens, replica=replica)
+                                   mode=mode, global_tokens=body_global_tokens, replica=replica)
         ops.extend(body)
         if pcp_prefill:
             if runtime.final_norm_scope == "all":

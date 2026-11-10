@@ -599,7 +599,8 @@ def _scaled_pool_layout(
 
     candidates = enumerate_parallel_candidates(
         parsed, num_devices=target_dies, allow_dp=True, allow_ep=allow_ep,
-        allow_pp=False, allow_pcp=False)
+        allow_pp=(parsed.runtime.parallel.pp > 1),
+        allow_pcp=(parsed.runtime.parallel.pcp > 1))
     if not candidates:
         raise ModelingError(f"afd_no_parallel_layout:{target_dies}")
     base = parsed.runtime.parallel

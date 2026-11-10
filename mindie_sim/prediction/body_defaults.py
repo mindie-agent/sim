@@ -61,7 +61,7 @@ def _inherit_gdn_store(binding, default=None, carried=None):
 def _gdn_store_default(case, kernels):
     """Select only the declared BF16 store helper, independently of recurrence."""
     layers = [p for p in case.model.layer_plans if p.attention == "gdn"]
-    if (not layers or case.model.activation_dtype != "bf16" or case.runtime.parallel.pcp != 1
+    if (not layers or case.model.activation_dtype != "bf16"
             or any(p.recurrent_state_dtype != "fp32" for p in layers)):
         return None
     declared = kernels.get("families", {}).get("gdn_gating", {})
@@ -261,8 +261,8 @@ def _gdn_default(case, phase, tokens, kernels):
                 "recurrent_vector" in kernels.get("programs", {}))
     pipes = {"hbm", "vector", "mte2_aic", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
+              "partitioned_gdn_caller_domain" if phase != "decode" and parallel.pcp != 1 else
               "decode_profile_only" if phase != "decode" else
-              "partitioned_gdn_caller_domain" if parallel.pcp != 1 else
               "gdn_requires_bf16_inputs_fp32_state" if case.model.activation_dtype != "bf16"
               or any(p.recurrent_state_dtype != "fp32" for p in layers) else
               "gdn_independent_copy_pipes_not_declared" if any(
@@ -334,8 +334,8 @@ def _kda_default(case, phase, tokens, kernels):
                 bool(case.runtime.tensor_layouts) or raw_bf16)
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
+              "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
               "decode_profile_only" if phase != "decode" or not 1 <= tokens <= 8 else
-              "partitioned_kda_caller_domain" if parallel.pcp != 1 else
               "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"
               or any(p.recurrent_state_dtype not in {"bf16", "fp32"} for p in layers) else
               "kda_independent_copy_pipes_not_declared" if any(
@@ -380,7 +380,6 @@ def _attnres_default(case, phase, kernels):
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
               "decode_profile_only" if phase != "decode" else
-              "partitioned_attnres_caller_domain" if case.runtime.parallel.pp != 1 else
               "attnres_requires_bf16_uniform_blocks" if (
                   case.model.activation_dtype != "bf16"
                   or any(p.residual_block_size != block or p.engram or p.hyper_connections
@@ -418,9 +417,10 @@ def attention_defaults(case, phase, *, tokens=1):
                     (family == "indexed_mla" and ("indexed_attention" in lowerings or
                      "indexed_attention" in programs)))
         reason = ("explicit_implementation_preserved" if explicit else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
                   "decode_profile_only" if phase != "decode" else
                   "independent_copy_pipes_not_declared" if not pipes else
-                  "partitioned_attention_domain" if parallel.cp != 1 or parallel.pcp != 1 else "")
+                  "partitioned_attention_domain" if parallel.cp != 1 else "")
         if not reason and family == "gqa_decode":
             if (case.model.activation_dtype not in floating or case.model.quant.kv_dtype not in floating
                     or any(p.window or p.noncausal_attention for p in layers)):
@@ -480,9 +480,10 @@ def attention_defaults(case, phase, *, tokens=1):
             for d in case.machine.dies
         )
         reason = ("explicit_implementation_preserved" if explicit else
+                  "partitioned_attention_domain" if phase != "decode" and parallel.pcp != 1 else
                   "decode_profile_only" if phase != "decode" else
                   "independent_copy_pipes_not_declared" if not (pipes and paired_pipes) else
-                  "partitioned_attention_domain" if parallel.cp != 1 or parallel.pcp != 1 else
+                  "partitioned_attention_domain" if parallel.cp != 1 else
                   "paged_mla_source_geometry_outside_reviewed_domain" if (
                       not is_a5 or tokens != 1 or case.model.activation_dtype != "bf16"
                       or case.model.quant.kv_dtype != "bf16"

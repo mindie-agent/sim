@@ -126,7 +126,10 @@ def select_realization(runtime, layer, *, phase, tokens, valid_tokens, global_to
     if not matching:
         return None
     local_caller = runtime.moe_recipe == "local_expert_reduce"
-    if ((runtime.parallel.ep != 1 and not local_caller) or runtime.parallel.pcp != 1
+    # PCP splits queries before this histogram is applied, and PP only places
+    # layers. Neither changes the local top-k ledger, so both may compose.
+    if ((runtime.parallel.ep != 1 and not local_caller) or runtime.parallel.pcp < 1
+            or runtime.parallel.pp < 1
             or runtime.moe_recipe not in {"alltoall", "tp_join_reduce",
                                            "local_expert_reduce"}):
         raise ModelingError("routing_realization_requires_ep1_pcp1_unchunked_alltoall")

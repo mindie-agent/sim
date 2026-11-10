@@ -22,7 +22,7 @@ def recipes():
 def validate(*, views, plan, parallel, model, quant, padded_tokens, kv_splits=1,
              dispatch=None, native_query_capacity=None):
     if (not views or any(v.phase != 'decode' or v.q_len != 1 for v in views)
-            or parallel.cp != 1 or parallel.pcp != 1 or padded_tokens < len(views)
+            or parallel.cp != 1 or padded_tokens < len(views)
             or plan.mla_variant != 'latent_mla' or plan.cache_kind != 'dense'
             or plan.index_topk or plan.window or plan.noncausal_attention
             or (plan.kv_lora_rank, plan.qk_rope_head_dim) != (512, 64)

@@ -23,7 +23,7 @@
 """
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from copy import deepcopy
 from dataclasses import replace
 import json
@@ -40,7 +40,7 @@ from mindie_sim.backends.nvidia import (
     profiles as nvidia_profiles,
 )
 from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import QuantSpec
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES,
     ARCHITECTURE_PRESET_CATALOG,
@@ -120,7 +120,7 @@ def _resolve_va_lowerings(
         cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
     )
     lowerings: dict[str, Any] = {}
-    if any(p.attention == "kda" for p in model_spec.layer_plans) and p_cfg.pcp == 1:
+    if any(p.attention == "kda" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
         lowerings["kda"] = {
@@ -131,9 +131,9 @@ def _resolve_va_lowerings(
             }],
             "otherwise": "analytical",
         }
-    if any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp == 1:
+    if any(p.residual_block_size > 0 for p in model_spec.layer_plans) and p_cfg.pp >= 1:
         lowerings["attention_residual"] = "vllm_ascend_attn_res_prefix"
-    if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp == 1:
+    if any(p.attention == "gdn" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
         opts = {"recurrent_implementation": "arch35_fp32"} if is_a5 else {}
         binding = {"implementation": "vllm_ascend_gdn_decode", "options": opts}
         # The source caller has separate ordinary and speculative paths. A
@@ -410,13 +410,15 @@ def compose_case(
     intra_bw_4p_gbps: float | None = None,
     intra_bw_8p_gbps: float | None = None,
     va_recommended: bool = False,
+    pp_layer_partition: Sequence[int] | None = None,
+    enable_shared_expert_dp: bool = False,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
         if int(val) <= 0:
             raise ModelingError(f"invalid_parallel_dimension:{name}={val}")
     tp, dp, ep, pp, pcp, dcp = int(tp), int(dp), int(ep), int(pp), int(pcp), int(dcp)
-    if not (ep == 1 or (dp * tp) % ep == 0 or ep == dp * tp):
+    if not (ep == 1 or (dp * tp * pcp) % ep == 0 or ep == dp * tp):
         raise ModelingError(f"invalid_ep_partition:ep={ep},dp={dp},tp={tp}")
     if int(prompt_tokens) <= 0 or int(output_tokens) <= 0 or int(concurrency) <= 0:
         raise ModelingError("invalid_workload_dimensions")
@@ -545,10 +547,10 @@ def compose_case(
         num_experts_per_tok=num_experts_per_tok,
     )
     if (va_profile is not None and not sp and va_profile.get("sp", True)
-            and pp == 1 and pcp == 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
+            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
         from mindie_sim.prediction.sequence_parallel import _validate_model
         try:
-            _validate_model(model_spec)
+            _validate_model(model_spec, padding="right_to_tp")
             sp = True
         except ModelingError:
             pass
@@ -556,6 +558,34 @@ def compose_case(
     if int(mtp_proposal_tokens) > 0:
         has_mtp = getattr(model_spec.auxiliary, "mtp", None) is not None
         has_dspark = getattr(model_spec.auxiliary, "dspark", None) is not None
+        if (not (has_mtp or has_dspark) and model_spec.layer_plans
+                and model_spec.layer_plans[-1].attention in {"mla", "gqa"}):
+            last = model_spec.layer_plans[-1]
+            synth_mtp = DraftSpec(
+                kind="mtp", layers=1, hidden_size=model_spec.hidden_size,
+                intermediate_size=last.intermediate_size or last.moe_intermediate_size,
+                num_heads=last.num_heads, num_kv_heads=last.num_kv_heads,
+                head_dim=last.head_dim,
+                q_width=last.num_heads * last.head_dim,
+                kv_width=last.num_kv_heads * last.head_dim,
+                attention_kind=last.attention,
+                q_lora_rank=last.q_lora_rank, kv_lora_rank=last.kv_lora_rank,
+                qk_nope_head_dim=last.qk_nope_head_dim,
+                qk_rope_head_dim=last.qk_rope_head_dim, v_head_dim=last.v_head_dim,
+                o_lora_rank=last.o_lora_rank, o_groups=last.o_groups,
+                num_experts=last.num_experts, top_k=last.top_k,
+                expert_intermediate_size=last.moe_intermediate_size,
+                num_shared_experts=last.num_shared_experts,
+                target_layer_ids=(last.index,), block_size=1,
+                target_shared_embedding=True, target_shared_lm_head=True,
+                mla_variant=last.mla_variant,
+                kv_cache_elements=last.kv_cache_elements,
+                input_mode="dual_normalized", base_logits=True,
+                pp_capability=(1, 2, 4, 8, 16),
+                vocab_size=model_spec.vocab_size,
+            )
+            model_spec = replace(model_spec, auxiliary=AuxiliarySpec(mtp=synth_mtp))
+            has_mtp = True
         if not (has_mtp or has_dspark):
             raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
         if not (1.0 <= float(mtp_acceptance_length) <= float(1 + int(mtp_proposal_tokens))):
@@ -600,6 +630,8 @@ def compose_case(
     if int(mtp_proposal_tokens) > 0:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
+    if enable_shared_expert_dp:
+        runtime_meta["enable_shared_expert_dp"] = True
 
     runtime_dict: dict[str, Any] = {
         "parallel": {"dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp},
@@ -621,13 +653,22 @@ def compose_case(
         runtime_dict["piecewise_capture_keys"] = sorted(
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, resolved_max_batched}
         )
+    if pp_layer_partition is not None:
+        runtime_dict["pp_layer_partition"] = [int(x) for x in pp_layer_partition]
+    elif pp > 1 and model_spec.layers % pp != 0:
+        hi = (model_spec.layers + pp - 1) // pp
+        if hi * (pp - 1) < model_spec.layers:
+            runtime_dict["pp_layer_partition"] = [hi] * (pp - 1) + [model_spec.layers - hi * (pp - 1)]
+        else:
+            runtime_dict["pp_layer_partition"] = [
+                model_spec.layers // pp + (1 if i < model_spec.layers % pp else 0) for i in range(pp)]
     if sp:
         from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
-        if pp != 1 or pcp != 1 or tp <= 1 or ep < tp or (ep % tp != 0):
+        if pcp < 1 or pp < 1 or tp <= 1 or ep < tp or (ep % tp != 0):
             raise ModelingError(
                 f"sequence_parallel_invalid_topology:tp={tp},ep={ep},pp={pp},pcp={pcp}"
             )
-        _validate_model(model_spec)
+        _validate_model(model_spec, padding="right_to_tp")
         runtime_dict["kernels"] = {
             "sequence_parallel": dict(DECLARATION, padding="right_to_tp")
         }
@@ -687,10 +728,10 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
     kernels = dict(rt.get("kernels", {}))
     tp, ep, pp, pcp = int(par.get("tp", 1)), int(par.get("ep", 1)), int(par.get("pp", 1)), int(par.get("pcp", 1))
     if (va_profile.get("sp", True) and "sequence_parallel" not in kernels
-            and pp == 1 and pcp == 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
+            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
         from mindie_sim.prediction.sequence_parallel import DECLARATION, _validate_model
         try:
-            _validate_model(parsed.model)
+            _validate_model(parsed.model, padding="right_to_tp")
             kernels["sequence_parallel"] = dict(DECLARATION, padding="right_to_tp")
             meta["sp"] = True
         except ModelingError:

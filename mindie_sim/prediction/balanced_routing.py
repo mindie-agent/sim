@@ -17,6 +17,23 @@ from dataclasses import dataclass
 from mindie_sim.schema.common import ModelingError
 
 
+def _rank_rows(counts, ep, rank):
+    """Expert rows owned by one EP rank.
+
+    Stride across the ledger when ``ep`` does not exceed the expert count.
+    When more ranks than experts (replicated draft experts, for example 16
+    experts under EP32/EP64), split that expert's rows across
+    ``ep // len(counts)`` replicas so the rank ledger conserves the total.
+    """
+    width = len(counts)
+    if ep <= width:
+        return counts[rank::ep]
+    replicas = ep // width
+    expert = rank % width
+    rep = rank // width
+    return (counts[expert] // replicas + int(rep < counts[expert] % replicas),)
+
+
 @dataclass(frozen=True)
 class BalancedRouting:
     expert_rows: tuple[int, ...]
@@ -41,18 +58,25 @@ class BalancedRouting:
     def basis(self):
         return "forced_balanced_integer_counts"
 
+    def _expert_ids(self):
+        """Strided expert ids, or the one replicated expert when EP is wider."""
+        count = len(self.expert_rows)
+        if self.ep <= count:
+            return tuple(range(self.representative_rank, count, self.ep))
+        return (self.representative_rank % count,)
+
     def to_dict(self):
         return {
             "basis": self.basis, "global_tokens": self.global_tokens,
             "global_expert_rows": self.expert_rows,
             "local_expert_rows": self.local_expert_rows,
-            "representative_expert_ids": tuple(range(self.representative_rank, len(self.expert_rows), self.ep)),
+            "representative_expert_ids": self._expert_ids(),
             "expert_placement": "strided_ep", "matrix_groups": self.active,
             "rows_per_active_expert": (self.rows // self.active
                                        if self.active and len(set(self.local_expert_rows) - {0}) == 1
                                        else None),
             "row_classes": tuple(sorted(Counter(self.local_expert_rows).items())),
-            "rank_assignment_rows": tuple(sum(self.expert_rows[rank::self.ep])
+            "rank_assignment_rows": tuple(sum(_rank_rows(self.expert_rows, self.ep, rank))
                                           for rank in range(self.ep)),
             "representative_rank": self.representative_rank,
             "represented_ep_ranks": self.represented_ranks,
@@ -70,10 +94,9 @@ class BalancedRouting:
 def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
                          token_shards=1, valid_source_tokens=None, replica=0):
     p = runtime.parallel
-    if p.pcp != 1 or runtime.moe_recipe not in {
-            "alltoall", "tp_join_reduce", "local_expert_reduce"}:
+    if runtime.moe_recipe not in {"alltoall", "tp_join_reduce", "local_expert_reduce"}:
         raise ModelingError("balanced_routing_requires_pcp1_unchunked_alltoall")
-    width = p.ep // p.tp if p.ep_spans_dp else 1
+    width = p.ep_dp_width
     if width > 1 and global_tokens is None:
         raise ModelingError("balanced_routing_requires_complete_dp_cohort:use_target_graphs")
     total = tokens * token_shards if global_tokens is None else global_tokens
@@ -83,11 +106,15 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     assignments = total * layer.top_k
     q, r = divmod(assignments, layer.num_experts)
     counts = tuple(q + (index < r) for index in range(layer.num_experts))
-    first = (replica % width) * p.tp if p.ep_spans_dp else 0
-    ranks = tuple(range(first, first + min(p.tp, p.ep)))
-    representative = max(ranks, key=lambda rank: sum(counts[rank::p.ep]))
-    return BalancedRouting(counts, counts[representative::p.ep], p.ep,
-                           min(p.tp, p.ep) // token_shards, total,
+    local_ep = min(p.tp * p.pcp, p.ep) if p.ep_spans_pcp else min(p.tp, p.ep)
+    first = (replica % width) * local_ep if p.ep_spans_dp else 0
+    ranks = tuple(range(first, first + local_ep))
+    representative = max(ranks, key=lambda rank: sum(_rank_rows(counts, p.ep, rank)))
+    local_rows = _rank_rows(counts, p.ep, representative)
+    # PCP prefill tokens are already split across PCP ranks. Dividing by the
+    # PCP-extended local EP width would shrink dispatch/combine a second time.
+    return BalancedRouting(counts, local_rows, p.ep,
+                           max(1, min(p.tp, p.ep) // token_shards), total,
                            (valid_tokens * token_shards if valid_source_tokens is None
                             else valid_source_tokens), tokens * token_shards,
                            representative, ranks)

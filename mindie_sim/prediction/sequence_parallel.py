@@ -224,7 +224,7 @@ def _validate_declaration(raw: Any) -> Mapping:
     return raw
 
 
-def _validate_views(views, tokens, *, padding="none") -> tuple[Any, ...]:
+def _validate_views(views, tokens, *, padding: str = "none") -> tuple[Any, ...]:
     try:
         values = tuple(views)
     except TypeError as exc:
@@ -235,15 +235,18 @@ def _validate_views(views, tokens, *, padding="none") -> tuple[Any, ...]:
             raise ModelingError(f"sequence_parallel_requires_positive_q_len:{q_len!r}")
         if getattr(view, "padding", False):
             raise ModelingError("sequence_parallel_no_padding_domain")
-        for field in ("draft_proposal_tokens", "draft_accepted_tokens"):
-            if getattr(view, field, 0):
+        # Speculative draft fields are rejected only for the unpadded contract.
+        # right_to_tp serving may carry a draft proposal on the same views.
+        if padding == "none":
+            for field in ("draft_proposal_tokens", "draft_accepted_tokens"):
+                if getattr(view, field, 0):
+                    raise ModelingError(
+                        f"sequence_parallel_speculative_field_unsupported:{field}")
+            # The ordinary decode scheduler records one committed token here even
+            # when no draft exists. Only a multi-token advance needs speculative ABI.
+            if getattr(view, "draft_advanced_tokens", 0) not in (0, 1):
                 raise ModelingError(
-                    f"sequence_parallel_speculative_field_unsupported:{field}")
-        # The ordinary decode scheduler records one committed token here even
-        # when no draft exists. Only a multi-token advance needs speculative ABI.
-        if getattr(view, "draft_advanced_tokens", 0) not in (0, 1):
-            raise ModelingError(
-                "sequence_parallel_speculative_field_unsupported:draft_advanced_tokens")
+                    "sequence_parallel_speculative_field_unsupported:draft_advanced_tokens")
     total = sum(view.q_len for view in values)
     if tokens < total or (padding == "none" and tokens != total):
         raise ModelingError(
@@ -251,16 +254,21 @@ def _validate_views(views, tokens, *, padding="none") -> tuple[Any, ...]:
     return values
 
 
-def _validate_model(model) -> None:
+def _validate_model(model, *, padding: str = "none") -> None:
     plans = tuple(getattr(model, "layer_plans", ()))
     if not plans:
         raise ModelingError("sequence_parallel_requires_attn_residual_layer_plans")
     if any(getattr(layer, "scope", "body") != "body" for layer in plans):
         raise ModelingError("sequence_parallel_requires_body_scope")
-    if any(int(getattr(layer, "residual_block_size", 0)) <= 0 for layer in plans):
+    # Standard residual models (DeepSeek, GLM, Qwen) have no AttnRes block.
+    # That layout is valid once SP right-pads to TP; the unpadded contract
+    # still requires a positive source residual block.
+    if padding == "none" and any(
+            int(getattr(layer, "residual_block_size", 0)) <= 0 for layer in plans):
         raise ModelingError("sequence_parallel_requires_source_attn_residual_block_size")
-    if any(bool(getattr(layer, "hyper_connections", False))
-           or int(getattr(layer, "hc_mult", 0) or 0) > 0 for layer in plans):
+    if padding == "none" and any(
+            bool(getattr(layer, "hyper_connections", False))
+            or int(getattr(layer, "hc_mult", 0) or 0) > 0 for layer in plans):
         raise ModelingError("sequence_parallel_hyperconnections_unsupported")
 
 
@@ -284,17 +292,18 @@ def select(runtime, model, views, *, tokens, global_tokens=None):
     parallel = _parallel(runtime)
     pp, cp, pcp = int(parallel.pp), int(parallel.cp), int(parallel.pcp)
     tp, ep, dp = int(parallel.tp), int(parallel.ep), int(parallel.dp)
-    if pp != 1:
+    if pp < 1:
         raise ModelingError(f"sequence_parallel_requires_pp1:{pp}")
-    if cp != 1:
+    # Unpadded SP is the cp=1 source path. right_to_tp serving allows cp >= 1.
+    if padding == "none" and cp != 1:
         raise ModelingError(f"sequence_parallel_requires_cp1:{cp}")
-    if pcp != 1:
+    if pcp < 1:
         raise ModelingError(f"sequence_parallel_requires_pcp1:{pcp}")
     if tp <= 1:
         raise ModelingError(f"sequence_parallel_requires_tp_gt_1:{tp}")
     if ep < tp or ep % tp:
         raise ModelingError(f"sequence_parallel_requires_ep_ge_tp_and_divisible:{ep}:{tp}")
-    _validate_model(model)
+    _validate_model(model, padding=padding)
     if padding == "right_to_tp":
         tokens += (-tokens) % tp
     if tokens % tp:
@@ -303,9 +312,16 @@ def select(runtime, model, views, *, tokens, global_tokens=None):
     local = tokens // tp
     if ep > tp:
         if global_tokens is None:
-            raise ModelingError("sequence_parallel_cross_dp_requires_complete_cohort_tokens")
+            if padding == "right_to_tp" and dp == 1:
+                pcp_in_ep = min(pcp, max(1, ep // tp)) if getattr(parallel, "ep_spans_pcp", False) else 1
+                global_tokens = tokens * pcp_in_ep if any(getattr(v, "phase", "") == "prefill" for v in values) else tokens
+            else:
+                raise ModelingError("sequence_parallel_cross_dp_requires_complete_cohort_tokens")
         cohort = _positive_int(
             global_tokens, "sequence_parallel_global_tokens_invalid")
+        if padding == "right_to_tp":
+            cohort = max(cohort, tokens)
+            cohort += (-cohort) % tp
         if cohort < tokens:
             raise ModelingError(
                 f"sequence_parallel_cohort_tokens_below_local_full:{cohort}<{tokens}")

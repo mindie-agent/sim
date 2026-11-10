@@ -63,7 +63,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
             top_k=top_k, width=width, experts=experts, ep=ep,
             source_partitions=source_partitions, received_assignments=received_assignments,
             dtype=dtype, source_routing=source_routing)
-    if (source_partitions != 1 or ep < 2 or dtype not in {"bf16", "fp16"}
+    if (source_partitions < 1 or ep < 2 or dtype not in {"bf16", "fp16"}
             or getattr(runtime, "moe_recipe", "alltoall") != "alltoall"):
         raise ModelingError("mc2_fullmesh_requires_unpartitioned_float_rows_and_ep_alltoall")
     if runtime.kernels.get("moe_transport"):
@@ -72,7 +72,13 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     pack, dispatch, combine, unpack = (by_id[prefix + suffix]
                                       for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
     source_metadata = source_routing.to_dict() if source_routing is not None else None
-    valid_source_tokens = tokens if source_routing is None else source_routing.valid_local_tokens
+    # TPxDP without an explicit slice still publishes one source rank's rows.
+    if source_partitions > 1:
+        valid_source_tokens = ((tokens / source_partitions) if source_routing is None
+                               else source_routing.valid_local_tokens)
+        tokens = math.ceil(tokens / source_partitions)
+    else:
+        valid_source_tokens = tokens if source_routing is None else source_routing.valid_local_tokens
     send = valid_source_tokens * top_k
     quant = selected.get("dispatch_quant", "none")
     payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
@@ -194,7 +200,7 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                     "device_kernel_group": info(),
                     "native_kind": kernel,
                     "channel": "count_status" if counts else "framed_payload",
-                    "source_assignment_partitions": 1,
+                    "source_assignment_partitions": source_partitions,
                     "traffic_model": "uniform_peer_payload",
                 }
                 if not counts:

@@ -173,8 +173,10 @@ def test_compose_case_execution_controls_and_long_context() -> None:
     assert c_sp["runtime"]["metadata"]["sp"] is True
     assert predict(c_sp, scope="body", phase="decode", tokens=1, context=2048, sequences=1)["duration_ms"] > 0.0
 
+    c_sp_qwen = compose_case("qwen3.5-35b-a3b", hardware="a3", tp=4, dp=1, ep=4, layers=2, sp=True)
+    assert c_sp_qwen["runtime"]["metadata"]["sp"] is True
     with pytest.raises(ModelingError, match="sequence_parallel"):
-        compose_case("qwen3.5-35b-a3b", hardware="a3", tp=4, dp=1, ep=4, layers=2, sp=True)
+        compose_case("qwen3.5-35b-a3b", hardware="a3", tp=1, dp=1, ep=1, layers=2, sp=True)
 
     c_long = compose_case("qwen3-30b-a3b", hardware="a3", tp=2, dp=1, ep=2, layers=2, prompt_tokens=32768, output_tokens=128)
     assert c_long["runtime"]["max_model_len"] >= 32896
@@ -397,3 +399,38 @@ def test_va_recommended_compose_and_apply_helper() -> None:
     assert enriched_glm["runtime"]["metadata"]["va_recommended"] is True
     assert enriched_glm["runtime"]["kernels"]["lowerings"].get("mla_prolog") == "vllm_ascend_mla_prolog_v3"
     assert target_graphs(enriched_glm, phase="decode", tokens=1, context=1024, sequences=4)[0]
+
+
+def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
+    from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
+
+    scenarios = [
+        compose_case("kimi-k3", "a5", tp=4, dp=1, pp=4, ep=4, layers=8, prompt_tokens=256, output_tokens=8, mtp_proposal_tokens=2, va_recommended=True),
+        compose_case("kimi-k3", "a5", tp=4, dp=1, pp=4, pcp=2, ep=8, layers=8, prompt_tokens=256, output_tokens=8, mtp_proposal_tokens=2, va_recommended=True),
+        compose_case("glm-5.1", "a3", tp=1, dp=1, pcp=8, ep=8, layers=4, prompt_tokens=256, output_tokens=8, va_recommended=True),
+        compose_case("glm-5.3", "a3", tp=2, dp=1, pcp=8, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
+        compose_case("deepseek-r1", "a3", tp=4, dp=4, ep=16, layers=4, prompt_tokens=256, output_tokens=8, quant="w8a8", enable_shared_expert_dp=True, va_recommended=True),
+        compose_case("deepseek-v3.2", "a3", tp=2, dp=4, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, quant="w4a8", va_recommended=True),
+        compose_case("deepseek-v4-pro", "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
+        compose_case("qwen3.5-397b-a17b", "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
+    ]
+    for case in scenarios:
+        pf = predict(case, scope="body", phase="prefill", tokens=128, context=0, sequences=1)
+        dec = predict(case, scope="body", phase="decode", tokens=1, context=128, sequences=1)
+        assert pf["duration_ms"] > 0.0
+        assert dec["duration_ms"] > 0.0
+        assert target_graphs(case, phase="decode", tokens=1, context=128, sequences=1, scope="model")[0]
+
+    # PP1 vs PP2 AttnRes cross-layer bank preservation on Kimi-K3
+    c_pp1 = compose_case("kimi-k3", "a3", tp=8, pp=1, ep=8, layers=4, va_recommended=True)
+    c_pp2 = compose_case("kimi-k3", "a3", tp=8, pp=2, ep=8, layers=4, va_recommended=True)
+    l2_pp1 = [dict(op.metadata)["attn_res_view"]["valid_blocks"] for op in target_operators(c_pp1, phase="prefill", tokens=128, scope="model") if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
+    l2_pp2 = [dict(op.metadata)["attn_res_view"]["valid_blocks"] for op in target_operators(c_pp2, phase="prefill", tokens=128, scope="model") if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
+    assert l2_pp1 == l2_pp2 == [1, 1]
+
+    # Short prefill PCP cohort ownership (1 token per replica under DP2/TP2/EP4/PCP4)
+    c_short = compose_case("deepseek-v3.2", "a3", dp=2, tp=2, ep=4, pcp=4, layers=4)
+    g_short = target_graphs(c_short, phase="prefill", tokens=1, sequences=1, scope="body")
+    exp_up = [op for op in g_short[0] if "expert_up" in op.op_id][0]
+    assert exp_up.semantic_shape[0] == 4
+

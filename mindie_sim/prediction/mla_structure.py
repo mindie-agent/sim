@@ -11,7 +11,7 @@ from .structure_groups import declare_group
 
 def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
                     padded_tokens, scores, topk):
-    if parallel.cp != 1 or parallel.pcp != 1 or plan.candidate_filter:
+    if parallel.cp != 1 or plan.candidate_filter:
         return
     selection = next(op for op in ops if op.op_id == topk)
     quantized = quant.index_dtype not in {"bf16", "fp16"}
@@ -34,7 +34,7 @@ def declare_indexer(ops, *, prefix, plan, parallel, model, quant, views,
         implementation={
             "native_kind": "VllmAscendQuantLightningIndexerV2" if quantized else "LightningIndexer",
             "conditions": {
-                "cp": 1, "pcp": 1, "candidate_filter": False,
+                "cp": 1, "pcp": parallel.pcp, "candidate_filter": False,
                 "source_selection": "semantic_score_and_topk_projection",
                 "timing_boundary": "separate_declared_operators",
             },

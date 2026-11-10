@@ -111,7 +111,7 @@ def compute_hardware_service_factors( op: Any, geometry: Any, env: dict[str, Any
     nom_min = {"empty_aic": Fraction(439, 1_000_000), "w8a8_nd_bf16": Fraction(3037, 1_000_000), "cube": Fraction(1578, 1_000_000), "vector": Fraction(1312, 1_000_000)}.get(inv_key, Fraction(0))
     decl_min = as_fraction(inv.get(inv_key, 0.0)) if inv_key else Fraction(0)
     decl_start = as_fraction(inv.get(f"{inv_key}_startup_ms", 0.0)) if inv_key else Fraction(0)
-    if not peaks and not is_cube_family and not is_coll_family and vec_min <= 0 and empty_min <= 0 and decl_min <= 0 and decl_start <= 0:
+    if (not peaks or "mte2" in undeclared) and not is_cube_family and not is_coll_family and vec_min <= 0 and empty_min <= 0 and decl_min <= 0 and decl_start <= 0:
         env["CM_RIDGE_SHIFT"] = Fraction(1)
         env["RIDGE_EFFECTIVE_TOKENS"] = Fraction(tokens)
         env["VEC_EFFECTIVE_TOKENS"] = Fraction(tokens)

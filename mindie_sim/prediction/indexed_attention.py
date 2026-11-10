@@ -58,7 +58,7 @@ def lower_op(op, *, selection, view, views, plan, parallel):
     policy = selection.options.get("scratch_policy", "offchip")
     if policy not in {"resident", "offchip"}:
         raise ModelingError("indexed_attention_scratch_policy_required")
-    if (len(views) != 1 or parallel.cp != 1 or parallel.pcp != 1
+    if (len(views) != 1 or parallel.cp != 1
             or view.draft_proposal_tokens
             or (view.query_ranges and view.query_ranges != ((0, view.q_len),))):
         raise ModelingError("indexed_attention_requires_single_contiguous_sequence")

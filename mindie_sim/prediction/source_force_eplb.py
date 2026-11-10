@@ -95,15 +95,22 @@ class SourceForceEplb:
 
 
 @lru_cache(maxsize=128)
-def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens):
+def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens, tp=0):
     """Count source cursor residues without expanding token/expert assignments."""
     if (ep < 2 or experts % ep or not 0 < top_k <= experts
             or allocated_local_tokens < 1
             or not 0 < valid_global_tokens <= allocated_local_tokens * ep):
         raise ModelingError("source_force_eplb_requires_divisible_banks_and_bounded_valid_prefix")
     banks = experts // ep
-    valid = tuple(max(0, min(allocated_local_tokens,
-                            valid_global_tokens - src * allocated_local_tokens)) for src in range(ep))
+    if 0 < tp < ep and ep % tp == 0:
+        groups = ep // tp
+        valid_per_group = valid_global_tokens // groups
+        per_tp = tuple(max(0, min(allocated_local_tokens,
+                                  valid_per_group - src * allocated_local_tokens)) for src in range(tp))
+        valid = per_tp * groups
+    else:
+        valid = tuple(max(0, min(allocated_local_tokens,
+                                valid_global_tokens - src * allocated_local_tokens)) for src in range(ep))
     expert_counts = [0] * experts
     traffic = [[0] * ep for _ in range(ep)]
     for src, rows in enumerate(valid):
@@ -117,7 +124,7 @@ def ledger(experts, ep, top_k, allocated_local_tokens, valid_global_tokens):
     return SourceForceEplb(tuple(expert_counts),
                           tuple(tuple(expert_counts[r*banks:(r+1)*banks]) for r in range(ep)),
                           tuple(map(tuple, traffic)), valid, allocated_local_tokens,
-                          top_k, ep, valid_global_tokens)
+                          top_k, ep, sum(valid))
 
 
 def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
@@ -128,25 +135,29 @@ def select(runtime, layer, *, tokens, valid_tokens, global_tokens,
     p = runtime.parallel
     wrapper = runtime.kernels.get("moe_token_partition")
     if raw == {"kind": "vllm_ascend_mc2_tp", "global_bs": 0}:
-        if (runtime.routing != {"policy": "balanced"} or p.dp != 1 or p.ep != p.tp
-                or p.ep < 2 or p.cp != 1 or p.pcp != 1 or p.pp != 1 or replica != 0
+        if (runtime.routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
+                or p.ep % p.tp != 0 or p.ep < 2 or p.cp != 1 or p.pcp < 1
+                or p.pp < 1 or replica < 0
                 or runtime.moe_recipe != "alltoall" or token_shards != 1
                 or not wrapper or wrapper.get("kind") != "vllm_ascend_mc2_tp_slice"
                 or runtime.kernels.get("sequence_parallel")):
             raise ModelingError("source_force_eplb_requires_explicit_mc2_tp_caller")
-        if global_tokens not in (None, tokens) or not 0 < valid_tokens <= tokens:
+        if (global_tokens not in (None, tokens, tokens * (p.ep // p.tp))
+                or not 0 < valid_tokens <= tokens):
             raise ModelingError("source_force_eplb_requires_declared_caller_valid_prefix")
         return ledger(layer.num_experts, p.ep, layer.top_k,
-                      (tokens + p.tp - 1) // p.tp, valid_tokens)
+                      (tokens + p.tp - 1) // p.tp, valid_tokens * (p.ep // p.tp), p.tp)
     if raw != {"kind": "vllm_ascend_sp_mc2", "global_bs": 0}:
         raise ModelingError("force_eplb_source_requires_explicit_vllm_ascend_sp_mc2_global_bs0")
-    if (runtime.routing != {"policy": "balanced"} or p.dp != 1 or p.ep != p.tp
-            or p.ep < 2 or p.cp != 1 or p.pcp != 1 or p.pp != 1 or replica != 0
+    if (runtime.routing != {"policy": "balanced"} or p.dp < 1 or p.ep < p.tp
+            or p.ep % p.tp != 0 or p.ep < 2 or p.cp != 1 or p.pcp < 1
+            or p.pp < 1 or replica < 0
             or runtime.moe_recipe != "alltoall" or token_shards != p.tp
             or wrapper
             or runtime.kernels.get("native_moe_protocol", {}).get("kind") != "arch35_fullmesh"):
         raise ModelingError("source_force_eplb_requires_sp_dp1_ep_tp_mc2_alltoall")
-    if (valid_source_tokens is None or global_tokens not in (None, tokens * p.ep)
+    if (valid_source_tokens is None
+            or global_tokens not in (None, tokens * p.tp, tokens * p.ep)
             or valid_tokens != min(tokens, valid_source_tokens)):
         raise ModelingError("source_force_eplb_requires_explicit_sp_valid_prefix")
-    return ledger(layer.num_experts, p.ep, layer.top_k, tokens, valid_source_tokens)
+    return ledger(layer.num_experts, p.ep, layer.top_k, tokens, valid_source_tokens * (p.ep // p.tp), p.tp)

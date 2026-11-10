@@ -77,6 +77,13 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
         selected_runtime, selections = resolve(
             runtime, proposal_views, padded_tokens=rows, replay_scope=replay_scope,
             global_views=global_proposals, model_scope="draft")
+        # Sequence-parallel lowering is body-scoped; draft_program manages TP
+        # feature gather explicitly before entering the draft body.
+        if "sequence_parallel" in selected_runtime.kernels:
+            selected_runtime = replace(
+                selected_runtime,
+                kernels={k: v for k, v in selected_runtime.kernels.items()
+                         if k != "sequence_parallel"})
         requests = tuple(view.request_id for view in proposal_views)
         prefix = "draft_prefill." if prefill else f"draft{step}."
         feature_deps = [previous]
@@ -183,4 +190,30 @@ def draft_program(frontend, model, runtime, views, ready, *, global_views=None, 
             previous = sample.op_id
         regions.append(LoweringRegion(tuple(ops), selected_runtime,
                                       draft_model.activation_dtype, rows, selections))
+    # Draft runs on the last pipeline stage. Send accepted proposal ids back
+    # to stage 0 so the target schedule can consume them.
+    if not prefill and runtime.parallel.pp > 1 and regions and rows > 0:
+        stage = runtime.parallel.pp - 1
+        active = [v for v in views if v.draft_proposal_tokens > 0] or list(views)
+        xfer = comm_op(
+            op_id="draft_proposal_transfer",
+            deps=(previous,),
+            stage=0,
+            layer=-1,
+            requests=tuple(v.request_id for v in active),
+            family="p2p",
+            phase="draft",
+            recipe="draft_proposal_transfer",
+            link_bytes=len(active) * max(
+                1, max((v.draft_proposal_tokens for v in active), default=1)) * 8,
+            shape=(len(active),),
+            metadata=(
+                ("group_axis", "pp"),
+                ("source_stage", stage),
+                ("destination_stage", 0),
+            ),
+        )
+        last = regions[-1]
+        regions[-1] = replace(last, ops=last.ops + (xfer,))
+        previous = xfer.op_id
     return regions, previous

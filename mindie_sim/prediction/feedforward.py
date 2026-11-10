@@ -85,7 +85,10 @@ def dense(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
 def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mode,
         global_tokens=None, routing=RoutingPolicy(), routing_realization=None,
         overlap_shared=False, runtime=None, reduce_after_join=False, sequence_plan=None,
-        caller=None, **_):
+        caller=None, sp_tokens=None, **_):
+    pre_sp_tokens = tokens
+    if sp_tokens is not None:
+        tokens = sp_tokens
     exchange = caller is None or caller.exchange
     reduce_after_join = reduce_after_join or (caller is not None and caller.reduce_after_join)
     hidden = model.hidden_size
@@ -105,7 +108,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         overlap_shared or getattr(plan, "overlap_shared", False)
         or dict(getattr(runtime, "metadata", ()) or ()).get(
             "overlap_shared_expert", False))
-    group_tokens = tokens if global_tokens is None else global_tokens
+    group_tokens = global_tokens if global_tokens is not None else pre_sp_tokens
+    local_experts = max(1, plan.num_experts // parallel.ep)
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
                           min(parallel.tp, parallel.ep)))
@@ -432,7 +436,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             # Keep this analytical program distinct from dense/batched mapping;
             # an explicit source grouped planner still owns its actual rows.
             metadata["matrix_mapping_domain"] = "aggregate_experts"
-            metadata["matrix_weight_bank_groups"] = math.ceil(plan.num_experts / parallel.ep)
+            metadata["matrix_weight_bank_groups"] = local_experts
             if routing_realization is not None:
                 metadata["matrix_mapping_domain"] = "equal_expert_groups"
                 metadata["matrix_groups"] = active
@@ -552,7 +556,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                 entries=(gate_ops[0].op_id,),
                 anchor=activation.op_id, block="ffn", scope_role="body",
                 view={"input_width": latent, "intermediate_width": expert_width,
-                      "local_experts": math.ceil(plan.num_experts / parallel.ep),
+                      "local_experts": local_experts,
                       "routing_basis": dict(routing_metadata)["routing_basis"],
                       "input_dtype": dict(gate.metadata)["activation_format"],
                       "output_dtype": dict(down.metadata)["activation_format"],
@@ -674,8 +678,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         ops.extend(gathered)
         last, tokens = gathered[-1].op_id, full_tokens
     if plan.num_shared_experts and tokens:
+        shared_dp = bool(dict(runtime.metadata).get("enable_shared_expert_dp", False)) if runtime is not None else False
         shared_input, shared_tokens, shared_prefix = deps, tokens, []
-        if sequence_plan:
+        if sequence_plan and not shared_dp:
             from .sequence_parallel import allgather, reduce_scatter
             gathered = allgather(
                 plan=sequence_plan, op_id=prefix + ".shared.sp_gather", deps=(deps,),
@@ -686,12 +691,12 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         shared, shared_last = dense(
             prefix=prefix + ".shared", plan=replace(plan, intermediate_size=(
                 plan.shared_intermediate_size or plan.num_shared_experts * plan.moe_intermediate_size)),
-            deps=shared_input, stage=stage, requests=requests, tokens=shared_tokens, model=model,
-            parallel=parallel, mode=mode, category="shared_expert",
+            deps=shared_input, stage=stage, requests=requests, tokens=tokens if shared_dp else shared_tokens, model=model,
+            parallel=replace(parallel, tp=1) if shared_dp else parallel, mode=mode, category="shared_expert",
             runtime=runtime, reduce_output=not reduce_after_join and sequence_plan is None,
         )
         shared = shared_prefix + shared
-        if sequence_plan:
+        if sequence_plan and not shared_dp:
             scattered = reduce_scatter(
                 plan=sequence_plan, op_id=prefix + ".shared.sp_scatter", deps=(shared_last,),
                 stage=stage, layer=plan.index, requests=requests, phase=mode,
