@@ -45,3 +45,13 @@ jobs:
           cd /tmp
           /tmp/sim-wheel/bin/python -c "from mindie_sim.backends.ascend import profiles; assert profiles(); import ijson"
           /tmp/sim-wheel/bin/mindie-sim --help
+
+  release-ready:
+    name: release-ready
+    needs: [test, wheel]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: python -c 'import json,os; assert all(job["result"] == "success" for job in json.loads(os.environ["RESULTS"]).values()), "required CI failed or was skipped"'
