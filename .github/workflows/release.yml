@@ -12,6 +12,8 @@ permissions:
 jobs:
   release:
     uses: mindie-agent/mindie-bench/.github/workflows/publish-release.yml@main
+    secrets:
+      MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
       release-notes-path: docs/releases/sim-0.9.10.md
       setup-command: |
