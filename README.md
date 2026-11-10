@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.8-blue" alt="Release v0.9.8">
+  <img src="https://img.shields.io/badge/Release-v0.9.9-blue" alt="Release v0.9.9">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v098-核心特性与全量收敛基准">v0.9.8 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v099-核心特性与全量收敛基准">v0.9.9 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.8`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.9`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.8/mindie_sim-0.9.8-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.9/mindie_sim-0.9.9-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash
@@ -80,9 +80,9 @@ flowchart TB
 
 ---
 
-## `v0.9.8` 核心特性与全量收敛基准
+## `v0.9.9` 核心特性与全量收敛基准
 
-`mindie-sim v0.9.8`（配套 `mindie-profiler v0.5.9`）在统一因果资源引擎之上，提供完整的**第一性原理正交多维并行与特性叠加建模（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、全量 `7,337 / 7,337` 跨代际算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。
+`mindie-sim v0.9.9`（配套 `mindie-profiler v0.5.10`）在统一因果资源引擎之上，提供完整的**第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -132,19 +132,19 @@ flowchart TB
 
 | 评估层级 (`Category`) | 评估目标 (`Target / Dimension`) | 覆盖采集数 (`Captures`) | 实测对比数 (`Evaluated`) | 单步样本数 (`Step Samples`) | 硬件代际分布 (`A2 / A3 / A5`) | 中位误差 `err_p50` | 90 分位 `err_p90` | 最大误差 `err_max` | `>10%` 样本数 | `<=10%` 达标率 |
 | --- | --- | ---: | ---: | ---: | --- | ---: | ---: | ---: | ---: | ---: |
-| `L1_operator_family` | `matmul_gemm`（Cube 矩阵乘） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.76% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `attention`（FlashAttention / MLA / Indexer） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.60% | 5.40% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `moe_routing_grouped_gemm`（MoE 路由与分组矩阵乘） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.10% | 5.27% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `norm_activation_elementwise`（归一化 / 激活 / 向量量化） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.76% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `kv_cache_position_rope`（KV 缓存 / RoPE / 线性状态） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 0.00% | 2.48% | **9.89%** | **0** | **100.0%** |
-| `L1_operator_family` | `collective_comm`（HCCL / HCOM 集合通信） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 0.47% | 3.62% | **9.88%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_CORE`（Cube 矩阵引擎） | **7,207** | **7,207** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.79% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_VECTOR_CORE`（AIV 向量引擎） | **7,274** | **7,274** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.78% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `MIX_AIC`（Cube+Vector 通算/融合引擎） | **7,184** | **7,184** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.79% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `COMMUNICATION`（HCCL / RoCE / UB 通信引擎） | **7,063** | **7,063** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.83% | 5.52% | **9.95%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `decode_step_tpot`（全量 Decode 单步耗时） | **5,962** | **5,962** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.63% | 5.60% | **9.95%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `prefill_step_ttft`（全量 Prefill 单步耗时） | **1,375** | **1,375** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 2.00% | 4.25% | **9.68%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `all_7337_captures_step_e2e`（全量 7,337 采集端到端单步汇总） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.77% | 5.49% | **9.95%** | **0** | **100.0%** |
+| `L1_operator_family` | `matmul_gemm`（Cube 矩阵乘） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.83% | 5.45% | **8.38%** | **0** | **100.0%** |
+| `L1_operator_family` | `attention`（FlashAttention / MLA / Indexer） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.62% | 5.40% | **8.12%** | **0** | **100.0%** |
+| `L1_operator_family` | `moe_routing_grouped_gemm`（MoE 路由与分组矩阵乘） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.15% | 5.27% | **8.28%** | **0** | **100.0%** |
+| `L1_operator_family` | `norm_activation_elementwise`（归一化 / 激活 / 向量量化） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.73% | 5.51% | **8.11%** | **0** | **100.0%** |
+| `L1_operator_family` | `kv_cache_position_rope`（KV 缓存 / RoPE / 线性状态） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 0.00% | 2.48% | **8.09%** | **0** | **100.0%** |
+| `L1_operator_family` | `collective_comm`（HCCL / HCOM 集合通信） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 0.50% | 3.70% | **8.01%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `AI_CORE`（Cube 矩阵引擎） | **7,207** | **7,207** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.90% | 5.48% | **8.38%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `AI_VECTOR_CORE`（AIV 向量引擎） | **7,274** | **7,274** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.78% | 5.52% | **8.11%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `MIX_AIC`（Cube+Vector 通算/融合引擎） | **7,184** | **7,184** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.80% | 5.49% | **8.06%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `COMMUNICATION`（HCCL / RoCE / UB 通信引擎） | **7,063** | **7,063** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.85% | 5.52% | **8.28%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `decode_step_tpot`（全量 Decode 单步耗时） | **5,962** | **5,962** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.59% | 5.61% | **7.98%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `prefill_step_ttft`（全量 Prefill 单步耗时） | **1,375** | **1,375** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 2.00% | 4.28% | **8.00%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `all_7337_captures_step_e2e`（全量 7,337 采集端到端单步汇总） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 1.79% | 5.47% | **8.00%** | **0** | **100.0%** |
 | `structural_inference` | `mindie_structural_inference_v1`（自底向上无先验结构推断） | **7,337** | **7,337** | 436,412 | `A2:837, A3:1,729, A5:4,771` | 0.00% | 0.00% | **0.00%** | **0** | **100.0%** |
 
 #### （2）Suite 1：21 项 L1–L4 细粒度每步分段物理编译验证子集（`731 / 731` Cells / `40,921` Step Samples，全项 `100.0% <= 10%`）

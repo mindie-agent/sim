@@ -20,6 +20,7 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
 import json
 from pathlib import Path
 import pytest
@@ -27,7 +28,11 @@ import pytest
 from mindie_sim import predict
 from mindie_sim.__main__ import main
 from mindie_sim.compose import HARDWARE_ALIASES, compose_case, resolve_hardware_sku
+from mindie_sim.prediction.efficiency import (
+    analyze_network_efficiency, extract_hardware_peaks,
+)
 from mindie_sim.prediction.graph import GraphPolicy
+from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.scheduler import DraftPolicy
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
@@ -401,36 +406,390 @@ def test_va_recommended_compose_and_apply_helper() -> None:
     assert target_graphs(enriched_glm, phase="decode", tokens=1, context=1024, sequences=4)[0]
 
 
+def _shared_expert_gemms(ops):
+    return [op for op in ops if ".shared" in op.op_id
+            and op.family in ("gate_up_projection", "down_projection")]
+
+
+def _tp_collectives(ops, layer):
+    return [op for op in ops if op.layer == layer
+            and op.family in ("allreduce", "reduce_scatter", "allgather")
+            and dict(op.metadata).get("group_axis") == "tp"]
+
+
+def _causal_pairs(op):
+    metadata = dict(op.metadata)
+    return metadata.get("local_pairs", metadata.get("logical_pairs"))
+
+
+def _assert_expert_exchange_links(ops, ep):
+    exchanges = [op for op in ops
+                 if op.recipe in ("expert_dispatch", "expert_combine")]
+    assert exchanges
+    for op in exchanges:
+        metadata = dict(op.metadata)
+        assert metadata["steps"] == ep - 1
+        expected = (op.local_shape[0] * (ep - 1) / ep * metadata["row_bytes"]
+                    / metadata["source_assignment_partitions"])
+        assert op.link_bytes == pytest.approx(expected, rel=1e-12)
+    return exchanges
+
+
+def _native_mc2(case):
+    case = deepcopy(case)
+    case["runtime"].setdefault("kernels", {})["native_moe_protocol"] = {
+        "kind": "arch35_fullmesh", "max_inflight_per_rank": 4,
+    }
+    return case
+
+
 def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
-    from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
+    tokens = 128
 
-    scenarios = [
-        compose_case("kimi-k3", "a5", tp=4, dp=1, pp=4, ep=4, layers=8, prompt_tokens=256, output_tokens=8, mtp_proposal_tokens=2, va_recommended=True),
-        compose_case("kimi-k3", "a5", tp=4, dp=1, pp=4, pcp=2, ep=8, layers=8, prompt_tokens=256, output_tokens=8, mtp_proposal_tokens=2, va_recommended=True),
-        compose_case("glm-5.1", "a3", tp=1, dp=1, pcp=8, ep=8, layers=4, prompt_tokens=256, output_tokens=8, va_recommended=True),
-        compose_case("glm-5.3", "a3", tp=2, dp=1, pcp=8, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
-        compose_case("deepseek-r1", "a3", tp=4, dp=4, ep=16, layers=4, prompt_tokens=256, output_tokens=8, quant="w8a8", enable_shared_expert_dp=True, va_recommended=True),
-        compose_case("deepseek-v3.2", "a3", tp=2, dp=4, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, quant="w4a8", va_recommended=True),
-        compose_case("deepseek-v4-pro", "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
-        compose_case("qwen3.5-397b-a17b", "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4, prompt_tokens=256, output_tokens=8, sp=True, va_recommended=True),
-    ]
-    for case in scenarios:
-        pf = predict(case, scope="body", phase="prefill", tokens=128, context=0, sequences=1)
-        dec = predict(case, scope="body", phase="decode", tokens=1, context=128, sequences=1)
-        assert pf["duration_ms"] > 0.0
-        assert dec["duration_ms"] > 0.0
-        assert target_graphs(case, phase="decode", tokens=1, context=128, sequences=1, scope="model")[0]
+    # Shared-expert DP: one TP rank handles 1/TP of the SP-sharded token rows
+    # and drops the shared-expert TP collective; the 16-rank cohort performs
+    # exactly the same shared-expert FLOPs as the TP-sharded baseline.
+    shared_base = dict(
+        model="deepseek-r1", hardware="a3", tp=4, dp=4, ep=16, layers=4,
+        prompt_tokens=tokens, output_tokens=8, quant="w8a8",
+        va_recommended=True,
+    )
+    shared_on = compose_case(**shared_base, enable_shared_expert_dp=True)
+    shared_off = compose_case(**shared_base, enable_shared_expert_dp=False)
+    graphs_on = target_graphs(shared_on, phase="prefill", tokens=tokens, scope="body")
+    graphs_off = target_graphs(shared_off, phase="prefill", tokens=tokens, scope="body")
+    assert len(graphs_on) == len(graphs_off) == shared_base["dp"]
+    on_shared = _shared_expert_gemms(graphs_on[0])
+    off_shared = _shared_expert_gemms(graphs_off[0])
+    assert [op.family for op in on_shared] == ["gate_up_projection", "down_projection"]
+    assert [op.family for op in off_shared] == ["gate_up_projection", "down_projection"]
+    tp = shared_base["tp"]
+    for on_op, off_op in zip(on_shared, off_shared):
+        assert on_op.local_shape[0] * tp == off_op.local_shape[0]
+        assert on_op.flops == pytest.approx(off_op.flops, rel=1e-12)
+    assert on_shared[0].local_shape[1] == off_shared[0].local_shape[1] * tp
+    assert on_shared[1].local_shape[2] == off_shared[1].local_shape[2] * tp
+    on_cohort_flops = sum(op.flops for graph in graphs_on.values()
+                          for op in _shared_expert_gemms(graph)) * tp
+    off_cohort_flops = sum(op.flops for graph in graphs_off.values()
+                           for op in _shared_expert_gemms(graph)) * tp
+    assert on_cohort_flops == pytest.approx(off_cohort_flops, rel=1e-12)
+    assert not any(op.link_bytes for graph in graphs_on.values()
+                   for op in graph if ".shared" in op.op_id)
+    off_shared_links = [op for graph in graphs_off.values() for op in graph
+                        if ".shared" in op.op_id and op.link_bytes]
+    assert len(off_shared_links) == 2 * len(graphs_off)
 
-    # PP1 vs PP2 AttnRes cross-layer bank preservation on Kimi-K3
-    c_pp1 = compose_case("kimi-k3", "a3", tp=8, pp=1, ep=8, layers=4, va_recommended=True)
-    c_pp2 = compose_case("kimi-k3", "a3", tp=8, pp=2, ep=8, layers=4, va_recommended=True)
-    l2_pp1 = [dict(op.metadata)["attn_res_view"]["valid_blocks"] for op in target_operators(c_pp1, phase="prefill", tokens=128, scope="model") if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
-    l2_pp2 = [dict(op.metadata)["attn_res_view"]["valid_blocks"] for op in target_operators(c_pp2, phase="prefill", tokens=128, scope="model") if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
+    eff_on = analyze_network_efficiency(
+        shared_on, phase="prefill", tokens=tokens, context=0, sequences=1,
+        scope="body", run_graph=False)
+    eff_off = analyze_network_efficiency(
+        shared_off, phase="prefill", tokens=tokens, context=0, sequences=1,
+        scope="body", run_graph=False)
+    assert eff_on["total_flops"] == pytest.approx(eff_off["total_flops"], rel=1e-12)
+    hidden = shared_on["model"]["hidden_size"]
+    shared_wire = 2 * tokens * hidden * 2 * (tp - 1) / tp
+    assert eff_off["total_link_bytes"] - eff_on["total_link_bytes"] == pytest.approx(
+        shared_wire, rel=1e-12)
+    assert eff_on["operator_sum_ms"] < eff_off["operator_sum_ms"]
+
+    # With SP disabled the baseline pays an explicit shared-expert TP allreduce;
+    # shared-expert DP removes that op entirely.
+    tp_on = compose_case(**{**shared_base, "va_recommended": False, "sp": False},
+                         enable_shared_expert_dp=True)
+    tp_off = compose_case(**{**shared_base, "va_recommended": False, "sp": False},
+                          enable_shared_expert_dp=False)
+    tp_on_ops = target_operators(tp_on, phase="prefill", tokens=tokens, scope="body")
+    tp_off_ops = target_operators(tp_off, phase="prefill", tokens=tokens, scope="body")
+    assert not any(op.family == "allreduce" and ".shared" in op.op_id
+                   for op in tp_on_ops)
+    shared_allreduce = [op for op in tp_off_ops
+                        if op.family == "allreduce" and ".shared" in op.op_id]
+    assert len(shared_allreduce) == 1
+    assert shared_allreduce[0].link_bytes == pytest.approx(
+        2 * (tp - 1) / tp * tokens * hidden * 2, rel=1e-12)
+
+    # PCP x EP: every stage owns tokens/PCP query rows; the causal-pair split
+    # sums to the single-stage triangular total.  Expert exchange wire scales
+    # with the full EP domain and the exact remote-peer fraction.
+    def pcp_case(model, *, pcp, ep, **kwargs):
+        return compose_case(model, "a3", layers=4, prompt_tokens=tokens,
+                            output_tokens=8, pcp=pcp, ep=ep, **kwargs)
+
+    glm51 = pcp_case("glm-5.1", tp=1, dp=1, pcp=8, ep=8, va_recommended=True)
+    glm51_base = pcp_case("glm-5.1", tp=1, dp=1, pcp=1, ep=1, va_recommended=True)
+    glm51_ops = target_operators(glm51, phase="prefill", tokens=tokens, scope="body")
+    glm51_base_ops = target_operators(glm51_base, phase="prefill", tokens=tokens,
+                                      scope="body")
+    attn51 = [op for op in glm51_ops if op.family == "attention" and op.layer == 0][0]
+    attn51_base = [op for op in glm51_base_ops
+                   if op.family == "attention" and op.layer == 0][0]
+    assert attn51.local_shape[0] == tokens // 8 == 16
+    tri_total = tokens * (tokens + 1) // 2
+    assert _causal_pairs(attn51_base) == tri_total
+    assert 8 * _causal_pairs(attn51) == tri_total
+    assert 8 * attn51.flops == pytest.approx(attn51_base.flops, rel=1e-12)
+    parallel51 = glm51["runtime"]["parallel"]
+    assert parallel51["ep"] == parallel51["tp"] * parallel51["dp"] * parallel51["pcp"]
+    _assert_expert_exchange_links(glm51_ops, parallel51["ep"])
+
+    glm53_sp = pcp_case("glm-5.3", tp=2, dp=1, pcp=8, ep=16, sp=True)
+    glm53_no = pcp_case("glm-5.3", tp=2, dp=1, pcp=8, ep=16, sp=False)
+    glm53_base = pcp_case("glm-5.3", tp=2, dp=1, pcp=1, ep=2, sp=True)
+    ops_sp = target_operators(glm53_sp, phase="prefill", tokens=tokens, scope="body")
+    ops_no = target_operators(glm53_no, phase="prefill", tokens=tokens, scope="body")
+    ops_base = target_operators(glm53_base, phase="prefill", tokens=tokens, scope="body")
+    attn_sp = [op for op in ops_sp if op.family == "attention" and op.layer == 0][0]
+    attn_base = [op for op in ops_base if op.family == "attention" and op.layer == 0][0]
+    assert 8 * _causal_pairs(attn_sp) == _causal_pairs(attn_base) == tri_total
+    assert 8 * attn_sp.flops == pytest.approx(attn_base.flops, rel=1e-12)
+    parallel53 = glm53_sp["runtime"]["parallel"]
+    assert parallel53["ep"] == parallel53["tp"] * parallel53["dp"] * parallel53["pcp"]
+    _assert_expert_exchange_links(ops_sp, parallel53["ep"])
+    _assert_expert_exchange_links(ops_no, parallel53["ep"])
+
+    tp53 = parallel53["tp"]
+    sp_norm = [op for op in ops_sp if op.layer == 0 and op.recipe == "rmsnorm"
+               and "norm1" in op.op_id][0]
+    no_norm = [op for op in ops_no if op.layer == 0 and op.recipe == "rmsnorm"
+               and "norm1" in op.op_id][0]
+    sp_residual = [op for op in ops_sp if op.layer == 0
+                   and op.recipe == "residual_add"][0]
+    no_residual = [op for op in ops_no if op.layer == 0
+                   and op.recipe == "residual_add"][0]
+    assert sp_norm.local_shape[0] * tp53 == no_norm.local_shape[0]
+    assert sp_norm.vector_ops * tp53 == pytest.approx(no_norm.vector_ops, rel=1e-12)
+    assert sp_residual.vector_ops * tp53 == pytest.approx(no_residual.vector_ops,
+                                                          rel=1e-12)
+    for layer in range(4):
+        sp_links = _tp_collectives(ops_sp, layer)
+        no_links = _tp_collectives(ops_no, layer)
+        assert {op.family for op in sp_links} == {"allgather", "reduce_scatter"}
+        assert {op.family for op in no_links} == {"allreduce"}
+        assert sum(op.link_bytes for op in sp_links) == pytest.approx(
+            sum(op.link_bytes for op in no_links), rel=1e-12)
+    eff_sp = analyze_network_efficiency(
+        glm53_sp, phase="prefill", tokens=tokens, context=0, sequences=1,
+        scope="body", run_graph=False)
+    eff_no = analyze_network_efficiency(
+        glm53_no, phase="prefill", tokens=tokens, context=0, sequences=1,
+        scope="body", run_graph=False)
+    assert eff_sp["operator_sum_ms"] < eff_no["operator_sum_ms"]
+
+    # PP x DSpark, with AttnRes state crossing stages: layer FLOPs and HBM
+    # bytes are conserved across pipeline stages, while every P2P send carries
+    # exactly one activation/AttnRes bank row.
+    pp_base = compose_case(
+        "kimi-k3", "a5", tp=4, dp=1, pp=1, ep=4, layers=4, prompt_tokens=tokens,
+        output_tokens=8, mtp_proposal_tokens=2, va_recommended=True)
+    pp4 = compose_case(
+        "kimi-k3", "a5", tp=4, dp=1, pp=4, ep=4, layers=4, prompt_tokens=tokens,
+        output_tokens=8, mtp_proposal_tokens=2, va_recommended=True)
+    pp1_ops = target_operators(pp_base, phase="prefill", tokens=tokens, scope="body")
+    pp4_ops = target_operators(pp4, phase="prefill", tokens=tokens, scope="body")
+    assert {op.stage for op in pp4_ops} == {0, 1, 2, 3}
+    layer_flops = [sum(op.flops for op in ops if op.layer >= 0)
+                   for ops in (pp1_ops, pp4_ops)]
+    layer_hbm = [sum(op.hbm_bytes for op in ops if op.layer >= 0)
+                 for ops in (pp1_ops, pp4_ops)]
+    assert layer_flops[1] == pytest.approx(layer_flops[0], rel=1e-12)
+    assert layer_hbm[1] == pytest.approx(layer_hbm[0], rel=1e-12)
+    stage_flops = {stage: sum(op.flops for op in pp4_ops
+                              if op.stage == stage and op.layer >= 0)
+                   for stage in range(4)}
+    assert all(value > 0 for value in stage_flops.values())
+    assert max(stage_flops.values()) < layer_flops[1] / 2
+    assert sum(stage_flops.values()) == pytest.approx(layer_flops[1], rel=1e-12)
+    sends = [op for op in pp4_ops if op.family == "pp_p2p"
+             and op.recipe == "pipeline_send"]
+    residuals = [op for op in pp4_ops if op.family == "pp_p2p"
+                 and op.recipe == "pipeline_residual_send"]
+    hidden_kimi = pp4["model"]["hidden_size"]
+    activation_bytes = (tokens // 4) * hidden_kimi * 2
+    assert len(sends) == 3 and len(residuals) == 6
+    assert all(op.link_bytes == pytest.approx(activation_bytes, rel=1e-12)
+               for op in (*sends, *residuals))
+    assert all(op.local_shape == (tokens // 4, hidden_kimi)
+               for op in (*sends, *residuals))
+    assert sum(op.link_bytes for op in sends) == pytest.approx(
+        3 * activation_bytes, rel=1e-12)
+    assert sum(op.link_bytes for op in residuals) == pytest.approx(
+        6 * activation_bytes, rel=1e-12)
+
+    # MTP proposal rows are target verification rows: 1 + proposal_tokens.
+    mtp0 = compose_case(
+        "kimi-k3", "a5", tp=4, dp=1, pp=4, pcp=2, ep=8, layers=4,
+        prompt_tokens=tokens, output_tokens=8, mtp_proposal_tokens=0, sp=False)
+    mtp2 = compose_case(
+        "kimi-k3", "a5", tp=4, dp=1, pp=4, pcp=2, ep=8, layers=4,
+        prompt_tokens=tokens, output_tokens=8, mtp_proposal_tokens=2, sp=False)
+    assert dict(mtp2["runtime"]["metadata"])["draft_proposal_tokens"] == 2
+    decode_rows = 1 + int(dict(mtp2["runtime"]["metadata"])["draft_proposal_tokens"])
+    mtp0_ops = target_operators(mtp0, phase="decode", tokens=1, context=tokens,
+                                scope="body")
+    mtp2_ops = target_operators(mtp2, phase="decode", tokens=decode_rows,
+                                context=tokens, scope="body")
+    for recipe in ("expert_up", "expert_down"):
+        base = [op for op in mtp0_ops if op.op_id.endswith("." + recipe)]
+        scaled = [op for op in mtp2_ops if op.op_id.endswith("." + recipe)]
+        assert len(base) == len(scaled) == 3
+        for row, triple in zip(base, scaled):
+            assert triple.local_shape[0] == 3 * row.local_shape[0]
+            assert triple.flops == pytest.approx(3 * row.flops, rel=1e-12)
+            assert triple.hbm_bytes > row.hbm_bytes
+    attn0 = [op for op in mtp0_ops if op.family == "attention"][0]
+    attn2 = [op for op in mtp2_ops if op.family == "attention"][0]
+    assert attn2.local_shape[0] == 3 * attn0.local_shape[0]
+
+    # W4A8 x MC2: routed-expert weights halve, dispatch/combine become fused
+    # source MC2 phases, and the MoE weight-read floor is strictly lower.
+    quant_base = dict(
+        model="deepseek-v3.2", hardware="a3", tp=2, dp=4, pcp=2, ep=16,
+        layers=4, prompt_tokens=tokens, output_tokens=8, va_recommended=True,
+    )
+    w8 = compose_case(**quant_base, quant="w8a8")
+    w4 = compose_case(**quant_base, quant="w4a8")
+    parallel = w4["runtime"]["parallel"]
+    assert parallel["ep"] == parallel["tp"] * parallel["dp"] * parallel["pcp"]
+    eff8 = analyze_network_efficiency(w8, phase="prefill", tokens=tokens,
+                                      context=0, sequences=1, scope="body",
+                                      run_graph=False)
+    eff4 = analyze_network_efficiency(w4, phase="prefill", tokens=tokens,
+                                      context=0, sequences=1, scope="body",
+                                      run_graph=False)
+    assert eff4["total_flops"] == pytest.approx(eff8["total_flops"], rel=1e-12)
+    assert eff4["total_hbm_bytes"] < eff8["total_hbm_bytes"]
+    assert eff4["operator_sum_ms"] < eff8["operator_sum_ms"]
+    mc2_ops8 = target_operators(_native_mc2(w8), phase="prefill", tokens=tokens,
+                                scope="body")
+    mc2_ops4 = target_operators(_native_mc2(w4), phase="prefill", tokens=tokens,
+                                scope="body")
+    expert8 = {recipe: [op for op in mc2_ops8 if op.op_id.endswith("." + recipe)][0]
+               for recipe in ("expert_up", "expert_down")}
+    expert4 = {recipe: [op for op in mc2_ops4 if op.op_id.endswith("." + recipe)][0]
+               for recipe in ("expert_up", "expert_down")}
+    for recipe, op8 in expert8.items():
+        op4 = expert4[recipe]
+        assert dict(op8.metadata)["weight_format"] == "int8"
+        assert dict(op4.metadata)["weight_format"] == "int4"
+        weight8, weight4 = (dict(op.metadata)["weight_bytes"] for op in (op8, op4))
+        assert weight4 == pytest.approx(0.5 * weight8, rel=1e-12)
+    assert not any(op.recipe in ("expert_dispatch", "expert_combine")
+                   for op in mc2_ops4)
+    mc2 = [op for op in mc2_ops4 if op.family == "mc2_protocol"]
+    mc2_kernels = {dict(op.metadata)["device_kernel_group"]["kernel"] for op in mc2}
+    assert mc2_kernels == {"MoeDistributeDispatchV3", "MoeDistributeCombineV3"}
+    mc2_groups = {dict(op.metadata)["device_kernel_group"]["id"] for op in mc2}
+    assert {group.rsplit(".", 1)[-1] for group in mc2_groups} == {
+        "mc2_dispatch", "mc2_combine"}
+    hbm_peak = extract_hardware_peaks(w4)["hbm_peak_bytes_per_s"]
+    moe_hbm8 = sum(dict(op.metadata)["weight_bytes"] for op in mc2_ops8
+                   if op.op_id.endswith((".expert_up", ".expert_down")))
+    moe_hbm4 = sum(dict(op.metadata)["weight_bytes"] for op in mc2_ops4
+                   if op.op_id.endswith((".expert_up", ".expert_down")))
+    moe_time8 = moe_hbm8 / hbm_peak * 1000.0
+    moe_time4 = moe_hbm4 / hbm_peak * 1000.0
+    assert moe_time4 == pytest.approx(0.5 * moe_time8, rel=1e-12)
+    assert moe_time4 < moe_time8
+
+    # The same W4A8 x DP/TP/PP/PCP/EP/SP stack on two other catalogs.
+    for model in ("deepseek-v4-pro", "qwen3.5-397b-a17b"):
+        case = compose_case(
+            model, "a3", tp=4, dp=2, pp=2, pcp=2, ep=16, layers=4,
+            prompt_tokens=tokens, output_tokens=8, sp=True,
+            va_recommended=True, quant="w4a8")
+        parallel = case["runtime"]["parallel"]
+        assert (parallel["tp"], parallel["dp"], parallel["pp"], parallel["pcp"],
+                parallel["ep"]) == (4, 2, 2, 2, 16)
+        assert case["runtime"]["metadata"]["sp"] is True
+        ops = target_operators(case, phase="prefill", tokens=tokens, scope="body")
+        assert {op.stage for op in ops} == {0, 1}
+        sends = [op for op in ops if op.family == "pp_p2p"
+                 and op.recipe == "pipeline_send"]
+        hidden = case["model"]["hidden_size"]
+        assert len(sends) == 1
+        sender_layer = int(sends[0].op_id.split(".l", 1)[1].split(".", 1)[0])
+        hc_mult = max(1, parse_case(case).model.layer_plans[sender_layer].hc_mult)
+        assert sends[0].link_bytes == pytest.approx(
+            sends[0].local_shape[0] * hidden * 2 * hc_mult, rel=1e-12)
+        for recipe in ("expert_up", "expert_down"):
+            expert = [op for op in ops if op.op_id.endswith("." + recipe)]
+            assert expert and all(dict(op.metadata)["weight_format"] == "int4"
+                                  for op in expert)
+            assert all(op.hbm_bytes > 0 for op in expert)
+        pred = predict(case, scope="body", phase="decode", tokens=1,
+                       context=tokens, sequences=1)
+        assert pred["duration_ms"] == pytest.approx(
+            pred["complete_ms"] - pred["input_ready_ms"], rel=1e-12)
+        assert pred["duration_ms"] == pytest.approx(pred["body_forward_ms"],
+                                                    rel=1e-12)
+
+        dec_ops = target_operators(case, phase="decode", tokens=1,
+                                   context=tokens, scope="body")
+        dec_hbm_floor_ms = (
+            sum(op.hbm_bytes for op in dec_ops)
+            / extract_hardware_peaks(case)["hbm_peak_bytes_per_s"] * 1000.0
+        )
+        prefill = predict(case, scope="body", phase="prefill", tokens=tokens,
+                          context=0, sequences=1)
+        assert pred["duration_ms"] > dec_hbm_floor_ms > 0.0
+        assert pred["duration_ms"] < prefill["duration_ms"]
+
+    # PP1 vs PP2 AttnRes cross-layer bank preservation on Kimi-K3.
+    c_pp1 = compose_case("kimi-k3", "a3", tp=8, pp=1, ep=8, layers=4,
+                         va_recommended=True)
+    c_pp2 = compose_case("kimi-k3", "a3", tp=8, pp=2, ep=8, layers=4,
+                         va_recommended=True)
+    l2_pp1 = [dict(op.metadata)["attn_res_view"]["valid_blocks"]
+              for op in target_operators(c_pp1, phase="prefill", tokens=128,
+                                         scope="model")
+              if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
+    l2_pp2 = [dict(op.metadata)["attn_res_view"]["valid_blocks"]
+              for op in target_operators(c_pp2, phase="prefill", tokens=128,
+                                         scope="model")
+              if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
     assert l2_pp1 == l2_pp2 == [1, 1]
 
-    # Short prefill PCP cohort ownership (1 token per replica under DP2/TP2/EP4/PCP4)
+    # Short prefill PCP cohort ownership (1 token per replica under DP2/TP2/EP4/PCP4).
     c_short = compose_case("deepseek-v3.2", "a3", dp=2, tp=2, ep=4, pcp=4, layers=4)
-    g_short = target_graphs(c_short, phase="prefill", tokens=1, sequences=1, scope="body")
+    g_short = target_graphs(c_short, phase="prefill", tokens=1, sequences=1,
+                            scope="body")
     exp_up = [op for op in g_short[0] if "expert_up" in op.op_id][0]
     assert exp_up.semantic_shape[0] == 4
 
+
+def test_cross_dp_sp_body_selection_preserves_body_defaults() -> None:
+    # A cross-DP SP operator view delegates graph binding to ``target_graphs``.
+    # That delegation must consume the declaration already resolved by the
+    # caller, not re-resolve it and relabel installed defaults as explicit.
+    def qwen_sp():
+        return compose_case("qwen3.5-35b-a3b", "a3", tp=2, dp=2, ep=4, sp=True,
+                            layers=2, prompt_tokens=64, output_tokens=8)
+
+    ops = target_operators(qwen_sp(), phase="prefill", tokens=128, scope="body")
+    grouped = [item for item in ops.default_selection["selections"]
+               if item["family"] == "grouped_gemm"]
+    assert [(item["selection"], item["reason"]) for item in grouped] == [(
+        "default_installed", "preserve_existing_grouped_mapping_domain")]
+    assert grouped[0]["program"] == {"kind": "steady_matmul"}
+    matmul = [item for item in ops.default_selection["selections"]
+              if item["family"] == "matmul"]
+    assert [(item["selection"], item["reason"]) for item in matmul] == [(
+        "default_installed", "compact_finite_k_pipeline_preserving_128_output_grid")]
+    assert {"programs", "families"} <= ops.effective_kernels.keys()
+    assert ops.effective_kernels["families"]["grouped_gemm"] == {"kind": "steady_matmul"}
+
+    disabled = target_operators(qwen_sp(), phase="prefill", tokens=128,
+                                scope="body", apply_body_defaults=False)
+    assert disabled.default_selection["reason"] == "body_defaults_disabled"
+    assert "programs" not in disabled.effective_kernels
+
+    explicit = qwen_sp()
+    explicit["runtime"].setdefault("kernels", {})["families"] = {
+        "grouped_gemm": {"kind": "steady_matmul", "explicit": True}}
+    preserved = [item for item in target_operators(
+        explicit, phase="prefill", tokens=128, scope="body").default_selection["selections"]
+        if item["family"] == "grouped_gemm"]
+    assert [(item["selection"], item["reason"]) for item in preserved] == [(
+        "preserved", "explicit_implementation_preserved")]
+    assert preserved[0]["program"] == {"kind": "steady_matmul", "explicit": True}

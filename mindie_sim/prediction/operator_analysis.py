@@ -26,6 +26,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True):
     from mindie_sim.schema.workload import RequestView
+    from .dispatch import cohorts
 
     case = parse_case(case)
     _check_geometry(phase, tokens, sequences, context, scope)
@@ -35,6 +36,26 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     views = tuple(RequestView(f"analysis{index}", tokens, context, scope == "model", phase,
                               draft_prepare=draft_prepare) for index in range(sequences))
     case = _media_case(case, views, scope, media_tokens_per_sequence)
+    participants = cohorts(case.runtime.parallel)[0]
+    if (len(participants) > 1
+            and case.runtime.kernels.get("sequence_parallel")):
+        # A single rank cannot resolve cross-DP SP without the complete
+        # cohort's query totals. ``target_graphs`` already binds that
+        # geometry; keep this one-rank operator view on its first replica.
+        # ``case`` and ``selection`` already carry the body defaults resolved
+        # above. Re-applying them here would start a second declaration and
+        # overwrite the caller-visible selection with a preserved-explicit
+        # record. Delegate only the cohort graph binding.
+        graphs = target_graphs(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope,
+            media_tokens_per_sequence=media_tokens_per_sequence,
+            resource_fusion=resource_fusion, draft_prepare=draft_prepare,
+            apply_body_defaults=False,
+        )
+        result = tuple(op for op in graphs[participants[0]] if op.family != "barrier")
+        return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)
+                if scope == "body" else result)
     result = tuple(op for op in _target_ops(case, views, scope, resource_fusion=resource_fusion)
                    if op.family != "barrier")
     return (TargetOperators(result, kernels=case.runtime.kernels, selection=selection)

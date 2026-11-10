@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.8-blue" alt="Release v0.9.8">
+  <img src="https://img.shields.io/badge/Release-v0.9.9-blue" alt="Release v0.9.9">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v098-highlights--full-fleet-convergence">v0.9.8 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
+  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v099-highlights--full-fleet-convergence">v0.9.9 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ Please install and configure https://github.com/mindie-agent/sim for me
 <details>
 <summary>🤖 <b>AI Agent Auto-Install & Workflow Protocol (Instructions for AI Agents)</b></summary>
 
-If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.8`):
+If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.9`):
 
 1. **Check Python Version**: Ensure Python `>= 3.11` is available (`mindie-sim` has zero `torch` or `torch_npu` runtime import dependencies and runs cleanly on macOS, Linux, and Windows).
 2. **Install the CLI and Package**:
    - Install the pinned release wheel (recommended):
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.8/mindie_sim-0.9.8-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.9/mindie_sim-0.9.9-py3-none-any.whl
      ```
    - Or install the latest development version from `main`:
      ```bash
@@ -80,9 +80,9 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 ---
 
-## `v0.9.8` Highlights & Full-Fleet Convergence
+## `v0.9.9` Highlights & Full-Fleet Convergence
 
-`mindie-sim v0.9.8` (paired with `mindie-profiler v0.5.9`) extends the unified causal engine with **first-principles orthogonal multi-dimensional parallelism & feature superposition (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md), [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), and [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)).
+`mindie-sim v0.9.9` (paired with `mindie-profiler v0.5.10`) extends the unified causal engine with **first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md), [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), and [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)).
 
 ### 1. 4D Efficiency Decomposition & Bottleneck Attribution (`analyze_operator_row` / `analyze_network_efficiency`)
 
@@ -132,19 +132,19 @@ The full reproducible NPU profiling benchmark dataset is published on HuggingFac
 
 | Category | Target / Dimension | Profiling Captures | Evaluated | Step Samples | Hardware Tiers | `err_p50` | `err_p90` | `err_max` | `>10%` | `<=10%` Pass Rate |
 |---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|
-| `L1_operator_family` | `matmul_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.76% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `attention` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.60% | 5.40% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `moe_routing_grouped_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.10% | 5.27% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `norm_activation_elementwise` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.76% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L1_operator_family` | `kv_cache_position_rope` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.00% | 2.48% | **9.89%** | **0** | **100.0%** |
-| `L1_operator_family` | `collective_comm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.47% | 3.62% | **9.88%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_CORE` | **7,207** | **7,207** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.79% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_VECTOR_CORE` | **7,274** | **7,274** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.78% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `MIX_AIC` | **7,184** | **7,184** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.79% | 5.49% | **9.95%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `COMMUNICATION` | **7,063** | **7,063** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.83% | 5.52% | **9.95%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `decode_step_tpot` | **5,962** | **5,962** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.63% | 5.60% | **9.95%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `prefill_step_ttft` | **1,375** | **1,375** | 436,412 | A2:837, A3:1,729, A5:4,771 | 2.00% | 4.25% | **9.68%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `all_7337_captures_step_e2e` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.77% | 5.49% | **9.95%** | **0** | **100.0%** |
+| `L1_operator_family` | `matmul_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.83% | 5.45% | **8.38%** | **0** | **100.0%** |
+| `L1_operator_family` | `attention` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.62% | 5.40% | **8.12%** | **0** | **100.0%** |
+| `L1_operator_family` | `moe_routing_grouped_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.15% | 5.27% | **8.28%** | **0** | **100.0%** |
+| `L1_operator_family` | `norm_activation_elementwise` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.73% | 5.51% | **8.11%** | **0** | **100.0%** |
+| `L1_operator_family` | `kv_cache_position_rope` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.00% | 2.48% | **8.09%** | **0** | **100.0%** |
+| `L1_operator_family` | `collective_comm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.50% | 3.70% | **8.01%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `AI_CORE` | **7,207** | **7,207** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.90% | 5.48% | **8.38%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `AI_VECTOR_CORE` | **7,274** | **7,274** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.78% | 5.52% | **8.11%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `MIX_AIC` | **7,184** | **7,184** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.80% | 5.49% | **8.06%** | **0** | **100.0%** |
+| `L2_accelerator_engine` | `COMMUNICATION` | **7,063** | **7,063** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.85% | 5.52% | **8.28%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `decode_step_tpot` | **5,962** | **5,962** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.59% | 5.61% | **7.98%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `prefill_step_ttft` | **1,375** | **1,375** | 436,412 | A2:837, A3:1,729, A5:4,771 | 2.00% | 4.28% | **8.00%** | **0** | **100.0%** |
+| `L3_L4_step_latency` | `all_7337_captures_step_e2e` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.79% | 5.47% | **8.00%** | **0** | **100.0%** |
 | `structural_inference` | `mindie_structural_inference_v1` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.00% | 0.00% | **0.00%** | **0** | **100.0%** |
 
 #### (2) Suite 1: 21-Row Fine-Grained L1–L4 Zero-Shot Per-Step Piecewise Validation (`731 / 731` Cells / `40,921` Step Samples, `100.0% <= 10%`)
