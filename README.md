@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.9-blue" alt="Release v0.9.9">
+  <img src="https://img.shields.io/badge/Release-v0.9.10-blue" alt="Release v0.9.10">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v099-核心特性与全量收敛基准">v0.9.9 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v0910-核心特性与全量收敛基准">v0.9.10 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.9`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.10`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.9/mindie_sim-0.9.9-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.10/mindie_sim-0.9.10-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash
@@ -80,9 +80,9 @@ flowchart TB
 
 ---
 
-## `v0.9.9` 核心特性与全量收敛基准
+## `v0.9.10` 核心特性与全量收敛基准
 
-`mindie-sim v0.9.9`（配套 `mindie-profiler v0.5.10`）在统一因果资源引擎之上，提供完整的**第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。
+`mindie-sim v0.9.10`（配套 `mindie-profiler v0.5.10`）在统一因果资源引擎之上，提供完整的**第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)、[`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) 与 [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)）。
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
