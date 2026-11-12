@@ -14,12 +14,25 @@ from __future__ import annotations
 
 from mindie_sim.schema.common import ModelingError
 
+#: Evidence values that positively resolve a callable or kernel identity.
+_POSITIVE_EVIDENCE = frozenset(("established", "source_declared"))
 
-def _bound_state(evidence, source_sha256, typed):
-    """True bound = callable/entry OR declared kernel, plus source and typed ABI."""
-    has_call = (evidence.get("entry") in {"established", "source_declared"}
-                or evidence.get("aclnn_symbol") in {"established", "source_declared"}
-                or evidence.get("kernels") in {"source_declared", "partial"})
+
+def _positive_callable(evidence):
+    return (evidence.get("entry") in _POSITIVE_EVIDENCE
+            or evidence.get("aclnn_symbol") in _POSITIVE_EVIDENCE)
+
+
+def _bound_state(evidence, source_sha256, typed, kernels=None):
+    """True bound = callable/entry OR resolved kernel, plus source and typed ABI."""
+    has_callable = _positive_callable(evidence)
+    has_resolved_kernel = (
+        any(isinstance(kernel, dict) and kernel.get("evidence") in _POSITIVE_EVIDENCE
+            for kernel in kernels) if kernels is not None
+        else evidence.get("kernels") in _POSITIVE_EVIDENCE)
+    has_kernels = (evidence.get("kernels") in (_POSITIVE_EVIDENCE | {"partial"})
+                   and has_resolved_kernel)
+    has_call = has_callable or has_kernels
     reasons = []
     if not has_call:
         reasons.append("no_bound_entry_or_kernel")
@@ -28,6 +41,16 @@ def _bound_state(evidence, source_sha256, typed):
     if not isinstance(typed, dict) or not typed.get("signature_hash"):
         reasons.append("typed_abi_unresolved")
     return has_call and not reasons, reasons
+
+
+def _is_fully_paired(is_bound, evidence, kernels, unresolved):
+    """Complete pairing needs a callable and every declared kernel positive."""
+    complete_kernels = (evidence.get("kernels") in _POSITIVE_EVIDENCE and bool(kernels)
+                        and all(isinstance(kernel, dict)
+                                and kernel.get("evidence") in _POSITIVE_EVIDENCE
+                                for kernel in kernels))
+    return bool(is_bound and _positive_callable(evidence) and complete_kernels
+                and "installed_selected_binary_not_established" not in (unresolved or ()))
 
 
 def native_call_coverage(ops, *, bindings=None):
@@ -61,11 +84,11 @@ def native_call_coverage(ops, *, bindings=None):
             continue
         evidence = binding.evidence
         is_bound, reasons = _bound_state(
-            evidence, (binding.source or {}).get("sha256"), binding.typed)
+            evidence, (binding.source or {}).get("sha256"), binding.typed,
+            kernels=binding.kernels)
         row["bound" if is_bound else "unresolved"] += 1
-        row["fully_paired"] += int(
-            is_bound and "installed_selected_binary_not_established"
-            not in binding.unresolved)
+        row["fully_paired"] += int(_is_fully_paired(
+            is_bound, evidence, binding.kernels, binding.unresolved))
         for reason in reasons:
             row["unbound_reasons"][reason] = row["unbound_reasons"].get(reason, 0) + 1
         row["with_entry"] += int(bool(binding.api.get("entry")))
@@ -123,12 +146,13 @@ def coverage_from_records(records, *, emitted=None):
             "with_core": 0, "fully_paired": 0, "unbound_reasons": {}})
         row["emitted"] += 1
         evidence = record.get("evidence") or {}
+        kernels = record.get("kernels")
         is_bound, reasons = _bound_state(
-            evidence, (record.get("source") or {}).get("sha256"), record.get("typed"))
+            evidence, (record.get("source") or {}).get("sha256"), record.get("typed"),
+            kernels=kernels)
         row["bound" if is_bound else "unresolved"] += 1
-        row["fully_paired"] += int(
-            is_bound and "installed_selected_binary_not_established"
-            not in (record.get("unresolved") or ()))
+        row["fully_paired"] += int(_is_fully_paired(
+            is_bound, evidence, kernels, record.get("unresolved")))
         for reason in reasons:
             row["unbound_reasons"][reason] = row["unbound_reasons"].get(reason, 0) + 1
         api = record.get("api") or {}

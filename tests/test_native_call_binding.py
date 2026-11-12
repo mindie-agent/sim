@@ -1,8 +1,9 @@
 """BIND1 native-call identity over real emitted structure and declared sources.
 
-The producer hooks are intentionally not assumed: each call boundary here is
-declared explicitly from a real case/operator, then bound through the ordinary
-``OperatorPlan``/``RecipeBook`` or HCCL lowering path.
+[Role] Prove one declared boundary identity through bind, coverage and export.
+[Invariants] Unresolved evidence never binds; derived provenance never hashes.
+[Timeouts & Locks] Pure in-process metadata; no I/O, device or locks.
+[Side-Effect Policy] Writes only pytest temporary HOME/config/data fixtures.
 """
 import ast
 import json
@@ -82,6 +83,25 @@ def _qbmm_declared(op):
     )
 
 
+def _mla_call_parent(observed_aliases=None):
+    raw = json.loads((ROOT / "examples/source-families/mla-decode-control.json").read_text())
+    parent = mla_decode.make_op({
+        "implementation": mla_decode.IMPLEMENTATION, "contexts": [17], "heads": 4,
+        "key_heads": 1, "latent_dim": 256, "rope_dim": 32, "page_size": 16,
+        "num_kv_splits": 2, "dtype": "bf16", "cache_dtype": "bf16",
+        "is_mla": True, "is_hip": False})
+    declared = declare_native_call(
+        parent, api={"namespace": "triton", "entry": "decode_attention_fwd_grouped"},
+        source={"path": "vllm_ascend/ops/mla.py", "sha256": "a" * 64,
+                "symbol": "decode_attention_fwd_grouped"},
+        kernels=[{"name": "_fwd_grouped_kernel_stage1", "role": "vector",
+                  "evidence": "source_declared"},
+                 {"name": "_fwd_kernel_stage2", "role": "vector",
+                  "evidence": "source_declared"}],
+        observed_aliases=observed_aliases)
+    return declared, raw["runtime"]["kernels"]
+
+
 def _plain_op(op_id="norm"):
     return OpSpec(op_id, "rmsnorm", "prefill", 0, 0, (), (8, 16), (8, 16),
                   (8, 16), (8, 16), dtype="bf16",
@@ -93,7 +113,7 @@ def _occurrence_binding():
                 dtype="bf16")
     declared = declare_native_call(
         op, api={"namespace": "torch", "entry": "occ"},
-        typed={"attrs": {"mode": "a"}, "occurrence_attrs": {
+        typed={"attrs": {"mode": "a", "axis": 1}, "occurrence_attrs": {
             "c": {"const": 7}, "i": "int", "p": "positive_int",
             "il": "int_list", "pl": "positive_int_list", "im": "int_matrix",
             "s": "string", "ref": "typed_ref", "d": "declared"}})
@@ -172,6 +192,14 @@ def test_multistage_kernel_and_one_to_many_source_call_keep_one_identity():
     assert binding.kernels[0]["source_stages"] == stages
     assert binding.typed["layout"] == "PA_ND"
     assert binding.typed["shapes"]["launch"] == list(op.launch_shape)
+    normalized = bind_native_call(declare_native_call(
+        _plain_op("normalized"), kernels=[{"name": "ExampleKernel"}]))
+    assert normalized.kernels[0]["role"] == "unknown"
+    assert normalized.kernels[0]["evidence"] == "source_declared"
+    assert normalized.evidence["kernels"] == "source_declared"
+    bound_alias = replace(_plain_op("alias"), metadata=(
+        ("native_call_binding", {"kernels": [{"name": "ExampleKernel"}]}),))
+    assert bind_native_call(bound_alias).evidence["kernels"] == "source_declared"
 
     names = ("Cast", "Transpose", "Prepare", "H", "O")
     parent = OpSpec("gdn_chunk", "gdn_prefill", "prefill", 0, 0, (),
@@ -208,23 +236,10 @@ def test_multistage_kernel_and_one_to_many_source_call_keep_one_identity():
     assert all(view.physical["charged"].startswith("never_separately")
                for view in views)
 
-    raw = json.loads((ROOT / "examples/source-families/mla-decode-control.json").read_text())
-    real_parent = mla_decode.make_op({
-        "implementation": mla_decode.IMPLEMENTATION, "contexts": [17], "heads": 4,
-        "key_heads": 1, "latent_dim": 256, "rope_dim": 32, "page_size": 16,
-        "num_kv_splits": 2, "dtype": "bf16", "cache_dtype": "bf16",
-        "is_mla": True, "is_hip": False})
-    real_parent = declare_native_call(
-        real_parent, api={"namespace": "triton", "entry": "decode_attention_fwd_grouped"},
-        source={"path": "vllm_ascend/ops/mla.py", "sha256": "a" * 64,
-                "symbol": "decode_attention_fwd_grouped"},
-        kernels=[{"name": "_fwd_grouped_kernel_stage1", "role": "vector",
-                  "evidence": "source_declared"},
-                 {"name": "_fwd_kernel_stage2", "role": "vector",
-                  "evidence": "source_declared"}])
+    real_parent, real_kernels = _mla_call_parent()
     report = export_op_structure(
         {0: (real_parent,)}, model={}, execution={"phase": "decode"},
-        kernels=raw["runtime"]["kernels"])
+        kernels=real_kernels)
     records = report["native_calls"]
     assert len(records) == 2
     assert len({record["call_id"] for record in records}) == 1
@@ -303,12 +318,17 @@ def test_validate_invocation_round_trip_and_explicit_mismatches():
 
 def test_occurrence_attrs_reject_missing_and_invalid_values():
     binding = _occurrence_binding()
-    base = {"mode": "a", "c": 7, "i": 3, "p": 1, "il": [1], "pl": [2],
+    base = {"mode": "a", "axis": 1, "c": 7, "i": 3, "p": 1, "il": [1], "pl": [2],
             "im": [[0, 1]], "s": "x",
             "ref": {"ref": "r", "dtype": "bf16", "rank": 2}, "d": False}
     args = {"dtype": "bf16", "layout": "contiguous",
             "shapes": binding.typed["shapes"], "attrs": base}
     assert validate_invocation(binding, args)["call_id"] == binding.call_id
+    with pytest.raises(ModelingError, match="shape_mismatch:local"):
+        validate_invocation(binding, {**args, "shapes": {
+            **binding.typed["shapes"], "local": None}})
+    with pytest.raises(ModelingError, match="attr_mismatch:axis"):
+        validate_invocation(binding, {**args, "attrs": {**base, "axis": None}})
     with pytest.raises(ModelingError, match="missing_fields:s"):
         validate_invocation(binding, {"dtype": "bf16", "layout": "contiguous",
                                       "shapes": binding.typed["shapes"],
@@ -431,3 +451,49 @@ def test_piecewise_and_subgraph_sources_never_name_retired_mechanisms():
             if any(token in name for name in names for token in forbidden):
                 violations.append(f"{path.relative_to(ROOT)}:{node.lineno}")
     assert violations == []
+
+
+def _counts(binding, records=None):
+    totals = (coverage_from_records(records) if records is not None else native_call_coverage(
+        (_plain_op("coverage"),), bindings={0: binding}))["totals"]
+    return totals["bound"], totals["unresolved"], totals["fully_paired"]
+
+
+@pytest.mark.parametrize("declaration, evidence, expected", (
+    ({"kernels": [{"name": "UnresolvedKernel", "evidence": "unresolved"}]},
+     "unresolved", (0, 1, 0)),
+    ({"kernels": [{"name": "Resolved", "evidence": "source_declared"},
+                  {"name": "Unresolved", "evidence": "unresolved"}]}, "partial", (1, 0, 0)),
+    ({"api": {"namespace": "torch", "entry": "CallableKernel"}}, "unresolved", (1, 0, 0)),
+    ({"api": {"namespace": "cann_kernel", "entry": "CompleteKernel"},
+      "kernels": [{"name": "CompleteKernel", "evidence": "source_declared"}]},
+     "source_declared", (1, 0, 1)),
+))
+def test_kernel_evidence_controls_binding(declaration, evidence, expected):
+    binding = bind_native_call(declare_native_call(
+        _plain_op("scenario"), source={"path": "kernel.cpp", "sha256": "9" * 64},
+        **declaration))
+    assert binding.evidence["kernels"] == evidence
+    assert _counts(binding) == _counts(binding, [binding.to_dict()]) == expected
+    if evidence == "unresolved":
+        claimed = {**binding.to_dict(), "evidence": {
+            **binding.evidence, "kernels": "partial"}}
+        assert _counts(binding, [claimed]) == expected
+
+
+def test_observed_aliases_are_evidence_not_structural_identity():
+    def report(expanded, aliases):
+        if not expanded:
+            op = _plain_op("alias") if aliases is None else declare_native_call(
+                _plain_op("alias"), observed_aliases=aliases)
+            return export_op_structure({0: (op,)}, model={},
+                                       execution={"phase": "prefill"})
+        op, kernels = _mla_call_parent(aliases)
+        return export_op_structure({0: (op,)}, model={},
+                                   execution={"phase": "decode"}, kernels=kernels)
+    for expanded in (False, True):
+        reports = [report(expanded, alias) for alias in (None, [{"name": "a"}], [{"name": "b"}])]
+        keys = ("graph_id", "nodes", "source_calls", "subgraphs")
+        assert all(row[key] == reports[0][key] for row in reports for key in keys)
+        assert [row["native_calls"][0]["observed_aliases"] for row in reports] == [
+            [], [{"name": "a"}], [{"name": "b"}]]
