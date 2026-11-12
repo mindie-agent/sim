@@ -29,6 +29,8 @@ _MAX_NESTED = 64
 #: name->core rule; anything else remains unresolved.
 PROVED_CORES = frozenset(("aic", "aiv", "mix", "aicpu", "hccl", "host"))
 _NAMESPACES = frozenset(("aclnn", "torch", "hccl", "cann_kernel", "triton"))
+#: Evidence values that positively resolve a callable or kernel identity.
+_POSITIVE_EVIDENCE = frozenset(("established", "source_declared"))
 
 
 def _jsonable(value):
@@ -36,9 +38,8 @@ def _jsonable(value):
         return value
     if isinstance(value, (list, tuple)):
         return [_jsonable(item) for item in value]
-    if isinstance(value, dict):
-        return {str(key): _jsonable(item) for key, item in value.items()}
-    return str(value)
+    return ({str(key): _jsonable(item) for key, item in value.items()}
+            if isinstance(value, dict) else str(value))
 
 
 def _digest(value):
@@ -68,18 +69,14 @@ def _first_source(meta):
     binding = meta.get("implementation_binding")
     if isinstance(binding, dict) and (record := _source_record(binding.get("source"))):
         return record
-    for declaration in meta.get("structure_subgraphs", ()):
-        if isinstance(declaration, dict):
-            record = _source_record(declaration.get("source"))
-            if record is not None:
-                return record
-    return None
+    records = (_source_record(declaration.get("source")) for declaration in
+               meta.get("structure_subgraphs", ()) if isinstance(declaration, dict))
+    return next((record for record in records if record is not None), None)
 
 
 def _typed_payload(op, meta, *, include_launch=True):
     """Declared call fields; a fused grid belongs to each selected kernel."""
-    keys = ("local_shape", "padded_shape", "launch_shape") if include_launch else (
-        "local_shape", "padded_shape")
+    keys = ("local_shape", "padded_shape") + (("launch_shape",) if include_launch else ())
     shapes = {key.replace("_shape", ""): list(value) for key in keys
               if (value := getattr(op, key, ()))}
     attrs = {}
@@ -161,25 +158,30 @@ def family_is_hccl(op, meta=None):
             or "hccl_selection" in meta or "hccl_phase" in meta)
 
 
+def _normalize_kernels(items):
+    """Normalize declared kernel rows, keeping the first row for each name."""
+    unique = {}
+    for raw in items or ():
+        if isinstance(raw, dict) and raw.get("name"):
+            record = {"name": str(raw["name"]), "role": _text(raw.get("role")) or "unknown",
+                      "source_path": _text(raw.get("source_path")),
+                      "source_sha256": _text(raw.get("source_sha256")),
+                      "evidence": _text(raw.get("evidence")) or "source_declared"}
+            for key in ("launch_shape", "source_stages", "variant", "count"):
+                if raw.get(key) is not None:
+                    record[key] = _jsonable(raw[key])
+            unique.setdefault(record["name"], record)
+    return tuple(unique.values())
+
+
 def _kernel_records(op, meta, children):
     records = []
-    explicit = meta.get("native_call")
+    explicit = meta.get("native_call") or meta.get("native_call_binding")
     if isinstance(explicit, dict):
-        for raw in explicit.get("kernels", ()):
-            if isinstance(raw, dict) and raw.get("name"):
-                record = {
-                    "name": str(raw["name"]), "role": _text(raw.get("role")) or "unknown",
-                    "source_path": _text(raw.get("source_path")),
-                    "source_sha256": _text(raw.get("source_sha256")),
-                    "evidence": _text(raw.get("evidence")) or "source_declared"}
-                for key in ("launch_shape", "source_stages", "variant", "count"):
-                    if raw.get(key) is not None:
-                        record[key] = _jsonable(raw[key])
-                records.append(record)
+        records.extend(_normalize_kernels(explicit.get("kernels", ())))
     for child in children:
         if child is op or (child.op_id == op.op_id and child.family == "barrier"):
-            # The expansion join is a logical barrier with the parent op_id,
-            # never a native child kernel of the call.
+            # The expansion join is a logical barrier, never a child kernel.
             continue
         child_meta = dict(child.metadata)
         implementation = child_meta.get("native_implementation") or {}
@@ -193,20 +195,16 @@ def _kernel_records(op, meta, children):
             "launch_shape": list(child.launch_shape) if child.launch_shape else None,
             "evidence": ("source_declared" if child_meta.get("native_kind")
                          or implementation else "unresolved")})
-    seen, unique = set(), []
+    unique = {}
     for record in records:
-        if record["name"] in seen:
-            continue
-        seen.add(record["name"])
-        unique.append(record)
-    return tuple(unique)
+        unique.setdefault(record["name"], record)
+    return tuple(unique.values())
 
 
 def _explicit_core(meta):
-    candidates = (meta.get("execution_core"), meta.get("invocation_class"))
     execution = meta.get("program_execution")
-    if isinstance(execution, dict):
-        candidates += (execution.get("execution_class"),)
+    candidates = (meta.get("execution_core"), meta.get("invocation_class"),
+                  execution.get("execution_class") if isinstance(execution, dict) else None)
     return next((value for value in candidates
                  if isinstance(value, str) and value in PROVED_CORES), None)
 
@@ -236,8 +234,8 @@ def _merges(explicit, derived):
     for key in ("source", "execution_core", "unresolved", "non_claims"):
         if explicit.get(key) not in (None, (), [], {}):
             result[key] = explicit[key]
-    if explicit.get("kernels"):
-        result["kernels"] = explicit["kernels"]
+    if normalized := _normalize_kernels(explicit.get("kernels")):
+        result["kernels"] = normalized
     if explicit.get("members"):
         result["members"] = explicit["members"]
     if explicit.get("occurrence"):
@@ -274,9 +272,8 @@ class NativeCallBinding:
     def to_dict(self):
         return {"schema": SCHEMA, "call_id": self.call_id, "op_id": self.op_id,
                 "family": self.family, "recipe": self.recipe,
-                "source_boundary": self.source_boundary, "api": self.api,
-                "source": self.source, "typed": self.typed,
-                "occurrence": dict(self.occurrence),
+                "source_boundary": self.source_boundary, "api": self.api, "source": self.source,
+                "typed": self.typed, "occurrence": dict(self.occurrence),
                 "observed_aliases": [dict(row) for row in self.observed_aliases],
                 "kernels": [dict(row) for row in self.kernels],
                 "members": {"op_ids": list(self.member_op_ids), "charge": "call",
@@ -287,8 +284,7 @@ class NativeCallBinding:
 
     def prepare_args(self):
         """Complete typed invocation arguments for a prepare-only caller."""
-        return {"dtype": self.typed.get("dtype"),
-                "layout": self.typed.get("layout"),
+        return {"dtype": self.typed.get("dtype"), "layout": self.typed.get("layout"),
                 "shapes": _jsonable(self.typed.get("shapes") or {}),
                 "attrs": _jsonable({**(self.typed.get("attrs") or {}),
                                     **(self.occurrence or {})})}
@@ -300,24 +296,30 @@ class NativeCallBinding:
                 "timing_owner": self.timing_owner}
 
 
+def _kernel_evidence(kernels):
+    """Positive evidence count controls partial: zero resolved never binds."""
+    resolved = [row.get("evidence") for row in kernels
+                if row.get("evidence") in _POSITIVE_EVIDENCE]
+    if not resolved:
+        return "unresolved"
+    if len(resolved) < len(kernels):
+        return "partial"
+    return "established" if all(ev == "established" for ev in resolved) else "source_declared"
+
+
 def _evidence(api, source, kernels, core):
     # "established" stays reserved for a verified symbol/entry; a declared
     # source identity is source_declared even when the entry string is exact.
     verified = api.get("verified") is True
     entry = ("established" if api.get("entry") and verified else
              "source_declared" if api.get("entry") else "unresolved")
-    symbol = ("not_applicable" if api.get("namespace") == "hccl"
-              else "established" if api.get("aclnn_symbol") and verified
-              else "source_declared" if api.get("aclnn_symbol")
-              else "unresolved")
-    kernel_evidence = ("source_declared" if kernels and all(
-        row["evidence"] == "source_declared" for row in kernels) else
-        "unresolved" if not kernels else "partial")
-    return {
-        "entry": entry, "aclnn_symbol": symbol,
-        "source": "source_declared" if source else "unresolved",
-        "typed_args": "source_declared", "kernels": kernel_evidence,
-        "core": "proved" if core else "not_declared"}
+    symbol = ("not_applicable" if api.get("namespace") == "hccl" else
+              "established" if api.get("aclnn_symbol") and verified else
+              "source_declared" if api.get("aclnn_symbol") else "unresolved")
+    return {"entry": entry, "aclnn_symbol": symbol,
+            "source": "source_declared" if source else "unresolved",
+            "typed_args": "source_declared", "kernels": _kernel_evidence(kernels),
+            "core": "proved" if core else "not_declared"}
 
 
 def declare_native_call(op, *, api=None, source=None, typed=None, kernels=None,
@@ -353,14 +355,12 @@ def bind_native_call(op, *, contract=None, implementation=None, children=(),
         # HCCL phase/exit atoms are members of the enclosing collective call,
         # not independent invocations.  The entry (or an explicit declaration)
         # owns the call identity; phases must not mint a second one.
-        if op.family == "hccl_local":
+        if op.family in {"hccl_local", "barrier"}:
             return None
         if op.family == "hccl_boundary":
             group = meta.get("device_kernel_group")
             if not (isinstance(group, dict) and group.get("entry")):
                 return None
-        if op.family == "barrier":
-            return None
     declared = tuple(child for child in children if child is not op
                      and not (child.op_id == op.op_id and child.family == "barrier"))
     declared_fused = len(declared) > 1 or len(explicit.get("kernels") or ()) > 1
@@ -370,8 +370,7 @@ def bind_native_call(op, *, contract=None, implementation=None, children=(),
         # A fused call identity excludes any single member's launch grid.
         "typed": _typed_payload(op, meta, include_launch=not declared_fused),
         "kernels": _kernel_records(op, meta, tuple(children)),
-        "execution_core": _explicit_core(meta),
-    }
+        "execution_core": _explicit_core(meta)}
     merged = _merges(explicit, derived)
     api, source = merged.get("api") or {}, merged.get("source")
     typed, occurrence = merged.get("typed") or {}, merged.get("occurrence") or {}
@@ -382,33 +381,28 @@ def bind_native_call(op, *, contract=None, implementation=None, children=(),
     if api.get("namespace") == "hccl" and api.get("aclnn_symbol"):
         raise ModelingError("hccl_call_cannot_carry_aclnn_symbol")
     raw_members = merged.get("members")
-    if isinstance(raw_members, dict):
-        member_ids = tuple(str(value) for value in raw_members.get("op_ids", ()))
-    elif isinstance(raw_members, (list, tuple)):
-        member_ids = tuple(str(value) for value in raw_members)
-    else:
-        member_ids = ()
+    raw_ids = (raw_members.get("op_ids", ()) if isinstance(raw_members, dict) else
+               raw_members if isinstance(raw_members, (list, tuple)) else ())
+    member_ids = tuple(str(value) for value in raw_ids)
     if not member_ids:
         member_ids = tuple(child.op_id for child in declared) or (op.op_id,)
     identity = {
         "namespace": api.get("namespace"), "entry": api.get("entry"),
-        "aclnn_symbol": api.get("aclnn_symbol"),
-        "source_path": (source or {}).get("path"),
+        "aclnn_symbol": api.get("aclnn_symbol"), "source_path": (source or {}).get("path"),
         "source_sha256": (source or {}).get("sha256"),
         "source_symbol": (source or {}).get("symbol"),
         "typed": typed, "kernels": [row["name"] for row in kernels]}
     call_id = _digest(identity)
     physical = None
-    if plan is not None:
-        work = getattr(plan, "work", None)
-        if work is not None:
-            physical = {"basis": "existing_operator_plan_work",
-                        "matrix": _jsonable(getattr(work, "matrix", {})),
-                        "resources": _jsonable(getattr(work, "resources", {})),
-                        "charged": "once_at_timing_owner"}
-            prepared_physical = getattr(prepared, "flops", None)
-            if prepared_physical is not None:
-                physical["prepared_flops"] = prepared_physical
+    work = getattr(plan, "work", None)
+    if work is not None:
+        physical = {"basis": "existing_operator_plan_work",
+                    "matrix": _jsonable(getattr(work, "matrix", {})),
+                    "resources": _jsonable(getattr(work, "resources", {})),
+                    "charged": "once_at_timing_owner"}
+        prepared_physical = getattr(prepared, "flops", None)
+        if prepared_physical is not None:
+            physical["prepared_flops"] = prepared_physical
     unresolved = [str(value) for value in (merged.get("unresolved") or ())]
     if not api.get("entry"):
         unresolved.append("exact_native_entry_not_selected"
@@ -453,6 +447,10 @@ def validate_invocation(binding, args):
     if not isinstance(args, dict) or not args:
         raise ModelingError("native_call_invocation_requires_complete_typed_arguments")
     typed = binding.typed
+    if args.get("shapes") is not None and not isinstance(args.get("shapes"), dict):
+        raise ModelingError("native_call_invocation_shapes_not_mapping")
+    if args.get("attrs") is not None and not isinstance(args.get("attrs"), dict):
+        raise ModelingError("native_call_invocation_attrs_not_mapping")
     shapes, attrs = args.get("shapes") or {}, args.get("attrs") or {}
     # Preserve mismatch-first diagnostics for an explicitly wrong value.
     for key in ("dtype", "layout"):
@@ -460,14 +458,18 @@ def validate_invocation(binding, args):
         if declared is not None and actual is not None and declared != actual:
             raise ModelingError(f"native_call_signature_{key}_mismatch")
     for name, shape in (typed.get("shapes") or {}).items():
-        actual = shapes.get(name)
-        if actual is None:
+        if name not in shapes:
             continue
-        if tuple(actual) != tuple(shape):
+        actual = shapes[name]
+        if (shape is not None and (actual is None
+                                   or not isinstance(actual, (list, tuple))
+                                   or tuple(actual) != tuple(shape))):
             raise ModelingError(f"native_call_signature_shape_mismatch:{name}")
     for name, value in (typed.get("attrs") or {}).items():
-        actual = attrs.get(name)
-        if actual is not None and _jsonable(actual) != _jsonable(value):
+        if name not in attrs:
+            continue
+        actual = attrs[name]
+        if (value is not None and actual is None) or _jsonable(actual) != _jsonable(value):
             raise ModelingError(f"native_call_signature_attr_mismatch:{name}")
     missing = [key for key in ("dtype", "layout")
                if typed.get(key) is not None and args.get(key) is None]

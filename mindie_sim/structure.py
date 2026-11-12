@@ -12,7 +12,7 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -83,6 +83,32 @@ def _json_value(value):
     return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
 
 
+_NATIVE_EVIDENCE_KEYS = frozenset(("native_call", "native_call_binding", "observed_aliases"))
+
+
+def _without_native_call_evidence(op):
+    """Structural view: derived native-call provenance is not identity.
+
+    ``native_call``/``native_call_binding``/``observed_aliases`` describe what a
+    profiler observed about a boundary, not the declared structural or physical
+    program.  They are carried beside the graph identity and must not enter the
+    node, source-call or physical-signature serialization.
+    """
+    meta = dict(op.metadata)
+    semantic = meta.get("semantic_metadata")
+    nested = (isinstance(semantic, Mapping)
+              and bool(_NATIVE_EVIDENCE_KEYS.intersection(semantic)))
+    if not _NATIVE_EVIDENCE_KEYS.intersection(meta) and not nested:
+        return op
+    for key in _NATIVE_EVIDENCE_KEYS:
+        meta.pop(key, None)
+    if nested:
+        meta["semantic_metadata"] = {
+            key: value for key, value in semantic.items()
+            if key not in _NATIVE_EVIDENCE_KEYS}
+    return replace(op, metadata=tuple(meta.items()))
+
+
 def _node_id(replica, op_id):
     return f"rank:{replica}/{op_id}"
 
@@ -100,7 +126,10 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         # Source planners own physical declarations. Preparing a plan does not
         # start its program, consult timings, or resolve captured ABI identity.
         op, plan = book.prepare(op, geometry)
-    operator = op.to_dict(include_work=False)
+    # The actual call keeps the full operator metadata (including observed
+    # aliases); structural and physical views strip only derived evidence.
+    structural_op = _without_native_call_evidence(op)
+    operator = structural_op.to_dict(include_work=False)
     contract = predicted_contract(operator)
     meta = dict(op.metadata)
     semantic = meta.get("semantic_metadata", {})
@@ -128,7 +157,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         "operator": operator,
         "contract": contract,
         "implementation": native_implementation(operator, contract) or {},
-        **node_physical(op, recipe_bindings=kernels),
+        **node_physical(structural_op, recipe_bindings=kernels),
         "physical_work_basis": ("prepared_source_plan" if geometry is not None else
                                 "source_declaration_without_resource_geometry")
                                if op.source_boundary == "kernel" else "operator_declaration",
@@ -201,7 +230,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
-                    "operator": op.to_dict(include_work=False),
+                    "operator": _without_native_call_evidence(op).to_dict(include_work=False),
                     "children": [
                         _node_id(replica, child.op_id)
                         for child in expanded if child.op_id != op.op_id
