@@ -284,12 +284,14 @@ class _Ctx:
     @property
     def kv_row_bytes(self) -> float:
         # Ordinary GQA/MQA owns one local KV row per rank (replicated when the
-        # global KV head count is below TP); using the global cache row would
-        # charge every rank for all logical KV heads.  MLA and compressed
-        # representations keep their declared cache-row layout.
+        # global KV head count is below TP); Gemma K=V aliases the value plane.
+        # MLA and compressed representations keep their declared cache layout.
         if (self.layer.attention in {"gqa", "mha", "mqa"}
                 and self.layer.cache_kind != "window_compressed"):
-            elements = self.local_kv_heads * (self.width + self.width)
+            facts = dict(self.model.catalog_facts)
+            k_eq_v = bool(self.layer.k_eq_v) or (
+                self.layer.index in {int(v) for v in facts.get("gemma4_k_eq_v_layers", ())})
+            elements = self.local_kv_heads * (self.width if k_eq_v else 2 * self.width)
         else:
             elements = self.kv_row_elements
         return elements * dtype_bytes(self.kv_dtype)
@@ -577,9 +579,7 @@ class InstantiatedModel:
         return tuple(instance.fingerprint() for instance in self.subgraphs)
 
 def _stage_for(layer: int, layers: int, pp: int) -> int:
-    if pp <= 1 or layers <= 1:
-        return 0
-    return min(pp - 1, layer * pp // layers)
+    return 0 if pp <= 1 or layers <= 1 else min(pp - 1, layer * pp // layers)
 
 def _validate_parallel(model: ModelSpec, features: FeatureConfig) -> None:
     """Reject layouts whose local ownership would silently drop heads."""
@@ -599,11 +599,8 @@ def _validate_parallel(model: ModelSpec, features: FeatureConfig) -> None:
             raise ModelingError(
                 f"experts_not_divisible_by_ep:{model.num_experts}%{ep}")
 
-def _gemma_facts(model: ModelSpec) -> dict:
-    return dict(model.catalog_facts)
-
 def _layer_has_ple(model: ModelSpec, layer: LayerPlan) -> bool:
-    facts = _gemma_facts(model)
+    facts = dict(model.catalog_facts)
     layers = facts.get("gemma4_ple_layers")
     if layers is not None:
         return layer.index in {int(value) for value in layers}
@@ -635,6 +632,10 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
         variant = "mqa" if (layer.num_kv_heads or 0) == 1 and layer.num_heads > 1 else "gqa"
         if shared_consumer:
             variant = "shared_consumer"
+        if layer.indexer:
+            slots.append(LayerSlot("I0", str(layer.indexer_type or "full"), "index_produce"))
+            slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk",
+                                   "index_select"))
         slots.append(LayerSlot(attention_kind, variant, "attention"))
         slots.append(kv_slot)
     elif attention_kind == "A1":
@@ -661,14 +662,11 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
             slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk",
                                    "index_select"))
         slots.append(LayerSlot("A2", "", "attention"))
-    if attention_kind not in {"A1", "A2"}:
-        if layer.compress_ratio or layer.cache_kind == "window_compressed":
-            slots.append(LayerSlot("K1", str(layer.compressor_kind or "weighted_pool"),
-                                   "compress"))
-        if layer.indexer:
-            slots.append(LayerSlot("I0", str(layer.indexer_type or "full"), "index_produce"))
-            slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk",
-                                   "index_select"))
+    if attention_kind not in {"A1", "A2"} and (layer.compress_ratio or layer.cache_kind == "window_compressed"):
+        slots.append(LayerSlot("K1", str(layer.compressor_kind or "weighted_pool"), "compress"))
+    if attention_kind not in {"A0", "A1", "A2"} and layer.indexer:
+        slots.append(LayerSlot("I0", str(layer.indexer_type or "full"), "index_produce"))
+        slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk", "index_select"))
     boundary("attn_post")
     slots.append(LayerSlot("N0", "residual", "attn_residual"))
     slots.append(LayerSlot("N0", "layernorm" if layer.ffn_activation == "gelu" and False
@@ -735,8 +733,7 @@ _DEFAULT_REGISTRY = TemplateRegistry()
 
 def _has_ple(model: ModelSpec) -> bool:
     facts = dict(model.catalog_facts)
-    metadata = dict(model.metadata)
-    return bool(facts.get("ple") or metadata.get("ple") or facts.get("gemma_ple"))
+    return bool(facts.get("ple") or dict(model.metadata).get("ple") or facts.get("gemma_ple"))
 
 def instantiate_model(model: ModelSpec, features: FeatureConfig, *,
                       registry: TemplateRegistry | None = None) -> InstantiatedModel:
@@ -788,11 +785,9 @@ def instantiate_model(model: ModelSpec, features: FeatureConfig, *,
             holes.append(CoverageHole("E1", "ple_not_instantiated",
                                       "PLE declared without an explicit per-layer table record"))
     coverage = CoverageReport(tuple(entries), tuple(holes))
-    return InstantiatedModel(
-        model=model, features=features, layers=layers, globals=tuple(globals_),
-        coverage=coverage, stage_of=tuple(layer.stage for layer in layers))
+    return InstantiatedModel(model=model, features=features, layers=layers, globals=tuple(globals_),
+                             coverage=coverage, stage_of=tuple(layer.stage for layer in layers))
 
 def instantiate(model: ModelSpec, features: FeatureConfig | None = None, *,
                 runtime: Any = None, registry: TemplateRegistry | None = None) -> InstantiatedModel:
-    return instantiate_model(model, features or FeatureConfig.from_runtime(runtime, model),
-                             registry=registry)
+    return instantiate_model(model, features or FeatureConfig.from_runtime(runtime, model), registry=registry)

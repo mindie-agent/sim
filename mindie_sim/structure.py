@@ -12,13 +12,17 @@ from __future__ import annotations
 import argparse
 from collections import defaultdict
 from collections.abc import Mapping
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from hashlib import sha256
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from .prediction.operator_analysis import target_graphs
+from .prediction.native_binding import (
+    bind_native_call, coverage_from_records, member_physical_view,
+)
 from .prediction.program import RecipeBook
 from .prediction.structure import parse_case
 from .structure_contracts import comparison_scope, predicted_contract
@@ -47,8 +51,62 @@ _FAMILY_BLOCKS = {
 }
 
 
+def _intern_tree(value):
+    """Intern decoded strings without changing mapping order or values.
+
+    ``json.loads(json.dumps(...))`` creates a distinct ``str`` for every key
+    and value occurrence.  A decode report repeats the same small vocabulary
+    across tens of thousands of nodes, so retaining those duplicates dominates
+    the report footprint.  Interning is identity-only: equality, hashing, JSON
+    encoding and insertion order are unchanged.
+    """
+    if isinstance(value, str):
+        return sys.intern(value)
+    if isinstance(value, dict):
+        items = []
+        for key, item in value.items():
+            new_key = sys.intern(key) if isinstance(key, str) else key
+            items.append((new_key, _intern_tree(item)))
+        value.clear()
+        value.update(items)
+        return value
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _intern_tree(item)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_intern_tree(item) for item in value)
+    return value
+
+
 def _json_value(value):
-    return json.loads(json.dumps(value, allow_nan=False))
+    return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
+
+
+_NATIVE_EVIDENCE_KEYS = frozenset(("native_call", "native_call_binding", "observed_aliases"))
+
+
+def _without_native_call_evidence(op):
+    """Structural view: derived native-call provenance is not identity.
+
+    ``native_call``/``native_call_binding``/``observed_aliases`` describe what a
+    profiler observed about a boundary, not the declared structural or physical
+    program.  They are carried beside the graph identity and must not enter the
+    node, source-call or physical-signature serialization.
+    """
+    meta = dict(op.metadata)
+    semantic = meta.get("semantic_metadata")
+    nested = (isinstance(semantic, Mapping)
+              and bool(_NATIVE_EVIDENCE_KEYS.intersection(semantic)))
+    if not _NATIVE_EVIDENCE_KEYS.intersection(meta) and not nested:
+        return op
+    for key in _NATIVE_EVIDENCE_KEYS:
+        meta.pop(key, None)
+    if nested:
+        meta["semantic_metadata"] = {
+            key: value for key, value in semantic.items()
+            if key not in _NATIVE_EVIDENCE_KEYS}
+    return replace(op, metadata=tuple(meta.items()))
 
 
 def _node_id(replica, op_id):
@@ -62,17 +120,29 @@ def _block(op):
 
 
 def _node(op, replica, *, source_call=None, block=None, role=None, structure=None,
-          kernels=None, book=None, geometry=None):
+          kernels=None, book=None, geometry=None, shared_call=None, native_sink=None):
+    plan = None
     if geometry is not None and op.source_boundary != "call":
         # Source planners own physical declarations. Preparing a plan does not
         # start its program, consult timings, or resolve captured ABI identity.
-        op, _ = book.prepare(op, geometry)
-    operator = op.to_dict(include_work=False)
+        op, plan = book.prepare(op, geometry)
+    # The actual call keeps the full operator metadata (including observed
+    # aliases); structural and physical views strip only derived evidence.
+    structural_op = _without_native_call_evidence(op)
+    operator = structural_op.to_dict(include_work=False)
     contract = predicted_contract(operator)
     meta = dict(op.metadata)
     semantic = meta.get("semantic_metadata", {})
-    return _json_value({
-        "node_id": _node_id(replica, op.op_id),
+    if shared_call is not None:
+        # A fused member keeps the parent call identity and forwards only its
+        # own existing plan work as a view; it never becomes a second charge.
+        binding = member_physical_view(shared_call, plan, op if plan is not None else None)
+    else:
+        binding = bind_native_call(op, contract=contract, plan=plan,
+                                   prepared=op if plan is not None else None)
+    node_id = _node_id(replica, op.op_id)
+    payload = {
+        "node_id": node_id,
         "op_id": op.op_id,
         "replica": replica,
         "layer": op.layer,
@@ -87,7 +157,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         "operator": operator,
         "contract": contract,
         "implementation": native_implementation(operator, contract) or {},
-        **node_physical(op, recipe_bindings=kernels),
+        **node_physical(structural_op, recipe_bindings=kernels),
         "physical_work_basis": ("prepared_source_plan" if geometry is not None else
                                 "source_declaration_without_resource_geometry")
                                if op.source_boundary == "kernel" else "operator_declaration",
@@ -98,11 +168,17 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
             "fused_from": meta.get("fused_from", semantic.get("fused_from")),
             "semantic_recipe": meta.get("semantic_recipe"),
         },
-    })
+    }
+    if binding is not None and native_sink is not None:
+        # BIND1 evidence travels beside the node identity, not inside the
+        # structural content hash: it is derived provenance, not structure.
+        native_sink.append({"node_id": node_id, **binding.to_dict()})
+    return _json_value(payload)
 
 
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
-                        expand_calls=True, resource_graphs=None, resource_geometries=None):
+                        expand_calls=True, resource_graphs=None, resource_geometries=None,
+                        native_evidence=False):
     """Export a declared OpSpec DAG without a hardware Case or timing execution.
 
     A sequence selects replica 0; a mapping supplies explicit replica -> DAG.
@@ -115,6 +191,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     ``resource_geometries`` optionally maps (replica, stage) to declared Geometry
     for source-kernel planning. It contains ownership/capacity, not resource rates.
     Caller ``source`` is provenance excluded from the content hash.
+    ``native_evidence=True`` attaches derived ``native_calls`` and
+    ``native_call_coverage`` beside the identity. It is opt-in because released
+    consumers (profiler <= 0.5.11) verify ``graph_id`` over every top-level key
+    except ``graph_id``/``source``; the default report stays verifiable by them.
     """
     graphs = ops if isinstance(ops, Mapping) else {0: ops}
     graphs = {replica: tuple(operators) for replica, operators in graphs.items()}
@@ -129,6 +209,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}
     nodes, source_calls, external = [], [], set()
+    native_calls = []
     declarations, entry_dependencies, memberships = {}, defaultdict(set), defaultdict(set)
     for replica, operators in sorted(graphs.items()):
         for op in operators:
@@ -148,10 +229,13 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                 memberships[replica, group].update(_node_id(replica, child.op_id) for child in expanded)
             is_expanded = op.source_boundary == "call" and expand_calls
             parent = _node_id(replica, op.op_id) if is_expanded else None
+            # One shared actual-call descriptor for a fused source call: every
+            # declared child kernel keeps this same call_id and one timing owner.
+            call_binding = bind_native_call(op, children=expanded) if is_expanded else None
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
-                    "operator": op.to_dict(include_work=False),
+                    "operator": _without_native_call_evidence(op).to_dict(include_work=False),
                     "children": [
                         _node_id(replica, child.op_id)
                         for child in expanded if child.op_id != op.op_id
@@ -160,7 +244,9 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             nodes.extend(_node(child, replica, source_call=parent, block=_block(op),
                                role=meta.get("structure_role"),
                                structure=layer_structure(model, op.layer), kernels=kernels,
-                               book=book, geometry=resource_geometries.get((replica, child.stage)))
+                               book=book, geometry=resource_geometries.get((replica, child.stage)),
+                               shared_call=(None if child.family == "barrier" else call_binding),
+                               native_sink=native_calls)
                          for child in expanded)
     ids = {node["node_id"] for node in nodes}
     if len(ids) != len(nodes):
@@ -221,11 +307,18 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
     for chunk in encoder.iterencode(payload):
         digest.update(chunk.encode("utf-8"))
-    return {
+    report = {
         **payload,
         "graph_id": "sha256:" + digest.hexdigest(),
         "source": _json_value(source),
     }
+    if native_evidence:
+        # Derived actual-invocation evidence: carried beside the structural
+        # identity, excluded from its hash exactly like caller source.
+        report["native_calls"] = _json_value(native_calls)
+        report["native_call_coverage"] = _json_value(
+            coverage_from_records(native_calls, emitted=len(nodes)))
+    return report
 
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,

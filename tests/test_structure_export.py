@@ -117,7 +117,11 @@ def test_export_keeps_repeated_layer_instances_and_stable_content_identity():
     second = export_structure(deepcopy(raw), phase="prefill", tokens=3,
                               source={"revision": "two"})
     assert first["graph_id"] == second["graph_id"]
-    payload = {key: value for key, value in first.items() if key not in {"graph_id", "source"}}
+    # Derived BIND1 evidence is carried beside the structural identity, like
+    # caller source; it is excluded from the content hash by contract.
+    payload = {key: value for key, value in first.items()
+               if key not in {"graph_id", "source", "native_calls",
+                              "native_call_coverage"}}
     canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
     assert first["graph_id"] == "sha256:" + sha256(canonical.encode("utf-8")).hexdigest()
     assert first["source"] != second["source"]

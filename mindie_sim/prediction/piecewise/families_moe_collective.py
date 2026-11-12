@@ -69,10 +69,8 @@ _WEIGHT_WIDTHS = {
 }
 _NON_QUANT = frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32",
                         "float32", ""})
-
 def _int(value: Any, default: int) -> int:
     return default if value is None else int(value)
-
 def _frac(value: Any, default: Any = 0) -> Any:
     return as_fraction(default) if value is None else as_fraction(value)
 
@@ -480,14 +478,14 @@ def _compile_router(ctx: CompiledOperator, operator: BoundOperator) -> FamilyTem
 
 def _collective_kind(name: str, theta: Any) -> str:
     text = (str(theta.find("collective", "") or name)).lower().replace("-", "_")
-    if "allreduce" in text or "all_reduce" in text:
+    compact = text.replace("_", "")
+    if "allreduce" in compact:
         return "allreduce"
-    if "reduce_scatter" in text or "reducescatter" in text:
+    if "reducescatter" in compact:
         return "reduce_scatter"
-    if "all_gather" in text or "allgather" in text:
+    if "allgather" in compact:
         return "all_gather"
-    if "alltoall" in text or "all_to_all" in text or "dispatch" in text \
-            or "combine" in text:
+    if "alltoall" in compact or "dispatch" in text or "combine" in text:
         return "alltoallv"
     return "allreduce"
 
@@ -654,9 +652,19 @@ def _compile_collective(ctx: CompiledOperator,
     wire = _frac(theta.find("wire_bytes", theta.find("bytes_per_token", 0.0)), 0.0)
     mtu = max(1, _int(theta.find("mtu_bytes"), DEFAULT_MTU))
     chunks = max(1, _int(theta.find("chunks"), 1))
-    etp = name == "etp_allreduce" or ctx.kind == "F3"
-    route = _moe_route_shape(ctx, theta) if etp else None
-    message = (Mul((Var("MOE_ROWS"), Const(wire))) if etp
+    boundary = str(theta.find("reduction_boundary", "") or "").strip().lower()
+    if not boundary:
+        rec = str(theta.find("moe_recipe", theta.find("recipe", "")) or "").strip().lower()
+        boundary = "token_rows" if rec in {"tp_join_reduce", "local_expert_reduce"} else ("expert_rows" if rec in {"alltoall", "mc2"} else "")
+    is_etp = name == "etp_allreduce" or ctx.kind == "F3"
+    if kind == "alltoallv":
+        routed = ctx.kind == "F2" or _int(theta.find("k", theta.find("top_k", 1)), 1) > 1
+    elif is_etp:
+        routed = False if boundary == "token_rows" else (True if boundary == "expert_rows" else (_int(theta.find("ep", 1), 1) > 1 and _moe_route_shape(ctx, theta)[1] > 1))
+    else:
+        routed = boundary == "expert_rows"
+    route = _moe_route_shape(ctx, theta) if routed else None
+    message = (Mul((Var("MOE_ROWS"), Const(wire))) if routed
                else Mul((Var("T"), Const(wire))))
     matrix = _traffic_matrix(theta)
     if matrix is not None and len(matrix[0]) != ranks:

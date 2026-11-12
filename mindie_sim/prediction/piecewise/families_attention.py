@@ -235,8 +235,7 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
                     task_cube_max,
                     2 * group * max(tile_picks) * (s["cube_qk"] + s["cube_v"]))
             continue
-        eff_win = (min(window, s["topk"]) if window else s["topk"]) if (
-            mla and s["topk"] > 0) else window
+        eff_win = (min(window, s["topk"]) if window else s["topk"]) if s["topk"] > 0 else window
         unabs = mla and not absorbed and selected_q_len > 1 and s["topk"] == 0
         cqk = align(s["dk"], 16) if unabs else s["cube_qk"]
         cv = s["dv_cube"] if unabs else s["cube_v"]
@@ -382,6 +381,8 @@ def _split_expressions(ctx: CompiledOperator, static: dict[str, Any],
         ("causal_pairs", Var("PAIRS")),
         ("query_rows", rows),
         ("kv_positions", Var("KV_ROWS")),
+        ("KV_ROWS", Var("KV_ROWS")),
+        ("KV_LOGICAL_BYTES", Var("KV_LOGICAL_BYTES")),
         ("logical_flops", Var("LOGICAL_FLOPS")),
         ("physical_pairs", Var("PAIRS_PHYSICAL")),
         ("physical_flops", Var("CUBE_FLOPS")),

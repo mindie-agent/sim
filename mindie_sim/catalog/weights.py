@@ -171,7 +171,8 @@ def _indexer_terms(plan, model):
                     _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
                 ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim, plan.q_lora_rank, "indexer_fp8"),
+        terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim,
+                         plan.q_lora_rank or model.hidden_size, "indexer_fp8"),
                       _t("indexer_weights", plan.index_heads, model.hidden_size,
                          "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights")])
     if plan.index_kpool > 1:
@@ -290,10 +291,11 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             _t("q_proj", q_width, h, "attn.qkv", "out_tp"),
             _t("k_proj", kv_width, h, "attn.qkv", "kv_out",
                units=plan.num_kv_heads, unit_width=plan.head_dim),
-            _t("v_proj", kv_width, h, "attn.qkv", "kv_out",
-               units=plan.num_kv_heads, unit_width=plan.head_dim),
-            _t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"),
         ])
+        if not plan.k_eq_v:
+            terms.append(_t("v_proj", kv_width, h, "attn.qkv", "kv_out",
+                            units=plan.num_kv_heads, unit_width=plan.head_dim))
+        terms.append(_t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"))
         if 0 <= plan.kv_owner_layer_id < plan.index:
             terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
         return terms

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "mindie-sim"
-version = "0.9.10"
+version = "0.9.11"
 description = "Hardware-neutral causal performance simulation, primitive calibration and independent validation"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -21,7 +21,7 @@ mindie-sim = "mindie_sim.__main__:main"
 include = ["mindie_sim*"]
 
 [tool.setuptools.package-data]
-mindie_sim = ["model_configs/*.json", "backends/profiles/*.json"]
+mindie_sim = ["model_configs/*.json", "catalog/configs/*.json", "backends/profiles/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
