@@ -156,10 +156,13 @@ def _build_f3(ctx: _Ctx) -> _Built:
     _precede(specs, signatures, ctx, "expert_gate_up", latent, "routed_expert")
     _precede(specs, signatures, ctx, "expert_down", expert_width, "routed_expert")
     if ctx.etp > 1:
+        boundary = ("token_rows" if str(ctx.features.moe_recipe) in
+                    {"tp_join_reduce", "local_expert_reduce"} else "expert_rows")
         specs.append(("etp_allreduce", "collective", "etp"))
         signatures["etp_allreduce"] = _collective(
             "etp", ctx, axis="etp", members=ctx.etp,
-            bytes_per_token=latent * dtype_bytes(ctx.features.activation_format))
+            bytes_per_token=latent * dtype_bytes(ctx.features.activation_format),
+            extra=(("reduction_boundary", boundary),))
     return _built("F3", ctx, variant, "Routed Expert FFN (路由专家前馈网络)", specs, signatures,
                   coverage="partial",
                   state_in=(_HIDDEN_IN, _in("expert_rows", "routing")),

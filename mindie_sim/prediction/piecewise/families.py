@@ -147,17 +147,27 @@ def compute_hardware_service_factors( op: Any, geometry: Any, env: dict[str, Any
         splits, q_tiles, kv_heads = max(1, int(env.get("SPLITS", 1) or 1)), max(1, int(env.get("QUERY_TILES", 1) or 1)), max(1, int(theta.find("kv", 1) or 1)); q_heads = max(1, int(theta.find("q", kv_heads) or kv_heads))
         if is_decode:
             if family == "attention":
+                q_tasks = max(1, int(env.get("QUERY_TASKS", batch * q_tiles * kv_heads) or (batch * q_tiles * kv_heads)))
+                ref_rates = {"mte2": Fraction(4_224_000_000), "hbm": Fraction(4_000_000_000), "cube": Fraction(432_537_600_000), "vector": Fraction(6_758_400_000), "mte3": Fraction(13_516_800_000)}
                 if kv_heads > 1:
-                    if aic < 32 or q_len_g > 1:
-                        sp_tgt = max(1, int(getattr(op.policy, "split_target", 4096) or 4096))
-                        eff_sp = min(Fraction(splits), max(Fraction(1), Fraction(q_len_g * max(1, (q_heads + kv_heads - 1) // kv_heads) * max(1, int(geometry.s_max)), sp_tgt)))
-                        active_kv_f = min(Fraction(aic_sat), max(Fraction(1), Fraction(batch * kv_heads * q_len_g) * eff_sp))
-                        wave_scale = Fraction(aic_sat) / active_kv_f
-                    else:
-                        kv_par = batch * kv_heads; active_kv = min(12, aic_sat, max(1, kv_par if kv_par <= 4 else (4 + (kv_par - 4) // 2 if kv_par <= 8 else (6 if kv_par <= 16 else 6 + (kv_par - 16) * 6 // 16))))
-                        wave_scale = Fraction(aic_sat, active_kv) * Fraction(7, 8)
+                    base_ch = Fraction(q_tasks) if q_tasks <= 4 else (Fraction(4) + Fraction(q_tasks - 4, 2) if q_tasks <= 8 else (Fraction(6) if q_tasks <= 16 else min(Fraction(12), Fraction(6) + Fraction((q_tasks - 16) * 6, 16))))
+                    sp_tgt = max(1, int(getattr(op.policy, "split_target", 4096) or 4096))
+                    q_rows_max = max(1, int(env.get("QUERY_ROWS_MAX", q_len_g * max(1, (q_heads + kv_heads - 1) // kv_heads)) or 1))
+                    eff_sp = min(Fraction(splits), max(Fraction(1), Fraction(q_rows_max * max(1, int(geometry.s_max)), sp_tgt)))
+                    kv_burst = float(env.get("KV_BURST_BYTES", 0) or 0)
+                    burst_ratio = as_fraction(round(max(1.0, kv_burst / 300_000_000.0), 6))
+                    grow_ch = base_ch * (Fraction(1, 4) + Fraction(3, 4) * burst_ratio)
+                    eff_ch = min(Fraction(aic_sat), min(Fraction(32), Fraction(q_tasks) * eff_sp), max(Fraction(1), grow_ch))
+                    occ_frac, cap_mult = min(Fraction(1), eff_ch * Fraction(8, 7) / Fraction(32)), Fraction(32)
                 else:
-                    active_cores = min(aic_sat, max(1, batch * kv_heads * q_len_g * (splits if (aic < 32 or q_len_g > 1) else 8))); wave_scale = min(Fraction(8), Fraction(aic_sat, active_cores))
+                    eff_ch = min(Fraction(aic_sat), max(Fraction(1), Fraction(q_tasks * 8)))
+                    occ_frac, cap_mult = min(Fraction(1), eff_ch / Fraction(32)), Fraction(8)
+                supply_map = dict(supply.rates)
+                for p, r_ref in ref_rates.items():
+                    if p in supply_map:
+                        r_eff = as_fraction(supply.effective(p))
+                        r_cap = r_ref * occ_frac
+                        scale_pipes[p] = scale_pipes.get(p, Fraction(1)) * (min(cap_mult, max(Fraction(1), r_eff / r_cap)) if r_cap > 0 else Fraction(1))
             else:
                 h_groups = max(8, q_heads // 8) if int(theta.find("index_topk", 0) or 0) > 0 else max(1, q_heads // 16); active_cores, s_val = min(32, aic, max(1, batch * h_groups * splits)), float(geometry.s_max)
                 mla_f = _lerp_frac(Fraction(6, 5), Fraction(8, 5), _ramp(s_val, 1024.0, 2048.0))
@@ -165,7 +175,7 @@ def compute_hardware_service_factors( op: Any, geometry: Any, env: dict[str, Any
                     qh_t, mla_asym = 1.0 - _ramp(float(q_heads), 8.0, 32.0), _lerp_frac(Fraction(9, 20), Fraction(13, 40), _ramp(s_val, 32768.0, 131072.0)); mla_hi = mla_asym + (mla_f - mla_asym) * Fraction(4096) / as_fraction(round(s_val, 3))
                     mla_f = _lerp_frac(mla_f, mla_hi, qh_t)
                 mla_cap = Fraction(24 if splits == 1 else 12); wave_scale = min(mla_cap, Fraction(32, active_cores) * mla_f)
-            for p in ("mte2", "hbm", "cube", "vector", "mte3"): scale_pipes[p] = scale_pipes.get(p, Fraction(1)) * wave_scale
+                for p in ("mte2", "hbm", "cube", "vector", "mte3"): scale_pipes[p] = scale_pipes.get(p, Fraction(1)) * wave_scale
         else:
             par_blocks = max(1, batch * q_tiles * (kv_heads if family == "attention" else max(1, q_heads // 8))); active_par = min(32, aic, par_blocks)
             if active_par < 32 and op.kind != "A0":

@@ -45,8 +45,10 @@ _ALIASES = {
     "activation": "silu", "rotary": "rotary", "rope": "rotary", "rotary_embedding": "rotary",
     "quant": "quant", "quantize": "quant", "dynamic_quant": "quant",
     "collective": "collective", "allreduce": "collective", "all_reduce": "collective",
-    "reduce_scatter": "collective", "all_gather": "collective", "alltoall": "collective",
-    "all_to_all": "collective", "etp_allreduce": "collective",
+    "reduce_scatter": "collective", "reducescatter": "collective",
+    "all_gather": "collective", "allgather": "collective", "alltoall": "collective",
+    "all_to_all": "collective", "alltoallv": "collective", "all_to_allv": "collective",
+    "etp_allreduce": "collective",
 }
 _SELECTORS = ("op", "operator", "primitive", "kind", "family", "type", "name")
 _QUANT_DTYPES = {"fp8": "fp8_e4m3", "fp8_e4m3": "fp8_e4m3", "mxfp8": "fp8_e4m3",
@@ -57,42 +59,36 @@ def _pick(spec, keys, default=None):
         if spec.get(key) is not None:
             return spec[key]
     return default
-
+def _reduction_extras(spec):
+    return tuple((key, spec[key]) for key in ("reduction_boundary", "moe_recipe") if spec.get(key) is not None)
 def _num(value, label):
     try:
         return int(value)
     except (TypeError, ValueError):
         raise ModelingError(f"primitive_parameter_invalid:{label}:{value}") from None
-
 def _int(spec, keys, default):
     return max(1, _num(_pick(spec, keys, default), keys[0]))
-
 def _zero(spec, keys, default):
     return max(0, _num(_pick(spec, keys, default), keys[0]))
-
 def _real(spec, keys, default):
     raw = _pick(spec, keys, default)
     try:
         return float(raw)
     except (TypeError, ValueError):
         raise ModelingError(f"primitive_parameter_invalid:{keys[0]}:{raw}") from None
-
 def _fmt(spec, keys, default):
     return str(_pick(spec, keys, default) or default).strip().lower()
-
 def _width(fmt, default=2.0):
     try:
         return float(dtype_bytes(fmt))
     except ModelingError:
         return default
-
 def _bind(name, family, role, *, matrix=(), heads=(), experts=(), quant=(),
           parallel=(), tiles=(), extras=()):
     return BoundOperator(
         OperatorTemplate(name=name, family=family, role=role),
         StaticSignature(role=name, matrix=matrix, heads=heads, experts=experts,
                         quant=quant, parallel=parallel, tiles=tiles, extras=extras))
-
 def _gemm(spec, aic):
     k = _int(spec, ("in_features", "hidden_size", "hidden", "K"), 4096)
     n = _int(spec, ("out_features", "intermediate_size", "N"), 4096)
@@ -102,7 +98,6 @@ def _gemm(spec, aic):
                quant=(("act_bytes", act), ("act_format", afmt), ("weight_format", wfmt), ("output_format", ofmt)),
                tiles=(("cores", aic),))
     return ((op, "E1", "gemm", "AI_CORE"),)
-
 def _grouped(spec, aic):
     k, n = _int(spec, ("K", "in_features", "hidden_size", "hidden"), 4096), _int(spec, ("N", "out_features", "intermediate_size"), 2048)
     experts, ep = _int(spec, ("E", "experts", "num_experts"), 64), _int(spec, ("ep",), 1)
@@ -113,7 +108,6 @@ def _grouped(spec, aic):
                quant=(("weight_format", _fmt(spec, ("weight_format", "w_dtype"), "bf16")),),
                tiles=(("cores", aic),))
     return ((op, "F3", "moe_grouped", "MIX_AIC"),)
-
 def _moe(spec, aic):
     hidden = _int(spec, ("hidden", "hidden_size", "K"), 4096)
     inter = _int(spec, ("inter", "moe_intermediate_size", "intermediate_size", "N"), 1536)
@@ -150,10 +144,10 @@ def _moe(spec, aic):
         items.append((_bind("etp_allreduce", "collective", "etp_allreduce",
                             parallel=(("axis", "etp"), ("members", etp), ("etp", etp), ("tp", tp), ("ep", ep)),
                             experts=(("E", experts), ("local", local), ("k", top_k)),
-                            quant=(("wire_bytes", wire), ("bytes_per_token", wire))),
+                            quant=(("wire_bytes", wire), ("bytes_per_token", wire)),
+                            extras=_reduction_extras(spec)),
                       "F3", "collective", "COMMUNICATION"))
     return tuple(items)
-
 def _attention(spec, aic, mla):
     q_heads = _int(spec, ("q_heads", "q", "heads", "num_attention_heads"), 32)
     act = _real(spec, ("act_bytes",), 2.0)
@@ -181,7 +175,6 @@ def _attention(spec, aic, mla):
                tiles=(("mt", 128), ("nt", 128), ("cores", aic)),
                extras=(("window", _zero(spec, ("window",), 0)), ("causal", _zero(spec, ("causal",), 1))))
     return ((op, "A0", "attention", "MIX_AIC"),)
-
 def _ew(spec, name, family, role, kind, mechanism, *, read, write, ops, quantized=False):
     elements = _int(spec, ("elements", "intermediate_size", "hidden", "hidden_size", "width", "dim", "K"), 4096)
     act = _real(spec, ("act_bytes",), 2.0)
@@ -192,7 +185,6 @@ def _ew(spec, name, family, role, kind, mechanism, *, read, write, ops, quantize
                extras=(("ops_per_element", _int(spec, ("ops_per_element",), ops)),
                        ("read_bytes", read * elements * act), ("write_bytes", write * elements * act)))
     return ((op, kind, mechanism, "AI_VECTOR_CORE"),)
-
 def _norm(spec, aic):
     factor = 2 if _zero(spec, ("residual",), 0) else 1
     return _ew(spec, "rmsnorm", "elementwise", "norm", "N0", "norm_residual", read=factor, write=factor, ops=6)
@@ -240,6 +232,12 @@ def _conv(spec, aic):
 
 def _collective(spec, aic, key, devices):
     name = str(spec.get("name") or spec.get("collective") or key).strip().lower().replace("-", "_")
+    compact = name.replace("_", "")
+    if "etp" in compact: canon_name, kind = "etp_allreduce", "F3"
+    elif "alltoall" in compact or "dispatch" in name or "combine" in name: canon_name, kind = "alltoall", "F2"
+    elif "reducescatter" in compact: canon_name, kind = "reduce_scatter", "R1"
+    elif "allgather" in compact: canon_name, kind = "all_gather", "R1"
+    else: canon_name, kind = "allreduce", "R1"
     ranks = max(1, _num(_pick(spec, ("members", "ranks", "tp", "ep", "world_size"), devices), "members"))
     rpn = max(1, min(ranks, _num(_pick(spec, ("ranks_per_node",), min(ranks, 8)), "ranks_per_node")))
     hidden = _int(spec, ("hidden", "elements", "hidden_size", "width"), 4096)
@@ -250,10 +248,9 @@ def _collective(spec, aic, key, devices):
         raw = _pick(spec, keys, None)
         if raw is not None:
             group.append((label, _num(raw, label)))
-    kind = "F3" if "etp" in name else ("F2" if "alltoall" in name else "R1")
-    op = _bind(name, "collective", name, parallel=(("members", ranks), ("ranks", ranks), ("ranks_per_node", rpn)),
+    op = _bind(canon_name, "collective", canon_name, parallel=(("members", ranks), ("ranks", ranks), ("ranks_per_node", rpn)),
                experts=tuple(group), quant=(("wire_bytes", wire), ("bytes_per_token", wire), ("act_bytes", act)),
-               extras=(("collective", name),))
+               extras=(("collective", canon_name), *_reduction_extras(spec)))
     return ((op, kind, "collective", "COMMUNICATION"),)
 
 _BUILDERS = {"gemm": _gemm, "grouped_matmul": _grouped, "moe_native": _moe,
@@ -276,7 +273,7 @@ def _request_shape(spec):
     batch_n = _int(spec, ("batch", "batch_size", "spr"), 1)
     rows, query = _pick(spec, ("M", "m", "tokens", "num_tokens"), None), _pick(spec, ("q_len", "seq_len", "tps", "prompt_tokens"), None)
     cache = _pick(spec, ("kv_len", "s_kv", "context"), None)
-    cache_n = max(1, _num(cache, "kv_len")) if cache is not None else None
+    cache_n = max(0, _num(cache, "kv_len")) if cache is not None else None
     if query is not None:
         query_n = max(1, _num(query, "q_len"))
         return (query_n,) * batch_n, query_n, cache_n
@@ -321,8 +318,13 @@ def evaluate_primitive_spec(spec: Mapping[str, Any], *, sku: str = "Ascend950DT_
     lengths, query_n, cache_n = _request_shape(spec)
     total_kv = max(max(lengths), cache_n if cache_n is not None else query_n)
     phase = _phase(spec, query_n, total_kv, cache_n)
-    geometry = WorkloadGeometry(tuple(RequestGeometry(length, total_kv - length, phase=phase)
-                                       for length in lengths), phase=phase)
+    prefix = _pick(spec, ("prefix_len", "prefix_tokens"), None)
+    if prefix is not None: contexts = (max(0, _num(prefix, "prefix_len")),) * len(lengths)
+    elif cache_n is None or cache_n == 0 or (phase == "prefill" and cache_n <= max(lengths) and spec.get("context") is None): contexts = (0,) * len(lengths)
+    elif phase == "prefill" and spec.get("context") is not None and spec.get("kv_len") is None and spec.get("s_kv") is None: contexts = (cache_n,) * len(lengths)
+    else: contexts = tuple(max(0, cache_n - length) for length in lengths)
+    geometry = WorkloadGeometry(tuple(RequestGeometry(length, context, phase=phase)
+                                       for length, context in zip(lengths, contexts)), phase=phase)
     items = _collective(spec, aic, key, devices) if canonical == "collective" else _BUILDERS[canonical](spec, aic)
     total = Fraction(0)
     by_mechanism, by_core, details = {}, {}, []
