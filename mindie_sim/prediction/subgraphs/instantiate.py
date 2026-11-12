@@ -662,14 +662,11 @@ def _layer_slots(model: ModelSpec, layer: LayerPlan,
             slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk",
                                    "index_select"))
         slots.append(LayerSlot("A2", "", "attention"))
-    if attention_kind not in {"A0", "A1", "A2"}:
-        if layer.compress_ratio or layer.cache_kind == "window_compressed":
-            slots.append(LayerSlot("K1", str(layer.compressor_kind or "weighted_pool"),
-                                   "compress"))
-        if layer.indexer:
-            slots.append(LayerSlot("I0", str(layer.indexer_type or "full"), "index_produce"))
-            slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk",
-                                   "index_select"))
+    if attention_kind not in {"A1", "A2"} and (layer.compress_ratio or layer.cache_kind == "window_compressed"):
+        slots.append(LayerSlot("K1", str(layer.compressor_kind or "weighted_pool"), "compress"))
+    if attention_kind not in {"A0", "A1", "A2"} and layer.indexer:
+        slots.append(LayerSlot("I0", str(layer.indexer_type or "full"), "index_produce"))
+        slots.append(LayerSlot("I1", "candidate" if layer.candidate_filter else "topk", "index_select"))
     boundary("attn_post")
     slots.append(LayerSlot("N0", "residual", "attn_residual"))
     slots.append(LayerSlot("N0", "layernorm" if layer.ffn_activation == "gelu" and False
