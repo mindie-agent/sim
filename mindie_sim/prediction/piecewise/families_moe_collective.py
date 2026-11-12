@@ -654,9 +654,10 @@ def _compile_collective(ctx: CompiledOperator,
     wire = _frac(theta.find("wire_bytes", theta.find("bytes_per_token", 0.0)), 0.0)
     mtu = max(1, _int(theta.find("mtu_bytes"), DEFAULT_MTU))
     chunks = max(1, _int(theta.find("chunks"), 1))
-    etp = name == "etp_allreduce" or ctx.kind == "F3"
-    route = _moe_route_shape(ctx, theta) if etp else None
-    message = (Mul((Var("MOE_ROWS"), Const(wire))) if etp
+    routed = kind == "alltoallv" and (
+        ctx.kind == "F2" or _int(theta.find("k", theta.find("top_k", 1)), 1) > 1)
+    route = _moe_route_shape(ctx, theta) if routed else None
+    message = (Mul((Var("MOE_ROWS"), Const(wire))) if routed
                else Mul((Var("T"), Const(wire))))
     matrix = _traffic_matrix(theta)
     if matrix is not None and len(matrix[0]) != ranks:
