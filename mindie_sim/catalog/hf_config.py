@@ -118,13 +118,14 @@ ALIASES = {
     "num_hidden_layers": ("num_layers", "n_layer"),
     "hidden_size": ("d_model", "n_embd"),
     "num_attention_heads": ("n_heads", "n_head"),
-    "num_key_value_heads": ("multi_query_group_num",),
+    "num_key_value_heads": ("multi_query_group_num", "num_attention_groups"),
     "head_dim": ("kv_channels",),
     "intermediate_size": ("ffn_hidden_size", "ffn_dim"),
     "vocab_size": ("padded_vocab_size",),
     "n_routed_experts": ("num_routed_experts", "num_local_experts",
                          "num_experts", "moe_num_experts"),
-    "num_experts_per_tok": ("top_k", "num_experts_per_token", "moe_top_k"),
+    "num_experts_per_tok": ("top_k", "num_experts_per_token", "moe_top_k",
+                            "top_k_experts"),
     "n_shared_experts": ("num_shared_experts",),
     "first_k_dense_replace": ("first_k_dense_layers",),
     "shared_expert_intermediate_size": ("shared_intermediate_size", "share_expert_dim"),
@@ -156,6 +157,20 @@ problem_type remove_invalid_values repetition_penalty
 return_dict_in_generate sep_token_id suppress_tokens task_specific_params
 temperature tf_legacy_loss tokenizer_class top_p
 typical_p use_bfloat16 use_unified_vision_chunk video_placeholder media_placeholder_token_id
+image_grid_pinpoints image_seq_length img_token_compression_config
+multimodal_projector_bias num_reward_heads process_image_mode
+projector_hidden_act projector_hidden_size vision_feature_layer
+vision_feature_select_strategy audio_config audio_token_id boa_token_id
+boi_token_id eoa_token_id eoa_token_index eoi_token_id
+vision_soft_tokens_per_image im_end_token im_patch_token im_start_token
+image_token_len patch_token_len projector_bias understand_projector_stride
+use_im_start_end vision_select_layer att_impl_type attention_other_setting
+fp32_residual_connection head_dim_full_attention head_dim_sliding_attention
+num_attention_groups_full_attention num_attention_groups_sliding_attention
+num_sliding_attention_heads need_fp32_gate norm_dtype norm_expert_weight
+yarn_only_types use_double_wide_mlp use_bidirectional_attention
+final_logit_softcapping vocab_size_per_layer_input
+make_ngram_vocab_size_divisible_by
 """.split())
 
 _FALSY_DEFAULT_FIELDS = frozenset({
@@ -184,6 +199,9 @@ qk_head_dim moe_renormalize moe_router_activation_func num_expert_group
 use_grouped_topk block_size markov_rank num_target_layers
 sparse_attention_config ngram_embedding zero_expert_num dit_config
 double_stream_layers single_stream_layers swiglu_limit
+attention_output_gate dense_intermediate_size num_mtp_modules
+attention_k_eq_v enable_moe_block global_head_dim hidden_activation
+hidden_size_per_layer_input num_global_key_value_heads moe_layer_list
 """.split())
 
 NATIVE_ADAPTER_FIELDS = set("""
@@ -195,7 +213,7 @@ dspark_target_layer_ids enable_confidence_head engram_head_dim engram_layer_ids
 engram_max_ngram_size engram_n_heads engram_num_embeddings engram_pad_token_id
 engram_storage_mode expert_dtype hc_mult hc_sinkhorn_iters image_token_id
 index_head_dim index_n_heads index_source_layer_ids index_topk indexer_types
-index_kpool index_kpool_compress index_kpool_always_select_tail
+indexer_head_dim indexer_n_heads index_kpool index_kpool_compress index_kpool_always_select_tail
 latent_moe_use_norm media_placeholder_token_id mhc mla_use_output_gate
 mlp_layer_types moe_router_dtype num_hash_layers o_groups o_lora_rank
 video_token_id mla_use_nope index_share_for_mtp_iteration
@@ -204,6 +222,13 @@ engram_compressed_vocab_size confidence_head_with_markov markov_head_type
 apply_layernorm_1p linear_expand_v
 target_hidden_size target_num_hidden_layers target_layer_ids mask_token_id
 draft_vocab_size full_attention_causal sample_from_anchor
+hc_count hc_lowrank heads_per_ngram indexer_budget indexer_compress_ratio
+indexer_kv_heads mtp ngram_size ngram_vocab_size_base ple_conv_kernel_size
+ple_embed_dim ple_layer_ids split_ngram_parts qk_norm_type rotary_dim
+use_gemma_norm use_routing_bias swiglu_alpha expert_intermediate_size
+num_kv_shared_layers moe_router_scaling_factor partial_rotary_factors
+sparse_config swiglu_limits swiglu_limits_shared use_head_wise_attn_gate
+use_moe use_moe_router_bias image_token_index video_token_index
 """.split())
 
 

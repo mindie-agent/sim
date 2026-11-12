@@ -37,6 +37,7 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.coverage import model_coverage
 from mindie_sim.catalog.specs import build_model_spec as _build_model_spec
+from mindie_sim.catalog.fleet import FLEET_CATALOG_ENTRIES, FLEET_MODEL_ALIASES
 from mindie_sim.catalog.weights import (
     body_parameter_count, body_weight_bytes, sharded_weight_bytes as _sharded,
     stage_weight_bytes, stage_weight_terms, weight_breakdown,
@@ -58,6 +59,7 @@ CATALOG: dict[str, str] = {
     "qwen3.5-27b": "qwen3.5-27b.json", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b.json",
     "qwen3.5-397b-a17b": "qwen3.5-397b-a17b.json", "qwen3.6-27b": "qwen3.6-27b.json",
     "qwen3.8-2.4t-a95b": "qwen3.8-2.4t-a95b.json", "qwen3.8-27b": "qwen3.8-27b.json",
+    **FLEET_CATALOG_ENTRIES,
 }
 
 MODEL_ALIASES = {
@@ -89,13 +91,14 @@ MODEL_ALIASES = {
     "Qwen3.8-2.4T-A95B": "qwen3.8-2.4t-a95b", "Qwen3.8-27B": "qwen3.8-27b",
     "Qwen3.6-27B": "qwen3.6-27b", "qwen3.6-27b": "qwen3.6-27b",
     "Qwen3.5-35B-A3B": "qwen3.5-35b-a3b", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b",
-    "qwen3_5_moe_a3b": "qwen3.5-35b-a3b", "Qwen3.6-35B-A3B": "qwen3.5-35b-a3b", "qwen3.6-35b-a3b": "qwen3.5-35b-a3b",
+    "qwen3_5_moe_a3b": "qwen3.5-35b-a3b",
     "Qwen3.5-397B-A17B": "qwen3.5-397b-a17b", "qwen3_5_397b_a17b": "qwen3.5-397b-a17b", "qwen3.5-397b": "qwen3.5-397b-a17b",
+    **FLEET_MODEL_ALIASES,
 }
 
 ARCHITECTURE_PRESET_CATALOG: dict[str, str] = {
     "longcat-flash-lite": "longcat-flash-lite.json",
-    "minimax-m3": "minimax-m3.json",
+    "minimax-m3": "../catalog/configs/minimax-m3.json",
     "bailing-v3": "bailing-v3.json",
     "qwen3.5-moe": "qwen3.5-moe.json",
     "hunyuan-video-dit": "hunyuan-video-dit.json",
@@ -519,13 +522,6 @@ def load_architecture_profile(
 ) -> ModelArchitectureProfile:
     resolved = _catalog_key(key)
     root = Path(config_root) if config_root is not None else CONFIG_DIR
-    if resolved in ARCHITECTURE_PRESET_CATALOG:
-        path = root / ARCHITECTURE_PRESET_CATALOG[resolved]
-        try:
-            config = json.loads(path.read_text(encoding="utf-8"))
-        except OSError as exc:
-            raise ModelingError(f"architecture_preset_unreadable:{resolved}:{type(exc).__name__}") from exc
-        return build_architecture_profile(config, key=resolved)
     if resolved in CATALOG:
         model = load_model(resolved, config_root=config_root)
         schedule = [plan.attention for plan in model.layer_plans]
@@ -549,6 +545,13 @@ def load_architecture_profile(
             },
             key=resolved,
         )
+    if resolved in ARCHITECTURE_PRESET_CATALOG:
+        path = root / ARCHITECTURE_PRESET_CATALOG[resolved]
+        try:
+            config = json.loads(path.read_text(encoding="utf-8"))
+        except OSError as exc:
+            raise ModelingError(f"architecture_preset_unreadable:{resolved}:{type(exc).__name__}") from exc
+        return build_architecture_profile(config, key=resolved)
     raise ModelingError(f"architecture_preset_unknown:{key}")
 
 
@@ -698,6 +701,12 @@ def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
     path = root / entries[key] if key in entries else Path(key).expanduser()
     if path.is_dir():
         path = path / "config.json"
+    if key in entries and config_root is not None and not path.is_file():
+        name = Path(entries[key]).name
+        fallback = next((p for p in (root / name, Path(__file__).parent / "catalog" / "configs" / name)
+                         if p.is_file()), None)
+        if fallback is not None:
+            path = fallback
     if key not in entries and not path.is_file():
         raise ModelingError(f"model_catalog_unknown:{key}")
     if path.stat().st_size > 50 * 1024 * 1024:

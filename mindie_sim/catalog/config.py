@@ -47,6 +47,13 @@ def _profile(config: Mapping[str, Any], merged: Mapping[str, Any]) -> str:
     model_type = str(merged.get("model_type", config.get("model_type", ""))).lower()
     if "DSparkDraftModel" in archs or "K3DSpark" in archs or model_type == "k3_dspark":
         return "kimi_dspark"
+    if model_type in {"gemma4", "gemma4_text"} or "Gemma4" in archs:
+        return "gemma4"
+    if (model_type == "minimax_m3_vl" or "MiniMaxM3" in archs
+            or merged.get("family") == "minimax_m3"):
+        return "minimax_m3"
+    if model_type in {"step5", "step5_vl"} or "Step5" in archs:
+        return "step5"
     if "num_layers" in merged and "num_hidden_layers" not in merged:
         return "generic"
     if "deepseek_v41" in model_type or "DeepseekV41" in archs:

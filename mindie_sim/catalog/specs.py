@@ -53,6 +53,9 @@ def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
 def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     c, text, vision_raw = flatten_config(config)
     family = _profile(config, c)
+    if family in {"gemma4", "minimax_m3", "step5"}:
+        from .fleet import build_fleet_model
+        return build_fleet_model(key, config, family)
     if family == "generic" or family.startswith("standard_"):
         from .composable import build_composable
         return build_composable(key, config, family)
@@ -99,7 +102,7 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ffn = "moe" if _int(c, "num_experts") else "dense"
         aux = _aux_qwen(c)
         vision = _vision_qwen(config, c) if vision_raw else None
-        engram = None
+        engram = _engram(c)
     else:
         raise ModelingError(f"model_catalog_profile_unsupported:{family}")
     from .hf_config import native_coverage, resolve_quant
@@ -122,11 +125,13 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
                                else plan.compress_ratio * (2 if plan.compress_ratio == 4 else 1)),
         index_input="compressed" if family == "deepseek_v41" else "hidden",
         index_query_per_layer=family == "glm" and plan.attention == "mla" and plan.indexer,
-        index_heads=_int(c, "index_n_heads"), index_dim=_int(c, "index_head_dim"),
-        index_topk=_int(c, "index_topk"),
+        index_heads=plan.index_heads or _int(c, "index_n_heads"),
+        index_dim=plan.index_dim or _int(c, "index_head_dim"),
+        index_topk=plan.index_topk or _int(c, "index_topk"),
         candidate_block_size=max(1, _int(c, "candidate_block_size", 8)),
         candidate_topk_blocks=_int(c, "candidate_topk_blocks", 2048),
-        qk_norm=family == "qwen" and plan.attention == "gqa",
+        qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa"))
+        if family == "qwen" else False,
     ) for plan in plans]
     # V4.1 uses source-layer sets for compressed KV; its adapter has already
     # resolved them. The dense helper expects one owner entry per layer.
