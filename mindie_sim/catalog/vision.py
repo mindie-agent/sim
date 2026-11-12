@@ -93,6 +93,28 @@ def _vision_qwen(config: Mapping[str, Any], text: Mapping[str, Any]) -> VisionSp
 
 
 def _engram(c: Mapping[str, Any]) -> EngramSpec | None:
+    # Qwen4Exp declares its n-gram memory as per-layer embedding (PLE) ids:
+    # one (ngram-1)*heads-column table per layer at the declared base vocab.
+    ple_layers = [int(v) for v in c.get("ple_layer_ids", ()) or ()]
+    if ple_layers:
+        max_ngram = _int(c, "ngram_size", 0)
+        heads = _int(c, "heads_per_ngram", 0)
+        embed = _int(c, "ple_embed_dim", 0)
+        base_rows = _int(c, "ngram_vocab_size_base", 0)
+        columns = (max_ngram - 1) * heads
+        if max_ngram < 2 or heads <= 0 or embed <= 0 or columns <= 0 or embed % columns:
+            raise ModelingError("model_config_ple_geometry_missing")
+        width = embed // columns
+        tables = tuple(
+            EngramTableSpec(layer_id=layer, table_id=index,
+                            rows=base_rows, width=width)
+            for index, layer in enumerate(ple_layers)
+        )
+        return EngramSpec(
+            tables=tables, max_ngram=max_ngram, heads=heads, width=width,
+            pad_token_id=_int(c, "engram_pad_token_id", 0),
+            source=merge_source({"ple_layer_ids": str(len(tables))}),
+        )
     layer_ids = [int(v) for v in c.get("engram_layer_ids", ()) or ()]
     rows = [int(v) for v in c.get("engram_num_embeddings", ()) or ()]
     if not layer_ids:

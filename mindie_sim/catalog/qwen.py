@@ -86,6 +86,12 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     conv_k = int(_require(c, "linear_conv_kernel_dim"))
     conv_width = 2 * key_heads * key_dim + value_heads * value_dim
     gate = _qwen_output_gate(c)
+    hc_count = _int(c, "hc_count")
+    indexer_heads = _int(c, "indexer_n_heads")
+    indexer_dim = _int(c, "indexer_head_dim")
+    indexer_budget = _int(c, "indexer_budget")
+    indexer_ratio = _int(c, "indexer_compress_ratio")
+    indexer = indexer_heads > 0 and indexer_dim > 0 and indexer_budget > 0
     ssm_raw = str(c.get("mamba_ssm_dtype") or "fp32").lower()
     ssm_dtype = {
         "float32": "fp32", "fp32": "fp32",
@@ -123,6 +129,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 state_bytes=float(value_heads * key_dim * value_dim * dtype_bytes(ssm_dtype)
                                   + conv_width * (conv_k - 1) * dtype_bytes("bf16")),
                 q_output_gate=gate,
+                hyper_connections=hc_count > 0, hc_mult=hc_count,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",
             ))
@@ -143,6 +150,15 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 # Qwen3.5 reuses this attention class for its full-attention layers.
                 qk_norm=True,
                 q_output_gate=gate,
+                hyper_connections=hc_count > 0, hc_mult=hc_count,
+                indexer=indexer, indexer_type="full" if indexer else "none",
+                owns_index_k=indexer, index_k_owner_layer_id=index if indexer else -1,
+                owns_topk=indexer, topk_owner_layer_id=index if indexer else -1,
+                index_heads=indexer_heads if indexer else 0,
+                index_dim=indexer_dim if indexer else 0,
+                index_topk=indexer_budget if indexer else 0,
+                index_kpool=max(1, indexer_ratio) if indexer else 1,
+                index_kpool_compress=indexer and indexer_ratio > 1,
                 kv_cache_elements=2 * kv_heads * head_dim,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",

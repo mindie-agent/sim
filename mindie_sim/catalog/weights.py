@@ -171,7 +171,8 @@ def _indexer_terms(plan, model):
                     _t("indexer_pool_ape", plan.index_kpool, plan.index_dim, "param_fp32"),
                 ])
     if plan.indexer or plan.owns_topk or plan.index_query_per_layer:
-        terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim, plan.q_lora_rank, "indexer_fp8"),
+        terms.extend([_t("indexer_wq", plan.index_heads * plan.index_dim,
+                         plan.q_lora_rank or model.hidden_size, "indexer_fp8"),
                       _t("indexer_weights", plan.index_heads, model.hidden_size,
                          "linear_param_bf16" if plan.index_kpool > 1 else "indexer.weights")])
     if plan.index_kpool > 1:
