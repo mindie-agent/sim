@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import builtins
+from dataclasses import replace
 import ipaddress
 import json
 import re
@@ -31,7 +32,18 @@ from pathlib import Path
 
 import pytest
 
-from mindie_sim.model_catalog import CATALOG, MODEL_ALIASES, load_model
+try:  # Imported before the offline-root fixture scans installed distributions.
+    from setuptools.command.build_py import build_py as _build_py
+    from setuptools.dist import Distribution as _Distribution
+except ModuleNotFoundError:  # pragma: no cover - minimal offline test envs
+    _build_py = _Distribution = None
+
+from mindie_sim.catalog.weights import layer_weight_terms
+from mindie_sim.model_catalog import (
+    CATALOG, MODEL_ALIASES, build_model_spec, load_model,
+)
+from mindie_sim.prediction.gated_activation import gated_activation
+from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
 from mindie_sim.prediction.piecewise.compiler import (
     ImplementationPolicy, OperatorPiecewiseCompiler, PipeSupply,
 )
@@ -42,7 +54,8 @@ from mindie_sim.prediction.piecewise.model_pipeline import (
 from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, instantiate_model
 from mindie_sim.schema.model import ModelSpec
 
-CONFIG_DIR = Path(__file__).parents[1] / "mindie_sim" / "catalog" / "configs"
+ROOT = Path(__file__).parents[1]
+CONFIG_DIR = ROOT / "mindie_sim" / "catalog" / "configs"
 CANONICAL = (
     "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b", "gemma-4-31b",
     "qwen3.6-35b-a3b", "qwen3.8-flash-next", "step-5-preview",
@@ -87,6 +100,10 @@ FEATURES = dict(token_tile=16, kv_tile=16, cores=2, moe_row_tile=4,
 _TIMING = ("timing", "latency", "throughput", "measured", "benchmark",
            "duration_ms", "tokens_per_second")
 _HOST = ("/Volumes/", "/mnt/", "/Users/")
+SPARSE_LAYERS = {
+    "minimax-m3": 3, "minimax-m3.1-flash": 0,
+    "qwen3.8-flash-next": 3, "step-5-preview": 3,
+}
 
 
 def _forbid(path: object) -> None:
@@ -274,3 +291,200 @@ def test_fleet_models_instantiate_compile_prefill_decode_and_serve(key):
         pipeline, [dict(id="fleet", prompt_tokens=3, output_tokens=2)],
         FrameworkConfig(supply=SUPPLY, policy=POLICY, max_batch=1))
     assert result.steps and result.steps[0]["body_ms"] > 0
+
+
+def _manifest_files(root: Path) -> set[str]:
+    """Expand the local ``MANIFEST.in`` include/recursive-include directives."""
+    includes: list[str] = []
+    recursive: list[tuple[str, tuple[str, ...]]] = []
+    for line in (root / "MANIFEST.in").read_text(encoding="utf-8").splitlines():
+        fields = line.split()
+        if not fields or fields[0].startswith("#"):
+            continue
+        if fields[0] == "include" and len(fields) == 2:
+            includes.append(fields[1])
+        elif fields[0] == "recursive-include" and len(fields) >= 3:
+            recursive.append((fields[1], tuple(fields[2:])))
+    found = {name for name in includes if (root / name).is_file()}
+    for directory, patterns in recursive:
+        for pattern in patterns:
+            found.update(path.relative_to(root).as_posix()
+                         for path in (root / directory).rglob(pattern) if path.is_file())
+    return found
+
+
+def _catalog_config_names() -> set[str]:
+    return {f"mindie_sim/catalog/configs/{path.name}" for path in CONFIG_DIR.glob("*.json")}
+
+
+def test_catalog_configs_are_declared_package_data():
+    import tomllib
+
+    configs = _catalog_config_names()
+    assert len(configs) == len(CANONICAL) == 7
+    assert configs <= _manifest_files(ROOT)
+    patterns = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["setuptools"]["package-data"]["mindie_sim"]
+    assert "catalog/configs/*.json" in patterns
+    package_root = ROOT / "mindie_sim"
+    declared = {f"mindie_sim/{path.relative_to(package_root).as_posix()}"
+                for pattern in patterns
+                for path in package_root.glob(pattern) if path.is_file()}
+    assert configs <= declared
+
+
+def test_setuptools_build_py_discovers_catalog_configs():
+    if _build_py is None or _Distribution is None:
+        pytest.skip("setuptools unavailable")
+    import tomllib
+
+    package_data = tomllib.loads(
+        (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    )["tool"]["setuptools"]["package-data"]
+    distribution = _Distribution()
+    distribution.packages = ["mindie_sim"]
+    distribution.package_data = package_data
+    command = _build_py(distribution)
+    command.finalize_options()
+    rows = command.get_data_files_without_manifest()
+    discovered = {f"mindie_sim/{name}" for _, _, _, names in rows for name in names}
+    assert _catalog_config_names() <= discovered
+
+
+def _fleet_case(key: str, *, tp: int = 1) -> dict:
+    model = load_model(key)
+    return {
+        "machine": {
+            "name": "declared-fleet", "architecture": "cuda", "num_devices": tp,
+            "device": {"memory_bytes": 1024 ** 4,
+                       "compute_peaks": {"bf16": 1e12, "fp32": 1e12},
+                       "rates": {"memory": 1e10, "vector": 1e10}, "compute_units": 64},
+            "links": [{"name": "fabric", "capacity_bytes_per_ms": 1e6,
+                       "members": list(range(tp)), "semantics": "shared"}],
+        },
+        "model": model.to_dict(),
+        "workload": {"requests": [{"id": "probe", "prompt_tokens": 8,
+                                   "output_tokens": 1}]},
+        "runtime": {"tp": tp, "dp": 1, "pp": 1, "ep": 1,
+                    "max_num_batched_tokens": 64, "max_num_seqs": 8,
+                    "max_model_len": 131072, "enable_chunked_prefill": True,
+                    "gpu_memory_utilization": 0.9, "graph_mode": "auto",
+                    "graph_buckets": [1, 2, 4, 8], "kv_block_size": 128},
+    }
+
+
+def test_gated_gelu_activation_uses_tanh_approximated_geglu_work():
+    plan = load_model("gemma-4-31b").layer_plans[0]
+    for activation in ("gelu", "geglu", "gelu_tanh", "gelu_pytorch_tanh"):
+        op = gated_activation(
+            plan=replace(plan, ffn_activation=activation), op_id="probe",
+            deps=("input",), rows=2, width=4, dtype="bf16", stage=0,
+            requests=(), phase="decode", recipe="swiglu")
+        assert op.family == op.recipe == "geglu"
+        assert op.vector_ops == 8 * 2 * 4
+        assert op.mte2_bytes == 2 * 8 * 2 and op.mte3_bytes == 8 * 2
+
+
+def test_fleet_models_lower_gated_activations_in_ordinary_graphs():
+    for key in CANONICAL:
+        case = _fleet_case(key)
+        for phase in ("prefill", "decode"):
+            operators = target_operators(case, phase=phase, tokens=1)
+            assert operators, (key, phase)
+            graphs = target_graphs(case, phase=phase, tokens=1)
+            assert graphs and all(items for items in graphs.values()), (key, phase)
+
+
+def test_sparse_attention_orders_indexer_before_attention_and_bounds_kv():
+    for key, layer_index in SPARSE_LAYERS.items():
+        model = load_model(key)
+        instantiated = instantiate_model(
+            model, FeatureConfig.from_model(model, **FEATURES))
+        layer = instantiated.layers[layer_index]
+        kinds = [subgraph.kind for subgraph in layer.subgraphs]
+        assert kinds.index("I0") < kinds.index("A0"), key
+        assert kinds.index("I1") < kinds.index("A0"), key
+        a0 = layer.find("A0", role="attention")
+        assert int(a0.operator("attention").theta.find("index_topk")) > 0, key
+        i1 = layer.find("I1", role="index_select")
+        compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
+
+        def cost_at(instance, name, context):
+            evaluation = compiler.compile(instance).evaluate(
+                WorkloadGeometry.homogeneous(1, 1, context))
+            return next(cost for cost in evaluation.operators if cost.name == name)
+
+        high_kv = cost_at(a0, "attention", 32768)
+        low_kv = cost_at(a0, "attention", 16384)
+        assert high_kv.get("KV_ROWS") == low_kv.get("KV_ROWS") > 0, key
+        assert (high_kv.get("KV_LOGICAL_BYTES") == low_kv.get("KV_LOGICAL_BYTES") > 0), key
+        assert (cost_at(i1, "topk", 32768).get("index_rows")
+                > cost_at(i1, "topk", 16384).get("index_rows")), key
+
+
+def test_sparse_target_graphs_bound_attention_traffic_by_index_topk():
+    names = ("index_wq", "index_wk", "index_store", "index_scores", "index_topk")
+    for key, layer_index in SPARSE_LAYERS.items():
+        case = _fleet_case(key)
+        body = {context: [op for op in target_operators(
+                    case, phase="decode", tokens=1, context=context)
+                if op.layer == layer_index]
+                for context in (16384, 32768)}
+        graph = {context: [op for op in target_graphs(
+                    case, phase="decode", tokens=1, context=context)[0]
+                if op.layer == layer_index]
+                for context in (16384, 32768)}
+        for ops in (body, graph):
+            high, low = ops[32768], ops[16384]
+            attention = next(op for op in high if op.op_id.endswith(".attention"))
+            prefix = attention.op_id.rsplit(".", 1)[0]
+            order = [op.op_id for op in high]
+            for name in names:
+                assert f"{prefix}.{name}" in order, (key, name)
+                assert order.index(f"{prefix}.{name}") < order.index(attention.op_id), key
+            low_attention = next(op for op in low if op.op_id.endswith(".attention"))
+            assert attention.mte2_bytes == low_attention.mte2_bytes > 0, key
+            assert attention.hbm_bytes == low_attention.hbm_bytes > 0, key
+
+
+def test_gemma4_k_eq_v_omits_value_projection_and_halves_cache_plane():
+    model = load_model("gemma-4-26b-a4b")
+    global_plan, local_plan = model.layer_plans[5], model.layer_plans[0]
+    assert global_plan.k_eq_v and not local_plan.k_eq_v
+    terms = {term.name: term for term in layer_weight_terms(global_plan, model)}
+    assert terms["q_proj"].rows == 16 * 512
+    assert terms["k_proj"].rows == 2 * 512
+    assert "v_proj" not in terms
+    local_terms = {term.name: term for term in layer_weight_terms(local_plan, model)}
+    assert local_terms["q_proj"].rows == 16 * 256
+    assert local_terms["k_proj"].rows == local_terms["v_proj"].rows == 8 * 256
+
+    case = _fleet_case("gemma-4-26b-a4b")
+
+    def qkv_width(ops, layer):
+        widths = {op.local_shape[1] for op in ops
+                  if op.layer == layer and op.recipe == "qkv_projection"}
+        assert len(widths) == 1
+        return widths.pop()
+
+    operators = target_operators(case, phase="decode", tokens=1)
+    graphs = target_graphs(case, phase="prefill", tokens=1)[0]
+    assert qkv_width(operators, 5) == 16 * 512 + 2 * 512 == 9216
+    assert qkv_width(graphs, 5) == 9216
+    assert qkv_width(operators, 0) == 16 * 256 + 2 * 8 * 256 == 8192
+    assert qkv_width(graphs, 0) == 8192
+    assert global_plan.cache_row_elements == 1 * 2 * 512
+
+
+def test_gemma4_inline_config_without_intermediate_size_builds():
+    config = json.loads((CONFIG_DIR / "gemma-4-26b-a4b.json").read_text(encoding="utf-8"))
+    text = config["text_config"]
+    text.pop("intermediate_size", None)
+    text["moe_intermediate_size"] = 704
+    text["shared_expert_intermediate_size"] = 2112
+    model = build_model_spec("gemma-4-26b-a4b-inline", config)
+    assert model.intermediate_size == 2112
+    assert model.moe_intermediate_size == 704
+    assert all(plan.k_eq_v for plan in model.layer_plans if not plan.window)
+    assert not any(plan.k_eq_v for plan in model.layer_plans if plan.window)

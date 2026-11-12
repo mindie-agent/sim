@@ -21,7 +21,7 @@ mindie-sim = "mindie_sim.__main__:main"
 include = ["mindie_sim*"]
 
 [tool.setuptools.package-data]
-mindie_sim = ["model_configs/*.json", "backends/profiles/*.json"]
+mindie_sim = ["model_configs/*.json", "catalog/configs/*.json", "backends/profiles/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

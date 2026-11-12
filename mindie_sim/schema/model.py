@@ -175,6 +175,7 @@ class LayerPlan:
     ffn_activation: str = "silu"
     activation_situ_beta: float = 1.0
     activation_situ_linear_beta: float | None = None
+    k_eq_v: bool = False
 
     @property
     def indexer_executes(self) -> bool:
@@ -186,7 +187,7 @@ class LayerPlan:
             return int(self.kv_cache_elements)
         if self.attention == "mla":
             return int(self.kv_lora_rank + self.qk_rope_head_dim)
-        return int(2 * self.num_kv_heads * self.head_dim)
+        return int((1 if self.k_eq_v else 2) * self.num_kv_heads * self.head_dim)
 
     @property
     def state_bytes_total(self) -> float:
