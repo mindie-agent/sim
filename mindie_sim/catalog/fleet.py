@@ -164,7 +164,8 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
     global_head_dim = _int(c, "global_head_dim") or 512
     kv_heads = _int(c, "num_key_value_heads") or heads
     global_kv_heads = _int(c, "num_global_key_value_heads") or kv_heads
-    intermediate = _int(c, "intermediate_size")
+    intermediate = (_int(c, "intermediate_size") or _int(c, "shared_expert_intermediate_size")
+                    or _int(c, "moe_intermediate_size") or 1)
     kinds = [str(v) for v in c.get("layer_types") or ()]
     if len(kinds) != layers or any(k not in {"sliding_attention", "full_attention"} for k in kinds):
         raise ModelingError("model_config_gemma4_layer_types_invalid")
@@ -194,7 +195,7 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
             top_k=top_k, moe_intermediate_size=moe_i, num_shared_experts=shared,
             shared_intermediate_size=shared_i, qk_norm=True, ffn_activation="gelu",
             kv_cache_elements=factor * layer_kv * layer_hd,
-            kv_owner_layer_id=index, owns_long_kv=True,
+            kv_owner_layer_id=index, owns_long_kv=True, k_eq_v=bool(full and k_eq_v),
             native_layer_id=index, scope="body",
         ))
     gemma_facts = {
@@ -310,9 +311,21 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         moe_set = {int(v) for v in str(enum).split(",") if v.strip()} if enum is not None else set()
     if bool(c.get("use_moe", False)) and not moe_set:
         raise ModelingError("model_config_step5_moe_schedule_missing")
+    sparse = c.get("sparse_config")
+    sparse_on = isinstance(sparse, Mapping) and bool(sparse.get("enabled", False))
+    sparse = dict(sparse) if isinstance(sparse, Mapping) else {}
+    apply_types = ({str(v) for v in (sparse.get("apply_to_layer_types") or ("full_attention",))}
+                   if sparse_on else set())
+    idx_heads = _int(sparse, "sparse_indexer_num_heads")
+    idx_dim = _int(sparse, "proxy_dim")
+    topk_regions = _int(sparse, "topk")
+    block = max(1, _int(sparse, "region_block_size", 1))
+    if sparse_on and min(idx_heads, idx_dim, topk_regions) <= 0:
+        raise ModelingError("model_config_step5_sparse_dims_missing")
     gate = bool(c.get("use_head_wise_attn_gate", False)); plans = []
     for index, kind in enumerate(kinds):
         full = kind == "full_attention"; moe = index in moe_set
+        sparse_layer = bool(sparse_on and kind in apply_types)
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
             ffn="moe" if moe else "dense", window=0 if full else window,
@@ -324,11 +337,23 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             shared_intermediate_size=shared_i if moe else 0,
             router_input_size=hidden if moe else 0, router_mode="softmax",
             q_output_gate=gate, ffn_activation="silu",
+            indexer=sparse_layer, indexer_type="full" if sparse_layer else "none",
+            owns_index_k=sparse_layer, index_k_owner_layer_id=index if sparse_layer else -1,
+            owns_topk=sparse_layer, topk_owner_layer_id=index if sparse_layer else -1,
+            index_heads=idx_heads if sparse_layer else 0,
+            index_dim=idx_dim if sparse_layer else 0,
+            index_topk=topk_regions * block if sparse_layer else 0,
+            index_kpool=block if sparse_layer else 1,
+            index_kpool_compress=bool(sparse_layer and block > 1),
+            candidate_block_size=block if sparse_layer else 1,
+            candidate_topk_blocks=topk_regions if sparse_layer else 0,
             kv_cache_elements=2 * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
     gaps = ["native_partial_rotary_dimensions_unresolved:retained_plan_proxy"]
+    if sparse_on:
+        gaps.append("csa_block_compress_ssmax_approximated_by_pooled_indexer")
     if vision_raw:
         gaps.append("vision_encoder_and_projector:language_backbone_only")
     return _model(

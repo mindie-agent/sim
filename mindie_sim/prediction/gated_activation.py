@@ -40,6 +40,10 @@ def gated_activation(*, plan, op_id, deps, rows, width, dtype, stage, requests,
     metadata = (("activation_kind", activation),)
     if activation == "silu":
         family, per_element = "swiglu", 4
+    elif activation in {"gelu", "geglu", "gelu_tanh", "gelu_pytorch_tanh"}:
+        # Tanh-approximated GeGLU: cubic + scale + add + tanh + +1 + 0.5*gate
+        # + gate*up.
+        family, per_element = "geglu", 8
     elif activation == "situ":
         if plan.activation_situ_beta <= 0 or (
                 plan.activation_situ_linear_beta is not None
