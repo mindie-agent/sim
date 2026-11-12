@@ -148,10 +148,16 @@ def compute_hardware_service_factors( op: Any, geometry: Any, env: dict[str, Any
         if is_decode:
             if family == "attention":
                 if kv_heads > 1:
-                    kv_par = batch * kv_heads; active_kv = min(12, aic, max(1, kv_par if kv_par <= 4 else (4 + (kv_par - 4) // 2 if kv_par <= 8 else (6 if kv_par <= 16 else 6 + (kv_par - 16) * 6 // 16))))
-                    wave_scale = Fraction(32, active_kv) * Fraction(7, 8)
+                    if aic < 32 or q_len_g > 1:
+                        sp_tgt = max(1, int(getattr(op.policy, "split_target", 4096) or 4096))
+                        eff_sp = min(Fraction(splits), max(Fraction(1), Fraction(q_len_g * max(1, (q_heads + kv_heads - 1) // kv_heads) * max(1, int(geometry.s_max)), sp_tgt)))
+                        active_kv_f = min(Fraction(aic_sat), max(Fraction(1), Fraction(batch * kv_heads * q_len_g) * eff_sp))
+                        wave_scale = Fraction(aic_sat) / active_kv_f
+                    else:
+                        kv_par = batch * kv_heads; active_kv = min(12, aic_sat, max(1, kv_par if kv_par <= 4 else (4 + (kv_par - 4) // 2 if kv_par <= 8 else (6 if kv_par <= 16 else 6 + (kv_par - 16) * 6 // 16))))
+                        wave_scale = Fraction(aic_sat, active_kv) * Fraction(7, 8)
                 else:
-                    active_cores = min(32, aic, max(1, batch * kv_heads * 8)); wave_scale = min(Fraction(8), Fraction(32, active_cores))
+                    active_cores = min(aic_sat, max(1, batch * kv_heads * q_len_g * (splits if (aic < 32 or q_len_g > 1) else 8))); wave_scale = min(Fraction(8), Fraction(aic_sat, active_cores))
             else:
                 h_groups = max(8, q_heads // 8) if int(theta.find("index_topk", 0) or 0) > 0 else max(1, q_heads // 16); active_cores, s_val = min(32, aic, max(1, batch * h_groups * splits)), float(geometry.s_max)
                 mla_f = _lerp_frac(Fraction(6, 5), Fraction(8, 5), _ramp(s_val, 1024.0, 2048.0))
