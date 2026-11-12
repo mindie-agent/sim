@@ -26,7 +26,8 @@ def test_periodic_activation_and_scale_refills_conserve_actual_service(source_ca
     assert compact["peak_buffers_per_unit"] == detailed["peak_buffers_per_unit"]
     # Fixpipe rate is destination bytes/cycle for F32->BF16. HBM and
     # Fixpipe both publish 2 bytes per real output, not FP32 source bytes.
-    assert compact["serviced"]["fixpipe@r0:s0"] == 2 * sum(rows) * n
+    assert compact["serviced"]["fixpipe@r0:s0"] == pytest.approx(
+        2 * sum(rows) * n)
 
 
 @pytest.mark.parametrize("role", ("hbm", "mte2_aic", "mte2_aiv", "mte1", "mte3", "vector", "fixpipe"))

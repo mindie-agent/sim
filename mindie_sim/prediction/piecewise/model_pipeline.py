@@ -11,10 +11,11 @@ import math
 from typing import Any, Iterable, Mapping, Sequence
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.model import LayerPlan, ModelSpec, RequestSpec
+from mindie_sim.schema.subgraphs import BoundOperator, OperatorTemplate, StaticSignature
 from mindie_sim.prediction.piecewise.compiler import (CompiledSubgraph, ImplementationPolicy, OperatorPiecewiseCompiler,
     PipeSupply)
-from mindie_sim.prediction.piecewise.composition import (ContentionEnvelope, SerialResult, advance_state,
-    contention_envelope, evaluate_serial_split, p2p_transfer_cost)
+from mindie_sim.prediction.piecewise.composition import (ContentionEnvelope, OperatorSegment, SerialResult, advance_state,
+    contention_envelope, evaluate_serial_split, operator_segment, p2p_transfer_cost)
 from mindie_sim.prediction.piecewise.geometry import AnalysisDomain, RequestGeometry, WorkloadGeometry
 from mindie_sim.prediction.subgraphs.builders_attention import gemma4_model_spec, _gemma_config, _gemma_global
 from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, InstantiatedModel, LayerInstances, instantiate_model
@@ -34,6 +35,69 @@ _FAST_FIELDS = ( "attention", "ffn", "architecture", "compress_ratio", "indexer"
     "o_groups", "o_lora_rank", "residual_block_size", "ffn_activation", "cache_kind", "compressor_kind", )
 def _frac(value: Any) -> Fraction: return value if isinstance(value, Fraction) else Fraction(str(value))
 def _ms(value: Any) -> float: return float(value)
+
+def _features_with_hardware_ranks(features: FeatureConfig, supply: PipeSupply) -> FeatureConfig:
+    """Copy the device node size onto feature metadata before instantiation.
+
+    Builders freeze ``ranks_per_node`` into collective theta.  The historical
+    default is 8, which splits a 16-rank single-node group into two nodes.
+    An explicit metadata value wins.  The supply field is the machine profile
+    (``PipeSupply.invocations``), not a measured span.
+    """
+    meta = dict(features.metadata)
+    if int(meta.get("ranks_per_node", 0) or 0) > 0:
+        return features
+    declared = int(dict(supply.invocations).get("ranks_per_node", 0) or 0)
+    if declared < 1:
+        return features
+    meta["ranks_per_node"] = declared
+    return replace(features, metadata=tuple(sorted(meta.items())))
+def pcp_rank_geometry(geometry: WorkloadGeometry, pcp: int,
+                      rank: int | None = None) -> WorkloadGeometry:
+    """Local rank geometry for a declared PCP prefill schedule.
+
+    PCP shards the current query chunks, keeps the older context replicated,
+    and chooses the true worst-cost rank from the public split_pcp_pairs
+    contract.  Each owned early/late range becomes an independent local query
+    chunk with its absolute prefix context; no blind division by cp is used.
+    """
+    pcp = max(1, int(pcp))
+    if pcp <= 1 or geometry.phase_name != "prefill":
+        return geometry
+    from mindie_sim.catalog.context_parallel import (
+        pcp_rank_chunk_ranges, split_pcp_pairs,
+    )
+    costs = [0] * pcp
+    for request in geometry.requests:
+        split = split_pcp_pairs(request.q_len, request.context, pcp)
+        for r, amount in enumerate(split.per_rank):
+            costs[r] += amount
+    if rank is None:
+        rank = max(range(pcp), key=costs.__getitem__)
+    if not 0 <= int(rank) < pcp:
+        raise ModelingError(f"pcp_rank_invalid:{rank}:{pcp}")
+    rank = int(rank)
+    requests = []
+    for owner, request in enumerate(geometry.requests):
+        last_selected = (max(end for _start, end in request.query_ranges) - 1
+                         if request.query_ranges else request.q_len - 1)
+        for start, end in pcp_rank_chunk_ranges(request.q_len, pcp, rank):
+            if end > start:
+                requests.append(replace(
+                    request, q_len=end - start,
+                    context=request.context + start,
+                    query_ranges=(), phase=request.phase,
+                    owner_index=owner,
+                    parent_query_ranges=tuple(request.query_ranges),
+                    emit=(start <= last_selected < end),
+                    emit_position=(request.context + last_selected
+                                   if start <= last_selected < end else -1)))
+    if not requests:
+        return geometry
+    return replace(geometry, requests=tuple(requests),
+                   local_batch=geometry.batch)
+
+
 @dataclass(frozen=True)
 class OperatorRow:
     layer: int; kind: str; role: str; cost: Any
@@ -41,11 +105,22 @@ class OperatorRow:
     @property
     def duration_ms(self) -> Fraction:
         return self.cost.duration_ms
+    @property
+    def native_call(self) -> dict | None:
+        return getattr(self.cost, "native_call", None)
+    @property
+    def native_occurrence(self) -> dict | None:
+        return getattr(self.cost, "native_occurrence", None)
+    @property
+    def phase(self) -> str:
+        return str((self.native_occurrence or {}).get("phase") or "")
     def to_dict(self) -> dict:
         return {"layer": self.layer, "kind": self.kind, "role": self.role,
                 "name": self.cost.name, "family": self.cost.family, "duration_ms": str(self.cost.duration_ms),
                 "dominant_pipe": self.cost.dominant_pipe, "padded_tokens": self.padded_tokens,
-                "active_tokens": self.active_tokens, "geometry": self.geometry, "fused": self.cost.family == "fused"}
+                "active_tokens": self.active_tokens, "geometry": self.geometry, "fused": self.cost.family == "fused",
+                "phase": self.phase, "native_call": self.native_call,
+                "native_occurrence": self.native_occurrence}
 @dataclass(frozen=True)
 class SubgraphPrediction:
     instance_id: str; kind: str; variant: str; role: str
@@ -75,6 +150,128 @@ class LayerPrediction:
                 "operator_duration_ms": str(self.operator_duration_ms), "group": self.group, "reused": self.reused,
                 "subgraphs": [item.to_dict() for item in self.subgraphs],
                 "contention": self.contention.to_dict() if self.contention else None}
+def selected_geometry(active: WorkloadGeometry,
+                      emit_mask: Sequence[bool] | None = None) -> WorkloadGeometry | None:
+    """One selected-logit row per completing logical request.
+
+    PCP rank chunks are one logical request.  Only the chunk owning the final
+    logical query token emits; emit_mask is indexed by logical request index.
+    Ordinary requests keep the historical one-row behavior.
+    """
+    requests = []
+    owned = any(request.owner_index >= 0 for request in active.requests)
+    for index, request in enumerate(active.requests):
+        if request.q_len <= 0:
+            continue
+        if owned and request.owner_index >= 0:
+            if not request.emit:
+                continue
+            logical = request.owner_index
+            if emit_mask is not None and (logical >= len(emit_mask)
+                                          or not emit_mask[logical]):
+                continue
+        else:
+            logical = index
+            if emit_mask is not None and index >= len(emit_mask):
+                continue
+            if emit_mask is not None and not emit_mask[index]:
+                continue
+        if request.phase == "verify":
+            q_len, context = request.q_len, request.context
+        elif owned and request.owner_index >= 0 and request.emit_position >= 0:
+            q_len, context = 1, request.emit_position
+        else:
+            q_len, context = 1, request.context + request.q_len - 1
+        requests.append(RequestGeometry(
+            q_len, context, phase=request.phase, replica=request.replica,
+            draft_len=request.draft_len, owner_index=logical, emit=True))
+    if not requests:
+        return None
+    return WorkloadGeometry(
+        tuple(requests), media_tokens=active.media_tokens,
+        phase=active.phase_name, local_batch=len(requests))
+
+
+_SPEC_PHASES = frozenset({"verify", "draft", "draft_prefill"})
+
+
+def physical_selected_geometry(active: WorkloadGeometry) -> WorkloadGeometry | None:
+    """One terminal logits row per scheduled request, independent of emit.
+
+    The genuine R31 non-spec runner (model_runner_v1.py L1634-1643) uses
+    ``np.ones(num_reqs)`` and ``query_start_loc[1:num_reqs+1]-1``: every
+    scheduled partial-prefill request is physically sampled, then invalid
+    emissions are discarded later (L1480-85, L3038+).  This geometry is the
+    physical sample/model-logit scope, not the emitted/committed token count.
+
+    Spec/draft/verify and padded distributed geometry keep their original
+    source path and return ``None``.
+    """
+    if active.phase_name in _SPEC_PHASES:
+        return None
+    if any(request.phase in _SPEC_PHASES for request in active.requests):
+        return None
+    if (int(active.physical_tokens) > int(active.tokens)
+            or int(active.graph_bucket) > int(active.tokens)):
+        return None
+    requests = []
+    for index, request in enumerate(active.requests):
+        if request.q_len <= 0:
+            continue
+        if request.phase in _SPEC_PHASES:
+            return None
+        # Non-owned requests use the scheduled index as their logical key,
+        # matching selected_geometry; owned chunks keep their owner index.
+        owner_index = request.owner_index if request.owner_index >= 0 else index
+        requests.append(RequestGeometry(
+            1, request.context + request.q_len - 1, phase=request.phase,
+            replica=request.replica, draft_len=request.draft_len,
+            owner_index=owner_index, emit=request.emit))
+    if not requests:
+        return None
+    return WorkloadGeometry(
+        tuple(requests), media_tokens=active.media_tokens,
+        phase=active.phase_name, local_batch=len(requests))
+
+
+def producing_selected_geometry(active: WorkloadGeometry,
+                               selected: WorkloadGeometry | None) -> WorkloadGeometry | None:
+    """The producing token rows plus the legitimate selected logit rows.
+
+    The selected geometry stores one completing row per request, so it no
+    longer carries the producing tensor length.  Rebuild the active producing
+    requests with an explicit ``query_ranges`` selection of the same terminal
+    row.  The result keeps ``tokens``/``effective_tokens`` as the producing
+    rows and ``selected_tokens``/``producing_lm_head_rows`` as the legitimate
+    selected rows, without inventing either count.
+    """
+    if selected is None:
+        return None
+    terminals = {terminal.owner_index: terminal
+                 for terminal in selected.requests}
+    requests = []
+    for index, base in enumerate(active.requests):
+        key = base.owner_index if base.owner_index >= 0 else index
+        terminal = terminals.pop(key, None)
+        if terminal is None:
+            # The producing tensor still includes this request's scheduled
+            # rows; a zero-length range contributes no selected logit row.
+            requests.append(replace(base, query_ranges=((0, 0),)))
+            continue
+        if str(terminal.phase or "") == "verify":
+            start, end = 0, int(base.q_len)
+        else:
+            start = int(terminal.context) - int(base.context)
+            end = start + 1
+        if start < 0 or end > int(base.q_len) or end <= start:
+            return None
+        requests.append(replace(base, query_ranges=((start, end),)))
+    if terminals or not requests:
+        return None
+    return replace(active, requests=tuple(requests),
+                   local_batch=len(requests))
+
+
 @dataclass(frozen=True)
 class ModelPrediction:
     layers: tuple[LayerPrediction, ...]
@@ -122,17 +319,20 @@ class ModelPipeline:
             raise ModelingError("model_pipeline_requires_pipe_supply")
         if policy is None:
             policy = ImplementationPolicy(cores=features.cores)
+        features = _features_with_hardware_ranks(features, supply)
         self.model, self.features, self.supply, self.policy = model, features, supply, policy
         self.instantiated: InstantiatedModel = instantiate_model(model, features, registry=registry)
         self.compiler = OperatorPiecewiseCompiler(supply, self.policy, domain or _PIPELINE_DOMAIN)
         self._compiled: dict[tuple, CompiledSubgraph] = {}
         self._cache: dict[tuple, _CachedLayer] = {}
+        self._kda_beta_ops: dict[tuple, Any] = {}
         self.groups = self._build_groups()
         self._group_of = {layer: group.group_id for group in self.groups for layer in group.indices}
     def _subgraph(self, instance: Any) -> CompiledSubgraph:
         key = (instance.performance_key(), instance.layer)
         if key not in self._compiled:
-            self._compiled[key] = self.compiler.compile(instance)
+            self._compiled[key] = self.compiler.compile(
+                instance, feature_metadata=self.features.metadata)
         return self._compiled[key]
     def _layer_key(self, layer: LayerInstances) -> tuple:
         plan = self.model.layer_plans[layer.layer]
@@ -178,34 +378,48 @@ class ModelPipeline:
         return tuple(contracts)
     @staticmethod
     def _selected_rows(active: WorkloadGeometry, emit_mask: Sequence[bool] | None = None ) -> WorkloadGeometry | None:
-        """Selected logits rows: one per completing request, all verify rows."""
-        requests = []
-        for index, request in enumerate(active.requests):
-            if request.q_len <= 0:
+        return selected_geometry(active, emit_mask)
+
+    def _o0_physical_source(self) -> bool:
+        """Whether the compiled O0 row is the declared R31 non-spec runner."""
+        if int(self.features.pp or 1) != 1:
+            return False
+        for item in self.globals:
+            if item.kind != "O0":
                 continue
-            if emit_mask is not None and index >= len(emit_mask):
-                continue
-            if emit_mask is not None and not emit_mask[index]:
-                continue
-            if request.phase == "verify":
-                q_len, context = request.q_len, request.context
-            else:
-                q_len, context = 1, request.context + request.q_len - 1
-            requests.append(RequestGeometry( q_len, context, phase=request.phase, replica=request.replica,
-                draft_len=request.draft_len))
-        if not requests:
-            return None
-        return WorkloadGeometry(tuple(requests), media_tokens=active.media_tokens, phase=active.phase_name)
+            compiled = self._subgraph(item)
+            return any(
+                op.name == "hidden_select"
+                and str(op.operator.theta.find("row_binding", "")) == "selected"
+                and str(op.operator.theta.find("source_runner_class", ""))
+                == "NPUModelRunner"
+                for op in compiled.operators)
+        return False
 
     def _geometry_for(self, kind: str, operator: Any, active: WorkloadGeometry, padded: WorkloadGeometry | None,
-                      selected: WorkloadGeometry | None = None ) -> tuple[WorkloadGeometry, str]:
+                      selected: WorkloadGeometry | None = None, dsa_local: WorkloadGeometry | None = None,
+                      dsa_local_padded: WorkloadGeometry | None = None ) -> tuple[WorkloadGeometry, str]:
         if kind == "O0":
             chosen = selected or active
             if operator.name == "hidden_select":
+                if (self.features.final_norm_scope == "all"
+                        and selected is not None):
+                    producing = producing_selected_geometry(active, selected)
+                    if producing is not None:
+                        return producing, "producing_selected"
                 return chosen, "selected"
             if operator.name == "final_norm" and self.features.final_norm_scope == "all":
                 return active, "active"
             return chosen, "selected"
+        if dsa_local is not None:
+            # Shared DSA-CP projection: local query/attention/indexer, full
+            # replicated KV/index cache.  Same helper is used by z._aggregate.
+            from mindie_sim.catalog.context_parallel import project_dsa_cp_geometry
+            projected = project_dsa_cp_geometry(
+                kind, str(operator.name), str(operator.family), active, padded,
+                dsa_local, dsa_local_padded)
+            if projected is not None:
+                return projected
         if padded is None:
             return active, "active"
         if kind in {"A0", "A1"}:
@@ -218,16 +432,19 @@ class ModelPipeline:
         return padded, "padded"
     def _prediction(self, compiled: CompiledSubgraph, result: SerialResult,
                     active: WorkloadGeometry, padded: WorkloadGeometry | None,
-                    selected: WorkloadGeometry | None = None) -> SubgraphPrediction:
+                    selected: WorkloadGeometry | None = None,
+                    dsa_local: WorkloadGeometry | None = None,
+                    dsa_local_padded: WorkloadGeometry | None = None ) -> SubgraphPrediction:
         rows = []
         for cost in result.costs:
             if cost.family == "fused":
                 fusion = next((item for item in result.fusion_results if f"fused:{item.name}" == cost.name), None)
                 first = (compiled.operator(fusion.semantic[0].name) if fusion else compiled.operators[0])
-                used, geometry = self._geometry_for( compiled.instance.kind, first, active, padded, selected)
+                used, geometry = self._geometry_for( compiled.instance.kind, first, active, padded, selected,
+                    dsa_local, dsa_local_padded)
             else:
                 used, geometry = self._geometry_for( compiled.instance.kind, compiled.operator(cost.name),
-                    active, padded, selected)
+                    active, padded, selected, dsa_local, dsa_local_padded)
             rows.append(OperatorRow( compiled.instance.layer, compiled.instance.kind,
                 str(dict(compiled.instance.metadata).get("role", "")), cost,
                 used.effective_tokens, active.tokens, geometry))
@@ -237,49 +454,52 @@ class ModelPipeline:
     def _run(self, compiled: Iterable[CompiledSubgraph], state: StateView,
              active: WorkloadGeometry, padded: WorkloadGeometry | None,
              fusion: bool, selected: WorkloadGeometry | None = None,
-             skip: Sequence[str] = ()) -> tuple[tuple[SubgraphPrediction, ...], StateView, Fraction]:
+             skip: Sequence[str] = (),
+             dsa_local: WorkloadGeometry | None = None,
+             dsa_local_padded: WorkloadGeometry | None = None ) -> tuple[tuple[SubgraphPrediction, ...], StateView, Fraction]:
         current, predictions, duration = state, [], Fraction(0)
         self._last_contention: ContentionEnvelope | None = None
-        a1_stages, idx_stages, a1_ms, idx_ms = [], [], Fraction(0), Fraction(0)
+        a1_chain: list[OperatorSegment] = []
+        idx_chain: list[OperatorSegment] = []
+        a1_ms, idx_ms = Fraction(0), Fraction(0)
         for item in compiled:
             names = (tuple(contract.name for contract in item.instance.template.fusions) if fusion else ())
             result = evaluate_serial_split( item, active, current,
                 geometry_for=lambda operator, kind=item.instance.kind:
-                    self._geometry_for(kind, operator, active, padded, selected)[0], fusion=names, skip=skip)
+                    self._geometry_for(kind, operator, active, padded, selected,
+                                       dsa_local, dsa_local_padded)[0], fusion=names, skip=skip)
             if result.contention is not None:
                 self._last_contention = result.contention
             if self.features.multistream_attention_indexer and item.instance.kind == "A1":
                 prolog_names = {"q_down", "q_norm", "q_up", "q_direct", "kv_down", "kv_norm", "rotary", "kv_store", "fused:mla_prolog"}
                 prolog = [c for c in result.costs if c.name in prolog_names]
                 for c in prolog:
-                    a1_stages.extend([list(s) for s in c.stage_work] if c.stage_work else ([list(c.work)] if c.work else []))
+                    a1_chain.append(operator_segment(c, self.supply))
                     a1_ms += c.duration_ms
             elif self.features.multistream_attention_indexer and item.instance.kind in {"I0", "I1"}:
-                idx_stages.extend(self._stages(result)); idx_ms += result.total_ms
-            predictions.append(self._prediction(item, result, active, padded, selected))
+                idx_chain.extend(operator_segment(c, self.supply) for c in result.costs)
+                idx_ms += result.total_ms
+            predictions.append(self._prediction(item, result, active, padded, selected,
+                                                dsa_local, dsa_local_padded))
             current, duration = result.state, duration + result.total_ms
-        if a1_stages and idx_stages:
-            self._last_contention = contention_envelope({"attention": a1_stages, "indexer": idx_stages}, self.supply)
+        if a1_chain and idx_chain:
+            self._last_contention = contention_envelope(
+                {}, self.supply, chains={"attention": a1_chain, "indexer": idx_chain})
             duration += self._last_contention.makespan_ms - (a1_ms + idx_ms)
         return tuple(predictions), current, duration
-    @staticmethod
-    def _stages(result: SerialResult) -> list[list[tuple[str, Fraction]]]:
-        stages = []
-        for cost in result.costs:
-            if cost.stage_work:
-                stages.extend([list(stage) for stage in cost.stage_work])
-            elif cost.work:
-                stages.append(list(cost.work))
-        return stages
     def _evaluate_layer(self, layer: LayerInstances, state: StateView,
                         active: WorkloadGeometry, padded: WorkloadGeometry | None,
-                        fusion: bool, selected: WorkloadGeometry | None = None ) -> _CachedLayer:
+                        fusion: bool, selected: WorkloadGeometry | None = None,
+                        skip: Sequence[str] = (),
+                        dsa_local: WorkloadGeometry | None = None,
+                        dsa_local_padded: WorkloadGeometry | None = None ) -> _CachedLayer:
         compiled = tuple(self._subgraph(item) for item in layer.subgraphs)
         indices = [index for index, item in enumerate(compiled) if item.instance.kind in {"F2", "F3", "F4"}]
         can_fork = (self.features.multistream_shared_expert and any(item.instance.kind == "F4" for item in compiled)
                     and any(item.instance.kind in {"F2", "F3"} for item in compiled))
         if not can_fork:
-            predictions, _, duration = self._run(compiled, state, active, padded, fusion, selected)
+            predictions, _, duration = self._run(compiled, state, active, padded, fusion, selected, skip=skip,
+                                                 dsa_local=dsa_local, dsa_local_padded=dsa_local_padded)
             return _CachedLayer(duration, predictions, self._last_contention, duration)
         first, last = min(indices), max(indices)
         prefix, suffix = compiled[:first], compiled[last + 1:]
@@ -294,33 +514,41 @@ class ModelPipeline:
             branches["shared"] = shared
         if routed:
             branches["routed"] = routed
-        prefix_rows, current, prefix_ms = self._run(prefix, state, active, padded, fusion, selected)
+        prefix_rows, current, prefix_ms = self._run(prefix, state, active, padded, fusion, selected, skip=skip,
+                                                    dsa_local=dsa_local, dsa_local_padded=dsa_local_padded)
         base = current
-        branch_rows, work, branch_states = [], {}, {}
+        branch_rows, chains, branch_states = [], {}, {}
         for name, items in branches.items():
             branch_state = base
-            work[name] = []
+            chains[name] = []
             for item in items:
                 result = evaluate_serial_split( item, active, branch_state,
                     geometry_for=lambda operator, kind=item.instance.kind:
-                        self._geometry_for(kind, operator, active, padded, selected)[0],
-                    fusion=(tuple(contract.name for contract in item.instance.template.fusions) if fusion else ()))
-                work[name].extend(self._stages(result))
-                branch_rows.append(self._prediction(item, result, active, padded, selected))
+                        self._geometry_for(kind, operator, active, padded, selected,
+                                           dsa_local, dsa_local_padded)[0],
+                    fusion=(tuple(contract.name for contract in item.instance.template.fusions) if fusion else ()),
+                    skip=skip)
+                chains[name].extend(operator_segment(cost, self.supply) for cost in result.costs)
+                branch_rows.append(self._prediction(item, result, active, padded, selected,
+                                                    dsa_local, dsa_local_padded))
                 branch_state = result.state
             branch_states[name] = branch_state
-        envelope = contention_envelope(work, self.supply)
+        envelope = contention_envelope({}, self.supply, chains=chains)
         current = (branch_states.get("routed") or branch_states.get("shared") or base)
         join_rows, join_ms = [], Fraction(0)
         for item in joins:
             result = evaluate_serial_split( item, active, current,
                 geometry_for=lambda operator, kind=item.instance.kind:
-                    self._geometry_for(kind, operator, active, padded, selected)[0],
-                fusion=(tuple(contract.name for contract in item.instance.template.fusions) if fusion else ()))
-            join_rows.append(self._prediction(item, result, active, padded, selected))
+                    self._geometry_for(kind, operator, active, padded, selected,
+                                       dsa_local, dsa_local_padded)[0],
+                fusion=(tuple(contract.name for contract in item.instance.template.fusions) if fusion else ()),
+                skip=skip)
+            join_rows.append(self._prediction(item, result, active, padded, selected,
+                                              dsa_local, dsa_local_padded))
             join_ms += result.total_ms
             current = result.state
-        suffix_rows, current, suffix_ms = self._run(suffix, current, active, padded, fusion, selected)
+        suffix_rows, current, suffix_ms = self._run(suffix, current, active, padded, fusion, selected, skip=skip,
+                                                    dsa_local=dsa_local, dsa_local_padded=dsa_local_padded)
         duration = prefix_ms + envelope.makespan_ms + join_ms + suffix_ms
         return _CachedLayer(duration, prefix_rows + tuple(branch_rows)
                             + tuple(join_rows) + suffix_rows, envelope, duration)
@@ -350,11 +578,25 @@ class ModelPipeline:
                              commit_tokens: Sequence[int] | None = None) -> StateView:
         for instance in layer.subgraphs:
             if instance.kind == "K1":
-                ratio = max(1, int(instance.operator("compress").theta.find( "ratio", 1) or 1))
-                records = ((request_ids[index] if request_ids is not None and index < len(request_ids) else index,
-                            request.context,
-                            int(commit_tokens[index]) if commit_tokens is not None and index < len(commit_tokens)
-                            else request.q_len) for index, request in enumerate(active.requests))
+                # The layer plan owns the true compression ratio.  A K1
+                # placeholder for a zero-compressor/no-owner layer carries
+                # ratio 0 and must not invent a ratio-1 cursor; genuine K1
+                # keeps its source ratio 1/2/4/128 and advances as before.
+                ratio = int(instance.operator("compress").theta.find("ratio", 0) or 0)
+                if ratio <= 0:
+                    continue
+                ratio = max(1, ratio)
+                records = ((
+                    request_ids[(request.owner_index if request.owner_index >= 0 else index)]
+                    if request_ids is not None and
+                    (request.owner_index if request.owner_index >= 0 else index) < len(request_ids)
+                    else (request.owner_index if request.owner_index >= 0 else index),
+                    request.context,
+                    int(commit_tokens[(request.owner_index if request.owner_index >= 0 else index)])
+                    if commit_tokens is not None and
+                    (request.owner_index if request.owner_index >= 0 else index) < len(commit_tokens)
+                    else request.q_len)
+                    for index, request in enumerate(active.requests))
                 state, _ = state.update_compression(layer.layer, ratio, records)
                 committed = [record for (owner, _), record in state.compression_requests
                              if owner == layer.layer]
@@ -369,6 +611,46 @@ class ModelPipeline:
                 state = advance_state(self._subgraph(instance), state, active)
         return state
 
+    def _kda_external_beta_cost(self, layer: LayerInstances, active: WorkloadGeometry):
+        """Separate beta sigmoid when the declared option leaves it outside the scan.
+
+        ``use_beta_sigmoid`` true folds that producer into the decode kernel.
+        False keeps ``linear_beta_sigmoid``: one elementwise launch per KDA
+        layer, ``heads`` elements per token and 5 ops per element, matching
+        ``Builder.vector`` in ``recurrent.linear``. Undeclared stays unchanged.
+        """
+        declared = dict(self.features.metadata).get("kda_use_beta_sigmoid", None)
+        if declared is None or int(declared) != 0 or active.phase_name != "decode":
+            return None
+        plan = self.model.layer_plans[layer.layer]
+        if plan.attention != "kda" or not any(item.kind == "A4" for item in layer.subgraphs):
+            return None
+        heads = max(1, math.ceil(int(plan.linear_value_heads or plan.linear_heads or 1)
+                                 / max(1, self.features.tp)))
+        act_bytes = dtype_bytes(self.features.activation_dtype or "bf16")
+        return self._kda_beta_operator(heads, act_bytes).evaluate(active, readiness=False)
+
+    def _kda_beta_operator(self, heads: int, act_bytes: int):
+        key = (heads, act_bytes, self.features.token_tile, self.features.cores)
+        found = self._kda_beta_ops.get(key)
+        if found is not None:
+            return found
+        template = OperatorTemplate("linear_beta_sigmoid", "elementwise", "sigmoid",
+                                    static_slots=("elements",))
+        theta = StaticSignature(
+            "sigmoid",
+            matrix=(("elements", heads),),
+            quant=(("act_bytes", act_bytes),),
+            tiles=(("mt", self.features.token_tile), ("cores", self.features.cores)),
+            extras=(("ops_per_element", 5),
+                    ("read_bytes", heads * act_bytes),
+                    ("write_bytes", heads * 4)))
+        compiled = self.compiler.compile_operator(
+            BoundOperator(template, theta), kind="A4",
+            feature_metadata=self.features.metadata)
+        self._kda_beta_ops[key] = compiled
+        return compiled
+
     def forward(self, geometry: WorkloadGeometry, state: StateView | None = None, *,
                 padded_geometry: WorkloadGeometry | None = None, fusion: bool = True, aggregate: bool = True,
                 include_draft: bool = False, request_ids: Sequence[Any] | None = None,
@@ -377,25 +659,45 @@ class ModelPipeline:
                 commit_tokens: Sequence[int] | None = None) -> ModelPrediction:
         self._cache.clear()
         current, active, padded = state or StateView(), geometry, padded_geometry
+        if self.features.pcp > 1 and self.features.cp_plan == "pcp":
+            active = pcp_rank_geometry(active, self.features.pcp)
+            if padded is not None:
+                padded = pcp_rank_geometry(padded, self.features.pcp)
+        dsa_local = None
+        dsa_local_padded = None
+        if (self.features.cp_plan == "dsa_cp" and self.features.tp > 1
+                and active.phase_name == "prefill"):
+            from mindie_sim.catalog.context_parallel import dsa_cp_rank_geometry
+            dsa_local = dsa_cp_rank_geometry(active, self.features.tp)
+            if padded is not None:
+                dsa_local_padded = dsa_cp_rank_geometry(padded, self.features.tp)
         if current.residual.retained or current.index_ready or current.selection_ready:
             current = replace(current, residual=ResidualSlotState(current.residual.block_size, ()),
                               index_ready=(), selection_ready=())
         if self.features.ep > 1:
             routing = dict(active.routing)
-            local = max(1, math.ceil(self.model.num_experts / self.features.ep))
-            experts = max(1, self.model.num_experts)
-            total_rows = active.for_subgraph("F3").tokens * max(1, self.model.top_k)
-            base, extra = divmod(total_rows, experts)
-            uniform = tuple(base + (1 if index < extra else 0) for index in range(experts))[::self.features.ep][:local]
-            uniform = uniform + (0,) * (local - len(uniform))
+            cohort_tokens = active.for_subgraph("F3").tokens
             for layer in self.instantiated.layers:
-                if (layer.layer not in routing and any(item.kind == "F3" for item in layer.subgraphs)):
-                    routing[layer.layer] = uniform
+                if layer.layer in routing or not any(item.kind == "F3" for item in layer.subgraphs):
+                    continue
+                experts, top_k, local = _layer_moe(self.model, layer.layer, self.features.ep)
+                total_rows = cohort_tokens * max(1, top_k)
+                base, extra = divmod(total_rows, experts)
+                uniform = tuple(base + (1 if index < extra else 0) for index in range(experts))[::self.features.ep][:local]
+                routing[layer.layer] = uniform + (0,) * (local - len(uniform))
             active = replace(active, routing=tuple(sorted(routing.items())))
         selected = self._selected_rows(active, emit_mask)
+        physical_source = self._o0_physical_source()
+        physical_selected = (physical_selected_geometry(active)
+                             if physical_source else None)
+        o0_selected = physical_selected or selected
+        dsa_skip = (("dsa_cp_output_all_gather",)
+                    if (self.features.cp_plan == "dsa_cp"
+                        and active.phase_name != "prefill") else ())
         rows_in, current, total = self._run( tuple(self._subgraph(item) for item in self.globals
                   if item.kind == "E0" or (item.kind == "V0"
-                                           and active.media_tokens > 0)), current, active, padded, fusion)
+                                           and active.media_tokens > 0)), current, active, padded, fusion,
+                  dsa_local=dsa_local, dsa_local_padded=dsa_local_padded)
         layers, evaluations = [], 0
         for layer in self.instantiated.layers:
             block = int(self.model.layer_plans[layer.layer].residual_block_size or 0)
@@ -406,15 +708,29 @@ class ModelPipeline:
                    tuple((k, tuple(v)) for k, v in active.routing if k == layer.layer), bool(fusion), bool(aggregate))
             cached = self._cache.get(key); reused = cached is not None
             if cached is None:
-                cached = self._evaluate_layer(layer, current, active, padded, fusion, selected)
+                cached = self._evaluate_layer(layer, current, active, padded, fusion,
+                                              selected, skip=dsa_skip,
+                                              dsa_local=dsa_local,
+                                              dsa_local_padded=dsa_local_padded)
                 if aggregate:
                     self._cache[key] = cached
                 evaluations += 1
             next_state = self._advance_layer_state(layer, current, active, request_ids, commit_tokens)
-            layers.append(LayerPrediction( layer.layer, layer.stage, cached.duration_ms,
-                self._rebase(cached.subgraphs, layer.layer), current, next_state, self._group_of[layer.layer], reused,
-                cached.contention, cached.operator_duration_ms))
-            current, total = next_state, total + cached.duration_ms
+            beta = self._kda_external_beta_cost(layer, active)
+            duration, operator_duration = cached.duration_ms, cached.operator_duration_ms
+            subgraphs = self._rebase(cached.subgraphs, layer.layer)
+            if beta is not None:
+                row = OperatorRow(layer.layer, "A4", "sigmoid", beta,
+                                  active.effective_tokens, active.tokens, "active")
+                subgraphs = subgraphs + (SubgraphPrediction(
+                    f"A4:linear_beta_sigmoid:L{layer.layer}", "A4", "beta", "sigmoid",
+                    beta.duration_ms, (row,)),)
+                duration += beta.duration_ms
+                operator_duration += beta.duration_ms
+            layers.append(LayerPrediction( layer.layer, layer.stage, duration,
+                subgraphs, current, next_state, self._group_of[layer.layer], reused,
+                cached.contention, operator_duration))
+            current, total = next_state, total + duration
         if self.features.pp > 1:
             for index in range(len(layers) - 1):
                 if layers[index].stage >= layers[index + 1].stage:
@@ -430,12 +746,24 @@ class ModelPipeline:
                     operator_duration_ms=(layers[index].operator_duration_ms + transferred.duration_ms),
                     subgraphs=layers[index].subgraphs + (subgraph,))
                 total += transferred.duration_ms
-        skip = (("lm_head", "logits_gather", "sampling") if selected is None else ())
-        if selected is None and self.features.final_norm_scope == "selected":
-            skip += ("hidden_select", "final_norm")
+        if physical_selected is not None:
+            # The R31 non-spec runner physically samples every scheduled
+            # request; invalid emissions are discarded later, not skipped
+            # from the computation.
+            skip = ()
+        else:
+            skip = (("hidden_select", "lm_head", "logits_gather", "sampling")
+                    if selected is None else ())
+            if selected is None and self.features.final_norm_scope == "selected":
+                skip += ("final_norm",)
+            if physical_source and physical_selected is None:
+                # Spec/draft/verify or padded distributed keeps its original
+                # source path; do not bind this non-spec producer row.
+                skip += ("hidden_select",)
         rows_out, current, out_ms = self._run( tuple(self._subgraph(item) for item in self.globals
                   if item.kind == "O0" or (include_draft and item.kind == "D0")),
-            current, active, padded, fusion, selected, skip)
+            current, active, padded, fusion, o0_selected, skip,
+            dsa_local=dsa_local, dsa_local_padded=dsa_local_padded)
         if acceptance is not None:
             current = current.commit(int(acceptance[0]), verified=int(acceptance[1]))
         return ModelPrediction(tuple(layers), rows_in + rows_out, total + out_ms,
@@ -450,7 +778,7 @@ def geometry_key(geometry: WorkloadGeometry | None) -> tuple:
             tuple((layer, tuple(counts)) for layer, counts in geometry.routing))
 def assemble_model(model: ModelSpec | Mapping[str, Any], *, supply: PipeSupply, features: FeatureConfig | None = None,
                    policy: ImplementationPolicy | None = None, registry: TemplateRegistry | None = None,
-                   domain: AnalysisDomain | None = None) -> ModelPipeline:
+                   domain: AnalysisDomain | None = None, machine: Any | None = None) -> ModelPipeline:
     """Zero-parameter entry: config -> templates -> compiled model walk."""
     if isinstance(model, Mapping):
         family = str(model.get("model_type", "")).lower()
@@ -459,7 +787,9 @@ def assemble_model(model: ModelSpec | Mapping[str, Any], *, supply: PipeSupply, 
         spec = model
     else: raise ModelingError("model_pipeline_requires_model_spec_or_mapping")
     if features is None:
-        features = FeatureConfig.from_model(spec, **({"cores": policy.cores} if policy is not None else {}))
+        features = FeatureConfig.from_model(
+            spec, machine=machine,
+            **({"cores": policy.cores} if policy is not None else {}))
     return ModelPipeline(spec, features, supply, policy, registry=registry, domain=domain)
 @dataclass(frozen=True)
 class FrameworkConfig:
@@ -523,21 +853,32 @@ def _bucket_for(tokens: int, buckets: Sequence[int]) -> int:
         if tokens <= value:
             return value
     return buckets[-1] if buckets else 0
+def _layer_moe(model: Any, layer_index: int, ep: int) -> tuple[int, int, int]:
+    """Expert cardinality, top-k and per-rank shard for one layer.
+
+    A layer plan that declares ``num_experts`` or ``top_k`` replaces the model
+    default.  The shard length is the even expert-parallel split of that count.
+    """
+    plan = model.layer_plans[layer_index] if 0 <= layer_index < len(model.layer_plans) else None
+    experts = int((getattr(plan, "num_experts", 0) or 0) or model.num_experts or 1)
+    top_k = int((getattr(plan, "top_k", 0) or 0) or model.top_k or 1)
+    local = max(1, math.ceil(experts / max(1, int(ep))))
+    return experts, top_k, local
+
 def _padding(active: WorkloadGeometry, buckets: Sequence[int]) -> WorkloadGeometry | None:
     if not buckets:
         return None
     bucket = _bucket_for(active.tokens, buckets)
     if bucket <= active.tokens:
         return None
-    return WorkloadGeometry(active.requests, graph_bucket=bucket, phase=active.phase_name)
+    # Padding changes the physical bucket only.  Routing, cohort and phase
+    # stay on the geometry the step already declared.
+    return replace(active, graph_bucket=bucket)
 def _ep_skew(pipeline: ModelPipeline, active: WorkloadGeometry, config: FrameworkConfig) -> tuple[float, float]:
     """Per-rank complete layer envelopes, then one join maximum per layer (rank-permutation invariant)."""
     if pipeline.features.ep <= 1:
         return 0.0, 0.0
-    local = max(1, math.ceil(pipeline.model.num_experts / pipeline.features.ep))
-    size = max(1, pipeline.model.num_experts)
-    base, extra = divmod(active.for_subgraph("F3").tokens * max(1, pipeline.model.top_k), size)
-    uniform = tuple(base + (1 if index < extra else 0) for index in range(size))
+    cohort_tokens = active.for_subgraph("F3").tokens
     layers = pipeline.instantiated.layers
     kv = tuple((layer.layer, "kv_cache") for layer in layers)
     index = tuple((layer.layer, "index") for layer in layers)
@@ -549,6 +890,9 @@ def _ep_skew(pipeline: ModelPipeline, active: WorkloadGeometry, config: Framewor
     for layer in layers:
         if not any(item.kind == "F3" for item in layer.subgraphs):
             continue
+        experts, top_k, local = _layer_moe(pipeline.model, layer.layer, pipeline.features.ep)
+        base, extra = divmod(cohort_tokens * max(1, top_k), experts)
+        uniform = tuple(base + (1 if index < extra else 0) for index in range(experts))
         counts = next((tuple(values) for key, values in config.routing if key == layer.layer), None) or uniform
         row = []
         for rank in range(pipeline.features.ep):
@@ -576,9 +920,13 @@ def _draft_cost(pipeline: ModelPipeline, geometry: WorkloadGeometry, state: Stat
                                   phase="draft", replica=request.replica)
                   for request in geometry.requests), phase="draft")
         for operator in body:
-            draft_ms += pipeline.compiler.compile_operator(operator, kind="D0").evaluate(step_geom, state).duration_ms
+            draft_ms += pipeline.compiler.compile_operator(
+                operator, kind="D0",
+                feature_metadata=pipeline.features.metadata).evaluate(step_geom, state).duration_ms
     for operator in commit:
-        commit_ms += pipeline.compiler.compile_operator(operator, kind="D0").evaluate(geometry, state).duration_ms
+        commit_ms += pipeline.compiler.compile_operator(
+            operator, kind="D0",
+            feature_metadata=pipeline.features.metadata).evaluate(geometry, state).duration_ms
     return draft_ms, commit_ms
 def predict_framework(model: ModelSpec | ModelPipeline | Mapping[str, Any],
                       requests: Iterable[Any], config: FrameworkConfig, *, features: FeatureConfig | None = None,
@@ -601,11 +949,13 @@ def predict_framework(model: ModelSpec | ModelPipeline | Mapping[str, Any],
     mtp_steps = mtp_accepted = mtp_verified = 0
     if config.mtp_draft_len and pipeline.draft_subgraph is None:
         raise ModelingError("mtp_requires_draft_subgraph")
-    local_experts = max(1, math.ceil(pipeline.model.num_experts / pipeline.features.ep))
     buckets = config.graph_buckets or pipeline.features.graph_buckets
     def localized(rank: int) -> tuple[tuple[int, tuple[int, ...]], ...]:
-        return tuple((int(layer), tuple(counts[rank * local_experts: (rank + 1) * local_experts]))
-                     for layer, counts in config.routing)
+        rows = []
+        for layer, counts in config.routing:
+            _experts, _top_k, local = _layer_moe(pipeline.model, int(layer), pipeline.features.ep)
+            rows.append((int(layer), tuple(counts[rank * local:(rank + 1) * local])))
+        return tuple(rows)
     def take_pending(rank: int, limit: float) -> _RunRequest | None:
         for candidate in pending:
             if candidate.replica == rank and candidate.spec.arrival_ms <= limit + 1e-12:
@@ -648,7 +998,8 @@ def predict_framework(model: ModelSpec | ModelPipeline | Mapping[str, Any],
                 declared = pipeline.draft_subgraph.operator("target_verify").theta.find("verify_tokens", 0) or 0
                 verify_rows = max(1 + config.mtp_draft_len, int(declared))
                 active = WorkloadGeometry(tuple(RequestGeometry(
-                    verify_rows, request.context, phase="verify", replica=rank) for request in active.requests),
+                    verify_rows, request.context, phase="verify", replica=rank,
+                    draft_len=max(1, config.mtp_draft_len)) for request in active.requests),
                     phase="verify")
             routing = localized(rank)
             if routing:
@@ -678,7 +1029,8 @@ def predict_framework(model: ModelSpec | ModelPipeline | Mapping[str, Any],
         ep_delta, ep_skew = _ep_skew(pipeline, prediction.active, config)
         ep_delta, ep_skew = _frac(ep_delta), _frac(ep_skew)
         draft_ms, commit_ms = (_draft_cost(pipeline, WorkloadGeometry(
-                tuple(RequestGeometry(1, request.context, phase="draft", replica=request.replica)
+                tuple(RequestGeometry(1, request.context, phase="draft", replica=request.replica,
+                                      draft_len=max(1, config.mtp_draft_len))
                       for request in prediction.active.requests), phase="draft"),
             replica_states[0], proposals=config.mtp_draft_len)
             if any(item["mtp"] for item in round_runs) else (Fraction(0), Fraction(0)))
@@ -788,3 +1140,7 @@ def predict_framework(model: ModelSpec | ModelPipeline | Mapping[str, Any],
         sum(item.tpot_ms for item in metrics) / len(metrics),
         sum(item.itl_ms for item in metrics) / len(metrics), tuple(metrics),
         tuple(records), tuple(bottlenecks[:12]), padding, sync, mtp_report)
+
+
+# Backward-compatible private name used by tests and profiler callers.
+_pcp_rank_geometry = pcp_rank_geometry

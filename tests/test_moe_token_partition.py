@@ -41,10 +41,12 @@ def test_full_router_local_selection_global_expert_ledger_and_final_gather(tp, r
         view = by_id['s0.l0.' + suffix]
         assert view.family == 'barrier'
         assert view.flops == view.vector_ops == view.hbm_bytes == 0
-    for suffix in ('pack', 'unpack'):
-        phase = dict(by_id['s0.l0.' + suffix].metadata)['mc2_phase']
+    for kind, op_id in (('dispatch', 's0.l0.dispatch'),
+                        ('combine', 's0.l0.unpack')):
+        phase = dict(by_id[op_id].metadata)['mc2_phase']
         assert phase['source_tokens'] == local
-        assert phase['source_assignments' if suffix == 'pack' else 'received_assignments'] == local * 2
+        assert phase['source_assignments' if kind == 'dispatch'
+               else 'received_assignments'] == local * 2
     gate = by_id['s0.l0.expert_up']
     ledger = dict(gate.metadata)['routing_realization']
     assert sum(ledger['global_expert_rows']) == rows * 2

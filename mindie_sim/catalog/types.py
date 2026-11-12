@@ -32,7 +32,7 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 _FP32_CATEGORIES = {
     "param_fp32", "mhc", "ape", "conv_weight_f32", "a_log", "dt_bias",
@@ -51,6 +51,47 @@ _RUNTIME_OVERRIDE = {
 }
 _EXPERT_CATEGORIES = {"routed_expert", "dspark_routed_expert"}
 _SHARED_CATEGORIES = {"shared_expert"}
+#: Explicit normalization-parameter roles.  These are model semantics, not
+#: arbitrary quant categories: a checkpoint header binds a stored gamma format
+#: to one of these names, and the norm builders consume only these names.
+_NORM_ROLES = frozenset({
+    "norm", "attn_norm", "ffn_norm", "kv_a", "q_a", "indexer_k",
+    "final", "shared_head", "enorm", "hnorm",
+})
+#: Roles covered by the generic ``norm`` declaration.  Shared-head, Engram and
+#: hyper-connection norms have separate source headers and are not silently
+#: promoted by a generic layer-norm declaration.
+_NORM_GENERIC_ROLES = frozenset({
+    "attn_norm", "ffn_norm", "kv_a", "q_a", "indexer_k", "final",
+})
+_NORM_FORMATS = {
+    "fp32": "fp32", "float32": "fp32", "f32": "fp32",
+    "bf16": "bf16", "bfloat16": "bf16",
+}
+
+
+def norm_role(name: str) -> str:
+    """Map an operator name to one fixed normalization-parameter role."""
+    text = str(name or "").lower().replace("-", "_")
+    if "q_norm" in text or "q_a_layernorm" in text:
+        return "q_a"
+    if "kv_norm" in text or "kv_a_layernorm" in text:
+        return "kv_a"
+    if "index_norm" in text or ("indexer" in text and "norm" in text):
+        return "indexer_k"
+    if "final_norm" in text or text.endswith("model.norm") or text.endswith("model.norm.weight"):
+        return "final"
+    if "shared_head" in text:
+        return "shared_head"
+    if "enorm" in text:
+        return "enorm"
+    if "hnorm" in text:
+        return "hnorm"
+    if "norm1" in text or "attn_norm" in text or "input_layernorm" in text:
+        return "attn_norm"
+    if "norm2" in text or "ffn_norm" in text or "post_attention_layernorm" in text:
+        return "ffn_norm"
+    return "norm"
 _FP8_CATEGORIES = {
     "attn", "mla", "gdn", "kda", "dense_mlp", "compressor", "indexer",
     "indexer_fp8", "shared_expert",
@@ -90,10 +131,34 @@ class QuantSpec:
     category_overrides: tuple[tuple[str, tuple[tuple[str, Any], ...]], ...] = ()
     native_format: str = "bf16"
     int8_weight_metadata: str = "scale_offset"
+    # Execution ABI can differ from checkpoint storage: the W8 dynamic
+    # QuantBatchMatmulV3 normal caller consumes one BF16 scale per output
+    # channel and one FLOAT scale per activation row, even when the checkpoint
+    # stores FP32 per-channel scales.  Empty strings/zero preserve the prior
+    # storage-derived behavior for every source that does not declare this ABI.
+    runtime_weight_scale_format: str = ""
+    runtime_weight_scale_bytes: float = 0.0
+    runtime_activation_scale_format: str = ""
+    runtime_int8_weight_metadata: str = ""
+    output_format: str = ""
+    #: Checkpoint/stored gamma formats per fixed norm role.  The source header
+    #: proves storage; the runtime table may declare a deployment-selected cast.
+    norm_storage: tuple[tuple[str, str], ...] = ()
+    norm_runtime: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
         if self.int8_weight_metadata not in {"scale_only", "scale_offset"}:
             raise ModelingError("int8_weight_metadata_requires_scale_only_or_scale_offset")
+        if self.runtime_int8_weight_metadata not in {"", "scale_only", "scale_offset"}:
+            raise ModelingError("runtime_int8_weight_metadata_requires_scale_only_or_scale_offset")
+        if self.runtime_weight_scale_bytes < 0:
+            raise ModelingError("runtime_weight_scale_bytes_requires_nonnegative")
+        if self.runtime_weight_scale_format and not self.runtime_weight_scale_bytes:
+            raise ModelingError("runtime_weight_scale_bytes_required_with_format")
+        if self.output_format and self.output_format not in {
+                "bf16", "bfloat16", "fp16", "float16", "fp32", "float32",
+                "int8", "fp8", "fp8_e4m3", "fp8_e5m2"}:
+            raise ModelingError("quant_output_format_unsupported:" + self.output_format)
         # JSON mappings become immutable records before they enter model IDs.
         for key in ("weight_block", "exclusions", "notes"):
             object.__setattr__(self, key, tuple(getattr(self, key)))
@@ -103,7 +168,7 @@ class QuantSpec:
             "weight_format", "activation_format", "weight_block", "expert_block",
             "scale_format", "scale_bytes", "activation_group_size",
             "activation_scale_format", "activation_scale_pack",
-            "int8_weight_metadata",
+            "int8_weight_metadata", "output_format",
         }
         entries = (self.category_overrides.items() if isinstance(self.category_overrides, Mapping)
                    else self.category_overrides)
@@ -117,6 +182,34 @@ class QuantSpec:
                 fields["weight_block"] = tuple(fields["weight_block"])
             normalized.append((str(category), tuple(sorted(fields.items()))))
         object.__setattr__(self, "category_overrides", tuple(sorted(normalized)))
+        for key in ("norm_storage", "norm_runtime"):
+            raw = getattr(self, key)
+            records = raw.items() if isinstance(raw, Mapping) else raw
+            parsed = []
+            for role, fmt in records:
+                role = str(role)
+                if role not in _NORM_ROLES:
+                    raise ModelingError("quant_norm_role_unsupported:" + role)
+                canonical = _NORM_FORMATS.get(str(fmt).strip().lower())
+                if canonical is None:
+                    raise ModelingError("quant_norm_format_unsupported:" + str(fmt))
+                parsed.append((role, canonical))
+            object.__setattr__(self, key, tuple(sorted(parsed)))
+        # The checkpoint mapper historically put a stored F32 norm gamma into
+        # the generic ``norm`` category override.  Keep that as storage
+        # provenance only: it never selects the kernel gamma dtype, and its
+        # activation_format is ignored.  Actual deployment gamma remains the
+        # model's native format unless a separate runtime ABI is declared.
+        norm_override = dict(self.category_overrides).get("norm")
+        if norm_override is not None:
+            stored = _NORM_FORMATS.get(
+                str(dict(norm_override).get("weight_format", "")).strip().lower())
+            if stored is not None:
+                if not self.norm_storage:
+                    object.__setattr__(self, "norm_storage", (("norm", stored),))
+                object.__setattr__(self, "category_overrides", tuple(
+                    (category, fields) for category, fields in self.category_overrides
+                    if category != "norm"))
 
     def for_category(self, category: str) -> "QuantSpec":
         """Resolve family defaults then progressively more specific roles."""
@@ -138,12 +231,59 @@ class QuantSpec:
             changes["expert_weight_format"] = changes["weight_format"]
         return replace(self, **changes, category_overrides=())
 
+    _MX_METHODS = frozenset({"mx_fp8", "mx_fp4"})
+
+    def linear_method(self, category: str) -> str:
+        """Authoritative runtime linear method for one resolved role.
+
+        MX requires both E8M0 (or ue8m0) weight scales in blocks of 32 and
+        group-32 dynamic activation scales.  A regular FP8/INT8 row, even at
+        group 32 with BF16/FP32 scales, is not MX.
+        """
+        resolved = self.for_category(category)
+        wf = str(resolved.weight_format or "").lower().replace("-", "_")
+        af = str(resolved.activation_format or "").lower().replace("-", "_")
+        sf = str(resolved.scale_format or "").lower().replace("-", "_")
+        block = resolved.weight_block
+        group = int(block[1] if isinstance(block, (tuple, list)) and len(block) > 1 else 0)
+        act_group = int(resolved.activation_group_size or 0)
+        mx_scale = sf in {"fp8_e8m0", "ue8m0"} and group == 32 and act_group == 32
+        if mx_scale and wf in {"mxfp4", "mx_fp4", "mxfp4_e2m1"}:
+            return "mx_fp4"
+        if mx_scale and wf in {"mxfp8", "mx_fp8", "mxfp8_e4m3",
+                               "fp8_e4m3", "fp8_e5m2"} and af in {
+                                   "mxfp8", "mx_fp8", "mxfp8_e4m3",
+                                   "fp8_e4m3", "fp8_e5m2"}:
+            return "mx_fp8"
+        if wf in {"int8", "w8a8"} or af in {"int8"}:
+            return "w8a8"
+        if wf in {"int4", "w4a8", "int4_weight"}:
+            return "w4a8"
+        if wf in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
+            return "fp8"
+        return "dense"
+
+    def output_format_for(self, category: str, default: str = "",
+                          *, prequant: str = "") -> str:
+        resolved = self.for_category(category)
+        if resolved.output_format:
+            return resolved.output_format
+        method = resolved.linear_method(category)
+        if method in self._MX_METHODS:
+            return prequant or resolved.native_format or default
+        return default
+
+
     def format_for(self, category: str, *, source: bool = False) -> str:
         resolved = self.for_category(category)
         if resolved is not self:
             return resolved.format_for(category, source=source)
         cat = str(category)
         family = cat.split(".", 1)[0]
+        if source and family == "norm" and self.norm_gamma_declared("norm"):
+            # Source/theory query only; resident ``format_for("norm")`` stays
+            # on the actual selected kernel format.
+            return self.norm_gamma_format("norm", source=True)
         # Native source FP32 categories are never downgraded by a vector/gate
         # exclusion.  Exclusions describe "do not quantize", not "cast to BF16".
         if family in _FP32_CATEGORIES:
@@ -177,6 +317,8 @@ class QuantSpec:
         if resolved is not self:
             return resolved.source_format_for(category)
         cat = str(category)
+        if cat == "norm" and self.norm_gamma_declared("norm"):
+            return self.norm_gamma_format("norm", source=True)
         if cat in {"compressor_fp32_runtime", "compressor_bf16_runtime"}:
             return "bf16"
         if cat == "engram_table":
@@ -188,6 +330,52 @@ class QuantSpec:
         if cat == "engram_table":
             return self.weight_format if self.weight_format != "bf16" else "bf16"
         return self.format_for(cat, source=True)
+
+    def norm_gamma_declared(self, role: str = "norm") -> bool:
+        """Whether a fixed norm role has an explicit stored/runtime declaration."""
+        role = str(role)
+        storage = dict(self.norm_storage)
+        runtime = dict(self.norm_runtime)
+        if role in storage or role in runtime:
+            return True
+        return role in _NORM_GENERIC_ROLES and (
+            "norm" in storage or "norm" in runtime)
+
+    def norm_gamma_format(self, role: str = "norm", *, source: bool = False) -> str:
+        """Checkpoint or selected-kernel gamma format for one fixed norm role.
+
+        A runtime declaration is the actual loaded/kernel gamma format.  A
+        checkpoint-only declaration never upgrades the runtime: absent an
+        explicit runtime ABI the selected kernel keeps the model's native
+        format (BF16 for the signed GLM RmsNorm/AddRmsNormBias ABI).  The
+        generic ``norm`` key covers layer norms (attention/FFN/KV-A/Q-A/
+        indexer/final), never shared-head/Engram/hyper-connection norms.
+        """
+        role = str(role)
+        table = dict(self.norm_storage if source else self.norm_runtime)
+        if role in table:
+            return table[role]
+        if role in _NORM_GENERIC_ROLES and "norm" in table:
+            return table["norm"]
+        return self.native_format or "bf16"
+
+    def norm_gamma_bytes(self, width: int, role: str = "norm", *,
+                         source: bool = False) -> float:
+        return float(int(width)) * float(
+            dtype_bytes(self.norm_gamma_format(role, source=source)))
+
+    def execution_weight_scale_format(self) -> str:
+        return self.runtime_weight_scale_format or self.scale_format
+
+    def execution_weight_scale_bytes(self) -> float:
+        return self.runtime_weight_scale_bytes or self.scale_bytes
+
+    def execution_activation_scale_format(self) -> str:
+        return (self.runtime_activation_scale_format
+                or self.activation_scale_format or self.scale_format)
+
+    def execution_int8_weight_metadata(self) -> str:
+        return self.runtime_int8_weight_metadata or self.int8_weight_metadata
 
     def matrix_payload_bytes(
         self, rows: int, cols: int, category: str, *, source: bool = False,
@@ -205,6 +393,9 @@ class QuantSpec:
         if rows <= 0 or cols <= 0:
             raise ModelingError(f"catalog_weight_shape_invalid:{category}:{rows}x{cols}")
         fmt = self.source_format_for(category) if source else self.format_for(category)
+        scale_bytes = self.scale_bytes if source else self.execution_weight_scale_bytes()
+        metadata_columns = (1 if self.int8_weight_metadata == "scale_only" else 2) if source else (
+            1 if self.execution_int8_weight_metadata() == "scale_only" else 2)
         if str(category) == "engram_table":
             mode = "host_fp8_e8m0" if source else self.engram_table_mode
             return float(rows * cols * (2 if mode == "device_bf16" else 1))
@@ -226,6 +417,9 @@ class QuantSpec:
         if rows <= 0 or cols <= 0:
             raise ModelingError(f"catalog_weight_shape_invalid:{category}:{rows}x{cols}")
         fmt = self.source_format_for(category) if source else self.format_for(category)
+        scale_bytes = self.scale_bytes if source else self.execution_weight_scale_bytes()
+        metadata_columns = (1 if self.int8_weight_metadata == "scale_only" else 2) if source else (
+            1 if self.execution_int8_weight_metadata() == "scale_only" else 2)
         if str(category) == "engram_table":
             # Engram tables have explicit host/device storage modes.  Scales
             # are one per row per32 columns, not a 2-D block grid.
@@ -248,7 +442,7 @@ class QuantSpec:
                 raise ModelingError("catalog_fp8_block_missing")
             scale_rows = _ceil_div(rows, block_rows)
             scale_cols = _ceil_div(cols, block_cols)
-            return data + scale_rows * scale_cols * float(self.scale_bytes)
+            return data + scale_rows * scale_cols * float(scale_bytes)
         if fmt in {"mxfp4", "fp4", "fp4_e2m1"}:
             group = max(1, int(self.expert_block))
             data = float(rows * _ceil_div(cols, 2))
@@ -262,15 +456,14 @@ class QuantSpec:
             group = max(1, int(self.expert_block))
             data = float(rows * _ceil_div(cols, 2))
             scale_count = rows if group <= 1 else rows * _ceil_div(cols, group)
-            return data + float(scale_count) * float(self.scale_bytes)
+            return data + float(scale_count) * float(scale_bytes)
         if str(category) == "shared_expert_payload":
             # Payload only; the shared expert's scale is charged once.
             return float(rows * cols)
         if fmt in {"int8", "w8a8"}:
             # Native INT8 callers may provide one scale or a scale/offset pair.
             # This declaration also owns residency; an absent offset has no bytes.
-            metadata_columns = 1 if self.int8_weight_metadata == "scale_only" else 2
-            return float(rows * cols + rows * self.scale_bytes * metadata_columns)
+            return float(rows * cols + rows * float(scale_bytes) * metadata_columns)
         raise ModelingError(f"catalog_weight_format_unsupported:{fmt}")
 
     @property
@@ -302,6 +495,8 @@ class QuantSpec:
             "activation_group_size": self.activation_group_size,
             "activation_scale_format": self.activation_scale_format,
             "activation_scale_pack": self.activation_scale_pack,
+            "norm_storage": {role: fmt for role, fmt in self.norm_storage},
+            "norm_runtime": {role: fmt for role, fmt in self.norm_runtime},
             "category_overrides": {
                 category: dict(fields) for category, fields in self.category_overrides
             },

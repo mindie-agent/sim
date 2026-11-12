@@ -82,4 +82,4 @@ def first_owner(g, phases, context):
 def eligible(g):
     # Multiple L1 panels expose intermediate MTE1 releases and output-ring
     # reuse across panels. Keep their original DAG, with visible diagnostics.
-    return g.k_span <= g.k_l1
+    return g.m_tiles == 1 and g.k_span <= g.k_l1

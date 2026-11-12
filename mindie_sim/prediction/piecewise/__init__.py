@@ -16,7 +16,8 @@ from .guards import (
 )
 from .compiler import (
     AnalysisDomain, CompiledOperator, CompiledSubgraph, ImplementationPolicy,
-    OperatorCost, OperatorPiecewiseCompiler, PipeSupply, QuantLedger,
+    NativeProgram, NativeSchedule, NativeTask, OperatorCost,
+    OperatorPiecewiseCompiler, PipeSupply, QuantLedger,
     RequestGeometry, SegmentAxis, SegmentFormula, SegmentTable, WorkloadGeometry,
     quant_ledger,
 )
@@ -29,8 +30,9 @@ from .service_span import (
     ttft_wave_scale,
 )
 from .composition import (
-    ClosedForm, EngineResult, ForkJoinResult, FusionResult, SerialResult,
-    SubgraphCostFunction, compose_sequence, lower_fusion, pipeline_makespan,
+    ClosedForm, EngineResult, ForkJoinResult, FusionResult, OperatorSegment,
+    SerialResult, SubgraphCostFunction, compose_sequence,
+    contention_envelope, lower_fusion, operator_segment, pipeline_makespan,
     run_engine, run_engine_work,
 )
 from .diagnostics import DiagnosticReport, boundary_distance, coverage_summary, explain
@@ -39,8 +41,10 @@ __all__ = [
     "Add", "AnalysisDomain", "CeilDiv", "CompiledOperator", "CompiledSubgraph",
     "Const", "CoreWaveGuard", "Crossover", "DiagnosticReport", "Div", "Expr",
     "FloorDiv", "ForkJoinResult", "FusionResult", "GraphBucketGuard", "GuardCell",
-    "ImplementationPolicy", "Interval", "Max", "Min", "Mul", "Neg", "OperatorCost",
-    "OperatorPiecewiseCompiler", "PartitionAudit", "PipeDemand",
+    "ImplementationPolicy", "Interval", "Max", "Min", "Mul", "NativeProgram",
+    "NativeSchedule", "NativeTask", "Neg", "OperatorCost",
+    "OperatorPiecewiseCompiler",
+    "OperatorSegment", "PartitionAudit", "PipeDemand",
     "PipeDominanceGuard", "PipeEnvelope", "PipeSupply", "QuantLedger",
     "RequestGeometry",
     "SegmentAxis", "SegmentFormula", "SegmentTable", "SerialResult",
@@ -50,7 +54,8 @@ __all__ = [
     "chunked_prefill_mean_ttft_ms",
     "clamp_graph_bucket", "compose_sequence", "coverage_summary", "ep_batch",
     "evaluate", "explain", "local_batch", "lower_fusion",
-    "lower_layer_predictions", "pipeline_makespan", "quant_ledger", "run_engine", "run_engine_work",
+    "lower_layer_predictions", "operator_segment", "contention_envelope",
+    "pipeline_makespan", "quant_ledger", "run_engine", "run_engine_work",
     "service_ttft_overhead_ms", "simplify", "substitute", "ttft_wave_scale",
     "ClosedForm", "EngineResult",
 ]

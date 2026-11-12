@@ -1,0 +1,67 @@
+{
+  "schema": "a5-gm-128b-cacheline-service-review/1",
+  "date": "2026-11-12",
+  "hardware": "Ascend950DT_9581/9582, NpuArch3510 (A5)",
+  "decision": "install_generic_hbm_128b_cacheline_transaction_supply_only",
+  "installed_service": {
+    "name": "gm_hbm_cacheline_128b",
+    "unit": "cachelines",
+    "owner_axis": "vector",
+    "per_owner_rate": 488281250.0,
+    "device_total_rate": 31250000000.0,
+    "derivation": "device.rates.hbm=4000000000000 B/s; 4000000000000/128=31250000000 lines/s; equal-share per active AIV: /64=488281250 lines/s",
+    "mode": "peak HBM 128-byte line throughput, equal per-AIV share; not a scalar instruction issue rate",
+    "scope": "only for an independently supplied count of unique HBM 128-byte line transactions; atomic RMW must count its read and write line transactions (2); no DataCache hit/miss inference",
+    "excludes": [
+      "scalar_gm_access call price",
+      "scalar_alu_issue price",
+      "GetSFFValue/PIPE_S issue",
+      "BF16 scalar_store_issue queue",
+      "dependent pointer-chase response latency",
+      "queue depth/MLP/outstanding-request limit",
+      "L1/L2 hit rate or latency",
+      "A2/A3 or other architecture"
+    ]
+  },
+  "evidence": [
+    {
+      "path": "sim/data/observations/sources/arch3510-physical-services/platform-units/npu_arch_3510.md",
+      "sha256": "3a69176f4d4eab9e3883755e92598fb9defb3d51dc117de0bd94bb1acaa03caa",
+      "lines": "28",
+      "fact": "A5 SIMT external access is 128-byte granular; SIMT DCache max128KiB. This establishes the 128-byte transaction width, not scalar GetValue latency or a cache hit."
+    },
+    {
+      "path": "sim/mindie_sim/backends/profiles/ascend.json",
+      "sha256": "5b1e0bbba482abc26f895012c132b61963d95b81d51b03b9f9a741659dbad450",
+      "fact": "A5 9581/9582 device.rates.hbm=4000000000000 B/s. Only peak line throughput is derived."
+    },
+    {
+      "path": "profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.md",
+      "sha256": "81fc340d4e4cbcfe79c280aef8c6dcc8c3911b9d9d9a88b189b3c38ed7a0b6bf",
+      "fact": "Six native captures provide composite AIV scalar/MTE slopes only. The document states the population does not isolate a GetValue, sort opcode or atomic RMW latency."
+    },
+    {
+      "path": "profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+      "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
+      "fact": "Per-record ABI, BlockNum, PMU populations and scalar/MTE busy times; no independent per-load latency, queue depth, cacheline hit/miss or cache transaction count."
+    },
+    {
+      "path": "sim/docs/operators/source-scalar-services.md",
+      "sha256": "8e817ebc7b7b6f9bf66cc1fbfdd86f461dc594c5e81a68de8c646bb8328ff5b5",
+      "fact": "Existing source scalar_gm_access/scalar_alu_issue remain unpriced; UB access and BF16 store evidence are explicitly not GM pointer-chase or atomic latency."
+    }
+  ],
+  "rejected_substitutions": [
+    {"candidate": "GetSFFValue/PIPE_S 1.65GHz", "reason": "fixed typed scalar instruction issue, not a GM load or dependent address response"},
+    {"candidate": "BF16 scalar_store_issue queue", "reason": "UB-to-GM store queue, not scalar GM load or pointer chase"},
+    {"candidate": "fleet AIV scalar busy slope", "reason": "composite source schedule, not isolated per-load service; cannot identify dependent response"},
+    {"candidate": "128B cacheline count as one GetValue call", "reason": "a call may hit, share a line, or miss; no hit/miss evidence and no call-to-line identity"},
+    {"candidate": "fabricated fixed hit or miss latency", "reason": "A5 public docs do not provide scalar GM response latency, outstanding depth or hit policy; not installed"}
+  ],
+  "unresolved": {
+    "dependent_scalar_load_response": "unknown; no independent A5 latency/queue-depth/MLP source found in retained local evidence",
+    "scalar_gm_access": "unpriced source-call tag",
+    "scalar_alu_issue": "unpriced source-call tag",
+    "l1_l2": "no independent A5 hit rate/latency or transaction count"
+  }
+}

@@ -143,9 +143,11 @@ def gemm_op(
         existing_meta = dict(metadata)
         scale_meta = ()
         if "weight_scale_format" not in existing_meta:
-            scale_meta += (("weight_scale_format", quant.scale_format),)
+            scale_meta += (("weight_scale_format", quant.execution_weight_scale_format()),)
         if "weight_scale_bytes" not in existing_meta:
-            scale_meta += (("weight_scale_bytes", quant.scale_bytes),)
+            scale_meta += (("weight_scale_bytes", quant.execution_weight_scale_bytes()),
+                           ("weight_scale_storage_format", quant.scale_format),
+                           ("weight_scale_storage_bytes", float(quant.scale_bytes)))
         meta = meta + scale_meta + (
             ("dequant", "fused" if fmt in {"mxfp4", "fp4", "fp4_e2m1", "int4", "w4a8"} else "none"),
             ("dequant_traffic", 0.0),
@@ -158,8 +160,10 @@ def gemm_op(
         # Per-row dynamic quantization rescales the completed INT32 reduction.
         # Retain only the declared column inputs; an absent offset must not
         # double the scale traffic or become a synthetic matrix operand.
-        metadata_columns = 1 if quant.int8_weight_metadata == "scale_only" else 2
-        column_width = metadata_columns * quant.scale_bytes
+        runtime_meta = quant.execution_int8_weight_metadata()
+        runtime_scale_bytes = quant.execution_weight_scale_bytes()
+        metadata_columns = 1 if runtime_meta == "scale_only" else 2
+        column_width = metadata_columns * runtime_scale_bytes
         column_metadata = weight_bytes * column_width / (int(weight_cols or k) + column_width)
         operations = 3 if out_dtype in {"fp32", "float32"} else 4
         vector_ops = float(operations * m * n)
@@ -167,9 +171,9 @@ def gemm_op(
             "kind": "row_column_scale", "row_scale_bytes": float(scale_bytes),
             "column_scale_bytes": column_metadata, "operations_per_output": operations,
         }), ("matrix_output_contract", "int32_cast_row_scale_column_scale_output_cast"),
-            ("int8_weight_metadata", quant.int8_weight_metadata),
+            ("int8_weight_metadata", runtime_meta),
             ("column_metadata_policy", "declared_scale_only_storage_traffic"
-             if quant.int8_weight_metadata == "scale_only"
+             if runtime_meta == "scale_only"
              else "retains_declared_scale_and_offset_storage_traffic"))
     return OpSpec(
         op_id=op_id, family=family, phase=phase, stage=stage, layer=layer,
@@ -195,7 +199,8 @@ def activation_scales(quant, dtype, rows, cols):
     if dtype == "int8":
         group = quant.activation_group_size or cols
         groups = (cols + group - 1) // group
-        return group, "fp32", (rows,) if groups == 1 else (rows, groups), float(rows * groups * 4)
+        scale_format = quant.execution_activation_scale_format()
+        return group, scale_format, (rows,) if groups == 1 else (rows, groups), float(rows * groups * dtype_bytes(scale_format))
     if dtype in {"fp8", "fp8_e4m3", "fp8_e5m2"}:
         group = quant.activation_group_size or cols
         groups = (cols + group - 1) // group

@@ -269,6 +269,65 @@ def test_moe_skew_waves_and_zero_expert_weight_reads():
     assert ragged_cost.get("padded_rows") == 4 * 16
 
 
+def _router_movement(operator, tokens, phase):
+    compiled = compile_op(operator, policy=POLICY, supply=SUPPLY)
+    geometry = WorkloadGeometry((RequestGeometry(tokens, 0, phase=phase),),
+                                phase=phase)
+    return compiled.evaluate(geometry, StateView())
+
+
+def test_router_outbound_permute_is_prefill_only_and_source_dense():
+    def permute():
+        return make_op(
+            "router_permute", "router", role="permute",
+            matrix=(("elements", 8),), experts=(("E", 256), ("k", 8)),
+            tiles=(("mt", 128), ("cores", 1)),
+            extras=(("router_hidden", 6144), ("router_dtype_bytes", 2),
+                    ("router_indices_bytes", 4), ("router_prob_bytes", 2)))
+    prefill = _router_movement(permute(), 1024, "prefill")
+    dense = 1024 * 6144 * 2
+    packed = 1024 * 8 * 6144 * 2
+    indices = 1024 * 8 * 4
+    assert dict(prefill.work)["hbm"] == dense + packed + 2 * indices
+    assert dict(prefill.work)["mte2"] == dense + indices
+    assert dict(prefill.work)["mte3"] == packed + indices
+    decode = _router_movement(permute(), 1, "decode")
+    assert float(decode.duration_ms) == 0
+    assert all(value == 0 for _, value in decode.work)
+
+
+def test_router_finalize_is_separate_post_expert_return():
+    def finalize():
+        return make_op(
+            "router_finalize", "router", role="finalize",
+            matrix=(("elements", 8),), experts=(("E", 256), ("k", 8)),
+            tiles=(("mt", 128), ("cores", 1)),
+            extras=(("router_hidden", 6144), ("router_dtype_bytes", 2),
+                    ("router_indices_bytes", 4), ("router_prob_bytes", 2)))
+    prefill = _router_movement(finalize(), 1024, "prefill")
+    dense = 1024 * 6144 * 2
+    packed = 1024 * 8 * 6144 * 2
+    indices = 1024 * 8 * 4
+    probs = 1024 * 8 * 2
+    assert dict(prefill.work)["mte2"] == packed + indices + probs
+    assert dict(prefill.work)["mte3"] == dense
+    assert dict(prefill.work)["hbm"] == dense + packed + indices + probs
+    assert dict(prefill.work)["vector"] == 1024 * 6144 * (2 * 8 - 1)
+    # F2 parent may be expanded to the global cohort (2048 tokens); the
+    # weighted return still owns this rank's 1024 gathered slots.
+    expanded = WorkloadGeometry(
+        (RequestGeometry(1024, 0, phase="prefill"),), phase="prefill",
+        cohort_batch=2, local_batch=1).for_subgraph("F2")
+    compiled = compile_op(finalize(), policy=POLICY, supply=SUPPLY)
+    cohort_cost = compiled.evaluate(expanded, StateView())
+    assert dict(cohort_cost.work)["mte2"] == 100_712_448
+    assert dict(cohort_cost.work)["mte3"] == 12_582_912
+    assert dict(cohort_cost.work)["hbm"] == 113_295_360
+    decode = _router_movement(finalize(), 1, "decode")
+    assert float(decode.duration_ms) == 0
+    assert all(value == 0 for _, value in decode.work)
+
+
 def test_moe_init_routing_histogram_sort_permute():
     operator = make_op(
         "MoEInitRouting", "router", role="routing",
@@ -334,17 +393,22 @@ def test_alltoallv_directed_matrix_receive_hotspot():
     # all-rank aggregate; the aggregate remains a derived ledger only.
     assert cost.get("intra_bytes") == intra
     assert cost.get("inter_bytes") == inter
-    assert cost.get("local_hbm_bytes") == max(rows) + max(columns)
+    # HBM is a per-rank resource: pair each rank's own egress and ingress
+    # before taking the hotspot, rather than adding two unrelated ranks.
+    assert cost.get("local_hbm_bytes") == max(
+        row + column for row, column in zip(rows, columns))
     assert stage_pipe(cost, 0, "link_hccs") == intra
     assert stage_pipe(cost, 0, "link_roce") == inter
 
     local = ((10, 100), (200, 20))
     _, local_cost = cost_for(traffic_op(matrix=local, ranks=2,
                                         node_ranks=2), 1)
-    assert local_cost.get("send_bytes") == 220
-    assert local_cost.get("recv_hotspot") == 210
+    # Diagonals 10/20 are local self copies, not peer wire cells.
+    assert local_cost.get("send_bytes") == 200
+    assert local_cost.get("recv_hotspot") == 200
     assert local_cost.get("aggregate_wire_bytes") == 300
-    assert local_cost.get("local_hbm_bytes") == 430
+    assert local_cost.get("local_hbm_bytes") == max(
+        100 + 200, 200 + 100) == 300
 
 
 def test_alltoallv_mtu_frame_padding_changes_hotspot():
@@ -427,14 +491,22 @@ def test_mc2_transport_uses_rows_and_directed_hotspot():
                           row_bytes=1000.0, top_k=2)
     _, cost = cost_for(operator, 3)
     message = 3 * 2 * 1000
+    source_payload = message / 4
+    per_peer = source_payload / 4
+    send = 3 * per_peer
     assert cost.get("routed_rows") == 6
     assert cost.get("peer_bytes") == message
-    assert cost.get("send_bytes") == message
-    assert cost.get("recv_hotspot") == message
-    assert cost.get("intra_bytes") == Fraction(message, 3)
-    assert cost.get("inter_bytes") == Fraction(2 * message, 3)
+    # One source rank owns message/ranks routed bytes; its own share is not
+    # sent, and the remaining 3 shares are framed per destination.
+    assert cost.get("source_payload_bytes") == source_payload
+    assert cost.get("per_peer_useful_bytes") == per_peer
+    assert cost.get("send_bytes") == send
+    assert cost.get("recv_hotspot") == send
+    assert cost.get("intra_bytes") == per_peer
+    assert cost.get("inter_bytes") == 2 * per_peer
     assert len(cost.stage_times) == 2
-    assert cost.get("local_hbm_bytes") == 2 * message
+    assert cost.get("local_hbm_bytes") == 2 * send
+    assert cost.get("aggregate_wire_bytes") == 4 * send
     for pipe in ("link_hccs", "link_roce", "hbm"):
         assert total_pipe(cost, pipe) == stage_pipe(cost, 0, pipe) * 4
 
@@ -593,7 +665,10 @@ def test_gemm_split_partial_and_tail_core_physics():
     _, tail = cost_for(gemm_op(k=16, n=16, cores=4), 16)
     assert tail.get("j_tiles") == 1 and tail.get("waves") == 1
     assert total_pipe(tail, "mte2") == tail.get("mte2_padded_bytes") == 1024
-    assert total_pipe(tail, "cube") == 4 * 2 * 16 * 16 * 16
+    # One 16x16x16 tile on 4 cores.  Cube counts the physical product.
+    # The idle cores stay in gemm_schedule_scale, which divides elapsed time.
+    assert total_pipe(tail, "cube") == 2 * 16 * 16 * 16
+    assert tail.get("gemm_schedule_scale") == Fraction(1, 4)
     assert total_pipe(tail, "mte3") == 16 * 16 * 2
 
     # One wave with four internal K panels pipelines the panels instead of
@@ -601,9 +676,13 @@ def test_gemm_split_partial_and_tail_core_physics():
     _, panel = cost_for(gemm_op(k=512, n=16, cores=4), 16)
     assert panel.get("k_panels") == 4 and panel.get("k_split_panels") == 4
     assert total_pipe(panel, "mte2") == 4 * (16 * 128 * 2 + 128 * 16 * 2)
-    assert total_pipe(panel, "cube") == 4 * 2 * 16 * 16 * 512
+    # Four K panels issue 2*M*N*K once.  The core count is the elapsed cap,
+    # not a second factor on the cube product.  Stage 3 holds the three
+    # panels after the first.
+    assert total_pipe(panel, "cube") == 2 * 16 * 16 * 512
+    assert panel.get("gemm_schedule_scale") == Fraction(1, 4)
     assert panel.stage_work[3] and dict(panel.stage_work[3])["cube"] == (
-        4 * 3 * 2 * 16 * 16 * 128)
+        3 * 2 * 16 * 16 * 128)
 
 
 def test_gemm_batch_multiplicity_metadata_and_capacity():
@@ -708,6 +787,10 @@ def test_elementwise_moe_default_rows_follow_top_k():
 def test_uniform_traffic_matrix_matches_uniform_alltoallv_fallback():
     matrix = ((0, 128, 128, 128), (128, 0, 128, 128),
               (128, 128, 0, 128), (128, 128, 128, 0))
+    # A routed transport source owns 3*128/4 = 96 bytes and sends one 24-byte
+    # share to each of the four group members; the own share is excluded.
+    transport_matrix = ((0, 24, 24, 24), (24, 0, 24, 24),
+                        (24, 24, 0, 24), (24, 24, 24, 0))
     keys = ("intra_bytes", "inter_bytes", "send_bytes", "recv_hotspot",
             "local_hbm_bytes", "aggregate_wire_bytes")
     for mtu in (1, 4096):
@@ -726,7 +809,8 @@ def test_uniform_traffic_matrix_matches_uniform_alltoallv_fallback():
                          ranks=4, node_ranks=2, mtu=mtu, chunks=1,
                          row_bytes=128.0, top_k=3)
         fallback_t = cost_for(traffic_op(**transport), 1)[1]
-        explicit_t = cost_for(traffic_op(**transport, matrix=matrix), 1)[1]
+        explicit_t = cost_for(traffic_op(**transport,
+                                         matrix=transport_matrix), 1)[1]
         for key in keys:
             assert explicit_t.get(key) == fallback_t.get(key)
         assert explicit_t.duration_ms == fallback_t.duration_ms

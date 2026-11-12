@@ -138,7 +138,9 @@ def test_fork_join_hbm_contention_and_shared_branch_envelope():
         m_rec = make_model(plans=[dict(index=0, attention=attn, ffn="dense", num_heads=4, num_kv_heads=2, head_dim=16, intermediate_size=64, linear_heads=4, linear_head_dim=16)])
         p_rec = pipeline(m_rec, feature_overrides={flag: True}).forward(WorkloadGeometry.homogeneous(2, 1, 16)).layers[0]
         assert p_rec.contention is not None and {"main", "aux"} == set(dict(p_rec.contention.branches))
-    m_idx = make_model(plans=[dict(index=0, attention="mla", ffn="dense", num_heads=4, num_kv_heads=1, head_dim=16, intermediate_size=64, indexer=True, index_heads=2, index_dim=16, index_topk=8)], mla=dict(q_lora_rank=16, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, index_topk=8))
+    m_idx = make_model(plans=[dict(index=0, attention="mla", ffn="dense", num_heads=4, num_kv_heads=1, head_dim=16, intermediate_size=64, indexer=True, index_heads=2, index_dim=16, index_topk=8,
+                                  owns_index_k=True, index_k_owner_layer_id=0,
+                                  topk_owner_layer_id=0, owns_topk=True)], mla=dict(q_lora_rank=16, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, index_topk=8))
     p_idx = pipeline(m_idx, feature_overrides={"multistream_attention_indexer": True}).forward(WorkloadGeometry.homogeneous(2, 1, 16)).layers[0]
     assert p_idx.contention is not None and {"attention", "indexer"} == set(dict(p_idx.contention.branches))
 
@@ -232,20 +234,46 @@ def compact(model, limit=8):
     selected = set()
     for plan in groups.values():
         selected.add(plan.index)
-        if 0 <= plan.kv_owner_layer_id < plan.index:
-            selected.add(plan.kv_owner_layer_id)
+        for owner in (plan.kv_owner_layer_id, plan.index_k_owner_layer_id,
+                      plan.topk_owner_layer_id, plan.index_source_layer_id,
+                      plan.candidate_source_layer_id):
+            if 0 <= owner < plan.index:
+                selected.add(owner)
     indices = sorted(selected)[:limit]
+    # Keep every declared owner of a retained layer.  A compacted model must
+    # preserve the original shared cache/top-k topology, not turn a shared
+    # consumer into a self-owner.  The limit is a soft group budget; owners are
+    # mandatory and may take the final count above it.
     keep = set(indices)
-    for plan in model.layer_plans:
-        if plan.index in keep and 0 <= plan.kv_owner_layer_id < plan.index:
-            keep.add(plan.kv_owner_layer_id)
+    changed = True
+    while changed:
+        changed = False
+        for plan in model.layer_plans:
+            if plan.index not in keep:
+                continue
+            for owner in (plan.kv_owner_layer_id, plan.index_k_owner_layer_id,
+                          plan.topk_owner_layer_id, plan.index_source_layer_id,
+                          plan.candidate_source_layer_id):
+                if 0 <= owner < plan.index and owner not in keep:
+                    keep.add(owner)
+                    changed = True
     indices = sorted(keep)
     remap = {old: new for new, old in enumerate(indices)}
+    def owner(old):
+        return remap.get(int(old), -1)
+
     plans = []
     for new, old in enumerate(indices):
         plan = model.layer_plans[old]
-        owner = remap.get(plan.kv_owner_layer_id, new)
-        plans.append(replace(plan, index=new, kv_owner_layer_id=owner, owns_long_kv=owner == new))
+        kv_owner = owner(plan.kv_owner_layer_id)
+        plans.append(replace(
+            plan, index=new,
+            kv_owner_layer_id=kv_owner,
+            owns_long_kv=kv_owner == new,
+            index_k_owner_layer_id=owner(plan.index_k_owner_layer_id),
+            topk_owner_layer_id=owner(plan.topk_owner_layer_id),
+            index_source_layer_id=owner(plan.index_source_layer_id),
+            candidate_source_layer_id=owner(plan.candidate_source_layer_id)))
     return replace(model, layers=len(plans), layer_plans=tuple(plans), body_layers=len(plans))
 
 def fixture_model(name):
@@ -368,6 +396,46 @@ def test_dp_and_ep_cross_rank_sync_waits():
         FrameworkConfig(supply=SUPPLY, max_batch=1, routing=((0, (4, 0, 4, 0)),)))
     assert balanced.sync["ep_skew_ms"] < ep_result.sync["ep_skew_ms"]
 
+def test_weighted_return_follows_routed_combine_without_shared_experts():
+    plan = dict(index=0, attention="gqa", ffn="moe", num_heads=4,
+                num_kv_heads=2, head_dim=16, intermediate_size=128,
+                num_experts=4, top_k=2, moe_intermediate_size=32,
+                num_shared_experts=0)
+    model = make_model(name="moe_no_shared", plans=[plan],
+                       num_experts=4, top_k=2, moe_intermediate_size=32,
+                       num_shared_experts=0)
+    pipe = pipeline(model, feature_overrides={"ep": 2})
+    prediction = pipe.forward(WorkloadGeometry(
+        (RequestGeometry(64, 0, phase="prefill"),), phase="prefill"))
+    rows = tuple(row for layer in prediction.layers for row in layer.rows)
+    names = [row.cost.name for row in rows]
+    assert "combine" in names and "router_finalize" in names
+    assert names.index("combine") < names.index("router_finalize")
+    finalize = next(row for row in rows if row.cost.name == "router_finalize")
+    assert finalize.kind == "F2"
+    assert finalize.role == "transport_combine"
+    combine = pipe.instantiated.find("F2", layer=0, role="transport_combine")
+    assert combine is not None
+    assert [op.name for op in combine.operators] == ["combine", "router_finalize"]
+    assert combine.operators[-1].theta.find("router_upstream") == "combine"
+    assert not any(row.kind == "F4" for row in rows)
+
+
+def test_mc2_fused_recipe_does_not_emit_external_finalize():
+    plan = dict(index=0, attention="gqa", ffn="moe", num_heads=4,
+                num_kv_heads=2, head_dim=16, intermediate_size=128,
+                num_experts=4, top_k=2, moe_intermediate_size=32,
+                num_shared_experts=0)
+    model = make_model(name="moe_mc2", plans=[plan], num_experts=4, top_k=2,
+                       moe_intermediate_size=32, num_shared_experts=0)
+    pipe = pipeline(model, feature_overrides={"ep": 2, "moe_recipe": "mc2"})
+    prediction = pipe.forward(WorkloadGeometry(
+        (RequestGeometry(64, 0, phase="prefill"),), phase="prefill"))
+    names = [row.cost.name for layer in prediction.layers for row in layer.rows]
+    assert "combine" in names
+    assert "router_finalize" not in names
+
+
 def mtp_model():
     raw = dict( name="mtp", layers=1, hidden_size=64, num_heads=4, num_kv_heads=2,
         head_dim=16, intermediate_size=128, vocab_size=128, layer_plans=[dense_plan(0)],
@@ -484,7 +552,11 @@ def test_fusion_preserves_external_stores_stages_and_member_readiness():
     assert "mte2" in first and fused.fused.duration_ms > max( fused.fused.stage_times)
     baseline = evaluate_serial_split(f0, geometry, fusion=("dequant_swiglu_quant",))
     late = evaluate_serial_split(f0, geometry, fusion=("dequant_swiglu_quant",), readiness={"gate_up": 3})
-    assert late.gap_ms == 3 and late.total_ms == baseline.total_ms + 3
+    # gate_up's dynamic quant does not share that readiness, so it runs
+    # inside the wait and only the residual slack is idle.
+    prefix = baseline.by_name("gate_up_QuantV2").duration_ms
+    assert late.gap_ms == 3 - prefix
+    assert late.total_ms == baseline.total_ms + late.gap_ms
     n0 = pipe._subgraph(pipe.instantiated.find("N0", layer=0, role="attn_norm"))
     n0_fused = lower_fusion(n0.instance, n0.evaluate(geometry).operators, "add_rmsnorm_quant", supply=SUPPLY)
     assert n0_fused.fused.pipe_work("mte3") >= 2 * 64 * 8
@@ -579,7 +651,8 @@ def test_dp_completion_is_true_rank_maximum():
 def a2_pipe():
     plan = dict(index=0, attention="gqa", ffn="dense", num_heads=4, num_kv_heads=2,
                 head_dim=16, intermediate_size=128, cache_kind="window_compressed", window=8, compress_ratio=4, compressor_kind="weighted_pool",
-                indexer=True, index_heads=2, index_dim=8, index_topk=4, index_kpool=1, owns_long_kv=True)
+                indexer=True, index_heads=2, index_dim=8, index_topk=4, index_kpool=1, owns_long_kv=True,
+                owns_index_k=True, index_k_owner_layer_id=0, topk_owner_layer_id=0, owns_topk=True)
     return pipeline(make_model(plans=[plan]))
 
 def test_a0_fusion_keeps_v_slice_and_recovers_supply():
@@ -796,3 +869,56 @@ def test_pp_transfer_only_at_stage_cut_and_invalid_tp_rejected():
     invalid = make_model(plans=[dense_plan(0, num_heads=10, num_kv_heads=1)], num_heads=10, num_kv_heads=1, hidden_size=160)
     with pytest.raises(ModelingError):
         pipeline(invalid, feature_overrides={"tp": 3})
+
+
+def test_r31_non_spec_runner_physical_select_is_not_emit_filtered():
+    """R31 L1634-1643 physically samples every scheduled request.
+
+    The emitted/committed count is separate: an all-false emit mask still
+    computes the O0 logits for the scheduled requests, then discards them.
+    The scope-selected/no-source models below remain the genuine negative.
+    """
+    model = dense_model()
+    base = features(model)
+    meta = tuple(sorted({
+        **dict(base.metadata),
+        "image_id": (
+            "sha256:9e869e8148467296f56d1001b0dac4fea893c841ac7d0a03d4e824a233c2ffea"),
+        "model_identifier": "qwen3_5",
+    }.items()))
+    source = assemble_model(model, supply=SUPPLY, policy=POLICY,
+                            features=replace(base, metadata=meta))
+    chunks = WorkloadGeometry(
+        (RequestGeometry(4, 0, phase="prefill"),
+         RequestGeometry(2, 0, phase="prefill")), phase="prefill")
+    for mask in ((True, False), (False, False)):
+        rows = source.forward(chunks, emit_mask=mask, fusion=False).rows
+        hidden = [row for row in rows if row.cost.name == "hidden_select"]
+        head = [row for row in rows if row.cost.name == "lm_head"]
+        assert len(hidden) == 1 and len(head) == 1
+        assert head[0].padded_tokens == 2
+        prepare = hidden[0].native_occurrence["prepare"]
+        assert prepare["match"]["selected_rows"] == 2
+        assert prepare["observed"]["current_producing_rows"] == 6
+    single = source.forward(
+        WorkloadGeometry((RequestGeometry(4, 0, phase="prefill"),),
+                         phase="prefill"), emit_mask=(False,), fusion=False).rows
+    single_hidden = next(row for row in single
+                         if row.cost.name == "hidden_select")
+    single_prepare = single_hidden.native_occurrence["prepare"]
+    assert single_prepare["match"]["selected_rows"] == 1
+    assert single_prepare["observed"]["current_producing_rows"] == 4
+    verify = WorkloadGeometry(
+        (RequestGeometry(3, 2, phase="verify"),), phase="verify")
+    checked = source.forward(verify, emit_mask=(True,), fusion=False,
+                             acceptance=(2, 2)).rows
+    assert not any(row.cost.name == "hidden_select" for row in checked)
+    padded = WorkloadGeometry(
+        (RequestGeometry(4, 0, phase="prefill"),), phase="prefill",
+        physical_tokens=8)
+    padded_rows = source.forward(padded, emit_mask=(True,), fusion=False).rows
+    assert not any(row.cost.name == "hidden_select" for row in padded_rows)
+    plain = pipeline(dense_model())
+    none = plain.forward(chunks, emit_mask=(False, False), fusion=False).rows
+    assert not any(row.cost.name in {"hidden_select", "lm_head", "sampling"}
+                   for row in none)

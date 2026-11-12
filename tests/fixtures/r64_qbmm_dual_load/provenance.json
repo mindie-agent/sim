@@ -1,0 +1,11 @@
+{
+ "schema": "mindie-profiler-supply-fixture-provenance/1",
+ "source_capture": "/Volumes/data/mindie-agent-workstreams/a5-multinode-fleet-rack06-20261107/out/glm51_dp16tp1ep16/pf_1k_c1/177.25.21.1/dp2_pp0_tp0_dcp0_ep2_rank0_1467_20261107094934940_ascend_pt/kernel_details.csv.gz",
+ "source_capture_sha256": "cc05e517246544f8c4c4461e6986fac07c8892ad4547f3d221339c514123630f",
+ "producer": "mindie_profiler analyze --full-range --hash --aic-count 32 on the real r64 GLM51 prefill capture; measured_supply extracted unchanged (per-condition medians, issued work, declared AIC capacity)",
+ "selected_native_call": "aclnnQuantMatmulWeightNz_QuantBatchMatmulV3_QuantBatchMatmulV3",
+ "selected_n": 6144,
+ "selected_k": 16384,
+ "supply_sha256": "57e544f509384e24ce128566fbe46d35fa2332b160b0ef39c08e9b4e3ae4251c",
+ "not_fabricated": true
+}

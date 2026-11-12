@@ -20,13 +20,16 @@ from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 from .engine import Allocation, Engine, Event
 
 
+_EMPTY_MAPPING = MappingProxyType({})
+
+
 def scope_allocations(name, items):
     """Rename immutable buffer identities without reflecting dataclass fields."""
     return tuple(Allocation(f"{name}:{a.name}", a.pool, a.size, a.units)
                  for a in items) if items else ()
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Stage:
     name: str
     work: Mapping[str, float] = field(default_factory=dict)
@@ -41,13 +44,34 @@ class Stage:
     coupled: bool = False
 
     def __post_init__(self):
-        # A frozen Stage is a reusable physical template, not an alias to a
-        # caller's mutable work or placement dictionary.
-        object.__setattr__(self, "work", MappingProxyType(dict(self.work)))
-        object.__setattr__(self, "caps", MappingProxyType(dict(self.caps)))
-        object.__setattr__(self, "placement", MappingProxyType(
-            {key: tuple(units) for key, units in self.placement.items()}))
+        # Empty/default identity is immutable and shared. Nonempty
+        # caller-owned dicts still receive a proper MappingProxyType copy;
+        # an existing proxy is already immutable. This avoids three new
+        # proxy+dict objects for the common empty caps/work/placement case.
+        work = self.work
+        if not work:
+            work = _EMPTY_MAPPING
+        else:
+            # MappingProxyType is a read-only view, not frozen ownership. Copy
+            # every nonempty caller mapping, including an ordinary proxy.
+            work = MappingProxyType(dict(work))
+        caps = self.caps
+        if not caps:
+            caps = _EMPTY_MAPPING
+        else:
+            caps = MappingProxyType(dict(caps))
+        placement = self.placement
+        if not placement:
+            placement = _EMPTY_MAPPING
+        else:
+            placement = MappingProxyType(
+                {key: tuple(units) for key, units in placement.items()})
+        object.__setattr__(self, "work", work)
+        object.__setattr__(self, "caps", caps)
+        object.__setattr__(self, "placement", placement)
         for name in ("after", "acquire", "free", "previous"):
+            # tuple(existing tuple) is the same object; a caller list or other
+            # sequence becomes an independent snapshot, including empty lists.
             object.__setattr__(self, name, tuple(getattr(self, name)))
 
     def prepare(self, engine, name, scoped):
@@ -117,6 +141,29 @@ class PipelineProgram:
     setup_ms: float = 0.0
 
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event:
+        # One finite tile has no pipeline recurrence to protect.  Keep the
+        # same individual Stage submissions, dependencies and physical times,
+        # but elide the setup/span/outer-completion adapters that only forward
+        # this single tile's completion.
+        if self.count == 1 and self.slots == 1 and not self.setup_ms and not self.minimum_ms:
+            complete = engine.future(name + ":complete")
+
+            def compact_begin(_: Event) -> None:
+                local: dict[str, Event] = {}
+                scoped = lambda items: scope_allocations(name, items)
+                for stage in tuple(self.tile(0)):
+                    deps = tuple(local[key] for key in stage.after)
+                    local[stage.name] = stage.submit(
+                        engine, f"{name}:tile0:{stage.name}", deps or (ready,),
+                        scoped, owner)
+                engine.submit(
+                    name + ":tile0:retire",
+                    after=tuple(local.values()) or (ready,), owner=owner,
+                    on_complete=lambda _event: engine.resolve(complete))
+
+            engine.submit(name + ":begin", after=(ready,), owner=owner,
+                          on_complete=compact_begin)
+            return complete
         complete = engine.future(name + ":pipeline_complete")
         ready = engine.submit(name + ":setup", after=(ready,), latency=self.setup_ms, owner=owner)
         observation = engine.submit(name + ":span", after=(ready,), latency=self.minimum_ms, owner=owner)
@@ -213,6 +260,14 @@ class RecipeContext:
     # Selected observable regime, including continuity group, execution mode,
     # response basis and the distinct response/executed durations.
     service_regime: Mapping | None = None
+    # Per-stage capacity caps and diagnostics for a measured MAC service.  The
+    # caps constrain only the selected physical pipe; other stages keep their
+    # ordinary work and overlap.
+    mac_caps: Mapping[str, float] = field(default_factory=dict)
+    mac_service: Mapping | None = None
+    # Source-selected implementation for this matched invocation only.  It is
+    # never installed into the case or reused by an off-domain invocation.
+    program_recipe: object = None
 
     def for_phase(self, work, *, kernel, dtype=None, layout=None, axes=None):
         """Bind explicitly identified phase work without repeating kernel setup."""
@@ -338,8 +393,17 @@ class RecipeBook:
         from .matrix_mapping import MappedMatmul
         from .matrix_steady import SteadyMatmul
         from .state_program import RecurrentVector
-        balanced_matrix = (families or {}).get(
-            "grouped_gemm", (programs or {}).get("matmul", MappedMatmul()))
+        generic_grouped = (programs or {}).get("matmul", MappedMatmul())
+        self._generic_grouped = generic_grouped
+        balanced_matrix = (families or {}).get("grouped_gemm", generic_grouped)
+        from .generic_latent_attention import build as _generic_latent_build
+        from .mechanism import PlannedRecipe as _PlannedRecipe
+        self._explicit_recipes = frozenset((recipes or {}).keys())
+        # ``_explicit_recipes`` also receives internally registered source
+        # recipes.  Only this set is the caller's own override.
+        self._caller_recipes = frozenset((recipes or {}).keys())
+        self._explicit_families = frozenset((families or {}).keys())
+        self._family_kinds = {}
         self.recipes = {
             "balanced_grouped_gate_up": balanced_matrix,
             "balanced_grouped_down": balanced_matrix,
@@ -349,7 +413,9 @@ class RecipeBook:
                          "engram_rh2d": HostStaging(),
                          "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
                          **(families or {})}
-        self.programs = {"matmul": TiledMatmul(128, 128), **(programs or {})}
+        self.programs = {"matmul": TiledMatmul(128, 128),
+                         "dense_latent_attention": _PlannedRecipe(_generic_latent_build),
+                         **(programs or {})}
         self.default = default or ResourceEnvelope()
 
     def select(self, op: object) -> Recipe:
@@ -361,9 +427,68 @@ class RecipeBook:
             if op.source_boundary == "call" and recipe.kernels is None:
                 raise ModelingError(f"source_kernel_expansion_required:{op.recipe}")
             return recipe
+        view = dict(dict(op.metadata).get("attention_tensor_view", {}) or {})
+        explicit = (str(getattr(op, "recipe", "")) in self._explicit_recipes
+                    or str(getattr(op, "family", "")) in self._explicit_families)
+        if (not explicit
+                and dict(op.metadata).get("program_kind") == "dense_latent_attention_generic"
+                and view.get("kind") == "dense_paged_latent"
+                and "latent_attention_schedule" in dict(op.metadata)):
+            recipe = self.programs.get("dense_latent_attention")
+            if isinstance(recipe, PlannedRecipe):
+                return recipe
         kind = dict(op.metadata).get("program_kind")
-        recipe = self.recipes.get(op.recipe, self.families.get(
-            op.family, self.programs.get(kind, self.default)))
+        recipe_name = str(getattr(op, "recipe", ""))
+        # Priority: a caller-supplied recipe override, then an explicitly
+        # selected grouped_gemm physical family for the generic balanced
+        # names, then the ordinary recipe/family/default lookup.  Specific
+        # alternate recipes (K3, negative-weight, explicit grouped variants)
+        # keep their own binding and are never replaced by the NXNK family.
+        generic_grouped = {"balanced_grouped_gate_up",
+                           "balanced_grouped_down"}
+        if recipe_name in self._caller_recipes:
+            recipe = self.recipes[recipe_name]
+        elif (str(getattr(op, "family", "")) in self._explicit_families
+              and str(getattr(op, "family", "")) != "grouped_gemm"):
+            # An explicit caller family is authoritative over any automatic
+            # source leaf, including the shared W4A8 default.
+            recipe = self.families[op.family]
+        elif str(getattr(op, "family", "")) in {"gate_up_projection",
+                                                "down_projection"}:
+            from .shared_w4a8 import (config_from_op as _shared_config,
+                                      matches_source_interface as _shared_match,
+                                      recipe as _shared_recipe)
+            if _shared_match(op):
+                # A valid ordinary shared W4A8 interface with a bad local
+                # shape/scale must surface its error, not fall back.
+                _shared_config(op)
+                recipe = _shared_recipe()
+            else:
+                recipe = self.recipes.get(recipe_name, self.families.get(
+                    op.family, self.programs.get(kind, self.default)))
+        elif (str(getattr(op, "family", "")) == "grouped_gemm"
+              and "grouped_gemm" in self._explicit_families
+              and recipe_name in generic_grouped):
+            recipe = self.families["grouped_gemm"]
+            # The shared MXA8W4 NZNK family is source-specific.  Do not apply
+            # it to unsupported W8/other layouts: the existing typed
+            # config_from_op is the gate; on rejection use the ordinary
+            # recipe default (never a blanket all-grouped W4 binding).
+            if self._family_kinds.get("grouped_gemm") == "ascend_mxa8w4_nznk":
+                from .mxfp4_grouped import (config_from_op as _mxfp4_config,
+                                            matches_source_interface)
+                if not matches_source_interface(op):
+                    # Unsupported W8/other layout/weight group: use the
+                    # ordinary analytical grouped recipe that existed before
+                    # the source family.
+                    recipe = self._generic_grouped
+                else:
+                    # A valid source interface with malformed/inconsistent
+                    # rows must surface its real error, not silently fall back.
+                    _mxfp4_config(op)
+        else:
+            recipe = self.recipes.get(recipe_name, self.families.get(
+                op.family, self.programs.get(kind, self.default)))
         if "matrix_group_rows" in dict(op.metadata):
             from .grouped_rows import adapt
             recipe = adapt(recipe, op)
@@ -411,6 +536,8 @@ class RecipeBook:
         from .mxfp4_grouped import recipe as mxa8w4_nznk
         from .bf16_grouped import recipe as bf16_grouped
         from .mxfp8_grouped import recipe as mxfp8_grouped
+        from .family_kda_recurrent import recipes as kda_recurrent_recipes
+        from .family_attnres import recipes as attn_res_recipes
         from .collectives import PairwiseCollective, RingCollective
         from .direct_peer import DirectPeerCollective
         factories = {"envelope": ResourceEnvelope, "tiled_matmul": TiledMatmul,
@@ -436,9 +563,17 @@ class RecipeBook:
         explicit = {**native_moe_recipes(raw), **hccl_recipes(raw),
                     **sparse_kv_offload_recipes(),
                     **implementation_recipes(raw.get("lowerings", {})),
+                    **kda_recurrent_recipes(),
+                    **attn_res_recipes(),
                     **build(raw.get("recipes", {}))}
-        return cls(explicit, families=build(raw.get("families", {})),
+        book = cls(explicit, families=build(raw.get("families", {})),
                    programs=build(raw.get("programs", {})))
+        book._caller_recipes = frozenset((raw.get("recipes") or {}).keys())
+        book._family_kinds = {
+            name: value.get("kind") for name, value in
+            (raw.get("families") or {}).items()
+            if isinstance(value, Mapping)}
+        return book
 
 
 class HostStaging:

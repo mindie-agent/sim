@@ -9,6 +9,7 @@
 """
 from copy import deepcopy
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 import math
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -26,6 +27,90 @@ NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
 # feasible block is not evidence that the deployed kernel dispatches it.
 UNDERFILLED_CANDIDATES = tuple((m, n, k) for m in (16, 32, 64)
                               for n in (16, 32, 64) for k in (64, 128))
+
+
+def mte_owner_unit_count(resource_units):
+    """Hardware unit count that pins one matrix output owner.
+
+    Native ``owned(core, core_count, read_role)`` partitions ``mte2_aic``.
+    A supply that never declares those units has no per-owner split.
+    """
+    units = dict(resource_units or ())
+    for name in ("mte2_aic", "mte2", "compute_units"):
+        value = int(units.get(name, 0) or 0)
+        if value > 0:
+            return value
+    return 0
+
+
+def gemm_fractal_operand_bytes(tokens, n_tiles, n_pad, k_pad, act_bytes, weight_bytes,
+                               *, fractal=16):
+    """Summed operand bytes of the piecewise GEMM copy, before partials.
+
+    Activation is copied once per N tile at the 16-row fractal height.
+    Weights move once at the padded N.  Split-K cancels: each split carries
+    ``K / splits``.  This is the family's summed copy, not the slowest owner.
+    """
+    tokens = int(tokens)
+    if tokens <= 0 or int(n_tiles) <= 0 or int(k_pad) <= 0:
+        return Fraction(0)
+    rows = (tokens + int(fractal) - 1) // int(fractal) * int(fractal)
+    act = Fraction(act_bytes)
+    weight = Fraction(weight_bytes)
+    return (Fraction(int(n_tiles)) * rows * Fraction(int(k_pad)) * act
+            + Fraction(int(k_pad)) * Fraction(int(n_pad)) * weight)
+
+
+def critical_output_owner_rate_fraction(
+    m, n, k, tile_m, tile_n, units, *,
+    act_bytes, weight_bytes, charged_bytes=None, groups=1,
+):
+    """Share of an aggregate pipe that elapses as the slowest output owner.
+
+    ``SteadyMatmul`` pins each output tile with ``owned(core, core_count, ...)``.
+    Idle units stay idle.  One tile on a 20-unit pipe therefore runs at
+    ``1/20`` of the aggregate, and the makespan is the maximum private copy
+
+        act_bytes * m_extent * k + weight_bytes * n_extent * k
+
+    using the exact local tail from ``owner_tiles`` (a 288-wide N on a
+    128 tile is 128, 128, 32, not the average 96).  Piecewise stage work
+    sums every owner and, for the GEMM family, the fractal row pad.  Passing
+    that summed ``charged_bytes`` makes
+
+        charged / (aggregate * fraction) = max_copy / (aggregate / units)
+
+    without rewriting the charged bytes and without reading a duration.
+    HBM is unpinned and is not this share.  A missing unit count returns 1.
+    """
+    units = int(units)
+    if units <= 0 or int(m) <= 0 or int(n) <= 0 or int(k) <= 0:
+        return Fraction(1)
+    owners = owner_tiles(
+        int(m), int(n), max(1, int(tile_m)), max(1, int(tile_n)),
+        units, int(groups))
+    if not owners:
+        return Fraction(1)
+    act = Fraction(act_bytes)
+    weight = Fraction(weight_bytes)
+    kk = Fraction(int(k))
+    m_tiles = max(1, (int(m) + max(1, int(tile_m)) - 1) // max(1, int(tile_m)))
+    copies = [
+        act * Fraction(extent_m) * kk
+        + (weight * Fraction(extent_n) * kk / Fraction(m_tiles))
+        for _count, extent_m, extent_n, _area in owners
+    ]
+    peak = max(copies)
+    if peak <= 0:
+        return Fraction(1)
+    # The W panel is reused across the M tiles; the stage ledger charges W
+    # once while each owner's local panel is replicated per M tile.  Use the
+    # same schedule in the denominator.  For one M tile this is exactly the
+    # old owner-copy law (sparse/tail/single-owner); only real tails lower it.
+    basis = Fraction(charged_bytes) if charged_bytes is not None else sum(copies, Fraction(0))
+    if basis <= 0:
+        return Fraction(1)
+    return min(Fraction(1), basis / (peak * Fraction(units)))
 
 
 def owner_tiles(m, n, tm, tn, cores, groups=1):

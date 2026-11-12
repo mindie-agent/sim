@@ -13,6 +13,7 @@
 """
 from collections import Counter
 from dataclasses import dataclass
+from fractions import Fraction
 
 from mindie_sim.schema.common import ModelingError
 
@@ -45,10 +46,16 @@ class BalancedRouting:
     padded_local_tokens: int
     representative_rank: int = 0
     represented_ranks: tuple[int, ...] = (0,)
+    expected_rows: Fraction | None = None
 
     @property
     def rows(self):
         return sum(self.local_expert_rows)
+
+    @property
+    def rank_assignment_rows(self):
+        return tuple(sum(_rank_rows(self.expert_rows, self.ep, rank))
+                     for rank in range(self.ep))
 
     @property
     def active(self):
@@ -83,6 +90,8 @@ class BalancedRouting:
             "rank_timing_assumption": ("exact_physical_rank" if len(self.represented_ranks) == 1
                                        else "heaviest_local_tp_shard_upper_bound"),
             "cohort_counts_basis": "exact_integer_expert_assignment_ledger",
+            "expected_rows_per_expert": (float(self.expected_rows)
+                                         if self.expected_rows is not None else None),
             "valid_local_tokens": self.valid_local_tokens,
             "padded_local_tokens": self.padded_local_tokens,
             "source_partitions": self.source_partitions,
@@ -113,11 +122,13 @@ def balanced_realization(runtime, layer, *, tokens, valid_tokens, global_tokens,
     local_rows = _rank_rows(counts, p.ep, representative)
     # PCP prefill tokens are already split across PCP ranks. Dividing by the
     # PCP-extended local EP width would shrink dispatch/combine a second time.
-    return BalancedRouting(counts, local_rows, p.ep,
-                           max(1, min(p.tp, p.ep) // token_shards), total,
-                           (valid_tokens * token_shards if valid_source_tokens is None
-                            else valid_source_tokens), tokens * token_shards,
-                           representative, ranks)
+    return BalancedRouting(
+        counts, local_rows, p.ep,
+        max(1, min(p.tp, p.ep) // token_shards), total,
+        (valid_tokens * token_shards if valid_source_tokens is None
+         else valid_source_tokens), tokens * token_shards,
+        representative, ranks,
+        Fraction(total * max(1, layer.top_k), p.ep))
 
 
 def cohort_padded_tokens(groups, runtime):

@@ -13,24 +13,44 @@ from .structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
 
+def physical_global_ranks(runtime, replicas):
+    """Global rank scope for DP replicas under the declared DP-outer/TP-inner layout.
+
+    The value is a scope, not an observed-owner substitution: W18F/W19F select
+    the actual TP member (for example TP0 or TP2) from source provenance.
+    """
+    tp = max(1, int(runtime.parallel.tp))
+    dp = max(1, int(runtime.parallel.dp))
+    out = {}
+    for replica in replicas:
+        replica = int(replica)
+        if replica < 0 or replica >= dp:
+            raise ModelingError(f"body_replica_outside_declared_dp:{replica}:{dp}")
+        out[replica] = tuple(replica * tp + tp_rank for tp_rank in range(tp))
+    return out
+
+
 def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
-                 recipes=None, primitives=None, event_limit=0):
+                 recipes=None, primitives=None, event_limit=0, compact=False,
+                 padded_idle=False):
     case = parse_case(case)
     if case.model.is_standalone_draft:
         raise ModelingError("draft_requires_target_model:attach_auxiliary_to_target;catalog_inspection_available")
     graphs = target_graphs(case, phase=phase, tokens=tokens, context=context,
                            sequences=sequences, scope="body",
-                           apply_body_defaults=recipes is None)
+                           apply_body_defaults=recipes is None,
+                           padded_idle=padded_idle)
     default_selection = (graphs.default_selection if recipes is None else
                          {"profile": "explicit_recipe_book_preserved"})
     result = graph_costs(case, graphs, recipes=recipes, primitives=primitives,
                          external_inputs={"analysis_input": 0},
                          include_submission=False, isolated=False,
-                         trace_limit=event_limit)
+                         trace_limit=event_limit, compact=compact)
     counts = cohort_sequence_counts(sequences, tuple(graphs))
     from .decode_probe import probe_capacity
     capacity = probe_capacity(case, context=context, tokens=tokens,
-                              sequences=sequences, phase=phase)
+                              sequences=sequences, phase=phase,
+                              padded_idle=padded_idle)
     padded = capacity["padded_query_tokens_by_replica"]
     graph_rows = capacity["graph_query_tokens_by_replica"]
     return {
@@ -45,6 +65,9 @@ def body_forward(case, *, phase="decode", tokens=1, context=0, sequences=1,
                      "graph_query_tokens_by_replica": graph_rows,
                      "graph_query_tokens": sum(graph_rows.values()),
                      "padded_query_tokens_by_replica": padded,
+                     "physical_global_rank_basis": "dp_replica * tp + tp_rank",
+                     "physical_global_ranks_by_replica": physical_global_ranks(
+                         case.runtime, tuple(graphs)),
                      "padding_basis": "graph_bucket_then_declared_sequence_parallel_padding",
                      "valid_query_tokens": tokens * sum(counts.values()),
                      "padded_query_tokens": sum(padded.values())},

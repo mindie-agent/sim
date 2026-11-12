@@ -129,7 +129,13 @@ class Engine:
         self.busy_ms = dict.fromkeys(self.resources, 0.0)
         self._tasks: dict[int, _Task] = {}
         self._promises: dict[int, Event] = {}
-        self._ready: set[int] = set()
+        # Ready and completable heaps are sequence-ordered. Running tasks stay
+        # out of the completable heap until work and latency are both done, so
+        # a zero-work chain does not re-sort every overlapping active task.
+        self._ready_heap: list[int] = []
+        self._ready_seen: set[int] = set()
+        self._completable: list[int] = []
+        self._completable_seen: set[int] = set()
         self._active: set[int] = set()
         self._releases: list[tuple[float, int]] = []
         self._sequence = 0
@@ -137,6 +143,17 @@ class Engine:
         self.peak_tasks = 0
         self.trace = deque(maxlen=trace_limit)
         self.trace_dropped = 0
+        # Isolated-schedule trace. A private program records the exact advance
+        # steps that touched only its own replica resources; identical ranks and
+        # later invocations replay those steps instead of rebuilding tasks.
+        self._trace_prefix: str | None = None
+        self._trace_token: str | None = None
+        self._trace_steps: list | None = None
+        self._trace_peaks: dict | None = None
+        self._trace_clean = True
+        self._trace_private = True
+        self._script_pending = None
+        self._script_pending_key = None
 
     def extend(self, resources=(), pools=None, pool_units=None):
         """Add a disjoint physical pool to the same virtual clock."""
@@ -250,6 +267,7 @@ class Engine:
         if not pending:
             self._queue(task)
         self.peak_tasks = max(self.peak_tasks, len(self._tasks))
+        self._note_traced_submit(name, prepared)
         return event
 
     def future(self, name: str) -> Event:
@@ -272,9 +290,21 @@ class Engine:
                 self._queue(dependent)
         event._waiters.clear()
 
+    def _push_ready(self, key: int) -> None:
+        if key in self._ready_seen:
+            return
+        self._ready_seen.add(key)
+        heapq.heappush(self._ready_heap, key)
+
+    def _push_completable(self, key: int) -> None:
+        if key in self._completable_seen:
+            return
+        self._completable_seen.add(key)
+        heapq.heappush(self._completable, key)
+
     def _queue(self, task: _Task) -> None:
         if task.release <= self.now:
-            self._ready.add(task.event.sequence)
+            self._push_ready(task.event.sequence)
         else:
             heapq.heappush(self._releases, (task.release, task.event.sequence))
 
@@ -301,6 +331,7 @@ class Engine:
                 if not self.unit_allocated[pair]:
                     del self.unit_allocated[pair]
         self._active.discard(key)
+        self._completable_seen.discard(key)
         del self._tasks[key]
         self.completed_count += 1
         if self.trace.maxlen:
@@ -318,36 +349,68 @@ class Engine:
         if task.callback is not None:
             task.callback(task.event)
 
+    def _start_ready(self, key: int) -> None:
+        task = self._tasks[key]
+        for item in task.acquire:
+            self.allocations[item.name] = item
+            self.allocated[item.pool] += item.size * len(item.units)
+            for unit in item.units:
+                pair = item.pool, unit
+                self.unit_allocated[pair] = self.unit_allocated.get(pair, 0) + item.size
+                self.peak_unit_allocated[pair] = max(
+                    self.peak_unit_allocated.get(pair, 0), self.unit_allocated[pair])
+                self.peak_allocated[item.pool] = max(
+                    self.peak_allocated[item.pool], self.unit_allocated[pair])
+        task.start = self.now
+        self._active.add(key)
+        if self._trace_prefix and task.event.name.startswith(self._trace_prefix):
+            token = self._trace_token
+            peaks = self._trace_peaks
+            for item in task.acquire:
+                if token not in item.pool:
+                    continue
+                for unit in item.units:
+                    val = self.unit_allocated[item.pool, unit]
+                    norm = item.pool.replace(token, "@r*", 1), unit
+                    if val > peaks.get(norm, 0.0):
+                        peaks[norm] = val
+        if not task.remaining and self.now >= task.start + task.latency:
+            self._push_completable(key)
+
     def _settle(self) -> None:
         while self._releases and self._releases[0][0] <= self.now:
             _, key = heapq.heappop(self._releases)
-            self._ready.add(key)
-        changed = True
-        while changed:
-            changed = False
-            for key in sorted(self._ready):
-                task = self._tasks[key]
-                if not self._can_allocate(task):
+            self._push_ready(key)
+        for key in self._active:
+            task = self._tasks[key]
+            if not task.remaining and self.now >= task.start + task.latency:
+                self._push_completable(key)
+        while True:
+            deferred: list[int] = []
+            while self._ready_heap:
+                key = self._ready_heap[0]
+                task = self._tasks.get(key)
+                heapq.heappop(self._ready_heap)
+                self._ready_seen.discard(key)
+                if task is None:
                     continue
-                self._ready.remove(key)
-                for item in task.acquire:
-                    self.allocations[item.name] = item
-                    self.allocated[item.pool] += item.size * len(item.units)
-                    for unit in item.units:
-                        pair = item.pool, unit
-                        self.unit_allocated[pair] = self.unit_allocated.get(pair, 0) + item.size
-                        self.peak_unit_allocated[pair] = max(
-                            self.peak_unit_allocated.get(pair, 0), self.unit_allocated[pair])
-                        self.peak_allocated[item.pool] = max(
-                            self.peak_allocated[item.pool], self.unit_allocated[pair])
-                task.start = self.now
-                self._active.add(key)
-                changed = True
-            for key in sorted(self._active):
-                task = self._tasks[key]
-                if not task.remaining and self.now >= task.start + task.latency:
-                    self._complete(task)
-                    changed = True
+                if not self._can_allocate(task):
+                    deferred.append(key)
+                    continue
+                self._start_ready(key)
+            for key in deferred:
+                self._push_ready(key)
+            if not self._completable:
+                return
+            # Drain the snapshot before starting tasks woken by these callbacks.
+            # Lower sequence numbers still complete first, matching sorted order.
+            batch = [heapq.heappop(self._completable) for _ in range(len(self._completable))]
+            for key in batch:
+                self._completable_seen.discard(key)
+                task = self._tasks.get(key)
+                if task is None or task.remaining or self.now < task.start + task.latency:
+                    continue
+                self._complete(task)
 
     def _rates(self) -> dict[str, dict[int, float]]:
         contenders: dict[str, dict[int, float]] = {}
@@ -381,6 +444,9 @@ class Engine:
             raise ExecutionError("time_cannot_move_backwards")
         while True:
             self._settle()
+            if self._script_pending is not None and self.replay_ready():
+                self._drain_script()
+                continue
             complete = tuple(event for event in until if event.done)
             if (complete and first) or (until and len(complete) == len(until)):
                 return complete
@@ -406,7 +472,28 @@ class Engine:
             next_time = self.now + dt
             if dt > 0 and next_time == self.now:
                 next_time = math.nextafter(self.now, math.inf)
+            tracing = self._trace_prefix is not None
+            adds = []
+            busy = []
+            if tracing:
+                prefix = self._trace_prefix
+                for key in self._active:
+                    if not self._tasks[key].event.name.startswith(prefix):
+                        self._trace_clean = False
+                        break
+                if self._releases:
+                    rel_t, rel_key = self._releases[0]
+                    rel_task = self._tasks.get(rel_key)
+                    if rel_t <= self.now + dt and (
+                            rel_task is None or not rel_task.event.name.startswith(prefix)):
+                        self._trace_clean = False
             for name, consumers in rates.items():
+                own_resource = tracing and self._trace_token in name
+                if tracing and not own_resource:
+                    self._trace_private = False
+                    self._trace_clean = False
+                if own_resource:
+                    busy.append(name.replace(self._trace_token, "@r*", 1))
                 self.busy_ms[name] += dt
                 for key, rate in consumers.items():
                     task = self._tasks[key]
@@ -420,10 +507,14 @@ class Engine:
                     if self.trace.maxlen:
                         task.service[name] = task.service.get(name, 0.0) + used
                     self.serviced[name] += used
+                    if own_resource and task.event.name.startswith(self._trace_prefix):
+                        adds.append((name.replace(self._trace_token, "@r*", 1), used))
                     if residual:
                         task.remaining[name] = residual
                     else:
                         del task.remaining[name]
+            if tracing and self._trace_clean:
+                self._trace_steps.append((dt, tuple(busy), tuple(adds)))
             self.now = next_time
 
     def summary(self) -> dict:
@@ -440,3 +531,92 @@ class Engine:
             "peak_live_tasks": self.peak_tasks,
             "retained_trace_events": len(self.trace), "trace_dropped": self.trace_dropped,
         }
+
+    def _note_traced_submit(self, name: str, prepared: _PreparedTask) -> None:
+        prefix = self._trace_prefix
+        if prefix is None:
+            return
+        if (prepared.demand or prepared.acquire) and not name.startswith(prefix):
+            self._trace_clean = False
+        token = self._trace_token
+        if token is None:
+            return
+        for key in prepared.demand:
+            if token not in key:
+                self._trace_private = False
+                self._trace_clean = False
+        for item in prepared.acquire:
+            if token not in item.pool:
+                self._trace_private = False
+                self._trace_clean = False
+
+    def begin_trace(self, prefix: str, token: str) -> None:
+        """Record one private program's advance steps under ``prefix``."""
+        self._trace_prefix = prefix
+        self._trace_token = token
+        self._trace_steps = []
+        self._trace_peaks = {}
+        self._trace_clean = True
+        self._trace_private = True
+
+    def end_trace(self):
+        """Stop recording. The script is reusable only when every step stayed private."""
+        clean = self._trace_clean and self._trace_private
+        steps = tuple(self._trace_steps or ())
+        peaks = tuple((pool, unit, value) for (pool, unit), value in (self._trace_peaks or {}).items())
+        self._trace_prefix = None
+        self._trace_token = None
+        self._trace_steps = None
+        self._trace_peaks = None
+        return clean, steps, peaks
+
+    def replay_ready(self) -> bool:
+        """True when no live demand can change an isolated program's rates or dt."""
+        if self._trace_prefix is not None:
+            return False
+        for task in self._tasks.values():
+            if task.remaining or task.allocation_demands:
+                return False
+        for key in self._active:
+            task = self._tasks[key]
+            if task.latency and task.start is not None and self.now < task.start + task.latency:
+                return False
+        return True
+
+    def queue_script(self, key, steps, members, peaks) -> None:
+        """Replay ``steps`` once for every ``(rank token, completion)`` member."""
+        self._script_pending_key = key
+        self._script_pending = (steps, list(members), peaks)
+
+    def _drain_script(self) -> None:
+        steps, members, peaks = self._script_pending
+        self._script_pending = None
+        self._script_pending_key = None
+        for dt, busy, adds in steps:
+            next_time = self.now + dt
+            if dt > 0 and next_time == self.now:
+                next_time = math.nextafter(self.now, math.inf)
+            for name in busy:
+                for token, _complete in members:
+                    concrete = name.replace("@r*", token, 1)
+                    if concrete in self.busy_ms:
+                        self.busy_ms[concrete] += dt
+            for name, used in adds:
+                for token, _complete in members:
+                    concrete = name.replace("@r*", token, 1)
+                    if concrete in self.serviced:
+                        self.serviced[concrete] += used
+            self.now = next_time
+        for pool, unit, value in peaks:
+            for token, _complete in members:
+                concrete = pool.replace("@r*", token, 1)
+                if concrete not in self.peak_allocated:
+                    continue
+                pair = concrete, unit
+                if value > self.peak_unit_allocated.get(pair, 0.0):
+                    self.peak_unit_allocated[pair] = value
+                if value > self.peak_allocated[concrete]:
+                    self.peak_allocated[concrete] = value
+        for _token, complete in members:
+            if complete.time is None:
+                self.resolve(complete)

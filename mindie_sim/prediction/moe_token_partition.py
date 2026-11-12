@@ -57,6 +57,9 @@ class TokenPartition:
     kind: str = KIND
     padding_implementation: str = "concat"
     ep: int = 0
+    logits_dtype: str = ""
+    activation_tensor_rows: int = 0
+    activation_owners: int = 0
 
     @property
     def caller(self):
@@ -87,10 +90,15 @@ class TokenPartition:
             "valid_rows_per_rank": self.valid_per_rank,
             "gather_output_materialization": self.gather_output_materialization,
             "source": self.source,
+            **({"activation_tensor_rows": self.activation_tensor_rows}
+               if self.activation_tensor_rows else {}),
+            **({"activation_owners": self.activation_owners}
+               if self.activation_owners else {}),
         }),)
 
     def prepare(self, *, prefix, input_id, logits_id, width, experts,
                 stage, layer, requests, phase, dtype, logits_dtype):
+        logits_dtype = self.logits_dtype or logits_dtype
         prepared = []
         def view(suffix, dependency, columns, element_dtype):
             if self.allocated_rows != self.full_rows:
@@ -216,7 +224,8 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
         return None
     if (not isinstance(raw, dict) or raw.get("kind") not in {KIND, ALLTOALL_KIND}
             or set(raw) - {"kind", "gather_output_materialization", "padding", "layer_scopes",
-                           "padding_implementation"}):
+                           "padding_implementation", "logits_dtype",
+                           "activation_tensor_rows", "activation_owners"}):
         raise ModelingError("moe_token_partition_requires_explicit_vllm_ascend_tp_slice")
     scopes = raw.get("layer_scopes")
     if scopes is not None:
@@ -228,7 +237,10 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
     materialization = raw.get("gather_output_materialization", "view")
     if materialization not in {"view", "per_rank_copy"}:
         raise ModelingError("mc2_gather_output_materialization_requires_view_or_per_rank_copy")
-    if (parallel.tp < 2 or parallel.ep < parallel.tp or parallel.ep % parallel.tp != 0
+    if parallel.tp < 2:
+        # TP1 has no TP reconstruction; ordinary/observed code emits no gather.
+        return None
+    if (parallel.dp != 1 or parallel.ep != parallel.tp
             or parallel.etp != 1 or parallel.cp != 1
             or sequence_plan is not None or reduce_after_join
             or getattr(runtime, "moe_recipe", "alltoall") != "alltoall"):
@@ -246,8 +258,21 @@ def select(runtime, *, parallel, plan, model, tokens, sequence_plan=None,
         raise ModelingError("alltoall_tp_slice_requires_divisible_rows_without_padding")
     if padding not in {"none", "right_to_tp"}:
         raise ModelingError("mc2_tp_slice_padding_requires_none_or_right_to_tp")
+    logits_dtype = raw.get("logits_dtype", "")
+    if logits_dtype not in {"", "bf16", "float32"}:
+        raise ModelingError("mc2_tp_slice_logits_dtype_requires_bf16_or_float32")
+    activation_tensor_rows = raw.get("activation_tensor_rows", 0)
+    activation_owners = raw.get("activation_owners", 0)
+    for name, value in (("activation_tensor_rows", activation_tensor_rows),
+                        ("activation_owners", activation_owners)):
+        if value not in (0, None) and (not isinstance(value, int)
+                                       or isinstance(value, bool) or value < 1):
+            raise ModelingError(f"mc2_tp_slice_{name}_requires_positive_integer")
     if tokens <= 0 or (tokens % parallel.tp and padding == "none"):
         raise ModelingError("mc2_tp_slice_requires_positive_tp_divisible_physical_rows")
     local = (tokens + parallel.tp - 1) // parallel.tp
     return TokenPartition(tokens, local, parallel.tp, materialization, padding, raw["kind"],
-                          padding_implementation, ep=parallel.ep)
+                          padding_implementation, ep=parallel.ep,
+                          logits_dtype=logits_dtype,
+                          activation_tensor_rows=int(activation_tensor_rows or 0),
+                          activation_owners=int(activation_owners or 0))

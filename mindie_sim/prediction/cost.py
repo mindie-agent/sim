@@ -144,7 +144,8 @@ class CostModel:
 
     def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
                       response_basis=None, mismatched_axes=(), continuity_group=None,
-                      execution_mode=None, exterior_policy=None):
+                      execution_mode=None, exterior_policy=None, issued_work=None,
+                      rate_flops_per_s=None, active_owners=None, stage=None):
         record = self.regimes.setdefault(key, {
             "model_id": key, **model, "queries": {}, "response_us_min": None,
             "response_us_max": None})
@@ -163,6 +164,15 @@ class CostModel:
         if exterior_policy is not None:
             policies = record.setdefault("exterior_policies", {})
             policies[exterior_policy] = policies.get(exterior_policy, 0) + 1
+        if issued_work is not None:
+            record["issued_work"] = max(
+                float(record.get("issued_work", 0.0)), float(issued_work))
+        if rate_flops_per_s is not None:
+            record["rate_flops_per_s"] = float(rate_flops_per_s)
+        if active_owners is not None:
+            record["active_owners"] = int(active_owners)
+        if stage is not None:
+            record["stage"] = str(stage)
         for axis in mismatched_axes:
             counts = record.setdefault("mismatched_axes", {})
             counts[axis] = counts.get(axis, 0) + 1

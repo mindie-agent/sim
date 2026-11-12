@@ -40,6 +40,9 @@ class Software:
     invalid_full_modes: bool = False
     deepep_high_throughput: bool = False
     multistream_overlap_shared_expert: bool = False
+    multistream_kda_proj: bool = False
+    multistream_attention_indexer: bool = False
+    multistream_window_compressed: bool = False
     moe_recipe: str = "alltoall"
     mc2_chunks: int = 4
     mtp_acceptance_length: float = 1

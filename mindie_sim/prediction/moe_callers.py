@@ -13,6 +13,7 @@ from __future__ import annotations
 from collections import Counter
 from dataclasses import dataclass, replace
 import math
+from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
 
@@ -20,29 +21,51 @@ from mindie_sim.schema.common import ModelingError
 LOCAL_EXPERT_REDUCE = "local_expert_reduce"
 _FLOAT_EXPERT_FORMATS = {"bf16": "bf16", "bfloat16": "bf16",
                          "fp16": "fp16", "float16": "fp16"}
+_W8A8_FORMATS = {"int8": "int8", "w8a8": "int8"}
+_FULL_EAGER_GROUPED = "full_eager_allocation"
 
 
-def _effective_expert_format(quant, category):
-    """Resolve the category selection used by the ordinary matrix builders."""
-    return _FLOAT_EXPERT_FORMATS.get(
-        str(quant.for_category(category).format_for(category)).strip().lower())
+def _category_format(quant, category):
+    return quant.for_category(category).format_for(category)
 
 
-def _require_floating_expert_paths(model):
+def _expert_path(model):
+    """Float experts stay on the original caller. W8A8 is a separate legal path.
+
+    Routed int8 or w8a8 with a floating activation is accepted when the shared
+    expert is that same activation float or the same int8. Shared int8 beside
+    floating routed experts, mixed floats, and every other quantized format
+    stay rejected. The recipe still has to be selected explicitly.
+    """
     activation = _FLOAT_EXPERT_FORMATS.get(str(model.activation_dtype).strip().lower())
     if activation is None:
         raise ModelingError(
             f"local_expert_reduce_requires_floating_activation_dtype:{model.activation_dtype}")
-    for category in ("routed_expert", "shared_expert"):
-        fmt = _effective_expert_format(model.quant, category)
-        if fmt is None:
-            raise ModelingError(
-                "local_expert_reduce_rejects_quantized_expert_format:"
-                f"{category}:{model.quant.for_category(category).format_for(category)}")
-        if fmt != activation:
+    routed_shown = _category_format(model.quant, "routed_expert")
+    shared_shown = _category_format(model.quant, "shared_expert")
+    routed_f = _FLOAT_EXPERT_FORMATS.get(str(routed_shown).strip().lower())
+    shared_f = _FLOAT_EXPERT_FORMATS.get(str(shared_shown).strip().lower())
+    routed_q = _W8A8_FORMATS.get(str(routed_shown).strip().lower())
+    shared_q = _W8A8_FORMATS.get(str(shared_shown).strip().lower())
+    if routed_f is not None and shared_f is not None:
+        if routed_f != activation:
             raise ModelingError(
                 "local_expert_reduce_rejects_mixed_expert_format:"
-                f"{category}:{fmt}!={activation}")
+                f"routed_expert:{routed_f}!={activation}")
+        if shared_f != activation:
+            raise ModelingError(
+                "local_expert_reduce_rejects_mixed_expert_format:"
+                f"shared_expert:{shared_f}!={activation}")
+        return "float"
+    if routed_q == "int8" and (shared_f == activation or shared_q == "int8"):
+        return "w8a8"
+    if routed_f is None:
+        raise ModelingError(
+            "local_expert_reduce_rejects_quantized_expert_format:"
+            f"routed_expert:{routed_shown}")
+    raise ModelingError(
+        "local_expert_reduce_rejects_quantized_expert_format:"
+        f"shared_expert:{shared_shown}")
 
 
 # Source identities describe the selected branch. They are never a timing input.
@@ -245,6 +268,8 @@ class LocalExpertReduce:
     source_partitions: int = 1
     exchange: bool = False
     reduce_after_join: bool = True
+    #: W8A8 eager allocation is a witness; matrix m stays the local bank rows.
+    full_buffer_grouped: bool = False
 
     def __post_init__(self):
         if self.ep < 1 or self.experts % self.ep:
@@ -304,6 +329,17 @@ class LocalExpertReduce:
                 active_local_experts=active,
                 histogram_counts=tuple(bank_rows),
                 global_expert_rows=tuple(expert_rows),
+            )
+        if self.full_buffer_grouped:
+            # The eager router allocates q*top_k slots, but the native grouped
+            # GEMM consumes only the local bank's group-list rows. Keep the
+            # active matrix rows and the larger allocation as separate facts;
+            # never turn rank totals or the allocation into per-expert counts.
+            metadata.update(
+                grouped_gemm_rows=_FULL_EAGER_GROUPED,
+                matrix_active_rows=local_rows,
+                matrix_capacity_rows=self.allocated_rows,
+                matrix_capacity_basis="eager_routing_allocation_not_activated_rows",
             )
         return tuple(metadata.items())
 
@@ -460,9 +496,16 @@ def select(runtime, plan, parallel, model, tokens: int, *,
         raise ModelingError("local_expert_reduce_rejects_routed_output_transform")
     if global_tokens not in (None, tokens):
         raise ModelingError("local_expert_reduce_requires_replicated_dp1_tokens")
-    _require_floating_expert_paths(model)
+    path = _expert_path(model)
+    # The full grouped-matmul buffer is an explicit W8A8 witness. A float
+    # caller that does not declare it keeps the heaviest contiguous bank.
+    full_buffer = (
+        path == "w8a8"
+        and metadata.get("moe_grouped_gemm_rows") == _FULL_EAGER_GROUPED
+    )
     policy = LocalExpertReduce(tokens=tokens, top_k=plan.top_k,
-                               experts=plan.num_experts, ep=parallel.ep)
+                               experts=plan.num_experts, ep=parallel.ep,
+                               full_buffer_grouped=full_buffer)
     if routing_realization is not None:
         basis = getattr(routing_realization, "basis", "")
         if basis == "source_force_eplb_masked_integer_counts":
@@ -516,3 +559,556 @@ def local_expert_reduce_recipe(**kwargs):
     kwargs.pop("chunks", None)
     kwargs["caller"] = policy
     return alltoall(**kwargs)
+
+
+@dataclass(frozen=True)
+class ExpertReceipt:
+    """One current-rank routed-expert receipt shared by native GMM1/GMM2.
+
+    ``counts``/``group_list`` are local-expert values; ``received_rows`` is the
+    actual local activation R_rank only when an explicit scoped source declared
+    it; ``upper_bound`` is the separately declared capacity.  A global count
+    vector without the current rank's local ids stays symbolic, never sliced.
+    """
+
+    layer: int
+    rank_index: int | None
+    ep: int
+    local_expert_ids: tuple[int, ...] | None
+    counts: tuple[int, ...] | None
+    group_list: tuple[int, ...] | None
+    valid_rows: int | None
+    received_rows: int | None
+    upper_bound: int | None
+    activation_dtype: str
+    scale_dtype: str
+    group_list_dtype: str
+    basis: str
+    symbolic: bool
+    ownership_known: bool
+    input_group_list: tuple[int, ...] | None = None
+    input_group_list_type: int | None = None
+    gmm1_group_list: tuple[int, ...] | None = None
+    gmm1_group_list_type: int | None = 0
+    gmm2_group_list: tuple[int, ...] | None = None
+    gmm2_group_list_type: int | None = None
+    gmm1_shape_complete: bool = False
+    gmm2_shape_complete: bool = False
+    conflicts: tuple[str, ...] = ()
+
+    @property
+    def shape_complete(self) -> bool:
+        return self.gmm1_shape_complete and self.gmm2_shape_complete
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "layer": self.layer,
+            "rank_index": self.rank_index,
+            "ep": self.ep,
+            "local_expert_ids": (list(self.local_expert_ids)
+                                 if self.local_expert_ids is not None else None),
+            "counts": list(self.counts) if self.counts is not None else None,
+            "group_list": (list(self.group_list)
+                           if self.group_list is not None else None),
+            "group_list_type": 0,
+            "canonical_counts": list(self.counts) if self.counts is not None else None,
+            "canonical_group_list": (list(self.gmm1_group_list)
+                                     if self.gmm1_group_list is not None else None),
+            "canonical_group_list_type": 0,
+            "input_group_list": (list(self.input_group_list)
+                                 if self.input_group_list is not None else None),
+            "input_group_list_type": self.input_group_list_type,
+            "input_group_list_layout": ("per_expert"
+                                        if self.input_group_list_type == 1 else
+                                        "cumulative"
+                                        if self.input_group_list_type == 0 else None),
+            "gmm1_group_list": (list(self.gmm1_group_list)
+                                if self.gmm1_group_list is not None else None),
+            "gmm1_group_list_type": self.gmm1_group_list_type,
+            "gmm2_group_list": (list(self.gmm2_group_list)
+                                if self.gmm2_group_list is not None else None),
+            "gmm2_group_list_type": self.gmm2_group_list_type,
+            "gmm1_shape_complete": self.gmm1_shape_complete,
+            "gmm2_shape_complete": self.gmm2_shape_complete,
+            "valid_rows": self.valid_rows,
+            "received_rows": self.received_rows,
+            "upper_bound": self.upper_bound,
+            "activation_dtype": self.activation_dtype,
+            "scale_dtype": self.scale_dtype,
+            "group_list_dtype": self.group_list_dtype,
+            "basis": self.basis,
+            "symbolic": self.symbolic,
+            "ownership_known": self.ownership_known,
+            "shape_complete": self.shape_complete,
+            "conflicts": list(self.conflicts),
+        }
+
+
+def _receipt_int(value: Any) -> int | None:
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None
+
+
+def _receipt_ints(value: Any) -> tuple[int, ...] | None:
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return None
+    try:
+        values = tuple(int(item) for item in value)
+    except (TypeError, ValueError):
+        return None
+    if any(item < 0 for item in values):
+        return None
+    return values
+
+
+def _receipt_vector(raw: Any, layer: int,
+                    rank: int | None) -> tuple[int, ...] | None:
+    """Current-layer vector: flat tuple or layer/rank-keyed mapping."""
+    if isinstance(raw, Mapping):
+        if layer in raw:
+            return _receipt_ints(raw[layer])
+        if rank is not None and rank in raw:
+            return _receipt_ints(raw[rank])
+        return None
+    return _receipt_ints(raw)
+
+
+def _receipt_source_type(value: Any) -> int | None:
+    if isinstance(value, str):
+        name = value.strip().lower()
+        if name in {"0", "cumulative", "prefix"}:
+            return 0
+        if name in {"1", "per_expert", "counts"}:
+            return 1
+        return None
+    if isinstance(value, int) and not isinstance(value, bool) and value in {0, 1}:
+        return value
+    return None
+
+
+def _receipt_ids(raw: Any, layer: int, rank: int | None) -> tuple[int, ...] | None:
+    """Current-layer ids: flat tuple or layer/rank-keyed mapping, never a scalar."""
+    if isinstance(raw, Mapping):
+        if layer in raw:
+            return _receipt_ints(raw[layer])
+        if rank is not None and rank in raw:
+            return _receipt_ints(raw[rank])
+        return None
+    return _receipt_ints(raw)
+
+
+def _receipt_layer_value(raw: Any, layer: int,
+                         rank: int | None = None) -> Any:
+    """Resolve a per-layer (or rank->per-layer) explicit source value."""
+    if isinstance(raw, Mapping):
+        if layer in raw:
+            value = raw[layer]
+            if (isinstance(value, Mapping) and rank is not None
+                    and rank in value):
+                return value[rank]
+            if (isinstance(value, Sequence)
+                    and not isinstance(value, (str, bytes))
+                    and rank is not None and 0 <= rank < len(value)
+                    and isinstance(value[rank], int)
+                    and not isinstance(value[rank], bool)):
+                return value[rank]
+            return value
+        if rank is not None and rank in raw:
+            value = raw[rank]
+            if isinstance(value, Mapping):
+                return value.get(layer)
+            if (isinstance(value, Sequence)
+                    and not isinstance(value, (str, bytes))
+                    and 0 <= layer < len(value)):
+                return value[layer]
+        return None
+    if isinstance(raw, Sequence) and not isinstance(raw, (str, bytes)):
+        if 0 <= layer < len(raw):
+            return raw[layer]
+        return None
+    if isinstance(raw, int) and not isinstance(raw, bool):
+        return raw
+    return None
+
+
+def _build_expert_receipt(
+    *,
+    layer: int,
+    geometry: Any = None,
+    state: Any = None,
+    local_experts: int = 0,
+    experts: int = 0,
+    ep: int = 0,
+    explicit: Mapping[str, Any] | None = None,
+    activation_dtype: str = "",
+    scale_dtype: str = "",
+    group_list_dtype: str = "int64",
+    expected_scope: str = "",
+) -> ExpertReceipt:
+    """Project the one current-rank receipt used by GMM1 and GMM2.
+
+    Counts come from ``StateView.routing_state(layer)``/``MoeRoutingState`` when
+    present, else ``WorkloadGeometry.routing_for(layer)``.  A global vector is
+    accepted only with the current rank's explicit ``local_expert_ids``; it is
+    never sliced by rank or stride.  ``received_rows`` and ``upper_bound`` come
+    only from the explicit scoped source and must not contradict the counts.
+    """
+    explicit = dict(explicit or {})
+    layer = int(layer)
+    conflicts: list[str] = []
+    explicit_layer = _receipt_int(explicit.get("layer"))
+    if explicit_layer is not None and explicit_layer != layer:
+        conflicts.append("explicit_layer_mismatch")
+    scope = str(explicit.get("scope") or "")
+    if expected_scope and scope and scope != expected_scope:
+        conflicts.append("explicit_scope_mismatch")
+
+    record = None
+    if state is not None:
+        routing_state = getattr(state, "routing_state", None)
+        if callable(routing_state):
+            try:
+                record = routing_state(layer)
+            except ModelingError:
+                record = None
+        elif hasattr(state, "counts"):
+            record = state
+    state_counts = _receipt_ints(getattr(record, "counts", None))
+    state_ids = _receipt_ints(getattr(record, "local_expert_ids", None))
+
+    geometry_counts = None
+    routing_for = getattr(geometry, "routing_for", None)
+    if callable(routing_for):
+        try:
+            geometry_counts = _receipt_ints(routing_for(layer))
+        except ModelingError:
+            geometry_counts = None
+
+    if (state_counts is not None and geometry_counts is not None
+            and tuple(state_counts) != tuple(geometry_counts)):
+        conflicts.append("state_geometry_counts_disagree")
+    counts = state_counts if state_counts is not None else geometry_counts
+    basis = ("state_routing" if state_counts is not None
+             else "geometry_routing" if geometry_counts is not None
+             else "unknown")
+    if "state_geometry_counts_disagree" in conflicts:
+        counts = None
+        basis = "state_geometry_conflict"
+
+    explicit_ids = _receipt_ids(
+        explicit.get("local_expert_ids"), layer,
+        _receipt_int(explicit.get("rank_index",
+                                  explicit.get("current_rank"))))
+    if explicit_ids is not None and state_ids is not None \
+            and tuple(explicit_ids) != tuple(state_ids):
+        conflicts.append("state_explicit_local_expert_ids_disagree")
+    local_ids = explicit_ids if explicit_ids is not None else state_ids
+    rank = _receipt_int(explicit.get("rank_index",
+                                     explicit.get("current_rank")))
+
+    if local_experts < 1:
+        local_experts = (len(local_ids) if local_ids is not None
+                         else len(state_counts) if state_counts is not None
+                         else len(counts) if counts is not None else 0)
+    if experts < 1:
+        experts = len(counts) if counts is not None else local_experts
+    if ep < 1:
+        ep = (experts // local_experts
+              if local_experts > 0 and experts % local_experts == 0 else 0)
+    if local_ids is not None and len(local_ids) != local_experts:
+        conflicts.append("local_expert_ids_length_mismatch")
+        local_ids = None
+
+    local_counts = None
+    ownership_known = False
+    if counts is not None and local_experts > 0:
+        if len(counts) == local_experts:
+            if basis == "state_routing":
+                local_counts = counts
+                ownership_known = local_ids is not None
+            elif local_ids is not None:
+                local_counts = counts
+                ownership_known = True
+            else:
+                conflicts.append("geometry_local_counts_without_local_expert_ids")
+        elif len(counts) == experts:
+            if local_ids is not None:
+                if any(index >= len(counts) for index in local_ids):
+                    conflicts.append("local_expert_ids_out_of_range")
+                else:
+                    local_counts = tuple(counts[index] for index in local_ids)
+                    ownership_known = True
+            else:
+                conflicts.append("global_counts_without_local_expert_ids")
+        else:
+            conflicts.append("routing_count_length_mismatch")
+
+    source_type_raw = explicit.get(
+        "input_group_list_type",
+        explicit.get("moe_input_group_list_type",
+                     explicit.get("moe_group_list_type",
+                                  explicit.get("group_list_type"))))
+    source_type = _receipt_source_type(source_type_raw)
+    if source_type_raw is not None and source_type is None:
+        conflicts.append("input_group_list_type_invalid")
+    source_vector = _receipt_vector(
+        explicit.get("input_group_list",
+                     explicit.get("moe_input_group_list")), layer, rank)
+
+    canonical_prefix = None
+    valid = None
+    if local_counts is not None:
+        running = 0
+        values: list[int] = []
+        for value in local_counts:
+            running += int(value)
+            values.append(running)
+        canonical_prefix = tuple(values)
+        valid = canonical_prefix[-1]
+
+    gmm1_group_list = canonical_prefix
+    gmm1_group_list_type = 0 if gmm1_group_list is not None else None
+    input_group_list = source_vector
+    gmm2_group_list = None
+    gmm2_group_list_type = None
+    if local_counts is not None:
+        if source_type == 1:
+            if source_vector is None:
+                source_vector = canonical_prefix if canonical_prefix is not None else None
+                # type 1 input is the per-expert counts, not the prefix
+                source_vector = local_counts
+            if tuple(source_vector) != tuple(local_counts):
+                conflicts.append("input_per_expert_group_list_disagrees")
+            else:
+                input_group_list = local_counts
+                gmm2_group_list = local_counts
+                gmm2_group_list_type = 1
+        elif source_type == 0:
+            if source_vector is None:
+                source_vector = canonical_prefix
+            if canonical_prefix is not None and (
+                    len(source_vector) != len(canonical_prefix)
+                    or any(source_vector[index] > source_vector[index + 1]
+                           for index in range(len(source_vector) - 1))
+                    or any(source_vector[index] - (source_vector[index - 1]
+                                                   if index else 0)
+                           != local_counts[index]
+                           for index in range(len(local_counts)))):
+                conflicts.append("input_cumulative_group_list_disagrees")
+            else:
+                input_group_list = source_vector
+                gmm2_group_list = source_vector
+                gmm2_group_list_type = 0
+        else:
+            if source_vector is not None:
+                input_group_list = source_vector
+                gmm2_group_list = source_vector
+                gmm2_group_list_type = None
+
+    received = _receipt_int(_receipt_layer_value(
+        explicit.get("received_rows"), layer, rank))
+    capacity = _receipt_int(_receipt_layer_value(
+        explicit.get("capacity_rows", explicit.get("capacity")), layer, rank))
+    if received is not None and valid is not None and received < valid:
+        conflicts.append("received_rows_below_valid_rows")
+        received = None
+    if capacity is not None and (
+            (received is not None and capacity < received)
+            or (valid is not None and capacity < valid)):
+        conflicts.append("capacity_below_received_or_valid_rows")
+        capacity = None
+    if "explicit_layer_mismatch" in conflicts or "explicit_scope_mismatch" in conflicts:
+        local_counts = None
+        canonical_prefix = None
+        gmm1_group_list = None
+        gmm1_group_list_type = None
+        input_group_list = None
+        gmm2_group_list = None
+        gmm2_group_list_type = None
+        valid = None
+        received = None
+        capacity = None
+
+    gmm1_complete = (received is not None and gmm1_group_list is not None
+                     and not conflicts)
+    gmm2_complete = (received is not None and gmm2_group_list is not None
+                     and gmm2_group_list_type is not None and not conflicts)
+    if conflicts and (gmm1_group_list is None or gmm2_group_list is None):
+        basis = conflicts[0]
+    elif gmm1_group_list is None:
+        basis = "group_list_not_declared"
+    elif gmm2_group_list is None or gmm2_group_list_type is None:
+        basis = "input_group_list_type_not_declared"
+    return ExpertReceipt(
+        layer=layer, rank_index=rank, ep=ep,
+        local_expert_ids=local_ids,
+        counts=local_counts,
+        group_list=gmm1_group_list,
+        valid_rows=valid,
+        received_rows=received,
+        upper_bound=capacity,
+        input_group_list=input_group_list,
+        input_group_list_type=source_type,
+        gmm1_group_list=gmm1_group_list,
+        gmm1_group_list_type=gmm1_group_list_type,
+        gmm2_group_list=gmm2_group_list,
+        gmm2_group_list_type=gmm2_group_list_type,
+        gmm1_shape_complete=gmm1_complete,
+        gmm2_shape_complete=gmm2_complete,
+        activation_dtype=str(activation_dtype or ""),
+        scale_dtype=str(scale_dtype or ""),
+        group_list_dtype=str(group_list_dtype or "int64"),
+        basis=basis,
+        symbolic=not (gmm1_complete and gmm2_complete),
+        ownership_known=ownership_known,
+        conflicts=tuple(dict.fromkeys(conflicts)),
+    )
+
+
+def _compiled_receipt_terms(compiled: Any) -> dict[str, Any] | None:
+    """Extract only the shared GMM1/GMM2 source facts from one compiled node."""
+    operator = getattr(compiled, "operator", None)
+    theta = getattr(operator, "theta", None)
+    if theta is None:
+        return None
+    extras = dict(getattr(theta, "extras", {}) or ())
+    quant = dict(getattr(theta, "quant", {}) or ())
+    meta = dict(getattr(compiled, "feature_metadata", ()) or ())
+
+    def pick(*keys: str) -> Any:
+        for key in keys:
+            for source in (extras, meta):
+                if key in source and source[key] is not None:
+                    return source[key]
+        return None
+
+    local = _receipt_int(pick("E_local", "local")) or 0
+    experts = _receipt_int(pick("E")) or 0
+    if local < 1:
+        ids = _receipt_ids(pick("moe_local_expert_ids"),
+                           int(getattr(compiled, "layer", 0) or 0),
+                           _receipt_int(pick("moe_rank_index", "rank_index")))
+        local = len(ids) if ids is not None else 0
+    if experts < 1:
+        experts = local
+    ep = (experts // local
+          if local > 0 and experts > 0 and experts % local == 0 else 0)
+    explicit = {
+        "layer": int(getattr(compiled, "layer", 0) or 0),
+        "rank_index": pick("moe_rank_index", "rank_index"),
+        "local_expert_ids": pick("moe_local_expert_ids"),
+        "received_rows": pick("moe_received_rows", "dispatch_rows",
+                              "received_rows", "router_received_rows"),
+        "capacity_rows": pick("moe_capacity_rows", "capacity_rows"),
+        "input_group_list": pick("moe_input_group_list", "input_group_list"),
+        "input_group_list_type": pick(
+            "moe_input_group_list_type", "input_group_list_type",
+            "moe_group_list_type"),
+        "group_list_type": pick("moe_group_list_type"),
+        "scope": pick("moe_route_scope", "native_scope"),
+    }
+    return {
+        "local_experts": local, "experts": experts, "ep": ep,
+        "explicit": explicit,
+        "activation_dtype": str(quant.get("output_format")
+                                or quant.get("act_format") or ""),
+        "scale_dtype": str(quant.get("weight_scale_format")
+                           or quant.get("x_scale_format")
+                           or quant.get("weight_scale_storage_format") or ""),
+    }
+
+
+def project_expert_receipt(
+    compiled: Any,
+    geometry: Any,
+    *,
+    state: Any = None,
+    activation_dtype: str | None = None,
+    scale_dtype: str | None = None,
+    expected_scope: str = "",
+) -> dict[str, Any] | None:
+    """Public GMM1/GMM2 receipt: one R_rank, group values and upper bound.
+
+    Returns the shared dictionary (no private schema marker) or ``None`` for a
+    compiled node that is not the routed-expert grouped source.  Counts come
+    from ``StateView.routing_state(layer).counts``/``MoeRoutingState`` when
+    present, else ``WorkloadGeometry.routing_for(layer)``.  A global vector is
+    never sliced; it needs the current rank's explicit ``local_expert_ids``.
+    """
+    terms = _compiled_receipt_terms(compiled)
+    if terms is None:
+        return None
+    receipt = _build_expert_receipt(
+        layer=int(getattr(compiled, "layer", 0) or 0),
+        geometry=geometry, state=state,
+        local_experts=terms["local_experts"], experts=terms["experts"],
+        ep=terms["ep"], explicit=terms["explicit"],
+        activation_dtype=(terms["activation_dtype"]
+                          if activation_dtype is None else activation_dtype),
+        scale_dtype=(terms["scale_dtype"]
+                     if scale_dtype is None else scale_dtype),
+        group_list_dtype="int64", expected_scope=expected_scope)
+    unresolved = list(receipt.conflicts)
+    if receipt.received_rows is None:
+        unresolved.append("received_rows_not_declared")
+    if receipt.gmm1_group_list is None:
+        unresolved.append(receipt.basis)
+    if receipt.input_group_list is None:
+        unresolved.append("input_group_list_not_declared")
+    if receipt.input_group_list_type is None:
+        unresolved.append("input_group_list_type_not_declared")
+    if receipt.gmm2_group_list is None:
+        unresolved.append("gmm2_group_list_not_declared")
+    if receipt.gmm2_group_list_type is None:
+        unresolved.append("gmm2_group_list_type_not_declared")
+    if not receipt.ownership_known:
+        unresolved.append("local_expert_ids_not_declared")
+    if receipt.upper_bound is None:
+        unresolved.append("upper_bound_not_declared")
+    return {
+        "layer": receipt.layer,
+        "rank": receipt.rank_index,
+        "ep": receipt.ep,
+        "received_rows": receipt.received_rows,
+        "input_rows": receipt.received_rows,
+        "group_list": (list(receipt.group_list)
+                       if receipt.group_list is not None else None),
+        "group_list_layout": "cumulative",
+        "group_list_type": 0,
+        "canonical_counts": (list(receipt.counts)
+                             if receipt.counts is not None else None),
+        "canonical_group_list": (list(receipt.gmm1_group_list)
+                                 if receipt.gmm1_group_list is not None else None),
+        "canonical_group_list_type": 0,
+        "input_group_list": (list(receipt.input_group_list)
+                             if receipt.input_group_list is not None else None),
+        "input_group_list_type": receipt.input_group_list_type,
+        "input_group_list_layout": (
+            "per_expert" if receipt.input_group_list_type == 1 else
+            "cumulative" if receipt.input_group_list_type == 0 else None),
+        "gmm1_group_list": (list(receipt.gmm1_group_list)
+                            if receipt.gmm1_group_list is not None else None),
+        "gmm1_group_list_type": receipt.gmm1_group_list_type,
+        "gmm2_group_list": (list(receipt.gmm2_group_list)
+                            if receipt.gmm2_group_list is not None else None),
+        "gmm2_group_list_type": receipt.gmm2_group_list_type,
+        "gmm1_shape_complete": receipt.gmm1_shape_complete,
+        "gmm2_shape_complete": receipt.gmm2_shape_complete,
+        "local_expert_ids": (list(receipt.local_expert_ids)
+                             if receipt.local_expert_ids is not None else None),
+        "expert_rows": (list(receipt.counts)
+                        if receipt.counts is not None else None),
+        "capacity_rows": receipt.upper_bound,
+        "capacity_basis": receipt.basis,
+        "activation_dtype": receipt.activation_dtype,
+        "scale_dtype": receipt.scale_dtype,
+        "group_list_dtype": receipt.group_list_dtype,
+        "basis": receipt.basis,
+        "symbolic": receipt.symbolic,
+        "ownership_known": receipt.ownership_known,
+        "shape_complete": receipt.shape_complete,
+        "complete": False,
+        "valid_rows": receipt.valid_rows,
+        "unresolved": list(dict.fromkeys(unresolved)),
+    }

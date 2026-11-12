@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import fields, replace
 from typing import Mapping
+import json
 
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
@@ -155,6 +156,11 @@ def parse_case(value: Case | Mapping) -> Case:
     case.machine.validate_placement(p)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
+    # Carry the unaltered case machine/model identity with the parsed runtime so
+    # every ordinary FeatureConfig/compiled feature record receives it.  This is
+    # the deployment identity, not a measured supply or model-label branch.
+    from .subgraphs.instantiate import _identity_metadata
+    metadata.update(_identity_metadata(case.machine, model))
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:
         metadata["media_tokens_by_request"] = media
@@ -166,6 +172,25 @@ def parse_case(value: Case | Mapping) -> Case:
     if (deepep_enabled and "deepep_ranks_per_node" not in metadata
             and not (isinstance(moe_cfg, Mapping) and moe_cfg.get("ranks_per_node"))):
         metadata["deepep_ranks_per_node"] = int(case.machine.ranks_per_node)
+    binding = runtime.kernels.get("lowerings", {}).get("gdn_decode")
+    options = binding.get("options") if isinstance(binding, Mapping) else None
+    if isinstance(binding, Mapping):
+        assumptions = dict(case.machine.assumptions)
+        assumptions["gdn_decode_selected"] = "1"
+        if isinstance(options, Mapping) and options.get("recurrent_implementation"):
+            assumptions["gdn_recurrent_implementation"] = str(options["recurrent_implementation"])
+        case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
+    if isinstance(options, Mapping) and "gating_beta_store" in options:
+        store = options.get("gating_beta_store")
+        if store in ({}, None):
+            store = {"disabled": True}
+        elif isinstance(store, Mapping):
+            store = dict(store)
+            if not store.get("from_hardware"):
+                store.pop("bytes_per_element", None)
+        assumptions = dict(case.machine.assumptions)
+        assumptions["gdn_gating_beta_store"] = json.dumps(store, sort_keys=True)
+        case = replace(case, machine=replace(case.machine, assumptions=tuple(sorted(assumptions.items()))))
     return replace(case, model=model, runtime=replace(
         runtime, pp_layer_partition=counts, metadata=tuple(sorted(metadata.items()))))
 

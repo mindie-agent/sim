@@ -55,6 +55,10 @@ def _duration(value):
 class ResponseValue:
     duration_us: float | None
     basis: str
+    issued_work: float | None = None
+    rate_flops_per_s: float | None = None
+    active_owners: int | None = None
+    stage: str | None = None
 
 
 @dataclass(frozen=True)
@@ -69,6 +73,13 @@ class ResponseFunction:
     grid: tuple[tuple[str, tuple[float, ...]], ...] = ()
     values_us: tuple[float, ...] = ()
     strides: tuple[int, ...] = ()
+    loads: tuple[Mapping, ...] = ()
+    resource: str = ""
+    dtype: str = ""
+    scope: str = ""
+    issue: Mapping | None = None
+    owner_grid: Mapping | None = None
+    owner_coordinate: bool = False
 
     @property
     def varying_coordinates(self):
@@ -76,6 +87,8 @@ class ResponseFunction:
             return {self.coordinate}
         if self.kind == "multilinear":
             return {name for name, _ in self.grid}
+        if self.kind == "measured_dual_load":
+            return {"m", "n", "k"} | ({"owners"} if self.owner_coordinate else set())
         return {term["coordinate"] for term in self.terms}
 
     @property
@@ -108,6 +121,81 @@ class ResponseFunction:
         kind = raw.get("kind", "affine")
         if not isinstance(kind, str):
             raise ModelingError("service_regime_response_kind_unknown")
+        if kind == "measured_dual_load":
+            if set(raw) - {"kind", "fixed_us", "resource", "dtype", "loads",
+                           "scope", "issue", "owner_grid"}:
+                raise ModelingError("service_regime_response_unknown_fields")
+            for name in ("m", "n", "k"):
+                if name not in coordinate_names:
+                    raise ModelingError(
+                        "measured_dual_load_requires_declared_m_n_k_coordinates")
+            owner_coordinate = "owners" in coordinate_names
+            owner_grid = raw.get("owner_grid")
+            if owner_grid is not None and (not isinstance(owner_grid, Mapping)
+                  or set(owner_grid) != {"tile_m", "tile_n", "cores"}
+                  or any(isinstance(owner_grid.get(key), bool)
+                         or not isinstance(owner_grid.get(key), int)
+                         or owner_grid[key] <= 0
+                         for key in ("tile_m", "tile_n", "cores"))):
+                raise ModelingError("measured_dual_load_invalid_owner_grid")
+            resource = raw.get("resource")
+            if not isinstance(resource, str) or not resource:
+                raise ModelingError("measured_dual_load_requires_resource")
+            dtype = raw.get("dtype")
+            if resource == "cube" and not dtype:
+                raise ModelingError("measured_dual_load_cube_requires_dtype")
+            issue = raw.get("issue")
+            if (not isinstance(issue, Mapping)
+                    or set(issue) - {"native_type", "dtype", "output_dtype",
+                                     "m_alignment", "alignment_basis", "source_path",
+                                     "source_sha256", "source_revision", "scope", "n", "k",
+                                     "weight_layout", "wrapper_source_path",
+                                     "wrapper_source_sha256", "wrapper_source_revision",
+                                     "wrapper_symbol", "deployment_image_id",
+                                     "source_scope", "source_basis"}
+                    or not isinstance(issue.get("m_alignment"), int)
+                    or isinstance(issue.get("m_alignment"), bool)
+                    or issue["m_alignment"] <= 0
+                    or not isinstance(issue.get("n"), int)
+                    or not isinstance(issue.get("k"), int)
+                    or issue["n"] <= 0 or issue["k"] <= 0):
+                raise ModelingError("measured_dual_load_requires_certified_issue_rule")
+            declared = raw.get("loads")
+            if not isinstance(declared, (list, tuple)) or len(declared) != 2:
+                raise ModelingError("measured_dual_load_requires_two_measured_loads")
+            loads, ids = [], set()
+            for load in declared:
+                if (not isinstance(load, Mapping)
+                        or set(load) - {"id", "active_owners", "rate_flops_per_s",
+                                        "measured_issued_flops", "measured_logical_flops",
+                                        "event_count", "median_aic_mac_time_ns",
+                                        "median_aic_mac_ratio", "median_mte2_time_ns",
+                                        "median_elapsed_ns", "cube_utilization_pct",
+                                        "limiting_pipe", "provenance"}):
+                    raise ModelingError("measured_dual_load_invalid_load_record")
+                load_id = load.get("id")
+                if load_id not in {"saturated", "underfilled"} or load_id in ids:
+                    raise ModelingError("measured_dual_load_requires_saturated_and_underfilled")
+                ids.add(load_id)
+                owners = load.get("active_owners")
+                if (isinstance(owners, bool) or not isinstance(owners, int)
+                        or owners <= 0):
+                    raise ModelingError("measured_dual_load_requires_positive_active_owners")
+                rate = positive(load.get("rate_flops_per_s"))
+                issued = positive(load.get("measured_issued_flops"))
+                loads.append({**load, "active_owners": owners,
+                              "rate_flops_per_s": rate,
+                              "measured_issued_flops": issued})
+            if ids != {"saturated", "underfilled"}:
+                raise ModelingError("measured_dual_load_requires_saturated_and_underfilled")
+            if int(loads[0]["active_owners"]) == int(loads[1]["active_owners"]):
+                raise ModelingError("measured_dual_load_requires_distinct_owner_counts")
+            return cls(kind, nonnegative(raw.get("fixed_us", 0)),
+                       loads=tuple(loads), resource=str(resource),
+                       dtype=str(dtype or ""), scope=str(raw.get("scope", "")),
+                       issue=dict(issue),
+                       owner_grid=dict(owner_grid) if owner_grid is not None else None,
+                       owner_coordinate=owner_coordinate)
         if kind == "roofline":
             if set(raw) - {"kind", "fixed_us", "services"}:
                 raise ModelingError("service_regime_response_unknown_fields")
@@ -194,6 +282,56 @@ class ResponseFunction:
         """Return the numerical response, not an Engine completion prediction."""
         if not isinstance(values, Mapping):
             raise ModelingError("service_regime_response_requires_coordinate_values")
+        if self.kind == "measured_dual_load":
+            m = _value(values, "m")
+            n = _value(values, "n")
+            k = _value(values, "k")
+            explicit_owners = None
+            if "owners" in values:
+                owners_value = values.get("owners")
+                if (isinstance(owners_value, bool)
+                        or not isinstance(owners_value, (int, float))
+                        or not math.isfinite(float(owners_value))
+                        or float(owners_value) != int(owners_value)
+                        or int(owners_value) <= 0):
+                    raise ModelingError("measured_dual_load_requires_positive_active_owners")
+                explicit_owners = int(owners_value)
+            issue = self.issue or {}
+            if float(n) != float(issue.get("n")) or float(k) != float(issue.get("k")):
+                return ResponseValue(None, "measured_load_geometry_mismatch")
+            alignment = int(issue["m_alignment"])
+            aligned_m = math.ceil(float(m) / alignment) * alignment
+            issued = 2.0 * aligned_m * float(n) * float(k)
+            if not math.isfinite(issued) or issued <= 0:
+                raise ModelingError("measured_dual_load_issued_work_invalid")
+            under = next((item for item in self.loads
+                          if item["id"] == "underfilled"), None)
+            saturated = next((item for item in self.loads
+                              if item["id"] == "saturated"), None)
+            load = None
+            if (under is not None
+                    and int(round(issued)) == int(under["measured_issued_flops"])):
+                load = under
+            else:
+                full_work = (int(saturated["measured_issued_flops"])
+                             if saturated is not None else 0)
+                issued_int = int(round(issued))
+                if (full_work > 0 and issued_int >= full_work
+                        and issued_int % full_work == 0):
+                    load = saturated
+            if load is None:
+                return ResponseValue(None, "measured_load_unknown_issue_class")
+            owners = int(load["active_owners"])
+            if explicit_owners is not None and explicit_owners != owners:
+                return ResponseValue(None, "measured_load_unknown_active_owners")
+            duration = self.fixed_us + issued * 1e6 / float(load["rate_flops_per_s"])
+            if not math.isfinite(duration):
+                raise ModelingError("measured_dual_load_service_overflow")
+            return ResponseValue(
+                _duration(duration), "measured_" + str(load["id"]),
+                issued_work=issued, rate_flops_per_s=float(load["rate_flops_per_s"]),
+                active_owners=owners, stage="mac",
+            )
         if self.kind == "roofline":
             if rate_for is None:
                 raise ModelingError("service_regime_scaled_response_requires_physical_rates")

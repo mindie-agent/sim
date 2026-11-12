@@ -13,6 +13,7 @@ from dataclasses import replace
 from typing import Any, Callable, Mapping
 
 from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
+from mindie_sim.prediction.native_binding import declare_native_call
 from mindie_sim.prediction.program import (
     KernelProgram,
     ParallelProgram,
@@ -97,7 +98,7 @@ def make_op(params: Mapping[str, Any]) -> OpSpec:
         )),
     )
 
-    return OpSpec(
+    op = OpSpec(
         op_id="mla_decode",
         family="mla_decode",
         phase="decode",
@@ -111,6 +112,44 @@ def make_op(params: Mapping[str, Any]) -> OpSpec:
         recipe=IMPLEMENTATION, source_boundary="call",
         dtype="bf16",
         metadata=metadata,
+    )
+    # BIND1 producer binding: the selected Triton source wrapper and its two
+    # unconditional kernel launches.  Exact file/hash and line scope come from
+    # this family's existing SOURCE_FILES declaration; no runtime dispatch is
+    # claimed and no ACLNN symbol exists for a Triton call.
+    triton_file = SOURCE_FILES[1]
+    return declare_native_call(
+        op,
+        api={"namespace": "triton", "entry": "decode_attention_fwd_grouped"},
+        source={"repository": "vllm", "path": triton_file["path"],
+                "sha256": triton_file["sha256"],
+                "symbol": "decode_attention_fwd_grouped",
+                "revision": "vllm-v0.25.1", "state": "source"},
+        typed={
+            "attrs": {"page_size": int(dispatch["page_size"]),
+                      "num_kv_splits": int(dispatch["num_kv_splits"]),
+                      "grouped": bool(dispatch["grouped"]),
+                      "is_mla": True},
+            # Per-occurrence facts; not part of the stable call signature.
+            "occurrence_attrs": {"seq_lens": "positive_int_list",
+                                 "block_table": "typed_ref",
+                                 "cache_layout": {"const": "PA_ND"}},
+        },
+        occurrence={"seq_lens": list(seq_lens),
+                    "block_table": {"ref": "block_table", "dtype": "int32",
+                                    "rank": 2},
+                    "cache_layout": "PA_ND"},
+        kernels=[
+            {"name": dispatch["stage1_kernel"], "role": "vector",
+             "source_path": triton_file["path"],
+             "source_sha256": triton_file["sha256"],
+             "evidence": "source_declared"},
+            {"name": dispatch["stage2_kernel"], "role": "vector",
+             "source_path": triton_file["path"],
+             "source_sha256": triton_file["sha256"],
+             "evidence": "source_declared"},
+        ],
+        unresolved=["triton_runtime_dispatch_not_observed"],
     )
 
 

@@ -1,8 +1,10 @@
 """Typed source register inventories for MXA8W4 weight expansion and scales.
 
 [Role] Project retained 950 Reg instruction counts onto existing capacities.
-[Invariants] B8 lanes are not charged at a FP32 arithmetic rate. Issue, data
-  writes and UB ports are independent bounds; UB stores are not GM/MTE3 writes.
+[Invariants] B8 arithmetic is retained as native source counts and per-opcode
+  throughput bounds; no unsupported single-port aggregation is charged. Issue,
+  data writes and UB ports are independent bounds; UB stores are not GM/MTE3
+  writes.
 [Timeouts & Locks] Constant-sized inventories for a finite source panel.
 [Side-Effect Policy] Pure inventories; no fitting or compiler/device access.
 """
@@ -32,6 +34,10 @@ CLASSES = {
 def widen(elements):
     blocks = elements // 256
     assert elements % 256 == 0
+    # Exact WeightNz MX vector block: one-time per invocation 2 CreateMask
+    # and 3 Duplicate (L373-381), then for each 256 expanded bytes one
+    # DIST_US_B8 packed read128B, 2x ShiftRight.I8, 1x ShiftLeft.I8,
+    # 1x Select, 1x And, 1x Store256B.
     return InstructionInventory({
         "Mask": InstructionCount(2),
         "DuplicateB8": InstructionCount(3, 3 * 256),

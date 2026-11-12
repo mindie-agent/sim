@@ -24,12 +24,17 @@ class CacheFormat:
     scale_dtype: str = "none"
     suffix_elements: int = 0
     suffix_dtype: str = "bf16"
+    # Number of logical elements represented by one payload storage unit.
+    # uint8 packed rows use 2; plain int8/FP8/FP16 rows use 1.
+    packed_elements: int = 1
 
     def row_bytes(self, width):
         quantized = width - self.suffix_elements
         if quantized < 0:
             raise ModelingError("cache_suffix_exceeds_row_width")
-        return (ceil(quantized * payload_bytes(self.dtype))
+        if not isinstance(self.packed_elements, int) or self.packed_elements < 1:
+            raise ModelingError("cache_packed_elements_invalid")
+        return (ceil(quantized / self.packed_elements) * payload_bytes(self.dtype)
                 + self.suffix_elements * dtype_bytes(self.suffix_dtype) + (
             ceil(quantized / self.group_size) * dtype_bytes(self.scale_dtype)
             if self.group_size else 0))
@@ -41,7 +46,8 @@ def cache_format(model, region):
     if raw is None:
         quant = getattr(model, "quant", None)
         return CacheFormat(getattr(quant, "kv_dtype", "") or getattr(model, "kv_dtype", "bf16"))
-    if set(raw) - {"dtype", "group_size", "scale_dtype", "suffix_elements", "suffix_dtype"}:
+    if set(raw) - {"dtype", "group_size", "scale_dtype", "suffix_elements",
+                   "suffix_dtype", "packed_elements"}:
         raise ModelingError("cache_representation_fields_unknown:" + region)
     dtype = raw["dtype"]
     payload_bytes(dtype)
@@ -56,7 +62,10 @@ def cache_format(model, region):
     if not isinstance(suffix, int) or suffix < 0:
         raise ModelingError("cache_suffix_elements_invalid:" + region)
     dtype_bytes(suffix_dtype)
-    return CacheFormat(dtype, group, scale, suffix, suffix_dtype)
+    packed = raw.get("packed_elements", 1)
+    if not isinstance(packed, int) or packed < 1:
+        raise ModelingError("cache_representation_packed_elements_invalid:" + region)
+    return CacheFormat(dtype, group, scale, suffix, suffix_dtype, packed)
 
 
 def with_packed_mla_cache(model, rope):

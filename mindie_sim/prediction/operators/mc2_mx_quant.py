@@ -29,9 +29,13 @@ def mx32_work(width, input_dtype="bf16", payload_dtype="fp8_e4m3"):
     ComputeFp8Data performs one multiply, two rearrangements and two casts
     per input element. This is typed work, not exact instruction issue time.
     """
-    if (input_dtype != "bf16" or payload_dtype != "fp8_e4m3"
+    if (input_dtype != "bf16" or payload_dtype not in {"fp8_e4m3", "fp4_e2m1", "fp4"}
             or width < 256 or width % 256):
-        raise ModelingError("mc2_mx32_requires_bf16_e4m3_and_width_multiple_256")
+        raise ModelingError("mc2_mx32_requires_bf16_e4m3_or_fp4_and_width_multiple_256")
+    # The retained source names the E4M3/F8 quantize path only.  FP4 shares
+    # its max-exponent/group-scale construction; until the FP4 cast source is
+    # retained, keep the same element rescale work as an explicit upper-bound
+    # ledger rather than inventing a cheaper FP4 instruction count.
     iterations, scales = width // 256, width // 32
     return {
         # The FP16-only invalid exponent constant has no BF16 consumer.

@@ -434,35 +434,48 @@ def test_transport_dispatch_prefill_continuity_at_2048() -> None:
     )
     for batch in (1, 2):
         vals = [float(op.evaluate(WorkloadGeometry.homogeneous(batch, q, q, phase="prefill")).duration_ms) for q in (2047, 2048, 2049)]
-        # No discrete jump at the 2048 grid boundary; the batch=1 ratio is
-        # continuous across it even though its smooth slope turns.
-        assert abs(vals[1] - vals[0]) / max(vals[1], 1e-9) < 1e-4, f"batch={batch} dispatch jumped before q=2048: {vals}"
-        assert abs(vals[2] - vals[1]) / max(vals[1], 1e-9) < 1e-4, f"batch={batch} dispatch jumped after q=2048: {vals}"
-        if batch == 2:
-            assert vals[0] <= vals[1] <= vals[2], f"batch=2 dispatch dipped at q=2048: {vals}"
+        # A vectorised all-to-all frames each peer payload to the declared MTU.
+        # One source owns Q*8*4096/16 = Q*2048 bytes and sends Q*128 bytes to
+        # each of the other 15 ranks.  Q*128 is exactly 64 frames at Q=2048 and
+        # crosses to 65 frames at Q=2049; the exact frame step is physical.
+        link_rate = op.supply.effective("link_hccs") if "link_hccs" in dict(op.supply.rates) else op.supply.effective("link")
+        one_frame = 15 * 4096.0 / link_rate
+        assert vals[1] - vals[0] == pytest.approx(0.0, abs=1e-12), f"batch={batch} dispatch inside one frame: {vals}"
+        # The next token crosses one declared frame for every remote peer.
+        step2 = vals[2] - vals[1]
+        assert step2 == pytest.approx(one_frame, rel=1e-12), (
+            f"batch={batch} dispatch moved by a non-frame amount: {vals}")
+        assert vals[0] <= vals[1] <= vals[2], f"batch={batch} dispatch non-monotonic: {vals}"
 
 
 def test_ttft_wave_scale_chunk_budget_and_chunked_mean_are_distinct() -> None:
     from mindie_sim.prediction.piecewise.service_span import chunked_prefill_mean_ttft_ms, ttft_wave_scale
 
+    # The public prefill body is already the local batch; concurrent requests
+    # finish together and the wave scale is identity.
     base = ttft_wave_scale(
         phase="prefill", concurrency=8, dp=1, ep=16, layers=40,
         graph_buckets=(1, 2, 4, 8), prompt_tokens=8192,
     )
-    assert base == pytest.approx(1.0 + 0.045, rel=1e-12)
+    assert base == 1.0
     chunked_c2 = ttft_wave_scale(
         phase="prefill", concurrency=2, dp=1, ep=16, layers=2,
         graph_buckets=(), prompt_tokens=8192, max_batched_tokens=8192,
     )
-    assert chunked_c2 == pytest.approx(0.75, rel=1e-12)
+    assert chunked_c2 == 1.0
     chunked_c4 = ttft_wave_scale(
         phase="prefill", concurrency=4, dp=1, ep=16, layers=2,
         graph_buckets=(), prompt_tokens=16384, max_batched_tokens=8192,
     )
-    assert chunked_c4 == pytest.approx((8 + 1) / (2.0 * 8), rel=1e-12)
+    assert chunked_c4 == 1.0
 
     mean = chunked_prefill_mean_ttft_ms((8192, 8192, 8192, 8192), dp=1, max_batched_tokens=8192, body_one=lambda _tokens: 1.0)
     assert mean == pytest.approx(2.5, rel=1e-12)
+    # Per-request FCFS finish must not average a single request's chunks.
+    single = chunked_prefill_mean_ttft_ms((16384,), dp=1, max_batched_tokens=8192, body_one=lambda _tokens: 1.0)
+    assert single == pytest.approx(2.0, rel=1e-12)
+    two = chunked_prefill_mean_ttft_ms((8192, 8192), dp=1, max_batched_tokens=8192, body_one=lambda _tokens: 1.0)
+    assert two == pytest.approx(1.5, rel=1e-12)
 
     import functools
 

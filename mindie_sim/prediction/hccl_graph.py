@@ -49,7 +49,8 @@ def recipes(kernels):
 def lower(ops, runtime, source_dtype):
     bindings = runtime.kernels.get('hccl',{})
     analytic = runtime.kernels.get('analytic_hierarchy', {})
-    if not bindings and not analytic:
+    observed_any = any(dict(op.metadata).get('hccl_observed_call') for op in ops)
+    if not bindings and not analytic and not observed_any:
         return ops
     if set(bindings)-{'allreduce','allgather','reduce_scatter'}:
         raise ModelingError('hccl_caller_supports_allreduce_allgather_reduce_scatter')
@@ -58,6 +59,15 @@ def lower(ops, runtime, source_dtype):
     result = []
     for original in ops:
         meta = dict(original.metadata)
+        # A signed observed HCCL packet supplies the API/tensor/raw identity and
+        # native observed name, but not a source-selected detailed variant.  It
+        # stays a boundary-only call: the detailed phase/template decomposition
+        # is left explicitly unpaired and no observed duration enters work.
+        observed = meta.get('hccl_observed_call')
+        if isinstance(observed, dict):
+            from .native_binding import declare_native_call
+            result.append(declare_native_call(original, **observed))
+            continue
         axis = meta.get('group_axis','tp')
         raw = bindings.get(original.family)
         analytic_raw = analytic.get(original.family)

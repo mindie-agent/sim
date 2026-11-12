@@ -36,7 +36,12 @@ from mindie_sim.schema.common import ModelingError
 
 def as_fraction(value: Any) -> Fraction:
     """Exact scalar conversion: ints and Fractions are exact, floats decimal."""
-    if isinstance(value, bool):
+    t = type(value)
+    if t is Fraction:
+        return value
+    if t is int:
+        return Fraction(value)
+    if t is bool or isinstance(value, bool):
         raise ModelingError(f"expression_non_numeric:{value!r}")
     if isinstance(value, Fraction):
         return value

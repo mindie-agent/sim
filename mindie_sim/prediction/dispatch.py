@@ -27,6 +27,33 @@ def submit_batch(case, schedulers, plans, execution, lower, now):
             if plan else IterationPlan((), iteration=schedulers[replica].iteration)
             for replica, plan in plans.items()
         }
+        logical_local = dict(local)
+        phase = next((view.phase for plan in local.values()
+                      for view in plan.requests), "decode")
+        if isinstance(lower, Frontend):
+            from .operator_analysis import graph_padded_idle
+            from .graph import GraphPolicy
+            from mindie_sim.schema.workload import RequestView
+            counts = {replica: len(plan.requests)
+                      for replica, plan in local.items()}
+            if graph_padded_idle(case, phase, counts):
+                context0 = next(
+                    (view.context for plan in logical_local.values()
+                     for view in plan.requests), 0)
+                for replica, plan in local.items():
+                    if plan.requests:
+                        continue
+                    probe = RequestView(
+                        f"serving{replica}:bucket_probe", 0, context0,
+                        False, phase, padding=True, draft_verify=False,
+                        draft_prepare=False)
+                    bucket, _ = GraphPolicy().select((probe,), case.runtime)
+                    physical = int(bucket or 0)
+                    if physical:
+                        local[replica] = replace(plan, requests=(RequestView(
+                            f"serving{replica}:padding", physical, context0,
+                            False, phase, padding=True, draft_verify=False,
+                            draft_prepare=False),))
         global_views = tuple(view for plan in local.values() for view in plan.requests)
         context = ({"global_views": global_views, "global_tokens": sum(
             view.q_len + view.draft_proposal_tokens for view in global_views)} if len(plans) > 1 else {})
@@ -38,13 +65,52 @@ def submit_batch(case, schedulers, plans, execution, lower, now):
                 (plan.requests for plan in local.values()), case.runtime)
         # The built-in frontend owns physical shard selection. Custom lowerers
         # keep their existing callable contract and their own placement policy.
+        source_rows_by_replica = tuple(
+            sum(view.q_len + view.draft_proposal_tokens
+                for view in logical_local[replica].requests)
+            for replica in local)
+        if isinstance(lower, Frontend):
+            # Physical graph padding and the valid routed workload are separate
+            # declarations: the former shapes the graph, the latter owns the
+            # routing/F3 projection.
+            valid_global = sum(source_rows_by_replica)
+            context["routing_global_tokens"] = valid_global
+            if len(local) > 1 and "sequence_parallel" in case.runtime.kernels:
+                from .sequence_parallel import select as select_sp
+                physical_rows = []
+                for replica, plan in local.items():
+                    rows = sum(view.q_len + view.draft_proposal_tokens
+                               for view in logical_local[replica].requests)
+                    runtime = schedulers[replica].next_runtime(plan)
+                    sp = select_sp(
+                        runtime, case.model, logical_local[replica].requests,
+                        tokens=rows, global_tokens=valid_global)
+                    if sp is not None:
+                        physical_rows.extend(sp.valid_per_tp)
+                if physical_rows:
+                    source_rows_by_replica = tuple(physical_rows)
+            context["source_rows_by_replica"] = source_rows_by_replica
+        cohort_views = tuple(
+            view for replica in logical_local for view in logical_local[replica].requests)
+        route_context = ({"routing_views": cohort_views}
+                         if isinstance(lower, Frontend) and len(plans) > 1
+                         else {})
         works = {replica: lower(plan, case.model, schedulers[replica].next_runtime(plan), case.machine,
-                               **context, **({"replica": replica} if isinstance(lower, Frontend) else {}))
+                               **context, **route_context,
+                               **({"replica": replica} if isinstance(lower, Frontend) else {}))
                  for replica, plan in local.items()}
+        if isinstance(lower, Frontend):
+            # Serving and target_graphs share the same ordinary cohort producer;
+            # never leave serving with only the generic uniform peer bytes.
+            from .cohort_traffic import bind_cohort_traffic
+            bound = bind_cohort_traffic(
+                case, {replica: work.ops for replica, work in works.items()})
+            works = {replica: replace(work, ops=bound[replica])
+                     for replica, work in works.items()}
         emitted = {}
         for replica, plan in local.items():
             emitted[replica] = {}
-            for view in plan.requests:
+            for view in logical_local[replica].requests:
                 state = schedulers[replica].by_id[view.request_id]
                 count = (int(view.draft_advanced_tokens or 1) if view.phase == "decode"
                          else int(view.samples and not state.generated))

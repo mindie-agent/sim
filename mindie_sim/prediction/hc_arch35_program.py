@@ -4,10 +4,12 @@
 [Invariants] Cast/RMS feeds L1 directly; no GM cast ring or Cube Gram exists.
   Fixed source buffers and their reuse dependencies bound every owner. Vector
   demand is a disclosed elementary-operation envelope, not instruction timing.
-[Timeouts & Locks] Pure bounded geometry; decode source domain has M <= 256.
+  M up to the device/UB limit follows the retained source mDim/kDim and L1
+  tile formulas; no M<=256 row gate is installed.
+[Timeouts & Locks] Pure bounded geometry; finite source phase DAGs.
 [Side-Effect Policy] Constructs immutable stages only; no files or hardware.
 """
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 
 from mindie_sim.schema.common import ModelingError
@@ -79,6 +81,15 @@ class PreGeometry:
     d_factor: int
     first_ub: int
     second_ub: int
+    m_dim: int = 1
+    k_dim: int = 1
+    single_core_m: int = 0
+    m_tiles: int = 1
+    k_block_num: int = 0
+    tiling_key: int = 1000
+    m_cnt: int = 1
+    m_rounds: int = 1
+    m_main: int = 0
 
     @property
     def width(self):
@@ -98,16 +109,29 @@ def pre_geometry(view, geometry):
     cores = geometry.compute_units
     aivs = geometry.resource_units.get('vector', 0)
     if (view['dtype'] != 'bf16' or view['hc'] != 4 or view.get('mixed', 24) != 24
-            or not 1 <= rows <= 256 or hidden % 32 or not 32 <= hidden <= 32768
+            or rows < 1 or hidden % 32 or not 32 <= hidden <= 32768
             or cores < 2 or aivs != 2 * cores):
-        raise ModelingError('hc_pre_arch35_requires_bf16_hc4_M1to256_Kmultiple128_two_aiv_per_aic')
-    # M <= 256 keeps host mDimNum=1 and kDimNum=cores, hence key1000.
-    # actualKBlockNum can still be one for a small hidden dimension.
-    kspan = align(ceil(4 * hidden / cores), 256)
-    kparts = ceil(4 * hidden / kspan)
-    ml1 = align(rows, 16)
-    kl1 = min(32768 // ml1, 1024) // 128 * 128
-    mub, kub = ceil(ml1 / 2), kl1 // 2
+        raise ModelingError('hc_pre_arch35_source_geometry_invalid')
+    # hc_pre_tiling_arch35.h:295-429 (retained revision 175ef4d4...):
+    # M_L1_MAX_SIZE=256 is the per-core M L1 tile, never an M row limit.
+    # mDimNum splits rows across AIC; each M core covers singleCoreM rows in
+    # ceil(singleCoreM/mL1Size) finite L1 tiles.  kDimNum splits K; kL1Size is
+    # the per-core L1 K tile.  Keep the source's two-aiv-per-aic mapping.
+    k_size = 4 * hidden
+    m_dim = min(cores, max(1, ceil(rows / 256)))
+    single_core_m = align(ceil(rows / m_dim), 16)
+    m_l1 = min(256, single_core_m)
+    m_cnt = ceil(rows / m_l1)
+    m_rounds = ceil(m_cnt / m_dim)
+    m_main = m_cnt % m_dim
+    m_tiles = m_rounds
+    k_dim = max(1, cores // m_dim)
+    split_k = align(ceil(k_size / k_dim), 256)
+    k_block = ceil(k_size / split_k)
+    kspan = split_k
+    kparts = k_block
+    kl1 = min((128 * 256) // m_l1, 1024) // 128 * 128
+    mub, kub = ceil(m_l1 / 2), kl1 // 2
     first = (2 * mub * align(kub, 16) * 2 + 2 * align(mub, 8) * 4
              + mub * (align(kub, 8) * 4 + 32)
              + align(mub, 8) * align(kub, 8) * 4 * 2)
@@ -130,8 +154,10 @@ def pre_geometry(view, geometry):
     second = second_ub(kparts, factor, d)
     check_capacity(geometry, {'ub': max(first, second), 'l1': 512 * 1024,
                              'l0a': 65536, 'l0b': 65536, 'l0c': 262144})
-    return PreGeometry(rows, hidden, cores, aivs, kspan, kparts, ml1, kl1,
-                       mub, kub, former, factor, d, first, second)
+    return PreGeometry(rows, hidden, cores, aivs, kspan, kparts, m_l1, kl1,
+                       mub, kub, former, factor, d, first, second,
+                       m_dim, k_dim, single_core_m, m_tiles, k_block,
+                       1001 if k_dim == 1 else 1000, m_cnt, m_rounds, m_main)
 
 
 def cast_rms_ops(rows, cols, *, accumulate):
@@ -142,10 +168,19 @@ def cast_rms_ops(rows, cols, *, accumulate):
                    + lanes + max(0, lanes - 1) + bool(accumulate))
 
 
-def pre_owner(g, owner):
-    """Literal finite K panel DAG; MTE1 releases L1 before Cube finishes L0."""
-    phases, tails = [], {}
-    def emit(name, work=Work(), after=(), *, aiv=None, fifo=()):
+def pre_owner(g, owner, *, msplit=False):
+    """Literal source K-panel/M-tile DAG; one owner = (M core, K part).
+
+    ``msplit`` selects the key1001 HcPreMSplitCorePart1 local path: no
+    workspace projection/rms HBM stores and no global K-partial stage.
+
+    Owner indexes are the source AIC owners; a core with singleCoreM > mL1
+    executes its finite M L1 tiles serially.  MTE1 releases L1 before Cube
+    finishes L0; fixed input/UB rings and tile tails are retained.
+    """
+    phase_list = []
+
+    def emit(phases, tails, name, work=Work(), after=(), *, aiv=None, fifo=()):
         deps = list(after)
         for pipe in fifo:
             if pipe in tails:
@@ -155,73 +190,120 @@ def pre_owner(g, owner):
                             owner if aiv is None else 2 * owner + aiv,
                             g.cores if aiv is None else g.aivs))
         return name
-    width = min(g.k_span, g.width - owner * g.k_span)
-    releases, cubes, operands = [], [], []
-    ub_stores = [[], []]
-    input_frees = [[], []]
-    for panel, offset in enumerate(range(0, width, g.k_l1)):
-        cols = min(g.k_l1, width - offset)
-        reuse = (releases[panel - 2],) if panel >= 2 else ()
-        b = emit(f'p{panel}.weight', memory(read=24 * cols * 4, role='mte2_aic'),
-                 reuse, fifo=('weight_read',))
-        ready_a = []
-        for sub, count in enumerate((g.rows // 2, g.rows - g.rows // 2)):
-            for chunk, start in enumerate(range(0, cols, g.k_ub)):
-                kk = min(g.k_ub, cols - start)
-                prefix = f'p{panel}.v{sub}.c{chunk}'
-                input_reuse = ((input_frees[sub][-2],) if len(input_frees[sub]) >= 2 else ())
-                load = emit(prefix + '.read', memory(read=count * kk * 2), input_reuse,
-                            aiv=sub, fifo=(f'read{sub}',))
-                # Cast scratch is single-slot: the preceding transpose must
-                # consume it. Input queue can fetch two chunks ahead.
-                cast = emit(prefix + '.cast_rms', Work(resources={
-                    'vector': cast_rms_ops(count, kk, accumulate=offset + start > 0)}),
-                    (load,), aiv=sub, fifo=(f'vector{sub}',))
-                input_frees[sub].append(cast)
-                index = len(ub_stores[sub])
-                dep = (ub_stores[sub][index - 2],) if index >= 2 else ()
-                trans = emit(prefix + '.transpose', Work(resources={'vector': count * kk}), (cast, *dep),
-                             aiv=sub, fifo=(f'vector{sub}',))
-                put = emit(prefix + '.publish_l1', Work(resources={'mte3': count * kk * 4}),
-                           (trans, *reuse), aiv=sub, fifo=(f'write{sub}',))
-                ub_stores[sub].append(put)
-            ready_a.append(ub_stores[sub][-1])
-        # Source divides before multiplying: M80 uses K96, not K102.
-        step = (256 // max(g.m_l1, 32)) * 32
-        for micro, start in enumerate(range(0, cols, step)):
-            kk = min(step, cols - start)
-            deps = [b, *ready_a]
-            if len(cubes) >= 2:
-                deps.append(cubes[-2])
-            operand = emit(f'p{panel}.k{micro}.operands', Work(resources={
-                'mte1': (g.m_l1 + 32) * align(kk, 8) * 4}),
-                deps, fifo=('operand',))
-            operands.append(operand)
-            cube = emit(f'p{panel}.k{micro}.cube', Work(matrix={
-                'hf32': 2 * g.m_l1 * 32 * kk}), (operand,), fifo=('cube',))
-            cubes.append(cube)
-        releases.append(operands[-1])
-    emit('projection_out', Work(resources={'fixpipe': g.rows * 24 * 4,
-         'hbm': g.rows * 24 * 4}), (cubes[-1],))
-    for sub, count in enumerate((g.rows // 2, g.rows - g.rows // 2)):
-        emit(f'rms_out{sub}', memory(write=count * 4),
-             (tails[f'vector{sub}'],), aiv=sub, fifo=(f'write{sub}',))
-    return tuple(phases)
+
+    m_core, k_part = divmod(owner, g.k_parts)
+    m_cnt = ceil(g.rows / g.m_l1)
+    single_round = ceil(m_cnt / g.m_dim)
+    main = m_cnt % g.m_dim
+    if main == 0 or m_core < main:
+        m_start = m_core * single_round * g.m_l1
+        m_tiles = single_round
+    else:
+        m_start = (main * single_round + (m_core - main)
+                   * (single_round - 1)) * g.m_l1
+        m_tiles = single_round - 1
+    k_start = k_part * g.k_span
+    width = min(g.k_span, g.width - k_start)
+    if width <= 0:
+        return ()
+    tile_tail = ()
+    for tile in range(m_tiles):
+        row_start = m_start + tile * g.m_l1
+        rows = min(g.m_l1, g.rows - row_start)
+        if rows <= 0:
+            break
+        m_pad = align(rows, 16)
+        prefix = f'm{tile}.' if m_tiles > 1 else ''
+        phases, tails = [], {}
+        releases, cubes, operands = [], [], []
+        ub_stores = [[], []]
+        input_frees = [[], []]
+        for panel, offset in enumerate(range(0, width, g.k_l1)):
+            cols = min(g.k_l1, width - offset)
+            reuse = (releases[panel - 2],) if panel >= 2 else ()
+            b = emit(phases, tails, f'{prefix}p{panel}.weight',
+                     memory(read=24 * cols * 4, role='mte2_aic'),
+                     (*tile_tail, *reuse) if panel == 0 else reuse,
+                     fifo=('weight_read',))
+            ready_a = []
+            for sub, count in enumerate((rows // 2, rows - rows // 2)):
+                for chunk, start in enumerate(range(0, cols, g.k_ub)):
+                    kk = min(g.k_ub, cols - start)
+                    tag = f'{prefix}p{panel}.v{sub}.c{chunk}'
+                    input_reuse = ((input_frees[sub][-2],)
+                                   if len(input_frees[sub]) >= 2 else ())
+                    load = emit(phases, tails, tag + '.read',
+                                memory(read=count * kk * 2), input_reuse,
+                                aiv=sub, fifo=(f'read{sub}',))
+                    # Cast scratch is single-slot: the preceding transpose must
+                    # consume it. Input queue can fetch two chunks ahead.
+                    cast = emit(phases, tails, tag + '.cast_rms', Work(resources={
+                        'vector': cast_rms_ops(
+                            count, kk, accumulate=k_start + offset + start > 0)}),
+                        (load,), aiv=sub, fifo=(f'vector{sub}',))
+                    input_frees[sub].append(cast)
+                    index = len(ub_stores[sub])
+                    dep = (ub_stores[sub][index - 2],) if index >= 2 else ()
+                    trans = emit(phases, tails, tag + '.transpose',
+                                 Work(resources={'vector': count * kk}),
+                                 (cast, *dep), aiv=sub,
+                                 fifo=(f'vector{sub}',))
+                    put = emit(phases, tails, tag + '.publish_l1',
+                               Work(resources={'mte3': count * kk * 4}),
+                               (trans, *reuse), aiv=sub, fifo=(f'write{sub}',))
+                    ub_stores[sub].append(put)
+                ready_a.append(ub_stores[sub][-1])
+            # Source divides before multiplying: M80 uses K96, not K102.
+            step = (256 // max(g.m_l1, 32)) * 32
+            for micro, start in enumerate(range(0, cols, step)):
+                kk = min(step, cols - start)
+                deps = [b, *ready_a]
+                if len(cubes) >= 2:
+                    deps.append(cubes[-2])
+                operand = emit(phases, tails, f'{prefix}p{panel}.k{micro}.operands',
+                               Work(resources={
+                                   'mte1': (m_pad + 32) * align(kk, 8) * 4}),
+                               deps, fifo=('operand',))
+                operands.append(operand)
+                cube = emit(phases, tails, f'{prefix}p{panel}.k{micro}.cube',
+                            Work(matrix={'hf32': 2 * m_pad * 32 * kk}),
+                            (operand,), fifo=('cube',))
+                cubes.append(cube)
+            releases.append(operands[-1])
+        projection = emit(phases, tails,
+                          prefix + ('projection_local' if msplit else 'projection_out'),
+                          Work(resources={'fixpipe': rows * 24 * 4,
+                                          **({} if msplit else {'hbm': rows * 24 * 4})}),
+                          (cubes[-1],))
+        rms = []
+        for sub, count in enumerate((rows // 2, rows - rows // 2)):
+            rms.append(emit(phases, tails,
+                            f'{prefix}rms_out{sub}',
+                            Work() if msplit else memory(write=count * 4),
+                            (tails[f'vector{sub}'],), aiv=sub,
+                            fifo=(f'write{sub}',)))
+        tile_tail = (projection, *rms)
+        phase_list.extend(phases)
+    return tuple(phase_list)
 
 
-def pre_second_owner(g, owner, iterations):
+def pre_second_owner(g, owner, iterations, *, after=(), msplit=False):
     owned = min(g.row_former, g.rows - owner * g.row_former)
     phases = []
     def emit(name, work, after=()):
         phases.append(Phase(name, work, after, owner, g.aivs))
         return name
-    base = emit('base', memory(read=24 * 4))
+    base = emit('base', memory(read=24 * 4), after)
     previous = base
     store_tail = None
     for batch, start in enumerate(range(0, owned, g.row_factor)):
         rows = min(g.row_factor, owned - start)
         tag = f'b{batch}'
-        load = emit(tag + '.partials', memory(read=rows * g.k_parts * 25 * 4), (previous,))
+        if msplit:
+            load = previous
+        else:
+            load = emit(tag + '.partials',
+                        memory(read=rows * g.k_parts * 25 * 4), (previous,))
         # hcScale GetValue is payload only; no undocumented scalar latency.
         norm = emit(tag + '.normalize', Work(resources={'vector': rows * (
             (g.k_parts + (3 if g.k_parts >= 4 else 0)) * 25 + 27)}), (load,))
@@ -252,7 +334,63 @@ def pre_second_owner(g, owner, iterations):
     return tuple(phases)
 
 
+def _msplit_rows(g, m_core):
+    m_cnt = ceil(g.rows / g.m_l1)
+    single_round = ceil(m_cnt / g.m_dim)
+    main = m_cnt % g.m_dim
+    if main == 0 or m_core < main:
+        start = m_core * single_round * g.m_l1
+        tiles = single_round
+    else:
+        start = (main * single_round + (m_core - main)
+                 * (single_round - 1)) * g.m_l1
+        tiles = single_round - 1
+    return start, min(tiles * g.m_l1, g.rows - start)
+
+
+def pre_msplit_second(g, m_core, iterations, *, after=()):
+    """key1001 local vector post stage; one AIC and two AIVs, no K partials."""
+    _, rows = _msplit_rows(g, m_core)
+    phases = []
+    for sub in range(2):
+        count = rows // 2 + (1 if sub == 0 and rows % 2 else 0)
+        clone = replace(g, rows=count, k_parts=1, row_former=max(1, count),
+                        row_factor=min(g.row_factor, max(1, count)))
+        local = pre_second_owner(clone, 0, iterations, after=after, msplit=True)
+        owner = 2 * m_core + sub
+        phases.extend(replace(phase, owner=owner) for phase in local)
+    return tuple(phases)
+
+
+def pre_msplit_groups(g, iterations):
+    groups = []
+    for m_core in range(g.m_dim):
+        local = pre_owner(g, m_core, msplit=True)
+        tails = tuple(phase.name for phase in local
+                      if phase.name.endswith('projection_local')
+                      or '.rms_out' in phase.name or phase.name.startswith('rms_out'))
+        groups.append(tuple(local) + pre_msplit_second(
+            g, m_core, iterations, after=tails))
+    return tuple(groups)
+
+
 def pre_program(g, first, second, context, *, compact=False):
+    if g.tiling_key == 1001:
+        from .program import ParallelProgram
+        groups = pre_msplit_groups(g, _iterations_from_context(g, context))
+        ub = max(g.first_ub, g.second_ub)
+        alloc = allocations(context, 'pre_msplit',
+                            {'l1': 524288, 'l0a': 65536, 'l0b': 65536,
+                             'l0c': 262144}, range(g.m_dim), g.cores)
+        alloc += allocations(context, 'pre_msplit', {'ub': ub},
+                             range(2 * g.m_dim), g.aivs)
+        return KernelProgram((Stage('source_msplit', acquire=alloc, free=alloc,
+            program=ParallelProgram(tuple(phase_program(group, context)
+                                          for group in groups))),))
+    return _pre_program_key1000(g, first, second, context, compact=compact)
+
+
+def _pre_program_key1000(g, first, second, context, *, compact=False):
     from .hc_arch35_compact import first_owner
     first_alloc = allocations(context, 'pre1', {'l1': 524288, 'l0a': 65536,
         'l0b': 65536, 'l0c': 262144}, range(g.cores), g.cores)
@@ -267,12 +405,19 @@ def pre_program(g, first, second, context, *, compact=False):
     ))
 
 
+def _iterations_from_context(g, context):
+    return int(dict(getattr(context, "metadata", ()) or ()).get(
+        "sinkhorn_iters", getattr(g, "sinkhorn_iters", 20)))
+
+
+
+
 def post_geometry(view, geometry):
     if (view['dtype'] != 'bf16' or view['hc'] != 4
             or view.get('coefficient_dtype', 'fp32') != 'fp32'
             or view['hidden'] % 32 or not 32 <= view['hidden'] <= 32768
-            or not 1 <= view['tokens'] <= 256):
-        raise ModelingError('hc_post_arch35_requires_bf16_fp32coeff_hc4_M1to256_D32to32768')
+            or view['tokens'] < 1):
+        raise ModelingError('hc_post_arch35_source_geometry_invalid')
     # Double X/residual/output queues + FP32 sum scratch. Source reserves full
     # D4096 even for a short last chunk and casts the full output scratch.
     size = 2 * 4096 * 2 + 2 * 4 * 4096 * 2 + 2 * 4 * 4 + 2 * 16 * 4

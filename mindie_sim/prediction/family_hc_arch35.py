@@ -54,6 +54,7 @@ LIMITATIONS = (
     'MTE1_base_pipe_bytes_no_directional_instruction_rate_assumption',
     'source_control_flags_zero_latency_readiness_dependencies',
     'pre_stage2_row_batches_conservative_serial_completion',
+    'pre_stage1_multi_m_tiles_execute_serially_within_one_source_core',
 )
 
 
@@ -70,10 +71,18 @@ def _frozen_groups(groups):
 def _pre_template(g, iterations):
     # Future layers share source IR, never bound programs, rates or Engine events.
     # Capacity checks still run before this cache lookup on each physical device.
-    first = _frozen_groups(pre_owner(g, owner) for owner in range(g.k_parts))
+    first = _frozen_groups(pre_owner(g, owner)
+                           for owner in range(g.m_dim * g.k_parts))
     second = _frozen_groups(pre_second_owner(g, owner, iterations)
                            for owner in range((g.rows + g.row_former - 1) // g.row_former))
     return first, second, _frozen_work(total_work((*first, *second)))
+
+
+@lru_cache(maxsize=4)
+def _msplit_template(g, iterations):
+    from .hc_arch35_program import pre_msplit_groups
+    groups = _frozen_groups(pre_msplit_groups(g, iterations))
+    return groups, _frozen_work(total_work(groups))
 
 
 @lru_cache(maxsize=4)
@@ -109,11 +118,29 @@ def selected_plan(op, geometry):
             if name in exposed and phase['recipe'] not in {'hc_sinkhorn', 'hc_pre_mix'}:
                 raise ModelingError('hc_arch35_cannot_export_internal_intermediate')
         g = pre_geometry(view, geometry)
-        first, second, work = _pre_template(g, view['sinkhorn_iters'])
-        from .hc_arch35_compact import eligible
-        compact=profile==COMPACT_PRE_PROFILE and eligible(g)
+        if g.tiling_key == 1001:
+            first, work = _msplit_template(g, view['sinkhorn_iters'])
+            second = None
+            compact = False
+        else:
+            first, second, work = _pre_template(g, view['sinkhorn_iters'])
+            from .hc_arch35_compact import eligible
+            compact = profile == COMPACT_PRE_PROFILE and eligible(g)
         diagnostic.update(geometry=vars(g), logical_projection_flops=2 * g.rows * g.width * 24,
-                          physical_projection_flops=2 * g.m_l1 * g.width * 32,
+                          physical_projection_flops=int(work.matrix.get('hf32', 0)),
+                          m_k_tiling={
+                              'basis': 'hc_pre_tiling_arch35.h:295-429',
+                              'source_revision': SOURCE['revision'],
+                              'm_l1_max': 256, 'm_dim': g.m_dim,
+                              'single_core_m': g.single_core_m,
+                              'm_l1': g.m_l1, 'm_tiles': g.m_tiles,
+                              'k_dim': g.k_dim, 'k_span': g.k_span,
+                              'k_parts': g.k_parts, 'k_l1': g.k_l1,
+                              'owner_count': g.m_dim * g.k_parts,
+                              'tiling_key': g.tiling_key,
+                              'm_cnt': g.m_cnt, 'm_rounds': g.m_rounds,
+                              'm_main': g.m_main,
+                          },
                           source_workspace_bytes=g.rows * g.k_parts * 25 * 4,
                           compact_pipeline={
                               'requested':profile==COMPACT_PRE_PROFILE,

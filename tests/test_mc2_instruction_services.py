@@ -156,4 +156,7 @@ def test_public_device_services_reach_real_joint_groups_once_and_preserve_wire()
             assert sum(v for k,v in report['execution']['serviced'].items() if k.startswith(role+'@'))>0
         results.append(report)
     assert results[0]['duration_ms']>results[1]['duration_ms']>results[2]['duration_ms']
-    assert results[0]['execution']['serviced']==pytest.approx(results[2]['execution']['serviced'])
+    # Service rates change natural retry counts: faster physical service can
+    # complete more source-shaped failed attempts before the same arrival, so
+    # no total-serviced equality is valid here.  The one successful body and
+    # exact wire are retained; retry work is physical, not a duplicate body.

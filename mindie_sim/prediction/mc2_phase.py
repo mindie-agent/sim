@@ -62,8 +62,59 @@ def build(op, geometry):
     # Source geometry and declared owner roles determine this IR. Layer/rank
     # identities, rates and Engine callbacks are bound only by program(context).
     raw = dict(op.metadata)["mc2_phase"]
+    if "phase" not in raw:
+        # The ordinary public graph binds one whole native dispatch/combine
+        # call, not a dozen separately scheduled semantic phase operators.
+        return _native_plan(raw, geometry)
     return _template(tuple(sorted(raw.items())), geometry.compute_units,
                      tuple(sorted(geometry.resource_units.items())))
+
+
+def _native_plan(raw, geometry):
+    """One real native call over the existing phase contract.
+
+    The phase ledger remains attributable metadata; it is not scheduled a
+    second time as separate Work operators.  The common Execution launches the
+    returned peer program on its own Engine.
+    """
+    units = max(2, int(geometry.resource_units.get(
+        "vector", geometry.compute_units)))
+    plan = contract(raw, units)
+    resources = {}
+    for phase in plan.phases:
+        for role, amount in phase.work:
+            resources[role] = resources.get(role, 0.0) + float(amount)
+    link = 0.0
+    matrix = raw.get("route_matrix")
+    if matrix is not None:
+        rank = int(raw.get("route_rank", 0))
+        reverse = bool(raw.get("route_reverse", False))
+        if 0 <= rank < len(matrix):
+            link = float(sum(
+                (matrix[peer][rank] if reverse else matrix[rank][peer])
+                for peer in range(len(matrix)) if peer != rank)
+                * plan.layout.packet_bytes)
+    else:
+        from .piecewise.families_moe_mc2 import _link_work
+        for phase in _link_work(plan, max(1, int(raw["ep"])), 0):
+            link += sum(float(amount) for pipe, amount in phase.work
+                        if pipe in {"link", "link_hccs", "link_roce"})
+    if link:
+        resources["link"] = resources.get("link", 0.0) + link
+    kind = str(raw["kind"])
+
+    def program(context):
+        from .piecewise.families_moe_mc2 import native_program_from_contract
+        return native_program_from_contract(raw, context)
+
+    return OperatorPlan(
+        Work(resources=resources), program, {
+            "execution_class": "vector",
+            "mc2_kind": kind,
+            "mc2_phases": tuple(phase.name for phase in plan.phases),
+            "mc2_phase_contract": "source_ordered; one native launch",
+            "coverage": "complete_native_call_from_declared_source_contract",
+        }, native=True)
 
 
 @lru_cache(maxsize=128)

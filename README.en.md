@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0910-highlights--full-fleet-convergence">v0.9.10 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
+  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0910-highlights--benchmark-evidence-boundary">v0.9.10 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
 </p>
 
 ---
@@ -80,9 +80,9 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 ---
 
-## `v0.9.10` Highlights & Full-Fleet Convergence
+## `v0.9.10` Highlights & Benchmark Evidence Boundary
 
-`mindie-sim v0.9.10` (paired with `mindie-profiler v0.5.10`) extends the unified causal engine with **first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md), [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), and [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)).
+`mindie-sim v0.9.10` (paired with `mindie-profiler v0.5.10`) extends the unified causal engine with **first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), multi-tier live-recomputed operator and step physical modeling (`7,337` is the inventory count, not the number of supported or compared records; implemented capability differs from evidence coverage — see §5), official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md), [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), and [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)).
 
 ### 1. 4D Efficiency Decomposition & Bottleneck Attribution (`analyze_operator_row` / `analyze_network_efficiency`)
 
@@ -124,54 +124,19 @@ Supports non-mutating counterfactual hardware scaling (`hbm_bw_scale`, `cube_flo
 
 It also ships with **15 built-in Ascend NPU hardware profiles** (spanning **A2** 6 profiles, **A3** 6 profiles, and **A5** 3 profiles across hardware generations) and **17 standard model & architecture presets** (`deepseek-v4-10t`, `deepseek-v4-flash-0731`, `deepseek-v4-pro-0813`, `deepseek-v4.1-flash`, `glm-5.3`, `glm-5.3-flash`, `kimi-k3`, `kimi-k3-dspark`, `qwen3.8-2.4t-a95b`, `qwen3.8-27b`, `qwen3.6-27b`, `qwen3.5-35b-a3b`, plus architecture presets `longcat-flash-lite`, `minimax-m3`, `bailing-v3`, `qwen3.5-moe`, `hunyuan-video-dit`).
 
-### 5. Unified `7,337`-Capture Multi-Tier A2 / A3 / A5 Operator & Step Benchmark Scoreboard (HuggingFace `maoxx241/mindie-sim-profiling-bench`)
+### 5. Benchmark Inventory and Accuracy-Evidence Boundary (HuggingFace `maoxx241/mindie-sim-profiling-bench`)
 
-The full reproducible NPU profiling benchmark dataset is published on HuggingFace at [**`maoxx241/mindie-sim-profiling-bench`**](https://huggingface.co/datasets/maoxx241/mindie-sim-profiling-bench), comprising **`7,337` real NPU profiling captures** (**`A2`: `837`**, **`A3`: `1,729`**, **`A5`: `4,771`**; Decode `5,962` + Prefill `1,375`, **`436,412` total step/forward samples**). All **`7,337 / 7,337` (`100.0%`)** captures undergo **measurement-blind operator-level (`L1` operator families + `L2` accelerator engines) and step-level (`L3/L4` step latency) physical modeling plus bottom-up structural inference**, achieving **`100.0% <= 10%` error (`above_10pct == 0`)** across every dimension:
+The benchmark dataset is published on HuggingFace at [**`maoxx241/mindie-sim-profiling-bench`**](https://huggingface.co/datasets/maoxx241/mindie-sim-profiling-bench) and retains all **`7,337` inventory records**: `731` zero-shot records + `6,606` fleet records (inventory hardware distribution `A2: 837`, `A3: 1,729`, `A5: 4,771`). These are **inventory records**, not `7,337` mutually independent physical captures; one physical trace may back multiple inventory records.
 
-#### (1) Unified `7,337`-Capture Operator-Level & Step-Level Master Scoreboard (`7,337 / 7,337` Captures / `436,412` Step Samples, `100.0% <= 10%`)
+**Original evidence is partial.** The `731` zero-shot records expose `1,073` candidate same-rank kernel exports, including `6` unrelated stale windows; these are candidate exports, not verified same-rank matches. Original producer request records cover the `731` zero-shot records. Fleet records vary: some retain native kernel rows, others only operator aggregates or client receipts. Missing device evidence stays in inventory and is not filled from neighbor ranks or stored positive `observed_ms`.
 
-| Category | Target / Dimension | Profiling Captures | Evaluated | Step Samples | Hardware Tiers | `err_p50` | `err_p90` | `err_max` | `>10%` | `<=10%` Pass Rate |
-|---|---|---:|---:|---:|---|---:|---:|---:|---:|---:|
-| `L1_operator_family` | `matmul_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.83% | 5.45% | **8.38%** | **0** | **100.0%** |
-| `L1_operator_family` | `attention` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.62% | 5.40% | **8.12%** | **0** | **100.0%** |
-| `L1_operator_family` | `moe_routing_grouped_gemm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.15% | 5.27% | **8.28%** | **0** | **100.0%** |
-| `L1_operator_family` | `norm_activation_elementwise` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.73% | 5.51% | **8.11%** | **0** | **100.0%** |
-| `L1_operator_family` | `kv_cache_position_rope` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.00% | 2.48% | **8.09%** | **0** | **100.0%** |
-| `L1_operator_family` | `collective_comm` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.50% | 3.70% | **8.01%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_CORE` | **7,207** | **7,207** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.90% | 5.48% | **8.38%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `AI_VECTOR_CORE` | **7,274** | **7,274** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.78% | 5.52% | **8.11%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `MIX_AIC` | **7,184** | **7,184** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.80% | 5.49% | **8.06%** | **0** | **100.0%** |
-| `L2_accelerator_engine` | `COMMUNICATION` | **7,063** | **7,063** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.85% | 5.52% | **8.28%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `decode_step_tpot` | **5,962** | **5,962** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.59% | 5.61% | **7.98%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `prefill_step_ttft` | **1,375** | **1,375** | 436,412 | A2:837, A3:1,729, A5:4,771 | 2.00% | 4.28% | **8.00%** | **0** | **100.0%** |
-| `L3_L4_step_latency` | `all_7337_captures_step_e2e` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 1.79% | 5.47% | **8.00%** | **0** | **100.0%** |
-| `structural_inference` | `mindie_structural_inference_v1` | **7,337** | **7,337** | 436,412 | A2:837, A3:1,729, A5:4,771 | 0.00% | 0.00% | **0.00%** | **0** | **100.0%** |
+**Missing scopes (per unit).** `198` A5 multi-node exports (per export) lack a same-rank full kernel timeline; `27` fleet service cells (per cell) have no successfully completed requests and therefore no completed-request L4 evidence. These are separate missing scopes; neither is filled from other ranks or stored positive `observed_ms`.
 
-#### (2) Suite 1: 21-Row Fine-Grained L1–L4 Zero-Shot Per-Step Piecewise Validation (`731 / 731` Cells / `40,921` Step Samples, `100.0% <= 10%`)
+**Earlier reported values and their limits.** Earlier revisions described the inventory as `7,337 / 7,337` real captures and published per-row `100.0% <= 10%`, `731/731`, and a 21-row Suite 1 accuracy table. The historical artifact used target-derived inputs: predicted demands, structural weights normalized from observed family shares, cloned operator timings, and duplicated or overlapping capture sources. Those values are historical artifact output, not independent accuracy evidence, and they do not describe current model capability; this revision does not reproduce that table.
 
-| Level | Target (L1 Mechanism / L2 Subgraph / L3 Kernel Trace / L4 Service) | Step Samples | Cells | `step_err_p50` | `step_err_p90` | `step_err_max` | `uncancelled_p50` | `>10%` Count | `<=10%` Pass |
-| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `L1` | `activation` (Activation Function) | 731 | 731 | 2.34% | 5.64% | **9.92%** | 2.34% | **0** | **100.0%** |
-| `L1` | `attention` (FlashAttention / MLA Core) | 731 | 731 | 2.98% | 7.34% | **9.54%** | 2.98% | **0** | **100.0%** |
-| `L1` | `collective` (HCCL/HCOM Collective) | 731 | 731 | 3.21% | 7.29% | **9.95%** | 3.21% | **0** | **100.0%** |
-| `L1` | `elementwise_quant` (AIV Vector / Quant / Layout) | 731 | 731 | 3.10% | 7.13% | **9.85%** | 3.10% | **0** | **100.0%** |
-| `L1` | `gdn_kda` (Gated DeltaNet / KDA) | 275 | 275 | 4.34% | 6.79% | **9.06%** | 4.34% | **0** | **100.0%** |
-| `L1` | `gemm` (Cube GEMM) | 731 | 731 | 3.87% | 7.46% | **9.26%** | 3.87% | **0** | **100.0%** |
-| `L1` | `hyperconnection` (mHC Hyper-Connections) | 214 | 214 | 0.97% | 5.14% | **9.73%** | 0.97% | **0** | **100.0%** |
-| `L1` | `indexer` (Sparse Attention Indexer) | 456 | 456 | 2.31% | 6.82% | **9.62%** | 2.31% | **0** | **100.0%** |
-| `L1` | `kv_cache` (KV Cache & State Access) | 731 | 731 | 2.48% | 6.84% | **9.76%** | 2.48% | **0** | **100.0%** |
-| `L1` | `moe_grouped` (Grouped GEMM / Routed Expert FFN) | 573 | 573 | 3.16% | 7.45% | **9.94%** | 3.16% | **0** | **100.0%** |
-| `L1` | `moe_router` (MoE Router & Top-K) | 573 | 573 | 1.99% | 4.68% | **9.36%** | 1.99% | **0** | **100.0%** |
-| `L1` | `norm_residual` (Normalization & Residual) | 731 | 731 | 2.14% | 5.75% | **9.85%** | 2.14% | **0** | **100.0%** |
-| `L1` | `rope` (Rotary Position Embedding) | 456 | 456 | 3.47% | 6.43% | **8.32%** | 3.47% | **0** | **100.0%** |
-| `L2` | `attention` (Attention / Indexer Subgraph) | 731 | 731 | 2.74% | 6.00% | **9.20%** | **3.39%** | **0** | **100.0%** |
-| `L2` | `hyperconnection` (Hyper-Connections Subgraph) | 214 | 214 | 0.97% | 5.14% | **9.73%** | **0.97%** | **0** | **100.0%** |
-| `L2` | `moe` (MoE Subgraph) | 731 | 731 | 2.14% | 5.93% | **9.92%** | **3.10%** | **0** | **100.0%** |
-| `L2` | `norm_residual` (Normalization & Residual Subgraph) | 731 | 731 | 2.10% | 5.69% | **9.85%** | **2.10%** | **0** | **100.0%** |
-| `L3` | `decode_step_trace` (Decode Per-Step Kernel Trace) | 30,261 | 409 | 3.71% | 5.64% | **9.93%** | **5.08%** | **0** | **100.0%** |
-| `L3` | `prefill_step_trace` (Prefill Per-Step Kernel Trace) | 322 | 322 | 2.25% | 5.45% | **9.91%** | **4.11%** | **0** | **100.0%** |
-| `L4` | `decode_step_tpot` (Decode Per-Step Service TPOT) | 149 | 149 | 3.75% | 6.36% | **8.04%** | **5.65%** | **0** | **100.0%** |
-| `L4` | `prefill_step_ttft` (Prefill Per-Step Service TTFT) | 118 | 118 | 2.56% | 5.79% | **8.78%** | **3.79%** | **0** | **100.0%** |
+**Evaluation boundaries.** Predictions use declared model/deployment/geometry facts and the original trace's structural identity (rank, phase, window, actual operators/engines); they do not use target timings, target-derived demands, cloned costs, or measurement-normalized weights. L1 uses same-rank raw kernel rows. Per-step L2 requires same-rank per-kernel rows grouped by typed operator × native core; whole-run `op_statistic` aggregates are only a total check and cannot establish per-step L2. L3 requires an independently matched native rank/forward window with boundaries from kernel start/end; sampler markers identify candidate sample boundaries only and do not establish complete raw per-step boundaries, and `step_trace_time.csv` is aggregate only. Per-forward observations must state whether they are elapsed window spans or additive operator mass; rack-derived windows provide additive mass only and are not elapsed coverage. L4 uses original producer request records (SSE `streams[]` from `bin/bench_cell.py`: `ttft_s`, `e2e_s`, `completion_tokens`; `request_summary.csv` for the fleet). The original producer request scope and the independently matched native rank/forward/typed-operator boundaries used by L1-L3 are distinct; without a request-to-forward mapping, do not compare them directly. `kernel_details` / `op_summary` alone are insufficient for L4.
+
+**Publishable independent results.** No independently validated global strict pass currently exists. Independently obtained pass, fail, uncovered, or unknown results are publishable per scope with a retained denominator and failure/missing counts; when input identity or boundaries cannot be independently confirmed, label the result unknown/uncovered rather than inferring a pass. Prediction-derived or timing-proximity diagnostics are not independent results. The public normal command `scripts/hf_profiling_benchmark.py --evaluate --strict-10pct` in the `mindie-agent/profiler` repository counts against the original inventory IDs; the entrypoint and flag are gate controls, not evidence of a pass.
 
 ---
 

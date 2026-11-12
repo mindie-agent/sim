@@ -157,6 +157,18 @@ def _execution(rule):
         if set(execution) != {"kind"}:
             raise ModelingError("service_regime_completion_floor_execution_requires_only_kind")
         return "completion_floor", None
+    if kind == "mac_service":
+        if (set(execution) != {"kind", "resource", "native_kernel",
+                               "tile_m", "tile_n", "tile_k", "slots"}
+                or execution.get("resource") != "cube"
+                or not execution.get("native_kernel")):
+            raise ModelingError("mac_service_requires_cube_and_native_kernel")
+        for key in ("tile_m", "tile_n", "tile_k", "slots"):
+            if (isinstance(execution.get(key), bool)
+                    or not isinstance(execution.get(key), int)
+                    or execution[key] <= 0):
+                raise ModelingError("mac_service_requires_positive_tile_geometry")
+        return "mac_service", dict(execution)
     if kind != "joint_native":
         raise ModelingError("service_regime_execution_kind_unknown")
     if not execution.get("resource") or not execution.get("native_kernel"):

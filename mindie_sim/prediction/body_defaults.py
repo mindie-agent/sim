@@ -324,14 +324,19 @@ def _kda_default(case, phase, tokens, kernels):
                            and name[len("recurrent_scan"):].isdigit() for name in recipes)
     raw_bf16 = (case.model.quant.weight_format == "bf16"
                 and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
+    # A5 Kimi K3 decode is an actual native KDA source call even when the
+    # frontend declaration is raw BF16.  Keep raw BF16 as an explicit-generic
+    # guard for non-A5 / foreign KDA domains only.
+    native_a5 = case.machine.arch_family == "A5"
+    raw_bf16_generic = raw_bf16 and not native_a5
     explicit = ("kda" in kernels.get("lowerings", {}) or
                 bool({"short_convolution", "recurrent_vector", "recurrent_scan"}
                      & kernels.get("families", {}).keys()) or
                 bool({"delta_gates", "short_convolution", "qk_l2norm", "recurrent_scan"}
                      & recipes.keys()) or per_request_scan or
                 "recurrent_vector" in kernels.get("programs", {}) or
-                bool(kernels.get("service_regimes")) or
-                bool(case.runtime.tensor_layouts) or raw_bf16)
+                (bool(kernels.get("service_regimes")) and not native_a5) or
+                bool(case.runtime.tensor_layouts) or raw_bf16_generic)
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
@@ -354,7 +359,23 @@ def _kda_default(case, phase, tokens, kernels):
     if not reason:
         impl = ("vllm_ascend_recurrent_kda_arch35" if case.machine.arch_family == "A5"
                 else "vllm_ascend_recurrent_kda_arch22")
-        kernels.setdefault("lowerings", {})["kda"] = impl
+        options = {}
+        if case.machine.arch_family == "A5":
+            from .kda_source import resolve as resolve_kda_source
+            bounds = {getattr(p, "kda_gate_lower_bound", None) for p in layers}
+            if len(bounds) != 1:
+                reason = "kda_gate_lower_bound_not_uniform_across_layers"
+            elif phase != "decode":
+                reason = "kda_source_decode_only"
+            else:
+                options = resolve_kda_source(
+                    layers[0], arch=case.machine.arch_family, phase=phase,
+                    kernels=kernels, activation_dtype=case.model.activation_dtype)
+                if options is None:
+                    reason = "kda_source_explicit_override_or_gate_invalid"
+        if not reason:
+            kernels.setdefault("lowerings", {})["kda"] = {
+                "implementation": impl, "options": options}
     return {"family": "kda_decode", "selection": "preserved" if reason else "default_installed",
             "reason": reason or "supported_tensor_and_resource_geometry"}
 
@@ -364,26 +385,23 @@ def _attnres_default(case, phase, kernels):
                   if p.residual_block_size), 0)
     if block < 1:
         return None
-    raw_bf16 = (case.model.quant.weight_format == "bf16"
-                and "moe_dispatch_quantization" not in dict(case.runtime.metadata))
     # Fusing the block would delete these independently declared member
-    # programs, so any explicit member choice keeps the unfused boundary.
+    # programs, so an explicit residual recipe/family keeps the unfused
+    # boundary.  Generic matmul/service declarations are not residual choices.
+    from . import family_attnres
     recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
                "attention_residual_scores", "attention_residual_softmax",
                "attention_residual_mix", "attention_residual_output_cast"}
     families = {"gemm", "rmsnorm", "softmax", "elementwise", "cast"}
     explicit = ("attention_residual" in kernels.get("lowerings", {}) or
                 bool(recipes & kernels.get("recipes", {}).keys()) or
-                bool(families & kernels.get("families", {}).keys()) or
-                "matmul" in kernels.get("programs", {}) or
-                bool(kernels.get("service_regimes")) or raw_bf16)
+                bool(families & kernels.get("families", {}).keys()))
+    source_domain = (family_attnres.source_eligible(
+        case.model, case.machine.arch_family, phase)
+        and family_attnres.source_image_match(case.runtime))
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
-              "decode_profile_only" if phase != "decode" else
-              "attnres_requires_bf16_uniform_blocks" if (
-                  case.model.activation_dtype != "bf16"
-                  or any(p.residual_block_size != block or p.engram or p.hyper_connections
-                         for p in case.model.layer_plans)) else
+              "attnres_source_image_or_domain_unsupported" if not source_domain else
               "attnres_independent_copy_pipes_not_declared" if any(
                   not pipes <= dict(d.rates).keys() or dict(d.buffers).get("ub", 0) <= 32768
                   for d in case.machine.dies) else "")

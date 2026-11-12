@@ -16,7 +16,7 @@ def test_one_successful_flag_check_prices_vector_and_exposes_unpriced_scalar(tok
     details = plan.metadata['source_service_details']
     assert details['scalar_instruction_counts']['scalar_sff_calls'] == tokens * (compared // 64)
     assert details['scalar_instruction_counts']['ub_uint64_mask_reads'] == tokens * (compared // 64)
-    assert details['additional_spin_polls'] == 'unmodeled'
+    assert details['additional_spin_polls'] == 'unknown; no universal count'
     # Independent low-rate serial initialize -> DMA -> compare oracle.
     assert elapsed == pytest.approx(((tokens + 63) // 64) * (2 * compared + top_k * 32) / 1000)
     own = [r for r in engine.trace if 'owner0:' in r['task']]

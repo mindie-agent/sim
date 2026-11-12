@@ -160,12 +160,25 @@ def test_missing_invocation_classes_use_declared_minima_not_ratios():
     ratio_empty = ARCH3510_VECTOR_MIN_MS * 0.35
     assert ARCH3510_W8A8_ND_BF16_MIN_MS != pytest.approx(ratio_quant)
     assert ARCH3510_EMPTY_AIC_MIN_MS != pytest.approx(ratio_empty)
-    expected = (
-        Fraction(1)
+    # A 1 ms cube body is already above the declared cube invocation floor.
+    # This operator's work is cube-only, so an undeclared w8a8 class and a
+    # 1.5x vector multiple are not added.  The old expected sum
+    # 1 + w8a8 + 1.5*vector had no source in the invocation table.
+    declared_cube = as_fraction(dict(supply.invocations)["cube"])
+    assert stage_times[-1] == Fraction(1)
+    assert declared_cube == as_fraction(ARCH3510_CUBE_MIN_MS)
+    tiny = [Fraction(1, 1_000_000)]
+    apply_hardware_service(
+        _Op(supply), _Geometry(), {}, [{"cube": Fraction(1)}], tiny,
+        {"cube": Fraction(1)}, {"cube": Fraction(1)}, {"cube": Fraction(1)},
+    )
+    # A body below the declared cube floor completes at that floor alone.
+    assert tiny[-1] == declared_cube
+    assert tiny[-1] != (
+        declared_cube
         + as_fraction(ARCH3510_W8A8_ND_BF16_MIN_MS)
         + as_fraction(ARCH3510_VECTOR_MIN_MS) * Fraction(3, 2)
     )
-    assert stage_times[-1] == expected
 
 
 def test_undeclared_mte2_does_not_invent_an_arch3510_rate():

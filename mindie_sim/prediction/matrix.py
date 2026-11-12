@@ -110,6 +110,7 @@ class TiledMatmul:
                       placement=context.owned(core, cores, (operand_read,))
                       if self.distributed_transfers else {}),
                 Stage("compute", compute, after=("load",),
+                      caps=context.mac_caps,
                       placement=context.owned(core, cores, ("cube", "vector")),
                       acquire=accumulator if kk == 0 else (), free=operand),
             ]

@@ -49,12 +49,33 @@ def test_valid_input_projection_padding_and_gather_trim(native, source):
     ledger = dict(by_id['s0.l0.expert_up'].metadata)['routing_realization']
     assert sum(ledger['global_expert_rows']) == 3 * 2
     assert sum(ledger['rank_assignment_rows']) == 3 * 2
-    networks = [op for op in ops if dict(op.metadata).get('peer_traffic') and
-                dict(op.metadata).get('channel') != 'count_status']
-    assert len(networks) == 2
-    forward, reverse = [dict(op.metadata)['peer_traffic']['payload_bytes'] for op in networks]
-    assert not any(forward[3])  # allocated row on last rank is an invalid MC2 mask bit
-    assert all(reverse[i][j] == forward[j][i] for i in range(4) for j in range(4))
+    if native:
+        selected = [op for op in ops
+                    if dict(op.metadata).get('mc2_phase', {}).get('kind')
+                    in {'dispatch', 'combine'}]
+        assert len(selected) == 2
+        if source:
+            by_kind = {dict(op.metadata)['mc2_phase']['kind']: op
+                       for op in selected}
+            forward = dict(by_kind['dispatch'].metadata)['mc2_phase'][
+                'route_matrix']
+            reverse_raw = dict(by_kind['combine'].metadata)['mc2_phase']
+            assert reverse_raw['route_reverse'] is True
+            reverse = tuple(tuple(forward[src][dst] for src in range(4))
+                            for dst in range(4))
+            assert not any(forward[3])  # allocated row is not a valid MC2 bit
+            assert all(reverse[i][j] == forward[j][i]
+                       for i in range(4) for j in range(4))
+    else:
+        networks = [op for op in ops
+                    if dict(op.metadata).get('peer_traffic')
+                    and dict(op.metadata).get('channel') != 'count_status']
+        assert len(networks) == 2
+        forward, reverse = [dict(op.metadata)['peer_traffic']['payload_bytes']
+                            for op in networks]
+        assert not any(forward[3])
+        assert all(reverse[i][j] == forward[j][i]
+                   for i in range(4) for j in range(4))
     report = graph_costs(raw, {0:ops}, external_inputs={'analysis_input':7}, input_ready_ms=7)
     assert report['execution']['live_tasks'] == report['execution']['live_programs'] == 0
     assert all(row['ready_ms'] >= 7 for row in report['timeline'])

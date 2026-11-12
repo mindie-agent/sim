@@ -16,7 +16,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass, field
+from functools import lru_cache
+import hashlib
 import json
+from pathlib import Path
 import math
 from statistics import median
 from typing import Mapping
@@ -43,7 +46,7 @@ __all__ = [
     "A5_ARCH_FAMILY", "A5_HARDWARE_KEY", "A5_SKU", "A5CommCalibrationBundle",
     "EMBEDDED_A5_CAMPAIGNS", "EMBEDDED_A5_MC2_CAMPAIGNS",
     "bind_service_curve", "build_a5_comm_recipe", "build_a5_followup_manifest",
-    "compute_a5_contention_slowdown", "evaluate_a5_mc2_chains",
+    "collect_native_service", "compute_a5_contention_slowdown", "evaluate_a5_mc2_chains",
     "fit_a5_service_curves", "ingest_a5_campaign_data", "resolve_expansion_regime",
     "to_service_regime",
 ]
@@ -672,3 +675,140 @@ class _ManifestCell(dict):
     def upper(self): return self._text().upper()
     def startswith(self, prefix): return self._text().startswith(prefix)
     def endswith(self, suffix): return self._text().endswith(suffix)
+
+
+NATIVE_A5_SERVICE_SOURCE = (
+    "/Volumes/data/mindie-sim-data/calibration-20261107/a5/hccl-native/raw/parsed/native-summary.json"
+)
+
+
+@lru_cache(maxsize=4)
+def _collect_native_service_cached(source: str, groups: tuple, stack: str,
+                                   cann: str, execution_core: str,
+                                   placement: str, mtime_ns: int, size: int,
+                                   deployment_image_id: str):
+    """Fit the existing A5 ServiceCurve bundle from a validated native wave.
+
+    The cached producer reads the source artifacts only on a cache miss.  It
+    validates actual environment host/image, manifest SHA, CANN/topology,
+    group/dtype/canary/mapping evidence and the requested deployment image.
+    The fitted response is the active AICPU child, never the COMMUNICATION
+    envelope or a sum of parent/alias.
+    """
+    path = Path(source)
+    summary = json.loads(path.read_text(encoding="utf-8"))
+    source_id = str(summary.get("manifest_sha256") or "")
+    manifest = path.parents[2] / "manifest" / "native-manifest.json"
+    if not source_id or not manifest.is_file() or hashlib.sha256(
+            manifest.read_bytes()).hexdigest() != source_id:
+        raise ValueError("native_service_manifest_identity_mismatch")
+    versions = path.parents[1] / "native-versions.json"
+    if not versions.is_file():
+        raise ValueError("native_service_versions_missing")
+    version = json.loads(versions.read_text(encoding="utf-8"))
+    packages = version.get("python_packages") or {}
+    if str(cann) not in str(packages.get("cann") or "") and str(cann) not in str(
+            version.get("cann_version_info") or ""):
+        raise ValueError("native_service_cann_mismatch")
+    if "intrahost" not in str(version.get("topology_interpretation") or "").lower():
+        raise ValueError("native_service_topology_not_intrahost")
+    environment = path.parents[1] / "environment.txt"
+    if not environment.is_file():
+        raise ValueError("native_service_environment_missing")
+    env_text = environment.read_text(encoding="utf-8", errors="replace")
+    host = next((line.split()[1] for line in env_text.splitlines()
+                 if line.startswith("Linux ")), "")
+    image_line = next((line for line in env_text.splitlines()
+                       if line.startswith("image_id=")), "")
+    env_image = ""
+    for token in image_line.split():
+        if token.startswith("image_id="):
+            env_image = token.split("=", 1)[1]
+    if not env_image or str(deployment_image_id) != env_image:
+        raise ValueError("native_service_environment_image_mismatch")
+    if not host or not host.lower().startswith(str(stack).lower()):
+        raise ValueError("native_service_environment_stack_mismatch")
+    if str(execution_core).lower() != "aicpu":
+        raise ValueError("native_service_requires_aicpu_active_child")
+    if str(placement) != "intra_node_ub":
+        raise ValueError("native_service_requires_intra_node_ub")
+    wanted = {int(group) for group in groups}
+    conditions, heldout = [], set()
+    for row in summary.get("conditions") or ():
+        if int(row.get("group_size") or 0) not in wanted:
+            continue
+        if str(row.get("collective")) not in {"all_gather", "reduce_scatter"}:
+            continue
+        if str(row.get("dtype") or "bf16").lower() not in {"bf16", "bfloat16"}:
+            continue
+        if str(row.get("status") or "ok") != "ok":
+            raise ValueError("native_service_condition_status_not_ok")
+        active = []
+        payload = int(row.get("input_bytes") or 0)
+        rank_keys = sorted(int(key) for key in (row.get("per_rank") or {}))
+        group = int(row.get("group_size") or 0)
+        if rank_keys != [0, group - 1] or int(row.get("profile_rank_count") or 0) != 2:
+            raise ValueError("native_service_rank_placement_not_declared")
+        for rank in (row.get("per_rank") or {}).values():
+            if rank.get("canary_before_ok") is False or rank.get(
+                    "canary_after_ok") is False or rank.get("mapping_ok") is False:
+                raise ValueError("native_service_rank_evidence_failed")
+            if rank.get("actual_bytes_match") is False or int(
+                    rank.get("actual_input_bytes") or 0) != payload:
+                raise ValueError("native_service_actual_input_mismatch")
+            calls = rank.get("calls") or ()
+            for call in calls:
+                ai_rows = call.get("ai_cpu_rows") or ()
+                if not ai_rows or any(row.get("kind") != "ai_cpu"
+                                      or "HcclLaunchAicpuKernel" not in str(
+                                          row.get("name") or "")
+                                      for row in ai_rows):
+                    raise ValueError("native_service_active_aicpu_evidence_missing")
+            samples = rank.get("ai_cpu_union_us") or ()
+            samples = [float(value) for value in samples if value is not None]
+            if samples:
+                active.append(median(samples))
+        if not active:
+            continue
+        if payload <= 0:
+            continue
+        split = str(row.get("split") or "train")
+        if split == "heldout":
+            heldout.add(payload)
+        conditions.append({
+            "collective": row["collective"],
+            "world_size": int(row["group_size"]),
+            "payload_bytes": payload,
+            "per_op_ms": median(active) / 1000.0,
+            "dtype": "bf16", "placement_scope": placement,
+            "split": split, "single": False,
+            "observed_expansion_mode": execution_core,
+            "requested_expansion_mode": "unspecified", "source": str(path),
+        })
+    if not conditions:
+        raise ValueError("native_service_no_compatible_conditions")
+    campaign = {
+        "label": f"native-service:{source_id[:12]}",
+        "kind": "a5_collective_calibration", "status": "completed",
+        "canary": "all_ranks_matched", "canary_ok": True,
+        "hardware_key": A5_HARDWARE_KEY, "arch_family": A5_ARCH_FAMILY,
+        "stack": str(stack), "cann": str(cann), "dtype": "bf16",
+        "placement": placement, "observed_expansion_mode": execution_core,
+        "requested_expansion_mode": "unspecified", "source": str(path),
+        "conditions": conditions,
+    }
+    ingested = _ingest_a5_campaign_data(campaign)
+    return fit_a5_service_curves(
+        ingested, holdout_payloads=tuple(sorted(heldout)))
+
+
+def collect_native_service(source: str, *, stack: str, cann: str,
+                           execution_core: str, placement: str,
+                           deployment_image_id: str, groups=(2, 4, 8)):
+    """Public cached collector; only source revision/deployment and axes key it."""
+    path = Path(source)
+    stat = path.stat()
+    return _collect_native_service_cached(
+        str(path), tuple(int(group) for group in groups), str(stack),
+        str(cann), str(execution_core), str(placement),
+        int(stat.st_mtime_ns), int(stat.st_size), str(deployment_image_id))

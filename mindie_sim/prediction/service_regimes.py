@@ -35,6 +35,8 @@ MISSING = object()
 RULE_FIELDS = {"id", "match", "coordinates", "domain", "response", "provenance",
                "execution", "continuity"}
 EXECUTION_FIELDS = {"kind", "resource", "reference_rate", "native_kernel"}
+MAC_EXECUTION_FIELDS = {"kind", "resource", "native_kernel",
+                        "tile_m", "tile_n", "tile_k", "slots"}
 
 
 @dataclass(frozen=True)
@@ -46,11 +48,17 @@ class RegimeSelection:
     response_basis: str | None = None
     coordinate_values: Mapping | None = None
     exterior_policy: str | None = None
+    issued_work: float | None = None
+    rate_flops_per_s: float | None = None
+    active_owners: int | None = None
+    stage: str | None = None
 
     @property
     def mode(self):
         """Normalized execution semantics, never an arbitrary mapping probe."""
-        return "joint_native" if self.execution is not None else "completion_floor"
+        if self.execution is not None:
+            return str(self.execution.get("kind"))
+        return "completion_floor"
 
     def bind_joint(self, context):
         """Observed joint service occupies an explicitly declared device queue.
@@ -77,6 +85,10 @@ class RegimeSelection:
         return {"rule_id": self.rule_id, "continuity_group": self.continuity_group,
                 "execution_mode": self.mode, "response_basis": self.response_basis,
                 "response_duration_ms": self.duration_ms,
+                "issued_work": self.issued_work,
+                "rate_flops_per_s": self.rate_flops_per_s,
+                "active_owners": self.active_owners,
+                "stage": self.stage,
                 "coordinate_values": dict(self.coordinate_values or {}),
                 "exterior_policy": self.exterior_policy}
 
@@ -116,7 +128,9 @@ def coordinates(axes, declarations):
     for name, raw in declarations.items():
         value = lookup(axes, raw["path"])
         if value is MISSING:
-            return None
+            if "default" not in raw:
+                return None
+            value = raw["default"]
         if "reduce" in raw:
             if not isinstance(value, (list, tuple)) or not value:
                 return None
@@ -185,6 +199,16 @@ def _execution(raw):
         if set(execution) != {"kind"}:
             raise ModelingError("service_regime_completion_floor_execution_requires_only_kind")
         return None
+    if execution.get("kind") == "mac_service":
+        if (set(execution) != MAC_EXECUTION_FIELDS
+                or execution.get("resource") != "cube"
+                or not execution.get("native_kernel")):
+            raise ModelingError("mac_service_requires_cube_and_native_kernel")
+        for key in ("tile_m", "tile_n", "tile_k", "slots"):
+            value = execution.get(key)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ModelingError("mac_service_requires_positive_tile_geometry")
+        return {**execution}
     if (set(execution) != EXECUTION_FIELDS or execution.get("kind") != "joint_native"
             or not execution.get("resource") or not execution.get("native_kernel")
             or _nonnegative(execution.get("reference_rate", 0)) == 0):
@@ -258,9 +282,12 @@ class RegimePolicy:
                 if not isinstance(coord, Mapping):
                     raise ModelingError("service_regime_coordinate_unknown_reducer")
                 self.physical_rates |= _path(coord["path"])[0] == "physical_rates"
-                if set(coord) - {"path", "reduce", "scale"} or coord.get("reduce", "sum") not in REDUCERS:
+                if (set(coord) - {"path", "reduce", "scale", "default"}
+                        or coord.get("reduce", "sum") not in REDUCERS):
                     raise ModelingError("service_regime_coordinate_unknown_reducer")
                 _nonnegative(coord.get("scale", 1))
+                if "default" in coord:
+                    _nonnegative(coord["default"])
             for name, bounds in raw.get("domain", {}).items():
                 if (name not in raw.get("coordinates", {})
                         or set(bounds) - {"min", "max", "min_inclusive", "max_inclusive"}):
@@ -312,7 +339,8 @@ class RegimePolicy:
         """Native multi-phase groups keep their source/transport program."""
         selected = self.resolve(context, record)
         if selected is not None and selected.mode != "completion_floor":
-            raise ModelingError("joint_native_service_requires_single_local_kernel")
+            raise ModelingError(
+                "joint_native_or_mac_service_requires_single_local_kernel")
         return selected.duration_ms if selected is not None else 0.0
 
     def resolve(self, context, record):
@@ -370,13 +398,19 @@ class RegimePolicy:
         raw, key, result, values = matches[0]
         execution = self.executions[key]
         continuity = raw.get("continuity") or {}
-        mode = "joint_native" if execution is not None else "completion_floor"
-        record(raw, key, "joint_native_service" if execution else "observable_response",
+        mode = str(execution.get("kind")) if execution is not None else "completion_floor"
+        record(raw, key, ("joint_native_service" if mode == "joint_native"
+                          else "observable_response"),
                duration_us=result.duration_us, coordinate_values=values,
                response_basis=result.basis, continuity_group=continuity.get("group"),
-               execution_mode=mode)
-        return RegimeSelection(result.duration_us / 1000, execution, raw["id"],
-                               continuity.get("group"), result.basis, values)
+               execution_mode=mode, issued_work=result.issued_work,
+               rate_flops_per_s=result.rate_flops_per_s,
+               active_owners=result.active_owners, stage=result.stage)
+        return RegimeSelection(
+            result.duration_us / 1000, execution, raw["id"],
+            continuity.get("group"), result.basis, values,
+            issued_work=result.issued_work, rate_flops_per_s=result.rate_flops_per_s,
+            active_owners=result.active_owners, stage=result.stage)
 
     def _exterior(self, context, axes, record):
         """Apply one declared exterior policy; never clamp or silently select."""

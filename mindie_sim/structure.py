@@ -16,9 +16,13 @@ from dataclasses import asdict
 from hashlib import sha256
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 from .prediction.operator_analysis import target_graphs
+from .prediction.native_binding import (
+    bind_native_call, coverage_from_records, member_physical_view,
+)
 from .prediction.program import RecipeBook
 from .prediction.structure import parse_case
 from .structure_contracts import comparison_scope, predicted_contract
@@ -47,8 +51,36 @@ _FAMILY_BLOCKS = {
 }
 
 
+def _intern_tree(value):
+    """Intern decoded strings without changing mapping order or values.
+
+    ``json.loads(json.dumps(...))`` creates a distinct ``str`` for every key
+    and value occurrence.  A decode report repeats the same small vocabulary
+    across tens of thousands of nodes, so retaining those duplicates dominates
+    the report footprint.  Interning is identity-only: equality, hashing, JSON
+    encoding and insertion order are unchanged.
+    """
+    if isinstance(value, str):
+        return sys.intern(value)
+    if isinstance(value, dict):
+        items = []
+        for key, item in value.items():
+            new_key = sys.intern(key) if isinstance(key, str) else key
+            items.append((new_key, _intern_tree(item)))
+        value.clear()
+        value.update(items)
+        return value
+    if isinstance(value, list):
+        for index, item in enumerate(value):
+            value[index] = _intern_tree(item)
+        return value
+    if isinstance(value, tuple):
+        return tuple(_intern_tree(item) for item in value)
+    return value
+
+
 def _json_value(value):
-    return json.loads(json.dumps(value, allow_nan=False))
+    return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
 
 
 def _node_id(replica, op_id):
@@ -62,17 +94,26 @@ def _block(op):
 
 
 def _node(op, replica, *, source_call=None, block=None, role=None, structure=None,
-          kernels=None, book=None, geometry=None):
+          kernels=None, book=None, geometry=None, shared_call=None, native_sink=None):
+    plan = None
     if geometry is not None and op.source_boundary != "call":
         # Source planners own physical declarations. Preparing a plan does not
         # start its program, consult timings, or resolve captured ABI identity.
-        op, _ = book.prepare(op, geometry)
+        op, plan = book.prepare(op, geometry)
     operator = op.to_dict(include_work=False)
     contract = predicted_contract(operator)
     meta = dict(op.metadata)
     semantic = meta.get("semantic_metadata", {})
-    return _json_value({
-        "node_id": _node_id(replica, op.op_id),
+    if shared_call is not None:
+        # A fused member keeps the parent call identity and forwards only its
+        # own existing plan work as a view; it never becomes a second charge.
+        binding = member_physical_view(shared_call, plan, op if plan is not None else None)
+    else:
+        binding = bind_native_call(op, contract=contract, plan=plan,
+                                   prepared=op if plan is not None else None)
+    node_id = _node_id(replica, op.op_id)
+    payload = {
+        "node_id": node_id,
         "op_id": op.op_id,
         "replica": replica,
         "layer": op.layer,
@@ -98,7 +139,12 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
             "fused_from": meta.get("fused_from", semantic.get("fused_from")),
             "semantic_recipe": meta.get("semantic_recipe"),
         },
-    })
+    }
+    if binding is not None and native_sink is not None:
+        # BIND1 evidence travels beside the node identity, not inside the
+        # structural content hash: it is derived provenance, not structure.
+        native_sink.append({"node_id": node_id, **binding.to_dict()})
+    return _json_value(payload)
 
 
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
@@ -129,6 +175,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}
     nodes, source_calls, external = [], [], set()
+    native_calls = []
     declarations, entry_dependencies, memberships = {}, defaultdict(set), defaultdict(set)
     for replica, operators in sorted(graphs.items()):
         for op in operators:
@@ -148,6 +195,9 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                 memberships[replica, group].update(_node_id(replica, child.op_id) for child in expanded)
             is_expanded = op.source_boundary == "call" and expand_calls
             parent = _node_id(replica, op.op_id) if is_expanded else None
+            # One shared actual-call descriptor for a fused source call: every
+            # declared child kernel keeps this same call_id and one timing owner.
+            call_binding = bind_native_call(op, children=expanded) if is_expanded else None
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
@@ -160,7 +210,9 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             nodes.extend(_node(child, replica, source_call=parent, block=_block(op),
                                role=meta.get("structure_role"),
                                structure=layer_structure(model, op.layer), kernels=kernels,
-                               book=book, geometry=resource_geometries.get((replica, child.stage)))
+                               book=book, geometry=resource_geometries.get((replica, child.stage)),
+                               shared_call=(None if child.family == "barrier" else call_binding),
+                               native_sink=native_calls)
                          for child in expanded)
     ids = {node["node_id"] for node in nodes}
     if len(ids) != len(nodes):
@@ -225,6 +277,11 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         **payload,
         "graph_id": "sha256:" + digest.hexdigest(),
         "source": _json_value(source),
+        # Derived actual-invocation evidence: carried beside the structural
+        # identity, excluded from its hash exactly like caller source.
+        "native_calls": _json_value(native_calls),
+        "native_call_coverage": _json_value(
+            coverage_from_records(native_calls, emitted=len(nodes))),
     }
 
 

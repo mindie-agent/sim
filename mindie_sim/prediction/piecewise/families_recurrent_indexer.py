@@ -33,15 +33,17 @@
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass
 from fractions import Fraction
-from typing import Any
+from typing import Any, Mapping
 
 from mindie_sim.catalog.index_pool import completed_prefix, selected_tokens
-from mindie_sim.schema.common import ModelingError
+from mindie_sim.catalog.quant import projection_quant
+from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .compiler import (
     CompiledOperator, FamilyTemplate, SegmentAxis, _demand, _frac, _out_name,
 )
-from .expressions import Add, Const, Div, Max, Mul, Sub, Var, as_fraction
+from .expressions import Add, Const, Div, Max, Mul, Var, as_fraction
 from .guards import StepGuard
 
 
@@ -53,6 +55,134 @@ DESCRIPTOR_BYTES = 8
 PAGE_ROWS = 128
 HEAD_REDUCE_M = 16
 DEFAULT_ELEMENT_BYTES = Fraction(2)
+CANN_KEYPOOL = "vllm_ascend_cann_keypool_caller"
+
+
+@dataclass(frozen=True)
+class IndexPoolLaunch:
+    """One analytical F.linear. Bytes stay with the GEMM solver."""
+
+    name: str
+    category: str
+    k: int
+    n: int
+    packing: str
+    key_end: int = 0
+    weights_begin: int = 0
+    weights_end: int = 0
+
+
+@dataclass(frozen=True)
+class IndexPoolDeclaration:
+    """Resolved producer. ``quant`` is ``projection_quant``, not a forced FP32 plan."""
+
+    quant: Any
+    query_k: int
+    query_category: str
+    query_k_source: str
+    launches: tuple[IndexPoolLaunch, ...]
+    cast_elements: int
+    cast_read_per_token: int
+    cast_write_per_token: int
+    input_format: str
+    fused: bool
+
+
+@dataclass(frozen=True)
+class IndexPoolMode:
+    """Which indexer producer the declaration can see.
+
+    ``analytical`` is the separate cast plus F.linear path. ``not_pooled`` is
+    the kpool==1 (or failed precondition) path and keeps the caller's existing
+    roles. ``quant_undistinguished`` means the layer is pooled but no quant
+    record can separate the FP32 default from an explicit override.
+    ``cann_caller`` is the single KeyPool envelope, which this declaration
+    does not price.
+    """
+
+    kind: str
+    declaration: IndexPoolDeclaration | None = None
+
+
+def cann_keypool_selected(model_metadata, feature_metadata) -> bool:
+    """True only when the model or the runtime metadata names the CANN caller."""
+    for meta in (model_metadata, feature_metadata):
+        table = dict(meta or ())
+        if "native_keypool_caller" in table:
+            return True
+        if table.get("pool_key_indexer") == CANN_KEYPOOL:
+            return True
+    return False
+
+
+def _pooled_contract(layer) -> bool:
+    """Same guard as ``index_pool.producer`` before it raises."""
+    return bool(
+        int(getattr(layer, "index_kpool", 1) or 1) > 1
+        and getattr(layer, "index_kpool_compress", False)
+        and str(getattr(layer, "index_input", "hidden") or "hidden") == "hidden"
+        and not int(getattr(layer, "compress_ratio", 0) or 0)
+        and not int(getattr(layer, "qk_rope_head_dim", 0) or 0))
+
+
+def index_pool_mode(layer, quant, *, hidden: int, activation_dtype: str,
+                    cann_caller: bool = False) -> IndexPoolMode:
+    """Map one layer onto the analytical KPool producer, or say why not.
+
+    Fusion follows quant equality of ``indexer.pool_projection`` and
+    ``indexer.weights`` after ``projection_quant``. An explicit parent
+    override that defeats the kpool>1 FP32 default stays on that override.
+    """
+    if cann_caller:
+        return IndexPoolMode("cann_caller")
+    if not _pooled_contract(layer):
+        return IndexPoolMode("not_pooled")
+    width = int(getattr(layer, "index_dim", 0) or 0)
+    heads = int(getattr(layer, "index_heads", 0) or 0)
+    hidden = int(hidden)
+    if min(width, heads, hidden) < 1:
+        return IndexPoolMode("not_pooled")
+    if quant is None:
+        return IndexPoolMode("quant_undistinguished")
+    resolved = projection_quant(quant, layer)
+    pool = resolved.for_category("indexer.pool_projection")
+    weights = resolved.for_category("indexer.weights")
+    fused = pool == weights
+    packing = ("source_joint_key_weights" if fused
+               else "separate_explicit_operand_formats")
+    if fused:
+        launches = [IndexPoolLaunch(
+            "index_k_projection", "indexer.pool_projection", hidden, width + heads,
+            packing, width, width, width + heads)]
+    else:
+        launches = [
+            IndexPoolLaunch(
+                "index_k_projection", "indexer.pool_projection", hidden, width,
+                packing, width, 0, 0),
+            IndexPoolLaunch(
+                "index_weights_projection", "indexer.weights", hidden, heads,
+                packing),
+        ]
+    launches.append(IndexPoolLaunch(
+        "index_pool_gate", "indexer.pool_gate", hidden, width,
+        "separate_explicit_operand_formats"))
+    rank = int(getattr(layer, "q_lora_rank", 0) or 0)
+    if rank > 0:
+        query_k, query_source = rank, "q_lora_rank"
+    else:
+        query_k, query_source = hidden, "hidden_rank_absent"
+    act = str(activation_dtype or "bf16")
+    if act in {"fp32", "float32"}:
+        cast_elements = cast_read = cast_write = 0
+    else:
+        cast_elements = hidden
+        cast_read = hidden * int(dtype_bytes(act))
+        cast_write = hidden * 4
+    return IndexPoolMode("analytical", IndexPoolDeclaration(
+        quant=resolved, query_k=query_k, query_category="indexer_fp8",
+        query_k_source=query_source, launches=tuple(launches),
+        cast_elements=cast_elements, cast_read_per_token=cast_read,
+        cast_write_per_token=cast_write, input_format=act, fused=fused))
 
 
 def align(value: int, multiple: int) -> int:
@@ -320,12 +450,110 @@ def _compile_sinkhorn(ctx: CompiledOperator, operator) -> FamilyTemplate:
     )
 
 
+
+def _compile_gdn_gating(ctx: CompiledOperator, operator) -> FamilyTemplate:
+    """Reuse the native gating_plan for the selected source geometry.
+
+    The source caller feeds q rows/flattened tokens; rows are not request
+    count.  All work, tiling, owner count and queue resources come from
+    gdn_decode_programs.gating_plan, never from fixed M2 literals.
+    """
+    from mindie_sim.prediction.gdn_decode_programs import gating_plan
+    from mindie_sim.prediction.gdn_program_bridge import gating_program_result
+    from types import SimpleNamespace
+
+    theta = operator.theta
+    heads = max(1, int(theta.find("value_heads", 1) or 1))
+    axes = (SegmentAxis("SEQ_TILES", "tokens",
+                        StepGuard("gating_rows", "tokens", 1), "max_tokens"),)
+    units = dict(ctx.supply.resource_units)
+    runtime_store = dict(ctx.supply.gdn_beta_store)
+    disabled = isinstance(runtime_store, Mapping) and bool(runtime_store.get("disabled"))
+    declared_queue = dict(ctx.supply.store_queues).get("scalar_store_issue")
+    supply_queue = None if disabled else declared_queue
+    if isinstance(runtime_store, Mapping) and not disabled:
+        explicit_queue = runtime_store.get("queue")
+        from_hardware = bool(runtime_store.get("from_hardware"))
+        if explicit_queue is not None and not from_hardware:
+            if "scalar_store_issue" not in dict(ctx.supply.rates):
+                raise ModelingError("physical_resource_rate_missing:scalar_store_issue")
+            queue_value = dict(explicit_queue)
+            beta_store = {"resource": "scalar_store_issue", "queue": queue_value}
+            supply_queue = queue_value
+        else:
+            queue_value = None if from_hardware else supply_queue
+            beta_store = ({"resource": "scalar_store_issue", "from_hardware": True}
+                          if (from_hardware or supply_queue) else {})
+            supply_queue = queue_value if from_hardware else supply_queue
+    else:
+        beta_store = ({"resource": "scalar_store_issue", "from_hardware": True}
+                      if supply_queue else {})
+        queue_value = supply_queue
+    if disabled:
+        queue_value = False
+        beta_store = {}
+
+    def binder(geometry, state):
+        rows = int(geometry.effective_tokens)
+        op = SimpleNamespace(local_shape=(rows, heads), metadata={
+            "beta_store": beta_store, "logical_programs": None})
+        g = SimpleNamespace(resource_units=units,
+                            compute_units=units.get("vector", 1))
+        plan = gating_plan(op, g)
+        resources = dict(plan.work.resources)
+        read_pipe = "mte2_aiv" if "mte2_aiv" in units else "mte2"
+        return {"GATING_ROWS": rows,
+                "GATING_HBM": resources.get("hbm", 0),
+                "GATING_READ": resources.get(read_pipe, 0),
+                "GATING_MTE3": resources.get("mte3", 0),
+                "GATING_VECTOR": resources.get("vector", 0),
+                "GATING_SCALAR": resources.get("scalar_store_issue", 0)}
+
+    rows = Var("GATING_ROWS")
+    materialization = (("gdn_gating_decay_fp32", Mul((rows, Const(heads * 4)))),
+                       ("gdn_gating_beta_bf16", Mul((rows, Const(heads * 2)))))
+    read_pipe = "mte2_aiv" if "mte2_aiv" in units else "mte2"
+    demand_list = [_demand(ctx, "hbm", Var("GATING_HBM")),
+                   _demand(ctx, read_pipe, Var("GATING_READ")),
+                   _demand(ctx, "mte3", Var("GATING_MTE3")),
+                   _demand(ctx, "vector", Var("GATING_VECTOR"))]
+    if (beta_store.get("resource") == "scalar_store_issue"
+            and "scalar_store_issue" in units):
+        demand_list.append(_demand(ctx, "scalar_store_issue", Var("GATING_SCALAR")))
+    demands = tuple(demand_list)
+    return FamilyTemplate(
+        axes=axes, stages=(demands,), materialization=materialization,
+        internal=(), residency=Const(0),
+        derived=(("gating_rows", rows), ("gating_hbm", Var("GATING_HBM")),
+                 ("gating_read", Var("GATING_READ")),
+                 ("gating_mte3", Var("GATING_MTE3")),
+                 ("gating_vector", Var("GATING_VECTOR")),
+                 ("active_lanes", Const(int(units.get("vector", 1)))),
+                 ("launched_blocks", Const(int(units.get("vector", 1)))),
+                 ("value_heads", Const(heads)),
+                 ("gate_outputs", Const(2))),
+        regime_exprs=(), binder=binder,
+        program_duration=lambda geometry, state: gating_program_result(
+            ctx.supply, int(geometry.effective_tokens), heads,
+            queue=(False if disabled else queue_value)),
+        annotations=(("family", "gdn_gating"),
+                     ("source_kernel", "fused_gdn_gating_kernel"),
+                     ("source_workisation", "native_gating_plan"),
+                     ("resource_program", "gdn_decode_programs.gating_plan")),
+    )
+
+
 def compile_recurrent(ctx: CompiledOperator, operator) -> FamilyTemplate:
     if operator.name in {"sinkhorn", "hc_pre_mix", "hc_post_mix"}:
         return _compile_sinkhorn(ctx, operator)
     theta = operator.theta
+    if operator.name == "gdn_gating":
+        return _compile_gdn_gating(ctx, operator)
     if operator.name == "conv":
         static = _conv_static(theta)
+        width = int(theta.find("qkv_width", 0) or 0)
+        use_native = (ctx.kind == "A3" and ctx.supply.gdn_decode_selected
+                      and width > 0)
         axes = (SegmentAxis("TOKEN_TILES", "tokens",
                             StepGuard("conv_tiles", "tokens", static["kernel"]),
                             "max_tokens"),)
@@ -343,6 +571,47 @@ def compile_recurrent(ctx: CompiledOperator, operator) -> FamilyTemplate:
             _demand(ctx, "hbm", Add((Mul((Const(2), moved)),
                                      Mul((Const(2), Var("B"), state))))),
         )
+        def conv_duration(geometry, state_view):
+            from mindie_sim.prediction.gdn_program_bridge import (
+                conv_program_result, prefill_conv_program_result)
+            requests = tuple(geometry.requests)
+            decode = tuple(r for r in requests if r.phase == "decode" and r.q_len > 0)
+            prefill = tuple(r for r in requests if r.phase == "prefill" and r.q_len > 0)
+            if not decode and not prefill:
+                return None
+            results = []
+            if prefill:
+                results.append(prefill_conv_program_result(
+                    ctx.supply, tuple(int(r.q_len) for r in prefill), width,
+                    static["kernel"], len(prefill) + 1, 0,
+                    tuple(r.context > 0 for r in prefill)))
+            if decode:
+                lengths = tuple(int(r.q_len) for r in decode)
+                speculative = any(length > 1 for length in lengths) or any(
+                    r.draft_len > 1 for r in decode)
+                if speculative and any(length == 1 for length in lengths):
+                    return None
+                results.append(conv_program_result(
+                    ctx.supply, sum(lengths), width, lengths, static["kernel"],
+                    speculative, static["kernel"] - 1 + max(lengths) - 1))
+            if len(results) == 1:
+                return results[0]
+            duration = sum((item[0] for item in results), Fraction(0))
+            work = {}
+            for item in results:
+                for key, value in item[4].items():
+                    work[key] = work.get(key, 0) + value
+            busy = {}
+            for item in results:
+                for key, value in item[3]:
+                    busy[key] = busy.get(key, 0) + value
+            if busy:
+                peak = max(busy.values())
+                dominant = next(name for name, value in busy.items() if value == peak)
+                tied = tuple(name for name, value in busy.items() if value == peak)
+            else:
+                dominant, tied = "", ()
+            return duration, dominant, tied, tuple(sorted(busy.items())), work
         return FamilyTemplate(
             axes=axes, stages=(main,), materialization=((_out_name(ctx), moved),),
             internal=(), residency=Const(0),
@@ -350,10 +619,58 @@ def compile_recurrent(ctx: CompiledOperator, operator) -> FamilyTemplate:
                      ("conv_history_rows", Const(static["history_rows"])),
                      ("conv_state_bytes", state), ("conv_ops", vector)),
             regime_exprs=(), binder=binder,
-            annotations=(("family", "recurrent_conv"), ("kernel", str(static["kernel"]))),
+            program_duration=conv_duration if use_native else None,
+            annotations=(("family", "recurrent_conv"), ("kernel", str(static["kernel"])),
+                         ("source_program", "gdn_decode_programs.conv_plan" if use_native
+                          else "aggregate_roofline")),
         )
 
     static = _delta_static(theta)
+    use_native = (ctx.kind == "A3" and ctx.supply.gdn_decode_selected
+                  and ctx.supply.gdn_recurrent_implementation == "arch35_fp32")
+    heads = max(1, int(theta.find("value_heads", 1) or 1))
+    keys = max(1, int(theta.find("key_heads", 1) or 1))
+    dk = max(1, int(theta.find("dk", 1) or 1))
+    dv = max(1, int(theta.find("dv", 1) or 1))
+
+    def recurrent_duration(geometry, state_view):
+        requests = tuple(geometry.requests)
+        decode = tuple(r for r in requests if r.phase == "decode" and r.q_len > 0)
+        prefill = tuple(r for r in requests if r.phase == "prefill" and r.q_len > 0)
+        if not decode and not prefill:
+            return None
+        results = []
+        if prefill:
+            from mindie_sim.prediction.gdn_program_bridge import pf3_program_result
+            results.append(pf3_program_result(
+                ctx.supply, tuple(int(r.q_len) for r in prefill),
+                heads, keys, dk, dv, 64))
+        if decode:
+            lengths = tuple(int(r.q_len) for r in decode)
+            if any(length > 8 for length in lengths):
+                return None
+            from mindie_sim.prediction.gdn_program_bridge import recurrent_program_result
+            results.append(recurrent_program_result(
+                ctx.supply, lengths, heads, keys, dk, dv))
+        if len(results) == 1:
+            return results[0]
+        duration = sum((item[0] for item in results), Fraction(0))
+        work = {}
+        for item in results:
+            for key, value in item[4].items():
+                work[key] = work.get(key, 0) + value
+        busy = {}
+        for item in results:
+            for key, value in item[3]:
+                busy[key] = busy.get(key, 0) + value
+        if busy:
+            peak = max(busy.values())
+            dominant = next(name for name, value in busy.items() if value == peak)
+            tied = tuple(name for name, value in busy.items() if value == peak)
+        else:
+            dominant, tied = "", ()
+        return duration, dominant, tied, tuple(sorted(busy.items())), work
+
     axes = (SegmentAxis("CHUNK_TILES", "tokens",
                         StepGuard("recurrent_tiles", "tokens", static["chunk"]),
                         "max_tokens"),)
@@ -389,8 +706,11 @@ def compile_recurrent(ctx: CompiledOperator, operator) -> FamilyTemplate:
         regime_exprs=(("ACCEPT", Var("ACCEPT")), ("COMMIT", Var("COMMIT")),
                       ("CHUNKS", Var("CHUNKS"))),
         binder=binder,
+        program_duration=recurrent_duration if use_native else None,
         annotations=(("family", "recurrent_delta"), ("chunk", str(static["chunk"])),
-                     ("accepted_state", str(int(static["kda"])))),
+                     ("accepted_state", str(int(static["kda"]))),
+                     ("source_program", "gdn_recurrent.build" if use_native
+                      else "aggregate_roofline")),
     )
 
 
@@ -538,6 +858,14 @@ def _index_metrics(theta, geometry=None, *, kpool: int | None = None,
             gather += gather_bytes(rows, row_bytes)
             transactions += rows
             burst_requests += 1
+    cp = max(1, int(theta.find("cp", 1) or 1))
+    cp_plan = str(theta.find("cp_plan", "none") or "none")
+    # DSA-CP is query-token SP over the TP group: the caller already supplied
+    # the local rank geometry (contiguous query chunk, full KV prefix).  The
+    # indexer therefore scores the local query rows over the full index-K
+    # prefix; there is no KV shard and no candidate gather in this family.
+    dsa = cp_plan == "dsa_cp"
+    dsa_phase = str(getattr(geometry, "phase_name", "") or "")
     if paged_queries and burst_requests:
         query_row = Fraction((paged_queries + 1) * heads) * row_bytes
     elif paged_queries:
@@ -571,6 +899,12 @@ def _index_metrics(theta, geometry=None, *, kpool: int | None = None,
         "SELECTION_BYTES": Fraction(selection),
         "selection_output_bytes": Fraction(selection),
         "index_work": scanned * heads * dim,
+        "cp": cp, "cp_plan": cp_plan,
+        "dsa_cp_query_token_sharded": int(dsa),
+        "dsa_cp_local_tokens": queries if dsa else 0,
+        "dsa_cp_kv_replicated": int(dsa),
+        "dsa_cp_prefill": int(dsa and dsa_phase == "prefill"),
+        "dsa_cp_phase": dsa_phase if dsa else "",
     }
 
 
@@ -578,6 +912,21 @@ def compile_indexer(ctx: CompiledOperator, operator) -> FamilyTemplate:
     theta = operator.theta
     kpool = _index_kpool(ctx, theta)
     metrics = _index_metrics(theta, kpool=kpool)
+    meta = dict(getattr(ctx, "feature_metadata", ()) or ())
+    image_id = str(meta.get("image_id") or meta.get("oci_image_digest") or "")
+    source_scope = str(meta.get("mx_quant_source_revision")
+                       or meta.get("source_scope") or "")
+    candidate_blocks = int(theta.find("candidate_blocks", 0) or 0)
+    index_bytes = float(theta.find("index_bytes", 1) or 1)
+    has_candidate_filter = any(
+        getattr(op, "name", "") == "candidate_filter"
+        or getattr(op, "family", "") == "index_filter"
+        for op in getattr(ctx, "siblings", ()))
+    fixed_c8_output = bool(
+        image_id and source_scope.lower() == "r64"
+        and candidate_blocks == 2048 and index_bytes == 1.0
+        and not has_candidate_filter)
+    topk = int(metrics["index_topk"])
     nt = max(1, int(theta.find("nt", ctx.policy.nt) or ctx.policy.nt))
     axes = (SegmentAxis("INDEX_TILES", "index_rows",
                         StepGuard("index_tiles", "index_rows", nt, lower_bound=0),
@@ -653,17 +1002,32 @@ def compile_indexer(ctx: CompiledOperator, operator) -> FamilyTemplate:
         rows = int(observed["SCANNED"])
         queries = max(1, int(observed["QUERIES"]))
         selected = int(observed["SELECTED"])
+        dsa_sharded = int(observed.get("dsa_cp_query_token_sharded", 0) or 0)
+        dsa_local = int(observed.get("dsa_cp_local_tokens", 0) or 0)
+        dsa_kv = int(observed.get("dsa_cp_kv_replicated", 0) or 0)
+        dsa_prefill = int(observed.get("dsa_cp_prefill", 0) or 0)
+        full_output = Fraction(queries * topk * 4) if fixed_c8_output else Fraction(selected * 4)
+        init_ops = Fraction(queries * topk) if fixed_c8_output else Fraction(0)
         return {"INDEX_ROWS": rows, "QUERIES": queries,
                 "SEL_OPS": Fraction(rows * select_ops + selected),
+                "SEL_INIT_OPS": init_ops,
                 "SEL_READ": Fraction(rows * 4),
-                "SEL_WRITE": Fraction(selected * 4),
+                "SEL_WRITE": full_output,
+                "SELECTION_BYTES": full_output,
                 "SELECTED": selected,
+                "DSACP_SHARDED": dsa_sharded,
+                "DSACP_LOCAL": dsa_local,
+                "DSACP_KV": dsa_kv,
+                "DSACP_PREFILL": dsa_prefill,
                 "index_rows": rows,
                 "index_work": rows * select_ops}
 
     read, write = Var("SEL_READ"), Var("SEL_WRITE")
+    # Valid score/select math plus the source's fixed INT32 output publication.
+    # The fixed row is written for every query when the R64 C8 selector is
+    # selected; unrelated analytic variants keep their valid-output write.
     main = (
-        _demand(ctx, "vector", Var("SEL_OPS")),
+        _demand(ctx, "vector", Add((Var("SEL_OPS"), Var("SEL_INIT_OPS")))),
         _demand(ctx, "mte2", read),
         _demand(ctx, "mte3", write),
         _demand(ctx, "hbm", Add((read, write))),
@@ -674,10 +1038,19 @@ def compile_indexer(ctx: CompiledOperator, operator) -> FamilyTemplate:
         internal=(), residency=Const(0),
         derived=(("index_rows", Var("INDEX_ROWS")),
                  ("selection_ops", Var("SEL_OPS")),
-                 ("selected_tokens", Var("SELECTED"))),
+                 ("selection_init_ops", Var("SEL_INIT_OPS")),
+                 ("selected_tokens", Var("SELECTED")),
+                 ("selection_bytes", Var("SELECTION_BYTES")),
+                 ("dsa_cp_query_token_sharded", Var("DSACP_SHARDED")),
+                 ("dsa_cp_local_tokens", Var("DSACP_LOCAL")),
+                 ("dsa_cp_kv_replicated", Var("DSACP_KV")),
+                 ("dsa_cp_prefill", Var("DSACP_PREFILL"))),
         regime_exprs=(), binder=binder_select,
         annotations=(("family", "indexer_select"),
-                     ("topk", str(metrics["index_topk"]))),
+                     ("topk", str(metrics["index_topk"])),
+                     ("fixed_c8_output", int(fixed_c8_output)),
+                     ("dsa_cp_query_token_sp",
+                      int(str(theta.find("cp_plan", "none")) == "dsa_cp"))),
     )
 
 
@@ -790,9 +1163,127 @@ def compile_compression(ctx: CompiledOperator, operator) -> FamilyTemplate:
     )
 
 
+def _state_io_dims(theta: Any) -> tuple[int, int, int, str, str]:
+    """Declared local value heads, state dims, state dtype and index dtype."""
+    values = int(theta.find("value_heads", theta.find("heads", 0)) or 0)
+    dk = int(theta.find("dk", 0) or 0)
+    dv = int(theta.find("dv", 0) or 0)
+    state_dtype = str(theta.find("state_dtype", "fp32") or "fp32")
+    index_dtype = str(theta.find("index_dtype", "int32") or "int32").lower()
+    if values < 1 or dk < 1 or dv < 1:
+        raise ModelingError("gdn_state_io_lanes_missing")
+    if index_dtype not in {"int32", "int64"}:
+        raise ModelingError(f"gdn_state_io_index_dtype_unsupported:{index_dtype}")
+    dtype_bytes(state_dtype)
+    return values, dk, dv, state_dtype, index_dtype
+
+
+def _prefill_state_counts(geometry: Any) -> tuple[int, int]:
+    """Per-sequence prefill batch and rows whose previous state must be read."""
+    prefill = tuple(request for request in geometry.requests
+                    if str(getattr(request, "phase", "")) == "prefill")
+    selected = sum(1 for request in prefill
+                   if int(getattr(request, "context", 0) or 0) > 0)
+    return len(prefill), selected
+
+
+def compile_state_gather(ctx: CompiledOperator, operator) -> FamilyTemplate:
+    """The FLA prefill cache gather: selected rows in, zero rows written out.
+
+    The source (``gather_ssm_states``) reads one state row only when the
+    per-sequence ``has_initial_state`` mask is true; the output row is always
+    written (zero fill otherwise).  Batch is the sequence count, never the
+    query-token count, and the kernel is prefill-only.
+    """
+    values, dk, dv, state_dtype, index_dtype = _state_io_dims(operator.theta)
+    elements = values * dv * dk
+    state_bytes = elements * dtype_bytes(state_dtype)
+    index_bytes = 8 if index_dtype == "int64" else 4
+
+    def binder(geometry: Any, state: Any) -> dict[str, Any]:
+        rows, selected = _prefill_state_counts(geometry)
+        return {"state_gather_rows": rows, "state_gather_selected": selected}
+
+    rows, selected = Var("state_gather_rows"), Var("state_gather_selected")
+    read = Add((Mul((selected, Const(state_bytes))),
+                Mul((rows, Const(index_bytes + 1)))))
+    write = Mul((rows, Const(state_bytes)))
+    vector = Mul((rows, Const(elements)))
+    main = (
+        _demand(ctx, "vector", vector),
+        _demand(ctx, "mte2", read),
+        _demand(ctx, "mte3", write),
+        _demand(ctx, "hbm", Add((read, write))),
+    )
+    return FamilyTemplate(
+        axes=(SegmentAxis(
+            "SEQUENCES", "state_gather_rows",
+            StepGuard("state_gather_sequences", "state_gather_rows", 1,
+                      lower_bound=0), "max_batch"),),
+        stages=(main,), materialization=(), internal=(), residency=Const(0),
+        derived=(("state_gather_rows", rows),
+                 ("state_gather_selected", selected),
+                 ("state_gather_read_bytes", read),
+                 ("state_gather_write_bytes", write)),
+        regime_exprs=(), binder=binder, active=Var("IS_PREFILL"),
+        annotations=(("family", "state_gather"), ("state_layout", "V,K"),
+                     ("row_bytes", str(state_bytes)),
+                     ("index_dtype", index_dtype),
+                     ("source_branch", "fla_gdn_prefill"),
+                     ("state_io_condition", str(operator.theta.find(
+                         "state_io_condition", "")))),
+    )
+
+
+def compile_state_scatter(ctx: CompiledOperator, operator) -> FamilyTemplate:
+    """The FLA prefill cache scatter: one state row per prefill sequence.
+
+    The source (``scatter_ssm_states_``) has no validity mask; every selected
+    sequence reads its dense source row and writes the cache state row.  The
+    batch axis is the prefill sequence count, not the query-token count.
+    """
+    values, dk, dv, state_dtype, index_dtype = _state_io_dims(operator.theta)
+    elements = values * dv * dk
+    state_bytes = elements * dtype_bytes(state_dtype)
+    index_bytes = 8 if index_dtype == "int64" else 4
+
+    def binder(geometry: Any, state: Any) -> dict[str, Any]:
+        rows, _ = _prefill_state_counts(geometry)
+        return {"state_scatter_rows": rows}
+
+    rows = Var("state_scatter_rows")
+    read = Mul((rows, Const(state_bytes + index_bytes)))
+    write = Mul((rows, Const(state_bytes)))
+    vector = Mul((rows, Const(elements)))
+    main = (
+        _demand(ctx, "vector", vector),
+        _demand(ctx, "mte2", read),
+        _demand(ctx, "mte3", write),
+        _demand(ctx, "hbm", Add((read, write))),
+    )
+    return FamilyTemplate(
+        axes=(SegmentAxis(
+            "SEQUENCES", "state_scatter_rows",
+            StepGuard("state_scatter_sequences", "state_scatter_rows", 1,
+                      lower_bound=0), "max_batch"),),
+        stages=(main,), materialization=(), internal=(), residency=Const(0),
+        derived=(("state_scatter_rows", rows),
+                 ("state_scatter_read_bytes", read),
+                 ("state_scatter_write_bytes", write)),
+        regime_exprs=(), binder=binder, active=Var("IS_PREFILL"),
+        annotations=(("family", "state_scatter"), ("state_layout", "V,K"),
+                     ("row_bytes", str(state_bytes)),
+                     ("index_dtype", index_dtype),
+                     ("source_branch", "fla_gdn_prefill"),
+                     ("state_io_condition", str(operator.theta.find(
+                         "state_io_condition", "")))),
+    )
+
+
 __all__ = [
     "BURST_BYTES", "DESCRIPTOR_BYTES", "HEAD_REDUCE_M", "PAGE_ROWS",
     "align", "gather_bytes", "range_burst_bytes", "k1_new_rows",
     "selected_token_rows", "index_scanned_rows", "state_matrix_bytes",
     "compile_recurrent", "_compile_sinkhorn", "compile_indexer", "compile_compression",
+    "compile_state_gather", "compile_state_scatter",
 ]

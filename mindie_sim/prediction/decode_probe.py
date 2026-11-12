@@ -37,7 +37,8 @@ def decode_windows(prompt_tokens, output_tokens, *, query_tokens=1, output_offse
                  for offset in offsets)
 
 
-def probe_capacity(case, *, context, tokens, sequences=1, phase="decode"):
+def probe_capacity(case, *, context, tokens, sequences=1, phase="decode",
+                   padded_idle=False):
     """Price resident weights/cache without running or gating a target graph.
 
     Like target_graphs, scalar sequences means *each* member of the first EP/DP
@@ -49,9 +50,19 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode"):
     _check_geometry(phase, tokens, 1, context, "body")
     participants = cohorts(case.runtime.parallel)[0]
     counts = cohort_sequence_counts(sequences, participants)
-    views = {r: tuple(
-        RequestView(f"capacity{r}:{i}", tokens, context, False, phase)
-        for i in range(count)) for r, count in counts.items()}
+    if not padded_idle:
+        from .operator_analysis import graph_padded_idle
+        padded_idle = graph_padded_idle(case, phase, counts)
+    views = {}
+    for replica, count in counts.items():
+        if count == 0 and padded_idle:
+            views[replica] = (RequestView(
+                f"capacity{replica}:padding", 0, context, False, phase,
+                padding=True, draft_verify=False, draft_prepare=False),)
+        else:
+            views[replica] = tuple(
+                RequestView(f"capacity{replica}:{i}", tokens, context, False, phase)
+                for i in range(count))
     selections = {r: GraphPolicy().select(group, case.runtime) if group else (None, "none")
                   for r, group in views.items()}
     graph_rows = {r: max(tokens * counts[r], bucket or 0)
@@ -91,6 +102,7 @@ def probe_capacity(case, *, context, tokens, sequences=1, phase="decode"):
                                    "stage": stage, "required": required, "available": available})
     return {"status": "outside_declared_capacity" if violations else "within_declared_capacity",
             "basis": "declared_resident_geometry_not_serving_admission",
+            "padded_idle": bool(padded_idle),
             "context_tokens": context, "query_tokens_per_sequence": tokens,
             "kv_length": context + tokens, "sequences_by_replica": counts,
             "sequences_in_cohort": sum(counts.values()),

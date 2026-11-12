@@ -20,6 +20,7 @@ def read_role(roles, aiv=None, *, prefer_generic=False):
     return ("mte2_aiv" if aiv is not None else "mte2_aic") if split else "mte2"
 
 
+@lru_cache(maxsize=4096)
 def unit_group(index, owners, units):
     """Map an owner's fixed physical partition to another resource's units."""
     if units >= owners and units % owners == 0:

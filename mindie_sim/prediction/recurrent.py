@@ -18,6 +18,29 @@ from .implementations import select
 from .projections import kda_projections, require_packed_slice
 
 
+def _serving_kda_source(runtime, model, views, plan):
+    """Shared A5 KDA source selection for ordinary serving.
+
+    The phase/runtime/typed-plan gate is the same helper used by body defaults.
+    Explicit lowerings, recipes, families and programs are preserved.
+    """
+    from .kda_source import resolve
+    if runtime is None:
+        return None
+    kernels = runtime.kernels
+    metadata = dict(runtime.metadata)
+    opts = resolve(plan, arch=metadata.get("arch_family"),
+                   phase=(views[0].phase if views else ""),
+                   kernels=kernels, activation_dtype=model.activation_dtype,
+                   views=views)
+    if opts is None:
+        return None
+    return select({"kda": {
+        "implementation": "vllm_ascend_recurrent_kda_arch35",
+        "options": opts,
+    }}, "kda")
+
+
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, **_):
     if (runtime and plan.attention == "gdn" and views
@@ -46,6 +69,8 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     key_width, value_width = key_heads * dk, heads * dv
     kda_source = (select(runtime.kernels.get("lowerings", {}), "kda")
                   if runtime and plan.attention == "kda" else None)
+    if kda_source is None:
+        kda_source = _serving_kda_source(runtime, model, views, plan)
     kda_caps = frozenset(getattr(kda_source.module, "CAPABILITIES", ())
                          if kda_source else ())
     prefill_source = (kda_source if kda_caps & {"prefill", "prefill_fwd_h"}

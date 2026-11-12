@@ -61,7 +61,13 @@ def test_chunked_prefill_mean_ttft_round_robin_and_chunking():
     assert seen_chunks == [(8192, 8192), (8192, 16384)]
     assert ctx_aware == pytest.approx((0.05 * 8192 + 0.01 * 8192) + (0.05 * 8192 + 0.01 * 16384))
     assert service_ttft_overhead_ms(prompt_tokens=4096, tp=8, ep=32) == 0.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=8, ep=32) == pytest.approx(145.0)
+    # Host time is a declared input, not a prompt/TP/EP fitted constant.
+    assert service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=8, ep=32, host_overhead_ms=145.0,
+    ) == pytest.approx(145.0)
+    assert service_ttft_overhead_ms(
+        prompt_tokens=4096, tp=1, ep=1, host_overhead_ms=145.0,
+    ) == pytest.approx(145.0)
 
 
 def test_hardware_cube_peak_sensitivity_moves_compiled_gemm():

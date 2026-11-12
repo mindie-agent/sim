@@ -26,8 +26,8 @@ def recipes():
 
 def validate(*, views, plan, parallel, model, padded_tokens,
              metadata_support_fd=False, addressing="scalar", return_softmax_lse=False):
-    if metadata_support_fd or addressing != "scalar" or return_softmax_lse:
-        raise ModelingError("mqsmla_supported_branch_is_whole_row_scalar_address_no_lse")
+    if metadata_support_fd or addressing not in {"scalar", "auto", "vector"} or return_softmax_lse:
+        raise ModelingError("mqsmla_supported_branch_is_whole_row_address_no_lse")
     if (parallel.cp != 1 or plan.num_heads // parallel.tp != 64
             or plan.num_kv_heads != 1 or plan.head_dim != 512
             or plan.qk_rope_head_dim != 64 or model.activation_dtype != "bf16"):
@@ -47,7 +47,9 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     rows = tuple((v.q_len, v.context) for v in views)
     shape = {"sequences": rows, "window": plan.window, "ratio": plan.compress_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": 64, "width": 512,
-             "metadata_support_fd": False, "addressing": "scalar"}
+             "metadata_support_fd": False,
+             "addressing": str(dict(getattr(selection, "options", {}) or {}).get(
+                 "addressing", "scalar"))}
     meta = {**dict(members[0].metadata), "mqsmla_geometry": shape,
             "logical_pairs": sum(dict(op.metadata).get("logical_pairs", 0) for op in members),
             "kv_sweeps": sum(dict(op.metadata).get("kv_sweeps", 0) for op in members),

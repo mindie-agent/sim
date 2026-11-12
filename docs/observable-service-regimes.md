@@ -61,6 +61,73 @@ Capture ABI, group-list and execution-mode uncertainties remain distinct from
 permission to calibrate hardware service. A missing measurement never prevents
 analytical simulation.
 
+## Measured dual-load matrix service
+
+The profiler C7 report carries one source-supported full-grid / tail pair:
+
+```text
+enrichment.pmu_observations.measured_supply.pair
+```
+
+Each condition is the median of its captured repeats, not the fastest event.
+`physical_owners` comes from the declared AIC capacity (`--aic-count`), never
+from the maximum sampled Block Num. The R64 QBMM condition also carries the
+certified issued-work rule `2 * align16(M) * K * N` beside the logical `2MNK`;
+the rate is issued work over measured active MAC time. The C7 carries
+`source_identity` (`r64`/`r35`/`unpinned`/`absent`, deployment digest, basis)
+from the same-capture status prepare or an explicit deployment image. R35 and
+bare captures retain generic measured PMUs but cannot produce the R64 pair;
+`import_profiler_supply` rejects their unavailable supply.
+
+`mindie_sim.observations.calibration.import_profiler_supply` reads only that
+fragment (streaming from a large C7), verifies the response with the normal
+parser, requires an explicit hardware identity, and fixes its `match` to the
+caller's selected recipe/kernel/hardware. `apply_profiler_supply` appends it to
+a case-local `runtime.kernels.service_regimes` list but does not rewrite the
+case's recipe/tiling. The existing CLI exposes the same path:
+
+```sh
+mindie-sim operators CASE.json --phase prefill --tokens 2 \
+  --supply c7.json --supply-recipe output \
+  --supply-hardware Ascend950DT_9582
+```
+
+The rule's `response.kind` is `measured_dual_load`; its coordinates are `m`,
+`n` and `k`. The `domain` fixes the measured `n` and `k` exactly. The response
+computes issued work from the certified alignment and selects the measured
+issue class first: the exact M16 underfilled footprint or an integer multiple
+of the saturated footprint. The active-owner count comes from that selected
+measured load (24/32), not from a tile-derived macro guess. An explicit
+`--supply-owners` value is only an optional consistency check; a mismatch falls
+back to analytic:
+
+```text
+issued_flops = 2 * align16(m) * k * n
+mac_us       = issued_flops / rate_flops_per_s * 1e6
+```
+
+`execution.kind: mac_service` replaces only the cube stage with that measured
+per-owner MAC time. When the selected operator is the ordinary `TiledMatmul`,
+the matched invocation uses the source rule's `tile_m`/`tile_n`/`tile_k`/slots;
+the case, other operators and every off-domain invocation keep their original
+recipe, geometry, MTE2 and service. HBM, MTE2, MTE3, vector, queues and overlap
+remain ordinary; the measured MAC service is not a whole-kernel completion
+floor. A missing owner, a different hardware/dtype/N/K identity, or an
+unmeasured owner count returns an explicit mismatch/unknown and keeps the
+untouched analytical execution; it is not reclassified to the nearest load.
+Measured supply and pure theoretical/roofline supply remain available in the
+same case.
+
+For the genuine original piecewise route, `CompiledOperator.select_measured_mac`
+matches the selected operator's `native_call`: query hardware, role/recipe,
+wrapper source SHA/revision, kernel source SHA, `FRACTAL_NZ` weight layout,
+dtype and K/N must all agree. It changes **only** `_elapsed_rate("cube")` to
+the measured FLOP/s/1000 for the empirical static M16 underfilled class or the
+full-wave saturated class. Physical `work`, `stage_work`, state, projections,
+tiling, and every other pipe rate remain the source values; the ordinary
+compiler recomputes stage/overlap timing from those unchanged values. The
+optional normal entry is `z.predict_cell(spec, measured_mac=rule)`.
+
 ## Continuous physical responses
 
 `response.kind: roofline` derives a response from native work and the current

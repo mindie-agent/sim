@@ -89,7 +89,10 @@ def test_missing_packed_cache_contract_is_visible_not_bf16_relabel(ordinary):
 
 def test_tail_repeats_loads_but_pv_only_computes_initialized_rows():
     phases = dict(tile_phases("original", 1, True, True))
-    assert phases["gather"].resources == {"hbm": 128 * (544 + 8), "mte2_aiv": 128 * 544}
+    assert sum(phases[f"gather_{i}"].resources["hbm"] for i in range(8)) == 128 * 544
+    assert sum(phases[f"gather_{i}"].resources["mte2_aiv"] for i in range(8)) == 128 * 544
+    assert sum(phases[f"addr_index_{i}"].resources["hbm"] for i in range(8)) == 128 * 4
+    assert sum(phases[f"addr_page_{i}"].resources["hbm"] for i in range(8)) == 128 * 4
     assert phases["qk"].matrix["bf16"] == 2 * 64 * 128 * 512
     assert phases["pv"].matrix["bf16"] == 2 * 64 * 16 * 512
     # Resident exchanges consume MTE3 and FIXPIPE but never HBM scratch.

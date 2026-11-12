@@ -87,8 +87,18 @@ class OperatorPlan:
     work: Work
     program: Callable[[RecipeContext], Program]
     metadata: Mapping = field(default_factory=dict)
+    #: A native peer program owns its own phase events and launch handles. The
+    #: common Execution launches it through launch_native_cohort instead of
+    #: wrapping it in a synthetic KernelProgram stage.
+    native: bool = False
 
     def lower(self, context: RecipeContext) -> Program:
+        if self.native:
+            from fractions import Fraction
+            from .piecewise.compiler import NativeProgram
+            inner = self.program(replace(context, setup_ms=0, minimum_ms=0))
+            return NativeProgram(
+                inner, tuple(getattr(inner, "work", ()) or ()), Fraction(0))
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
             Stage("body", after=("setup",),

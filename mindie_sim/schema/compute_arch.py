@@ -76,7 +76,12 @@ class ComputeArchSpec:
     def supplies(self, compute_units, resource_units, physical_rates=None):
         """Device totals retain per-owner partitioning; explicit rates override."""
         rates, units, work_units, modes = {}, {}, {}, {}
-        for service in self.instruction_services:
+        # Resource owners must exist before a mode claims to share them,
+        # regardless of alphabetical key order (e.g. get_sff... sharing
+        # pipe_s_issue).
+        services = tuple(sorted(self.instruction_services,
+                                key=lambda item: (item.resource is not None, item.name)))
+        for service in services:
             count = resource_units.get(service.owner_axis, compute_units)
             rate = service.per_owner_rate
             if service.scale_with:
@@ -91,9 +96,13 @@ class ComputeArchSpec:
             if service.resource:
                 # A source-owned pipe mode shares its physical queue and owner
                 # capacity; it must not become a second independent resource.
-                if resource_units.get(service.resource, compute_units) != count:
+                resource_count = units.get(
+                    service.resource,
+                    resource_units.get(service.resource, compute_units))
+                if resource_count != count:
                     raise ModelingError("instruction_service_owner_mismatch:" + service.name)
-                modes[service.name] = {"resource": service.resource, "rate": rate * count}
+                modes[service.name] = {"resource": service.resource,
+                                       "rate": rate * count}
             else:
                 rates[service.name] = rate * count
                 units[service.name] = count

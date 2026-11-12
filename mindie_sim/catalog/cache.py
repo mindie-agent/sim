@@ -215,7 +215,17 @@ def index_scale_bytes(model: Any) -> float:
 
 
 def index_row_bytes(model: Any, index_dim: int) -> float:
-    """Index data plus one declared scale per row (the tree's cache layout)."""
+    """Physical index row bytes from an explicit source representation.
+
+    Missing ``cache_representations['index_k']`` retains the historical plain
+    int8/FP16 arithmetic exactly. A declared uint8 packed representation is
+    routed through the shared CacheFormat rather than inferred from a model
+    name, hardware label or source id.
+    """
+    raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
+    if "index_k" in raw:
+        from mindie_sim.catalog.cache_format import cache_format
+        return float(cache_format(model, "index_k").row_bytes(index_dim))
     return float(index_dim) * index_element_bytes(model) + index_scale_bytes(model)
 
 

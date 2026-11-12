@@ -36,8 +36,10 @@ from mindie_sim.prediction.engine import Engine, ExecutionError, Resource
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.subgraphs import SubgraphInstance
-from .compiler import ( CompiledOperator, CompiledSubgraph, OperatorCost, PipeSupply, RequestGeometry,
-    SubgraphEvaluation, WorkloadGeometry, _PIPE_UNITS, _apply_operator_state, )
+from .compiler import ( CompiledOperator, CompiledSubgraph, NativeProgram, NativeTask,
+    OperatorCost, PipeSupply, RequestGeometry, SubgraphEvaluation,
+    WorkloadGeometry, _PIPE_UNITS, _apply_operator_state, )
+from .sfa_prolog import visible_adjustment as _sfa_visible_adjustment
 from .expressions import Expr, as_fraction
 from .guards import PipeDemand
 
@@ -48,6 +50,7 @@ class SerialResult:
     readiness: tuple[tuple[str, Fraction], ...] = ()
     fusion_results: tuple["FusionResult", ...] = ()
     contention: "ContentionEnvelope | None" = None
+    unfused_costs: tuple[OperatorCost, ...] = ()
     @property
     def gap_ms(self) -> Fraction: return sum(self.gaps_ms, Fraction(0))
     def by_name(self, name: str) -> OperatorCost:
@@ -99,6 +102,8 @@ class ContentionEnvelope:
     makespan_ms: Fraction; isolated_max_ms: Fraction; isolated_sum_ms: Fraction
     resource_work: tuple[tuple[str, Fraction], ...]; resource_bounds: tuple[tuple[str, Fraction], ...]
     shared_pipes: tuple[str, ...]; disjoint_pipes: tuple[str, ...]; branches: tuple[tuple[str, Fraction], ...]
+    # Engine completion of each chain, not the isolated counterfactual in branches.
+    completions: tuple[tuple[str, Fraction], ...] = ()
     @property
     def additivity_gap_ms(self) -> Fraction: return self.makespan_ms - self.isolated_sum_ms
     @property
@@ -124,6 +129,86 @@ class EngineResult:
     makespan_ms: Fraction; branches: tuple[tuple[str, Fraction], ...]
     resources: tuple[tuple[str, Fraction], ...]
     summary: tuple[tuple[str, Any], ...] = ()
+
+
+@dataclass(frozen=True)
+class OperatorSegment:
+    """One kernel on a stream: resource stages plus its own latency events.
+
+    ``floor`` starts when the kernel is released and overlaps startup, body
+    and dependency.  ``startup`` delays the body.  ``dependency`` follows the
+    body.  The next kernel on the same stream is released at
+    ``max(floor, startup + body + dependency)``.  Caps, when set, are executed
+    rates below the supply and apply only to this kernel's resource stages.
+    """
+
+    stages: tuple[tuple[tuple[str, Fraction], ...], ...]
+    floor: Fraction = Fraction(0)
+    startup: Fraction = Fraction(0)
+    dependency: Fraction = Fraction(0)
+    caps: tuple[tuple[str, Fraction], ...] = ()
+    native_stages: tuple[tuple[NativeTask, ...], ...] = ()
+    native_program: NativeProgram | None = None
+
+
+def operator_segment(cost: OperatorCost, supply: PipeSupply | None = None) -> OperatorSegment:
+    """Lift one compiled operator into a causal engine segment.
+
+    Native stage work is copied unchanged.  A cap is recorded only when the
+    compiler's elapsed rate for that pipe is below the live supply, which is
+    how a declared slower execution dtype stretches the body without adding
+    FLOPs or bytes.
+    """
+    fields = dict(cost.derived)
+    if cost.stage_work:
+        stages = tuple(
+            tuple((str(pipe), as_fraction(amount)) for pipe, amount in stage)
+            for stage in cost.stage_work)
+    elif cost.work:
+        stages = (tuple((str(pipe), as_fraction(amount)) for pipe, amount in cost.work),)
+    else:
+        stages = ()
+    caps: list[tuple[str, Fraction]] = []
+    if supply is not None:
+        times = dict(cost.times)
+        for pipe, amount in cost.work:
+            elapsed = as_fraction(times.get(pipe, 0))
+            native = as_fraction(amount)
+            if native <= 0 or elapsed <= 0:
+                continue
+            executed = native / elapsed
+            base = as_fraction(supply.effective(str(pipe)))
+            if executed < base:
+                caps.append((str(pipe), executed))
+    native_program = cost.native_program
+    if native_program is not None:
+        # The original executable program owns its own owner placement,
+        # reserves, dependencies and completion.  Do not add a fabricated
+        # floor/startup or replay an aggregate.
+        return OperatorSegment(
+            stages=(), floor=Fraction(0), startup=Fraction(0),
+            dependency=Fraction(0), native_program=native_program)
+    schedule = cost.native_schedule
+    if schedule is not None and schedule.stages:
+        # The native owner program is the source work.  Its analytical
+        # stage_work can collapse register work to zero or sum a different
+        # aggregate (the conv 756 us replay); never replay that substitute.
+        return OperatorSegment(
+            stages=(),
+            floor=as_fraction(fields.get("service_floor_ms", 0)),
+            startup=schedule.startup,
+            dependency=schedule.dependency,
+            native_stages=schedule.stages,
+        )
+    return OperatorSegment(
+        stages=stages,
+        floor=as_fraction(fields.get("service_floor_ms", 0)),
+        startup=as_fraction(fields.get("service_startup_ms", 0)),
+        dependency=as_fraction(fields.get("service_dependency_ms", 0)),
+        caps=tuple(caps),
+    )
+
+
 def _resource_units(pipe: str) -> str:
     return _PIPE_UNITS.get(pipe, "work")
 
@@ -134,14 +219,180 @@ def run_engine(branches: Mapping[str, Sequence[Sequence[PipeDemand]]], supply: P
              for name, stages in branches.items()}
     return run_engine_work(bound, supply)
 
-def run_engine_work(branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction]]]], supply: PipeSupply) -> EngineResult:
-    """Engine execution from already-bound ``(pipe, work)`` stage chains."""
+def _inferred_floor(stages: Sequence[Sequence[tuple[str, Fraction]]], supply: PipeSupply) -> Fraction:
+    """Infer a declared invocation floor for a direct branch caller.
+
+    Stage work carries no latency.  When a caller supplies only stage work, the
+    highest applicable declared minimum from the stage's resource classes is
+    the nonshared floor.  Explicit ``latencies`` always replace this.
+    """
+    inv = dict(supply.invocations)
+    pipes = {pipe for stage in stages for pipe, amount in stage if amount}
+    classes = [name for name in ("cube", "vector") if name in pipes and name in inv]
+    return max((as_fraction(inv[name]) for name in classes), default=Fraction(0))
+
+
+def _stage_work_map(stage: Sequence[tuple[str, Fraction]]) -> dict[str, float]:
+    work: dict[str, float] = {}
+    for pipe, amount in stage:
+        if amount > 0:
+            work[pipe] = work.get(pipe, 0.0) + float(amount)
+    return work
+
+
+def _schedule_segments(engine: Engine, name: str, segments: Sequence[OperatorSegment]) -> Any:
+    """Schedule one stream of kernels.  Each kernel's latency is its own event.
+
+    A later kernel is not released until the earlier kernel completes, so a
+    floor cannot hide inside the previous kernel's body.  Two streams that
+    share this engine still contend for the same pipes.
+    """
+    previous = None
+    for seg_index, segment in enumerate(segments):
+        release = (previous,) if previous is not None else ()
+        if segment.native_program is not None:
+            ready = engine.submit(f"{name}:{seg_index}:native_ready",
+                                  after=release)
+            previous = segment.native_program.start(
+                engine, f"{name}:{seg_index}:native", ready)
+            continue
+        caps = dict(segment.caps)
+        floor_event = None
+        if segment.floor > 0:
+            floor_event = engine.submit(
+                f"{name}:{seg_index}:floor", after=release, latency=float(segment.floor))
+        ready = previous
+        if segment.startup > 0:
+            ready = engine.submit(
+                f"{name}:{seg_index}:startup", after=release, latency=float(segment.startup))
+        body = ready
+        for stage_index, stage in enumerate(segment.stages):
+            work = _stage_work_map(stage)
+            stage_caps = {pipe: float(caps[pipe]) for pipe in work if pipe in caps}
+            body = engine.submit(
+                f"{name}:{seg_index}:{stage_index}", work=work,
+                after=(body,) if body is not None else (),
+                caps=stage_caps or None)
+        for stage_index, tasks in enumerate(segment.native_stages):
+            task_events = []
+            for task_index, task in enumerate(tasks):
+                task_caps = ({task.resource: float(task.cap)}
+                             if task.cap is not None else None)
+                task_events.append(engine.submit(
+                    f"{name}:{seg_index}:native:{stage_index}:{task_index}",
+                    work={task.resource: float(task.work)},
+                    after=(body,) if body is not None else (),
+                    caps=task_caps))
+            if task_events:
+                body = engine.submit(
+                    f"{name}:{seg_index}:native:{stage_index}:join",
+                    after=tuple(task_events))
+        if segment.dependency > 0:
+            body = engine.submit(
+                f"{name}:{seg_index}:dependency",
+                after=(body,) if body is not None else release,
+                latency=float(segment.dependency))
+        waited = tuple(event for event in (body, floor_event) if event is not None)
+        if not waited:
+            previous = engine.submit(f"{name}:{seg_index}:empty", after=release)
+        elif len(waited) == 1:
+            previous = waited[0]
+        else:
+            previous = engine.submit(f"{name}:{seg_index}:complete", after=waited)
+    if previous is None:
+        previous = engine.submit(f"{name}:empty", work={})
+    return previous
+
+
+def _validate_stage_work(branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction]]]]) -> None:
     for stages in branches.values():
         for stage in stages:
             for pipe, amount in stage:
                 val = float(amount)
                 if not math.isfinite(val) or val < 0:
                     raise ModelingError(f"engine_work_negative_or_nonfinite:{pipe}:{amount}")
+
+
+def _validate_segments(chains: Mapping[str, Sequence[OperatorSegment]]) -> None:
+    for name, segments in chains.items():
+        for segment in segments:
+            for value, label in (
+                    (segment.floor, "floor"), (segment.startup, "startup"),
+                    (segment.dependency, "dependency")):
+                if value < 0 or not math.isfinite(float(value)):
+                    raise ModelingError(f"engine_latency_invalid:{name}:{label}:{value}")
+            _validate_stage_work({name: segment.stages})
+            for stage in segment.native_stages:
+                for task in stage:
+                    if (not task.resource or not math.isfinite(float(task.work))
+                            or task.work < 0):
+                        raise ModelingError(
+                            f"engine_native_task_invalid:{name}:{task.resource}")
+                    if (task.cap is not None
+                            and (not math.isfinite(float(task.cap))
+                                 or task.cap <= 0)):
+                        raise ModelingError(
+                            f"engine_native_cap_invalid:{name}:{task.resource}")
+
+
+def run_engine_work(branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction]]]], supply: PipeSupply,
+                    latencies: Mapping[str, Fraction] | None = None, *,
+                    chains: Mapping[str, Sequence[OperatorSegment]] | None = None) -> EngineResult:
+    """Engine execution from bound stage chains or causal operator segments.
+
+    ``latencies`` are per-branch completion floors anchored at branch release.
+    That form is one event for the whole stage list: two concurrent copies of
+    one kernel finish at ``max(body, floor)``.  ``chains`` is the multi-kernel
+    form.  Each segment carries its own floor, startup and dependency, and the
+    next segment on that stream waits for the previous completion.
+    """
+    if chains is not None:
+        _validate_segments(chains)
+        has_program = any(segment.native_program is not None
+                          for segments in chains.values() for segment in segments)
+        if has_program:
+            # The original program may use any declared native rate/pool.
+            pipes = sorted({str(name) for name, _rate in supply.rates} | {
+                pipe for segments in chains.values() for segment in segments
+                for stage in segment.stages for pipe, amount in stage if amount} | {
+                task.resource for segments in chains.values()
+                for segment in segments for stage in segment.native_stages
+                for task in stage if task.work})
+        else:
+            pipes = sorted({
+                pipe for segments in chains.values() for segment in segments
+                for stage in segment.stages for pipe, amount in stage if amount} | {
+                task.resource for segments in chains.values()
+                for segment in segments for stage in segment.native_stages
+                for task in stage if task.work})
+        units = dict(supply.resource_units)
+        resources = tuple(Resource(pipe, supply.effective(pipe),
+                                   _resource_units(pipe), "fair",
+                                   int(units.get(pipe, 1)))
+                          for pipe in pipes)
+        pools = dict(supply.buffers)
+        pool_units = dict(supply.pool_units)
+        engine = Engine(resources, pools=pools, pool_units=pool_units)
+        events = {name: _schedule_segments(engine, name, segments) for name, segments in chains.items()}
+        engine.advance()
+        makespan = Fraction(str(engine.now))
+        completions = tuple(sorted(
+            (name, Fraction(str(event.time if event.time is not None else engine.now)))
+            for name, event in events.items()))
+        summary = tuple(sorted(engine.summary().items()))
+        return EngineResult(
+            makespan, completions,
+            tuple(sorted((key, Fraction(str(value))) for key, value in engine.busy_ms.items())),
+            summary)
+    _validate_stage_work(branches)
+    latency_by_branch = (
+        {str(name): _inferred_floor(stages, supply) for name, stages in branches.items()}
+        if latencies is None else
+        {str(name): as_fraction(value) for name, value in latencies.items()}
+    )
+    for name, value in latency_by_branch.items():
+        if value < 0 or not math.isfinite(float(value)):
+            raise ModelingError(f"engine_latency_invalid:{name}:{value}")
     pipes = sorted({pipe for stages in branches.values() for stage in stages for pipe, amount in stage if amount})
     resources = tuple(Resource(pipe, supply.effective(pipe), _resource_units(pipe), "fair") for pipe in pipes)
     engine = Engine(resources)
@@ -149,14 +400,18 @@ def run_engine_work(branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction
     for name, stages in branches.items():
         previous = None
         for index, stage in enumerate(stages):
-            work: dict[str, float] = {}
-            for pipe, amount in stage:
-                if amount > 0:
-                    work[pipe] = work.get(pipe, 0.0) + float(amount)
-            event = engine.submit(f"{name}:{index}", work=work, after=(previous,) if previous is not None else ())
+            event = engine.submit(
+                f"{name}:{index}", work=_stage_work_map(stage),
+                after=(previous,) if previous is not None else ())
             previous = event
         if previous is None:
             previous = engine.submit(f"{name}:empty", work={})
+        floor = latency_by_branch.get(str(name), Fraction(0))
+        if floor > 0:
+            # One kernel, or a caller that already folded a single latency:
+            # the floor starts at branch release and overlaps the body.
+            floor_event = engine.submit(f"{name}:floor", after=(), latency=float(floor))
+            previous = engine.submit(f"{name}:complete", after=(previous, floor_event))
         events[name] = previous
     engine.advance()
     makespan = Fraction(str(engine.now))
@@ -165,12 +420,98 @@ def run_engine_work(branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction
     summary = tuple(sorted(engine.summary().items()))
     return EngineResult(makespan, completions, tuple(sorted((key, Fraction(str(value))) for key, value in engine.busy_ms.items())), summary)
 
-def contention_envelope( branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction]]]], supply: PipeSupply, ) -> ContentionEnvelope:
-    """Compose concurrently ready branches through one shared-capacity engine."""
-    result = run_engine_work(branches, supply)
-    branch_totals: dict[str, Fraction] = {}
-    work: dict[str, Fraction] = {}
-    users: dict[str, set[str]] = {}
+def _isolated_segment_ms(segment: OperatorSegment, supply: PipeSupply) -> Fraction:
+    """No-contention completion of one kernel, including its own latency."""
+    if segment.native_program is not None:
+        return max(segment.floor,
+                   segment.startup + segment.native_program.duration
+                   + segment.dependency)
+    caps = dict(segment.caps)
+    body = Fraction(0)
+    for stage in segment.stages:
+        coalesced: dict[str, Fraction] = {}
+        for pipe, amount in stage:
+            if amount > 0:
+                coalesced[pipe] = coalesced.get(pipe, Fraction(0)) + amount
+        stage_time = Fraction(0)
+        for pipe, amount in coalesced.items():
+            rate = as_fraction(supply.effective(pipe))
+            cap = caps.get(pipe)
+            if cap is not None:
+                rate = min(rate, cap)
+            if rate > 0:
+                stage_time = max(stage_time, amount / rate)
+        body += stage_time
+    for tasks in segment.native_stages:
+        stage_time = Fraction(0)
+        for task in tasks:
+            rate = as_fraction(supply.effective(task.resource))
+            if task.cap is not None:
+                rate = min(rate, as_fraction(task.cap))
+            if rate > 0:
+                stage_time = max(stage_time, as_fraction(task.work) / rate)
+        body += stage_time
+    return max(segment.floor, segment.startup + body + segment.dependency)
+
+
+def contention_envelope( branches: Mapping[str, Sequence[Sequence[tuple[str, Fraction]]]], supply: PipeSupply,
+                         latencies: Mapping[str, Fraction] | None = None, *,
+                         chains: Mapping[str, Sequence[OperatorSegment]] | None = None, ) -> ContentionEnvelope:
+    """Compose concurrently ready branches through one shared-capacity engine.
+
+    ``chains`` schedules each kernel's floor, startup and dependency at that
+    kernel's release.  A single ``latencies`` value remains one branch-level
+    floor anchored at branch release, which is the one-kernel form.
+    """
+    if chains is not None:
+        result = run_engine_work({}, supply, chains=chains)
+        branch_totals: dict[str, Fraction] = {}
+        work: dict[str, Fraction] = {}
+        users: dict[str, set[str]] = {}
+        for name, segments in chains.items():
+            branch_totals[name] = sum((_isolated_segment_ms(segment, supply) for segment in segments), Fraction(0))
+            for segment in segments:
+                for stage in segment.stages:
+                    for pipe, amount in stage:
+                        if amount > 0:
+                            work[pipe] = work.get(pipe, Fraction(0)) + amount
+                            users.setdefault(pipe, set()).add(name)
+                for stage in segment.native_stages:
+                    for task in stage:
+                        if task.work > 0:
+                            work[task.resource] = work.get(
+                                task.resource, Fraction(0)) + task.work
+                            users.setdefault(task.resource, set()).add(name)
+                if segment.native_program is not None:
+                    rates = dict(supply.rates)
+                    modes = dict(supply.service_modes)
+                    for pipe, amount in segment.native_program.work:
+                        if amount <= 0:
+                            continue
+                        if pipe in rates:
+                            resource = pipe
+                        elif pipe in modes and modes[pipe][0] in rates:
+                            resource = modes[pipe][0]
+                        else:
+                            continue
+                        work[resource] = work.get(resource, Fraction(0)) + amount
+                        users.setdefault(resource, set()).add(name)
+        bounds = tuple(sorted((pipe, amount / supply.effective(pipe)) for pipe, amount in work.items()))
+        shared = tuple(sorted(pipe for pipe, owners in users.items() if len(owners) > 1))
+        disjoint = tuple(sorted(pipe for pipe, owners in users.items() if len(owners) == 1))
+        isolated_max = max(branch_totals.values(), default=Fraction(0))
+        return ContentionEnvelope( result.makespan_ms, isolated_max, sum(branch_totals.values(), Fraction(0)),
+            tuple(sorted(work.items())), bounds, shared, disjoint, tuple(sorted(branch_totals.items())),
+            result.branches)
+    result = run_engine_work(branches, supply, latencies)
+    latency_by_branch = (
+        {str(name): _inferred_floor(stages, supply) for name, stages in branches.items()}
+        if latencies is None else
+        {str(name): as_fraction(value) for name, value in latencies.items()}
+    )
+    branch_totals = {}
+    work = {}
+    users = {}
     for name, stages in branches.items():
         total = Fraction(0)
         for stage in stages:
@@ -183,13 +524,15 @@ def contention_envelope( branches: Mapping[str, Sequence[Sequence[tuple[str, Fra
             for pipe, amount in coalesced.items():
                 work[pipe] = work.get(pipe, Fraction(0)) + amount
                 users.setdefault(pipe, set()).add(name)
-        branch_totals[name] = total
+        # A single branch floor overlaps the body; it does not follow it.
+        branch_totals[name] = max(total, latency_by_branch.get(str(name), Fraction(0)))
     bounds = tuple(sorted((pipe, amount / supply.effective(pipe)) for pipe, amount in work.items()))
     shared = tuple(sorted(pipe for pipe, owners in users.items() if len(owners) > 1))
     disjoint = tuple(sorted(pipe for pipe, owners in users.items() if len(owners) == 1))
     isolated_max = max(branch_totals.values(), default=Fraction(0))
     return ContentionEnvelope( result.makespan_ms, isolated_max, sum(branch_totals.values(), Fraction(0)),
-        tuple(sorted(work.items())), bounds, shared, disjoint, tuple(sorted(branch_totals.items())))
+        tuple(sorted(work.items())), bounds, shared, disjoint, tuple(sorted(branch_totals.items())),
+        result.branches)
 
 def pipeline_makespan(stage_ms: Sequence[Fraction | float], tiles: int, slots: int) -> Fraction:
     """Finite two-level pipeline recurrence with explicit buffer slots and O(stages + slots) memory."""
@@ -419,12 +762,83 @@ def lower_fusion(instance: SubgraphInstance, costs: Sequence[OperatorCost],
         if removed_here > 0:
             removed[name] = removed.get(name, Fraction(0)) + removed_here
 
+    adjustment = _sfa_visible_adjustment(instance, outputs) if contract_name == "mla_prolog" else None
+    if adjustment is not None:
+        # The seven members stay the internal GEMM, RMS, RoPE and store.
+        # q_norm was forwarded into q_up above. The unabsorbed q_up write has
+        # no fusion consumer, so only that write leaves. The cache capacity
+        # is not a kept output; the packed-slot delta is store traffic.
+        q_act = outputs.get("q_activation", Fraction(0))
+        q_owner = producer.get("q_activation")
+        if q_act > 0 and q_owner is not None:
+            wrote = _subtract_stage(stages_by_member[q_owner], "mte3", q_act, reverse=True)
+            _subtract_stage(stages_by_member[q_owner], "hbm", wrote, reverse=True)
+            if wrote > 0:
+                removed["q_activation"] = removed.get("q_activation", Fraction(0)) + wrote
+        kept = {name: adjustment["kept_" + name] for name in
+                ("ql_nope", "q_pe", "q_c", "q_c_scale", "cache_index")}
+        store = stages_by_member[-1]
+        delta = adjustment["store_delta"]
+        if delta > 0:
+            store.append({"mte3": delta, "hbm": delta})
+        elif delta < 0:
+            wrote = _subtract_stage(store, "mte3", -delta, reverse=True)
+            _subtract_stage(store, "hbm", wrote, reverse=True)
+        if adjustment["index_read"] > 0:
+            store.append({"mte2": adjustment["index_read"], "hbm": adjustment["index_read"]})
+        if adjustment["visible_write"] > 0:
+            store.append({"mte3": adjustment["visible_write"], "hbm": adjustment["visible_write"]})
+
+    native_prolog = dict(getattr(instance.template, "contract", ()) or ()).get("mla_prolog_v3")
+    stage_rate_override: dict[int, dict[str, Fraction]] = {}
+    bf16_peak = None
+    if supply is not None:
+        bf16_peak = dict(getattr(supply, "compute_peaks", ()) or ()).get("bf16")
+        bf16_peak = Fraction(str(bf16_peak)) if bf16_peak else None
+    if contract_name == "mla_prolog" and native_prolog:
+        # One genuine fourth product: Qup -> W_UK (BF16), absorbed into the
+        # visible ql_nope.  It is not a fifth generic GEMM member and its
+        # output is not re-counted when visible_adjustment already pays it.
+        parts = dict(item.split("=", 1) for item in str(native_prolog).split(":") if "=" in item)
+        wuk = str(parts.get("W_UK", "64,192,512"))
+        try:
+            bh, kk, nn = (int(v) for v in wuk.split(","))
+        except ValueError as exc:
+            raise ModelingError("mla_prolog_v3_wuk_shape_invalid") from exc
+        q_up_cost = next((cost for cost in members if cost.name == "q_up"), None)
+        q_up_op = next((op for op in instance.operators if op.name == "q_up"), None)
+        if q_up_cost is not None and q_up_op is not None:
+            q_width = int(q_up_op.theta.find("N", 0) or 0)
+            q_act = Fraction(outputs.get("q_activation", 0))
+            tokens = (q_act // (q_width * 2)) if q_width > 0 else Fraction(0)
+            if tokens > 0:
+                flops = Fraction(2) * tokens * bh * kk * nn
+                weight = Fraction(bh * kk * nn * 2)
+                act = Fraction(tokens * bh * kk * 2)
+                out = Fraction(tokens * bh * nn * 2)
+                # Public work remains the true BF16 FLOPs.  Only this stage's
+                # cube service uses the declared BF16 peak; never scale the
+                # physical numerator to imitate a slower rate.
+                stage: dict[str, Fraction] = {"cube": flops,
+                                              "mte2": weight + act,
+                                              "hbm": weight + act}
+                if adjustment is None:
+                    stage["mte3"] = out
+                    stage["hbm"] += out
+                if bf16_peak is not None:
+                    stage_rate_override[id(stage)] = {"cube": bf16_peak}
+                q_index = next((i for i, cost in enumerate(members)
+                                if cost.name == "q_up"), None)
+                if q_index is not None:
+                    stages_by_member.insert(q_index + 1, [stage])
     flat: list[tuple[tuple[str, Fraction], ...]] = []
+    flat_rates: list[dict[str, Fraction]] = []
     work: dict[str, Fraction] = {}
     for stages in stages_by_member:
         for stage in stages:
             entries = tuple(sorted((pipe, value) for pipe, value in stage.items() if value > 0))
             flat.append(entries)
+            flat_rates.append(stage_rate_override.get(id(stage), {}))
             for pipe, value in entries:
                 work[pipe] = work.get(pipe, Fraction(0)) + value
     def rate(pipe: str) -> Fraction:
@@ -435,14 +849,31 @@ def lower_fusion(instance: SubgraphInstance, costs: Sequence[OperatorCost],
     stage_times: list[Fraction] = []
     times: dict[str, Fraction] = {}
     peak: dict[str, Fraction] = {}
-    for entries in flat:
-        stage_time = max((value / rate(pipe) for pipe, value in entries), default=Fraction(0))
+    for index, entries in enumerate(flat):
+        overrides = flat_rates[index]
+        stage_time = max((value / overrides.get(pipe, rate(pipe))
+                          for pipe, value in entries), default=Fraction(0))
         stage_times.append(stage_time)
         for pipe, value in entries:
-            elapsed = value / rate(pipe)
+            elapsed = value / overrides.get(pipe, rate(pipe))
             times[pipe] = times.get(pipe, Fraction(0)) + elapsed
             peak[pipe] = max(peak.get(pipe, Fraction(0)), elapsed)
-    duration = sum(stage_times, Fraction(0))
+    body = sum(stage_times, Fraction(0))
+    # One fused launch keeps the strictest declared floor.  Startup and
+    # propagation stay latency: they are not summed across members and they
+    # do not re-enter the work ledger.
+    floor = startup = dependency = Fraction(0)
+    for cost in members:
+        fields = dict(cost.derived)
+        floor = max(floor, as_fraction(fields.get("service_floor_ms", 0)))
+        startup = max(startup, as_fraction(fields.get("service_startup_ms", 0)))
+        dependency = max(dependency, as_fraction(fields.get("service_dependency_ms", 0)))
+    duration = max(floor, startup + body + dependency)
+    if contract_name == "add_rmsnorm":
+        # Source AddRmsNorm physically writes norm, residual and F32 rstd
+        # only; the member-local names are consumed inside the launch.
+        kept = {name: value for name, value in kept.items()
+                if name in {"norm_output", "residual", "rstd"}}
     removed_total = sum(removed.values(), Fraction(0))
     kept_total = sum(kept.values(), Fraction(0))
     dominant = max(peak, key=peak.get) if peak else ""
@@ -452,11 +883,17 @@ def lower_fusion(instance: SubgraphInstance, costs: Sequence[OperatorCost],
                 if slices is not None else tuple(sorted(kept.items())))
     derived = { "fused": Fraction(1), "physical_kernels": Fraction(1), "kept_outputs": Fraction(max(1, len(kept))),
         "removed_bytes": removed_total, "kept_bytes": kept_total, "member_stages": Fraction(len(flat)), }
+    if floor > 0 or startup > 0 or dependency > 0:
+        derived["service_floor_ms"] = floor
+        derived["service_startup_ms"] = startup
+        derived["service_dependency_ms"] = dependency
     fused = OperatorCost( name=f"fused:{contract_name}", family="fused", kind=instance.kind, segment_index=-1, regime=(), guard_cells=(),
         work=tuple(sorted(work.items())), times=tuple(sorted(times.items())), stage_times=tuple(stage_times), duration_ms=duration,
         stage_work=tuple(flat), dominant_pipe=dominant, tied_pipes=tied, materialization=material, internal=(),
         residency_bytes=sum((cost.residency_bytes for cost in members), Fraction(0)),
         derived=tuple(sorted(derived.items())), formula=f"fused({contract_name})", fidelity="fused_physical_kernel", )
+    from .native_calls import attach_fusion_native
+    fused = attach_fusion_native(fused, instance, contract, tuple(members))
     return FusionResult(contract_name, tuple(members), fused, tuple(sorted(removed.items())), tuple(sorted(kept.items())), contract.startup,
                         sum((as_fraction(cost.duration_ms) for cost in members), Fraction(0)))
 
@@ -543,6 +980,7 @@ def evaluate_serial_split( compiled: CompiledSubgraph, geometry: WorkloadGeometr
         costs.append(cost)
         current = _apply_operator_state(current, operator, cost, compiled.instance, local)
         current = _apply_declared_effects(current, operator, compiled.instance)
+    unfused_costs = tuple(costs)
     fused_names: list[str] = []
     fusion_results: list[FusionResult] = []
     waits = {key: as_fraction(value) for key, value in (readiness or {}).items()}
@@ -575,15 +1013,19 @@ def evaluate_serial_split( compiled: CompiledSubgraph, geometry: WorkloadGeometr
             streams[result.fused.name] = next(iter(member_streams)) if len(member_streams) == 1 else "main"
             if any(cost.name in fork_ops for cost in result.semantic):
                 fork_names.add(result.fused.name)
-        branches: dict[str, list[list[tuple[str, Fraction]]]] = {"main": [], "aux": []}
+        chains: dict[str, list[OperatorSegment]] = {"main": [], "aux": []}
         for cost in costs:
             if cost.name in fork_names:
-                target = branches["aux" if streams.get(cost.name) == "aux" else "main"]
-                target.extend([list(s) for s in cost.stage_work] if cost.stage_work else ([list(cost.work)] if cost.work else []))
+                branch = "aux" if streams.get(cost.name) == "aux" else "main"
+                # Each kernel keeps its own floor, startup and dependency.
+                # Summing those durations into one t=0 floor lets a later
+                # floor overlap the previous kernel's body.
+                chains[branch].append(operator_segment(cost, compiled.supply))
             else:
                 completion += cost.duration_ms
             gaps.append(Fraction(0))
-        envelope = contention_envelope(branches, compiled.supply)
+        live = {name: segments for name, segments in chains.items() if segments}
+        envelope = contention_envelope({}, compiled.supply, chains=live)
         completion += envelope.makespan_ms
     else:
         for cost in costs:
@@ -592,7 +1034,7 @@ def evaluate_serial_split( compiled: CompiledSubgraph, geometry: WorkloadGeometr
             completion = max(completion, ready) + cost.duration_ms
     effective = {**waits, **fused_ready}
     return SerialResult(tuple(costs), completion, current, tuple(gaps),
-                        tuple(fused_names), tuple(sorted(effective.items())), tuple(fusion_results), envelope)
+                        tuple(fused_names), tuple(sorted(effective.items())), tuple(fusion_results), envelope, unfused_costs)
 
 def evaluate_subgraphs_padded( compiled: Iterable[CompiledSubgraph], active: WorkloadGeometry, padded: WorkloadGeometry | None = None, *,
     active_kinds: Iterable[str] = ("A0", "A1", "A2", "A3", "A4", "K0", "K1", "I0", "I1", "F1", "F2", "F3", "D0"),

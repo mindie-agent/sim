@@ -35,6 +35,28 @@ def emit(value, output):
         print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
 
 
+def _add_supply_arguments(command):
+    command.add_argument(
+        "--supply", help="profiler C7 report or mindie-profiler-measured-supply/1 JSON")
+    command.add_argument("--supply-recipe", help="selected operator recipe to bind")
+    command.add_argument("--supply-kernel", help="selected native kernel name to bind")
+    command.add_argument("--supply-hardware", help="explicit hardware key for the binding")
+    command.add_argument("--supply-owners", type=int,
+                         help="selected implementation active-owner default")
+
+
+def _case_with_supply(args):
+    raw = read_json(args.case)
+    if getattr(args, "supply", None):
+        from .observations.calibration import apply_profiler_supply
+        raw = apply_profiler_supply(
+            raw, args.supply, recipe=getattr(args, "supply_recipe", None),
+            kernel=getattr(args, "supply_kernel", None),
+            hardware=getattr(args, "supply_hardware", None),
+            owners=getattr(args, "supply_owners", None))
+    return raw
+
+
 def parser():
     root = argparse.ArgumentParser(prog="mindie-sim")
     sub = root.add_subparsers(dest="command", required=True)
@@ -51,6 +73,7 @@ def parser():
             cmd.add_argument("--tokens", type=int, help="target verification rows per sequence")
             cmd.add_argument("--context", type=int)
             cmd.add_argument("--sequences", type=int, help="sequences per participating DP replica")
+            _add_supply_arguments(cmd)
     operators = sub.add_parser("operators", help="isolated target-body device program costs")
     operators.add_argument("case")
     operators.add_argument("--phase", choices=("prefill", "decode"), required=True)
@@ -62,7 +85,15 @@ def parser():
     operators.add_argument("--draft-prepare", action="store_true",
                            help="include declared draft cache preparation after model prefill")
     operators.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
+    _add_supply_arguments(operators)
     operators.add_argument("--output", "-o")
+    native_invoke = sub.add_parser(
+        "native-invoke",
+        help="execute one already-prepared standalone QBMM occurrence once")
+    native_invoke.add_argument("--occurrence", type=Path, required=True)
+    native_invoke.add_argument("--tensors", type=Path, required=True)
+    native_invoke.add_argument("--device", required=True)
+    native_invoke.add_argument("--output", type=Path, required=True)
     graph = sub.add_parser("graph", help="compose a pure target graph on shared device resources")
     graph.add_argument("case")
     graph.add_argument("--phase", choices=("prefill", "decode"), required=True)
@@ -81,6 +112,7 @@ def parser():
     graph.add_argument("--primitives")
     graph.add_argument("--event-limit", type=int, default=0)
     graph.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
+    _add_supply_arguments(graph)
     graph.add_argument("--output", "-o")
     catalog = sub.add_parser("catalog")
     catalog.add_argument("name", nargs="?")
@@ -282,7 +314,7 @@ def run(args):
     if args.command == "graph":
         from .prediction.graph_analysis import graph_costs
         from .prediction.operator_analysis import target_graphs
-        case = parse_case(read_json(args.case))
+        case = parse_case(_case_with_supply(args))
         graphs = target_graphs(case, phase=args.phase, tokens=args.tokens, context=args.context,
                                sequences=args.sequences, scope=args.scope,
                                media_tokens_per_sequence=args.media_tokens_per_sequence,
@@ -302,9 +334,24 @@ def run(args):
                 "draft_prepare": args.draft_prepare,
                 "deployment_scope": "first_independent_dp_cohort",
             }
+    if args.command == "native-invoke":
+        from .prediction.piecewise.native_invocation import invoke_qbmm
+        import torch
+        occurrence = read_json(args.occurrence)
+        loaded = torch.load(args.tensors, map_location="cpu", weights_only=True)
+        if not isinstance(loaded, dict):
+            raise ValueError("native_invoke_tensors_mapping_required")
+        tensors = {key: (value.to(args.device) if torch.is_tensor(value) else value)
+                   for key, value in loaded.items()}
+        result = invoke_qbmm(occurrence, tensors, device=args.device)
+        torch.save(result, args.output)
+        return {"entry": "torch_npu.npu_quant_matmul",
+                "output": str(args.output), "shape": list(result.shape),
+                "dtype": str(result.dtype), "device": str(result.device),
+                "runtime_executed": True}
     if args.command == "operators":
         from .prediction.operator_analysis import operator_costs, target_graphs
-        case = parse_case(read_json(args.case))
+        case = parse_case(_case_with_supply(args))
         ops = target_graphs(case, phase=args.phase, tokens=args.tokens, context=args.context,
                             sequences=args.sequences, scope=args.scope,
                             media_tokens_per_sequence=args.media_tokens_per_sequence,
@@ -317,7 +364,7 @@ def run(args):
                 "deployment_scope": "first_independent_dp_cohort"}
     if args.command == "predict":
         with PrimitiveStore(args.primitives) if args.primitives else nullcontext(None) as store:
-            return predict(read_json(args.case), primitives=store,
+            return predict(_case_with_supply(args), primitives=store,
                            trace_limit=args.trace_limit, event_limit=args.event_limit,
                            scope=args.scope, phase=args.phase, tokens=args.tokens,
                            context=args.context, sequences=args.sequences)

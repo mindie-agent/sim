@@ -3,8 +3,11 @@
 [Role] Schedule explicitly selected independent remote-window peer messages on
   the existing topology and Engine, including asymmetric cross-DP cohorts.
 [Invariants] Each directed cell is routed and framed once. A sender owns a
-  declared finite number of outstanding slots; a slot is reused only after
-  remote arrival. No peer waits for an unrelated prior peer's receive. Rank
+  declared finite number of outstanding slots.  When no finite window is
+  declared, the topology-derived maximum is the remote-peer count (one
+  destination slot per peer); the actual finite vendor buffer window may be
+  smaller and is an explicit unknown.  A slot is reused only after remote
+  arrival. No peer waits for an unrelated prior peer's receive. Rank
   completion includes every required incoming and outgoing message. Local
   quantization, packing and expert computation remain separate caller work.
 [Timeouts & Locks] O(ranks * outstanding slots) in-flight state; virtual events.
@@ -22,7 +25,9 @@ from .communication import MessageFlow
 
 @dataclass(frozen=True)
 class DirectPeerGroup(PairwiseGroup):
-    max_inflight_per_rank: int = 1
+    # None means the physical bound is the actual remote peer count: one
+    # outstanding destination slot per peer, not a fitted vendor window.
+    max_inflight_per_rank: int | None = None
 
     def start_participants(self, engine, name, ready_by_rank, *, owner=""):
         initial = _ready_by_rank(self.ranks, ready_by_rank)
@@ -37,6 +42,8 @@ class DirectPeerGroup(PairwiseGroup):
             for dst in range(count):
                 if src != dst and self._payload(src, dst, volumes, peer):
                     expected_receive[dst] += 1
+        window = (self.max_inflight_per_rank if self.max_inflight_per_rank is not None
+                  else max(1, count - 1))
         complete = {r: engine.future(f"{name}:rank{r}:complete") for r in self.ranks}
         issued = [0] * count
         outstanding = [0] * count
@@ -52,7 +59,7 @@ class DirectPeerGroup(PairwiseGroup):
 
         def issue(index):
             while (issued[index] < count - 1
-                   and outstanding[index] < self.max_inflight_per_rank):
+                   and outstanding[index] < window):
                 offset = issued[index] + 1
                 issued[index] += 1
                 destination_index = (index + offset) % count
@@ -100,11 +107,12 @@ class DirectPeerGroup(PairwiseGroup):
 class DirectPeerCollective(PairwiseCollective):
     """Declared coalesced peer window; not an inferred vendor token scheduler."""
 
-    max_inflight_per_rank: int = field(kw_only=True)
+    max_inflight_per_rank: int | None = field(default=None, kw_only=True)
     algorithm: ClassVar[str] = "direct_peer"
 
     def __post_init__(self):
-        if (not isinstance(self.max_inflight_per_rank, int)
+        if self.max_inflight_per_rank is not None and (
+                not isinstance(self.max_inflight_per_rank, int)
                 or isinstance(self.max_inflight_per_rank, bool)
                 or self.max_inflight_per_rank < 1):
             raise ModelingError("direct_peer_window_requires_positive_integer")

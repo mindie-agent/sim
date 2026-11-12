@@ -12,7 +12,8 @@ from collections import Counter
 
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, PlannedRecipe, Work
-from .mxfp4_geometry import Config, columns, panel_sizes, tile_runs, geometry_ledger
+from .mxfp4_geometry import (Config, align, columns, panel_sizes, tile_runs,
+                              geometry_ledger)
 from .mxfp4_registers import CLASSES, TABLES
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from .refill import RefillPipeline
@@ -29,20 +30,58 @@ SOURCE = {
         "gmm/grouped_matmul/op_host/op_tiling/arch35/grouped_weight_quant_batch_matmul_tiling.cpp:850-884,1757-1820",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/grouped_matmul_weight_quant_resplit_controller.h:136-251",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_basic_block.h:267-393",
+        "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_cube_compute.h:135-185",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/weight_quant_vec_compute.h:285-318,735-831",
         "gmm/grouped_matmul/op_kernel/arch35/weight_quant_basic_block/basic_api/weight_quant_basic_api_v1.h:111-242",
+        "gmm/common/op_kernel/weight_quant_tool.h:74-75",
     ),
     "capture_binary_identity": "unverified",
 }
 
 
+SOURCE_INTERFACE = {
+    "activation_format": "fp8_e4m3",
+    "input_format": "fp8_e4m3",
+    "activation_group_size": 32,
+    "activation_scale_format": "fp8_e8m0",
+    "weight_format": "mxfp4",
+    "weight_dtype": "mxfp4",
+    "weight_scale_format": "fp8_e8m0",
+    "weight_scale_storage_format": "fp8_e8m0",
+    "weight_representation": "fp4_group32_packed",
+    "output_format": "bf16",
+    "compute_format": "bf16",
+}
+
+
+def matches_source_interface(op):
+    """Exact ordinary MXA8W4_NZNK source interface, not a generic W4 match.
+
+    This deliberately distinguishes the stored 32-element MXFP4 weight group
+    (`fp4_group32_packed`) from a 64-element group that shares the same A8
+    activation group.  It validates the source interface only; row integrity
+    is checked later by ``config_from_op`` so a malformed matched call raises
+    instead of silently falling back to the analytical matrix.
+    """
+    if op.family != "grouped_gemm":
+        return False
+    meta = dict(op.metadata)
+    if meta.get("native_fusion_group") or meta.get("native_fusion"):
+        return False
+    if any(meta.get(key) != value for key, value in SOURCE_INTERFACE.items()):
+        return False
+    if meta.get("weight_block") not in {None, 32}:
+        return False
+    if meta.get("weight_group_size") not in {None, 32}:
+        return False
+    if meta.get("quant_category") not in {None, "routed_expert"}:
+        return False
+    return True
+
+
 def config_from_op(op):
     meta = dict(op.metadata)
-    if (op.family != "grouped_gemm"
-            or (meta.get("activation_format"), meta.get("weight_format"), meta.get("output_format"))
-            != ("fp8_e4m3", "mxfp4", "bf16")
-            or meta.get("activation_group_size") != 32
-            or meta.get("activation_scale_format") != "fp8_e8m0"):
+    if not matches_source_interface(op):
         raise ModelingError("mxa8w4_nznk_requires_fp8_mxfp4_group32_e8m0_to_bf16")
     rows = tuple(meta.get("matrix_group_rows", ()))
     m, n, k = op.local_shape[-3:]
@@ -144,7 +183,42 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "declared_banks": len(config.rows), "columns": tuple(columns(config, cores)),
             "owner_tiles": counts, "owner_runs": runs,
             "logical_flops": 2 * sum(config.rows) * config.n * config.k,
+            # Source-facing matrix issue distinction: MMAD/FixPipe parameter m
+            # is the valid row count, L0A is a full 16-row fractal transfer.
+            "mmad_parameter_m": tuple(sorted({m for owner in range(cores)
+                                               for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+            "fixpipe_m": tuple(sorted({m for owner in range(cores)
+                                        for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+            "l0a_issue_fractal_m": tuple(sorted({align(m, 16) for owner in range(cores)
+                                                  for m, _n, _r in tile_runs(config, owner, cores, compact)})),
+            "matrix_issue_basis": "normal arch3510 FP8 Mmad 16x16x32; physical "
+                                  "Cube M=16*ceil(m_arg/16); source API/FIX m=valid; "
+                                  "matrix ledger only, never elapsed x16",
+            "matrix_microtile_occupancy": "arch3510 normal FP8 physical Cube M16 "
+                                          "for source M1; L0A fractal M16; exact "
+                                          "instruction scheduling not claimed",
             "issued_cube_flops": total.matrix.get("fp8_e4m3", 0),
+            "b8_typed": (lambda b8: {
+                "raw_active_lanes": sum(
+                    count.active_lanes for op, count in inventory.counts.items()
+                    if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}),
+                "per_opcode": b8,
+                "native_i8_per_cycle_per_vf": 256,
+                "vf_owners": 64,
+                "nominal_clock_hz": 1.65e9,
+                "prologue": {"CreateMask": 2, "DuplicateB8": 3,
+                             "width_elements": 256, "once_per_invocation": True},
+                "single_port_charge": False,
+                "source": "basic_block_vf_mx.h:386-403; 1 DIST_US_B8 read128B, "
+                          "2 ShiftRight.I8, 1 ShiftLeft.I8, 1 Select, 1 And, 1 Store256B",
+                "priced_on": "reg_issue_slots_and_ub_ports; no aggregate "
+                             "five-op single-port charge",
+            })({
+                op: {"raw_lanes": count.active_lanes,
+                     "bound_us": (count.active_lanes
+                                  / (256 * 64 * 1.65e9) * 1e6)}
+                for op, count in inventory.counts.items()
+                if op in {"ShiftRightB8", "ShiftLeftB8", "SelectB8", "AndB8"}}),
             "mte1_mode": mte1_mode,
             "register_inventory": inventory.to_dict(),
             "register_capacity_work": inventory.capacity_work(CLASSES).resources,
@@ -158,7 +232,22 @@ def build(op, geometry, *, compact=True, compact_panels=True, mte1_mode="base", 
             "producer_mode": producer_mode,
             "compression": "consecutive_equal_owner_tiles_scaled_work_fluid" if compact else "detailed_tiles",
             "k_panel_execution": "finite_nominal_cycle_coupled_interior" if compact_panels else "detailed_panels",
-            "unmodeled": ["scalar_group_list_and_flag_instruction_latency", "hardware_cache_hits",
+            "source_control": {
+                "get_split_value_and_branch_calls": len(config.rows) * cores,
+                "positive_bank_owner_tiles": sum(m > 0 for m in config.rows) * cores,
+                "zero_bank_owner_immediate_update_gm_addr": (
+                    (len(config.rows) - sum(m > 0 for m in config.rows)) * cores),
+                "priced": False,
+                "price": "unpriced_no_event_rate",
+                "resplit_controller_sha256_prefix": "44798310",
+                "basis": "grouped_matmul_weight_quant_resplit_controller.h L152-184: "
+                         "each owner once per bank GetSplitValue+branch; M==0 immediately "
+                         "UpdateGmAddr with no N tiles; positive bank SplitN and "
+                         "curBasicBlockId += coreNum; owner takes its own tile L217-219",
+            },
+            "unmodeled": ["scalar_group_list_and_flag_instruction_latency",
+                          "unpriced_resplit_controller_get_split_value_and_branch",
+                          "hardware_cache_hits",
                           "cross_output_tile_overlap", *(
                               ["AIV_producer_phase_overlap_between_panels"]
                               if producer_mode == "serial" else [])],

@@ -50,7 +50,10 @@ def test_engine_keeps_owner_specific_prefix_then_payload_and_exact_total_work(to
     assert elapsed > 0
     counts = next(p for p in contract.phases if p.name == 'count_compute')
     c = len(counts.owner_domain)
-    assert dict(counts.work)['vector'] == 16 * (5 * tokens * topk - 1) + c * 9 * 16
+    # Count computation owns only the zero-filled expert-count vector.  The
+    # per-assignment quantize scan remains in send_read_quantize above; it is
+    # not charged a second time here.
+    assert dict(counts.work)['vector'] == c * 9 * ((16 + 7) // 8 * 8)
     assert engine.serviced['hbm'] == pytest.approx(tokens * topk * 480)
 
 

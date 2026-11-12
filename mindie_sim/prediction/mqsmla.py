@@ -14,6 +14,7 @@ from functools import lru_cache
 from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, ParallelProgram, PipelineProgram, Stage
+from .instructions import PrimitiveInventory
 
 SOURCE = {
     "repository": "cannbot-dsl",
@@ -61,8 +62,44 @@ def owner_ranges(rows, cores):
     return tuple(result)
 
 
+def addr_tab_w(k):
+    """Source pads address-table columns to 16."""
+    return ((int(k) + 15) // 16) * 16
+
+
+def _addr_pool_eligible(pool):
+    page = pool.get("page_size")
+    row = pool.get("cache_row_bytes")
+    bt = pool.get("bt_width")
+    idx = pool.get("idx_width")
+    ub = pool.get("addr_ub_bytes")
+    if not all(isinstance(v, int) and v > 0 for v in (page, row, bt, idx, ub)):
+        return False
+    if page < 16 or page & (page - 1):
+        return False
+    if pool.get("cache_stride_bytes") != page * row:
+        return False
+    return 4 * (addr_tab_w(bt) + 2 * addr_tab_w(idx)) <= ub
+
+
+def addr_vec_eligible(shape):
+    """Source eligibility must hold for both ORI and CMP pools.
+
+    No global single-pool shortcut: ORI and CMP run sequentially through the
+    same arena and both are tested before vector addressing is selected.
+    """
+    pools = shape.get("address_pools") or {}
+    original = pools.get("original")
+    compressed = pools.get("compressed")
+    if not original or not compressed:
+        return False
+    if not (_addr_pool_eligible(original) and _addr_pool_eligible(compressed)):
+        return False
+    return bool(compressed.get("present", True))
+
+
 @lru_cache(maxsize=512)
-def tile_phases(branch, valid, first, last):
+def tile_phases(branch, valid, first, last, addressing="scalar"):
     """Source phase payloads, not measured durations or utilization factors."""
     if not valid:
         return (
@@ -74,15 +111,28 @@ def tile_phases(branch, valid, first, last):
     row_bytes = 544 if branch == "original" else 320
     # Four 16-row subtiles per AIV; duplicate tail indices still issue copies.
     gather = physical * row_bytes
-    index = physical * 8  # INT32 sparse index and INT32 page-table entry.
+    index = physical * 4  # one INT32 key; page-table lookup is a second phase.
     padded_pv = (valid + 15) // 16 * 16
     q = 64 * 512 * 2 if first else 0
     output = 64 * 512 * 2 if last else 0
-    return (
+    phases = [
         ("query", Work(resources={"hbm": q, "mte2_aic": q})),
         ("sinks", Work(resources={"hbm": 256 if first else 0,
                                   "mte2_aiv": 256 if first else 0})),
-        ("gather", Work(resources={"hbm": gather + index, "mte2_aiv": gather})),
+    ]
+    subtile = 16
+    for part in range(physical // subtile):
+        sub_bytes = subtile * 4
+        row_bytes_part = subtile * row_bytes
+        phases.extend((
+            (f"addr_index_{part}", Work(resources={"hbm": sub_bytes})),
+            (f"addr_page_{part}", Work(resources={"hbm": sub_bytes})),
+            (f"gather_{part}", Work(resources={"hbm": row_bytes_part,
+                                               "mte2_aiv": row_bytes_part})),
+        ))
+    gather_names = tuple(f"gather_{part}" for part in range(physical // subtile))
+    phases.append(("addr_join", Work()))
+    phases.extend((
         ("dequant", Work(resources={"vector": physical * 512 * (6 if branch == "original" else 4)})),
         ("kv_l1", Work(resources={"mte3": physical * 512 * 2})),
         ("qk_operands", Work(resources={"mte1": (64 + physical) * 512 * 2})),
@@ -95,7 +145,8 @@ def tile_phases(branch, valid, first, last):
         ("values", Work(resources={"fixpipe": 64 * 512 * 4})),
         ("accumulate", Work(resources={"vector": 64 * 512 * ((1 if first else 3) + (2 if last else 0))})),
         ("output", Work(resources={"hbm": output, "mte3": output})),
-    )
+    ))
+    return tuple(phases)
 
 
 @dataclass(frozen=True)
@@ -129,9 +180,18 @@ class OwnerTiles:
 
 def build(op, geometry):
     shape = dict(op.metadata)["mqsmla_geometry"]
-    if (shape["heads"] != 64 or shape["width"] != 512
-            or shape["metadata_support_fd"] or shape["addressing"] != "scalar"):
+    requested = str(shape.get("addressing", "scalar"))
+    if shape["heads"] != 64 or shape["width"] != 512 or shape["metadata_support_fd"]:
         raise ModelingError("mqsmla_source_geometry_or_branch_unsupported")
+    if requested == "scalar":
+        addressing = "scalar"
+    elif requested in {"auto", "vector"}:
+        # The source vector prepass is an AIV-pair/AIC-relay publication once
+        # per invocation; it is not a per-tile table read and is not recovered
+        # here. Do not invent that work; retain the declared generic path.
+        addressing = "generic_analytical"
+    else:
+        raise ModelingError("mqsmla_addressing_mode_unsupported")
     rows = tuple(query_rows(shape))
     cores = geometry.compute_units
     if not rows or not 1 <= cores <= 36:
@@ -157,7 +217,7 @@ def build(op, geometry):
     total = Work()
     for _, stream in streams:
         for index in range(stream.count):
-            for _, work in tile_phases(*stream.key(index)):
+            for _, work in tile_phases(*stream.key(index), addressing=addressing):
                 total += work
 
     def program(context):
@@ -166,9 +226,17 @@ def build(op, geometry):
                 key = stream.key(index)
                 result = []
                 previous = None
-                for name, work in tile_phases(*key):
-                    if name in {"query", "sinks", "gather"}:
+                for name, work in tile_phases(*key, addressing=addressing):
+                    if name in {"query", "sinks"}:
                         after = ()
+                    elif name.startswith("addr_index_"):
+                        after = ("query", "sinks")
+                    elif name.startswith("addr_page_"):
+                        after = ("addr_index_" + name.rsplit("_", 1)[-1],)
+                    elif name.startswith("gather_"):
+                        after = ("addr_page_" + name.rsplit("_", 1)[-1],)
+                    elif name == "addr_join":
+                        after = tuple(f"gather_{part}" for part in range(8))
                     elif name == "qk_operands":
                         after = ("kv_l1", "query")
                     elif name == "softmax":
@@ -181,6 +249,7 @@ def build(op, geometry):
                     prior = {
                         "query": ("output",) if key[2] else (),
                         "sinks": ("output",) if key[2] else (),
+                        "addr_join": ("output",) if key[2] else (),
                         "qk_operands": ("qk",), "qk": ("scores",),
                         "pv_operands": ("pv",), "pv": ("values",),
                         "accumulate": ("output",) if key[2] else ("accumulate",),
@@ -211,8 +280,19 @@ def build(op, geometry):
         "mqsmla_owner_ranges": ownership, "mqsmla_buffers_per_owner": BUFFERS,
         "mqsmla_schedule": "whole_query_rows;metadata_SUPPORT_FD_false;two_live_phase_tiles",
         "mqsmla_approximation": "coarse_source_phase_DAG;register_operations_not_instruction_latency",
-        "unmodeled_source_features": ["aicpu_metadata_program", "scalar_page_lookup_response",
-                                      "vector_address_prepass", "flash_decode_partial_reduction",
+        "mqsmla_addressing": addressing,
+        "address_schedule": {
+            "subtiles_per_tile": 8, "rows_per_subtile": 16,
+            "scalar_reads_bytes": 2 * 512,
+            "primitives": PrimitiveInventory({
+                "scalar_gm_access": 2 * 128,
+                "scalar_alu_issue": 4 * 128,
+            }).to_dict(("hbm", "mte2_aiv", "vector", "mte3")),
+        },
+        "unmodeled_source_features": ["aicpu_metadata_program",
+                                      "scalar_page_lookup_response",
+                                      "vector_address_prepass",
+                                      "flash_decode_partial_reduction",
                                       "third_KV_slot_prefetch_overlap",
                                       "cross_query_sinks_prefetch_overlap",
                                       "source_compiler_instruction_scheduling"],

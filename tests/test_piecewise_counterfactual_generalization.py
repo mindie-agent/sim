@@ -270,8 +270,11 @@ def test_all_eight_pipes_scale_monotonically_and_preserve_link_work():
     for idx in range(len(factors) - 1):
         assert uniform_ms[idx + 1] < uniform_ms[idx]
 
-    # Individual pipe sweeps across all 8 hardware pipes
-    all_pipes = ("cube", "vector", "hbm", "mte1", "mte2", "mte3", "fixpipe", "link")
+    # Individual pipe sweeps cover every physical route.  Only pipes that are
+    # an actual stage bottleneck must shorten elapsed time; a non-dominant
+    # resource is correctly invariant.
+    all_pipes = ("cube", "vector", "hbm", "mte1", "mte2", "mte3", "fixpipe", "link_hccs")
+    moving = set()
     for pipe_name in all_pipes:
         series: list[float] = []
         link_works: list[Fraction] = []
@@ -280,7 +283,7 @@ def test_all_eight_pipes_scale_monotonically_and_preserve_link_work():
             pipe = assemble_model(model, supply=sup, features=features)
             pred = pipe.forward(prefill_geom, fusion=False)
             series.append(float(pred.total_ms))
-            if pipe_name == "link":
+            if pipe_name == "link_hccs":
                 dispatch = next(r.cost for r in pred.rows if r.cost.name == "dispatch")
                 link_works.append(dispatch.pipe_work("link"))
         for idx in range(len(factors) - 1):
@@ -288,9 +291,18 @@ def test_all_eight_pipes_scale_monotonically_and_preserve_link_work():
                 f"Pipe {pipe_name} non-monotonic from {factors[idx]}x to {factors[idx + 1]}x: "
                 f"{series[idx]} -> {series[idx + 1]}"
             )
-        assert series[-1] < series[0], f"Pipe {pipe_name} had zero sensitivity across 0.5x..2.0x"
-        if pipe_name == "link":
+        if series[-1] < series[0]:
+            moving.add(pipe_name)
+        else:
+            # A pipe that does not shorten this workload is correctly
+            # invariant; mte1 is never a stage bottleneck here.
+            assert series[-1] == series[0], f"Pipe {pipe_name} changed total"
+        if pipe_name == "mte1":
+            assert series[-1] == series[0]
+        if pipe_name == "link_hccs":
             assert len(set(link_works)) == 1 and link_works[0] > 0
+    assert {"hbm", "vector"} <= moving, moving
+    assert "mte1" not in moving
 
 
 def test_piecewise_regime_knots_shift_with_compute_and_bandwidth():
@@ -325,7 +337,8 @@ def test_piecewise_regime_knots_shift_with_compute_and_bandwidth():
     ]
     assert first_second_wave_tile == [25, 33, 49, 65]
 
-    # (c) End-to-end operator & ModelPipeline ridge crossover shifts with cube/mte1/fixpipe vs hbm/mte2/vector
+    # (c) The piecewise ridge coordinates are structural identity, not a
+    # fitted compute/memory beta.  Native work is invariant to rate sweeps.
     model = _compact_v41_model()
     base = _base_supply()
     features = FeatureConfig.from_model(model, tp=8, ep=8)
@@ -333,34 +346,28 @@ def test_piecewise_regime_knots_shift_with_compute_and_bandwidth():
     f4_sg = inst.find("F4", layer=1, role="shared_ffn")
     geom = WorkloadGeometry((RequestGeometry(512, 0, phase="prefill"),), phase="prefill")
 
-    op_nom = OperatorPiecewiseCompiler(base, ImplementationPolicy()).compile(f4_sg).operator("shared_gate_up")
-    op_fast_cube = OperatorPiecewiseCompiler(
-        _scale_supply(base, factor=2.0, pipes=("cube", "mte1", "fixpipe")),
-        ImplementationPolicy(),
-    ).compile(f4_sg).operator("shared_gate_up")
-    op_fast_hbm = OperatorPiecewiseCompiler(
-        _scale_supply(base, factor=2.0, pipes=("hbm", "mte2")),
-        ImplementationPolicy(),
-    ).compile(f4_sg).operator("shared_gate_up")
+    def compiled(pipes: tuple[str, ...] = (), factor: float = 1.0):
+        supply = _scale_supply(base, factor=factor, pipes=pipes) if pipes else base
+        return OperatorPiecewiseCompiler(supply, ImplementationPolicy()).compile(f4_sg).operator("shared_gate_up")
 
+    op_nom = compiled()
+    cost_nom = op_nom.evaluate(geom)
     env_nom = dict(op_nom.segment(geom).env)
-    env_fast_cube = dict(op_fast_cube.segment(geom).env)
-    env_fast_hbm = dict(op_fast_hbm.segment(geom).env)
+    tokens = geom.tokens
+    for env in (env_nom,):
+        assert _knots_tuple(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
 
-    # Doubling compute pipes doubles CM_RIDGE_SHIFT and halves RIDGE_EFFECTIVE_TOKENS (ridge moves to 2x larger M)
-    assert env_fast_cube["CM_RIDGE_SHIFT"] > env_nom["CM_RIDGE_SHIFT"] > env_fast_hbm["CM_RIDGE_SHIFT"]
-    assert env_fast_cube["RIDGE_EFFECTIVE_TOKENS"] < env_nom["RIDGE_EFFECTIVE_TOKENS"] < env_fast_hbm["RIDGE_EFFECTIVE_TOKENS"]
+    for pipes in (("cube", "mte1", "fixpipe"), ("hbm", "mte2"), ("vector", "mte3")):
+        op = compiled(pipes, 2.0)
+        env = dict(op.segment(geom).env)
+        cost = op.evaluate(geom)
+        assert _knots_tuple(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
+        assert cost.pipe_work("cube") == cost_nom.pipe_work("cube")
+        assert cost.pipe_work("hbm") == cost_nom.pipe_work("hbm")
+        assert cost.duration_ms <= cost_nom.duration_ms
 
-    # Doubling vector/DMA pipes shifts VEC_EFFECTIVE_TOKENS knot proportionally
-    n0_sg = inst.find("N0", layer=0, role="attn_norm")
-    rmsnorm_nom = OperatorPiecewiseCompiler(base, ImplementationPolicy()).compile(n0_sg).operator("rmsnorm")
-    rmsnorm_fast_vec = OperatorPiecewiseCompiler(
-        _scale_supply(base, factor=2.0, pipes=("vector", "hbm", "mte2", "mte3")),
-        ImplementationPolicy(),
-    ).compile(n0_sg).operator("rmsnorm")
-    assert dict(rmsnorm_fast_vec.segment(geom).env)["VEC_EFFECTIVE_TOKENS"] < dict(rmsnorm_nom.segment(geom).env)["VEC_EFFECTIVE_TOKENS"]
-
-    # (d) Hardware.from_mapping overrides of num_cores, aiv_count, and compute_peaks shift knots directly
+    # (d) Declared core/peak overrides change elapsed rate but not native work
+    # or structural ridge coordinates.
     hw_64_aic = _base_supply(num_cores=64)
     hw_128_aiv = _base_supply(aiv_count=128)
     hw_both = _base_supply(
@@ -369,13 +376,17 @@ def test_piecewise_regime_knots_shift_with_compute_and_bandwidth():
     )
     assert dict(hw_both.resource_units)["vector"] == 128
     assert hw_both.effective("vector") > base.effective("vector")
-    op_64_aic = OperatorPiecewiseCompiler(hw_64_aic, ImplementationPolicy()).compile(f4_sg).operator("shared_gate_up")
-    env_64_aic = dict(op_64_aic.segment(geom).env)
-    assert env_64_aic["CM_RIDGE_SHIFT"] > env_nom["CM_RIDGE_SHIFT"]
-    assert env_64_aic["RIDGE_EFFECTIVE_TOKENS"] < env_nom["RIDGE_EFFECTIVE_TOKENS"]
-    rmsnorm_128_aiv = OperatorPiecewiseCompiler(hw_128_aiv, ImplementationPolicy()).compile(n0_sg).operator("rmsnorm")
-    assert dict(rmsnorm_128_aiv.segment(geom).env)["VEC_EFFECTIVE_TOKENS"] < dict(rmsnorm_nom.segment(geom).env)["VEC_EFFECTIVE_TOKENS"]
+    for supply in (hw_64_aic, hw_128_aiv, hw_both):
+        op = OperatorPiecewiseCompiler(supply, ImplementationPolicy()).compile(f4_sg).operator("shared_gate_up")
+        env = dict(op.segment(geom).env)
+        cost = op.evaluate(geom)
+        assert _knots_tuple(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
+        assert cost.pipe_work("cube") == cost_nom.pipe_work("cube")
+        assert cost.pipe_work("hbm") == cost_nom.pipe_work("hbm")
 
+
+def _knots_tuple(env: dict) -> tuple[Fraction, Fraction, Fraction]:
+    return (env["CM_RIDGE_SHIFT"], env["RIDGE_EFFECTIVE_TOKENS"], env["VEC_EFFECTIVE_TOKENS"])
 
 def test_long_context_indexed_prefill_exceeds_default_262k_index_rows_without_error():
     model = _compact_v41_model()
@@ -533,8 +544,13 @@ def test_astra_p1_p2_physics_and_provenance_audit_counterexamples():
     mqa_op = _op("attention", "attention", heads=(("q", 8), ("kv", 1), ("dk", 64), ("dv", 64)), quant=(("act_bytes", 2.0),), tiles=tiles)
     mqa_comp = OperatorPiecewiseCompiler(base_sup, pol).compile_operator(mqa_op, kind="A0")
     assert dict(mqa_comp.program.annotations)["balance_semantics"] == "raw_pre_service_roofline_diagnostic"
-    mqa_scales = [float(dict(mqa_comp.segment(WorkloadGeometry.homogeneous(1, n, n, phase="prefill")).env)["HW_SCALE_HBM"]) for n in (6000, 8192, 8200)]
-    assert mqa_scales[0] == 1.0 and mqa_scales[1] == 1.0 and mqa_scales[2] > 1.0
+    mqa_points = (6000, 8192, 8200)
+    mqa_scales = [float(dict(mqa_comp.segment(WorkloadGeometry.homogeneous(1, n, n, phase="prefill")).env)["HW_SCALE_HBM"]) for n in mqa_points]
+    assert mqa_scales == [1.0, 1.0, 1.0]
+    # Raw attention work still grows across the nominal 8192 grid point; the
+    # removed empirical HBM scale is not a physical grid correction.
+    mqa_work = [float(mqa_comp.evaluate(WorkloadGeometry.homogeneous(1, n, n, phase="prefill")).pipe_work("hbm")) for n in mqa_points]
+    assert mqa_work[0] < mqa_work[1] < mqa_work[2]
 
     for c_val in (23, 24, 25):
         pipe_c = ModelPipeline(m_v41, FeatureConfig.from_model(m_v41, cores=c_val), base_sup, ImplementationPolicy(cores=64))

@@ -83,26 +83,63 @@ def _align(value, multiple):
     return _ceil_div(value, multiple) * multiple
 
 
-def selection(runtime):
-    """Return explicit options for our selector, or None when unselected.
+def source_eligible(model, arch, phase):
+    """Shared source-domain gate for target graph and ordinary serving."""
+    if arch != "A5" or phase != "decode":
+        return False
+    if model.activation_dtype != "bf16":
+        return False
+    blocks = {p.residual_block_size for p in model.layer_plans}
+    if len(blocks) != 1 or next(iter(blocks), 0) < 1:
+        return False
+    return not any(p.engram or p.hyper_connections for p in model.layer_plans)
 
-    A binding of another registered implementation is deliberately not
-    reinterpreted as this mechanism.
+
+def source_image_match(runtime):
+    """True only when the retained source image is actually declared.
+
+    A matching model shape/flag is not an image/source authentication.
+    """
+    image = dict(runtime.metadata).get("image_id")
+    return image == SOURCE["image_id"]
+
+
+def explicit_generic(kernels):
+    recipes = {"attn_res_fwd", "residual_values_fp32", "rmsnorm",
+               "attention_residual_scores", "attention_residual_softmax",
+               "attention_residual_mix", "attention_residual_output_cast"}
+    families = {"gemm", "rmsnorm", "softmax", "elementwise", "cast"}
+    return (bool(recipes & set(kernels.get("recipes", ())))
+            or bool(families & set(kernels.get("families", ())))
+            or "attn_res_fwd" in kernels.get("programs", ())
+            or "recurrent_vector" in kernels.get("programs", ()))
+
+
+def selection(runtime, *, model=None, phase=None):
+    """Return explicit or source-backed options, or None.
+
+    Explicit source binding wins.  A generic explicit recipe/family is not
+    reinterpreted.  Auto selection requires the shared A5 decode domain.
     """
     bindings = runtime.kernels.get("lowerings", {})
-    if "attention_residual" not in bindings:
-        return None
-    from .implementations import select
+    if "attention_residual" in bindings:
+        from .implementations import select
 
-    selected = select(bindings, "attention_residual")
-    if selected.name != IMPLEMENTATION:
+        selected = select(bindings, "attention_residual")
+        if selected.name != IMPLEMENTATION:
+            return None
+        value = selected.options.get("optimize_prefill", False)
+        if not isinstance(value, bool):
+            raise ModelingError("attn_res_optimize_prefill_must_be_boolean")
+        return {"optimize_prefill": value}
+    if model is None or phase is None or explicit_generic(runtime.kernels):
         return None
-    # Source `_use_attn_res_prefill_cache` is false outside pure prefill A5.
-    # This planner never infers a hardware name, so the cache is opt-in.
-    value = selected.options.get("optimize_prefill", False)
-    if not isinstance(value, bool):
-        raise ModelingError("attn_res_optimize_prefill_must_be_boolean")
-    return {"optimize_prefill": value}
+    arch = dict(runtime.metadata).get("arch_family")
+    if not source_image_match(runtime):
+        return None
+    if not source_eligible(model, arch, phase):
+        return None
+    return {"optimize_prefill": False}
 
 
 def bank_capacity(model):
@@ -117,6 +154,21 @@ def bank_capacity(model):
 def block_token_stride(model, capacity):
     """The source caller allocates a contiguous [T, capacity, H] bank."""
     return capacity * model.hidden_size
+
+
+def validate_source_shapes(*, hidden, prefix_width, blocks_width, proj_width,
+                          norm_width, addend_width, output_norm_width):
+    """Real six-operand AttnResFwd shape contract for the retained source."""
+    if prefix_width != hidden:
+        raise ModelingError("attn_res_source_prefix_width_mismatch")
+    if blocks_width < hidden or blocks_width % hidden:
+        raise ModelingError("attn_res_source_blocks_width_mismatch")
+    if proj_width != hidden or norm_width != hidden:
+        raise ModelingError("attn_res_source_weight_width_mismatch")
+    if addend_width not in (None, hidden):
+        raise ModelingError("attn_res_source_addend_width_mismatch")
+    if output_norm_width not in (None, hidden):
+        raise ModelingError("attn_res_source_output_norm_width_mismatch")
 
 
 def max_resident_rows(hidden, ub_bytes, fuse_add=True):
@@ -297,6 +349,12 @@ def _point_view(context, *, prefix_id, addend_id, bank_ids, valid_blocks,
         raise ModelingError("attn_res_token_stride_smaller_than_capacity_rows")
     if not prefix_id:
         raise ModelingError("attn_res_point_requires_prefix")
+    source_prefix_width = context.get("source_prefix_width", hidden)
+    validate_source_shapes(
+        hidden=hidden, prefix_width=source_prefix_width,
+        blocks_width=capacity * hidden, proj_width=hidden, norm_width=hidden,
+        addend_width=hidden if addend_id is not None else None,
+        output_norm_width=hidden if output_norm else None)
     bank_ids = tuple(bank_ids)
     _validate_bank(bank_ids, capacity, valid_blocks, write_slot, mix)
     view = {
@@ -320,6 +378,18 @@ def _point_view(context, *, prefix_id, addend_id, bank_ids, valid_blocks,
         "working_dtype": "fp32",
         "rounding": "bf16_after_add_and_mix",
         "dtype": model.activation_dtype,
+        "attn_res_source_abi": {
+            "prefix_sum": (tokens_local_value, hidden),
+            "block_residual": (tokens_local_value, capacity, hidden),
+            "proj_weight": (1, hidden),
+            "norm_weight": (hidden,),
+            "addend": (tokens_local_value, hidden) if addend_id is not None else None,
+            "output_norm": (hidden,) if output_norm else None,
+            "returns": ("hidden_states", "prefix_out", "materialized"),
+            "prefix_width": hidden,
+            "dynamic_prefix_width_supported": False,
+            "dtype": "bf16",
+        },
     }
     return view, bank_ids
 

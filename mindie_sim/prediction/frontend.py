@@ -39,7 +39,8 @@ def _scope(ops, block, role="body"):
 
 class Frontend:
     def __init__(self, *, attention=None, ffn=None, residuals=None, graph=None,
-                 attention_policy=None, routing=None):
+                 attention_policy=None, routing=None, features=None):
+        self.features = features
         self.attention = {**ATTENTION_BUILDERS, **(attention or {})}
         self.ffn = {**FFN_BUILDERS, **(ffn or {})}
         self.residuals = {**RESIDUAL_BUILDERS, **(residuals or {})}
@@ -48,8 +49,12 @@ class Frontend:
         self.routing = routing or RoutingPolicy()
 
     def body(self, model, runtime, views, *, prefix="", ready="", tokens=None,
-             mode="prefill", global_tokens=None, stages=None, replica=0):
+             mode="prefill", global_tokens=None, stages=None, replica=0,
+             features=None, source_rows_by_replica=None,
+             routing_global_tokens=None, routing_views=None,
+             physical_rank=None, query_position=None):
         p = runtime.parallel
+        features = self.features if features is None else features
         requests = tuple(view.request_id for view in views)
         tokens = sum(view.q_len for view in views) if tokens is None else tokens
         stages = stages or stage_map(model, runtime)
@@ -69,7 +74,9 @@ class Frontend:
                 previous = shard.op_id
         caches, indices, topks, candidates = {}, {}, {}, {}
         residual_sources = []
-        attnres = family_attnres.selection(runtime) if (tokens and mode not in {"draft", "draft_prefill"}) else None
+        attnres = (family_attnres.selection(
+            runtime, model=model, phase=mode)
+            if (tokens and mode not in {"draft", "draft_prefill"}) else None)
         attn_state = None
         if attnres is not None:
             if len(set(stages)) != 1 and runtime.parallel.pp == 1:
@@ -82,7 +89,10 @@ class Frontend:
             stage = stages[index]
             name = f"{prefix}s{stage}.l{index}"
             common = dict(prefix=name, plan=layer, stage=stage, requests=requests,
-                          tokens=tokens, model=model, mode=mode, residual_sources=tuple(residual_sources))
+                          tokens=tokens, model=model, mode=mode,
+                          residual_sources=tuple(residual_sources),
+                          features=features,
+                          source_rows_by_replica=source_rows_by_replica)
             residual = self.residuals["hyper" if layer.hyper_connections else
                                       "attention" if layer.residual_block_size else "plain"]
             if tokens:
@@ -173,11 +183,23 @@ class Frontend:
             else:
                 hidden = previous
             if tokens or layer.ffn == "moe":
+                routing_tokens = (routing_global_tokens
+                                  if routing_global_tokens is not None
+                                  else global_tokens)
+                # explicit token ledgers match genuine serving request views or
+                # an optional target-graph correlation passed by the caller.
+                realization_views = routing_views if routing_views is not None else views
                 realization = (select_realization(
                     runtime, layer, phase=mode, tokens=tokens,
-                    valid_tokens=sp.valid_per_tp[0] if sp else sum(view.q_len for view in views),
-                    global_tokens=global_tokens, token_shards=p.tp if sp else 1,
-                    valid_source_tokens=sp.valid_global if sp else None, replica=replica)
+                    valid_tokens=(sp.valid_per_tp[0] if sp else
+                                  sum(view.logical_q_len for view in views)),
+                    global_tokens=routing_tokens,
+                    token_shards=(1 if routing_global_tokens is not None
+                                  else (p.tp if sp else 1)),
+                    valid_source_tokens=sp.valid_global if sp else None, replica=replica,
+                    views=realization_views,
+                    physical_rank=physical_rank,
+                    query_position=query_position)
                     if layer.ffn == "moe" else None)
                 ffn_tokens = tokens
                 if sp and layer.ffn == "dense":
@@ -390,17 +412,32 @@ class Frontend:
         return max(local_tokens, dec_g + pf_local_sum + (pad_extra * pcp_in_ep + p.pcp - 1) // p.pcp)
 
     def __call__(self, plan, model, runtime, machine, *, global_tokens=None, global_views=None,
-                 resource_fusion=True, replica=0):
+                 resource_fusion=True, replica=0, source_rows_by_replica=None,
+                 routing_global_tokens=None, routing_views=None,
+                 physical_rank=None, query_position=None):
         model = normalize_model(model)
+        if physical_rank is None:
+            try:
+                from .topology import Topology
+                physical_rank = Topology(machine, runtime.parallel).ranks(
+                    replica, 0)[0]
+            except Exception:
+                physical_rank = None
+        # The ordinary selector consumes the same canonical feature record as
+        # the compiled subgraphs; it is derived from this case, never a trace.
+        from .subgraphs.instantiate import FeatureConfig
+        features = (self.features if self.features is not None else
+                    FeatureConfig.from_runtime(runtime, model, machine=machine))
         # An empty local query set can still receive expert rows. Its execution
         # phase belongs to the active cohort, not a fictitious "idle" kernel.
         mode = selected_mode(plan if plan.requests else replace(
             plan, requests=tuple(global_views or ())))
         views = tuple(replace(view, q_len=view.q_len + view.draft_proposal_tokens)
                       for view in plan.requests)
-        valid = sum(view.q_len for view in views)
+        valid = sum(view.logical_q_len for view in views)
+        physical = sum(view.q_len for view in views)
         bucket, scope = self.graph.select(views, runtime) if views else (None, "none")
-        padded = max(valid, bucket or 0)
+        padded = max(physical, bucket or 0)
         declared_runtime = runtime
         runtime, selections = resolve_implementations(
             runtime, views, padded_tokens=padded, replay_scope=scope,
@@ -449,7 +486,18 @@ class Frontend:
             if pcp_cohort else global_tokens
         )
         body, previous = self.body(model, runtime, local_views, ready=previous, tokens=local_tokens,
-                                   mode=mode, global_tokens=body_global_tokens, replica=replica)
+                                   mode=mode, global_tokens=body_global_tokens, replica=replica,
+                                   features=features,
+                                   source_rows_by_replica=source_rows_by_replica,
+                                   routing_global_tokens=routing_global_tokens,
+                                   routing_views=(routing_views
+                                                  if routing_views is not None
+                                                  else views),
+                                   physical_rank=physical_rank,
+                                   query_position=(query_position if query_position is not None
+                                                   else next((v.context for v in
+                                                              (routing_views or views)
+                                                              if not v.padding), None)))
         ops.extend(body)
         if pcp_prefill:
             if runtime.final_norm_scope == "all":

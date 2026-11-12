@@ -43,6 +43,53 @@ class PrimitiveInventory:
                 "unpriced_service_work": unknown,
                 "boundary": "declared_operation_counts_not_universal_isa_latency"}
 
+VECTOR_LANES_PER_INSTRUCTION = 64
+
+# A5 REG PIPE_V op weights relative to the shared 64-lane/AIV port:
+# Duplicate<int32> 64, Sub<int32> 32 (2 lanes/element), Abs<float> 64,
+# Mins<int32> 64, Reduce(SUM)<float> 64 elements/cycle.
+CAL_TOKEN_OP_WEIGHTS = (
+    ("vec_duplicate_ops", 1),
+    ("vec_sub_ops", 2),
+    ("fp32_abs_ops", 1),
+    ("vec_mins_ops", 1),
+    ("fp32_reduce_sum_ops", 1),
+)
+
+
+def cal_token_send_expert_work(cal_cnt: int) -> Work:
+    """Shared A5 PIPE_V/UB work for one CalTokenSendExpertCnt(cal_cnt) call.
+
+    The source has four dependent PIPE_V calls (Duplicate/Sub/Abs/Mins) and a
+    ReduceSum.  They use the one shared PIPE_V port, not independent opcodes:
+    Sub<int32> occupies two 64-lane slots per element; the others one.  The
+    source four emitted elementwise instructions consume shared pipe_v_issue;
+    the ReduceSum compiled lowering/short width is not asserted, so only its
+    element-lane work is retained.
+    """
+    if isinstance(cal_cnt, bool) or not isinstance(cal_cnt, int) or cal_cnt < 0:
+        raise ValueError("cal_token_count_requires_nonnegative_integer")
+    if cal_cnt == 0:
+        return Work()
+    instructions = (cal_cnt + VECTOR_LANES_PER_INSTRUCTION - 1) // VECTOR_LANES_PER_INSTRUCTION
+    lanes = sum(weight * cal_cnt for _role, weight in CAL_TOKEN_OP_WEIGHTS)
+    return Work(resources={
+        "pipe_v_lanes": lanes,
+        "pipe_v_issue": 4 * instructions,
+        "ub_read_bytes": 4 * cal_cnt,
+        "ub_write_bytes": 4,
+    })
+
+
+def get_sff_value_u64_i64_work(calls: int) -> Work:
+    """Exact A5 PIPE_S typed op work; shares pipe_s_issue with other PIPE_S ops."""
+    if isinstance(calls, bool) or not isinstance(calls, int) or calls < 0:
+        raise ValueError("get_sff_call_count_requires_nonnegative_integer")
+    if calls == 0:
+        return Work()
+    return Work(resources={"pipe_s_issue": calls})
+
+
 REGISTER_RESOURCES = (
     "reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_alu_lanes",
     "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes",

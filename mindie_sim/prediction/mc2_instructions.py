@@ -9,7 +9,7 @@
 """
 import math
 
-from .instructions import PrimitiveInventory
+from .instructions import PrimitiveInventory, cal_token_send_expert_work
 
 SOURCE_RANGES = {
     'dispatch': {
@@ -20,6 +20,17 @@ SOURCE_RANGES = {
     'combine': {'return_metadata': (855, 896), 'frame': (938, 951),
                 'successful_mask': (958, 993), 'weight': (1385, 1402)},
 }
+
+
+def _mask_count(raw):
+    """Source maskCnt: activeMaskBsCnt*axisK or expertIdsCnt."""
+    declared = raw.get("mask_count")
+    if declared is not None:
+        return max(1, int(declared))
+    active = raw.get("active_mask_bs_count")
+    if active is not None:
+        return max(1, int(active) * int(raw["top_k"]))
+    return max(1, int(raw["source_assignments"]))
 
 
 def phase_events(raw, phase, owner, weight, layout):
@@ -52,18 +63,34 @@ def phase_events(raw, phase, owner, weight, layout):
         elif phase_name == 'frame_payload':
             add('before', 'service', scalar_ub_access=3 * rows)
         elif phase_name == 'count_compute':
-            count = len(phase.owner_domain); index = phase.owner_domain.index(owner)
+            count = len(phase.owner_domain)
+            index = phase.owner_domain.index(owner)
             n = raw['experts'] // count + int(index < raw['experts'] % count)
             # CalExpertCnt skips its reduction when no source IDs exist.
             reduced = n if ids >= k else 0
+            mask = _mask_count(raw)
             add('after', 'service', scalar_ub_access=n + reduced,
                 pipe_barrier=1 + 4 * reduced)
+            if reduced:
+                typed = cal_token_send_expert_work(mask)
+                for role, amount in typed.resources.items():
+                    # The scalar/barrier counts above are the retained source
+                    # totals; consume the typed helper only for its physical
+                    # lane/UB/issue terms to avoid double charging.
+                    if role in {"scalar_ub_access", "scalar_alu_issue",
+                                "pipe_barrier"}:
+                        continue
+                    add('after', 'service', **{role: amount * reduced})
+                # Software ReduceSum is cal_cnt - 1 emitted VCADD calls.
+                add('after', 'service',
+                    reduce_sum_issue=max(0, mask - 1) * reduced)
         elif phase_name == 'receive_counts':
             add('before', 'read_status', scalar_ub_access=1)  # gather pattern SetValue
             add('after', 'check_status', scalar_ub_access=1)  # one successful GetValue
             add('after', 'sum_counts', scalar_ub_access=1)  # sumOfRecvCnt
         elif phase_name == 'prefix_counts':
-            count = len(phase.owner_domain); index = phase.owner_domain.index(owner)
+            count = len(phase.owner_domain)
+            index = phase.owner_domain.index(owner)
             n = raw['experts'] // count + int(index < raw['experts'] % count)
             add('before', 'read_sums', scalar_ub_access=1)  # gather pattern
             # GetCumSum success + output store, extra prefix result/pattern for
@@ -80,7 +107,11 @@ def phase_events(raw, phase, owner, weight, layout):
             words = math.ceil(raw['top_k'] * layout.blocks * 8 / 64)
             add('after', 'initialize_flags', pipe_barrier=tokens)
             add('after', 'compare_flags', scalar_ub_access=tokens*words,
-                scalar_alu_issue=tokens*words)  # one SFF per successful mask word
+                scalar_alu_issue=tokens*words,
+                ub_uint64_mask_reads=tokens*words,
+                scalar_sff_calls=tokens*words,
+                compare_sum_ops=tokens*words,
+                get_sff_value_u64_i64=tokens*words)  # one typed PIPE_S call per source op
         elif phase_name == 'weighted_reduce':
             for slot in range(raw['top_k']):
                 add('before', f'slot{slot}_read', scalar_ub_access=tokens)

@@ -9,7 +9,7 @@ import pytest
 from mindie_sim import operator_costs, target_graphs
 from mindie_sim.prediction.mxfp4_geometry import Config, columns, owner_tiles, tile_work
 from mindie_sim.prediction.mxfp4_grouped import UB_BYTES, recipe
-from mindie_sim.prediction.program import RecipeBook
+from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
 from mindie_sim.schema.common import ModelingError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -58,6 +58,17 @@ def test_ordinary_v41_frontend_selects_source_and_preserves_valid_rows(source_ca
         assert detail["active_banks"] == 6
         assert detail["logical_flops"] == op.flops
         assert detail["issued_cube_flops"] == op.flops * 16
+        assert detail["mmad_parameter_m"] == (1,)
+        assert detail["fixpipe_m"] == (1,)
+        assert detail["l0a_issue_fractal_m"] == (16,)
+        assert "physical Cube M=16*ceil(m_arg/16)" in detail["matrix_issue_basis"]
+        assert "never elapsed x16" in detail["matrix_issue_basis"]
+        b8 = detail["b8_typed"]
+        assert b8["raw_active_lanes"] > 0
+        assert b8["single_port_charge"] is False
+        assert b8["priced_on"].startswith("reg_issue_slots_and_ub_ports")
+        assert set(b8["per_opcode"]) == {"ShiftRightB8", "ShiftLeftB8",
+                                         "SelectB8", "AndB8"}
         assert row["operator"]["matrix_flops"] == {"fp8_e4m3": op.flops * 16}
         assert row["live_tasks"] == 0
     # The source recipe consumes only the matrix; caller activation and dynamic
@@ -94,13 +105,40 @@ def test_tail_work_is_conserved_on_real_resources(source_case, gate, rows, n, k)
     assert row["peak_buffers_per_unit"]["ub@r0:s0:unit0"] == UB_BYTES
 
 
+def test_caller_recipe_override_wins_over_source_family(source_case, gate):
+    explicit = ResourceEnvelope()
+    book = RecipeBook(families={"grouped_gemm": recipe()},
+                      recipes={"balanced_grouped_gate_up": explicit})
+    assert book.select(gate) is explicit
+    family_book = RecipeBook(families={"grouped_gemm": recipe()})
+    assert family_book.select(gate) is family_book.families["grouped_gemm"]
+
+
+def test_nonmatching_grouped_precision_is_rejected(source_case, gate):
+    meta = {**dict(gate.metadata), "matrix_group_rows": (1,),
+            "matrix_groups": 1, "matrix_weight_bank_groups": 1,
+            "activation_format": "fp8_e4m3", "weight_format": "fp8_e4m3",
+            "output_format": "bf16"}
+    shape = (1, 128, 64)
+    bad = replace(gate, local_shape=shape, semantic_shape=shape,
+                  launch_shape=shape, metadata=tuple(meta.items()))
+    with pytest.raises(ModelingError, match="mxa8w4_nznk_requires_fp8_mxfp4"):
+        price(source_case, bad)
+
+
 def test_small_cube_issue_does_not_invent_weight_banks(source_case, gate):
     one = price(source_case, physical_op(gate, (1, 0), 128, 64))
     sixteen = price(source_case, physical_op(gate, (16, 0), 128, 64))
     a = one["operator"]["metadata"]["program_execution"]["mxa8w4"]
     b = sixteen["operator"]["metadata"]["program_execution"]["mxa8w4"]
-    assert a["issued_cube_flops"] == b["issued_cube_flops"]
+    assert a["issued_cube_flops"] == a["logical_flops"] * 16
+    assert b["issued_cube_flops"] == b["logical_flops"]      # M=16 is already full
+    assert b["issued_cube_flops"] == a["issued_cube_flops"]  # same physical M16 tile
     assert a["logical_flops"] * 16 == b["logical_flops"]
+    assert a["mmad_parameter_m"] == (1,)
+    assert b["mmad_parameter_m"] == (16,)
+    assert a["l0a_issue_fractal_m"] == b["l0a_issue_fractal_m"] == (16,)
+    assert one["serviced"]["mte1@r0:s0"] == sixteen["serviced"]["mte1@r0:s0"]
     assert one["serviced"]["mte2_aiv@r0:s0"] == sixteen["serviced"]["mte2_aiv@r0:s0"]
     # One 64-deep weight panel is 4096B, scale read256B; fixed 128 scale
     # columns publish16384B plus8192B expanded weight, without extra HBM writes.
@@ -141,7 +179,8 @@ def test_l1_reuse_waits_for_cube_and_cube_waits_for_aiv_publish(gate):
     from mindie_sim.prediction.mxfp4_grouped import build
     from mindie_sim.prediction.program import RecipeContext
     op = physical_op(gate, (1,), 128, 2048)
-    register_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores", "reg_shuffle_lanes")
+    register_roles = ("reg_data_writes", "reg_ub_accesses", "reg_ub_stores",
+                      "reg_shuffle_lanes")
     roles = {role: 1e9 for role in ("hbm", "mte1", "mte2_aic", "mte2_aiv", "mte3", "vector", "fixpipe", *register_roles)}
     roles["cube"] = 1
     units = {role: 2 if role in ("vector", "mte2_aiv", "mte3", *register_roles) else 1 for role in roles}
@@ -189,8 +228,9 @@ def test_source_register_counts_do_not_charge_fp32_work_again(source_case, gate)
     row = price(source_case, physical_op(gate, (1,), 128, 64))
     info = row["operator"]["metadata"]["program_execution"]["mxa8w4"]
     counts = info["register_inventory"]["instructions"]
-    # 8192 widened B8 values in32 full registers, all on source sub-AIV0;
-    # sub-AIV1 still runs the two masks and three constants before a zero loop.
+    # 8192 widened B8 values in 32 full registers; the retained source block
+    # has DIST_US_B8, two ShiftRight, ShiftLeft, Select, And, Store (no
+    # synthetic Mask/Duplicate instructions).
     assert counts["ShiftRightB8"]["calls"] == 64
     assert counts["ShiftRightB8"]["active_lanes"] == 16384
     assert counts["StoreB8"]["calls"] == 32

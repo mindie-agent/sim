@@ -8,6 +8,7 @@
 [Side-Effect Policy] Returns records/programs; no hardware contexts or captures.
 """
 from collections import defaultdict
+from typing import Mapping
 from dataclasses import replace
 import heapq
 
@@ -20,6 +21,66 @@ from .program import KernelProgram, RecipeBook, ResourceEnvelope, Stage, Transfe
 
 
 RECIPE = "declared_native_fusion"
+
+_HC_ACLNN = {"hc_pre": ("aclnnHcPre", "1369"), "hc_post": ("aclnnHcPost", "1285")}
+
+
+def _hc_native_call(declaration, traffic, view):
+    """BIND1 producer declaration for one selected HC native fusion.
+
+    Source, dispatch and typed arguments are declared independently.  The
+    installed selected binary remains explicit: this is source/dispatch pairing,
+    not proof of the deployed image's chosen kernel.
+    """
+    role = declaration["role"]
+    entry, line = _HC_ACLNN[role]
+    dispatch = declaration.get("source") or {}
+    kernel = traffic.get("source") or {}
+    if not isinstance(kernel, dict) or not kernel.get("path"):
+        return None
+    shapes = {
+        key: [int(view[key])] for key in ("tokens", "hidden", "hc", "mixed")
+        if isinstance(view.get(key), int) and view[key] > 0
+    }
+    arch35_pre = role == "hc_pre" and str(kernel.get("sha256", "")).startswith(
+        "284443c5")
+    attrs = {
+        "dispatch": (f"torch_binding.cpp@1bf7a547:{line} "
+                     f"EXEC_NPU_CMD({entry})"),
+        "dispatch_path": "csrc/moe/torch_binding.cpp",
+        "dispatch_revision": "1bf7a547",
+        "source_execution_domain": kernel.get("source_domain") or "unknown",
+        "parameter_dtype": view.get("parameter_dtype") or "fp32",
+    }
+    return {
+        "api": {"namespace": "aclnn", "entry": entry, "aclnn_symbol": entry,
+                "version": "vllm-ascend@175ef4d4"},
+        "source": {
+            "repository": dispatch.get("repository") or "vllm-ascend",
+            "path": dispatch.get("path"),
+            "sha256": dispatch.get("sha256"),
+            "symbol": dispatch.get("symbol"),
+            "revision": (dispatch.get("base_revision")
+                         or dispatch.get("revision") or "175ef4d4"),
+            "state": dispatch.get("source_state") or "committed",
+        },
+        "typed": {"dtype": view.get("dtype") or "bf16", "layout": "ND",
+                  "shapes": shapes, "attrs": attrs},
+        "kernels": [{
+            "name": "HcPre" if role == "hc_pre" else "HcPost",
+            "role": "mix" if arch35_pre else "vector",
+            "source_path": kernel.get("path"),
+            "source_sha256": kernel.get("sha256"),
+            "evidence": "source_declared",
+        }],
+        "execution_core": "mix" if arch35_pre else None,
+        "unresolved": [
+            "installed_selected_binary_not_established",
+            "dispatch_source_sha256_unresolved",
+            "hc_optional_B4_tensor_abi_unresolved",
+            *(() if arch35_pre else ("execution_core_not_declared",)),
+        ],
+    }
 
 
 def recipes():
@@ -95,6 +156,7 @@ def _phase_op(record):
 
 
 def build(op, geometry):
+    from .mechanism import PlannedRecipe
     from .family_hc import selected_plan
     from .mla_prolog_arch22 import selected_plan as selected_mla_arch22
 
@@ -110,12 +172,26 @@ def build(op, geometry):
         return selected
     metadata = dict(op.metadata)
     book = RecipeBook.from_mapping(metadata["fusion_recipe_configuration"])
+    if any(dict(record.get("metadata", {})).get("mxfp4_gate_config")
+           for record in metadata["fusion_phases"]):
+        from .family_gate_up_situ_mxfp4 import RECIPE as GATE_RECIPE, build as build_gate
+        book.recipes[GATE_RECIPE] = PlannedRecipe(build_gate)
     prepared = []
     total = Work()
+    source_arrays = {}
     for record in metadata["fusion_phases"]:
         phase, recipe = book.prepare(_phase_op(record), geometry)
         work = _work(phase)
         total += work
+        plan_meta = getattr(recipe, "metadata", {}) or {}
+        if plan_meta.get("physical_cube_flops") is not None:
+            source_arrays.update({
+                key: value for key, value in plan_meta.items()
+                if key in {"logical_valid_flops", "source_api_flops",
+                           "physical_cube_flops", "physical_cube_flops_derived",
+                           "logical_fixpipe_bytes", "source_api_fixpipe_bytes",
+                           "physical_cube_m_by_bank"}
+            })
         prepared.append((phase, recipe, work))
 
     def program(context):
@@ -130,7 +206,8 @@ def build(op, geometry):
             stages.append(Stage(phase.op_id, after=phase.deps, program=recipe.lower(bound)))
         return KernelProgram(tuple(stages))
 
-    return OperatorPlan(total, program)
+    return OperatorPlan(total, program,
+                        {"physical_source_arrays": source_arrays} if source_arrays else {})
 
 
 def _groups(ops):
@@ -257,6 +334,7 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None):
     if program_profiles.keys() - roles:
         raise ModelingError("native_fusion_program_profiles_require_selected_roles")
     from .family_situ_mx import PROFILE as SITU_PROFILE
+    from .family_gate_up_situ_mxfp4 import PROFILE as GATE_PROFILE
     from .w4a8 import PROFILE as W4A8_PROFILE
     from .mxfp8_swiglu import PROFILE as MXFP8_PROFILE
     program_options = selection.options.get('program_options', {})
@@ -279,8 +357,41 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None):
     for declaration, members in _groups(original):
         if declaration["role"] not in roles:
             continue
-        if declaration.get("coverage", {}).get("kind", "complete_subgraph") != "complete_subgraph":
-            raise ModelingError(f"native_fusion_requires_complete_single_kernel:{declaration['key']}")
+        view = declaration.get("tensor_view", {})
+        gate_members = [op for op in members
+                        if dict(op.metadata).get("program_kind") == "matmul"]
+        gate_rows = tuple(dict(gate_members[0].metadata).get("matrix_group_rows", ())) if len(gate_members) == 1 else ()
+        if (declaration["role"] == "grouped_gate_up_situ_quant"
+                and str(view.get("weight_dtype", "")) == "mxfp4"
+                and members and str(members[0].phase) == "decode"
+                and gate_rows and max(gate_rows) < 34):
+            from . import mxfp4_supply
+            from . import family_gate_up_situ_mxfp4
+            from .mechanism import PlannedRecipe
+            config = mxfp4_supply.config_from_group(declaration, members)
+            gate = gate_members[0]
+            from .gmmsq_quant_typed import work as gmmsq_work
+            groups = (sum(config.group_rows) * 2 * config.output_width
+                      * config.k // 2) // 256
+            typed_work, _, _ = gmmsq_work(groups)
+            typed_resources = dict(typed_work.resources)
+            gate = replace(
+                gate, recipe=family_gate_up_situ_mxfp4.RECIPE,
+                flops=0, matrix_flops=(), vector_ops=0,
+                hbm_bytes=0, mte2_bytes=0, mte3_bytes=0,
+                metadata=gate.metadata + (
+                    ("mxfp4_gate_config", {
+                        "group_rows": config.group_rows,
+                        "output_width": config.output_width,
+                        "k": config.k,
+                        "allocated_rows": config.allocated_rows,
+                    }),
+                    ("resource_work", typed_resources),
+                ))
+            members = tuple(gate if op.op_id == gate.op_id else op
+                            for op in members)
+            book.recipes[family_gate_up_situ_mxfp4.RECIPE] = PlannedRecipe(
+                family_gate_up_situ_mxfp4.build)
         ids = {op.op_id for op in members}
         if ids & aliases.keys():
             raise ModelingError("native_fusion_selected_groups_overlap")
@@ -389,6 +500,11 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None):
             **{key: value for key, value in anchor.metadata
                if key in {"structure_block", "structure_role", "graph_captured", "graph_segment"}},
         }
+        if declaration["role"] in _HC_ACLNN:
+            hc_call = _hc_native_call(
+                declaration, traffic, declaration.get("tensor_view") or {})
+            if hc_call is not None:
+                metadata["native_call"] = hc_call
         from .mla_prolog_arch22 import PROFILE as MLA_ARCH22_PROFILE
         source_work = None
         if profile == MLA_ARCH22_PROFILE:
@@ -424,6 +540,20 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None):
     # required because received rows do not depend on local query ownership.
     local_roles = {"hc_pre", "hc_post", "situ_quant"}
     required_roles = roles - local_roles if local_tokens == 0 else roles
+    realized_rows = None
+    for op in original:
+        metadata = dict(op.metadata)
+        record = metadata.get("routing_realization", metadata.get("source_token_mask"))
+        if isinstance(record, Mapping) and "rows" in record:
+            value = record.get("rows")
+            if isinstance(value, int) and not isinstance(value, bool):
+                realized_rows = value if realized_rows is None else max(
+                    realized_rows, value)
+    if (realized_rows == 0
+            and not any(op.family == "grouped_gemm" for op in original)):
+        # A source-only representative has no local received F3 rows; it still
+        # executes transport/count/combine, but no grouped expert matrix.
+        required_roles = required_roles - {"grouped_gate_up_situ_quant"}
     if required_roles - matched_roles:
         raise ModelingError("native_fusion_selected_roles_unmatched:" +
                             ",".join(sorted(required_roles - matched_roles)))

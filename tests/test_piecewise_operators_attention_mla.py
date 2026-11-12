@@ -22,6 +22,7 @@
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from fractions import Fraction
 
 import pytest
@@ -318,10 +319,16 @@ def test_core_wave_tail_charges_a_full_wave():
     assert three.get("query_tile_steps") == 6  # 3 requests x 2 KV heads
     assert three.get("waves") == 2 and three.get("tail_cores") == 2
     assert three.get("active_cores") == 4
-    assert three.pipe_work("cube") == three.get("physical_flops") * Fraction(4, 3)
+    # Six tasks on four cores take two waves.  Cube work is the physical
+    # tensor product.  waves*cores/tasks = 4/3 is only the elapsed cap.
+    assert three.pipe_work("cube") == three.get("physical_flops")
+    assert three.get("cube_schedule_work") == three.get("physical_flops") * Fraction(4, 3)
+    assert three.get("cube_schedule_scale") == Fraction(3, 4)
     four = compiled.evaluate(decode(((1, 32),) * 4))
     assert four.get("waves") == 2 and four.get("tail_cores") == 4
     assert four.pipe_work("cube") == four.get("physical_flops")
+    assert four.get("cube_schedule_scale") == 1
+    assert four.get("cube_schedule_work") == four.get("physical_flops")
 
 
 # 9. MLA absorption/expansion, latent width and cache row bytes.
@@ -711,11 +718,18 @@ def test_ragged_attention_wave_obeys_longest_task_bound():
     cost = attention_cost(compiled, decode(((1, 0), (1, 1023))))
     long_task = 2 * 1 * 1024 * (64 + 64)
     assert cost.get("cube_task_max") == long_task
-    assert cost.pipe_work("cube") == 4 * long_task
+    # The longest task is still the wave bound.  Reported cube work is the
+    # physical instruction count; 4*long_task is the elapsed-cap denominator.
+    assert cost.pipe_work("cube") == cost.get("physical_flops")
+    assert cost.get("cube_schedule_work") == 4 * long_task
+    assert cost.get("cube_schedule_scale") == Fraction(
+        cost.get("physical_flops"), 4 * long_task)
     assert cost.duration_ms >= Fraction(4 * long_task, 1000)
     balanced = attention_cost(compiled, decode(((1, 1023), (1, 1023))))
     assert balanced.get("cube_task_max") == long_task
-    assert balanced.pipe_work("cube") == 4 * long_task
+    assert balanced.pipe_work("cube") == balanced.get("physical_flops")
+    assert balanced.get("cube_schedule_work") == 4 * long_task
+    assert balanced.get("cube_schedule_scale") == Fraction(1, 2)
 
 
 # 18. Query ranges select physical rows, Q loads and output rows.
@@ -796,3 +810,312 @@ def test_default_kv_row_supports_unequal_key_value_widths():
     cost = compiled.evaluate(decode(((1, 4),)))
     assert cost.get("kv_row_bytes") == 1 * (80 + 128) * 2
     assert cost.get("q_row_width") == 80
+
+
+# 22. Incremental paged FIA prices distinct int32 block-table slots on HBM.
+
+
+_HBM_BOUND = PipeSupply((
+    ("cube", 1_000_000_000_000.0), ("vector", 1_000_000_000_000.0),
+    ("hbm", 1_000_000.0),
+    ("mte1", 1_000_000_000_000.0), ("mte2", 1_000_000_000_000.0),
+    ("mte3", 1_000_000_000_000.0), ("fixpipe", 1_000_000_000_000.0),
+    ("link", 1_000_000_000_000.0),
+))
+
+
+def _page_attention_cost(heads, kv_heads, head_dim, requests, *,
+                         mt=128, page=0, page_attention=0, supply=_HBM_BOUND,
+                         split_target=10_000, chunked_prefill=None):
+    model = build_model(dict(num_heads=heads, num_kv_heads=kv_heads,
+                             head_dim=head_dim),
+                        heads=heads, kv_heads=kv_heads, head_dim=head_dim,
+                        hidden_size=max(128, heads * head_dim))
+    policy = make_policy(mt=mt, nt=128, cores=32, split_target=split_target,
+                         max_splits=8)
+    features = FeatureConfig.from_model(
+        model, token_tile=mt, kv_tile=128, cores=32, split_target=4096,
+        max_splits=8)
+    instance = instantiate_model(model, features).find("A0", layer=0,
+                                                       role="attention")
+    base = next(item for item in instance.operators if item.name == "attention")
+    updates = {"page": page, "page_attention": page_attention}
+    if chunked_prefill is not None:
+        updates["chunked_prefill"] = int(chunked_prefill)
+    compiled = OperatorPiecewiseCompiler(supply, policy).compile_operator(
+        BoundOperator(base.template, base.theta.relocated(**updates)))
+    return compiled, compiled.evaluate(decode(requests))
+
+
+def test_incremental_page_table_bytes_are_distinct_slots_not_issued_lookups():
+    # Two q=1 sequences, context 4160, page 128: hi=4161 touches 33 blocks.
+    # Slots are (batch, block): 2*33*4 bytes.  K and V each reissue the load,
+    # and each KV head reissues it, but those repeats are lookups only.
+    _, pages = range_burst_bytes(0, 4161, Fraction(1), page=128)
+    assert pages == 33
+    flagged, on = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (1, 4160)), page=128, page_attention=1)
+    _, off = _page_attention_cost(12, 2, 256, ((1, 4160), (1, 4160)))
+    assert on.get("block_table_entries") == 2 * pages
+    assert on.get("block_table_bytes") == 2 * pages * 4
+    assert on.get("block_table_lookups") == 2 * pages * 2 * 2
+    assert on.get("page_transactions") == 2 * pages * 2
+    assert on.get("block_table_bytes") != on.get("block_table_lookups") * 4
+    assert off.get("block_table_entries") == 0
+    assert off.get("block_table_bytes") == 0
+    assert off.get("block_table_lookups") == 0
+    assert on.pipe_work("mte2") == off.pipe_work("mte2")
+    assert on.pipe_work("cube") == off.pipe_work("cube")
+    work_delta = on.pipe_work("hbm") - off.pipe_work("hbm")
+    assert work_delta == 2 * pages * 4
+    # HBM is the critical pipe.  Elapsed time moves with that pipe alone,
+    # by the declared HBM rate applied to the added bytes.
+    assert on.dominant_pipe == off.dominant_pipe == "hbm"
+    assert on.duration_ms - off.duration_ms == on.pipe_time("hbm") - off.pipe_time("hbm")
+    moved = (on.duration_ms - off.duration_ms) * 1_000_000
+    assert round(moved) == int(work_delta)
+    assert on.duration_ms == sum(on.stage_times)
+    notes = dict(flagged.program.annotations)
+    assert notes["block_table_index"] == "int32_getvalue"
+    assert notes["block_table_scalar_rate"] == "unavailable"
+    assert notes["hbm_service"] == "full_chip_unscaled_by_block_num"
+
+    # A second query tile rewalks the same slots.  Entries stay one page.
+    _, rewalk = _page_attention_cost(
+        8, 1, 64, ((1, 127),), mt=4, page=128, page_attention=1)
+    assert rewalk.get("query_tile_steps") == 2
+    assert rewalk.get("block_table_entries") == 1
+    assert rewalk.get("block_table_bytes") == 4
+    assert rewalk.get("block_table_lookups") == 4
+
+    # d=256 is one K walk.  d=384 splits K into ceil(384/128) walks; V stays one.
+    _, narrow = _page_attention_cost(
+        2, 2, 256, ((1, 127),), page=128, page_attention=1)
+    _, wide = _page_attention_cost(
+        2, 2, 384, ((1, 127),), page=128, page_attention=1)
+    assert narrow.get("block_table_entries") == wide.get("block_table_entries") == 1
+    assert narrow.get("block_table_bytes") == wide.get("block_table_bytes") == 4
+    assert narrow.get("block_table_lookups") == 2 * 2
+    assert wide.get("block_table_lookups") == 2 * (math.ceil(384 / 128) + 1)
+
+    # q>1, a mixed batch, and a missing flag stay off this branch.
+    for requests, flagged_on in (
+        (((4, 16),), True),
+        (((1, 16), (2, 16)), True),
+        (((1, 16),), False),
+    ):
+        _, cost = _page_attention_cost(
+            4, 1, 64, requests, page=128, page_attention=int(flagged_on))
+        assert cost.get("block_table_bytes") == 0
+        assert cost.get("block_table_lookups") == 0
+
+    layer = dict(attention="mla", num_heads=4, num_kv_heads=1, head_dim=576,
+                 q_lora_rank=64, kv_lora_rank=512, qk_nope_head_dim=512,
+                 qk_rope_head_dim=64, v_head_dim=128)
+    model = build_model(layer, hidden_size=1024, heads=4, kv_heads=1,
+                        head_dim=576)
+    features = FeatureConfig.from_model(model, token_tile=128, kv_tile=128,
+                                        cores=4, split_target=10_000,
+                                        max_splits=4)
+    instance = instantiate_model(model, features).find("A1", layer=0,
+                                                       role="attention")
+    base = next(item for item in instance.operators
+                if item.name == "mla_attention")
+    mla = OperatorPiecewiseCompiler(SUPPLY, POLICY).compile_operator(
+        BoundOperator(base.template, base.theta.relocated(
+            page=128, page_attention=1)))
+    mla_cost = mla.evaluate(decode(((1, 4160),)))
+    assert mla_cost.get("block_table_bytes") == 0
+    assert mla_cost.get("block_table_lookups") == 0
+    assert mla_cost.get("host_used_aic") == 0
+    assert mla_cost.get("intra_owner_exposed_ms") == 0
+    assert dict(mla.program.annotations)["block_table_index"] == "absent"
+
+
+def test_q1_paged_owner_pipeline_is_inside_the_aggregate():
+    # Two q=1 sequences, context 4160, page 128, heads 12 / kv 2.
+    # A5 pfa-merge disables flash decode. SplitNBSeq uses 4 owners and 33
+    # S2 tiles. Priced KV splits are 1, so active cores are the owners.
+    a5 = replace(_HBM_BOUND, arch_family="A5")
+    pair = ((1, 4160), (1, 4160))
+    flagged, on = _page_attention_cost(
+        12, 2, 256, pair, page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    off_op, off = _page_attention_cost(
+        12, 2, 256, pair, supply=a5, split_target=4096)
+    notes = dict(flagged.program.annotations)
+    assert notes["intra_owner_pipeline"] == "simplified_bmm2_two_loops_later"
+    assert notes["bmm2_issue_delay"] == "2"
+    assert notes["s1_out_split"] == "false_for_q1_gs_merge"
+    assert notes["flash_decode"] == "false_when_s1_times_group_below_64"
+    assert notes["reconstruct_template"] == "false_when_dk_ne_128"
+    assert notes["l2_selector"] == "not_consulted_for_q1_gs_merge"
+    assert notes["tiling_key"] == "not_in_capture"
+    assert notes["d256_host_selected"] == "splitnbseq_when_a5_q1_pfa_merge"
+    assert notes["analytical_kv_splits"] == "not_a_tiling_key"
+    assert on.get("host_used_aic") == 4
+    assert on.get("host_s2_tiles") == 33
+    assert on.get("d256_host_selected") == 1
+    assert on.get("kv_splits") == 1
+    assert on.get("active_cores") == 4
+    assert on.get("fia_launch_count") == 1
+    assert on.get("split_partial_bytes") == 0
+    assert on.get("split_merge_vector") == on.get("query_rows") * (256 + 1)
+    assert on.get("intra_owner_pipeline_ms") > 0
+    assert on.get("intra_owner_exposed_ms") == 0
+    assert on.get("block_table_bytes") == 264
+    assert on.pipe_work("cube") == off.pipe_work("cube")
+    assert on.pipe_work("mte2") == on.get("kv_burst_bytes") + on.get("q_bytes")
+    assert on.pipe_work("hbm") == (
+        on.pipe_work("mte2") + on.get("block_table_bytes") + on.get("output_bytes"))
+    assert on.duration_ms == sum(on.stage_times)
+    assert off.get("host_used_aic") == 0
+    assert off.get("intra_owner_exposed_ms") == 0
+    assert "intra_owner_pipeline" not in dict(off_op.program.annotations)
+    # The same shape with no architecture stays on the analytical lattice.
+    _, bare = _page_attention_cost(
+        12, 2, 256, pair, page=128, page_attention=1, split_target=4096)
+    assert bare.get("host_used_aic") == 0
+    assert bare.get("d256_host_selected") == 0
+    assert bare.get("kv_splits") == 7
+    assert bare.get("active_cores") == 28
+    assert bare.get("block_table_bytes") == 264
+    assert bare.get("split_partial_bytes") == 2 * (7 - 1) * bare.get("query_rows") * (4 * 256 + 8)
+
+    # q>1, a mixed batch, a missing flag, dv<=128, and g>=64 stay off.
+    for heads, kv, dim, requests, flag in (
+        (4, 1, 64, ((4, 16),), 1),
+        (4, 1, 64, ((1, 16), (2, 16)), 1),
+        (4, 1, 64, ((1, 16),), 0),
+        (8, 1, 64, ((1, 127),), 1),
+        (4, 1, 128, ((1, 127),), 1),
+        (64, 1, 256, ((1, 127),), 1),
+    ):
+        compiled, cost = _page_attention_cost(
+            heads, kv, dim, requests, page=128, page_attention=flag)
+        assert cost.get("host_used_aic") == 0
+        assert cost.get("host_s2_tiles") == 0
+        assert cost.get("intra_owner_exposed_ms") == 0
+        assert cost.get("intra_owner_pipeline_ms") == 0
+        assert "intra_owner_pipeline" not in dict(compiled.program.annotations)
+
+    # One AIC's issue can exceed the unsplit aggregate when cube is slow.
+    # The dependency is that excess only. Cube work is not added twice.
+    slow = replace(PipeSupply((
+        ("cube", 1_000_000.0), ("vector", 1e15), ("hbm", 1e15),
+        ("mte1", 1e15), ("mte2", 1e15), ("mte3", 1e15),
+        ("fixpipe", 1e15), ("link", 1e15),
+    ), invocations=(("cube", 1e-18),)), arch_family="A5")
+    _, slow_on = _page_attention_cost(
+        12, 2, 256, pair, page=128, page_attention=1,
+        supply=slow, split_target=4096)
+    _, slow_off = _page_attention_cost(
+        12, 2, 256, pair, supply=slow, split_target=4096)
+    exposed = slow_on.get("intra_owner_exposed_ms")
+    assert slow_on.get("host_used_aic") == 4
+    assert slow_on.get("host_s2_tiles") == 33
+    assert slow_on.get("kv_splits") == 1
+    assert slow_on.get("split_partial_bytes") == 0
+    assert exposed > 0
+    assert slow_off.get("intra_owner_exposed_ms") == 0
+    assert slow_on.pipe_work("cube") == slow_off.pipe_work("cube")
+    assert slow_on.get("block_table_bytes") == 264
+    assert slow_on.pipe_work("mte2") == slow_on.get("kv_burst_bytes") + slow_on.get("q_bytes")
+    assert slow_on.duration_ms - sum(slow_on.stage_times) == exposed
+    assert slow_off.duration_ms == sum(slow_off.stage_times)
+
+
+def test_a5_phase_split_arch_gate_and_fresh_prefill():
+    a5 = replace(_HBM_BOUND, arch_family="A5")
+    a2 = replace(_HBM_BOUND, arch_family="A2")
+    # Real A2 does not take the arch35 owner route. The zero is annotated.
+    a2_op, a2_cost = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (1, 4160)), page=128, page_attention=1,
+        supply=a2, split_target=4096)
+    a2_notes = dict(a2_op.program.annotations)
+    assert a2_cost.get("host_used_aic") == 0
+    assert a2_cost.get("d256_host_selected") == 0
+    assert a2_notes["d256_host_selected"] == "0"
+    assert a2_notes["d256_host_applicability"] == (
+        "splitnbseq_when_a5_q1_dk_ne_128_else_unselected")
+    assert a2_cost.get("kv_splits") == 7
+    assert a2_cost.get("active_cores") == 28
+    assert a2_cost.get("block_table_bytes") == 264
+    assert a2_cost.get("fia_launch_count") == 1
+    # dk==128 is the other template, not an unqualified owner count of zero.
+    dk_op, dk_cost = _page_attention_cost(
+        4, 1, 128, ((1, 127),), page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    assert dk_cost.get("host_used_aic") == 0
+    assert dk_cost.get("d256_host_selected") == 0
+    assert dict(dk_op.program.annotations)["d256_host_applicability"] == (
+        "unselected_dk_128_other_template")
+    assert dk_cost.get("block_table_bytes") == 4
+    # A5 chunked mixed: q1 subgroup and the earliest q>1 group, both paged.
+    mixed_op, mixed = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (4096, 0)), page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    assert mixed.get("fia_launch_count") == 2
+    assert mixed.get("launch0_selected") == 1
+    assert mixed.get("launch0_owners") == 2
+    assert mixed.get("launch0_s2_tiles") == 33
+    assert mixed.get("launch0_kv_splits") == 1
+    assert mixed.get("launch0_split_partial_bytes") == 0
+    assert mixed.get("launch0_block_bytes") == 33 * 4
+    assert mixed.get("launch1_selected") == 0
+    assert mixed.get("launch1_owners") == 0
+    assert mixed.get("launch1_block_bytes") == 32 * 4
+    assert mixed.get("lane_scheduled") == 2
+    assert mixed.get("lane_valid") == 4097
+    assert mixed.get("lane_gathered") == 4097
+    assert mixed.get("fia_query_tokens") == 4097
+    assert mixed.pipe_work("hbm") == (
+        mixed.get("launch0_hbm_bytes") + mixed.get("launch1_hbm_bytes"))
+    assert mixed.duration_ms == (
+        mixed.get("launch0_duration_ms") + mixed.get("launch1_duration_ms"))
+    assert "intra_owner_pipeline" in dict(mixed_op.program.annotations)
+    # Pure fresh prefill has no block table and is not the q=1 owner route.
+    _, fresh = _page_attention_cost(
+        12, 2, 256, ((4096, 0),), page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    assert fresh.get("fia_launch_count") == 1
+    assert fresh.get("block_table_bytes") == 0
+    assert fresh.get("host_used_aic") == 0
+    assert fresh.get("d256_host_selected") == 0
+    # A paged prefill with context keeps its own slots and is not q=1 SplitNBSeq.
+    _, paged_pf = _page_attention_cost(
+        12, 2, 256, ((4096, 128),), page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    assert paged_pf.get("fia_launch_count") == 1
+    assert paged_pf.get("block_table_bytes") > 0
+    assert paged_pf.get("host_used_aic") == 0
+    assert paged_pf.get("d256_host_selected") == 0
+    # Explicit chunked_prefill=0 keeps one combined paged launch.
+    _, joined = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (4096, 0)), page=128, page_attention=1,
+        supply=a5, split_target=4096, chunked_prefill=0)
+    assert joined.get("fia_launch_count") == 1
+    assert joined.get("host_used_aic") == 0
+    assert joined.get("block_table_bytes") > 0
+    # A2 mixed stays one paged launch and does not publish arch35 owners.
+    _, a2_mixed = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (4096, 0)), page=128, page_attention=1,
+        supply=a2, split_target=4096)
+    assert a2_mixed.get("fia_launch_count") == 1
+    assert a2_mixed.get("host_used_aic") == 0
+    assert a2_mixed.get("block_table_bytes") > 0
+    # Static gathered width is not an extra KV sequence.
+    compiled, _ = _page_attention_cost(
+        12, 2, 256, ((1, 4160), (1, 4160)), page=128, page_attention=1,
+        supply=a5, split_target=4096)
+    static = WorkloadGeometry(
+        (RequestGeometry(1, 4160, phase="decode"),) * 2,
+        phase="decode", tp_width=2, dense_sequence_parallel=True,
+        graph_dispatch="full", capture_sizes=(8,))
+    padded = compiled.evaluate(static)
+    assert padded.get("lane_scheduled") == 2
+    assert padded.get("lane_valid") == 2
+    assert padded.get("fia_query_tokens") == 2
+    assert padded.get("lane_gathered") == 8
+    assert padded.get("host_used_aic") == 4
+    assert padded.get("block_table_entries") == 66

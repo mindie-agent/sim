@@ -74,7 +74,7 @@ def test_ordinary_consumer_has_one_quantized_producer_and_keeps_down_quantizatio
                                           if o.op_id == "s0.l0.expert_down")
     assert up.deps == ("s0.l0.dispatch",)
     assert dict(up.metadata)["activation_scale_producer"] == up.deps[0]
-    raw_phase = dict(ops["s0.l0.mc2_dispatch.send_read_quantize"].metadata)["mc2_phase"]
+    raw_phase = dict(ops["s0.l0.dispatch"].metadata)["mc2_phase"]
     plan = contract(raw_phase, 4)
     send = next(p for p in plan.phases if p.name == "send_read_quantize")
     assert dict(send.work)["vector"] == 2 * sum(mx32_work(512).values())
@@ -90,7 +90,7 @@ def test_quantized_consumer_waits_for_late_route_and_received_scale_publication(
     raw = case()
     selected = graphs(raw)
     selected[0] = tuple(replace(o, deps=o.deps + ("late_route",))
-                        if o.op_id == "s0.l0.pack" else o for o in selected[0])
+                        if o.op_id == "s0.l0.dispatch" else o for o in selected[0])
     result = graph_costs(raw, selected, external_inputs={"analysis_input": 0, "late_route": 17},
                          isolated=False)
     rows = {r["id"]: r for r in result["timeline"]}
@@ -114,14 +114,14 @@ def test_nonuniform_idle_source_keeps_quant_counts_and_return_transpose(sequence
     assert sum(wire(result).values()) == pytest.approx(expected)
     quant = 0
     for rank, ops in declared.items():
-        for op in ops:
-            phase = dict(op.metadata).get("mc2_phase", {})
-            if phase.get("phase") == "send_read_quantize":
-                ledger = contract(phase, 4)
-                send = next(p for p in ledger.phases if p.name == "send_read_quantize")
-                quant += sum(dict(values).get("vector", 0) for name, values in send.steps
-                             if name in mx32_work(5120))
-                assert phase["source_assignments"] == sequences[rank] * 2
+        dispatch = next(op for op in ops if op.op_id == 's0.l0.dispatch')
+        phase = dict(dispatch.metadata)['mc2_phase']
+        assert phase['kind'] == 'dispatch'
+        ledger = contract(phase, 4)
+        send = next(p for p in ledger.phases if p.name == 'send_read_quantize')
+        quant += sum(dict(values).get("vector", 0) for name, values in send.steps
+                     if name in mx32_work(5120))
+        assert phase["source_assignments"] == sequences[rank] * 2
     assert quant == sum(sequences) * 2 * sum(mx32_work(5120).values())
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
 

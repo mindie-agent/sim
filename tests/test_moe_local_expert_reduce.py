@@ -448,26 +448,64 @@ def test_old_recipe_still_rejects_cross_ep_global_histogram():
         target_operators(raw, phase="prefill", tokens=8)
 
 
-def test_quantized_and_mixed_expert_formats_are_rejected():
+def test_w8a8_local_expert_reduce_keeps_the_heaviest_bank_until_declared():
+    """Routed int8 with a bf16 shared expert is a legal caller.
+
+    The grouped GEMM stays on the heaviest bank unless the runtime declares
+    the witnessed full eager allocation. That declaration exposes the larger
+    allocation but does not replace the native local bank row histogram with
+    per-EP-rank totals. Shared int8 beside floating routed experts, fp8, and
+    mixed floats stay rejected.
+    """
     base = parse_case(local_case())
     int8 = replace(base.model, quant=QuantSpec(
         "declared-int8", expert_weight_format="int8"))
-    with pytest.raises(ModelingError,
-                       match="rejects_quantized_expert_format:routed_expert:int8"):
-        target_operators(replace(base, model=int8).to_dict(),
-                         phase="prefill", tokens=32)
+    graph = by_id(replace(base, model=int8).to_dict())
+    assert graph["s0.l0.expert_up"].local_shape[0] == 16
+    assert graph["s0.l0.expert_act"].local_shape[0] == 64
+    assert graph["s0.l0.router"].local_shape[0] == 32
+    assert not any(op.family in {"alltoall", "alltoallv"} for op in graph.values())
+    assert not any(op.recipe.startswith("arch35_fullmesh") for op in graph.values())
+    declared = replace(base, model=int8).to_dict()
+    declared["runtime"]["metadata"] = {"moe_grouped_gemm_rows": "full_eager_allocation"}
+    full = by_id(declared)
+    up, down, activation = (full["s0.l0.expert_up"], full["s0.l0.expert_down"],
+                            full["s0.l0.expert_act"])
+    metadata = dict(up.metadata)
+    # EP=4 and local bank=2 here, so rank totals (16,16,16,16) are not the
+    # local weight-bank histogram (8,8). The activated matrix stays 16 rows;
+    # the 64-slot eager allocation is capacity, not extra group-list work.
+    assert up.local_shape[0] == down.local_shape[0] == 16
+    assert activation.local_shape[0] == 64
+    assert metadata["matrix_group_rows"] == (8, 8)
+    assert metadata["matrix_groups"] == 2
+    assert metadata["local_expert_rows"] == (8, 8)
+    assert metadata["rank_assignment_rows"] == (16, 16, 16, 16)
+    assert metadata["matrix_active_rows"] == 16
+    assert metadata["matrix_capacity_rows"] == 64
+    assert metadata["matrix_capacity_basis"] == "eager_routing_allocation_not_activated_rows"
+    assert metadata["matrix_input_capacity_shape"] == (64, 32)
+    assert metadata["matrix_output_capacity_shape"] == (64, 128)
+    assert up.padded_shape[0] == 64
+    assert up.flops == 2 * 16 * 128 * 32
+    assert full["s0.l0.topk"].local_shape[0] == 32
+    assert metadata["grouped_gemm_rows"] == "full_eager_allocation"
+    override = replace(base.model, quant=QuantSpec(
+        "mixed-routed-override", weight_format="bf16", expert_weight_format="bf16",
+        category_overrides=(("routed_expert", {"weight_format": "int8"}),)))
+    override_graph = by_id(replace(base, model=override).to_dict())
+    assert override_graph["s0.l0.expert_up"].local_shape[0] == 16
     mixed_shared = replace(base.model, quant=QuantSpec(
         "mixed-int8-shared", weight_format="int8", expert_weight_format="bf16"))
     with pytest.raises(ModelingError,
                        match="rejects_quantized_expert_format:shared_expert:int8"):
         target_operators(replace(base, model=mixed_shared).to_dict(),
                          phase="prefill", tokens=32)
-    mixed_override = replace(base.model, quant=QuantSpec(
-        "mixed-routed-override", weight_format="bf16", expert_weight_format="bf16",
-        category_overrides=(("routed_expert", {"weight_format": "int8"}),)))
+    fp8 = replace(base.model, quant=QuantSpec(
+        "declared-fp8", expert_weight_format="fp8"))
     with pytest.raises(ModelingError,
-                       match="rejects_quantized_expert_format:routed_expert:int8"):
-        target_operators(replace(base, model=mixed_override).to_dict(),
+                       match="rejects_quantized_expert_format:routed_expert:fp8"):
+        target_operators(replace(base, model=fp8).to_dict(),
                          phase="prefill", tokens=32)
     mixed_float = replace(base.model, quant=QuantSpec(
         "mixed-fp16-shared", weight_format="fp16", expert_weight_format="bf16"))

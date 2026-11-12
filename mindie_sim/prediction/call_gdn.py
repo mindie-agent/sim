@@ -53,6 +53,45 @@ class GDNCall:
     ledger: dict
     limitations: tuple[str, ...]
 
+    @property
+    def device_program(self) -> dict:
+        """The selected call's actual arguments and tensor descriptors.
+
+        This is the existing ledger view: it is prepare-only metadata and never
+        allocates a tensor, imports a runtime or launches a kernel.
+        """
+        ledger = self.ledger or {}
+        return {
+            "call": ledger.get("call"),
+            "source": dict(ledger.get("source") or {}),
+            "arguments": dict(ledger.get("arguments") or {}),
+            "inputs": dict(ledger.get("inputs") or {}),
+            "outputs": dict(ledger.get("outputs") or {}),
+            "exports": dict(ledger.get("exports") or {}),
+            "state": dict(ledger.get("state") or {}),
+            "device_kernels": list(ledger.get("device_kernels") or ()),
+            "wrapper_source": dict(ledger.get("wrapper_source") or {}),
+            "materializations": self._materialization_records(),
+        }
+
+    def _materialization_records(self) -> list[dict]:
+        by_id = {op.op_id: op for op in self.ops}
+        records = []
+        for item in self.ledger.get("materializations") or ():
+            op = by_id.get(item.get("op_id"))
+            record = dict(item)
+            if op is not None:
+                meta = dict(op.metadata)
+                record.update({
+                    "recipe": op.recipe, "dtype": op.dtype,
+                    "semantic_shape": list(op.semantic_shape or ()),
+                    "padded_shape": list(op.padded_shape or ()),
+                    "source_layout": meta.get("source_layout"),
+                    "target_layout": meta.get("target_layout"),
+                })
+            records.append(record)
+        return records
+
 
 def _positive(params, name):
     value = params[name]
@@ -147,13 +186,16 @@ def _conv_prefill(params):
         raise ModelingError("gdn_conv_call_requires_bf16_arguments")
     if params.get("layout", "contiguous") != "contiguous":
         raise ModelingError("gdn_conv_call_requires_contiguous_arguments")
-    if params.get("activation", "silu") != "silu" or params.get("bias", True) is not True:
-        raise ModelingError("gdn_conv_call_requires_silu_and_bias")
+    bias = params.get("bias", False)
+    if not isinstance(bias, bool):
+        raise ModelingError("gdn_conv_call_bias_must_be_bool")
+    if params.get("activation", "silu") != "silu":
+        raise ModelingError("gdn_conv_call_requires_silu_activation")
     if params.get("initial_state", False) is not False:
         raise ModelingError("gdn_conv_call_requires_no_initial_state")
     arguments = {
         "lengths": (tokens,) * batch, "dim": dim, "width": width, "dtype": "bf16",
-        "activation": "silu", "bias": True, "metadata_placement": "device",
+        "activation": "silu", "bias": bias, "metadata_placement": "device",
         "has_initial_state": (False,) * batch, "cache_indices": tuple(range(1, batch + 1)),
         "state_rows": batch + 1, "state_history_slots": width - 1,
         "null_block_id": 0, "pad_slot_id": -1,
@@ -218,6 +260,13 @@ def _scan_prefill(params):
     lengths = (tokens,) * batch
     total = batch * tokens
     chunks = sum((length + chunk - 1) // chunk for length in lengths)
+    cu_seqlens = [0]
+    for length in lengths:
+        cu_seqlens.append(cu_seqlens[-1] + length)
+    chunk_indices = []
+    for sequence, length in enumerate(lengths):
+        for local in range((length + chunk - 1) // chunk):
+            chunk_indices.extend((sequence, local))
     builder = Builder("gdn_scan_prefill", _CALL_PLAN, 0, (), _CALL_MODEL, "prefill")
     tensors = TensorLowering(builder)
     values = {
@@ -250,9 +299,11 @@ def _scan_prefill(params):
         "call": "fla_npu.ops.ascendc.chunk_gated_delta_rule_fwd",
         "arguments": {
             "lengths": list(lengths), "batch": batch, "tokens": tokens,
-            "chunks": chunks, "cu_seqlens": [tokens * index for index in range(batch + 1)],
+            "chunks": chunks, "cu_seqlens": cu_seqlens,
             "chunk_size": chunk,
             "chunk_indices": {"count": chunks, "entries_per_chunk": 2,
+                              "values": chunk_indices,
+                              "shape": [len(chunk_indices)],
                               "construction": "host list from canonical equal-length chunks"},
             "layout": "BSND", "scale": dk ** -0.5, "use_exp2": True,
             "use_qk_l2norm_in_kernel": True, "use_gate_in_kernel": False,
@@ -262,7 +313,7 @@ def _scan_prefill(params):
         },
         "device_kernels": list(kernels),
         "source": PREFILL_SOURCE,
-        "wrapper_source": {**WRAPPER_SOURCE, "lines": [1472, 1510]},
+        "wrapper_source": {**WRAPPER_SOURCE, "lines": [1472, 1516]},
         "host_only": ["marshal prebuilt cu_seqlens/chunk_indices lists", "resolve cached adapter/current stream",
                       "allocate requested intermediate export slots"],
         "outside_call": ["create q/k/v/g/beta and the FP32 initial state",

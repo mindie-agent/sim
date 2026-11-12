@@ -1,0 +1,205 @@
+{
+  "schema": "mindie-sim/hccl-observed-call/1",
+  "status": "recorded_evidence",
+  "signed": {
+    "image": "sha256:9e869e8148467296f56d1001b0dac4fea893c841ac7d0a03d4e824a233c2ffea",
+    "launch_config_sha256": "19cd8b67d023654eb0d99f90327ca9d794ed5b9d23a5707f71e8ded3ec9fd9de",
+    "launch_config_line": 20,
+    "launch_env": {
+      "HCCL_OP_EXPANSION_MODE": "AIV",
+      "HCCL_SIMD": ""
+    },
+    "collector_sha256": "8f4a2912fffaff1cf2d82212a25ae20596463390729fc8561bb77632f5560f5e",
+    "run_sh_sha256": "99fb74a1c2e13eb505e8d842082f43de332da1470ead39c68a539e50e0685180",
+    "raw_target_sha256": "418a10dbceb3ae96510c2153121c130fced6d1098bcad719713b09fb95ec95d9",
+    "status_sha256": "70cb6fb2a9a60b6ebb54b44bea57e2c323ce034ecfbfb476b876a26a4a8a09ae",
+    "rank0_receipt_sha256": "2213e2d086a25643efebf5dfe152a94ac22eff9423e62fd90a1d1c02a0ed7387",
+    "rank1_receipt_sha256": "1d6cfb1b6b6ca260d7a4203d5b72288f0121604e90b2f2b045bb7930c1c65857"
+  },
+  "call": {
+    "api": {
+      "namespace": "hccl",
+      "entry": "torch.distributed.all_gather_into_tensor",
+      "aclnn_symbol": null
+    },
+    "source": {
+      "repository": "task-evidence",
+      "path": "COMRUN5A/raw-target.json",
+      "sha256": "418a10dbceb3ae96510c2153121c130fced6d1098bcad719713b09fb95ec95d9",
+      "symbol": "torch.distributed.all_gather_into_tensor",
+      "revision": "r31-9e869e8148467296f56d1001b0dac4fea893c841ac7d0a03d4e824a233c2ffea",
+      "state": "task_artifact"
+    },
+    "typed": {
+      "dtype": "bf16",
+      "layout": "contiguous",
+      "shapes": {
+        "input": [
+          5120
+        ],
+        "output": [
+          10240
+        ]
+      },
+      "attrs": {
+        "collective": "allGather",
+        "world_size": 2,
+        "ranks": 2,
+        "dtype": "bf16",
+        "elements_per_rank": 5120,
+        "output_elements": 10240,
+        "expansion": "AIV",
+        "simd": "",
+        "group": "ccl",
+        "connection_id": 2,
+        "operation_enum": "all_gather_into_tensor"
+      }
+    },
+    "kernels": [
+      {
+        "name": "aiv_all_gather_bfloat16_t",
+        "role": "aiv",
+        "source_path": "COMRUN5A/raw-target.json",
+        "source_sha256": "418a10dbceb3ae96510c2153121c130fced6d1098bcad719713b09fb95ec95d9",
+        "evidence": "measured"
+      }
+    ],
+    "execution_core": "aiv",
+    "unresolved": [
+      "hccl_detailed_variant_unestablished",
+      "nhr_label_not_equated_to_mesh1d",
+      "exact_source_caller_dispatch_unidentified",
+      "installed_selected_binary_not_established"
+    ],
+    "observed_aliases": [
+      {
+        "rank_id": "rank_0",
+        "physical_device": 4,
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "connection_id": 2,
+        "compute_name": "AivKernel",
+        "comm_name": "hcom_allGather__612_0_1",
+        "compute_task_type": 28,
+        "comm_task_type": 8,
+        "block_num": 64,
+        "start_ns": 1794404545183767792,
+        "end_ns": 1794404545240116603,
+        "device_id": 0,
+        "logical_rank": 0
+      },
+      {
+        "rank_id": "rank_1",
+        "physical_device": 5,
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "connection_id": 2,
+        "compute_name": "AivKernel",
+        "comm_name": "hcom_allGather__612_0_1",
+        "compute_task_type": 28,
+        "comm_task_type": 8,
+        "block_num": 64,
+        "start_ns": 1794404545240103566,
+        "end_ns": 1794404545240117011,
+        "device_id": 1,
+        "logical_rank": 1
+      }
+    ]
+  },
+  "observations": {
+    "rank_0": {
+      "rank_id": "rank_0",
+      "logical_rank": 0,
+      "physical_device": 4,
+      "compute": {
+        "name": "AivKernel",
+        "task_type": 8,
+        "compute_task_type": 28,
+        "op_type": "N/A",
+        "block_num": 64,
+        "mix_block_num": 0,
+        "start_ns": 1794404545183767792,
+        "end_ns": 1794404545240116603,
+        "duration_ms": 56.348811
+      },
+      "communication": {
+        "name": "hcom_allGather__612_0_1",
+        "task_type": 8,
+        "comm_task_type": 4294967295,
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "device_id": 0,
+        "start_ns": 1794404545183767792,
+        "end_ns": 1794404545240116603,
+        "src_rank": 4294967295,
+        "dst_rank": 65534,
+        "size": 65534,
+        "duration_ms": 56.348811
+      },
+      "raw_identity": {
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "connection_id": 2,
+        "device_id": 4,
+        "start_ns": 1794404545183767792,
+        "end_ns": 1794404545240116603
+      },
+      "measured_span_ms": 56.462669372558594,
+      "input_digest": "528caf1b50e2a58c9821263ef6bf5213794e367b82ec79a96eb42e1caf1b869a",
+      "output_digest": "3530baacea989b81171b9b192b521e5fd659c0e2ced5992fa7f9def37eb0774c"
+    },
+    "rank_1": {
+      "rank_id": "rank_1",
+      "logical_rank": 1,
+      "physical_device": 5,
+      "compute": {
+        "name": "AivKernel",
+        "task_type": 8,
+        "compute_task_type": 28,
+        "op_type": "N/A",
+        "block_num": 64,
+        "mix_block_num": 0,
+        "start_ns": 1794404545240103566,
+        "end_ns": 1794404545240117011,
+        "duration_ms": 0.013445
+      },
+      "communication": {
+        "name": "hcom_allGather__612_0_1",
+        "task_type": 8,
+        "comm_task_type": 4294967295,
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "device_id": 1,
+        "start_ns": 1794404545240103566,
+        "end_ns": 1794404545240117011,
+        "src_rank": 4294967295,
+        "dst_rank": 65534,
+        "size": 65534,
+        "duration_ms": 0.013445
+      },
+      "raw_identity": {
+        "global_task_id": 5,
+        "stream_id": 26,
+        "task_id": 17,
+        "connection_id": 2,
+        "device_id": 5,
+        "start_ns": 1794404545240103566,
+        "end_ns": 1794404545240117011
+      },
+      "measured_span_ms": 0.3651210069656372,
+      "input_digest": "9c4c444db0979ee92f5821faed18baff67fb4f9a523e7c8bf7cab9779a6fc71f",
+      "output_digest": "3530baacea989b81171b9b192b521e5fd659c0e2ced5992fa7f9def37eb0774c"
+    }
+  },
+  "non_claims": [
+    "observed_duration_not_used_for_prediction",
+    "rank_clocks_not_compared",
+    "not_isolated_hccl_duration",
+    "detailed_hccl_variant_unestablished"
+  ]
+}

@@ -258,6 +258,11 @@ def build_composable(key, config, family="generic"):
             config, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
         "source_model_type": str(c.get("model_type", "")),
         "declared_quantization": c.get("quantization_config", {}),
+        **({"routed_scaling_factor": c["routed_scaling_factor"]}
+           if isinstance(c.get("routed_scaling_factor"), (int, float))
+           and not isinstance(c.get("routed_scaling_factor"), bool) else {}),
+        **({"rope_parameters": c["rope_parameters"]}
+           if isinstance(c.get("rope_parameters"), Mapping) else {}),
     }
     from mindie_sim.schema.serialization import immutable_sequences
     metadata = immutable_sequences(metadata)

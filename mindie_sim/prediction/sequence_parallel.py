@@ -229,12 +229,18 @@ def _validate_views(views, tokens, *, padding: str = "none") -> tuple[Any, ...]:
         values = tuple(views)
     except TypeError as exc:
         raise ModelingError("sequence_parallel_views_must_be_iterable") from exc
+    padded = []
+    logical = []
     for view in values:
         q_len = getattr(view, "q_len", None)
         if not isinstance(q_len, int) or isinstance(q_len, bool) or q_len <= 0:
             raise ModelingError(f"sequence_parallel_requires_positive_q_len:{q_len!r}")
         if getattr(view, "padding", False):
-            raise ModelingError("sequence_parallel_no_padding_domain")
+            if padding != "right_to_tp":
+                raise ModelingError("sequence_parallel_no_padding_domain")
+            padded.append(view)
+            continue
+        logical.append(view)
         # Speculative draft fields are rejected only for the unpadded contract.
         # right_to_tp serving may carry a draft proposal on the same views.
         if padding == "none":
@@ -247,7 +253,11 @@ def _validate_views(views, tokens, *, padding: str = "none") -> tuple[Any, ...]:
             if getattr(view, "draft_advanced_tokens", 0) not in (0, 1):
                 raise ModelingError(
                     "sequence_parallel_speculative_field_unsupported:draft_advanced_tokens")
-    total = sum(view.q_len for view in values)
+    logical_total = sum(view.q_len for view in logical)
+    physical_total = sum(view.q_len for view in padded)
+    total = physical_total + logical_total if padded else logical_total
+    if padding == "none" and padded:
+        raise ModelingError("sequence_parallel_no_padding_domain")
     if tokens < total or (padding == "none" and tokens != total):
         raise ModelingError(
             f"sequence_parallel_tokens_must_equal_sum_q_len:{tokens}!={total}")
@@ -272,6 +282,19 @@ def _validate_model(model, *, padding: str = "none") -> None:
         raise ModelingError("sequence_parallel_hyperconnections_unsupported")
 
 
+def kimi_sequence_parallel(metadata: Mapping | None, tp: int) -> bool:
+    """One source capability decision for the declared K3 SP implementation.
+
+    The builders must not duplicate this condition.  It is exactly the already
+    accepted declaration: implementation name plus TP>1; no model/path name or
+    timing constant is added.
+    """
+    decl = dict(metadata or {}).get("sequence_parallel")
+    return (isinstance(decl, Mapping)
+            and str(decl.get("implementation", "")) == IMPLEMENTATION
+            and int(tp) > 1)
+
+
 def select(runtime, model, views, *, tokens, global_tokens=None):
     """Return the immutable plan, or ``None`` when no declaration is present.
 
@@ -287,7 +310,10 @@ def select(runtime, model, views, *, tokens, global_tokens=None):
     if type(tokens) is not int or tokens < 0:
         raise ModelingError(f"sequence_parallel_requires_nonnegative_tokens:{tokens!r}")
     values = _validate_views(views, tokens, padding=padding)
-    valid = sum(view.q_len for view in values)
+    # A padding view is a physical graph row, not a logical request.  Its
+    # q_len remains the source allocation; valid_global excludes it.
+    valid = sum(view.q_len for view in values
+                if not getattr(view, "padding", False))
     input_rows = tokens
     parallel = _parallel(runtime)
     pp, cp, pcp = int(parallel.pp), int(parallel.cp), int(parallel.pcp)

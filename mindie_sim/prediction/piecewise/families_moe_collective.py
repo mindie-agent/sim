@@ -4,7 +4,9 @@
   Derive explicit per-expert ragged tile work, matrix tiling capacity steps and
   topology-correct collective byte volumes as guarded piecewise expressions.
   This module provides the shared physical primitives used by the matrix family
-  and owns routing, grouped GEMM, collective and MC2 transport lowering.
+  and owns routing, grouped GEMM and collective lowering.  Ordinary routed
+  expert transport lives in the sibling ``families_moe_transport`` module and
+  is re-exported here for the family registry.
 
 [Invariants]
   * Shapes, expert counts, tile capacities, rank/topology facts and directed
@@ -17,6 +19,12 @@
   * Collective volume is a function of rank count, node split, message bytes,
     frame/MTU alignment and directed ``{M_uv}`` cells.  Receive hotspot is
     ``max_v sum_u M_uv`` and is not replaced by a per-model coefficient.
+  * Optional ``sp_rows`` of ``shard`` or ``padded`` is the sequence-parallel
+    pad rule (``ceil(T / R)`` input rows, or that count times R).  Absent,
+    the message stays ``T * wire``.  ``row_binding=real_q`` uses real query
+    rows (``T_VALID``), not the graph bucket.  ``row_binding=lm_head_selected``
+    uses the producing LM-head row count.  Neither binding combines with
+    ``sp_rows``.
   * Tile buffers are screened against declared L1/L0A/L0B/L0C bytes.  Pipeline
     fill plus ``q-1`` steady intervals is distinct from ``q`` serial tiles.
 
@@ -46,6 +54,9 @@ from .expressions import (
     Add, CeilDiv, Const, Div, Expr, Max, Min, Mul, Sub, Var, as_fraction,
 )
 from .guards import StepGuard
+from mindie_sim.prediction.moe_comm_selection import (
+    MoeCommConfig, selection_bindings,
+)
 
 FRACTAL = 16
 UB_ALIGN = 32
@@ -58,6 +69,26 @@ DEFAULT_L0C_BYTES = 128 * 1024
 DEFAULT_MTE2_GRANULE = 512
 DEFAULT_MTU = 4096
 DEFAULT_NODE_RANKS = 8
+
+def _owner_capacity(ctx: CompiledOperator, theta: Any, pool: str,
+                    default: int) -> int:
+    """Per-owner pool bytes from the declared hardware, not a pooled total.
+
+    ``PipeSupply.buffers`` carries the source-defined per-owner buffer size
+    (the same value the engine's pool capacity uses); ``pool_units`` is the
+    number of owners and must not be multiplied/divided into that byte value.
+    An explicit operator override wins.  The old constants remain only for a
+    synthetic supply with no buffer record.
+    """
+    explicit = theta.find(f"{pool}_bytes", None)
+    if explicit not in (None, ""):
+        return int(explicit)
+    buffers = dict(getattr(ctx.supply, "buffers", ()) or ())
+    value = buffers.get(pool)
+    if value is not None and int(value) > 0:
+        return int(value)
+    return int(default)
+
 
 _WEIGHT_WIDTHS = {
     "bf16": 2.0, "bfloat16": 2.0, "fp16": 2.0, "float16": 2.0,
@@ -87,6 +118,21 @@ def _width(fmt: Any, default: float = 2.0) -> float:
 
 def _is_quant(fmt: Any) -> bool:
     return str(fmt or "").strip().lower() not in _NON_QUANT
+
+def _moe_comm_bindings(theta: Any, geometry: Any) -> dict[str, Any]:
+    """Shared source-selection environment for one family operator."""
+    raw = theta.find("moe_comm", None)
+    if raw is None:
+        return {}
+    return selection_bindings(MoeCommConfig.from_items(raw), geometry)
+
+
+def _moe_comm_active(theta: Any, var: str = "MOE_COMM_SELECTED_ALLTOALL"):
+    """Gate a retained mode node on the selected source method."""
+    if theta.find("moe_comm", None) is None:
+        return None
+    return Var(str(theta.find("moe_comm_active_var", var)))
+
 
 def _round_expr(value: Expr, granule: int) -> Expr:
     if granule <= 1:
@@ -301,15 +347,30 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
     weight_payload = _frac(theta.find("weight_payload", weight_total), weight_total)
     weight_scale = _frac(theta.find("weight_scale", 0.0), 0.0)
     weight_zero = _frac(theta.find("weight_zero", 0.0), 0.0)
-    out_format = theta.find("output_format", theta.find("act_format", "bf16"))
+    # A fused grouped activation has a different output representation from
+    # the projection's input act_format/output_format.  Keep that selected
+    # typed output explicit instead of letting the quant group overwrite it.
+    out_format = theta.find("fused_output_format",
+                            theta.find("output_format", theta.find("act_format", "bf16")))
     out_bytes = _width(out_format)
+    fused_activation = int(theta.find("fused_activation_quant", 0) or 0) == 1
+    materialize_selected = int(
+        theta.find("materialize_selected_rows", 0) or 0) == 1
+    activation_elements = max(0, _int(theta.find("activation_elements", 0), 0))
+    activation_ops = max(0, _int(theta.find("activation_ops_per_element", 4), 4))
+    activation_payload_row = _frac(theta.find("activation_payload_row_bytes", 0), 0)
+    activation_scale_row = _frac(
+        theta.find("activation_scale_row_bytes",
+                   theta.find("activation_scale_bytes", 0)), 0)
+    if fused_activation and (activation_elements <= 0 or activation_payload_row <= 0):
+        raise ModelingError("grouped_activation_composite_requires_typed_row")
     plan = tile_plan(row_tile, n, k, mt=row_tile, nt=nt,
                      act_bytes=float(act_bytes), weight_bytes=weight_bytes,
                      out_bytes=out_bytes,
-                     l1_bytes=_int(theta.find("l1_bytes"), DEFAULT_L1_BYTES),
-                     l0a_bytes=_int(theta.find("l0a_bytes"), DEFAULT_L0A_BYTES),
-                     l0b_bytes=_int(theta.find("l0b_bytes"), DEFAULT_L0B_BYTES),
-                     l0c_bytes=_int(theta.find("l0c_bytes"), DEFAULT_L0C_BYTES),
+                     l1_bytes=_owner_capacity(ctx, theta, "l1", DEFAULT_L1_BYTES),
+                     l0a_bytes=_owner_capacity(ctx, theta, "l0a", DEFAULT_L0A_BYTES),
+                     l0b_bytes=_owner_capacity(ctx, theta, "l0b", DEFAULT_L0B_BYTES),
+                     l0c_bytes=_owner_capacity(ctx, theta, "l0c", DEFAULT_L0C_BYTES),
                      slots=_int(theta.find("pipeline_slots",
                                            theta.find("slots", None)),
                                 ctx.policy.pipeline_slots),
@@ -330,14 +391,23 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
         fractal_rows = sum(math.ceil(value / FRACTAL) * FRACTAL for value in counts if value)
         row_tiles = sum(math.ceil(value / m_tile) for value in counts if value)
         tiles = row_tiles * n_tiles
-        routed_tokens = rows / top_k if top_k else 0
+        # The routing expectation is over the declared global token batch,
+        # not the local assignment count.  Dividing local rows by top-k
+        # assumes every global token lands on this rank, overstating distinct
+        # active experts and reading each expert's weight for a phantom row.
+        routed_tokens = geometry.tokens if top_k else 0
         if top_k <= 0 or experts <= 0 or routed_tokens <= 0:
             expected = 0.0
         elif top_k >= experts:
-            expected = float(experts)
+            # k == E (schema rejects k > E): every token selects every expert,
+            # so exactly this rank's local bank is active.
+            expected = float(local)
         else:
-            expected = experts * (1.0 - (1.0 - top_k / experts)
-                                  ** routed_tokens)
+            # Distinct *local* experts that receive at least one of the
+            # global tokens; the local bank is `local`, the routing universe
+            # is `experts`.
+            expected = local * (1.0 - (1.0 - top_k / experts)
+                                ** routed_tokens)
         row_bins = [0] * cores
         tile_bins = [0] * cores
         for value in sorted((item for item in counts if item), reverse=True):
@@ -345,7 +415,18 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
             row_bins[slot] += value
             tile_bins[slot] += math.ceil(value / m_tile)
         busy = max(range(cores), key=tile_bins.__getitem__)
-        return {"moe_rows": rows, "MOE_ROWS": rows, "moe_active": active,
+        # `WorkloadGeometry.routing` is also populated with the pipeline's
+        # uniform default when no routing state was supplied.  That is not a
+        # declared route count.  Explicit counts arrive through StateView;
+        # only those may replace the routing expectation.
+        try:
+            state.routing_state(int(ctx.layer))
+            explicit_routing = True
+        except ModelingError:
+            explicit_routing = False
+        values = {"moe_rows": rows, "MOE_ROWS": rows, "moe_active": active,
+                "weight_experts": (active if explicit_routing
+                                   else as_fraction(expected)),
                 "MOE_ACTIVE": active, "moe_padded": padded,
                 "MOE_PADDED": padded, "MOE_FRACTAL_ROWS": fractal_rows,
                 "moe_tiles": tiles, "MOE_ROW_TILES": row_tiles,
@@ -355,6 +436,8 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
                 "expert_imbalance": (max(counts) / (rows / max(1, len(counts)))
                                      if rows else 0.0),
                 "max_owner_rows": row_bins[busy], "max_count": tile_bins[busy]}
+        values.update(_moe_comm_bindings(theta, geometry))
+        return values
 
     rows, active, padded = Var("MOE_ROWS"), Var("MOE_ACTIVE"), Var("MOE_PADDED")
     crit_m = Div(Var("max_owner_rows"), Max((Var("max_count"), Const(1))))
@@ -370,23 +453,56 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
     load_tile = Add((Mul((Const(m_tile), k_job, Const(act_bytes))),
                      Mul((k_job, Const(n_tile), Const(weight_bytes))),
                      metadata_tile))
+    if activation_scale_row:
+        load_tile = Add((load_tile, Mul((Const(m_tile), Const(activation_scale_row)))))
     compute_tile = Mul((Const(2), Const(m_tile), Const(n_tile), k_job))
     store_tile = Mul((Const(m_tile), Const(n_tile), Const(out_bytes)))
+    weight_share = Div(Var("weight_experts"), Max((active, Const(1))))
     stage_load = Add((Mul((crit_m, k_job, Const(act_bytes))),
-                      Mul((k_job, Const(n_tile), Const(weight_bytes))),
+                      Mul((k_job, Const(n_tile), Const(weight_bytes), weight_share)),
                       metadata_tile))
-    stage_compute = Mul((Const(2), crit_m, Const(n_tile), k_job))
+    if activation_scale_row:
+        stage_load = Add((stage_load, Mul((crit_m, Const(activation_scale_row)))))
     stage_store = Mul((crit_m, Const(n_tile), Const(out_bytes)))
+    if fused_activation:
+        # SwiGLU halves the grouped projection width: the composite stores one
+        # packed activation payload of E elements, not the 2E gate/up width.
+        # A tile stores at most its n_tile slice of that E-wide row.
+        store_width = min(n_tile, activation_elements)
+        stage_store = Mul((crit_m, Const(store_width), Const(out_bytes)))
+        if activation_scale_row:
+            stage_store = Add((stage_store, Mul((crit_m, Const(activation_scale_row)))))
     quant = _is_quant(weight_format) or _is_quant(theta.find("act_format", "bf16"))
     vector_tile = Mul((crit_m, k_job)) if quant else Const(0)
+    if fused_activation:
+        # SwiGLU (multiply, gate, activation) and output quantization run on
+        # the same owner after the gate/up cube; the BF16 intermediate is not
+        # materialized to HBM.
+        vector_tile = Add((vector_tile, Mul((
+            crit_m, Const(activation_elements * (activation_ops + 1))))))
     fill_extra = (("vector", Add((Const(4096 * 128), Mul((active, Const(512 * 128)))))),)
-    weight_read = Mul((active, Const(weight_total)))
+    # Each distinct active expert's weight is read once; use the declared
+    # routing expectation, not the number of local assignments (a token may
+    # contribute several assignments to the same expert bank).
+    weight_read = Mul((Var("weight_experts"), Const(weight_total)))
     act_read = Mul((rows, Const(k), Const(act_bytes)))
-    out = Mul((padded, Const(n), Const(out_bytes)))
+    out_rows = rows if materialize_selected else padded
+    out = Mul((out_rows, Const(n), Const(out_bytes)))
+    if fused_activation:
+        out = Mul((out_rows, Const(activation_elements * out_bytes)))
+        if activation_scale_row:
+            out = Add((out, Mul((out_rows, Const(activation_scale_row)))))
+    # pipeline_stages repeats `compute` once per core per critical wave.
+    # That product is the busiest core's tile on every core, including idle
+    # ones.  Cube resources stay the physical grouped product 2*rows*N*K.
+    # The wave multiplier still schedules the pipeline; this divisor cancels
+    # it for the cube pipe only.
+    logical_cube = Mul((Const(2), rows, Const(n), Const(k)))
+    expansion = Max((Mul((Const(cores), waves)), Const(1)))
     stages = pipeline_stages(
         ctx, load=(("mte2", stage_load), ("mte1", stage_load),
                    ("hbm", stage_load)),
-        compute=(("cube", stage_compute),
+        compute=(("cube", Div(logical_cube, expansion)),
                  ("fixpipe", Mul((crit_m, Const(n_tile), Const(4)))),
                  ("vector", vector_tile)),
         store=(("mte3", stage_store), ("hbm", stage_store)),
@@ -413,10 +529,41 @@ def _compile_grouped_gemm(ctx: CompiledOperator,
         ("tile_compute_flops", compute_tile), ("tile_store_bytes", store_tile),
         ("conserved_rows", rows), ("act_read_bytes", act_read),
         ("output_bytes", out),
+        ("selected_output_rows", rows if materialize_selected else padded),
+        ("padded_output_rows", padded),
+        ("selected_payload_bytes",
+         Mul((rows if materialize_selected else padded,
+              Const(activation_elements * out_bytes))) if fused_activation
+         else Const(0)),
+        ("padded_payload_bytes",
+         Mul((padded, Const(activation_elements * out_bytes)))
+         if fused_activation else Const(0)),
+        ("selected_scale_bytes",
+         Mul((rows if materialize_selected else padded,
+              Const(activation_scale_row))) if fused_activation
+         else Const(0)),
+        ("padded_scale_bytes",
+         Mul((padded, Const(activation_scale_row)))
+         if fused_activation else Const(0)),
+        ("selected_output_bytes", out),
+        ("padded_output_bytes",
+         Add((Mul((padded, Const(activation_elements * out_bytes))),
+              Mul((padded, Const(activation_scale_row)))))
+         if fused_activation else Mul((padded, Const(n * out_bytes)))),
     )
+    materialization = ((_out_name(ctx), out),)
+    if fused_activation:
+        materialization = (
+            (f"{_out_name(ctx)}_payload",
+             Mul((out_rows, Const(activation_elements * out_bytes)))),
+        )
+        if activation_scale_row:
+            materialization += (
+                (f"{_out_name(ctx)}_scale",
+                 Mul((out_rows, Const(activation_scale_row)))),)
     return FamilyTemplate(
         axes=axes, stages=stages,
-        materialization=((_out_name(ctx), out),), internal=(),
+        materialization=materialization, internal=(),
         residency=Const(weight_total * local), derived=derived,
         regime_exprs=(), binder=binder,
         annotations=(("family", "grouped_gemm"), ("E", str(experts)),
@@ -443,8 +590,18 @@ def _compile_router(ctx: CompiledOperator, operator: BoundOperator) -> FamilyTem
         tokens = geometry.tokens
         expected = (float(experts) if top_k >= experts else
                     experts * (1.0 - (1.0 - top_k / experts) ** tokens))
-        return {"routing_tokens": tokens, "routing_expected_active":
-                as_fraction(expected)}
+        values = {"routing_tokens": tokens, "routing_expected_active":
+                  as_fraction(expected)}
+        if operator.name == "router_finalize":
+            # Parent F2 may be lifted to the global communication cohort.
+            # The weighted return belongs to this rank's local gathered
+            # slots, so use the pre-expansion local batch rather than the
+            # parent token sum.  No fixed division or phase constant.
+            local_batch = geometry.local_batch or geometry.batch
+            values["ROUTER_LOCAL_TOKENS"] = sum(
+                request.q_len for request in geometry.requests[:local_batch])
+        values.update(_moe_comm_bindings(theta, geometry))
+        return values
 
     tokens = Var("T")
     scores = Mul((tokens, Const(width * 4)))
@@ -458,8 +615,121 @@ def _compile_router(ctx: CompiledOperator, operator: BoundOperator) -> FamilyTem
                   Mul((tokens, Const(top_k * max(1, math.ceil(math.log2(max(2, top_k))))))),
                   Mul((tokens, Const(top_k)))))
     writes = Add((topk, histogram, sorted_rows, permuted))
-    main = (_demand(ctx, "mte2", scores), _demand(ctx, "mte3", writes),
-            _demand(ctx, "hbm", Add((scores, writes))), _demand(ctx, "vector", vector))
+    materialization = ("moe_routing_ledger", writes)
+    active = None
+    comm_active = _moe_comm_active(theta)
+    if operator.name == "router_inbound":
+        # MoeInitRoutingV3 after dispatch and before grouped GEMM.  The row
+        # count is the declared local received-row ledger, never M*k.
+        received = max(0, _int(theta.find("router_received_rows", 0), 0))
+        hidden = max(0, _int(theta.find("router_hidden", 0), 0))
+        payload_bytes = _frac(theta.find("router_payload_bytes", 0), 0)
+        scale_cols = max(0, _int(theta.find("router_scale_cols", 0), 0))
+        index_bytes = _frac(theta.find("router_index_bytes", 4), 4)
+        if (hidden <= 0 or payload_bytes <= 0
+                or scale_cols <= 0 or index_bytes <= 0):
+            raise ModelingError("router_inbound_requires_payload_geometry")
+        if received <= 0:
+            # Source-selected All2All V3 exists, but the normal forecast has
+            # no current-rank R ledger. Keep one symbolic owner with no priced
+            # bytes; never substitute M*k or an observed capture row.
+            main = ()
+            materialization = ("expert_rows", Const(0))
+        else:
+            packed = Const(received)
+            row_bytes = hidden * payload_bytes + scale_cols + index_bytes
+            read = Mul((packed, Const(row_bytes)))
+            write = Mul((packed, Const(row_bytes)))
+            main = (_demand(ctx, "mte2", read), _demand(ctx, "mte3", write),
+                    _demand(ctx, "hbm", Add((read, write))),
+                    _demand(ctx, "vector", Mul((packed, Const(hidden)))))
+            materialization = ("expert_rows", write)
+        active = Var("IS_PREFILL")
+    elif operator.name == "router_unweighted_reorder":
+        # Unweighted returned local Unpermute after GMM and before return A2A.
+        # It consumes BF16 [R,H] + INT32[R], not FP4 payload and not M*k.
+        received = max(0, _int(theta.find("router_received_rows", 0), 0))
+        hidden = max(0, _int(theta.find("router_hidden", 0), 0))
+        if hidden <= 0:
+            raise ModelingError("router_unweighted_requires_hidden_geometry")
+        if received <= 0:
+            # The real source has this launch, but the caller has not declared
+            # the local R_rank. Preserve one physical owner with symbolic
+            # [R_rank,H] and no priced bytes; never invent 341/512 or drop it.
+            main = ()
+            materialization = ("expert_rows", Const(0))
+        else:
+            packed = Const(received)
+            read = Add((Mul((packed, Const(hidden * 2))),
+                        Mul((packed, Const(4)))))
+            write = Mul((packed, Const(hidden * 2)))
+            main = (_demand(ctx, "mte2", read), _demand(ctx, "mte3", write),
+                    _demand(ctx, "hbm", Add((read, write))),
+                    _demand(ctx, "vector", Mul((packed, Const(hidden)))))
+            materialization = ("expert_rows", write)
+        active = Var("IS_PREFILL")
+    elif operator.name == "router_permute":
+        # Outbound local MoeTokenPermute/MoeInitRoutingV2, exactly one real
+        # launch between gating and dispatch.  Source reads dense [M,H] BF16
+        # once and writes the packed [M*k,H] BF16 rows; indices are separate.
+        # Decode/static paths select no such launch, so the operator is
+        # inactive rather than charged a floor or phantom traffic.
+        hidden = max(0, _int(theta.find("router_hidden", 0), 0))
+        dtype_bytes = _frac(theta.find("router_dtype_bytes", 2), 2)
+        indices_bytes = _frac(theta.find("router_indices_bytes", 4), 4)
+        if hidden <= 0 or dtype_bytes <= 0:
+            raise ModelingError("router_permute_requires_dense_geometry")
+        rows = Mul((tokens, Const(top_k)))
+        dense = Mul((tokens, Const(hidden * dtype_bytes)))
+        indices = Mul((tokens, Const(top_k * indices_bytes)))
+        packed = Mul((rows, Const(hidden * dtype_bytes)))
+        read = Add((dense, indices))
+        write = Add((packed, indices))
+        main = (_demand(ctx, "mte2", read), _demand(ctx, "mte3", write),
+                _demand(ctx, "hbm", Add((read, write))),
+                _demand(ctx, "vector", indices))
+        materialization = ("expert_rows", packed)
+        active = Var("IS_PREFILL")
+    elif operator.name == "router_finalize":
+        # Weighted return MoeTokenUnpermute/MoeFinalizeRoutingV2 after expert
+        # execution and combine.  Reads the expanded BF16 rows plus the
+        # top-k indices/probabilities and returns one [M,H] dense row.
+        hidden = max(0, _int(theta.find("router_hidden", 0), 0))
+        dtype_bytes = _frac(theta.find("router_dtype_bytes", 2), 2)
+        indices_bytes = _frac(theta.find("router_indices_bytes", 4), 4)
+        prob_bytes = _frac(theta.find("router_prob_bytes", 2), 2)
+        if hidden <= 0 or dtype_bytes <= 0:
+            raise ModelingError("router_finalize_requires_dense_geometry")
+        local_tokens = Var("ROUTER_LOCAL_TOKENS")
+        rows = Mul((local_tokens, Const(top_k)))
+        packed = Mul((rows, Const(hidden * dtype_bytes)))
+        indices = Mul((local_tokens, Const(top_k * indices_bytes)))
+        probs = Mul((local_tokens, Const(top_k * prob_bytes)))
+        returned = Mul((local_tokens, Const(hidden * dtype_bytes)))
+        read = Add((packed, indices, probs))
+        # Weighted logical work: M*k*H multiplications and M*(k-1)*H
+        # reductions. These are useful logical operations, not the 65,536
+        # index bytes that the prior template mistook for vector ops.
+        weighted_ops = Add((Mul((rows, Const(hidden))),
+                            Mul((local_tokens,
+                                 Const(hidden * max(0, top_k - 1))))))
+        main = (_demand(ctx, "mte2", read), _demand(ctx, "mte3", returned),
+                _demand(ctx, "hbm", Add((read, returned))),
+                _demand(ctx, "vector", weighted_ops))
+        materialization = ("hidden", returned)
+        active = Var("IS_PREFILL")
+    else:
+        main = (_demand(ctx, "mte2", scores), _demand(ctx, "mte3", writes),
+                _demand(ctx, "hbm", Add((scores, writes))),
+                _demand(ctx, "vector", vector))
+    if comm_active is not None and operator.name in {
+            "router_permute", "router_finalize", "router_inbound",
+            "router_unweighted_reorder"}:
+        # A selected fused MC2 dispatch/combine owns local init/reorder and the
+        # weighted publication; the retained standalone route stays visible
+        # only on the generic AllToAll prefill path.  Decode keeps its existing
+        # no-standalone-launch contract.
+        active = Mul((Var("IS_PREFILL"), comm_active))
     derived = (
         ("routing_tokens", tokens), ("experts", Const(experts)),
         ("top_k", Const(top_k)), ("histogram_bins", Const(experts)),
@@ -470,9 +740,34 @@ def _compile_router(ctx: CompiledOperator, operator: BoundOperator) -> FamilyTem
     )
     return FamilyTemplate(
         axes=axes, stages=(main,),
-        materialization=(("moe_routing_ledger", writes),), internal=(),
+        materialization=(materialization,), internal=(),
         residency=Const(0), derived=derived, regime_exprs=(), binder=binder,
-        annotations=(("family", "router"), ("mode", "routing_init")),
+        active=active,
+        annotations=(
+            ("family", "router"), ("mode", "routing_init"),
+            ("selected_invocation",
+             "unweighted_local_return"
+             if operator.name == "router_unweighted_reorder"
+             else "moe_init_routing_v3_received_rows"
+             if operator.name == "router_inbound"
+             else "moe_token_permute_init_routing_v2"
+             if operator.name == "router_permute"
+             else "moe_finalize_routing_v2"
+             if operator.name == "router_finalize"
+             else "native_router_primitive"),
+            ("source_operation",
+             "MoeTokenUnpermute/MoeFinalizeRoutingV2 (unweighted)"
+             if operator.name == "router_unweighted_reorder"
+             else "MoeInitRoutingV3"
+             if operator.name == "router_inbound"
+             else "MoeTokenPermute/MoeInitRoutingV2"
+             if operator.name == "router_permute"
+             else "MoeTokenUnpermute/MoeFinalizeRoutingV2"
+             if operator.name == "router_finalize"
+             else "MoeGatingTopK/Histogram/Sort"),
+            ("source_dtype", str(theta.find("router_source_dtype", "bf16"))),
+            ("source_device", str(theta.find("router_source_device", "AIV"))),
+        ),
     )
 
 # ---------------------------------------------------------------------------
@@ -486,6 +781,8 @@ def _collective_kind(name: str, theta: Any) -> str:
         return "reduce_scatter"
     if "all_gather" in text or "allgather" in text:
         return "all_gather"
+    if text in {"gather", "gather_to_sampler"} or "gather_to_sampler" in text:
+        return "gather"
     if "alltoall" in text or "all_to_all" in text or "dispatch" in text \
             or "combine" in text:
         return "alltoallv"
@@ -546,6 +843,13 @@ def _collective_volumes(kind: str, message: Expr, ranks: int,
         intra = _coeff(Fraction(intra_ranks - 1, intra_ranks), message)
         inter = _coeff(Fraction(nodes - 1, nodes), shard) if nodes > 1 else Const(0)
     elif kind == "all_gather":
+        intra = _coeff(Fraction(intra_ranks - 1), message)
+        inter = (_coeff(Fraction((nodes - 1) * intra_ranks), message)
+                 if nodes > 1 else Const(0))
+    elif kind == "gather":
+        # Gather-to-sampler. The step waits on the sampler rank receiving
+        # every other shard. Message stays one rank's shard. This is the
+        # declared alternative to all-gather, not a second logits edge.
         intra = _coeff(Fraction(intra_ranks - 1), message)
         inter = (_coeff(Fraction((nodes - 1) * intra_ranks), message)
                  if nodes > 1 else Const(0))
@@ -639,6 +943,22 @@ def _chunk_stages(ctx: CompiledOperator, intra: Expr, inter: Expr,
         return (_stage(ctx, fill),)
     return (_stage(ctx, fill), _stage(ctx, _scale(fill, Const(chunks - 1))))
 
+def _sp_message(sp_rows: str, ranks: int, wire: Any) -> Expr:
+    """Sequence-parallel message, or the ordinary full-tensor message.
+
+    ``shard`` is the all-gather input (one rank's padded chunk).  ``padded``
+    is the reduce-scatter input (every rank holds the rank-padded full
+    tensor).  ``(-T) % R`` padding is ``ceil(T / R) * R``.
+    """
+    if not sp_rows:
+        return Mul((Var("T"), Const(wire)))
+    group = Const(max(1, int(ranks)))
+    shard_rows = CeilDiv(Var("T"), group)
+    if sp_rows == "shard":
+        return Mul((shard_rows, Const(wire)))
+    return Mul((Mul((shard_rows, group)), Const(wire)))
+
+
 def _compile_collective(ctx: CompiledOperator,
                         operator: BoundOperator) -> FamilyTemplate:
     theta = operator.theta
@@ -656,8 +976,29 @@ def _compile_collective(ctx: CompiledOperator,
     chunks = max(1, _int(theta.find("chunks"), 1))
     etp = name == "etp_allreduce" or ctx.kind == "F3"
     route = _moe_route_shape(ctx, theta) if etp else None
-    message = (Mul((Var("MOE_ROWS"), Const(wire))) if etp
-               else Mul((Var("T"), Const(wire))))
+    sp_rows = str(theta.find("sp_rows", "") or "")
+    phase_scope = str(theta.find("phase_scope", "") or "")
+    if phase_scope not in {"", "prefill", "decode"}:
+        raise ModelingError(f"collective_phase_scope_invalid:{phase_scope}")
+    if sp_rows not in {"", "shard", "padded"}:
+        raise ModelingError(f"collective_sp_rows_invalid:{sp_rows}")
+    row_binding = str(theta.find("row_binding", "") or "")
+    if row_binding not in {"", "real_q", "lm_head_selected"}:
+        raise ModelingError(f"collective_row_binding_invalid:{row_binding}")
+    if row_binding and sp_rows:
+        raise ModelingError("collective_row_binding_excludes_sp_rows")
+    if row_binding and etp:
+        raise ModelingError("collective_row_binding_excludes_etp")
+    if etp:
+        message = Mul((Var("MOE_ROWS"), Const(wire)))
+    elif row_binding == "real_q":
+        message = Mul((Var("T_VALID"), Const(wire)))
+    elif row_binding == "lm_head_selected":
+        message = Mul((Var("LM_HEAD_ROWS"), Const(wire)))
+    else:
+        message = _sp_message(sp_rows, ranks, wire)
+    if phase_scope:
+        message = Mul((Var("PHASE_ON"), message))
     matrix = _traffic_matrix(theta)
     if matrix is not None and len(matrix[0]) != ranks:
         raise ModelingError("collective_traffic_matrix_rank_count_mismatch")
@@ -674,7 +1015,7 @@ def _compile_collective(ctx: CompiledOperator,
         intra, inter = _collective_volumes(kind, message, ranks, node_ranks)
         send, hotspot = message, message
         aggregate = Mul((Add((intra, inter)), Const(ranks)))
-        if kind == "all_gather":
+        if kind in {"all_gather", "gather"}:
             output = Mul((message, Const(ranks)))
         elif kind == "reduce_scatter":
             output = Div(message, Const(ranks))
@@ -689,11 +1030,16 @@ def _compile_collective(ctx: CompiledOperator,
 
     def binder(geometry: WorkloadGeometry, state: StateView) -> dict[str, Any]:
         values = {"collective_ranks": ranks, "collective_chunks": chunks,
+                  "PHASE_ON": (1 if (not phase_scope or
+                                     geometry.phase_name == phase_scope) else 0),
                   "collective_bytes": (sum(sum(row) for row in matrix[0])
                                        if matrix is not None else 0)}
         if route is not None:
             rows = sum(_counts_for(ctx, geometry, state, *route))
             values.update(MOE_ROWS=rows, moe_rows=rows, etp_rows=rows)
+        if row_binding == "lm_head_selected":
+            values["LM_HEAD_ROWS"] = geometry.producing_lm_head_rows()
+        values.update(_moe_comm_bindings(theta, geometry))
         return values
 
     intra_pipe, inter_pipe = _link_pipes(ctx)
@@ -712,80 +1058,42 @@ def _compile_collective(ctx: CompiledOperator,
         ("alltoall_matrix_cells", Const(len(matrix) * len(matrix[0])
                                         if matrix else 0)),
     )
+    if row_binding:
+        # Payload is this rank's HCCL tensor. Logits keep the padded vocab
+        # shard. Useful bytes are the group-wide post-slice result. Peer sums
+        # add the configured group, not the DP world.
+        org = int(theta.find("org_vocab", 0) or 0)
+        width = as_fraction(theta.find("result_bytes", 0.0) or 0.0)
+        if row_binding == "lm_head_selected" and org > 0 and width > 0:
+            useful = Mul((Var("LM_HEAD_ROWS"), Const(as_fraction(org) * width)))
+        else:
+            useful = message
+        peers = Mul((message, Const(ranks)))
+        derived = derived + (
+            ("payload_bytes", message),
+            ("padded_wire_bytes", message),
+            ("useful_bytes", useful),
+            ("peer_payload_bytes", peers),
+            ("peer_padded_bytes", peers),
+        )
     return FamilyTemplate(
         axes=axes, stages=stages, materialization=(), internal=(),
         residency=Const(0), derived=derived, regime_exprs=(), binder=binder,
+        active=_moe_comm_active(theta),
         annotations=(("family", "collective"), ("collective", kind),
-                     ("topology", topology)),
+                     ("topology", topology)) + ((("sp_rows", sp_rows),)
+                                                if sp_rows else ())
+        + ((("row_binding", row_binding),) if row_binding else ()),
     )
+
 
 def _compile_transport(ctx: CompiledOperator,
                        operator: BoundOperator) -> FamilyTemplate:
-    theta = operator.theta
-    name = operator.name.lower().replace("-", "_")
-    kind = _collective_kind(name, theta)
-    ranks = _ranks(theta)
-    node_ranks = _node_ranks(theta, ranks)
-    topology = _topology(theta, ranks, node_ranks)
-    if topology == "hccs":
-        node_ranks = ranks
-    elif topology == "roce":
-        node_ranks = 1
-    row_bytes = _frac(theta.find("row_bytes", 0.0), 0.0)
-    top_k = max(1, _int(theta.find("top_k", theta.find("k", 1)), 1))
-    latent = max(1, _int(theta.find("latent", 1), 1))
-    wire_bytes = _frac(theta.find("wire_bytes", 0.0), 0.0)
-    chunks = max(1, _int(theta.find("chunks"), 1))
-    overlap = max(0, _int(theta.find("overlap"), 0))
-    mtu = max(1, _int(theta.find("mtu_bytes"), DEFAULT_MTU))
-    # Accept either one latent-width row or a row already expanded by top-k;
-    # normalize to one routed row and then apply top-k exactly once.
-    declared_row = as_fraction(latent) * wire_bytes
-    single_row = (declared_row
-                  if declared_row > 0 and row_bytes in (declared_row,
-                                                        declared_row * top_k)
-                  else row_bytes) or declared_row
-    rows = Mul((Var("T"), Const(top_k)))
-    message = Mul((rows, Const(single_row)))
-    matrix = _traffic_matrix(theta)
-    if matrix is not None and len(matrix[0]) != ranks:
-        raise ModelingError("collective_traffic_matrix_rank_count_mismatch")
-    if matrix is not None:
-        intra, inter, send, hotspot, aggregate, _ = _matrix_volumes(
-            matrix[0], node_ranks, mtu, matrix[1], Var("T"))
-        hbm = Add((send, hotspot))
-    else:
-        intra, inter, send, hotspot, aggregate = _uniform_alltoallv(
-            message, ranks, node_ranks, mtu)
-        hbm = Add((send, hotspot))
-    intra, inter = _round_expr(intra, mtu), _round_expr(inter, mtu)
-    mt = max(1, _int(theta.find("mt", ctx.policy.mt), ctx.policy.mt))
-    axes = (SegmentAxis("TOKEN_TILES", "tokens",
-                        StepGuard("transport_tiles", "tokens", mt),
-                        "max_tokens"),)
+    """Routed transport lowering lives in the sibling module.
 
-    def binder(geometry: WorkloadGeometry, state: StateView) -> dict[str, Any]:
-        return {"transport_ranks": ranks, "transport_chunks": chunks,
-                "transport_overlap": overlap}
-
-    intra_pipe, inter_pipe = _link_pipes(ctx)
-    stages = _chunk_stages(ctx, intra, inter, hbm, chunks, intra_pipe, inter_pipe, ranks, node_ranks)
-    derived = (
-        ("routed_rows", rows), ("peer_bytes", message),
-        ("transport_row_bytes", Const(single_row)),
-        ("send_bytes", send), ("recv_hotspot", hotspot),
-        ("aggregate_wire_bytes", aggregate),
-        ("intra_bytes", intra), ("inter_bytes", inter),
-        ("chunks", Const(chunks)), ("overlap", Const(overlap)),
-        ("latent", Const(latent)), ("top_k", Const(top_k)),
-        ("ranks", Const(ranks)), ("nodes", Const(math.ceil(ranks / node_ranks))),
-        ("ranks_per_node", Const(node_ranks)), ("mtu_bytes", Const(mtu)),
-        ("local_hbm_bytes", hbm), ("cohort_batch", Var("EP_B")),
-    )
-    return FamilyTemplate(
-        axes=axes, stages=stages,
-        materialization=(("peer_traffic", message),), internal=(),
-        residency=Const(0), derived=derived, regime_exprs=(), binder=binder,
-        annotations=(("family", "transport"), ("collective", kind),
-                     ("topology", topology)),
-    )
+    Kept as a stable re-export because the family registry and the matrix
+    sibling import this name; the import is lazy so the two modules do not
+    form an import cycle.
+    """
+    from .families_moe_transport import _compile_transport as compile_transport
+    return compile_transport(ctx, operator)

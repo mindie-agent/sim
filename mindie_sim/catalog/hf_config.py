@@ -325,6 +325,11 @@ def native_coverage(config, gaps, *, plans, quant):
         "unconsumed_config_fields": unconsumed,
         "declared_quantization": c.get("quantization_config", {}),
         "source_model_type": c.get("model_type", ""),
+        **({"routed_scaling_factor": c["routed_scaling_factor"]}
+           if isinstance(c.get("routed_scaling_factor"), (int, float))
+           and not isinstance(c.get("routed_scaling_factor"), bool) else {}),
+        **({"rope_parameters": c["rope_parameters"]}
+           if isinstance(c.get("rope_parameters"), Mapping) else {}),
     }
     return tuple(sorted(immutable_sequences(metadata).items()))
 

@@ -136,6 +136,7 @@ class LayerPlan:
     conv_width: int = 0
     recurrent_state_elements: int = 0
     recurrent_state_dtype: str = "fp32"
+    kda_gate_lower_bound: float | None = None
     conv_state_elements: int = 0
     conv_state_dtype: str = "bf16"
     kv_cache_elements: int = 0

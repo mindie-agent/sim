@@ -21,6 +21,7 @@ from .mla_structure import declare_indexer
 from .compression import compressor
 from .indexer_representation import index_representation
 from .mla_native import batched_matrix_metadata, index_layer_norm
+from . import family_paged_mla
 from .projections import mla_input_projections
 from . import mla_head_padding
 from .cache_representation import store as representation_store
@@ -67,6 +68,17 @@ def _attention_tensor_view(plan, view, heads, model, quant, parallel):
             "query_rope_shape": (view.q_len, heads, plan.qk_rope_head_dim),
             "cache_head_shape": (1, plan.kv_lora_rank),
             "rope_cache_head_shape": (1, plan.qk_rope_head_dim),
+        }),)
+    if (plan.mla_variant == "latent_mla" and plan.cache_kind == "dense"
+            and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16"):
+        query = (view.q_len, heads, plan.kv_lora_rank + plan.qk_rope_head_dim)
+        return (("attention_tensor_view", {
+            **common, "kind": "dense_paged_latent",
+            "query_shape": query,
+            "cache_head_shape": (1, plan.kv_lora_rank + plan.qk_rope_head_dim),
+            "output_shape": (heads, view.q_len, plan.kv_lora_rank),
+            "page_size": int(getattr(parallel, "kv_block_size", 0) or 0),
+            "source_scope": "generic_dense_latent_online_attention",
         }),)
     if (plan.mla_variant == "latent_mqa" and plan.cache_kind == "window_compressed"
             and plan.head_dim == plan.qk_nope_head_dim + plan.qk_rope_head_dim):
@@ -547,7 +559,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         for q_part, c_part in parts)
                     for r in range(cp)
                 )
-        transfer = query * heads * (qk_dim + latent_dim) * dtype_bytes(model.activation_dtype)
+        # Q and output are distinct source payloads.  The old half-transfer
+        # split charged both ports the mean (13056B here), hiding Qread+out.
+        q_read = query * heads * qk_dim * dtype_bytes(model.activation_dtype)
+        out_write = query * heads * latent_dim * dtype_bytes(model.activation_dtype)
         cache_read = sweeps * plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
         if plan.cache_kind == "window_compressed":
             original_rows = sum(
@@ -565,11 +580,32 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             (query, view.kv_len, heads, qk_dim, latent_dim),
             flops=2 * local_pairs * heads * (qk_dim + latent_dim),
             vector=5 * local_pairs * heads,
-            read=cache_read / cp + selection_reads + transfer / 2,
-            write=transfer / 2, family="attention",
+            read=cache_read / cp + selection_reads + q_read,
+            write=out_write, family="attention",
             metadata=(("query_tile", query_tile), ("logical_pairs", pairs), ("kv_sweeps", sweeps))
                      + selection_metadata
                      + _attention_tensor_view(plan, view, heads, model, quant, parallel)
+                     + ((("program_kind", "dense_latent_attention_generic"),)
+                        if latent and view.phase == "decode" and query == 1
+                        and plan.cache_kind == "dense" and not topk
+                        and not plan.indexer
+                        and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16" else ())
+                     + ((("latent_attention_schedule", {
+                         "heads": heads, "query_rows": query, "keys": view.kv_len,
+                         "qk_dim": qk_dim, "latent_dim": latent_dim,
+                         "dv": int(latent_dim),
+                         "q_bytes": query * heads * qk_dim * dtype_bytes(model.activation_dtype),
+                         "kv_row_bytes": plan.cache_row_elements * dtype_bytes(quant.kv_dtype),
+                         "kv_unique_bytes": plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
+                                             * view.kv_len,
+                         "output_bytes": query * heads * latent_dim * dtype_bytes(model.activation_dtype),
+                         "owners": max(1, min(32, math.ceil(view.kv_len / 128))),
+                         "tile_keys": 128,
+                         "page_size": int(getattr(runtime, "kv_block_size", 0) or 128),
+                         "source_scope": "generic_online_attention",
+                     }),) if latent and view.phase == "decode" and query == 1
+                     and plan.cache_kind == "dense" and not topk and not plan.indexer
+                     and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16" else ())
                      + ((("mla_head_contract", dict(head_contract)),) if head_contract else ())
                      + ((("sparse_kv_offload", offload_info),) if offload_info else ()),
         )
@@ -609,7 +645,9 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             b.ops, outputs, selection=mixed_quant, views=views, plan=plan,
             topk_present=bool(topk), prefix=prefix)
     if not selected and plan.cache_kind == "dense" and cp == 1 and parallel.pcp == 1:
+        from .generic_latent_attention import batch_ops as _batch_dense
         from .indexed_attention import batch_analytic_ops
+        outputs = _batch_dense(b.ops, outputs, runtime=runtime, views=views, prefix=prefix)
         outputs = batch_analytic_ops(b.ops, outputs, runtime=runtime, views=views, prefix=prefix)
     heads = logical_heads
     if latent:

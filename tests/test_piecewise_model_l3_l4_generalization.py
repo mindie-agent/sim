@@ -225,7 +225,24 @@ def test_l3_width_batch_and_context_are_monotonic():
             assert _ms(cache, build(512, 256, 32), supply, baseline) > body
         assert _ms(cache, small, supply, longer_q) > body
         assert _ms(cache, small, supply, wider_batch) > _ms(cache, small, supply, _prefill(32, context=0))
-        assert _ms(cache, small, supply, long_ctx) > _ms(cache, small, supply, short_ctx)
+        short_pred = pipe.forward(short_ctx)
+        long_pred = pipe.forward(long_ctx)
+        short_body = float(short_pred.total_ms)
+        long_body = float(long_pred.total_ms)
+
+        def attention_bytes(prediction) -> float:
+            return sum(
+                float(row.cost.pipe_work("hbm")) + float(row.cost.pipe_work("mte2"))
+                for row in prediction.rows
+                if row.cost.family in {"attention", "mla"}
+            )
+
+        # KV context is real work even when a sliding window/declared floor
+        # keeps elapsed time flat.  Assert the work identity separately.
+        assert attention_bytes(long_pred) > attention_bytes(short_pred)
+        # Elapsed time is monotonic; it may be flat when a declared floor or
+        # window masks the real work growth asserted above.
+        assert long_body >= short_body
 
 
 def test_l3_hbm_cores_and_pipes_speed_up_every_family():
@@ -280,13 +297,16 @@ def test_l4_cohort_batch_and_wave_conservation():
         phase="prefill", concurrency=4, dp=4, ep=1, layers=2, graph_buckets=(), prompt_tokens=9000,
     ) == 1.0
     assert service_ttft_overhead_ms(prompt_tokens=4096, tp=1, ep=1) == 0.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=1) == 35.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=8, ep=2) == 145.0
-    assert service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=2) == 95.0
-    assert service_ttft_overhead_ms(prompt_tokens=2048, tp=1, ep=1) == pytest.approx(35.0 * 0.45)
+    # Host time is declared, not synthesized from prompt/TP/EP.
     assert service_ttft_overhead_ms(
-        prompt_tokens=2048, tp=1, ep=2, short_ep_host_ms=80.0,
-    ) == pytest.approx(80.0 * 0.45)
+        prompt_tokens=1024, tp=1, ep=1, host_overhead_ms=35.0) == 35.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=8, ep=2, host_overhead_ms=145.0) == 145.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=2048, tp=1, ep=2, host_overhead_ms=95.0) == 95.0
+    assert service_ttft_overhead_ms(
+        prompt_tokens=4096, tp=8, ep=2, host_overhead_ms=35.0) == 35.0
+
     assert clamp_graph_bucket(0, 4, 2) == 0
     assert clamp_graph_bucket(3, 5, 1) == 0
     assert clamp_graph_bucket(32, 5, 1) == 32
@@ -309,13 +329,17 @@ def test_l4_cohort_batch_and_wave_conservation():
     assert forwarded.rows[0].cost.get("moe_rows") == direct.operators[0].get("moe_rows")
     body = float(prediction.total_ms)
     overhead = service_ttft_overhead_ms(prompt_tokens=1024, tp=1, ep=4)
-    waves = local
-    scale = chunked_prefill_mean_ttft_ms(
+    mean_ttft = chunked_prefill_mean_ttft_ms(
         [8192] * 8, dp=4, max_batched_tokens=8192, body_one=lambda tok: 1.0,
-    ) / waves
-    assert overhead == 95.0
-    assert scale * waves == pytest.approx((waves + 1) / 2.0)
-    assert body * scale + overhead > body
+    )
+    assert overhead == 0.0
+    # Four ranks each serve two one-chunk requests: finishes 1 and 2 bodies.
+    assert mean_ttft == pytest.approx(1.5)
+    assert body * mean_ttft + overhead > body
+    assert body * mean_ttft + service_ttft_overhead_ms(
+        prompt_tokens=1024, tp=1, ep=4, host_overhead_ms=12.5,
+    ) == pytest.approx(body * 1.5 + 12.5)
+
     ragged = WorkloadGeometry(
         (RequestGeometry(1, 15, phase="prefill"), RequestGeometry(3, 13, phase="prefill")),
         cohort_batch=4, phase="prefill",

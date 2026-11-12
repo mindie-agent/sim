@@ -1,5 +1,6 @@
 """Independent causal checks for the device invocation boundary."""
 import pytest
+from types import MappingProxyType
 
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
 from mindie_sim.prediction.invocation import InvocationProgram, InvocationTiming
@@ -271,3 +272,40 @@ def test_empty_body_is_an_explicit_declared_invocation(startup, minimum, expecte
     assert engine.serviced["cube"] == 0
     assert engine.summary()["live_tasks"] == 0
     assert engine.summary()["live_programs"] == 0
+
+
+def test_stage_snapshots_external_mapping_views_and_sequences():
+    raw = {"vector": 1}
+    caps = {"vector": 2}
+    placement = {"vector": (0,)}
+    after = []
+    acquire = []
+    free = []
+    previous = []
+    stage = Stage(
+        "x", work=MappingProxyType(raw), caps=MappingProxyType(caps),
+        placement=MappingProxyType(placement), after=after,
+        acquire=acquire, free=free, previous=previous)
+    raw["vector"] = 99
+    caps["vector"] = 99
+    placement["vector"] = (1,)
+    after.append("foreign_new")
+    acquire.append("foreign_acquire")
+    free.append("foreign_free")
+    previous.append("foreign_previous")
+    assert stage.work["vector"] == 1
+    assert stage.caps["vector"] == 2
+    assert stage.placement["vector"] == (0,)
+    assert stage.after == ()
+    assert stage.acquire == ()
+    assert stage.free == ()
+    assert stage.previous == ()
+
+    empty = {}
+    empty_after = []
+    empty_stage = Stage("empty", work=empty, after=empty_after)
+    empty["foreign"] = 1
+    empty_after.append("foreign")
+    assert dict(empty_stage.work) == {}
+    assert empty_stage.after == ()
+    assert empty_stage.work is Stage("empty").work

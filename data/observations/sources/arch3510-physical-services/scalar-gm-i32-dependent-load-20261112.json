@@ -1,0 +1,147 @@
+{
+  "schema": "mindie-a5-observed-scalar-gm-two-table-random-depth/1",
+  "status": "observed_data_only_no_product_roles",
+  "correction": {
+    "supersedes": "previous SATGATHER2 four linear load roles: cache_1chain 16.5625 ns/load, cache_2chain 4.61914 ns/load, hbm_1chain 90.83985 ns/load, hbm_2chain 48.15755 ns/load",
+    "reason": "Small 16KiB footprint is nonlinear across D0->128->256->512; old 33.125/18.477 ns/step were endpoint secants D128->D512, not general rates or D0-subtracted linear services. Large 128MiB is stable only within its measured depth domain; HBM/cache labels were not instrumented.",
+    "normal_profile_action": "No SATGATHER3 roles are installed. The four probe-depth-specific step roles were removed from both A5 profiles; the small-domain values remain evidence only."
+  },
+  "raw": {
+    "run_jsonl_sha256": "b609742d5bca022a3478de836f3fb3aa3a9307be3a51994ae82819ce7b1706ae",
+    "events": 112,
+    "cases": 16,
+    "event_launches_per_case": 7,
+    "device_event_clock": "ACL record/launch/record; host submit separate",
+    "d0_base_retained": true,
+    "kernel_source_sha256": "658f4a018c78d04938790ee6181f227e7e7fb61780ec741efdb4eb5a415d80bd",
+    "kernel_object_sha256": "5f76758f6b61f7d5614d03a7dcadc121412f4e78f6a2f5e9d94655dae1215eb5",
+    "host_source_sha256": "3eb7302e4f4f4f525e35a8d3c35b9975d290f06d631db67cabb3a17857a19453",
+    "host_binary_sha256": "d12d88e51d664aea04c83659519c3d416097a5a4a2a088ed90ef1da39f428dff",
+    "packet_sha256": "13f565e4480b89988ad562a683de88e3ba6d83c46f51d0022b7b6144f978c47f"
+  },
+  "hardware": {
+    "soc": "Ascend950DT_9582",
+    "arch": "A5/arch3510",
+    "host": "177.25.28.1",
+    "physical_device": 4,
+    "logical_device": 0,
+    "image": "sha256:9e869e8148467296f56d1001b0dac4fea893c841ac7d0a03d4e824a233c2ffea",
+    "cann": "9.2.0",
+    "compiler": "bisheng clang 15.0.5",
+    "blocks": 1,
+    "active_owner": "one AIV",
+    "lease_id": "satgather2-scalar-20261112T2153Z",
+    "lease_released": "2026-11-11T21:53:11Z"
+  },
+  "methodology": {
+    "kernel": "native AscendC AIV; two dependent int32 GlobalTensor<int32>::GetValue per step: table0 then table1",
+    "tables": "two independent random single-cycle permutations; start0=0; two chains start1=n/2",
+    "depths": [
+      0,
+      128,
+      256,
+      512
+    ],
+    "chains": [
+      1,
+      2
+    ],
+    "small_16k": {
+      "n_per_table": 2048,
+      "working_set_bytes": 16384
+    },
+    "large_128m": {
+      "n_per_table": 16777216,
+      "working_set_bytes": 134217728
+    },
+    "interval": "median event time at each depth; segment=(T_hi-T_lo)/(depth_hi-depth_lo); D0 base retained but cancels in segment differences",
+    "no_claim": [
+      "HBM level",
+      "cache level/hit/miss",
+      "L2 residency",
+      "universal dependent latency",
+      "queue depth/MLP beyond measured chain count",
+      "inverse clock equals latency"
+    ]
+  },
+  "small_16k_segments_data_only": {
+    "1chain_ns_per_2load_step": {
+      "128_256": 59.10938489062501,
+      "256_512": 20.132814824218748
+    },
+    "2chain_ns_per_4total_load_step": {
+      "128_256": 32.11719740624999,
+      "256_512": 11.656244167968746
+    },
+    "event_medians_us": {
+      "1chain": {
+        "d0": 7.369999774,
+        "d128": 20.16199939,
+        "d256": 27.728000656,
+        "d512": 32.882001251
+      },
+      "2chain": {
+        "d0": 7.37999985,
+        "d128": 20.239999518,
+        "d256": 24.351000786,
+        "d512": 27.334999293
+      }
+    },
+    "installed_as_normal_rate": false,
+    "superseded_endpoint_secants_ns_per_step": {
+      "1chain_old": 33.125004846354166,
+      "2chain_old": 18.476561914062493
+    }
+  },
+  "large_128m_segments": {
+    "event_medians_us": {
+      "1chain": {
+        "d0": 7.395999972,
+        "d128": 28.847999871,
+        "d256": 52.09299922,
+        "d512": 98.613001406
+      },
+      "2chain": {
+        "d0": 7.368000224,
+        "d128": 30.140999705,
+        "d256": 54.87100035,
+        "d512": 104.111000896
+      }
+    },
+    "1chain_ns_per_2load_step": {
+      "128_256": 181.60155741406254,
+      "256_512": 181.71875853906246
+    },
+    "2chain_ns_per_4total_load_step": {
+      "128_256": 193.20313003906253,
+      "256_512": 192.34375213281245
+    },
+    "stability": "two adjacent intervals differ 0.065% (1chain) and 0.445% (2chain); still only the measured 128-512 depth domain"
+  },
+  "mqs_decision": {
+    "wire_by_default": false,
+    "reason": "Working Mqs source starts contiguous row indices and then a page table with 16 independent rows; it has no long dependency across rows and does not match this two-table random-cycle topology.",
+    "action": "no MQS source edit; no synthetic K3/DS improvement; MQSADDR1 owns selected source count/DAG"
+  },
+  "limits": [
+    "one die/SKU, one AIV block",
+    "no PMU/cache counters",
+    "synthetic random two-cycle table pair, not Mqs execution",
+    "no target fit",
+    "no other profile or consumer hidden rates"
+  ],
+  "measurement_identity": {
+    "soc": "Ascend950DT_9582",
+    "arch": "A5/arch3510",
+    "physical_device": 4,
+    "logical_device": 0,
+    "blocks": 1,
+    "active_owner": "one AIV"
+  },
+  "product_roles_installed": false,
+  "normal_processor_primitives": {
+    "scalar_gm_access": "unpriced normal source tag",
+    "scalar_alu_issue": "unpriced normal source tag",
+    "actual_mqs_source": "unchanged"
+  }
+}

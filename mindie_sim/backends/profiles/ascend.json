@@ -4098,6 +4098,146 @@
         "l0c": 32,
         "ub": 64
       },
+      "compute_arch": {
+        "instruction_services": {
+          "pipe_v_lanes": {
+            "unit": "lanes",
+            "owner_axis": "vector",
+            "per_owner_rate": 105600000000.0,
+            "provenance": {
+              "kind": "ascend_a5_reg_pipe_v_lane",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 REG PIPE_V/AIV shared lane port: 64 lanes/cycle/AIV at 1.65GHz; op weights encode Duplicate64, Sub32, Abs64, Mins64, Reduce64",
+              "excludes": [
+                "A2/A3 table rows",
+                "independent per-op capacity",
+                "instruction issue"
+              ]
+            }
+          },
+          "pipe_v_issue": {
+            "unit": "instructions",
+            "owner_axis": "vector",
+            "per_owner_rate": 3300000000.0,
+            "provenance": {
+              "kind": "ascend_a5_reg_pipe_v_issue",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "sha256": "ef02731ce5e726fd",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 REG PIPE_V/AIV shared issue: VBR/VSUB/VABS/VMINS dual-issue 2/cycle; source PIPE_V barriers order the four calls",
+              "excludes": [
+                "barrier latency",
+                "reduce instruction issue",
+                "independent per-op capacity"
+              ]
+            }
+          },
+          "ub_read_bytes": {
+            "unit": "bytes",
+            "owner_axis": "vector",
+            "per_owner_rate": 422400000000.0,
+            "provenance": {
+              "kind": "ascend_a5_ub_read_port",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md table1",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 UB b32 aligned LoadAlign 64 elements/cycle/AIV =256B/cycle/AIV at1.65GHz; shared read port across opcodes",
+              "excludes": [
+                "scalar GetValue issue",
+                "bank conflicts",
+                "A2/A3 rows"
+              ]
+            }
+          },
+          "ub_write_bytes": {
+            "unit": "bytes",
+            "owner_axis": "vector",
+            "per_owner_rate": 422400000000.0,
+            "provenance": {
+              "kind": "ascend_a5_ub_write_port",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md table2",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 UB b32 aligned StoreAlign 64 elements/cycle/AIV =256B/cycle/AIV at1.65GHz; shared write port across opcodes",
+              "excludes": [
+                "BF16 UB-to-GM scalar_store_issue",
+                "scalar SetValue issue",
+                "A2/A3 rows"
+              ]
+            }
+          },
+          "pipe_s_issue": {
+            "unit": "calls",
+            "owner_axis": "vector",
+            "clock_hz": 1650000000.0,
+            "cycles_per_unit": 1.0,
+            "provenance": {
+              "kind": "ascend_a5_pipe_s_issue",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit api_pipeline_type_summary.md:166 PIPE_S; vector_instruction_theoretical_perf_summary.md:59 table4 GetSFFValue CPI1",
+              "sha256": "f823bb9954a04c00",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 AIV PIPE_S shared scalar issue: one instruction per cycle at independent declared 1.65GHz clock; GetSFFValue U64->I64 uses this resource",
+              "excludes": [
+                "generic scalar ALU",
+                "UB scalar GetValue/SetValue",
+                "barrier/V_S latency"
+              ]
+            }
+          },
+          "get_sff_value_u64_i64": {
+            "unit": "calls",
+            "owner_axis": "vector",
+            "resource": "pipe_s_issue",
+            "clock_hz": 1650000000.0,
+            "cycles_per_unit": 1.0,
+            "provenance": {
+              "kind": "ascend_a5_typed_pipe_s_op",
+              "architecture": "A5/arch3510",
+              "source": "moe_distribute_combine_v2_a5_mte.h:982 ScalarGetSFFValue<0>(flagCompMask); vector_instruction_theoretical_perf_summary.md:59 table4 GetSFFValue U64->I64 CPI1; api_pipeline_type_summary.md:166 PIPE_S",
+              "sha256": "133aef717fce163e06f942c82ffb162e5cc0fe8d8e9c56fcbaaccd13afd63429",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "exact A5 typed op; per active receive AIV owner; shares pipe_s_issue with other PIPE_S ops; 17 calls=10.303ns and 30 calls=18.182ns at1.65GHz before contention",
+              "excludes": [
+                "generic scalar_alu_issue price",
+                "non-PIPE_S scalar ops",
+                "A2/A3 tables"
+              ]
+            }
+          },
+          "gm_hbm_cacheline_128b": {
+            "unit": "cachelines",
+            "owner_axis": "vector",
+            "per_owner_rate": 488281250.0,
+            "provenance": {
+              "kind": "ascend_a5_hbm_128b_cacheline_transaction",
+              "architecture": "A5/arch3510",
+              "source": "npu_arch_3510.md:28 external128B granularity/128KiB SIMT DCache; device.rates.hbm=4000000000000B/s; scalar-dma constraints state no isolated GetValue/atomic latency",
+              "sha256": "b5b8c28b0bec5b8f462b7e0dc58769c577abb264207e3265eb01487e93d0fbca",
+              "revision": "Ascend950DT_9581/9582 arch3510 profile + retained scalar-dma review 20261112",
+              "mode": "peak HBM 128B line throughput, equal per-AIV share; not scalar issue or response latency",
+              "scope": "only an independently supplied count of unique HBM 128-byte line transactions; atomic RMW counts read+write lines=2; no fabricated hit/miss; no dependent pointer latency or queue-depth claim",
+              "excludes": [
+                "scalar_gm_access call price",
+                "scalar_alu_issue price",
+                "GetSFFValue/PIPE_S 1.65GHz",
+                "BF16 scalar_store_issue queue",
+                "dependent pointer-chase response latency",
+                "queue depth/MLP/outstanding requests",
+                "L1/L2 hit rate or latency",
+                "A2/A3 rows"
+              ]
+            }
+          }
+
+        }
+      },
       "kernel_invocations": {
         "vector": {
           "startup_ms": 0,
@@ -4458,6 +4598,146 @@
         "l0b": 32,
         "l0c": 32,
         "ub": 64
+      },
+      "compute_arch": {
+        "instruction_services": {
+          "pipe_v_lanes": {
+            "unit": "lanes",
+            "owner_axis": "vector",
+            "per_owner_rate": 105600000000.0,
+            "provenance": {
+              "kind": "ascend_a5_reg_pipe_v_lane",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 REG PIPE_V/AIV shared lane port: 64 lanes/cycle/AIV at 1.65GHz; op weights encode Duplicate64, Sub32, Abs64, Mins64, Reduce64",
+              "excludes": [
+                "A2/A3 table rows",
+                "independent per-op capacity",
+                "instruction issue"
+              ]
+            }
+          },
+          "pipe_v_issue": {
+            "unit": "instructions",
+            "owner_axis": "vector",
+            "per_owner_rate": 3300000000.0,
+            "provenance": {
+              "kind": "ascend_a5_reg_pipe_v_issue",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_instruction_single_dual_issue_summary.md",
+              "sha256": "ef02731ce5e726fd",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 REG PIPE_V/AIV shared issue: VBR/VSUB/VABS/VMINS dual-issue 2/cycle; source PIPE_V barriers order the four calls",
+              "excludes": [
+                "barrier latency",
+                "reduce instruction issue",
+                "independent per-op capacity"
+              ]
+            }
+          },
+          "ub_read_bytes": {
+            "unit": "bytes",
+            "owner_axis": "vector",
+            "per_owner_rate": 422400000000.0,
+            "provenance": {
+              "kind": "ascend_a5_ub_read_port",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md table1",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 UB b32 aligned LoadAlign 64 elements/cycle/AIV =256B/cycle/AIV at1.65GHz; shared read port across opcodes",
+              "excludes": [
+                "scalar GetValue issue",
+                "bank conflicts",
+                "A2/A3 rows"
+              ]
+            }
+          },
+          "ub_write_bytes": {
+            "unit": "bytes",
+            "owner_axis": "vector",
+            "per_owner_rate": 422400000000.0,
+            "provenance": {
+              "kind": "ascend_a5_ub_write_port",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit reg_vector_compute_interface_theoretical_perf_summary.md table2",
+              "sha256": "5bcad7b9043fbbed",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 UB b32 aligned StoreAlign 64 elements/cycle/AIV =256B/cycle/AIV at1.65GHz; shared write port across opcodes",
+              "excludes": [
+                "BF16 UB-to-GM scalar_store_issue",
+                "scalar SetValue issue",
+                "A2/A3 rows"
+              ]
+            }
+          },
+          "pipe_s_issue": {
+            "unit": "calls",
+            "owner_axis": "vector",
+            "clock_hz": 1650000000.0,
+            "cycles_per_unit": 1.0,
+            "provenance": {
+              "kind": "ascend_a5_pipe_s_issue",
+              "architecture": "A5/arch3510",
+              "source": "asc-devkit api_pipeline_type_summary.md:166 PIPE_S; vector_instruction_theoretical_perf_summary.md:59 table4 GetSFFValue CPI1",
+              "sha256": "f823bb9954a04c00",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "A5 AIV PIPE_S shared scalar issue: one instruction per cycle at independent declared 1.65GHz clock; GetSFFValue U64->I64 uses this resource",
+              "excludes": [
+                "generic scalar ALU",
+                "UB scalar GetValue/SetValue",
+                "barrier/V_S latency"
+              ]
+            }
+          },
+          "get_sff_value_u64_i64": {
+            "unit": "calls",
+            "owner_axis": "vector",
+            "resource": "pipe_s_issue",
+            "clock_hz": 1650000000.0,
+            "cycles_per_unit": 1.0,
+            "provenance": {
+              "kind": "ascend_a5_typed_pipe_s_op",
+              "architecture": "A5/arch3510",
+              "source": "moe_distribute_combine_v2_a5_mte.h:982 ScalarGetSFFValue<0>(flagCompMask); vector_instruction_theoretical_perf_summary.md:59 table4 GetSFFValue U64->I64 CPI1; api_pipeline_type_summary.md:166 PIPE_S",
+              "sha256": "133aef717fce163e06f942c82ffb162e5cc0fe8d8e9c56fcbaaccd13afd63429",
+              "revision": "56500ea0dc219380f50f4a17ce73ef5264f830fc",
+              "scope": "exact A5 typed op; per active receive AIV owner; shares pipe_s_issue with other PIPE_S ops; 17 calls=10.303ns and 30 calls=18.182ns at1.65GHz before contention",
+              "excludes": [
+                "generic scalar_alu_issue price",
+                "non-PIPE_S scalar ops",
+                "A2/A3 tables"
+              ]
+            }
+          },
+          "gm_hbm_cacheline_128b": {
+            "unit": "cachelines",
+            "owner_axis": "vector",
+            "per_owner_rate": 488281250.0,
+            "provenance": {
+              "kind": "ascend_a5_hbm_128b_cacheline_transaction",
+              "architecture": "A5/arch3510",
+              "source": "npu_arch_3510.md:28 external128B granularity/128KiB SIMT DCache; device.rates.hbm=4000000000000B/s; scalar-dma constraints state no isolated GetValue/atomic latency",
+              "sha256": "b5b8c28b0bec5b8f462b7e0dc58769c577abb264207e3265eb01487e93d0fbca",
+              "revision": "Ascend950DT_9581/9582 arch3510 profile + retained scalar-dma review 20261112",
+              "mode": "peak HBM 128B line throughput, equal per-AIV share; not scalar issue or response latency",
+              "scope": "only an independently supplied count of unique HBM 128-byte line transactions; atomic RMW counts read+write lines=2; no fabricated hit/miss; no dependent pointer latency or queue-depth claim",
+              "excludes": [
+                "scalar_gm_access call price",
+                "scalar_alu_issue price",
+                "GetSFFValue/PIPE_S 1.65GHz",
+                "BF16 scalar_store_issue queue",
+                "dependent pointer-chase response latency",
+                "queue depth/MLP/outstanding requests",
+                "L1/L2 hit rate or latency",
+                "A2/A3 rows"
+              ]
+            }
+          }
+
+        }
       },
       "kernel_invocations": {
         "vector": {

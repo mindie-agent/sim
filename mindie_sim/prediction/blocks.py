@@ -11,20 +11,37 @@ from __future__ import annotations
 from dataclasses import replace
 
 from mindie_sim.catalog.ops import gemm_op, vector_op
+from mindie_sim.catalog.types import norm_role
 from mindie_sim.schema.common import dtype_bytes
 from .structure_groups import declare_group, source_reference
 
 
 def norm(*, name, deps, stage, layer, requests, tokens, width, model, mode):
     semantics = dict(model.catalog_facts).get("normalization", {})
+    act_bytes = dtype_bytes(model.activation_dtype)
+    role = norm_role(name)
+    quant = getattr(model, "quant", None)
+    if quant is not None:
+        gamma_runtime = quant.norm_gamma_bytes(width, role)
+        gamma_storage = quant.norm_gamma_bytes(width, role, source=True)
+        gamma_format = quant.norm_gamma_format(role)
+        gamma_storage_format = quant.norm_gamma_format(role, source=True)
+    else:
+        gamma_runtime = gamma_storage = width * act_bytes
+        gamma_format = gamma_storage_format = model.activation_dtype
     return vector_op(
         op_id=name, deps=tuple(deps), stage=stage, layer=layer, requests=requests,
         elements=tokens * width, ops_per_element=5, dtype=model.activation_dtype,
         family="rmsnorm", phase=mode, recipe="rmsnorm", shape=(tokens, width),
-        read_bytes_override=(tokens + 1) * width * dtype_bytes(model.activation_dtype),
-        write_bytes_override=tokens * width * dtype_bytes(model.activation_dtype),
+        read_bytes_override=tokens * width * act_bytes + gamma_runtime,
+        write_bytes_override=tokens * width * act_bytes,
         metadata=(("reduction_width", width), ("norm_has_weight", True),
-                  ("norm_eps", model.norm_eps)) + tuple(
+                  ("norm_eps", model.norm_eps),
+                  ("norm_gamma_role", role),
+                  ("norm_gamma_runtime_bytes", gamma_runtime),
+                  ("norm_gamma_storage_bytes", gamma_storage),
+                  ("norm_gamma_runtime_format", gamma_format),
+                  ("norm_gamma_storage_format", gamma_storage_format)) + tuple(
                       (key, semantics[key]) for key in
                       ("norm_weight_offset", "norm_multiply_before_output_cast")
                       if key in semantics),

@@ -21,12 +21,34 @@ def expand_call(op, kernels):
              if key in semantic}
     inherited = {key: value for key, value in op.metadata
                  if key in {"graph_captured", "graph_segment"}}
+    # A fused source call owns one actual invocation.  Propagate the shared
+    # membership and timing owner into every child so a later binding of a
+    # child cannot mint its own call/charge.  Identity itself stays derived.
+    declared = meta.get("native_call")
+    shared_call = None
+    if isinstance(declared, dict) and len(declared.get("kernels") or ()) > 1:
+        shared_call = {
+            **declared,
+            "members": {
+                "op_ids": [ids[child.op_id] for child in children],
+                "charge": "call",
+                "charge_note": "priced once at timing_owner.op_id",
+            },
+            "timing_owner": {"op_id": op.op_id, "scope": "call"},
+        }
+
+    def child_metadata(child):
+        metadata = {**inherited, **dict(child.metadata), **scope}
+        if shared_call is not None:
+            metadata["native_call"] = shared_call
+        return tuple(metadata.items())
+
     expanded = tuple(replace(
         child, op_id=ids[child.op_id],
         deps=tuple(dict.fromkeys((*op.deps, *(ids[dep] for dep in child.deps)))),
         stage=op.stage, layer=op.layer, requests=op.requests, phase=op.phase,
         stream=child.stream or op.stream,
-        metadata=tuple({**inherited, **dict(child.metadata), **scope}.items()),
+        metadata=child_metadata(child),
     ) for child in children)
     consumed = {dep for child in children for dep in child.deps}
     terminal = tuple(ids[child.op_id] for child in children if child.op_id not in consumed)

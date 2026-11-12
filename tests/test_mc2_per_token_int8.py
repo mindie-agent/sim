@@ -49,7 +49,7 @@ def test_real_frontend_uses_received_row_scale_once_and_preserves_down_quantizer
     assert (up.flops, up.hbm_bytes, up.mte2_bytes, up.mte3_bytes) == (
         old[up.op_id].flops, old[up.op_id].hbm_bytes, old[up.op_id].mte2_bytes, old[up.op_id].mte3_bytes)
     assert dict(ops['s0.l0.expert_down'].metadata)['output_format'] == 'bf16'
-    phase = dict(ops['s0.l0.mc2_dispatch.send_read_quantize'].metadata)['mc2_phase']
+    phase = dict(ops['s0.l0.dispatch'].metadata)['mc2_phase']
     plan = contract(phase, 4)
     assert plan.layout.payload_bytes == 2048 and plan.layout.scale_bytes == 4
     assert plan.layout.packet_bytes == 2560 and plan.layout.materialized_bytes == 2064
@@ -71,16 +71,17 @@ def test_idle_and_unequal_dp_keep_exact_integer_scales_and_return_transpose(sequ
     assert sum(wire(report).values()) == sum(sequences) * (2560 + 4608) + 128
     vector = 0
     for rank, ops in declared.items():
-        for op in ops:
-            phase = dict(op.metadata).get('mc2_phase', {})
-            if phase.get('phase') == 'send_read_quantize':
-                assert phase['source_assignments'] == sequences[rank] * 2
-                send = next(p for p in contract(phase, 4).phases if p.name == 'send_read_quantize')
-                vector += dict(dict(send.steps)['quantize'])['vector']
-            if op.op_id == 's0.l0.expert_up':
-                meta = dict(op.metadata)
-                assert meta['activation_scale_shape'] == (op.local_shape[0],)
-                assert meta['activation_scale_bytes'] == op.local_shape[0] * 4
+        dispatch = next(op for op in ops if op.op_id == 's0.l0.dispatch')
+        phase = dict(dispatch.metadata)['mc2_phase']
+        assert phase['kind'] == 'dispatch'
+        assert phase['source_assignments'] == sequences[rank] * 2
+        send = next(p for p in contract(phase, 4).phases
+                    if p.name == 'send_read_quantize')
+        vector += dict(dict(send.steps)['quantize'])['vector']
+        gate = next(op for op in ops if op.op_id == 's0.l0.expert_up')
+        meta = dict(gate.metadata)
+        assert meta['activation_scale_shape'] == (gate.local_shape[0],)
+        assert meta['activation_scale_bytes'] == gate.local_shape[0] * 4
     assert vector == sum(sequences) * 2 * (7 * 2048 - 1)
     assert report['execution']['live_tasks'] == report['execution']['live_programs'] == 0
 
@@ -88,7 +89,7 @@ def test_idle_and_unequal_dp_keep_exact_integer_scales_and_return_transpose(sequ
 def test_late_route_blocks_payload_and_scale_before_actual_cube_consumer():
     raw = case(); declared = graphs(raw)
     declared[0] = tuple(replace(o, deps=o.deps + ('late_route',))
-                        if o.op_id == 's0.l0.pack' else o for o in declared[0])
+                        if o.op_id == 's0.l0.dispatch' else o for o in declared[0])
     report = graph_costs(raw, declared, isolated=False,
                          external_inputs={'analysis_input': 0, 'late_route': 17})
     timeline = {x['id']: x for x in report['timeline']}

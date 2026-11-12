@@ -111,6 +111,29 @@ def apply_matrix_wrapper(ops, selection, runtime, *, local_tokens=None):
                 "group_list_values": (rows,),
                 "group_type": 0,
                 "split_item": 2,
+                "source_selection": "explicit_matrix_wrapper",
+                "source_capability": "AscendW8A8MXFP8Dynamic",
+                "source_role": "single_group_dense_wrapper",
+                "source_basis": SOURCE["basis"],
+                "source_identity": {
+                    "wrapper_image_id": SOURCE["image_id"],
+                    "current_executable_source": False,
+                    "basis": SOURCE["basis"],
+                },
+                "matched_predicate": (
+                    "explicit_matrix_wrapper + no_bias + two_dimensional + "
+                    "fp8_e4m3_activation/weight + bf16_or_fp16_output + "
+                    "group32_e8m0 + none/off/eager_graph + all_recorded_rows_active"),
+                "proven_predicates": {
+                    "implementation": IMPLEMENTATION,
+                    "ascend_dynamic_mxfp8": True,
+                    "two_dimensional": True,
+                    "bias_free": True,
+                    "active_forward_rows": rows,
+                    "graph_mode": str(runtime.graph_mode),
+                    "eager_dispatch": True,
+                    "dtypes": ("fp8_e4m3", "fp8_e4m3", meta["output_format"]),
+                },
                 "source": SOURCE,
                 "prediction_boundary": "existing_matrix_program",
             },

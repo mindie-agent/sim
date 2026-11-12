@@ -23,6 +23,16 @@ from .peer_traffic import PeerTraffic
 
 
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
+# A cross-node fabric is not an on-node hop, even when its member list
+# happens to name every rank of one node.  "inter" alone is not enough:
+# an intra-package link can mention dies without being scale-out.
+_CROSS_NODE_MARKERS = ("inter_node", "roce", "rdma", "scaleout", "scale_out")
+
+
+def _is_cross_node_link(link) -> bool:
+    text = f"{getattr(link, 'channel', '')} {getattr(link, 'name', '')}".lower()
+    text = text.replace("-", "_")
+    return any(marker in text for marker in _CROSS_NODE_MARKERS)
 
 
 def _declared_peer_traffic(metadata, size):
@@ -56,6 +66,12 @@ class Topology:
         self.namespace = namespace
         self.links = {link.name: link for link in machine.links}
         self.routes = {}
+        width = max(1, int(getattr(machine, "ranks_per_node", 1) or 1))
+        self._ranks_per_node = width
+        self._rank_node = {
+            int(die.rank): int(getattr(die, "node", int(die.rank) // width))
+            for die in machine.dies
+        }
 
     def resources(self):
         result = []
@@ -90,11 +106,23 @@ class Topology:
             for link in sorted(self.links.values(), key=lambda item: (len(item.members), item.name)):
                 if rank not in link.members:
                     continue
+                # Same-node peers stay on the declared on-node mesh.  An extra
+                # inter-node link that lists those ranks is not a route they use.
+                cross = _is_cross_node_link(link)
                 for neighbor in link.members:
-                    if neighbor not in seen:
-                        seen.add(neighbor)
-                        queue.append((neighbor, path + ((link.name, rank, neighbor),)))
+                    if neighbor in seen:
+                        continue
+                    if cross and self._same_node(rank, neighbor):
+                        continue
+                    seen.add(neighbor)
+                    queue.append((neighbor, path + ((link.name, rank, neighbor),)))
         raise ValueError(f"physical_route_missing:{source}->{destination}")
+
+    def _same_node(self, left: int, right: int) -> bool:
+        if left in self._rank_node and right in self._rank_node:
+            return self._rank_node[left] == self._rank_node[right]
+        width = self._ranks_per_node
+        return int(left) // width == int(right) // width
 
     def ranks(self, replica, stage):
         p = self.parallel

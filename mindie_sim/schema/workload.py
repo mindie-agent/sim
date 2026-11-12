@@ -37,9 +37,20 @@ class RequestView:
             object.__setattr__(self, "semantic_phase", self.phase)
         if not self.execution_mode:
             object.__setattr__(self, "execution_mode", self.phase)
+        # A padding view is a physical graph allocation, not an active
+        # request.  It has no logical history; any active context belongs to
+        # the graph/source declaration, never to this pseudo-request.
+        if self.padding:
+            object.__setattr__(self, "context", 0)
+
+    @property
+    def logical_q_len(self) -> int:
+        return 0 if self.padding else self.q_len
 
     @property
     def kv_len(self) -> int:
+        if self.padding:
+            return 0
         return self.context + (self.global_q_len or self.q_len)
 
     def to_dict(self) -> dict[str, Any]:
@@ -72,7 +83,7 @@ class IterationPlan:
 
     @property
     def valid_tokens(self) -> int:
-        return sum(view.q_len for view in self.requests)
+        return sum(view.logical_q_len for view in self.requests)
 
     @property
     def modes(self) -> set[str]:

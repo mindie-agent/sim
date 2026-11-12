@@ -208,6 +208,21 @@ def _quant_w8a8_dynamic() -> QuantSpec:
         expert_weight_format="int8",
         weight_block=(1, 1), expert_block=1,
         scale_format="fp32", scale_bytes=4.0,
+        # QuantBatchMatmulV3 normal-caller execution ABI: one BF16 weight
+        # scale per output channel and one FLOAT dynamic scale per activation
+        # row.  The checkpoint storage remains per-channel FP32 (above); this
+        # runtime separation is not a general "all W8A8 is 2-byte" rule.
+        runtime_weight_scale_format="bf16", runtime_weight_scale_bytes=2.0,
+        runtime_activation_scale_format="fp32",
+        runtime_int8_weight_metadata="scale_only",
+        # The five INT8xINT8 QuantBatchMatmulV3 families return BF16; this is
+        # declared per source role, not a blanket quantized-projection rule.
+        category_overrides={
+            "gdn": {"output_format": "bf16"},
+            "dense_mlp": {"output_format": "bf16"},
+            "attn.qkv": {"output_format": "bf16"},
+            "attn.o": {"output_format": "bf16"},
+        },
         kv_dtype="bf16", index_dtype="bf16", index_scale_dtype="none",
         exclusions=("mtp", "norm", "lm_head", "embedding", "vision", "projector",
                     "conv_weight_f32", "conv_weight_bf16"),

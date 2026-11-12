@@ -29,10 +29,11 @@
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 import hashlib
 import json
-from typing import Any, Mapping
+from typing import Any
 
 from .common import ModelingError
 
@@ -67,7 +68,9 @@ def _freeze_value(item: Any, reason: str) -> Any:
 
 def _tuple_of_pairs(value: Any, reason: str) -> tuple[tuple[str, Any], ...]:
     """Normalise a mapping or iterable of pairs into sorted immutable pairs."""
-    if isinstance(value, Mapping):
+    if not value:
+        return ()
+    if isinstance(value, dict) or isinstance(value, Mapping):
         value = tuple(value.items())
     try:
         pairs = tuple((str(key), _freeze_value(item, reason)) for key, item in value)
@@ -187,12 +190,13 @@ class StaticSignature:
 
     def find(self, name: str, default: Any = None) -> Any:
         """Search all groups in declaration order (first hit wins)."""
-        for group in ("matrix", "heads", "experts", "quant", "parallel",
-                      "tiles", "extras"):
-            values = dict(getattr(self, group))
-            if name in values:
-                return values[name]
-        return default
+        flat = getattr(self, "_flat_cache", None)
+        if flat is None:
+            flat = {}
+            for group in ("extras", "tiles", "parallel", "quant", "experts", "heads", "matrix"):
+                flat.update(getattr(self, group))
+            object.__setattr__(self, "_flat_cache", flat)
+        return flat.get(name, default)
 
     def require(self, name: str) -> Any:
         marker = object()
@@ -204,11 +208,12 @@ class StaticSignature:
     def key(self) -> tuple:
         return (
             self.role,
-            tuple((name, tuple(sorted(values))) for name, values in (
+            (
                 ("matrix", self.matrix), ("heads", self.heads),
                 ("experts", self.experts), ("quant", self.quant),
                 ("parallel", self.parallel), ("tiles", self.tiles),
-                ("extras", self.extras))),
+                ("extras", self.extras),
+            ),
         )
 
     def fingerprint(self) -> str:
@@ -420,8 +425,11 @@ class SubgraphTemplate:
         raise ModelingError(f"subgraph_operator_missing:{self.kind}:{name}")
 
     def key(self) -> tuple:
+        cached = getattr(self, "_key_cache", None)
+        if cached is not None:
+            return cached
         # Presentation text (``title``) stays out of structural identity.
-        return (
+        val = (
             self.kind, self.variant,
             tuple(op.key() for op in self.operators),
             tuple(tuple(port.to_dict().items()) for port in self.state_in),
@@ -431,11 +439,18 @@ class SubgraphTemplate:
                    f.contract) for f in self.fusions),
             self.coverage, self.contract,
         )
+        object.__setattr__(self, "_key_cache", val)
+        return val
 
     def fingerprint(self) -> str:
+        cached = getattr(self, "_fp_cache", None)
+        if cached is not None:
+            return cached
         payload = json.dumps(_jsonable(self.key()), sort_keys=True,
                              separators=(",", ":"), default=str)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        val = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        object.__setattr__(self, "_fp_cache", val)
+        return val
 
 
 @dataclass(frozen=True)
@@ -509,9 +524,14 @@ class SubgraphInstance:
         )
 
     def fingerprint(self) -> str:
+        cached = getattr(self, "_fp_cache", None)
+        if cached is not None:
+            return cached
         payload = json.dumps(_jsonable(self.performance_key()), sort_keys=True,
                              separators=(",", ":"), default=str)
-        return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        val = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:32]
+        object.__setattr__(self, "_fp_cache", val)
+        return val
 
 
 @dataclass(frozen=True)
@@ -578,12 +598,12 @@ class CoverageReport:
 
 def _jsonable(value: Any) -> Any:
     """Stable JSON view that keeps the value's type distinguishable."""
-    if isinstance(value, Mapping):
-        return {str(key): _jsonable(item) for key, item in value.items()}
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
     if isinstance(value, (tuple, list)):
         return [_jsonable(item) for item in value]
-    if isinstance(value, (str, int, float, bool)) or value is None:
-        return value
+    if isinstance(value, dict) or isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
     return repr(value)
 
 

@@ -135,6 +135,74 @@ EMBEDDED_A5_CAMPAIGNS = {
     },
 }
 
+A5_NATIVE_GROUP2 = {
+    "source": "/Volumes/data/mindie-sim-data/calibration-20261107/a5/hccl-native/raw/parsed/native-summary.json",
+    "manifest_sha256": "7ab3030edaf471d907fd83e1fec766ae37a4b2effde94411ee3bf14a975cc2b9",
+    "platform": "A5 Ascend950DT intrahost",
+    "stack": "rack08",
+    "cann": "9.2.0",
+    "mode": "aicpu",
+    "dtype": "bf16",
+    "split": "48 train / 45 heldout",
+    "series": {
+        "all_gather": (
+            (32768, 0.069943), (786432, 0.074251), (1048576, 0.072051),
+            (10485760, 0.111949), (33550336, 0.193240),
+            (33558528, 0.187575), (50331648, 0.242885),
+            (67108864, 0.294509),
+        ),
+        "reduce_scatter": (
+            (65536, 0.058361), (1572864, 0.077590), (2097152, 0.081633),
+            (20971520, 0.127892), (67100672, 0.203326),
+            (67117056, 0.208005), (100663296, 0.250269),
+            (134217728, 0.312730),
+        ),
+    },
+    # Separate HcclLaunchAicpuKernel AI_CPU rows from the same conditions.
+    # Qwen's TP kernels are AICPU, so this is the matching service boundary.
+    "aicpu_series": {
+        "all_gather": (
+            (32768, 0.041113), (786432, 0.025880), (1048576, 0.040079),
+            (10485760, 0.059318), (33550336, 0.060119),
+            (33558528, 0.061353), (50331648, 0.060528),
+            (67108864, 0.062541),
+        ),
+        "reduce_scatter": (
+            (65536, 0.039239), (1572864, 0.044114), (2097152, 0.041995),
+            (20971520, 0.062780), (67100672, 0.066477),
+            (67117056, 0.063054), (100663296, 0.067298),
+            (134217728, 0.064268),
+        ),
+    },
+}
+
+
+def a5_native_group2_curve_ms(collective: str, work_bytes: float,
+                              service: str = "aicpu"):
+    """Standalone group2 AllGather/ReduceScatter native service, rack08.
+
+    These are the independent 2026-11-07 A5 intrahost native-wave medians for
+    the exact group2 primitive, bf16, AICPU, rack08/CANN 9.2.0.  The axis is
+    per-rank input bytes.  No extrapolation beyond the measured support and no
+    MC2/AllToAll substitution is performed.
+    """
+    from bisect import bisect_left
+    key = "aicpu_series" if str(service) == "aicpu" else "series"
+    points = A5_NATIVE_GROUP2[key].get(str(collective))
+    if not points or not work_bytes or work_bytes <= 0:
+        return None
+    if not points[0][0] <= work_bytes <= points[-1][0]:
+        return None
+    xs = [item[0] for item in points]
+    right = bisect_left(xs, work_bytes)
+    if points[right][0] == work_bytes:
+        return points[right][1]
+    left = right - 1
+    x0, y0 = points[left]
+    x1, y1 = points[right]
+    return y0 + (y1 - y0) * (work_bytes - x0) / (x1 - x0)
+
+
 EMBEDDED_A5_MC2_CAMPAIGNS = {
     "mc2-rack06-r1": {
         "label": "mc2-rack06-r1", "kind": "mc2_chain", "status": "completed", "canary_ok": True,

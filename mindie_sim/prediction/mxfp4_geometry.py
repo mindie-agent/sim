@@ -129,10 +129,18 @@ def panel_work(config, m, n, offset):
     micros = []
     for kk in range(0, depth, micro):
         k = min(micro, depth - kk)
-        # LoadData2D uses 16-row x 32-byte data tiles and paired E8M0 scale.
+        # Source-facing distinction: A GM->L1 ND2NZ transfers the valid m
+        # rows, but LoadAL1ToL0A is a 2D fractal transfer with
+        # mStep=ceil(l0M/16) unit-16 fractals even for M=1.  L0A operand and
+        # scale volume therefore use align(m,16).  MMAD parameter is valid m
+        # with disableGemv=true; the normal arch3510 FP8 issue granularity is
+        # 16x16x32, so issued physical matrix work uses the rounded m/n/k while
+        # logical FLOPs remain valid m.  This is a matrix consumption ledger,
+        # never an elapsed-time multiplier.
         left = align(m, 16) * (align(k, 32) + ceildiv(k, 64) * 2)
         right = align(n, 16) * (align(k, 32) + ceildiv(k, 64) * 2)
-        micros.append((left, right, 2 * align(m, 16) * align(n, 16) * align(k, 32)))
+        micros.append((left, right,
+                       2 * align(m, 16) * align(n, 16) * align(k, 32)))
     return a + a_scale, vectors, micros
 
 

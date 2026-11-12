@@ -26,8 +26,9 @@ def test_q_kv_and_inverse_have_three_independent_native_boundaries():
     assert [op.deps for op in b.ops]==[('q_projection',),('kv_norm',),('attention_output',)]
     # Real captured views are BF16[B,1,64,512] / BF16[B,1,1,512],
     # each with FP32[B,1,1,64] cosine and sine. No full-width copy is created.
-    assert [op.mte2_bytes for op in b.ops]==[8192+512,128+512,8192+512]
+    assert [op.mte2_bytes for op in b.ops]==[40960,640,40960]
     assert [op.mte3_bytes for op in b.ops]==[8192,128,8192]
+    assert [op.hbm_bytes for op in b.ops]==[16896,768,16896]
     assert b.ops[0].vector_ops==b.ops[2].vector_ops
     assert dict(b.ops[2].metadata)['native_tensor_view']['sine_sign']=='caller_negated'
 
@@ -37,7 +38,7 @@ def test_nope_width_does_not_create_inplace_slice_traffic_or_vector_work():
     for width in (128,512):
         declare(b,name=f'rotary_{width}',deps=('projection',),tokens=16,heads=32,head_dim=width,rotary_width=64)
     short,long=b.ops
-    assert short.hbm_bytes==long.hbm_bytes==16*(32*64*2*2+2*64*4)
+    assert short.hbm_bytes==long.hbm_bytes==139264
     assert short.vector_ops==long.vector_ops
     assert short.local_shape==(16,32,128) and long.local_shape==(16,32,512)
     assert dict(long.metadata)['native_tensor_view']['partial_slice']==(448,512)
@@ -51,9 +52,10 @@ def test_batch_scaling_and_coefficient_reuse_are_explicit_not_free():
     assert last.hbm_bytes==16*first.hbm_bytes
     assert last.vector_ops==16*first.vector_ops
     work=dict(last.metadata)['partial_rotary_work']
-    assert work['coefficient_bytes']==16*2*64*4
+    assert work['coefficient_bytes']==16*4*2*64*4
     assert work['vector_lane_operations']['coefficient_broadcast']==16*2*63*64
-    assert work['native_owner_split_and_reload_not_selected']
+    assert not work['native_owner_split_and_reload_not_selected']
+    assert work['ub_bytes_per_owner']==1024
 
 
 def test_public_caller_replaces_combined_rotation_and_orders_inverse_before_output_projection():
@@ -90,3 +92,23 @@ def test_public_caller_replaces_combined_rotation_and_orders_inverse_before_outp
                  ('q_rotary', 'kv_rotary', 'output_inverse_rotary')]
     assert len(rotations) == 3 * 3 * len(selected)
     assert all(row['ready_ms'] >= 7 for row in rotations)
+
+
+def test_regbase_ab_bn_split_and_kv_tail_are_geometry_derived():
+    from mindie_sim.prediction.family_v41_rotary import recipes
+    from mindie_sim.prediction.mechanism import Geometry
+    b=builder()
+    declare(b,name='q_c32',deps=(),tokens=2,heads=64,head_dim=512,rotary_width=64)
+    declare(b,name='kv_c32',deps=(),tokens=2,heads=1,head_dim=512,rotary_width=64)
+    q,kv=b.ops
+    assert q.mte2_bytes==49152 and kv.mte2_bytes==1280
+    geom=Geometry(64,{'vector':64,'mte2_aiv':64,'mte3':64},{'ub':253952},{'ub':64})
+    qplan=recipes()['q_rotary'].build(q,geom)
+    kvplan=recipes()['kv_rotary'].build(kv,geom)
+    qt=dict(qplan.metadata['host_tiler']); kt=dict(kvplan.metadata['host_tiler'])
+    assert (qt['class'],qt['layout'],qt['owners'],qt['block_num_n'],qt['ub_bytes_owner'])==(
+        'RopeRegBaseTilingClassAB','SBND',64,32,2048)
+    assert (kt['class'],kt['layout'],kt['owners'],kt['ub_bytes_owner'])==(
+        'RopeRegBaseTilingClassAAndB','NO_BROADCAST',2,1536)
+    assert qplan.work.resources['mte2_aiv']==49152
+    assert kvplan.work.resources['mte2_aiv']==1280

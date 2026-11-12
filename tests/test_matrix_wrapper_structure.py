@@ -170,3 +170,49 @@ def test_ineligible_projection_does_not_gain_a_native_contract(extra, reason):
     with pytest.raises(ModelingError, match=reason):
         matrix_wrappers.apply_matrix_wrapper(
             (changed,), selected(), replace(case.runtime, graph_mode="eager"))
+
+
+def test_source_identity_is_declared_candidate_without_measured_oci_runtime_hint():
+    case, ops = declared(1, "decode", graph_mode="eager")
+    projection = next(op for op in ops if op.recipe == "latent_projection")
+    wrapped = matrix_wrappers.apply_matrix_wrapper(
+        (projection,), selected(), replace(case.runtime, graph_mode="eager"))[0]
+    wrapper = dict(wrapped.metadata)["matrix_wrapper"]
+    identity = wrapper["source_identity"]
+    assert wrapper["native_kind"] == "GroupedMatmul"
+    assert wrapper["source_selection"] == "explicit_matrix_wrapper"
+    assert wrapper["source_capability"] == "AscendW8A8MXFP8Dynamic"
+    assert identity["wrapper_image_id"] == matrix_wrappers.SOURCE["image_id"]
+    assert identity["current_executable_source"] is False
+    assert identity["basis"] == "declared_source_wrapper_not_capture_dispatch_proof"
+    assert wrapper["source_role"] == "single_group_dense_wrapper"
+    assert wrapper["source_basis"] == "declared_source_wrapper_not_capture_dispatch_proof"
+    assert "b57207c2" not in json.dumps(wrapper)
+    assert "measured" not in json.dumps(wrapper)
+    assert "explicit_matrix_wrapper" in wrapper["matched_predicate"]
+    assert wrapper["proven_predicates"]["active_forward_rows"] == 1
+
+
+def test_real_geometry_without_explicit_source_selection_stays_ordinary_matrix():
+    case, ops = declared(1, "decode")
+    projection = next(op for op in ops if op.recipe == "latent_projection")
+    meta = dict(projection.metadata)
+    assert meta.get("graph_captured") is True
+    assert "matrix_wrapper" not in meta
+    assert "native_kind" not in meta
+    assert "grouping_kind" not in meta
+    assert predicted_contract(projection.to_dict())[0] == "matrix"
+    with pytest.raises(ModelingError, match="requires_.*eager_dispatch"):
+        matrix_wrappers.apply_matrix_wrapper(
+            (projection,), selected(), replace(case.runtime, graph_mode="eager"))
+
+
+def test_wrong_explicit_source_implementation_cannot_emit_native_kind():
+    case, ops = declared(1, "decode", graph_mode="eager")
+    projection = next(op for op in ops if op.recipe == "latent_projection")
+    wrong = Selection("some_other_projection_wrapper", matrix_wrappers,
+                      {"projection_recipes": ["latent_projection"]})
+    with pytest.raises(ModelingError, match="implementation_unsupported"):
+        matrix_wrappers.apply_matrix_wrapper(
+            (projection,), wrong, replace(case.runtime, graph_mode="eager"))
+    assert "matrix_wrapper" not in dict(projection.metadata)

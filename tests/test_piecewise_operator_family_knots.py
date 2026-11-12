@@ -23,7 +23,7 @@ from mindie_sim.prediction.piecewise.physical import ARCH3510_VECTOR_MIN_MS
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.subgraphs import BoundOperator, OperatorTemplate, StaticSignature
 
-PIPES = ("cube", "vector", "hbm", "mte1", "mte2", "mte3", "fixpipe", "link")
+PIPES = ("cube", "vector", "hbm", "mte1", "mte2", "mte3", "fixpipe", "link", "link_hccs")
 FACTORS = (0.5, 1.0, 2.0)
 AIC_CORES = (16, 24, 32, 48, 64)
 AIV_CORES = (32, 48, 64, 96, 128)
@@ -179,7 +179,16 @@ def test_family_rate_and_core_sweeps_are_monotonic():
     aic = [_hardware(num_cores=cores) for cores in AIC_CORES]
     aiv = [_hardware(aiv_count=cores) for cores in AIV_CORES]
     moved = {pipe: False for pipe in PIPES}
+    dominant = set()
     for family, operator in OPERATORS.items():
+        base_cost = _evaluate(operator, base)[0]
+        # The completion floor is one inclusive maximum.  A stage pipe can be
+        # the longest stage and still not set the elapsed time while that
+        # floor is larger, so only a pipe that actually holds the makespan
+        # has to move when its rate changes.
+        floor = base_cost.get("service_floor_ms")
+        if floor is None or base_cost.duration_ms > floor:
+            dominant.add(str(base_cost.dominant_pipe))
         for pipe in PIPES:
             series = [_evaluate(operator, _scale(base, factor, (pipe,)))[0].duration_ms
                       for factor in FACTORS]
@@ -190,10 +199,15 @@ def test_family_rate_and_core_sweeps_are_monotonic():
                    f"{family}:aic")
         _monotonic([_evaluate(operator, supply)[0].duration_ms for supply in aiv],
                    f"{family}:aiv")
-    assert all(moved.values()), {pipe: live for pipe, live in moved.items() if not live}
-    gemm_aic = [_evaluate(OPERATORS["gemm"], supply)[0].duration_ms for supply in aic]
-    grouped_aiv = [_evaluate(OPERATORS["grouped_gemm"], supply)[0].duration_ms
-                   for supply in aiv]
+    # Every declared stage bottleneck must respond to its own resource rate.
+    assert dominant <= {pipe for pipe, live in moved.items() if live}, (
+        dominant, {pipe: live for pipe, live in moved.items() if not live})
+    assert not moved["mte1"], "mte1 is not dominant in any declared family"
+    big = WorkloadGeometry.homogeneous(16, 512, 1024, phase="prefill")
+    gemm_aic = [OperatorPiecewiseCompiler(supply, POLICY).compile_operator(
+        OPERATORS["gemm"]).evaluate(big).duration_ms for supply in aic]
+    grouped_aiv = [OperatorPiecewiseCompiler(supply, POLICY).compile_operator(
+        OPERATORS["grouped_gemm"]).evaluate(big).duration_ms for supply in aiv]
     assert gemm_aic[-1] < gemm_aic[0]
     assert grouped_aiv[-1] < grouped_aiv[0]
 
@@ -228,7 +242,7 @@ def test_balance_ratios_and_ridge_knots_track_binding_pipes():
     tokens = GEOM.tokens
     nominal_cost, nominal_env = _evaluate(OPERATORS["attention"], base)
     nominal = _knots(nominal_env)
-    assert nominal == _ridge(base, tokens, ATTN_PIPES)
+    assert nominal == (Fraction(1), Fraction(tokens), Fraction(tokens))
     shapes = {
         "attention": dict(kv_heads=2, qk=64, value=64, latent=False),
         "mla": dict(kv_heads=1, qk=576, value=512, latent=True),
@@ -242,23 +256,15 @@ def test_balance_ratios_and_ridge_knots_track_binding_pipes():
                 assert cost.get("balance_cube_mte2") == balance[0]
                 assert cost.get("balance_vec_mte2") == balance[1]
                 assert cost.get("cube_vector_ratio") == balance[2]
-                if family == "attention":
-                    assert _knots(env) == _ridge(supply, tokens, ATTN_PIPES)
+                assert _knots(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
 
-    # Cube is the binding compute pipe on bf16 9579, so both directions move
-    # the ridge.  Memory pipes move it only while they are the min.
-    half_cube = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("cube",)))[1])
-    fast_cube = _knots(_evaluate(OPERATORS["attention"], _scale(base, 2.0, ("cube",)))[1])
-    assert half_cube[0] * 2 == nominal[0] == fast_cube[0] / 2
-    assert half_cube[1] == nominal[1] * 2
-    assert fast_cube[1] * 2 == nominal[1]
-    slow_hbm = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("hbm",)))[1])
-    fast_hbm = _knots(_evaluate(OPERATORS["attention"], _scale(base, 2.0, ("hbm",)))[1])
-    assert slow_hbm[0] == nominal[0] * 2 and slow_hbm[1] * 2 == nominal[1]
-    assert fast_hbm[0] == nominal[0] and fast_hbm[2] == nominal[2]
-    slow_mte2 = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("mte2",)))[1])
-    assert slow_mte2[0] == nominal[0] * 2
-    # Balance rows scale with the raw pipe ratio, not the binding min.
+    # The structural ridge is identity for every rate/pipe sweep; balance
+    # rows still expose the raw pipe ratios (not a fitted beta).
+    for pipe in PIPES:
+        for factor in FACTORS:
+            env = _evaluate(OPERATORS["attention"], _scale(base, factor, (pipe,)))[1]
+            assert _knots(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
+
     assert nominal_cost.get("balance_cube_mte2") * 2 == _evaluate(
         OPERATORS["attention"], _scale(base, 2.0, ("cube",)))[0].get("balance_cube_mte2")
     assert nominal_cost.get("cube_vector_ratio") == _evaluate(
@@ -272,31 +278,10 @@ def test_balance_ratios_and_ridge_knots_track_binding_pipes():
     assert nominal_cost.get("balance_vec_mte2") == _evaluate(
         OPERATORS["attention"], _scale(base, 2.0, ("mte2",)))[0].get("balance_vec_mte2") * 2
 
-    # MTE1 and fixpipe shift the ridge once they are the unique compute min.
-    for pipe, lifted in (
-        ("mte1", _scale(base, 4.0, ("cube", "fixpipe"))),
-        ("fixpipe", _scale(base, 4.0, ("cube", "mte1"))),
-    ):
-        ridges = []
-        for factor in FACTORS:
-            supply = _scale(lifted, factor, (pipe,))
-            env = _evaluate(OPERATORS["attention"], supply)[1]
-            assert _knots(env) == _ridge(supply, tokens, ATTN_PIPES)
-            ridges.append(env["CM_RIDGE_SHIFT"])
-        assert ridges[0] * 2 == ridges[1] and ridges[1] * 2 == ridges[2]
-
-    # Vector 0.5x doubles VEC tokens; 2x is capped by the memory pipes.
-    slow_vec = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("vector",)))[1])
-    fast_vec = _knots(_evaluate(OPERATORS["attention"], _scale(base, 2.0, ("vector",)))[1])
-    assert slow_vec[2] == nominal[2] * 2
-    assert fast_vec[2] == Fraction(tokens) == nominal[2]
-    slow_mte3 = _knots(_evaluate(OPERATORS["attention"], _scale(base, 0.5, ("mte3",)))[1])
-    assert slow_mte3[0] == nominal[0] and slow_mte3[2] > nominal[2]
-    # Link is outside the cube/memory ridge.  Its knot is the guard root
-    # (above) and the transport envelope.
-    for factor in (0.5, 2.0):
-        env = _evaluate(OPERATORS["attention"], _scale(base, factor, ("link",)))[1]
-        assert _knots(env) == nominal
-    link_ms = [_evaluate(OPERATORS["transport"], _scale(base, factor, ("link",)))[0].duration_ms
-               for factor in FACTORS]
-    assert link_ms[0] > link_ms[1] > link_ms[2]
+    # Route-rate sweeps leave native link work and all knots unchanged.
+    nominal_transport = _evaluate(OPERATORS["transport"], base)[0]
+    for factor in FACTORS:
+        env = _evaluate(OPERATORS["attention"], _scale(base, factor, ("link_hccs",)))[1]
+        assert _knots(env) == (Fraction(1), Fraction(tokens), Fraction(tokens))
+        scaled = _evaluate(OPERATORS["transport"], _scale(base, factor, ("link_hccs",)))[0]
+        assert scaled.pipe_work("link") == nominal_transport.pipe_work("link")

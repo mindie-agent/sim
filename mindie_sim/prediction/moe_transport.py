@@ -28,6 +28,10 @@ _SELECTOR = "moe_transport"
 _KIND = "separate_quantized_payload"
 _MXFP8 = frozenset({"mxfp8", "mx_fp8", "mxfp8_e4m3"})
 _FP8 = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
+# Packed FP4 payloads.  ``dtype_bytes('mxfp4')`` already folds the one E8M0
+# block byte per 32 elements into the row width; a typed exchange must keep
+# the 0.5 B payload and the separate scale byte as distinct ledgers.
+_FP4 = frozenset({"fp4", "fp4_e2m1", "mxfp4", "mx_fp4", "mxfp4_e2m1"})
 _DISPATCH_DTYPES = frozenset({"bf16", "fp16", "int8"}) | _FP8 | _MXFP8
 _OPTION_KEYS = frozenset({
     "layer_scopes", "mode", "deepep_overlap_ratio", "eplb_peak_to_avg",
@@ -310,13 +314,30 @@ def default_dispatch_spec(model, plan=None, width=None):
         }
     quant = model.quant.for_category("routed_expert")
     _, act = compute_dtype_for(quant, "routed_expert")
-    group, scale_format, _, scale_bytes_per_row = activation_scales(quant, act, 1, latent)
+    if act in _FP4:
+        # MXFP4 is a 0.5 B E2M1 payload plus one E8M0 byte per 32-element
+        # block.  dtype_bytes('mxfp4') already includes that scale byte, so
+        # the typed exchange must split it back out instead of publishing one
+        # mixed payload row with no separate scale ledger.
+        group = int(getattr(quant, "activation_group_size", 0)
+                    or getattr(quant, "expert_block", 0) or 32)
+        scale_format = str(getattr(quant, "activation_scale_format", "")
+                           or getattr(quant, "scale_format", ""))
+        pack = int(getattr(quant, "activation_scale_pack", 0) or 1)
+        groups = (latent + group - 1) // group
+        scale_bytes_per_row = (
+            float(((groups + pack - 1) // pack) * pack * dtype_bytes(scale_format))
+            if scale_format else 0.0)
+        payload_bytes_per_row = float(latent * dtype_bytes("fp4_e2m1"))
+    else:
+        group, scale_format, _, scale_bytes_per_row = activation_scales(
+            quant, act, 1, latent)
+        payload_bytes_per_row = float(latent * dtype_bytes(act))
     quantized = act not in {"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}
     if act in _FP8 and group == 32 and scale_format in {"fp8_e8m0", "e8m0"}:
         dispatch_dtype = "mxfp8"
     else:
         dispatch_dtype = act
-    payload_bytes_per_row = float(latent * dtype_bytes(act))
     dispatch_row_bytes = payload_bytes_per_row + (float(scale_bytes_per_row) if quantized else 0.0)
     return {
         "dispatch_dtype": dispatch_dtype,

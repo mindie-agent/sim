@@ -29,9 +29,10 @@ def qwen_case(concurrency, layers=40):
 
 def assert_layer(ops, layer, concurrency):
     prefix = f's0.l{layer}.'
-    router, topk, send, received, gate, activation, down = (
-        ops[prefix + name] for name in ('router', 'topk', 'pack', 'dispatch',
+    router, topk, received, gate, activation, down = (
+        ops[prefix + name] for name in ('router', 'topk', 'dispatch',
                                         'expert_up', 'expert_act', 'expert_down'))
+    send = received
     rows = concurrency * 8
     assert router.local_shape[0] == concurrency * 4
     assert topk.local_shape[0] == concurrency

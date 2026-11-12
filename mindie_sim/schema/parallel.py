@@ -22,11 +22,12 @@ _CP_PLAN_ALIASES = {
     "pcp_query_split_kv_gather": "pcp",
     "dsa_cp": "dsa_cp",
     "dsa-cp": "dsa_cp",
-    "dsa_cp_sharded_topk_lse_merge": "dsa_cp",
+    "dsa_cp_query_token_sp": "dsa_cp",
+    "dsa_cp_sp_full_kv": "dsa_cp",
     "none": "none",
 }
 
-def _normalise_cp_plan(value: Any, cp: int, pcp: int) -> str:
+def _normalise_cp_plan(value: Any, cp: int, pcp: int, tp: int) -> str:
     """Resolve and validate the declared plan name against the two degrees."""
     raw = str(value if value is not None else "auto").strip().lower()
     plan = _CP_PLAN_ALIASES.get(raw)
@@ -43,8 +44,14 @@ def _normalise_cp_plan(value: Any, cp: int, pcp: int) -> str:
         raise ModelingError(f"pcp_requires_pcp_plan:{plan}")
     if int(pcp) <= 1 and plan == "pcp":
         raise ModelingError("pcp_plan_requires_pcp")
-    if plan in {"dcp", "dsa_cp"} and int(cp) <= 1:
-        raise ModelingError(f"{plan}_plan_requires_cp")
+    if plan == "dcp" and int(cp) <= 1:
+        raise ModelingError("dcp_plan_requires_cp")
+    if plan == "dsa_cp":
+        # DSA-CP is query-token SP over the TP group; it is not DCP.
+        if int(cp) > 1:
+            raise ModelingError("dsa_cp_query_token_sp_excludes_dcp")
+        if int(tp) <= 1:
+            raise ModelingError("dsa_cp_query_token_sp_requires_tp")
     return plan
 
 @dataclass(frozen=True)
@@ -60,9 +67,10 @@ class ParallelSpec:
     group and gathers K/V.  It is not an alias of ``cp``.
 
     ``cp_plan`` names the execution strategy: ``dcp`` (KV shard + replicated
-    indexer + LSE merge), ``dsa_cp`` (sharded sparse indexer TopK + global merge
-    + LSE merge) or ``pcp`` (prefill query split + K/V gather, replicated
-    decode).  ``auto`` resolves from the declared degrees and is stored resolved.
+    indexer + LSE merge), ``dsa_cp`` (query-token SP over the TP group with a
+    full/replicated KV/index cache, local query TopK and a token all-gather
+    output) or ``pcp`` (prefill query split + K/V gather, replicated decode).
+    ``auto`` resolves from the declared degrees and is stored resolved.
     """
 
     dp: int = 1
@@ -73,6 +81,9 @@ class ParallelSpec:
     dcp: int = 1
     pcp: int = 1
     cp_plan: str = "auto"
+    #: Raw vLLM-Ascend ``additional_config.enable_dsa_cp`` declaration.  It is
+    #: the source switch; it resolves to the ``dsa_cp`` query-token SP plan.
+    enable_dsa_cp: bool = False
 
     def __post_init__(self) -> None:
         cp, dcp = int(self.cp), int(self.dcp)
@@ -90,7 +101,23 @@ class ParallelSpec:
             raise ModelingError("pcp_invalid")
         if pcp != self.pcp:
             object.__setattr__(self, "pcp", pcp)
-        plan = _normalise_cp_plan(self.cp_plan, value, pcp)
+        plan = _normalise_cp_plan(self.cp_plan, value, pcp, int(self.tp))
+        enable_dsa_cp = bool(self.enable_dsa_cp)
+        if enable_dsa_cp:
+            # The source switch is authoritative; auto/none resolves to the
+            # query-token SP plan, and a conflicting DCP/PCP plan is refused.
+            if plan not in {"dsa_cp", "none"}:
+                raise ModelingError(
+                    f"enable_dsa_cp_conflicts_with_plan:{plan}")
+            if plan == "none":
+                if value > 1:
+                    raise ModelingError("dsa_cp_query_token_sp_excludes_dcp")
+                if int(self.tp) <= 1:
+                    raise ModelingError("dsa_cp_query_token_sp_requires_tp")
+                plan = "dsa_cp"
+        elif plan == "dsa_cp":
+            enable_dsa_cp = True
+        object.__setattr__(self, "enable_dsa_cp", enable_dsa_cp)
         if plan != self.cp_plan:
             object.__setattr__(self, "cp_plan", plan)
 
@@ -100,7 +127,7 @@ class ParallelSpec:
         allowed = {
             "dp", "tp", "ep", "pp", "cp", "dcp", "pcp",
             "prefill_context_parallel_size", "cp_plan",
-            "context_parallel_plan", "world_size",
+            "context_parallel_plan", "world_size", "enable_dsa_cp",
         }
         _unknown(raw, allowed, prefix)
         cp = (
@@ -119,12 +146,16 @@ class ParallelSpec:
             f"{prefix}.pcp_invalid", minimum=1,
         )
         plan_raw = raw.get("cp_plan", raw.get("context_parallel_plan", "auto"))
+        enable_dsa_cp = raw.get("enable_dsa_cp", False)
+        if not isinstance(enable_dsa_cp, bool):
+            raise ModelingError(f"{prefix}.enable_dsa_cp_invalid")
         return cls(
             dp=_int(raw.get("dp", 1), f"{prefix}.dp_invalid", minimum=1),
             tp=_int(raw.get("tp", 1), f"{prefix}.tp_invalid", minimum=1),
             ep=_int(raw.get("ep", 1), f"{prefix}.ep_invalid", minimum=1),
             pp=_int(raw.get("pp", 1), f"{prefix}.pp_invalid", minimum=1),
             cp=cp, dcp=cp, pcp=pcp, cp_plan=str(plan_raw),
+            enable_dsa_cp=enable_dsa_cp,
         )
 
     @property
@@ -205,10 +236,11 @@ class ParallelSpec:
                 raise ModelingError(f"ep_not_divisor_of_tp_pcp:{local_domain}%{self.ep}")
             if self.ep > local_domain and self.ep % local_domain != 0:
                 raise ModelingError(f"ep_not_multiple_of_tp_pcp:{self.ep}%{local_domain}")
-        if self.cp > 1 or self.pcp > 1:
+        if self.cp > 1 or self.pcp > 1 or self.cp_plan == "dsa_cp":
             # DCP reuses TP devices (``tp % cp == 0``); PCP is a separate rank
-            # axis with its own prefill schedule.  The plan decides which guards
-            # apply; an unsupported combination is refused, never dropped.
+            # axis with its own prefill schedule; DSA-CP is query-token SP over
+            # the TP group with ``cp=1``.  The plan decides which guards apply;
+            # an unsupported combination is refused, never dropped.
             from mindie_sim.catalog.context_parallel import validate_cp_plan
 
             validate_cp_plan(model, self)
@@ -216,4 +248,6 @@ class ParallelSpec:
             raise ModelingError("ep_requires_moe_model")
 
     def to_dict(self) -> dict[str, Any]:
-        return {key: getattr(self, key) for key in ("dp", "tp", "ep", "pp", "cp", "pcp", "cp_plan")}
+        return {key: getattr(self, key) for key in (
+            "dp", "tp", "ep", "pp", "cp", "pcp", "cp_plan",
+            "enable_dsa_cp")}

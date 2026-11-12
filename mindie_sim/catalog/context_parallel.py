@@ -1,14 +1,16 @@
 """Context ownership and collective geometry.
 
-[Role] Partition DCP key positions and PCP zigzag query ranges.
-[Invariants] DCP reuses TP ranks; PCP adds a query-sharding axis. Pair counts
-  conserve the causal/windowed triangle and block ownership is explicit.
+[Role] Partition DCP key positions, PCP zigzag query ranges and DSA-CP
+  query-token TP chunks.
+[Invariants] DCP reuses TP ranks; PCP adds a query-sharding axis; DSA-CP
+  shards query tokens over the TP group with a full/replicated KV cache.
+  Pair counts conserve the causal/windowed triangle and block ownership is
+  explicit.
 [Timeouts & Locks] Bounded arithmetic, no device or observation access.
 [Side-Effect Policy] No external mutation.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -22,24 +24,22 @@ CP_STRATEGY = "kv_context_shard_lse_merge"
 DCP_STRATEGY = CP_STRATEGY
 #: PCP strategy: local query chunks, full K/V gathered, final outputs (no merge).
 PCP_STRATEGY = "pcp_query_split_kv_gather"
-#: DSA-CP strategy: sharded local indexer TopK + exact global merge + LSE merge.
-DSA_CP_STRATEGY = "dsa_cp_sharded_topk_lse_merge"
+#: DSA-CP strategy: local query tokens over full/replicated KV; output tokens
+#: are all-gathered after the layer.  It is not the DCP KV-shard/LSE plan.
+DSA_CP_STRATEGY = "dsa_cp_query_token_sp_full_kv_all_gather"
 CP_PLAN_DCP = "dcp"
 CP_PLAN_PCP = "pcp"
 CP_PLAN_DSA_CP = "dsa_cp"
 CP_PLAN_NONE = "none"
 CP_PLAN_KINDS = (CP_PLAN_DCP, CP_PLAN_PCP, CP_PLAN_DSA_CP)
 CP_INDEXER_POLICY = "replicated"
-DSA_CP_INDEXER_POLICY = "sharded_local_topk"
+DSA_CP_INDEXER_POLICY = "replicated_cache_local_query_topk"
 #: Attention kinds that own a PCP query-shard schedule. Projection-only layers
 #: may sit beside them; a model still needs one real query-shard builder.
 _CP_ATTENTION_TYPES = {"gqa", "mla", "kda", "gdn", "projection_only"}
-CP_UNMODELED_SCHEDULES = ("compact_kv_gather", "query_token_shard")
+CP_UNMODELED_SCHEDULES = ("compact_kv_gather",)
 DEFAULT_CP_INTERLEAVE = 128
 _FP32_BYTES = 4.0
-#: Bytes per gathered indexer candidate: FP32 score + int32 row id.  The merge
-#: exchanges only selected candidates, never the full index-K plane.
-_INDEX_CANDIDATE_BYTES = 8.0
 
 
 def strategy_for_plan(plan: str) -> str:
@@ -407,69 +407,201 @@ def pcp_kv_gather_bytes(
 
 
 # ---------------------------------------------------------------------------
-# DSA-CP: sharded local indexer TopK + exact global candidate merge
+# DSA-CP: query-token sequence parallel over the TP group
+#
+# Retained source: vllm_ascend/attention/context_parallel/dsa_cp.py
+# (sha256 dceec1a878d0357f4cdd6647ff868d319d5e24eaa32eb55c27ea754b7d71b797).
+# `_local_token_range` splits the flattened token stream into contiguous TP
+# chunks padded to the TP group; `_build_local_token_metadata` intersects each
+# request with the rank's chunk and truncates `local_seq_lens` to the local
+# chunk end; `_indexer_select_topk` scores the local query tokens over the full
+# index-K prefix; `_gather_cp_output` all-gathers the local output tokens.  The
+# KV/index cache stays full/replicated.  This is not the DCP KV-shard/LSE plan.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
-class DsaCpTopKPlan:
-    """Declared candidate geometry for one query token's sparse selection."""
+class DsaCpRankLayout:
+    """One rank's slice of the source's flattened query-token stream."""
 
-    cp: int
-    scored_rows: int
-    local_scored_rows: int
-    topk: int
-    global_selected_rows: int
-    local_candidates: int
-    merged_candidates: int
-    merge_elements: float
-    candidate_payload_bytes: float
-    merge_link_bytes: float
-    #: The union of per-rank local top-k provably contains the global top-k:
-    #: a global top-k can take at most ``k`` rows from any single shard.
-    exact: bool = True
+    tp: int
+    rank: int
+    phase: str
+    padded_tokens: int
+    tokens_per_rank: int
+    local_start: int
+    local_end: int
+    local_tokens: int
+    local_requests: int
+    kv_prefix_end: int
 
     def metadata(self, prefix: str = "dsa_cp") -> tuple[tuple[str, Any], ...]:
         return (
-            (f"{prefix}_topk_exact", self.exact),
-            (f"{prefix}_scored_rows", int(self.scored_rows)),
-            (f"{prefix}_local_scored_rows", int(self.local_scored_rows)),
-            (f"{prefix}_topk", int(self.topk)),
-            (f"{prefix}_selected_rows_global", int(self.global_selected_rows)),
-            (f"{prefix}_local_candidates", int(self.local_candidates)),
-            (f"{prefix}_merged_candidates", int(self.merged_candidates)),
-            (f"{prefix}_candidate_payload_bytes", float(self.candidate_payload_bytes)),
-            (f"{prefix}_candidate_link_bytes", float(self.merge_link_bytes)),
-            (f"{prefix}_selection", "local_topk_then_global_merge"),
+            (f"{prefix}_phase", self.phase),
+            (f"{prefix}_tp", int(self.tp)),
+            (f"{prefix}_rank", int(self.rank)),
+            (f"{prefix}_padded_tokens", int(self.padded_tokens)),
+            (f"{prefix}_tokens_per_rank", int(self.tokens_per_rank)),
+            (f"{prefix}_local_start", int(self.local_start)),
+            (f"{prefix}_local_end", int(self.local_end)),
+            (f"{prefix}_local_tokens", int(self.local_tokens)),
+            (f"{prefix}_local_requests", int(self.local_requests)),
+            (f"{prefix}_kv_prefix_end", int(self.kv_prefix_end)),
+            (f"{prefix}_query_token_sharded", True),
+            (f"{prefix}_kv_cache", "replicated_full"),
+            (f"{prefix}_phase_scope", "prefill"),
+            (f"{prefix}_output_merge", "token_all_gather"),
         )
 
 
-def plan_dsa_cp_topk(
-    scored_rows: int, topk: int, cp: int, *, tokens: int = 1,
-) -> DsaCpTopKPlan:
-    """Plan the sharded indexer TopK for ``tokens`` query rows.
+def dsa_cp_token_ranges(tokens: int, tp: int, rank: int) -> tuple[int, int, int, int]:
+    """The source's ``_local_token_range``: start, end, per-rank, padded total."""
+    tokens = max(0, int(tokens))
+    tp = max(1, int(tp))
+    rank = int(rank)
+    if not 0 <= rank < tp:
+        raise ModelingError(f"dsa_cp_rank_invalid:{rank}:{tp}")
+    padded = ((tokens + tp - 1) // tp) * tp
+    per_rank = padded // tp
+    start = rank * per_rank
+    return start, start + per_rank, per_rank, padded
 
-    Each rank scores only its KV shard and keeps ``min(local_rows, topk)``
-    candidates.  The union is all-gathered and merged to the global top-k.  This
-    is exact: a global top-k has at most ``k`` rows from any one shard, so no
-    global winner can be missing from a shard's local top-k.
+
+def _dsa_cp_local_requests(geometry: Any, tp: int, rank: int) -> tuple[Any, ...]:
+    """Intersect each request with one contiguous rank chunk.
+
+    The source flattens query tokens in request order, then takes a contiguous
+    ``tokens_per_rank`` slice.  A request's local chunk keeps the absolute
+    position as its context, so the causal KV prefix is the full prefix up to
+    the local end; no KV row is assigned a shard owner here.
     """
-    cp = max(1, int(cp))
-    scored = max(0, int(scored_rows))
-    topk = max(0, int(topk))
-    local_scored = int(math.ceil(scored / cp)) if cp > 1 else scored
-    global_selected = min(scored, topk) if topk else scored
-    local_k = min(local_scored, topk) if topk else local_scored
-    merged = cp * local_k
-    token_rows = max(1, int(tokens))
-    full = float(merged * token_rows * _INDEX_CANDIDATE_BYTES)
-    link = full * (cp - 1) / cp if cp > 1 else 0.0
-    return DsaCpTopKPlan(
-        cp=cp, scored_rows=scored, local_scored_rows=local_scored, topk=topk,
-        global_selected_rows=global_selected, local_candidates=local_k,
-        merged_candidates=merged,
-        merge_elements=float(merged * token_rows),
-        candidate_payload_bytes=full, merge_link_bytes=link,
-        exact=merged >= global_selected,
+    from mindie_sim.prediction.piecewise.geometry import RequestGeometry
+
+    total = sum(int(request.q_len) for request in geometry.requests)
+    local_start, local_end, _per_rank, _padded = dsa_cp_token_ranges(
+        total, tp, rank)
+    local: list[Any] = []
+    offset = 0
+    for index, request in enumerate(geometry.requests):
+        q_len = int(request.q_len)
+        global_start, global_end = offset, offset + q_len
+        offset = global_end
+        start, end = max(global_start, local_start), min(global_end, local_end)
+        if end <= start:
+            continue
+        parent = (request.parent_query_ranges or request.query_ranges
+                  or ((int(request.context), int(request.context) + q_len),))
+        local.append(RequestGeometry(
+            q_len=end - start,
+            context=int(request.context) + (start - global_start),
+            phase=request.phase,
+            query_ranges=(),
+            replica=int(request.replica),
+            draft_len=int(request.draft_len),
+            owner_index=index,
+            parent_query_ranges=parent,
+            emit=False,
+            emit_position=-1,
+        ))
+    return tuple(local)
+
+
+def dsa_cp_rank_layout(geometry: Any, tp: int, rank: int) -> DsaCpRankLayout:
+    """Declared one-rank layout for the source query-token stream."""
+    tp = max(1, int(tp))
+    total = sum(int(request.q_len) for request in geometry.requests)
+    local_start, local_end, per_rank, padded = dsa_cp_token_ranges(
+        total, tp, rank)
+    local = _dsa_cp_local_requests(geometry, tp, rank)
+    return DsaCpRankLayout(
+        tp=tp, rank=int(rank), phase=str(geometry.phase_name),
+        padded_tokens=padded, tokens_per_rank=per_rank,
+        local_start=local_start, local_end=local_end,
+        local_tokens=sum(int(request.q_len) for request in local),
+        local_requests=len(local),
+        kv_prefix_end=max((int(request.kv_len) for request in local), default=0),
     )
+
+
+def dsa_cp_worst_rank(geometry: Any, tp: int) -> int:
+    """The rank with the largest local causal attention work."""
+    tp = max(1, int(tp))
+    def cost(rank: int) -> tuple[int, int]:
+        local = _dsa_cp_local_requests(geometry, tp, rank)
+        return (sum(int(request.pairs(causal=True)) for request in local), rank)
+    return max(range(tp), key=cost)
+
+
+def dsa_cp_rank_geometry(geometry: Any, tp: int, rank: int | None = None) -> Any:
+    """Worst-rank query-token SP geometry, prefill only.
+
+    The returned geometry keeps the local query chunks, sets the local padded
+    tensor width and marks dense sequence parallel.  The KV/index cache is not
+    sharded: the full cache rows are still computed by the caller.  The
+    source uses this path on prefill; decode keeps the ordinary full geometry.
+    """
+    from dataclasses import replace
+
+    tp = max(1, int(tp))
+    if geometry.phase_name != "prefill" or tp <= 1:
+        return geometry
+    selected = dsa_cp_worst_rank(geometry, tp) if rank is None else int(rank)
+    local = _dsa_cp_local_requests(geometry, tp, selected)
+    if not local:
+        return geometry
+    layout = dsa_cp_rank_layout(geometry, tp, selected)
+    return replace(
+        geometry,
+        requests=local,
+        graph_bucket=0,
+        cohort_batch=int(geometry.cohort_batch or len(local)),
+        physical_tokens=layout.tokens_per_rank,
+        media_tokens=0,
+        phase=geometry.phase,
+        local_batch=len(local),
+        tp_width=tp,
+        dense_sequence_parallel=True,
+        graph_dispatch="none",
+        capture_sizes=(),
+    )
+
+
+_DSA_ATTENTION_FAMILIES = frozenset({"attention", "mla"})
+_DSA_I0_QUERY_OPS = frozenset({
+    "index_q_projection", "index_weights_projection", "index_rope",
+})
+_DSA_KV_PRODUCER_OPS = frozenset({
+    "kv_down", "kv_norm", "kv_store", "kv_read", "qkv_projection",
+})
+
+
+def project_dsa_cp_geometry(
+    kind: str, name: str, family: str, active: Any, padded: Any,
+    local: Any, local_padded: Any = None,
+) -> tuple[Any, str] | None:
+    """One operator's DSA-CP geometry: local query/attention, full cache.
+
+    Shared by the canonical ``ModelPipeline`` and the profiler
+    ``z._aggregate``.  ``local`` is the worst-rank prefill geometry and
+    ``local_padded`` the same on the padded tensor.  Returns ``None`` when the
+    operator is not on the DSA-CP query path, so the caller keeps its ordinary
+    active/padded/selected choice.  The KV/index cache producers stay full:
+    DSA-CP shards query tokens, not KV rows.
+    """
+    if local is None:
+        return None
+    local_padded = local_padded or local
+    name = str(name)
+    if kind == "I1":
+        return local, "dsa_local"
+    if kind == "I0":
+        return ((local_padded, "dsa_local") if name in _DSA_I0_QUERY_OPS
+                else (active, "active"))
+    if kind in {"A0", "A1", "A2"}:
+        if name in _DSA_KV_PRODUCER_OPS:
+            return active, "active"
+        if str(family) in _DSA_ATTENTION_FAMILIES:
+            return local, "dsa_local"
+        return local_padded, "dsa_local"
+    return None
 
 
 def split_index_rows(rows: int, cp: int) -> CpSplit:
@@ -547,10 +679,11 @@ def validate_cp_plan(model: ModelSpec, parallel: ParallelSpec) -> None:
         if int(getattr(parallel, "cp", 1) or 1) > 1:
             verify_cp_model(model, parallel)
     elif plan == CP_PLAN_DSA_CP:
+        # DSA-CP is query-token SP over the TP group, not DCP over `cp`.
+        if int(getattr(parallel, "cp", 1) or 1) != 1:
+            raise ModelingError("dsa_cp_query_token_sp_excludes_dcp")
         if int(getattr(parallel, "pcp", 1) or 1) > 1:
-            validate_pcp_geometry(parallel)
-        validate_cp_geometry(parallel)
-        verify_cp_model(model, parallel)
+            raise ModelingError("dsa_cp_query_token_sp_excludes_pcp")
         verify_dsa_cp_model(model, parallel)
     elif plan == CP_PLAN_DCP:
         validate_cp_geometry(parallel)
@@ -608,14 +741,16 @@ def verify_pcp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
 
 
 def verify_dsa_cp_model(model: ModelSpec, parallel: ParallelSpec) -> None:
-    """DSA-CP is only defined for a sparse indexer with a declared global top-k."""
+    """DSA-CP is query-token SP: TP group, sparse indexer, declared top-k."""
+    tp = int(getattr(parallel, "tp", 1) or 1)
     cp = int(getattr(parallel, "cp", 1) or 1)
-    if cp <= 1:
-        raise ModelingError("dsa_cp_requires_cp")
+    if cp != 1:
+        raise ModelingError("dsa_cp_query_token_sp_excludes_dcp")
+    if tp <= 1:
+        raise ModelingError("dsa_cp_query_token_sp_requires_tp")
     plans = tuple(getattr(model, "layer_plans", ()) or ())
     if not plans:
         raise ModelingError("dsa_cp_requires_catalog_sparse_model")
-    facts = dict(getattr(model, "catalog_facts", ()) or ())
     topk = max((plan.index_topk for plan in plans), default=0)
     indexers = [plan for plan in plans if bool(getattr(plan, "indexer", False))]
     if not indexers:
@@ -629,15 +764,26 @@ def cp_layer_scope(
 ) -> dict[str, Any]:
     """Which layers CP shards and which stay replicated, declared explicitly."""
     kinds = _attention_kinds(model)
-    dsa_cp = plan == CP_PLAN_DSA_CP
+    if plan == CP_PLAN_DSA_CP:
+        return {
+            "context_addressed": [],
+            "replicated": sorted(kinds),
+            "strategy": strategy_for_plan(plan),
+            "phase_scope": "prefill",
+            "query_token_sharded": True,
+            "kv_cache": "replicated_full",
+            "indexer_cache": "replicated_full",
+            "indexer_policy": DSA_CP_INDEXER_POLICY,
+            "indexer_cache_sharded": False,
+            "local_indexer": "local_query_topk_over_full_kv_prefix",
+            "output_merge": "token_all_gather",
+        }
     return {
         "context_addressed": sorted(kinds & {"gqa", "mla"}),
         "replicated": sorted(kinds - {"gqa", "mla"}),
         "strategy": strategy_for_plan(plan),
-        "indexer_policy": (
-            DSA_CP_INDEXER_POLICY if dsa_cp else CP_INDEXER_POLICY
-        ),
-        "indexer_cache_sharded": bool(dsa_cp),
+        "indexer_policy": CP_INDEXER_POLICY,
+        "indexer_cache_sharded": False,
     }
 
 

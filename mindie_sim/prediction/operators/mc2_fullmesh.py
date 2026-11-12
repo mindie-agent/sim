@@ -66,7 +66,8 @@ def dispatch_layout(width, *, input_dtype="bf16", payload_dtype="bf16",
         raise ModelingError("mc2_width_requires_positive_integer")
     if input_dtype not in {"bf16", "fp16", "fp8_e4m3", "fp8_e5m2"}:
         raise ModelingError("mc2_input_dtype_unsupported")
-    if payload_dtype not in {"bf16", "fp16", "int8", "fp8_e4m3", "fp8_e5m2"}:
+    if payload_dtype not in {"bf16", "fp16", "int8", "fp8_e4m3", "fp8_e5m2",
+                             "fp4_e2m1", "fp4"}:
         raise ModelingError("mc2_payload_dtype_unsupported")
     if not isinstance(input_scale_bytes, int) or input_scale_bytes < 0:
         raise ModelingError("mc2_input_scales_require_nonnegative_byte_count")
@@ -81,7 +82,8 @@ def dispatch_layout(width, *, input_dtype="bf16", payload_dtype="bf16",
             raise ModelingError("mc2_quantized_input_requires_unscaled_float_row")
         if quant_mode == "per_token" and payload_dtype in {"int8", "fp8_e4m3", "fp8_e5m2"}:
             scale, offset = 4, _align(outgoing, 32)
-        elif quant_mode == "mx" and payload_dtype in {"fp8_e4m3", "fp8_e5m2"}:
+        elif (quant_mode == "mx" and payload_dtype in {
+                "fp8_e4m3", "fp8_e5m2", "fp4_e2m1", "fp4"}):
             scale, offset = _align(math.ceil(width / 32), 2), _align(outgoing, 256)
         elif quant_mode == "per_group" and payload_dtype in {"fp8_e4m3", "fp8_e5m2"}:
             scale, offset = math.ceil(width / 128) * 4, _align(outgoing, 128)
@@ -204,8 +206,10 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
         quant_ops = (7 if layout.payload_dtype == "int8" else 5) * layout.width - 1
         unknown.append("per-token scalar reciprocal and scale store instruction service")
     elif (layout.quant_mode == "mx" and layout.input_dtype == "bf16"
-          and layout.payload_dtype == "fp8_e4m3" and layout.width % 256 == 0):
-        quant_ops = sum(mx32_work(layout.width).values())
+          and layout.payload_dtype in {"fp8_e4m3", "fp4_e2m1", "fp4"}
+          and layout.width % 256 == 0):
+        quant_ops = sum(mx32_work(layout.width,
+                                  payload_dtype=layout.payload_dtype).values())
         unknown.append("MX register load/store throughput and scalar control instruction service")
     elif layout.quant_mode in {"mx", "per_group"}:
         unknown.append("fused quantization vector instruction work: keep explicit caller quant program")
@@ -214,7 +218,15 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
     else:
         raise ModelingError("mc2_dispatch_row_layout_kind_invalid")
     # The second Duplicate sets one flag element per eight-element record.
-    count_vector = experts * max(5 * ids - 1, 0) + len(count) * 9 * _align(experts, 8)
+    # CalAndSendCntByExp passes maskCnt = isTokenMaskFlag_
+    #   ? activeMaskBsCnt * axisK : expertIdsCnt.
+    # The enrolled C2/C32 rows carry expertIdsCnt 6/12; K3 q2 carries 32.
+    # The per-expert five-op work is carried by the typed primitive roles in
+    # mc2_instructions, so the generic phase vector here is only the second
+    # Duplicate flag initialization.  Do not charge both.
+    mask_count = (max(1, int(source_assignments))
+                  if source_assignments > 0 else 0)
+    count_vector = len(count) * 9 * _align(experts, 8)
     c, a = len(count), aiv_count
     prefix_owners = tuple(range(min(a, experts)))
     prefix_work = assignment_prefix_work(source_tokens, top_k, rows, send)
@@ -233,13 +245,25 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
             "scalar_result_reads_unpriced": max(0, ids - top_k) if prefix_work is not None else None,
             "scalar_source_id_reads_unpriced": rows,
             "scalar_triple_stores_unpriced": 3 * rows,
+            "cal_token_send_expert_cnt": {
+                "source": "CalTokenSendExpertCnt:778-804",
+                "tensor_dtype": "int32",
+                "short_vector": int(top_k),
+                "ops_per_expert": ("Duplicate", "Sub", "Abs", "Mins",
+                                   "software ReduceSum"),
+                "pipe_v_per_expert": 4,
+                "v_s_dependency": True,
+                "int32_ub_read_bytes": rows * 4,
+                "int32_ub_write_bytes": prefix_total * 4,
+            },
         }))
     if layout.quant_mode == "mx" and quant_ops:
+        per_row = mx32_work(layout.width, payload_dtype=layout.payload_dtype)
         quant_steps = tuple((name, (("vector", rows * amount),))
-                            for name, amount in mx32_work(layout.width).items())
+                            for name, amount in per_row.items())
         quant_details += (("quantization_source", MX_SOURCE),
                           ("quantization_repetitions", rows),
-                          ("quantization_per_row", mx32_work(layout.width)))
+                          ("quantization_per_row", per_row))
     phases = (
         _staged("routing_metadata", (), all_cores, "each_AIV_reads_the_complete_ID_array", (
             ("initialize", (("vector", a * _align(ids * 4, 256) / 4 if ids else 0),)),
@@ -256,8 +280,25 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
                       (("per_row_packet_bytes", layout.packet_bytes),
                        ("reserved_flags_initialization", "UB buffers once per active owner; separately unresolved"))),
         ProtocolPhase("count_compute", ("routing_metadata",), count, "contiguous_expert_intervals", (
-            ("vector", count_vector),), (("includes_zero_count_experts", True),
-                                        ("scalar_count_stores", experts)), "domain"),
+            ("vector", count_vector),), (
+                ("includes_zero_count_experts", True),
+                ("scalar_count_stores", experts),
+                ("cal_expert_cnt", {
+                    "source": "CalExpertCnt:808-820",
+                    "tensor_dtype": "int32 indices; Abs/ReduceSum reinterpret float",
+                    "mask_count": mask_count,
+                    "mask_basis": ("source_assignments; activeMaskBsCnt unknown"
+                                   if mask_count else "unresolved"),
+                    "short_vector": mask_count,
+                    "ops_per_expert": ("Duplicate", "Sub", "Abs(float)",
+                                       "Mins", "software ReduceSum(float)"),
+                    "owner_domain": "contiguous_expert_intervals",
+                    "pipe_v_per_expert": 4,
+                    "v_s_dependency": True,
+                    "vector_ops_per_owner": 5 * mask_count,
+                    "int32_ub_read_bytes_per_expert": 4 * mask_count,
+                    "int32_ub_write_bytes_per_expert": 4,
+                })), "domain"),
         ProtocolPhase("count_status_exchange", ("count_compute",), count,
                       "contiguous_expert_intervals_to_destination_ranks", (
             ("mte3", experts * 32), ("hbm", experts * 32)), (
@@ -310,7 +351,11 @@ def dispatch_plan(layout, *, source_tokens, top_k, source_assignments,
         ProtocolPhase("receive_flags", ("payload_exchange", "receive_metadata"), all_cores,
                       "same_receive_owner", (("hbm", recv * layout.flag_bytes),
                                              ("mte2_aiv", recv * layout.flag_bytes)),
-                      (("polls_counted", 1), ("additional_spin_polls", "unmodeled"))),
+                      (("polls_counted", "unknown_causal"),
+                       ("poll_iteration_source", "WaitDispatch:1087-1112"),
+                       ("poll_termination", "matching_peer_send_event"),
+                       ("per_iteration_work", "MTE2 flag read + Compare/Sum + SFF issue"),
+                       ("additional_spin_polls", "unknown; no universal count"))),
         _staged("receive_local_copy", ("receive_flags",), all_cores,
                 "source_expert_intervals; active owners require route cells", (
                     ("read", _read(recv * (layout.data_region_bytes + layout.expert_scale_bytes))),
@@ -350,7 +395,11 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
         ProtocolPhase("receive_flags", ("payload_exchange",), cores,
                       "contiguous_output_tokens", (("hbm", recv * layout.flag_bytes),
                                                     ("mte2_aiv", recv * layout.flag_bytes)),
-                      (("polls_counted", 1), ("additional_spin_polls", "unmodeled")), "output_tokens"),
+                      (("polls_counted", "unknown_causal"),
+                       ("poll_iteration_source", "combine:958-985/1570"),
+                       ("poll_termination", "matching_peer_send_event"),
+                       ("per_iteration_work", "MTE2 flag read + Compare/Sum + SFF issue"),
+                       ("additional_spin_polls", "unknown; no universal count")), "output_tokens"),
         ProtocolPhase("receive_slots", ("receive_flags",), cores,
                       "contiguous_output_tokens; wait only required topk slots", (
             ("hbm", recv * layout.data_region_bytes),
@@ -380,7 +429,11 @@ def combine_plan(layout, *, source_assignments, received_assignments, experts, e
                 ("read_flags", _read(recv * layout.flag_bytes)),
                 ("compare_flags", (("vector", source_tokens * compared),)),
             ), owner_basis="output_tokens", details=(
-                ("polls_counted", 1), ("additional_spin_polls", "unmodeled"),
+                ("polls_counted", "unknown_causal"),
+                ("poll_iteration_source", "combine:958-985/1570"),
+                ("poll_termination", "matching_peer_send_event"),
+                ("per_iteration_work", "MTE2 flag read + Compare/Sum + SFF issue"),
+                ("additional_spin_polls", "unknown; no universal count"),
                 ("scalar_instruction_counts", {
                     "ub_uint64_mask_reads": source_tokens * (compared // 64),
                     "scalar_sff_calls": source_tokens * (compared // 64),
