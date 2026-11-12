@@ -177,7 +177,8 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
 
 
 def export_op_structure(ops, *, model, execution, kernels=None, source=None,
-                        expand_calls=True, resource_graphs=None, resource_geometries=None):
+                        expand_calls=True, resource_graphs=None, resource_geometries=None,
+                        native_evidence=False):
     """Export a declared OpSpec DAG without a hardware Case or timing execution.
 
     A sequence selects replica 0; a mapping supplies explicit replica -> DAG.
@@ -190,6 +191,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     ``resource_geometries`` optionally maps (replica, stage) to declared Geometry
     for source-kernel planning. It contains ownership/capacity, not resource rates.
     Caller ``source`` is provenance excluded from the content hash.
+    ``native_evidence=True`` attaches derived ``native_calls`` and
+    ``native_call_coverage`` beside the identity. It is opt-in because released
+    consumers (profiler <= 0.5.11) verify ``graph_id`` over every top-level key
+    except ``graph_id``/``source``; the default report stays verifiable by them.
     """
     graphs = ops if isinstance(ops, Mapping) else {0: ops}
     graphs = {replica: tuple(operators) for replica, operators in graphs.items()}
@@ -302,16 +307,18 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
     for chunk in encoder.iterencode(payload):
         digest.update(chunk.encode("utf-8"))
-    return {
+    report = {
         **payload,
         "graph_id": "sha256:" + digest.hexdigest(),
         "source": _json_value(source),
+    }
+    if native_evidence:
         # Derived actual-invocation evidence: carried beside the structural
         # identity, excluded from its hash exactly like caller source.
-        "native_calls": _json_value(native_calls),
-        "native_call_coverage": _json_value(
-            coverage_from_records(native_calls, emitted=len(nodes))),
-    }
+        report["native_calls"] = _json_value(native_calls)
+        report["native_call_coverage"] = _json_value(
+            coverage_from_records(native_calls, emitted=len(nodes)))
+    return report
 
 
 def export_structure(case, *, phase, tokens, context=0, sequences=1,

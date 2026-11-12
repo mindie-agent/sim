@@ -175,8 +175,13 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
     window = _int(c, "sliding_window") or 1024
     ple = bool(_int(c, "hidden_size_per_layer_input"))
     ple_width = _int(c, "hidden_size_per_layer_input") or _int(c, "ple_width") or hidden
-    moe = bool(c.get("enable_moe_block", False))
-    experts = _int(c, "num_experts") if moe else 0
+    # Real Gemma4 configs declare ``enable_moe_block`` + ``num_experts``; older
+    # HF-shaped callers (profiler <= 0.5.11) declare only a routed-expert count.
+    declared_experts = (_int(c, "num_experts") or _int(c, "n_routed_experts")
+                        or _int(c, "num_routed_experts") or _int(c, "num_local_experts"))
+    moe_flag = c.get("enable_moe_block")
+    moe = bool(moe_flag) if moe_flag is not None else bool(declared_experts)
+    experts = declared_experts if moe else 0
     top_k = (_int(c, "top_k_experts") or _int(c, "num_experts_per_tok")) if moe else 0
     moe_i = _int(c, "moe_intermediate_size") if moe else 0
     shared = (_int(c, "n_shared_experts") or _int(c, "num_shared_experts") or 1) if moe else 0
@@ -298,11 +303,12 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
     hidden = int(_require(c, "hidden_size")); heads = int(_require(c, "num_attention_heads"))
     kv_heads = _int(c, "num_attention_groups") or _int(c, "num_key_value_heads") or heads
     head_dim = int(_require(c, "head_dim")); vocab = int(_require(c, "vocab_size"))
-    intermediate = int(_require(c, "intermediate_size"))
     window = _int(c, "sliding_window") or 512
-    experts = _int(c, "moe_num_experts")
+    experts = (_int(c, "moe_num_experts") or _int(c, "n_routed_experts")
+               or _int(c, "num_routed_experts") or _int(c, "num_experts"))
     top_k = _int(c, "moe_top_k") or _int(c, "num_experts_per_tok")
-    moe_i = _int(c, "moe_intermediate_size"); shared_i = _int(c, "share_expert_dim") or moe_i
+    moe_i = _int(c, "moe_intermediate_size")
+    shared_i = _int(c, "share_expert_dim") or _int(c, "shared_expert_intermediate_size") or moe_i
     raw_moe = c.get("moe_layer_list")
     if isinstance(raw_moe, (list, tuple)):
         moe_set = {int(v) for v in raw_moe}
@@ -311,6 +317,14 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         moe_set = {int(v) for v in str(enum).split(",") if v.strip()} if enum is not None else set()
     if bool(c.get("use_moe", False)) and not moe_set:
         raise ModelingError("model_config_step5_moe_schedule_missing")
+    if not moe_set and c.get("use_moe") is None and experts > 0:
+        # Older HF-shaped callers (profiler <= 0.5.11) declare a routed-expert
+        # count without a schedule: every layer is MoE, as before 0.9.11.
+        moe_set = set(range(layers))
+    if _int(c, "intermediate_size") or len(moe_set) < layers:
+        intermediate = int(_require(c, "intermediate_size"))
+    else:
+        intermediate = shared_i or moe_i
     sparse = c.get("sparse_config")
     sparse_on = isinstance(sparse, Mapping) and bool(sparse.get("enabled", False))
     sparse = dict(sparse) if isinstance(sparse, Mapping) else {}

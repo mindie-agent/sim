@@ -488,3 +488,32 @@ def test_gemma4_inline_config_without_intermediate_size_builds():
     assert model.moe_intermediate_size == 704
     assert all(plan.k_eq_v for plan in model.layer_plans if not plan.window)
     assert not any(plan.k_eq_v for plan in model.layer_plans if plan.window)
+
+
+def test_gemma4_routed_expert_count_without_moe_flag_stays_moe():
+    # Legacy HF-shaped Gemma4 callers declare only n_routed_experts.
+    from mindie_sim.catalog.specs import build_model_spec
+    cfg = {"model_type": "gemma4", "num_hidden_layers": 6, "hidden_size": 2816,
+           "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 256,
+           "vocab_size": 262144, "moe_intermediate_size": 704,
+           "shared_expert_intermediate_size": 2112, "n_routed_experts": 128,
+           "num_experts_per_tok": 8, "n_shared_experts": 1,
+           "layer_types": ["sliding_attention"] * 5 + ["full_attention"]}
+    model = build_model_spec("gemma4-legacy", cfg)
+    assert all(plan.ffn == "moe" and plan.num_experts == 128 and plan.top_k == 8
+               for plan in model.layer_plans)
+    dense = build_model_spec("gemma4-dense", {**cfg, "enable_moe_block": False})
+    assert all(plan.ffn == "dense" for plan in dense.layer_plans)
+
+
+def test_step5_routed_expert_count_without_schedule_is_all_moe():
+    from mindie_sim.catalog.specs import build_model_spec
+    cfg = {"model_type": "step5", "num_hidden_layers": 4, "hidden_size": 4096,
+           "num_attention_heads": 64, "num_key_value_heads": 8, "head_dim": 128,
+           "vocab_size": 151936, "moe_intermediate_size": 1280,
+           "shared_expert_intermediate_size": 1280, "n_routed_experts": 256,
+           "num_experts_per_tok": 8, "n_shared_experts": 1,
+           "layer_types": ["full_attention"] * 4}
+    model = build_model_spec("step5-legacy", cfg)
+    assert all(plan.ffn == "moe" and plan.num_experts == 256 and plan.top_k == 8
+               for plan in model.layer_plans)

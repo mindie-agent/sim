@@ -239,7 +239,7 @@ def test_multistage_kernel_and_one_to_many_source_call_keep_one_identity():
     real_parent, real_kernels = _mla_call_parent()
     report = export_op_structure(
         {0: (real_parent,)}, model={}, execution={"phase": "decode"},
-        kernels=real_kernels)
+        kernels=real_kernels, native_evidence=True)
     records = report["native_calls"]
     assert len(records) == 2
     assert len({record["call_id"] for record in records}) == 1
@@ -395,7 +395,7 @@ def test_structure_attaches_native_calls_outside_graph_identity_and_interns():
 
     ops = (_plain_op("a"), _plain_op("b"))
     report = export_op_structure({0: ops}, model={}, execution={"phase": "prefill"},
-                                 source={"revision": "one"})
+                                 source={"revision": "one"}, native_evidence=True)
     assert len(report["native_calls"]) == 2
     assert report["native_call_coverage"]["denominator"]["emitted_operators"] == 2
     assert all("native_call" not in node for node in report["nodes"])
@@ -487,13 +487,25 @@ def test_observed_aliases_are_evidence_not_structural_identity():
             op = _plain_op("alias") if aliases is None else declare_native_call(
                 _plain_op("alias"), observed_aliases=aliases)
             return export_op_structure({0: (op,)}, model={},
-                                       execution={"phase": "prefill"})
+                                       execution={"phase": "prefill"}, native_evidence=True)
         op, kernels = _mla_call_parent(aliases)
         return export_op_structure({0: (op,)}, model={},
-                                   execution={"phase": "decode"}, kernels=kernels)
+                                   execution={"phase": "decode"}, kernels=kernels,
+                                   native_evidence=True)
     for expanded in (False, True):
         reports = [report(expanded, alias) for alias in (None, [{"name": "a"}], [{"name": "b"}])]
         keys = ("graph_id", "nodes", "source_calls", "subgraphs")
         assert all(row[key] == reports[0][key] for row in reports for key in keys)
         assert [row["native_calls"][0]["observed_aliases"] for row in reports] == [
             [], [{"name": "a"}], [{"name": "b"}]]
+
+
+def test_default_export_stays_verifiable_by_released_profiler_graph_id_check():
+    # profiler <= 0.5.11 verifies graph_id over every top-level key except
+    # graph_id/source; the default report must keep that contract.
+    report = export_op_structure({0: (_plain_op("a"), _plain_op("b"))}, model={},
+                                 execution={"phase": "prefill"}, source={"revision": "x"})
+    assert "native_calls" not in report and "native_call_coverage" not in report
+    payload = {key: value for key, value in report.items() if key not in {"graph_id", "source"}}
+    canonical = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    assert report["graph_id"] == "sha256:" + sha256(canonical.encode("utf-8")).hexdigest()
