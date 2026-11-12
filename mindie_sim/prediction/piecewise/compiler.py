@@ -395,6 +395,7 @@ class CompiledOperator:
             span_stage = (PipeDemand(t_pipe, Var("HW_SPAN_WORK"), self.supply.effective(t_pipe), _PIPE_UNITS.get(t_pipe, "work")),)
             self.program = replace(base_program, stages=(*scaled, span_stage))
         else: self.program = base_program
+        self._formula = _formula_text(self.program)
 
     @property
     def name(self) -> str: return self.operator.name
@@ -536,7 +537,7 @@ class CompiledOperator:
             dominant_pipe=dominant, tied_pipes=tied,
             materialization=materialization, internal=internal,
             residency_bytes=evaluate(self.program.residency, env),
-            derived=derived, formula=_formula_text(self.program),
+            derived=derived, formula=self._formula,
         )
 
     def cell_count(self, domain: AnalysisDomain) -> int:
