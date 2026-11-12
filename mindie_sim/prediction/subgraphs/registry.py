@@ -187,7 +187,7 @@ COMBINATION_RULES: tuple[CombinationRule, ...] = (
                     reason="compressed attention needs a cache producer"),
     CombinationRule("F4", requires_any=("F3", "F0"),
                     reason="shared branch joins a routed or dense branch"),
-    CombinationRule("D0", requires_any=("A0", "A1", "A2"),
+    CombinationRule("D0", requires_any=("A0", "A1", "A2", "A3", "A4"),
                     reason="draft/verify needs an attention macro"),
 )
 
