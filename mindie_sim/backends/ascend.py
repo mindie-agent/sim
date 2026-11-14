@@ -143,7 +143,7 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
 
 @lru_cache(maxsize=1)
 def profiles():
-    with Path(__file__).with_name("profiles").joinpath("ascend.json").open() as stream:
+    with Path(__file__).with_name("profiles").joinpath("ascend.json").open(encoding="utf-8") as stream:
         return json.load(stream)
 
 

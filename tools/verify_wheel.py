@@ -301,18 +301,20 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     root, wheel = Path(root).resolve(), Path(wheel).resolve()
     work = Path(tempfile.mkdtemp(prefix="sim-wheel-"))
     env = work / "env"
+    win_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
     subprocess.run(["uv", "venv", "--python", sys.executable, str(env)],
-                   check=True, timeout=60)
+                   check=True, timeout=60, **win_kw)
     python = next(path for path in (env / "bin/python", env / "Scripts/python.exe")
                   if path.is_file())
     subprocess.run(["uv", "pip", "install", "--python", str(python), str(wheel)],
-                   check=True, timeout=120)
+                   check=True, timeout=120, **win_kw)
     checks = []
 
     def run(args, name, expected_code=0, *, module="mindie_sim"):
         result = subprocess.run(
             [str(python), "-I", "-m", module, *map(str, args)],
-            cwd=work, text=True, capture_output=True, timeout=60)
+            cwd=work, text=True, encoding="utf-8", errors="replace",
+            capture_output=True, timeout=60, **win_kw)
         if result.returncode != expected_code:
             raise RuntimeError((name, result.stdout, result.stderr))
         checks.append({"command": name, "exit_code": result.returncode})
@@ -320,12 +322,12 @@ def verify(wheel, root, output, *, profiler_wheel=None):
 
     cli = next(path for path in (env / "bin/mindie-sim", env / "Scripts/mindie-sim.exe")
                if path.is_file())
-    subprocess.run([str(cli), "--help"], cwd=work, check=True, capture_output=True, timeout=30)
+    subprocess.run([str(cli), "--help"], cwd=work, check=True, capture_output=True, timeout=30, **win_kw)
     checks.append({"command": "installed-entrypoint", "exit_code": 0})
     run(["--help"], "help")
     assert len(run(["catalog"], "catalog")) > 1
     run(["predict", root / "examples/quickstart.json", "-o", work / "prediction.json"], "predict")
-    prediction = json.loads((work / "prediction.json").read_text())
+    prediction = json.loads((work / "prediction.json").read_text(encoding="utf-8"))
     assert prediction["status"] == "modeled"
     assert prediction["metrics"]["output_tokens"] == 14
     body = run(["predict", root / "examples/quickstart.json", "--scope", "body",
@@ -351,7 +353,7 @@ def verify(wheel, root, output, *, profiler_wheel=None):
             "workload": {"requests": [{"id": "r", "prompt_tokens": 1, "output_tokens": 1}]},
         }
         control_path = work / (sku + "-integer-body.json")
-        control_path.write_text(json.dumps(balanced) + "\n")
+        control_path.write_text(json.dumps(balanced) + "\n", encoding="utf-8", newline="\n")
         report = run(["predict", control_path, "--scope", "body", "--tokens", 5,
                       "--context", 256], "body-integer-banks-and-pipes-" + sku)
         programs = {row["program"] for row in report["timeline"]}
@@ -373,19 +375,20 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     verify_whitebox_services(run, root, work)
     sort32 = subprocess.run(
         [str(python), '-I', str(root / 'tools/verify_sort32_installed.py')],
-        cwd=work, text=True, capture_output=True, timeout=30, check=True)
+        cwd=work, text=True, encoding='utf-8', errors='replace',
+        capture_output=True, timeout=30, check=True, **win_kw)
     sort_report = json.loads(sort32.stdout)
     assert Path(sort_report['package']).is_relative_to(env)
     assert len(sort_report['results']) == 9
     checks.append({'command': 'installed-sort32-owner-capacity-controls', 'exit_code': 0})
     for sku, native in (("Ascend910_9362", False), ("Ascend950DT_9582", False), ("Ascend950DT_9582", True)):
         source = root / "examples/cases/high-concurrency-20261030/source-gdn-native/qwen36-a5-tp8-c4.json"
-        raw = json.loads(source.read_text())
+        raw = json.loads(source.read_text(encoding="utf-8"))
         raw["machine"]["sku"], raw["model"]["layers"] = sku, 1
         if not native:
             raw["runtime"]["kernels"].pop("lowerings")
         path = work / f"gdn-body-{sku}-{native}.json"
-        path.write_text(json.dumps(raw) + "\n")
+        path.write_text(json.dumps(raw) + "\n", encoding="utf-8", newline="\n")
         report = run(["predict", path, "--scope", "body", "--tokens", 4, "--context", 128,
                       "--sequences", 4], f"body-gdn-{sku}-{native}")
         recipes = {row["recipe"] for row in report["timeline"]}
@@ -704,7 +707,7 @@ def verify(wheel, root, output, *, profiler_wheel=None):
         from mindie_sim.observations.store import digest_file
         profiler_wheel = Path(profiler_wheel).resolve()
         subprocess.run(["uv", "pip", "install", "--python", str(python), str(profiler_wheel)],
-                       check=True, timeout=120)
+                       check=True, timeout=120, **win_kw)
         companion = {"wheel": str(profiler_wheel), "sha256": digest_file(profiler_wheel)}
         checks.append({"command": "install-companion-profiler-wheel", "exit_code": 0})
     fixtures = root / "tests/fixtures/observations"
@@ -717,7 +720,7 @@ def verify(wheel, root, output, *, profiler_wheel=None):
         "dtype": "raw_capture", "shape": variants[0]["context"], "scope": "device_kernel",
     }
     binding = {"variant": variants[0]["id"], "key": key, "run_id": "wheel-import", "split": "heldout"}
-    (work / "bindings.jsonl").write_text(json.dumps(binding) + "\n")
+    (work / "bindings.jsonl").write_text(json.dumps(binding) + "\n", encoding="utf-8", newline="\n")
     result = run(["bind-profiler", fixtures / "catalogue.sqlite", work / "primitives.sqlite",
                   work / "bindings.jsonl"], "bind-profiler")
     assert result["imported_samples"] > 0
@@ -727,7 +730,7 @@ def verify(wheel, root, output, *, profiler_wheel=None):
         "repeat_index": rows[0]["line"], "source": f"{fixtures / 'profiler.csv'}#line={rows[0]['line']}",
         "split": "heldout",
     }
-    (work / "samples.jsonl").write_text(json.dumps(sample) + "\n")
+    (work / "samples.jsonl").write_text(json.dumps(sample) + "\n", encoding="utf-8", newline="\n")
     imported = run(["calibrate", work / "primitives.sqlite", work / "samples.jsonl"], "calibrate")
     assert imported["heldout"]["repeats"] == result["imported_samples"] + 1
     heldout = run(["predict", root / "examples/quickstart.json", "--primitives",
@@ -746,8 +749,8 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     capture = next((root / "data/measurements/gpu").glob("*.stdout"))
     fit = run(["fit-rate", capture], "fit-rate")
     assert fit["train_trials"] == 15 and len(fit["heldout"]) == 5
-    raw = json.loads(capture.read_text())
-    retained = json.loads((root / "data/measurements/gpu/service-curve-validation-20261028.json").read_text())
+    raw = json.loads(capture.read_text(encoding="utf-8"))
+    retained = json.loads((root / "data/measurements/gpu/service-curve-validation-20261028.json").read_text(encoding="utf-8"))
     model = retained["calibration"]["model"]
     packet = {key: model[key] for key in
               ("resource", "work_unit", "identity", "boundary", "active_units")}
@@ -756,14 +759,14 @@ def verify(wheel, root, output, *, profiler_wheel=None):
          "run_id": capture.name, "repeat_index": row["trial"],
          "source": f"{capture}#/samples/{index}", "split": row["split"]}
         for index, row in enumerate(raw["samples"])]
-    (work / "service-packet.json").write_text(json.dumps(packet) + "\n")
+    (work / "service-packet.json").write_text(json.dumps(packet) + "\n", encoding="utf-8", newline="\n")
     service = run(["fit-service", work / "service-packet.json"], "fit-service")
     assert len(service["heldout"]) == 5
     # This is an interface check using a real retained event, not an accuracy claim.
     from mindie_sim.observations.captures import iter_observations
     from mindie_sim.observations.store import digest_file
     fixture = fixtures / "capture_adapters"
-    protocol = json.loads((root / "data/observations/protocols/grouped-call-protocol.json").read_text())
+    protocol = json.loads((root / "data/observations/protocols/grouped-call-protocol.json").read_text(encoding="utf-8"))
     protocol["producer"] = {"path": str(fixture / "grouped_producer.py.txt"),
                             "sha256": digest_file(fixture / "grouped_producer.py.txt")}
     protocol["supporting_sources"] = []
@@ -773,11 +776,11 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     packet = {"predictions": [{"point_id": "interface-contract-only",
                                "identity": observation["identity"], "duration_ms": 1}],
               "observations": [observation]}
-    (work / "accuracy-packet.json").write_text(json.dumps(packet) + "\n")
+    (work / "accuracy-packet.json").write_text(json.dumps(packet) + "\n", encoding="utf-8", newline="\n")
     accuracy = run(["accuracy", work / "accuracy-packet.json"], "accuracy")
     assert accuracy["coverage"]["paired_heldout_points"] == 0
     assert accuracy["coverage"]["excluded_observations"] == {"split_unassigned": 1}
-    (work / "grouped-protocol.json").write_text(json.dumps(protocol) + "\n")
+    (work / "grouped-protocol.json").write_text(json.dumps(protocol) + "\n", encoding="utf-8", newline="\n")
     grouped = run(["compare-calls", root / "examples/calls/quantized-grouped-small.json",
                    work / "grouped-protocol.json"], "compare-calls-quantized-grouped")
     assert grouped["summary"]["samples"] == 240
@@ -786,14 +789,14 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     assert grouped["summary"]["condition_statuses"] == {"predicted": 6}
     assert grouped["validation"]["strict_pairs"] == 0
     assert {row["protocol"]["invocations"] for row in grouped["predictions"]} == {1, 8}
-    protocol = json.loads((root / "data/observations/protocols/activation-call-protocol.json").read_text())
+    protocol = json.loads((root / "data/observations/protocols/activation-call-protocol.json").read_text(encoding="utf-8"))
     protocol["producer"] = {"path": str(fixture / "activation_producer.py.txt"),
                             "sha256": digest_file(fixture / "activation_producer.py.txt")}
     protocol["supporting_sources"] = []
     protocol["captures"] = [
         {"path": str(fixture / name), "sha256": digest_file(fixture / name)}
         for name in ("activation_a.json", "activation_b.json")]
-    (work / "activation-protocol.json").write_text(json.dumps(protocol) + "\n")
+    (work / "activation-protocol.json").write_text(json.dumps(protocol) + "\n", encoding="utf-8", newline="\n")
     aligned = run(["compare-calls", root / "examples/calls/activation-nominal.json",
                    work / "activation-protocol.json", "--include-submission"],
                   "compare-calls-activation")
@@ -815,15 +818,15 @@ def verify(wheel, root, output, *, profiler_wheel=None):
          "runpy.run_path(sys.argv.pop(1),run_name='__main__')",
          str(root / "tools"), str(root / "tools/model_scoreboard.py"),
          str(root / "tests/fixtures/verification/scoreboard-input.json"),
-         "-o", str(scoreboard)], cwd=work, check=True, capture_output=True, timeout=30)
-    board = json.loads(scoreboard.read_text())
+         "-o", str(scoreboard)], cwd=work, check=True, capture_output=True, timeout=30, **win_kw)
+    board = json.loads(scoreboard.read_text(encoding="utf-8"))
     assert len(board["models"]) == 6
     assert len(board["references"]) == 1
     assert any(row["step_comparison"]["status"] == "conditional_range" for row in board["models"])
     checks.append({"command": "installed-scoreboard-retained-observations", "exit_code": 0})
     location = subprocess.check_output(
         [str(python), "-I", "-c", "import mindie_sim; print(mindie_sim.__file__)"],
-        cwd=work, text=True, timeout=30).strip()
+        cwd=work, text=True, encoding="utf-8", errors="replace", timeout=30, **win_kw).strip()
     assert Path(location).is_relative_to(env)
     report = {
         "status": "passed", "environment": str(env), "import_path": location,
@@ -833,7 +836,7 @@ def verify(wheel, root, output, *, profiler_wheel=None):
         "scope": "Isolated installed wheel outside checkout; fixture imports check identity "
                  "translation and heldout separation, not serving calibration accuracy.",
     }
-    Path(output).write_text(json.dumps(report, indent=2) + "\n")
+    Path(output).write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
     return report
 
 

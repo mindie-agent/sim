@@ -549,6 +549,8 @@ def load_architecture_profile(
         path = root / ARCHITECTURE_PRESET_CATALOG[resolved]
         try:
             config = json.loads(path.read_text(encoding="utf-8"))
+        except TimeoutError:
+            raise
         except OSError as exc:
             raise ModelingError(f"architecture_preset_unreadable:{resolved}:{type(exc).__name__}") from exc
         return build_architecture_profile(config, key=resolved)
@@ -713,6 +715,8 @@ def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
         raise ModelingError(f"model_config_size_exceeds_metadata_limit:{key}")
     try:
         config = json.loads(path.read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
     except OSError as exc:
         raise ModelingError(f"model_config_unreadable:{key}:{type(exc).__name__}") from exc
     return _build_model_spec(key, config)

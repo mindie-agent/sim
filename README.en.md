@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.11-blue" alt="Release v0.9.11">
+  <img src="https://img.shields.io/badge/Release-v0.9.12-blue" alt="Release v0.9.12">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -55,13 +55,13 @@ Please install and configure https://github.com/mindie-agent/sim for me
 <details>
 <summary>🤖 <b>AI Agent Auto-Install & Workflow Protocol (Instructions for AI Agents)</b></summary>
 
-If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.11`):
+If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.12`):
 
 1. **Check Python Version**: Ensure Python `>= 3.11` is available (`mindie-sim` has zero `torch` or `torch_npu` runtime import dependencies and runs cleanly on macOS, Linux, and Windows).
 2. **Install the CLI and Package**:
    - Install the pinned release wheel (recommended):
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.11/mindie_sim-0.9.11-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.12/mindie_sim-0.9.12-py3-none-any.whl
      ```
    - Or install the latest development version from `main`:
      ```bash

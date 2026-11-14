@@ -22,17 +22,21 @@ def read_json(path):
     path = Path(path)
     if path.stat().st_size > 50 * 1024**2:
         raise ValueError("metadata_input_exceeds_50_MiB:use_streaming_observation_import")
-    with path.open() as stream:
+    with path.open(encoding="utf-8") as stream:
         return json.load(stream)
 
 
 def emit(value, output):
     if output:
-        with Path(output).open("w") as stream:
+        with Path(output).open("w", encoding="utf-8", newline="\n") as stream:
             json.dump(value, stream, ensure_ascii=False, indent=2, allow_nan=False)
             stream.write("\n")
     else:
-        print(json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False))
+        rendered = json.dumps(value, ensure_ascii=False, indent=2, allow_nan=False)
+        try:
+            print(rendered)
+        except UnicodeEncodeError:
+            print(json.dumps(value, ensure_ascii=True, indent=2, allow_nan=False))
 
 
 def parser():
