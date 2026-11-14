@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.12-blue" alt="Release v0.9.12">
+  <img src="https://img.shields.io/badge/Release-v0.9.13-blue" alt="Release v0.9.13">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0911-highlights--full-fleet-convergence">v0.9.11 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
+  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0913-highlights--full-fleet-convergence">v0.9.13 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
 </p>
 
 ---
@@ -55,13 +55,13 @@ Please install and configure https://github.com/mindie-agent/sim for me
 <details>
 <summary>🤖 <b>AI Agent Auto-Install & Workflow Protocol (Instructions for AI Agents)</b></summary>
 
-If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.12`):
+If you are an AI Agent receiving the prompt above, execute the following steps to install and verify `mindie-sim` (`v0.9.13`):
 
 1. **Check Python Version**: Ensure Python `>= 3.11` is available (`mindie-sim` has zero `torch` or `torch_npu` runtime import dependencies and runs cleanly on macOS, Linux, and Windows).
 2. **Install the CLI and Package**:
    - Install the pinned release wheel (recommended):
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.12/mindie_sim-0.9.12-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.13/mindie_sim-0.9.13-py3-none-any.whl
      ```
    - Or install the latest development version from `main`:
      ```bash
@@ -80,9 +80,9 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 ---
 
-## `v0.9.11` Highlights & Full-Fleet Convergence
+## `v0.9.13` Highlights & Full-Fleet Convergence
 
-`mindie-sim v0.9.11` (paired with `mindie-profiler v0.5.10`) extends the unified causal engine with **normalized native-call structural binding & coverage contracts (`native_binding` / `native_coverage`), canonical standalone primitive evaluation (`evaluate_primitive_spec`), packaged offline fleet model catalog configs (`minimax-m3`, `minimax-m3.1-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`, `qwen3.6-35b-a3b`, `qwen3.8-flash-next`, `step-5-preview` plus `GeGLU`, sparse `GQA`, and Gemma `K=V` lowering), first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md), [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md), [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md), and [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md)).
+`mindie-sim v0.9.13` (paired with `mindie-profiler v0.5.10+`) extends the unified causal engine with **cross-platform Windows `CP936` UTF-8 / Unix `LF` I/O determinism and strict `TimeoutError` propagation, normalized native-call structural binding & coverage contracts (`native_binding` / `native_coverage`), canonical standalone primitive evaluation (`evaluate_primitive_spec`), packaged offline fleet model catalog configs (`minimax-m3`, `minimax-m3.1-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`, `qwen3.6-35b-a3b`, `qwen3.8-flash-next`, `step-5-preview` plus `GeGLU`, sparse `GQA`, and Gemma `K=V` lowering), first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.13.en.md`](./docs/releases/sim-0.9.13.en.md), [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md), [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md), and [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)).
 
 ### 1. 4D Efficiency Decomposition & Bottleneck Attribution (`analyze_operator_row` / `analyze_network_efficiency`)
 
@@ -311,7 +311,7 @@ sim/
 
 | Topic | Link |
 | --- | --- |
-| **`v0.9.11` / `v0.9.5` / `v0.9.4` / `v0.9.3` Release Notes** | [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) · [`docs/releases/sim-0.9.4.md`](./docs/releases/sim-0.9.4.md) · [`docs/releases/sim-0.9.3.md`](./docs/releases/sim-0.9.3.md) |
+| **`v0.9.13` / `v0.9.12` / `v0.9.11` / `v0.9.5` Release Notes** | [`docs/releases/sim-0.9.13.en.md`](./docs/releases/sim-0.9.13.en.md) · [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md) · [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md) · [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md) |
 | **Unified Causal Architecture & Resource Time Semantics** | [`docs/architecture.md`](./docs/architecture.md) |
 | **Modeling Fidelity, Scope & Refinement Policy** | [`docs/modeling-fidelity.md`](./docs/modeling-fidelity.md) |
 | **Input Case Contracts & Hardware/Parallel Specs** | [`docs/inputs.md`](./docs/inputs.md) |
