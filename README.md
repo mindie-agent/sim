@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/Release-v0.9.11-blue" alt="Release v0.9.11">
+  <img src="https://img.shields.io/badge/Release-v0.9.12-blue" alt="Release v0.9.12">
   <img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" alt="Python 3.11+">
   <img src="https://img.shields.io/badge/Interface-CLI%20%7C%20Python%20API%20%7C%20PrimitiveStore-00ADD8" alt="CLI | Python API | PrimitiveStore">
   <img src="https://img.shields.io/badge/Target-Ascend%20NPU%20(A2%20%7C%20A3%20%7C%20A5)-FF6B00" alt="Ascend NPU A2/A3/A5">
@@ -55,13 +55,13 @@ flowchart TB
 <details>
 <summary>🤖 <b>AI Agent 自动安装与使用协议（Instructions for AI Agents）</b></summary>
 
-如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.11`）的安装与功能验证：
+如果你是收到上述指令的 AI Agent，请按以下步骤完成 `mindie-sim`（`v0.9.12`）的安装与功能验证：
 
 1. **检查基础环境**：确认 Python `>= 3.11` 可用（`mindie-sim` 导入时不依赖 `torch` 或 `torch_npu`，在 macOS、Linux 或 Windows 上均可直接运行）。
 2. **安装命令行与 Python 包**：
    - 使用固定版本 Release Wheel 安装（推荐生产环境）：
      ```bash
-     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.11/mindie_sim-0.9.11-py3-none-any.whl
+     uv pip install https://github.com/mindie-agent/sim/releases/download/v0.9.12/mindie_sim-0.9.12-py3-none-any.whl
      ```
    - 或从源码主分支安装最新开发版：
      ```bash

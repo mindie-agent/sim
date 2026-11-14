@@ -48,7 +48,7 @@ _ASSUMPTIONS = {
 
 @lru_cache(maxsize=1)
 def profiles():
-    with Path(__file__).with_name("profiles").joinpath("nvidia.json").open() as stream:
+    with Path(__file__).with_name("profiles").joinpath("nvidia.json").open(encoding="utf-8") as stream:
         return json.load(stream)
 
 

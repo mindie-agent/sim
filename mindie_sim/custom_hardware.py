@@ -650,10 +650,10 @@ def _read_sku_file(path: str | Path) -> dict[str, Mapping[str, Any]]:
     try:
         with target.open(encoding="utf-8") as stream:
             data = json.load(stream)
+    except TimeoutError:
+        raise
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
-        raise ModelingError(
-            f"custom_hardware_sku_file_unreadable:{target}:{error}"
-        ) from error
+        raise ModelingError(f"custom_hardware_sku_file_unreadable:{target}:{error}") from error
     if not isinstance(data, Mapping):
         raise ModelingError(f"custom_hardware_sku_file_must_be_mapping:{target}")
     entries: Any = data["skus"] if "skus" in data else data
@@ -687,9 +687,7 @@ def _load_file(
     return loaded
 
 
-def load_custom_hardware_skus_from_file(
-    path: str | Path,
-) -> dict[str, dict[str, Any]]:
+def load_custom_hardware_skus_from_file(path: str | Path) -> dict[str, dict[str, Any]]:
     """Register every SKU in a private JSON file and return the loaded map."""
     return _load_file(path, overwrite=True)
 
@@ -700,9 +698,10 @@ def _maybe_load_environment_skus() -> None:
         return
     try:
         _load_file(path, overwrite=False)
+    except TimeoutError:
+        raise
     except (OSError, ValueError, TypeError):
-        # A missing or malformed optional environment file must not break an
-        # otherwise explicit registry lookup.
+        # A missing or malformed optional environment file must not break an explicit registry lookup.
         return
 
 
