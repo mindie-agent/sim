@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v0913-核心特性与全量收敛基准">v0.9.14 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
+  <strong>中文</strong> · <a href="./README.en.md">English</a> · <a href="#为什么需要-sim">为什么需要</a> · <a href="#快速开始">快速开始</a> · <a href="#v0914-核心特性与全量收敛基准">v0.9.14 核心特性</a> · <a href="#cli-子命令与-python-api-一览">CLI 与 Python API</a> · <a href="#真实使用示例">使用示例</a> · <a href="#文档导航">文档导航</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent 主仓库</a>
 </p>
 
 ---
@@ -194,6 +194,15 @@ flowchart TB
 | `mindie-sim calibrate` / `bind-profiler` | 将实测原语样本或 Profiler 算子库导入 `PrimitiveStore` | `mindie-sim calibrate /tmp/primitives.db samples.jsonl` |
 | `mindie-sim validate` / `accuracy` | 在显式测量边界上对比预测结果与观测值，生成精度报告 | `mindie-sim validate pred.json obs.json --boundary body` |
 | `mindie-sim fit-rate` / `fit-service` | 拟合单资源有效速率或单原语工作量响应曲线 | `mindie-sim fit-service observations.json` |
+| `mindie-sim compose` | 从内置目录或实测剖析摘要合成仿真 Case（支持 `--recover-ssm`） | `mindie-sim compose --model qwen3-30b-a3b --hardware a3 --recover-ssm` |
+| `mindie-sim advise` / `sweep` / `skew` | 部署干预建议排序、并行/PD 网格 Pareto 寻优与 MoE 偏斜评估 | `mindie-sim advise examples/quickstart.json` |
+| `mindie-sim inspect-launch` / `sol` / `feature-deltas` | 解析启动命令、对照硬件物理极值（SOL）与评估特性反事实增量 | `mindie-sim sol examples/quickstart.json` |
+| `mindie-sim diff-trace` | 实测单步耗时四路守恒残差归因与 `repro-op` 复现命令生成 | `mindie-sim diff-trace examples/quickstart.json capture.json` |
+| `mindie-sim optimize-graph` | Day-0 计算图融合、多流调度与权重预取优化评估 | `mindie-sim optimize-graph examples/quickstart.json --phase decode` |
+| `mindie-sim sweep-ep-knee` / `size-xpyd` | 离散 EP 拐点扫描与总卡数/SLO 约束下 XPyD 分离池配比求解 | `mindie-sim size-xpyd examples/quickstart.json --total-npus 16` |
+| `mindie-sim memory-breakdown` / `kv-state` | 每 Rank 六分量常驻 HBM 账本与混合 KV / 7 族 `RecoverSSM` 状态评估 | `mindie-sim memory-breakdown examples/quickstart.json` |
+| `mindie-sim opflow` / `op-formula` | 通用算子流（OpFlow）管线评估与可解释单算子理论公式诊断 | `mindie-sim op-formula rms_norm --hardware a3` |
+| `mindie-sim build-accel` | 编译可选本地 C11 原生事件引擎加速核 | `mindie-sim build-accel` |
 
 ### 核心 Python API
 

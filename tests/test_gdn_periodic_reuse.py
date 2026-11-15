@@ -23,6 +23,8 @@ from dataclasses import replace
 from fractions import Fraction
 from types import SimpleNamespace
 
+import pytest
+
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.gdn_decode_programs import gating_plan
 from mindie_sim.prediction.gdn_program_bridge import (
@@ -178,14 +180,14 @@ def _assert_busy(fast, reference):
         assert _close(fast[name], value)
 
 
-def test_gating_full_engine_three_to_five_iterations_and_aligned_granule():
-    for rounds in (3, 4):
-        rows = 64 * 8 * rounds
-        reference = _gating_reference(_GATING_SUPPLY, rows, 24)
-        fast = gating_program_result(_GATING_SUPPLY, rows, 24)
-        assert _close(fast[0], reference[0])
-        _assert_busy(fast[3], reference[1])
-        assert dict(fast[4]) == dict(reference[2])
+@pytest.mark.parametrize("rounds", (3, 4))
+def test_gating_full_engine_three_to_five_iterations_and_aligned_granule(rounds):
+    rows = 64 * 8 * rounds
+    reference = _gating_reference(_GATING_SUPPLY, rows, 24)
+    fast = gating_program_result(_GATING_SUPPLY, rows, 24)
+    assert _close(fast[0], reference[0])
+    _assert_busy(fast[3], reference[1])
+    assert dict(fast[4]) == dict(reference[2])
 
 
 def test_gating_unaligned_granule_falls_back_to_full_plan():
@@ -231,51 +233,48 @@ def test_gating_alternate_outstanding_and_owner_occupancy():
     assert dict(fast[4]) == dict(reference[2])
 
 
-def test_gating_4096_period_tail_and_4097_wide_fallback():
-    q4096 = {"element_bytes": 2, "granule_bytes": 4096, "outstanding": 8,
+@pytest.mark.parametrize(("granule", "k"), ((4096, 4), (4096, 5), (4097, 3)))
+def test_gating_4096_period_tail_and_4097_wide_fallback(granule, k):
+    queue = {"element_bytes": 2, "granule_bytes": granule, "outstanding": 8,
              "response_ms": 9.125e-05, "row_control_ms": 7e-06}
-    q4097 = dict(q4096); q4097["granule_bytes"] = 4097
-    for granule, queue, rounds in (
-        (4096, q4096, (4, 5)),
-        (4097, q4097, (3,)),
-    ):
-        supply = replace(_GATING_SUPPLY, store_queues=(
-            ("scalar_store_issue", tuple(sorted(queue.items()))),
-        ))
-        for k in rounds:
-            rows = 64 * 8 * k
-            reference = _gating_reference(supply, rows, 24)
-            fast = gating_program_result(supply, rows, 24)
-            assert _close(fast[0], reference[0]), (granule, k)
-            _assert_busy(fast[3], reference[1])
-            assert dict(fast[4]) == dict(reference[2]), (granule, k)
+    supply = replace(_GATING_SUPPLY, store_queues=(
+        ("scalar_store_issue", tuple(sorted(queue.items()))),
+    ))
+    rows = 64 * 8 * k
+    reference = _gating_reference(supply, rows, 24)
+    fast = gating_program_result(supply, rows, 24)
+    assert _close(fast[0], reference[0]), (granule, k)
+    _assert_busy(fast[3], reference[1])
+    assert dict(fast[4]) == dict(reference[2]), (granule, k)
 
 
-def test_pf3_full_engine_three_to_five_pack_creation():
-    for rounds in (3, 4):
-        lengths = (512 * rounds,)
-        reference = _pf3_reference(_SUPPLY, lengths, 24, 8)
-        fast = pf3_program_result(_SUPPLY, lengths, 24, 8, 128, 128, 64)
-        assert _close(fast[0], reference[0])
-        assert len(fast[5]) == len(reference[3])
-        for left, right in zip(fast[5], reference[3]):
-            assert _close(left, right)
-        _assert_busy(fast[3], reference[1])
-        assert dict(fast[4]) == dict(reference[2])
+@pytest.mark.parametrize("rounds", (3, 4))
+def test_pf3_full_engine_three_to_five_pack_creation(rounds):
+    lengths = (512 * rounds,)
+    reference = _pf3_reference(_SUPPLY, lengths, 24, 8)
+    fast = pf3_program_result(_SUPPLY, lengths, 24, 8, 128, 128, 64)
+    assert _close(fast[0], reference[0])
+    assert len(fast[5]) == len(reference[3])
+    for left, right in zip(fast[5], reference[3]):
+        assert _close(left, right)
+    _assert_busy(fast[3], reference[1])
+    assert dict(fast[4]) == dict(reference[2])
 
 
-def test_pf3_actual_ratio4_and_occupancy_full_engine_controls():
-    for supply, heads, keys, stride in (
+@pytest.mark.parametrize("case_idx", (0, 1))
+def test_pf3_actual_ratio4_and_occupancy_full_engine_controls(case_idx):
+    cases = (
         (_SUPPLY, 32, 8, 512),
         (replace(_SUPPLY, resource_units=tuple(
             (name, 64 if name == "vector" else 32)
             for name, _ in _UNITS), compute_units=32), 24, 8, 256),
-    ):
-        lengths = (stride * 3,)
-        reference = _pf3_reference(supply, lengths, heads, keys)
-        fast = pf3_program_result(supply, lengths, heads, keys, 128, 128, 64)
-        assert _close(fast[0], reference[0])
-        for left, right in zip(fast[5], reference[3]):
-            assert _close(left, right)
-        _assert_busy(fast[3], reference[1])
-        assert dict(fast[4]) == dict(reference[2])
+    )
+    supply, heads, keys, stride = cases[case_idx]
+    lengths = (stride * 3,)
+    reference = _pf3_reference(supply, lengths, heads, keys)
+    fast = pf3_program_result(supply, lengths, heads, keys, 128, 128, 64)
+    assert _close(fast[0], reference[0])
+    for left, right in zip(fast[5], reference[3]):
+        assert _close(left, right)
+    _assert_busy(fast[3], reference[1])
+    assert dict(fast[4]) == dict(reference[2])

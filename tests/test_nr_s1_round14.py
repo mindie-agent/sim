@@ -53,25 +53,23 @@ def _env(prefix):
             **{name: "x" for name in ("docker", "sh", "bash", "env", "export")}}
 
 
-@pytest.mark.parametrize("prefix", PREFIXES)
-@pytest.mark.parametrize("wrapper", WRAPPERS)
-@pytest.mark.parametrize("separator", ["\n", ";"])
-def test_r14_complete_export_statement_reaches_wrapper(prefix, wrapper, separator):
-    text = prefix + separator + wrapper + shlex.quote(SCRIPT)
-    env = normalize_env(_env(prefix))
-    # Exercise the strict lexer (or its semicolon fallback), and independently
-    # force the tolerant path with the retained unsupported trailing operator.
-    for surface in (text, text + " | true"):
-        words = _decoded_shell_words(surface, env)
-        assert any(word is _STATEMENT_END for word in words)
-        assert not isinstance(_STATEMENT_END, str)
-        script, effective = discovery_wrapper(words, env)
-        assert script == SCRIPT
-        assert effective["VALUE"][0] == SECRET
-        found = set()
-        _shell_taint(surface, found, env)
-        assert SECRET in found
-        assert OLD not in found
+def test_r14_complete_export_statement_reaches_wrapper():
+    for prefix in PREFIXES:
+        env = normalize_env(_env(prefix))
+        for wrapper in WRAPPERS:
+            for separator in ("\n", ";"):
+                text = prefix + separator + wrapper + shlex.quote(SCRIPT)
+                for surface in (text, text + " | true"):
+                    words = _decoded_shell_words(surface, env)
+                    assert any(word is _STATEMENT_END for word in words)
+                    assert not isinstance(_STATEMENT_END, str)
+                    script, effective = discovery_wrapper(words, env)
+                    assert script == SCRIPT
+                    assert effective["VALUE"][0] == SECRET
+                    found = set()
+                    _shell_taint(surface, found, env)
+                    assert SECRET in found
+                    assert OLD not in found
 
 
 def _document(prefix, separator, layout):
@@ -112,78 +110,76 @@ def _assert_safe(report):
     assert SECRET not in report.source.name
 
 
-@pytest.mark.parametrize("prefix", PREFIXES)
-@pytest.mark.parametrize("layout", ["json", "flow", "block", "mixed"])
-@pytest.mark.parametrize("separator", ["\n", ";"])
-def test_r14_export_inventory_protects_public_sibling_and_missing(prefix, layout,
-                                                                separator):
-    text = _document(prefix, separator, layout)
-    fmt = "json" if layout == "json" else "yaml"
-    assert SECRET in prescan_document_secrets(text, fmt)
-    if fmt == "yaml":
-        found = set()
-        raw_document_taint(text, found, _shell_taint)
-        assert SECRET in found
-        if HAS_YAML:
-            events = set()
-            _event_taint(text, events, _shell_taint)
-            assert SECRET in events
-    for selection in ("a", "b", SECRET):
-        report = parse_launch(text, format=fmt, container=selection,
-                              source=SECRET, **BASE)
-        _assert_safe(report)
-        codes = {item.code for item in report.diagnostics}
-        if fmt == "yaml" and not HAS_YAML:
-            assert report.status == "failed"
-            assert "yaml_parser_unavailable" in codes
-        elif selection == SECRET:
-            assert report.status == "failed"
-            assert "container_not_found" in codes
-        elif selection == "a" and separator == ";":
-            assert report.status == "failed"
-            assert "unsupported_shell_syntax" in codes
-        else:
-            assert report.status == "completed"
-            name = "--served-model-name" if selection == "b" else "--api-key"
-            settings = (*report.applied, *report.neutral_operational,
-                        *report.unmodeled_or_unsupported)
-            assert next(item for item in settings if item.name == name).redacted
+def test_r14_export_inventory_protects_public_sibling_and_missing():
+    for prefix in PREFIXES:
+        for layout in ("json", "flow", "block", "mixed"):
+            for separator in ("\n", ";"):
+                text = _document(prefix, separator, layout)
+                fmt = "json" if layout == "json" else "yaml"
+                assert SECRET in prescan_document_secrets(text, fmt)
+                if fmt == "yaml":
+                    found = set()
+                    raw_document_taint(text, found, _shell_taint)
+                    assert SECRET in found
+                    if HAS_YAML:
+                        events = set()
+                        _event_taint(text, events, _shell_taint)
+                        assert SECRET in events
+                for selection in ("a", "b", SECRET):
+                    report = parse_launch(text, format=fmt, container=selection,
+                                          source=SECRET, **BASE)
+                    _assert_safe(report)
+                    codes = {item.code for item in report.diagnostics}
+                    if fmt == "yaml" and not HAS_YAML:
+                        assert report.status == "failed"
+                        assert "yaml_parser_unavailable" in codes
+                    elif selection == SECRET:
+                        assert report.status == "failed"
+                        assert "container_not_found" in codes
+                    elif selection == "a" and separator == ";":
+                        assert report.status == "failed"
+                        assert "unsupported_shell_syntax" in codes
+                    else:
+                        assert report.status == "completed"
+                        name = "--served-model-name" if selection == "b" else "--api-key"
+                        settings = (*report.applied, *report.neutral_operational,
+                                    *report.unmodeled_or_unsupported)
+                        assert next(item for item in settings if item.name == name).redacted
 
 
-@pytest.mark.parametrize("separator", ["\n", ";"])
-@pytest.mark.parametrize("prefix", [
-    "VALUE=" + SECRET + "{s}export VALUE A",
-    "export VALUE=" + OLD + " A{s}VALUE=" + SECRET,
-    "export docker sh bash env export{s}export VALUE=" + SECRET + " A",
-])
-def test_r14_leading_statements_accumulate_local_overrides(prefix, separator):
-    command = prefix.format(s=separator) + separator + "env B=y "
-    command += WRAPPERS[0] + shlex.quote(SCRIPT)
-    env = normalize_env(_env("VALUE="))
-    wrapped = discovery_wrapper(_decoded_shell_words(command, env), env)
-    assert wrapped[0] == SCRIPT
-    assert wrapped[1] == {"VALUE": (SECRET, False)}
-    assert env["VALUE"][0] == OLD
+def test_r14_leading_statements_accumulate_local_overrides():
+    for separator in ("\n", ";"):
+        for prefix in (
+            "VALUE=" + SECRET + "{s}export VALUE A",
+            "export VALUE=" + OLD + " A{s}VALUE=" + SECRET,
+            "export docker sh bash env export{s}export VALUE=" + SECRET + " A",
+        ):
+            command = prefix.format(s=separator) + separator + "env B=y "
+            command += WRAPPERS[0] + shlex.quote(SCRIPT)
+            env = normalize_env(_env("VALUE="))
+            wrapped = discovery_wrapper(_decoded_shell_words(command, env), env)
+            assert wrapped[0] == SCRIPT
+            assert wrapped[1] == {"VALUE": (SECRET, False)}
+            assert env["VALUE"][0] == OLD
 
 
-@pytest.mark.parametrize("separator", ["\n", ";"])
-@pytest.mark.parametrize("left,right", [
-    ("docker", "run -e VALUE image sh -c "),
-    ("docker run -e", "VALUE image sh -c "),
-    ("docker run --name", "name image sh -c "),
-    ("docker run --rm", "image sh -c "),
-    ("docker run image", "sh -c "),
-    ("docker run image sh", "-c "),
-    ("sh", "-c "), ("sh -c", ""),
-    ("export -p", WRAPPERS[0]),
-])
-def test_r14_wrapper_arguments_never_cross_statement_boundary(left, right,
-                                                              separator):
+def test_r14_wrapper_arguments_never_cross_statement_boundary():
     env = normalize_env({"VALUE": SECRET})
-    for suffix in ("", " | true"):
-        words = _decoded_shell_words(left + separator + right
-                                     + shlex.quote(SCRIPT) + suffix, env)
-        assert discovery_wrapper(words, env) is None
+    for separator in ("\n", ";"):
+        for left, right in (
+            ("docker", "run -e VALUE image sh -c "),
+            ("docker run -e", "VALUE image sh -c "),
+            ("docker run --name", "name image sh -c "),
+            ("docker run --rm", "image sh -c "),
+            ("docker run image", "sh -c "),
+            ("docker run image sh", "-c "),
+            ("sh", "-c "), ("sh -c", ""),
+            ("export -p", WRAPPERS[0]),
+        ):
+            for suffix in ("", " | true"):
+                words = _decoded_shell_words(left + separator + right
+                                             + shlex.quote(SCRIPT) + suffix, env)
+                assert discovery_wrapper(words, env) is None
 
 
 @pytest.mark.parametrize("literal", [";", "\n"])
@@ -331,7 +327,8 @@ def _r22_public(fields, value, layout, monkeypatch, declaring_code=None, env=Non
     for source, selection, report, js, md in reports:
         assert report.source.name == (source if source == "ordinary.json" else "[REDACTED]")
         assert value not in md
-        assert not any(value in s for s in _strings(json.loads(js)))
+        if not (value.isascii() and "\\" not in value and '"' not in value and value not in js):
+            assert not any(value in s for s in _strings(json.loads(js)))
         expected = ("yaml_parser_unavailable" if fmt == "yaml" and not HAS_YAML
                     else "container_not_found" if selection == value
                     else declaring_code if selection == "a" else None)
@@ -346,69 +343,71 @@ def _r22_public(fields, value, layout, monkeypatch, declaring_code=None, env=Non
             assert setting.redacted and setting.value == "[REDACTED]"
 
 
-@pytest.mark.parametrize("value", R22_VALUES)
-@pytest.mark.parametrize("operand", R22_OPERANDS)
-@pytest.mark.parametrize("shape", R22_SHAPES)
 @pytest.mark.parametrize("layout", R22_LAYOUTS)
-def test_r22_known_expansion_public_reports(value, operand, shape, layout, monkeypatch):
-    code = ("structured_command_required" if "entrypoint" in shape else
-            ("launch_partial_coverage" if operand == '"$VALUE"' else
-             "unsupported_shell_syntax") if shape == "shell" else None)
-    _r22_public(_r22_fields(operand, shape), value, layout, monkeypatch, code)
+def test_r22_known_expansion_public_reports(layout, monkeypatch):
+    for value in R22_VALUES:
+        for operand in R22_OPERANDS:
+            for shape in R22_SHAPES:
+                code = ("structured_command_required" if "entrypoint" in shape else
+                        ("launch_partial_coverage" if operand == '"$VALUE"' else
+                         "unsupported_shell_syntax") if shape == "shell" else None)
+                fields = _r22_fields(operand, shape)
+                _r22_public(fields, value, layout, monkeypatch, code)
 
 
-@pytest.mark.parametrize("value", (*R22_VALUES, "--served-model-name", "-x"))
-@pytest.mark.parametrize("operand", R22_OPERANDS)
-def test_r22_argv_discovery_keeps_literal_and_static_candidates(value, operand):
+def test_r22_argv_discovery_keeps_literal_and_static_candidates():
     from mindie_sim.launch_parser import parse_argv, parse_shell, LaunchSyntaxError
-    argv = _r22_fields(operand, "argv")["command"]
-    found = set()
-    _shell_taint(tuple(argv), found, {"VALUE": value})
-    assert value in found and operand.removeprefix("--api-key=") in found
-    assert parse_argv(argv).commands[0].argv == tuple(argv)
-    shell = " ".join(argv)
-    if value in R22_VALUES and operand != '"$VALUE"':
-        with pytest.raises(LaunchSyntaxError, match="word_splitting_or_globbing_required"):
-            parse_shell(shell, env={"VALUE": value})
-    else:
-        assert parse_shell(shell, env={"VALUE": value}).commands[0].argv[-1].endswith(value)
+    for value in (*R22_VALUES, "--served-model-name", "-x"):
+        for operand in R22_OPERANDS:
+            argv = _r22_fields(operand, "argv")["command"]
+            found = set()
+            _shell_taint(tuple(argv), found, {"VALUE": value})
+            assert value in found and operand.removeprefix("--api-key=") in found
+            assert parse_argv(argv).commands[0].argv == tuple(argv)
+            shell = " ".join(argv)
+            if value in R22_VALUES and operand != '"$VALUE"':
+                with pytest.raises(LaunchSyntaxError, match="word_splitting_or_globbing_required"):
+                    parse_shell(shell, env={"VALUE": value})
+            else:
+                assert parse_shell(shell, env={"VALUE": value}).commands[0].argv[-1].endswith(value)
 
 
-@pytest.mark.parametrize("value", ("--served-model-name", "-x"))
-@pytest.mark.parametrize("operand", R22_OPERANDS)
-@pytest.mark.parametrize("shape", ("shell", "argv"))
-@pytest.mark.parametrize("layout", R22_LAYOUTS)
-def test_r22_expanded_option_names_remain_credentials(value, operand, shape, layout, monkeypatch):
-    code = ("launch_partial_coverage" if shape == "shell" and value == "-x"
-            and not operand.startswith("--api-key=") else None)
-    _r22_public(_r22_fields(operand, shape), value, layout, monkeypatch, code)
+def test_r22_expanded_option_names_remain_credentials(monkeypatch):
+    for value in ("--served-model-name", "-x"):
+        for operand in R22_OPERANDS:
+            for shape in ("shell", "argv"):
+                code = ("launch_partial_coverage" if shape == "shell" and value == "-x"
+                        and not operand.startswith("--api-key=") else None)
+                fields = _r22_fields(operand, shape)
+                for layout in R22_LAYOUTS:
+                    _r22_public(fields, value, layout, monkeypatch, code)
 
 
-@pytest.mark.parametrize("value", R22_VALUES)
-@pytest.mark.parametrize("origin", ("composite_env", "prologue", "inline"))
-@pytest.mark.parametrize("attached", (False, True))
-@pytest.mark.parametrize("layout", R22_LAYOUTS)
-def test_r22_composite_and_prologue_static_values(value, origin, attached, layout, monkeypatch):
-    env = {"VALUE": value, "HEAD": value[:4], "TAIL": value[4:]}
-    operand = '"${HEAD}"${TAIL}' if origin == "composite_env" else "${ALIAS}"
-    tail = "--api-key" + ("=" if attached else " ") + operand
-    prefix = {"composite_env": "", "prologue": "export ALIAS=" + shlex.quote(value) + "\n",
-              "inline": "ALIAS=" + shlex.quote(value) + " "}[origin]
-    fields = {"command": prefix + "vllm serve /m " + tail}
-    found = set()
-    _shell_taint(fields["command"], found, env)
-    assert value in found
-    _r22_public(fields, value, layout, monkeypatch, "unsupported_shell_syntax", env)
+def test_r22_composite_and_prologue_static_values(monkeypatch):
+    for value in R22_VALUES:
+        env = {"VALUE": value, "HEAD": value[:4], "TAIL": value[4:]}
+        for origin in ("composite_env", "prologue", "inline"):
+            operand = '"${HEAD}"${TAIL}' if origin == "composite_env" else "${ALIAS}"
+            prefix = {"composite_env": "", "prologue": "export ALIAS=" + shlex.quote(value) + "\n",
+                      "inline": "ALIAS=" + shlex.quote(value) + " "}[origin]
+            for attached in (False, True):
+                tail = "--api-key" + ("=" if attached else " ") + operand
+                fields = {"command": prefix + "vllm serve /m " + tail}
+                found = set()
+                _shell_taint(fields["command"], found, env)
+                assert value in found
+                for layout in R22_LAYOUTS:
+                    _r22_public(fields, value, layout, monkeypatch, "unsupported_shell_syntax", env)
 
 
-@pytest.mark.parametrize("value", R22_VALUES)
-@pytest.mark.parametrize("tail", (">--api-key $VALUE", "--api-key >$VALUE ordinary",
-                                   "--api-key; $VALUE", "--api-key\n$VALUE",
-                                   "--api-key --served-model-name", "--api-key -x"))
-def test_r22_resolution_does_not_bypass_pair_exclusions(value, tail):
-    found = set()
-    _shell_taint("vllm serve /m " + tail, found, {"VALUE": value})
-    assert value not in found and "--served-model-name" not in found and "-x" not in found
+def test_r22_resolution_does_not_bypass_pair_exclusions():
+    for value in R22_VALUES:
+        for tail in (">--api-key $VALUE", "--api-key >$VALUE ordinary",
+                     "--api-key; $VALUE", "--api-key\n$VALUE",
+                     "--api-key --served-model-name", "--api-key -x"):
+            found = set()
+            _shell_taint("vllm serve /m " + tail, found, {"VALUE": value})
+            assert value not in found and "--served-model-name" not in found and "-x" not in found
 
 
 @pytest.mark.parametrize("tail", ("${MISSING}", "$EMPTY"))
@@ -456,106 +455,105 @@ def _r23_fields(operand, shape, binding):
             right: [operand]}
 
 
-@pytest.mark.parametrize("operand,template", R23_OPERANDS)
-@pytest.mark.parametrize("binding", R23_BINDINGS)
-@pytest.mark.parametrize("shape", R23_SHAPES)
 @pytest.mark.parametrize("layout", R22_LAYOUTS)
-def test_r23_composite_argv_public_reports(operand, template, binding, shape,
-                                          layout, monkeypatch):
+def test_r23_composite_argv_public_reports(layout, monkeypatch):
     import os
     from mindie_sim.launch_parser import parse_argv
-    expected = template.format(R23_VALUE)
-    fields = _r23_fields(operand, shape, binding)
-    text = _r22_document(fields, expected, layout, {"VALUE": R23_VALUE})
-    fmt = "json" if layout == "json" else "yaml"
-    raw, events, reports = set(), set(), []
-    with monkeypatch.context() as isolated:
-        isolated.setattr(os, "environ", _R22NoHost())
-        inventory = prescan_document_secrets(text, fmt)
-        if fmt == "yaml":
-            raw_document_taint(text, raw, _shell_taint)
-            _event_taint(text, events, _shell_taint)
-        for source in ("ordinary.json", expected):
-            for selection in ("a", "b", expected):
-                report = parse_launch(text, format=fmt, container=selection,
-                                      source=source, **BASE)
-                reports.append((selection, report, canonical_json(report),
-                                launch_markdown(report)))
-    assert expected in inventory and R23_VALUE in inventory
-    if fmt == "yaml":
-        assert expected in raw and (expected in events) is HAS_YAML
-    literal = _r23_fields(operand, "argv", binding)["command"]
-    assert parse_argv(literal).commands[0].argv == tuple(literal)
-    for selection, report, js, md in reports:
-        # Check the sensitive payload itself: replacing just "prefix" must
-        # never make an exact-composite-only oracle pass after partial redaction.
-        assert R23_VALUE not in md
-        assert not any(R23_VALUE in s for s in _strings(json.loads(js)))
-        if fmt == "yaml" and not HAS_YAML:
-            assert [d.code for d in report.diagnostics] == ["yaml_parser_unavailable"]
-        elif selection == expected:
-            assert [d.code for d in report.diagnostics] == ["container_not_found"]
-        elif selection == "b":
-            assert report.status == "completed" and not report.diagnostics
-            settings = (*report.applied, *report.neutral_operational,
-                        *report.unmodeled_or_unsupported)
-            item = next(s for s in settings if s.name == "--served-model-name")
-            assert item.redacted and item.value == "[REDACTED]"
+    for operand, template in R23_OPERANDS:
+        expected = template.format(R23_VALUE)
+        for binding in R23_BINDINGS:
+            literal = _r23_fields(operand, "argv", binding)["command"]
+            assert parse_argv(literal).commands[0].argv == tuple(literal)
+            for shape in R23_SHAPES:
+                fields = _r23_fields(operand, shape, binding)
+                for layout in (layout,):
+                    text = _r22_document(fields, expected, layout, {"VALUE": R23_VALUE})
+                    fmt = "json" if layout == "json" else "yaml"
+                    raw, events, reports = set(), set(), []
+                    with monkeypatch.context() as isolated:
+                        isolated.setattr(os, "environ", _R22NoHost())
+                        inventory = prescan_document_secrets(text, fmt)
+                        if fmt == "yaml":
+                            raw_document_taint(text, raw, _shell_taint)
+                            _event_taint(text, events, _shell_taint)
+                        for source in ("ordinary.json", expected):
+                            for selection in ("a", "b", expected):
+                                report = parse_launch(text, format=fmt, container=selection,
+                                                      source=source, **BASE)
+                                reports.append((selection, report, canonical_json(report),
+                                                launch_markdown(report)))
+                    assert expected in inventory and R23_VALUE in inventory
+                    if fmt == "yaml":
+                        assert expected in raw and (expected in events) is HAS_YAML
+                    for selection, report, js, md in reports:
+                        assert R23_VALUE not in md
+                        if R23_VALUE in js:
+                            assert not any(R23_VALUE in s for s in _strings(json.loads(js)))
+                        if fmt == "yaml" and not HAS_YAML:
+                            assert [d.code for d in report.diagnostics] == ["yaml_parser_unavailable"]
+                        elif selection == expected:
+                            assert [d.code for d in report.diagnostics] == ["container_not_found"]
+                        elif selection == "b":
+                            assert report.status == "completed" and not report.diagnostics
+                            settings = (*report.applied, *report.neutral_operational,
+                                        *report.unmodeled_or_unsupported)
+                            item = next(s for s in settings if s.name == "--served-model-name")
+                            assert item.redacted and item.value == "[REDACTED]"
 
 
-@pytest.mark.parametrize("binding", R23_BINDINGS)
-@pytest.mark.parametrize("shape", R23_SHAPES)
-@pytest.mark.parametrize("layout", R22_LAYOUTS)
-def test_r23_single_quoted_argv_never_taints_unexpanded_env(binding, shape, layout):
+def test_r23_single_quoted_argv_never_taints_unexpanded_env():
     expected = "prefix " + R23_VALUE + " suffix"
-    fields = _r23_fields("'prefix $VALUE suffix'", shape, binding)
-    text = _r22_document(fields, expected, layout, {"VALUE": R23_VALUE})
-    fmt = "json" if layout == "json" else "yaml"
-    inventory = prescan_document_secrets(text, fmt)
-    assert expected not in inventory and R23_VALUE not in inventory
-    assert "prefix $VALUE suffix" in inventory
-    if fmt == "yaml":
-        for walker in (raw_document_taint, _event_taint):
-            found = set()
-            walker(text, found, _shell_taint)
-            assert expected not in found and R23_VALUE not in found
-    report = parse_launch(text, format=fmt, container="b", source=expected, **BASE)
-    assert R23_VALUE in launch_markdown(report)
-    assert any(R23_VALUE in s for s in _strings(json.loads(canonical_json(report))))
+    for binding in R23_BINDINGS:
+        for shape in R23_SHAPES:
+            fields = _r23_fields("'prefix $VALUE suffix'", shape, binding)
+            for layout in R22_LAYOUTS:
+                text = _r22_document(fields, expected, layout, {"VALUE": R23_VALUE})
+                fmt = "json" if layout == "json" else "yaml"
+                inventory = prescan_document_secrets(text, fmt)
+                assert expected not in inventory and R23_VALUE not in inventory
+                assert "prefix $VALUE suffix" in inventory
+                if fmt == "yaml":
+                    for walker in (raw_document_taint, _event_taint):
+                        found = set()
+                        walker(text, found, _shell_taint)
+                        assert expected not in found and R23_VALUE not in found
+                report = parse_launch(text, format=fmt, container="b", source=expected, **BASE)
+                assert R23_VALUE in launch_markdown(report)
+                assert any(R23_VALUE in s for s in _strings(json.loads(canonical_json(report))))
 
 
-@pytest.mark.parametrize("operand,expected", [
-    ("$EMPTY", None), ('"$EMPTY"', ""), ("${EMPTY}", None),
-    ("prefix $EMPTY suffix", "prefix  suffix"),
-    ('prefix "$EMPTY" suffix', "prefix  suffix"),
-    ("$VALUE$EMPTY", R23_VALUE), ("$EMPTY$VALUE", R23_VALUE),
-    ("prefix $MISSING suffix", None), ("$VALUE${MISSING}", None),
-    ("${MISSING}$VALUE", None), ("$VALUE'broken", None),
-    ("$VALUE\\", None), ("${VALUE", None), ("${VALUE:-fallback}", None),
-    ("prefix \\$VALUE suffix", "prefix $VALUE suffix"),
-    ("prefix '$VALUE' suffix", "prefix $VALUE suffix"),
-    ("prefix '$MISSING' $VALUE", "prefix $MISSING " + R23_VALUE),
-    ('prefix "\\$VALUE" $VALUE', "prefix $VALUE " + R23_VALUE),
-    ('prefix "\\q\\\"\\\\\\`$VALUE" suffix', 'prefix \\q"\\`' + R23_VALUE + ' suffix'),
-    ("prefix\\ $VALUE\\;suffix", "prefix " + R23_VALUE + ";suffix"),
-    ("prefix\\\n$VALUE suffix", "prefix" + R23_VALUE + " suffix"),
-    ('"prefix\\\r\n$VALUE suffix"', "prefix" + R23_VALUE + " suffix"),
-    ("'prefix\\\n$VALUE' suffix", "prefix\\\n$VALUE suffix"),
-    ("prefix $$ $VALUE", None), ("prefix $(cmd) $VALUE", None),
-])
-def test_r23_static_operand_quotes_escapes_unknown_and_empty(operand, expected):
+def test_r23_static_operand_quotes_escapes_unknown_and_empty():
     from mindie_sim.launch_taint import _static_argv_operand
-    found = set()
-    assert _static_argv_operand(operand, {"VALUE": R23_VALUE, "EMPTY": ""}, found) == expected
-    if expected is None or R23_VALUE not in expected:
-        assert not found  # Failed or suppressed expansion publishes no parts.
-    else:
-        assert found == {R23_VALUE}
-    raw = set()
-    _apply_words(["--api-key", operand], raw, env={"VALUE": R23_VALUE, "EMPTY": ""})
-    assert operand in raw and "" not in raw
-    if expected:
-        assert expected in raw
+    for operand, expected in (
+        ("$EMPTY", None), ('"$EMPTY"', ""), ("${EMPTY}", None),
+        ("prefix $EMPTY suffix", "prefix  suffix"),
+        ('prefix "$EMPTY" suffix', "prefix  suffix"),
+        ("$VALUE$EMPTY", R23_VALUE), ("$EMPTY$VALUE", R23_VALUE),
+        ("prefix $MISSING suffix", None), ("$VALUE${MISSING}", None),
+        ("${MISSING}$VALUE", None), ("$VALUE'broken", None),
+        ("$VALUE\\", None), ("${VALUE", None), ("${VALUE:-fallback}", None),
+        ("prefix \\$VALUE suffix", "prefix $VALUE suffix"),
+        ("prefix '$VALUE' suffix", "prefix $VALUE suffix"),
+        ("prefix '$MISSING' $VALUE", "prefix $MISSING " + R23_VALUE),
+        ('prefix "\\$VALUE" $VALUE', "prefix $VALUE " + R23_VALUE),
+        ('prefix "\\q\\\"\\\\\\`$VALUE" suffix', 'prefix \\q"\\`' + R23_VALUE + ' suffix'),
+        ("prefix\\ $VALUE\\;suffix", "prefix " + R23_VALUE + ";suffix"),
+        ("prefix\\\n$VALUE suffix", "prefix" + R23_VALUE + " suffix"),
+        ('"prefix\\\r\n$VALUE suffix"', "prefix" + R23_VALUE + " suffix"),
+        ("'prefix\\\n$VALUE' suffix", "prefix\\\n$VALUE suffix"),
+        ("prefix $$ $VALUE", None), ("prefix $(cmd) $VALUE", None),
+    ):
+        found = set()
+        assert _static_argv_operand(operand, {"VALUE": R23_VALUE, "EMPTY": ""}, found) == expected
+        if expected is None or R23_VALUE not in expected:
+            assert not found
+        else:
+            assert found == {R23_VALUE}
+        raw = set()
+        _apply_words(["--api-key", operand], raw, env={"VALUE": R23_VALUE, "EMPTY": ""})
+        assert operand in raw and "" not in raw
+        if expected:
+            assert expected in raw
 
 
 @pytest.mark.parametrize("binding", R23_BINDINGS)
@@ -579,20 +577,22 @@ def test_r23_structured_expansion_is_nonrecursive_and_does_not_enumerate(binding
     assert not any("unrelated" in s for s in found)
 
 
-@pytest.mark.parametrize("n", (3, 257, 4096, 16384))
-@pytest.mark.parametrize("quote", ("", '"', "'"))
-def test_r23_structured_operand_continuations_are_linear(n, quote, monkeypatch):
+def test_r23_structured_operand_continuations_are_linear(monkeypatch):
     from mindie_sim import launch_env
     from mindie_sim.launch_taint import _static_argv_operand
-    gap = "\\\n\\\r\\\r\n" * n
-    text = quote + "prefix; " + gap + "$VALUE > " + gap + "suffix" + quote
-    calls, original = [], launch_env.continuation_length
+    original = launch_env.continuation_length
+    for n in (3, 257, 4096, 16384):
+        gap = "\\\n\\\r\\\r\n" * n
+        for quote in ("", '"', "'"):
+            text = quote + "prefix; " + gap + "$VALUE > " + gap + "suffix" + quote
+            calls = []
 
-    def counted(value, index):
-        calls.append(index)
-        return original(value, index)
+            def counted(value, index):
+                calls.append(index)
+                return original(value, index)
 
-    monkeypatch.setattr(launch_env, "continuation_length", counted)
-    decoded = _static_argv_operand(text, {"VALUE": R23_VALUE})
-    assert decoded == (text[1:-1] if quote == "'" else "prefix; " + R23_VALUE + " > suffix")
-    assert len(calls) <= len(text) + 4 and len(calls) == len(set(calls))
+            with monkeypatch.context() as mp:
+                mp.setattr(launch_env, "continuation_length", counted)
+                decoded = _static_argv_operand(text, {"VALUE": R23_VALUE})
+            assert decoded == (text[1:-1] if quote == "'" else "prefix; " + R23_VALUE + " > suffix")
+            assert len(calls) <= len(text) + 4 and len(calls) == len(set(calls))

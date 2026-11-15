@@ -415,6 +415,7 @@ def compose_case(
     va_recommended: bool = False,
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    recover_ssm: bool = False,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -655,6 +656,8 @@ def compose_case(
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "metadata": runtime_meta,
     }
+    if recover_ssm:
+        runtime_dict["recover_ssm"] = True
     if graph_capture_mode == "full":
         max_cap = max(1, resolved_max_seqs * max(1, 1 + int(mtp_proposal_tokens)))
         runtime_dict["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max_cap})

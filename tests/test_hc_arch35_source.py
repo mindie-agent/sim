@@ -236,31 +236,31 @@ def test_pre_and_post_large_m_follow_source_mk_tiling_and_tails(tokens, sequence
     assert not any(post_row['remaining_buffers'].values())
 
 
-def test_key1001_boundary_and_physical_tail_flops():
+@pytest.mark.parametrize('tokens', (257, 4096, 4097))
+def test_key1001_boundary_and_physical_tail_flops(tokens):
     case = parse_case(_layer0_raw_case())
-    for tokens in (257, 4096, 4097):
-        ops = target_graphs(case, scope='body', phase='prefill', tokens=tokens,
-                            context=2048, sequences=1)[0]
-        pre = next(o for o in ops if o.layer == 0 and
-                   dict(o.metadata).get('fusion_role') == 'hc_pre')
-        view = dict(pre.metadata)['fusion_tensor_view']
-        g = pre_geometry(view, geometry(case))
-        assert g.tiling_key == (1001 if g.k_dim == 1 else 1000)
-        row = run(case, pre)
-        meta = row['operator']['metadata']['program_execution']
-        assert meta['m_k_tiling']['tiling_key'] == g.tiling_key
-        # Diagnostic physical flops come from the actual owned/tail phase Work,
-        # not mDim*mTiles*mL1 for every tile.
-        first_work = total_work(tuple(pre_owner(g, owner) for owner in
-                                      range(g.m_dim * g.k_parts)))
-        assert meta['physical_projection_flops'] == first_work.matrix.get('hf32', 0)
-        if tokens == 257:
-            # mDim=2, m_l1=144; second M tile is 113 rows -> 128 aligned, not 144.
-            assert g.m_dim == 2 and g.m_l1 == 144
-            naive = 2 * g.m_dim * g.m_tiles * g.m_l1 * g.width * 32
-            assert meta['physical_projection_flops'] < naive
-        if tokens == 4096:
-            assert g.tiling_key == 1000 and g.m_dim == 16 and g.k_dim == 2
-        if tokens == 4097:
-            assert g.tiling_key == 1001 and g.m_dim == 17 and g.k_dim == 1
-            assert g.k_parts == 1
+    ops = target_graphs(case, scope='body', phase='prefill', tokens=tokens,
+                        context=2048, sequences=1)[0]
+    pre = next(o for o in ops if o.layer == 0 and
+               dict(o.metadata).get('fusion_role') == 'hc_pre')
+    view = dict(pre.metadata)['fusion_tensor_view']
+    g = pre_geometry(view, geometry(case))
+    assert g.tiling_key == (1001 if g.k_dim == 1 else 1000)
+    row = run(case, pre)
+    meta = row['operator']['metadata']['program_execution']
+    assert meta['m_k_tiling']['tiling_key'] == g.tiling_key
+    # Diagnostic physical flops come from the actual owned/tail phase Work,
+    # not mDim*mTiles*mL1 for every tile.
+    first_work = total_work(tuple(pre_owner(g, owner) for owner in
+                                  range(g.m_dim * g.k_parts)))
+    assert meta['physical_projection_flops'] == first_work.matrix.get('hf32', 0)
+    if tokens == 257:
+        # mDim=2, m_l1=144; second M tile is 113 rows -> 128 aligned, not 144.
+        assert g.m_dim == 2 and g.m_l1 == 144
+        naive = 2 * g.m_dim * g.m_tiles * g.m_l1 * g.width * 32
+        assert meta['physical_projection_flops'] < naive
+    if tokens == 4096:
+        assert g.tiling_key == 1000 and g.m_dim == 16 and g.k_dim == 2
+    if tokens == 4097:
+        assert g.tiling_key == 1001 and g.m_dim == 17 and g.k_dim == 1
+        assert g.k_parts == 1

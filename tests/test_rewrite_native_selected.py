@@ -57,10 +57,10 @@ def _matmul_request():
         "api": {"namespace": "aclnn", "entry": "aclnnMatmul"},
         "version": {"api": "cann-9.2.0", "source": "r31"},
         "tensors": {
-            "x1": {"shape": [257, 5120], "dtype": "bf16", "role": "input"},
-            "x2": {"shape": [17408, 5120], "dtype": "bf16",
+            "x1": {"shape": [33, 256], "dtype": "bf16", "role": "input"},
+            "x2": {"shape": [512, 256], "dtype": "bf16",
                    "role": "input"},
-            "output": {"shape": [257, 17408], "dtype": "bf16",
+            "output": {"shape": [33, 512], "dtype": "bf16",
                        "role": "output"},
         },
         "attrs": {"transpose_x1": False, "transpose_x2": True},

@@ -16,7 +16,7 @@ jobs:
         os: [ubuntu-latest, windows-latest, macos-latest]
         python: ['3.11', '3.13']
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 90
+    timeout-minutes: 25
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -39,7 +39,7 @@ jobs:
       - env:
           VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
-        run: uv run --no-project python -B -m pytest -q -n auto -p no:cacheprovider -m "not live_npu" --junitxml="${{ runner.temp }}/results.xml"
+        run: uv run --no-project python -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu" --durations=20 --junitxml="${{ runner.temp }}/results.xml"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

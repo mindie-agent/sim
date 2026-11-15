@@ -202,6 +202,8 @@ def parser():
     compose.add_argument("--tpot-slo-ms", type=float)
     compose.add_argument("--va-recommended", action="store_true",
                          help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
+    compose.add_argument("--recover-ssm", action="store_true",
+                         help="enable two-stage RecoverSSM linear-attention rollback in the synthesized Case")
     compose.add_argument("--output", "-o")
     advise = sub.add_parser("advise", help="attribute a Case and rank guarded counterfactual interventions")
     advise.add_argument("case", nargs="?")
@@ -462,12 +464,24 @@ def run(args):
                 "mtp_acceptance_length": args.mtp_accept,
                 "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
             }
-            return load_case_from_profile(
+            result = load_case_from_profile(
                 args.from_profile,
                 **{key: value for key, value in profile_overrides.items() if value is not None},
             )
+            if getattr(args, "recover_ssm", False):
+                result.setdefault("runtime", {})["recover_ssm"] = True
+                parse_case(result)
+            return result
         if not args.model:
             raise ValueError("compose_requires_model_or_from_profile")
+        optional_compose = {
+            key: value for key, value in (
+                ("prompt_tokens", args.prompt_tokens),
+                ("output_tokens", args.output_tokens),
+                ("ttft_slo_ms", args.ttft_slo_ms),
+                ("tpot_slo_ms", args.tpot_slo_ms),
+            ) if value is not None
+        }
         return compose_case(
             model=args.model, hardware=args.hardware or "a3",
             tp=1 if args.tp is None else args.tp, dp=1 if args.dp is None else args.dp,
@@ -476,8 +490,6 @@ def run(args):
             sp=args.sp, num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
             quant=args.quant, layers=args.layers, n_routed_experts=args.experts,
             num_experts_per_tok=args.top_k,
-            prompt_tokens=4096 if args.prompt_tokens is None else args.prompt_tokens,
-            output_tokens=128 if args.output_tokens is None else args.output_tokens,
             concurrency=1 if args.concurrency is None else args.concurrency,
             prefix_tokens=0 if args.prefix_tokens is None else args.prefix_tokens,
             max_num_seqs=args.max_num_seqs,
@@ -487,9 +499,9 @@ def run(args):
             graph_capture_mode=args.graph_mode or "none",
             mtp_proposal_tokens=0 if args.mtp_tokens is None else args.mtp_tokens,
             mtp_acceptance_length=1.0 if args.mtp_accept is None else args.mtp_accept,
-            ttft_slo_ms=5000.0 if args.ttft_slo_ms is None else args.ttft_slo_ms,
-            tpot_slo_ms=50.0 if args.tpot_slo_ms is None else args.tpot_slo_ms,
             va_recommended=bool(getattr(args, "va_recommended", False)),
+            recover_ssm=bool(getattr(args, "recover_ssm", False)),
+            **optional_compose,
         )
     if args.command == "advise":
         from .advise import advise_case
@@ -622,6 +634,11 @@ def run(args):
 
 
 def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv:
+        from .extended_cli import EXTENDED_COMMANDS, extended_main
+        if raw_argv[0] in EXTENDED_COMMANDS:
+            return extended_main(raw_argv, prog="mindie-sim")
     args = parser().parse_args(argv)
     try:
         result = run(args)

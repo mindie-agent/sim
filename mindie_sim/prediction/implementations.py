@@ -1191,7 +1191,10 @@ def audit_records(op):
     consumer ids there lets the relation be exported without making repeated
     layers look physically different.
     """
-    return tuple(dict(op.metadata).get("fused_origin_scopes", ()))
+    for key, value in reversed(op.metadata):
+        if key == "fused_origin_scopes":
+            return tuple(value) if value else ()
+    return ()
 
 
 def audit_boundary(op):
@@ -1226,6 +1229,36 @@ _PRODUCER_FIELDS = {
 }
 
 
+def _op_producer_refs(op):
+    refs = set(op.deps)
+    for record in audit_records(op):
+        if record.get("kind") == "input_ports":
+            for entry in record.get("ports", ()):
+                target = entry.get("op")
+                if target:
+                    refs.add(target)
+    for key, value in op.metadata:
+        if key in _PRODUCER_FIELDS and isinstance(value, str):
+            refs.add(value)
+    return refs
+
+
+def consumer_index(ops):
+    """Index candidate consumers by producer op_id while preserving ``ops`` order."""
+    by_producer = {}
+    by_id = {}
+    for index, op in enumerate(ops):
+        by_id[op.op_id] = op
+        item = (index, op)
+        for producer in _op_producer_refs(op):
+            bucket = by_producer.get(producer)
+            if bucket is None:
+                by_producer[producer] = [item]
+            elif bucket[-1][0] != index:
+                bucket.append(item)
+    return by_id, by_producer
+
+
 def consumer_value_uses(op, member_ids, values_by_id):
     """Resolve the actual ``(member, output)`` values an external reader uses.
 
@@ -1234,8 +1267,20 @@ def consumer_value_uses(op, member_ids, values_by_id):
     A reader of one member output never implicitly marks the member's other
     returns external.
     """
-    metadata = dict(op.metadata)
-    member_ids = set(member_ids)
+    if not isinstance(member_ids, (set, frozenset)):
+        member_ids = set(member_ids)
+    if not member_ids:
+        return ()
+    ports = input_ports(op)
+    has_port_hit = any(entry.get("op") in member_ids for entry in ports)
+    has_prod_hit = any(
+        key in _PRODUCER_FIELDS and isinstance(value, str) and value in member_ids
+        for key, value in op.metadata
+    )
+    has_dep_hit = any(dependency in member_ids for dependency in op.deps)
+    if not has_port_hit and not has_prod_hit and not has_dep_hit:
+        return ()
+    metadata = dict(op.metadata) if has_prod_hit else None
     uses = []
 
     def names(member):
@@ -1260,20 +1305,24 @@ def consumer_value_uses(op, member_ids, values_by_id):
         if pair not in uses:
             uses.append(pair)
 
-    for entry in input_ports(op):
-        add(entry.get("op"), entry.get("output"), fallback=False)
-    for field, requested in _PRODUCER_FIELDS.items():
-        producer = metadata.get(field)
-        if isinstance(producer, str):
-            add(producer, requested, fallback=requested is None)
-    for dependency in op.deps:
-        if dependency in member_ids and not any(
-                member == dependency for member, _ in uses):
-            add(dependency, None)
+    if has_port_hit:
+        for entry in ports:
+            add(entry.get("op"), entry.get("output"), fallback=False)
+    if metadata is not None:
+        for field, requested in _PRODUCER_FIELDS.items():
+            producer = metadata.get(field)
+            if isinstance(producer, str):
+                add(producer, requested, fallback=requested is None)
+    if has_dep_hit:
+        for dependency in op.deps:
+            if dependency in member_ids and not any(
+                    member == dependency for member, _ in uses):
+                add(dependency, None)
     return tuple(uses)
 
 
-def external_value_plan(ops, members, values_by_id, public_outputs=()):
+def external_value_plan(ops, members, values_by_id, public_outputs=(), *,
+                        consumer_map=None):
     """Exact externally-live values for one selected fusion group.
 
     ``ops`` includes the region around the group.  A member with no consumer
@@ -1283,9 +1332,22 @@ def external_value_plan(ops, members, values_by_id, public_outputs=()):
     """
     member_ids = {member.op_id for member in members}
     specs, consumers = [], []
-    outside = [op for op in ops if op.op_id not in member_ids]
+    consumed_members = set()
+    if consumer_map is not None:
+        by_id, by_producer = consumer_map
+        cand_by_pos = {}
+        for m_id in member_ids:
+            for pos, op in by_producer.get(m_id, ()):
+                if op.op_id not in member_ids:
+                    cand_by_pos[pos] = op
+        outside = [cand_by_pos[pos] for pos in sorted(cand_by_pos)]
+        group_ops = [by_id[m_id] for m_id in member_ids if m_id in by_id]
+    else:
+        outside = [op for op in ops if op.op_id not in member_ids]
+        group_ops = [op for op in ops if op.op_id in member_ids]
     for op in outside:
         for member_id, output in consumer_value_uses(op, member_ids, values_by_id):
+            consumed_members.add(member_id)
             pair = (member_id, output)
             if pair not in specs:
                 specs.append(pair)
@@ -1303,6 +1365,10 @@ def external_value_plan(ops, members, values_by_id, public_outputs=()):
             public_refs.add((member_id, output))
             if (member_id, output) not in specs:
                 specs.append((member_id, output))
+    internal_uses = [
+        (op.op_id, {m_id for m_id, _ in consumer_value_uses(op, member_ids, values_by_id)})
+        for op in group_ops
+    ]
     for member in members:
         member_public = {pair for pair in public_refs if pair[0] == member.op_id}
         if member_public:
@@ -1310,9 +1376,9 @@ def external_value_plan(ops, members, values_by_id, public_outputs=()):
                 if pair not in specs:
                     specs.append(pair)
             continue
-        if any(any(member.op_id == member_id for member_id, _ in
-                   consumer_value_uses(op, member_ids, values_by_id))
-               for op in ops if op.op_id != member.op_id):
+        if (member.op_id in consumed_members
+                or any(member.op_id in used for op_id, used in internal_uses
+                       if op_id != member.op_id)):
             continue
         for value in values_by_id.get(member.op_id, ()):
             pair = (member.op_id, value["output"])
@@ -1509,10 +1575,25 @@ def rewire_value_graph(ops, *, replacements, aliases, removed, port_map,
     """
     member_ids = set(aliases)
     values_by_id = values_by_id or {}
+    replacement_ports = {}
+    for (_, _), target in port_map.items():
+        replacement_ports.setdefault(target[0], set()).add(target[1])
 
     def rewire_node(op):
-        deps = tuple(dict.fromkeys(aliases.get(dep, dep) for dep in op.deps))
+        has_dep_alias = any(dep in aliases for dep in op.deps)
         old_ports = input_ports(op)
+        has_port_alias = any(entry.get("op") in aliases for entry in old_ports)
+        has_prod_alias = any(
+            key in _PRODUCER_FIELDS and isinstance(value, str) and value in aliases
+            for key, value in op.metadata
+        )
+        if not has_dep_alias and not has_port_alias and not has_prod_alias:
+            if len(op.deps) > 1:
+                dedup = tuple(dict.fromkeys(op.deps))
+                if dedup != op.deps:
+                    return replace(op, deps=dedup)
+            return op
+        deps = tuple(dict.fromkeys(aliases.get(dep, dep) for dep in op.deps))
         uses = consumer_value_uses(op, member_ids, values_by_id)
         existing = [entry for entry in old_ports
                     if entry.get("op") not in aliases]
@@ -1520,9 +1601,6 @@ def rewire_value_graph(ops, *, replacements, aliases, removed, port_map,
         producer_fields = {value for value in dict(op.metadata).values()
                            if isinstance(value, str)}
         target_counts = {}
-        replacement_ports = {}
-        for (_, _), target in port_map.items():
-            replacement_ports.setdefault(target[0], set()).add(target[1])
         for member, output in uses:
             target = port_map.get((member, output))
             if target is not None:

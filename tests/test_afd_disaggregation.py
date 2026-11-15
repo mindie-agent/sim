@@ -345,6 +345,18 @@ def test_predict_afd_m_step_pipeline_af_comm_and_link_degradation():
     assert pipelined["tokens_per_sec"] == pytest.approx(expected_tps, rel=1e-12)
     assert pipelined["tokens_per_sec_per_total_die"] == pytest.approx(expected_tps / total_dies, rel=1e-12)
 
+
+def test_predict_afd_link_degradation_dtype_and_sla_guards():
+    """Verify degraded link behavior, explicit dispatch dtype, SLA guards, and argument checks."""
+    attn_case = _make_dense_gqa_case(layers=2, tp=4)
+    ffn_case = _make_dense_gqa_case(layers=2, tp=8)
+    common = dict(tokens=64, context=512, sequences=60)
+    pipelined = predict_afd(attn_case, ffn_case, m_steps=3, **common)
+    attn_ms, ffn_ms = pipelined["attn_stage_ms"], pipelined["ffn_stage_ms"]
+    batch_tokens, hidden = 64 * 60, 4096
+    dispatch_bytes = batch_tokens * hidden * 2.0
+    combine_bytes = batch_tokens * hidden * 2.0
+
     # A degraded 5 GB/s link dominates both stages and flips the feasibility guard.
     slow = predict_afd(
         attn_case, ffn_case, m_steps=3, **common,

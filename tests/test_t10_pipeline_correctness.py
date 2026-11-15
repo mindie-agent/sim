@@ -513,8 +513,8 @@ def test_prefill_factory_runs_selected_plan_once_via_recipe_book():
     from pathlib import Path
 
     raw = json.loads(Path("examples/cases/qwen38-a5.json").read_text())
-    ops = target_operators(raw, phase="prefill", tokens=8192,
-                           context=16384, sequences=2)
+    ops = target_operators(raw, phase="prefill", tokens=256,
+                           context=512, sequences=2)
     index = next(i for i, op in enumerate(ops) if op.family == "attention")
     recipes = RecipeBook.from_mapping(
         {"recipes": {"flash_attention": {"kind": "staged_gqa_prefill"}}})

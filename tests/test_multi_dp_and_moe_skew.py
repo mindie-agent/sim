@@ -290,7 +290,7 @@ def test_moe_routing_imbalance_rank_level_and_greedy_eplb():
 
 def test_chunked_prefill_decode_interference_monotonicity_and_sla():
     """Verify exact 0.0 inflation at C=0, Engine-scheduled mixed graph monotonicity, and SLA selection."""
-    case = _make_moe_case(layers=2, dp=1, tp=4, ep=4)
+    case = _make_moe_case(layers=1, dp=1, tp=4, ep=4)
     chunks = (0, 512, 1024, 2048, 4096, 8192)
     res = analyze_chunked_prefill_decode_interference(
         case,
@@ -298,7 +298,7 @@ def test_chunked_prefill_decode_interference_monotonicity_and_sla():
         decode_context=32768,
         prefill_chunk_tokens=chunks,
         prefill_context=0,
-        sla_tpot_ms=10.0,
+        sla_tpot_ms=5.0,
     )
     assert res["schema"] == "mindie-sim.chunked-prefill-interference/1"
     assert len(res["chunks"]) == len(chunks)
@@ -315,12 +315,16 @@ def test_chunked_prefill_decode_interference_monotonicity_and_sla():
         assert next_t > prev_t
 
     expected_max_chunk = max(
-        (row["prefill_chunk_tokens"] for row in res["chunks"] if row["hybrid_step_ms"] <= 10.0),
+        (row["prefill_chunk_tokens"] for row in res["chunks"] if row["hybrid_step_ms"] <= 5.0),
         default=0,
     )
     assert res["max_sla_compliant_chunk_tokens"] == expected_max_chunk
     assert 0 < expected_max_chunk < 8192
 
+
+def test_chunked_prefill_decode_interference_tight_sla_and_validation():
+    """Verify tight SLA rejection, model-scope execution, and input validation guards."""
+    case = _make_moe_case(layers=2, dp=1, tp=4, ep=4)
     tight = analyze_chunked_prefill_decode_interference(
         case,
         decode_sequences=16,

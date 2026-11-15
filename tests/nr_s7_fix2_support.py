@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import dataclasses as dc
+from functools import lru_cache
 
 from mindie_sim.dspark_dcp_cost import DcpDraftBlockCost
 from mindie_sim.dspark_kv_physics import KvSpecSignature
@@ -29,14 +30,30 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.recoverssm_config import RecoverSsmConfig
 
 
-def _case(key="glm-5.3-flash", *, tp=8, pp=1, pcp=1, dcp=1,
-          max_model_len=4096, memory=None, prompt=1024,
-          sku="Ascend910_9362", topology="a3_16p"):
+@lru_cache(maxsize=None)
+def _cached_case(key, tp, pp, pcp, dcp, max_model_len, prompt, sku, topology):
     runtime = {"tp": tp, "dp": 1, "ep": 1, "pp": pp, "pcp": pcp, "cp": dcp,
                "max_model_len": max_model_len, "max_num_seqs": 8,
                "max_num_batched_tokens": 16384, "kv_block_size": 128}
-    if memory is not None:
-        runtime["memory"] = memory
+    return parse_case({
+        "machine": {"backend": "ascend", "sku": sku, "num_devices": 64,
+                    "ranks_per_node": 16, "topology_preset": topology},
+        "model": {"catalog_key": key},
+        "runtime": runtime,
+        "workload": {"requests": [{"request_id": "r",
+                                   "prompt_tokens": prompt,
+                                   "output_tokens": 16}]}})
+
+
+def _case(key="glm-5.3-flash", *, tp=8, pp=1, pcp=1, dcp=1,
+          max_model_len=4096, memory=None, prompt=1024,
+          sku="Ascend910_9362", topology="a3_16p"):
+    if memory is None:
+        return _cached_case(key, tp, pp, pcp, dcp, max_model_len, prompt, sku, topology)
+    runtime = {"tp": tp, "dp": 1, "ep": 1, "pp": pp, "pcp": pcp, "cp": dcp,
+               "max_model_len": max_model_len, "max_num_seqs": 8,
+               "max_num_batched_tokens": 16384, "kv_block_size": 128,
+               "memory": memory}
     return parse_case({
         "machine": {"backend": "ascend", "sku": sku, "num_devices": 64,
                     "ranks_per_node": 16, "topology_preset": topology},

@@ -17,12 +17,14 @@ from __future__ import annotations
 from dataclasses import dataclass, fields, is_dataclass
 import json
 import math
+import re
 from typing import Any
 
 SOL_TOLERANCE_MS = 1e-12
 ARITHMETIC_TOLERANCE = 1e-9
 _SECRET_MARKERS = ("api_key", "apikey", "secret", "password", "credential",
                     "authorization", "bearer")
+_CREDENTIAL_RE = re.compile(r"bearer |sk-|password=|api_key=|apikey=", re.IGNORECASE)
 _R = dataclass(frozen=True, slots=True)
 
 
@@ -34,18 +36,40 @@ class ReportValidationError(ValueError):
         super().__init__("; ".join(self.errors) or "report_invalid")
 
 
+_FIELD_NAMES: dict[type, tuple[str, ...]] = {}
+_SCALAR_TYPES = frozenset({str, int, bool})
+
+
 def _plain(value):
     """JSON-safe projection: tuples->lists, mappings->dicts, finite doubles."""
-    if is_dataclass(value):
-        return {field.name: _plain(getattr(value, field.name)) for field in fields(value)}
+    cls = type(value)
+    if value is None or cls in _SCALAR_TYPES:
+        return value
+    if cls is float:
+        if not math.isfinite(value):
+            raise ValueError("report_number_must_be_finite")
+        return 0.0 if value == 0 else value
+    if cls is dict:
+        return {str(key): _plain(item) for key, item in value.items()}
+    if cls is list or cls is tuple:
+        return [_plain(item) for item in value]
+    if not isinstance(value, type) and is_dataclass(value):
+        names = _FIELD_NAMES.get(cls)
+        if names is None:
+            names = tuple(field.name for field in fields(cls))
+            _FIELD_NAMES[cls] = names
+        return {name: _plain(getattr(value, name)) for name in names}
     if isinstance(value, dict):
         return {str(key): _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)): return [_plain(item) for item in value]
+    if isinstance(value, (list, tuple)):
+        return [_plain(item) for item in value]
     if isinstance(value, float):
-        if not math.isfinite(value): raise ValueError("report_number_must_be_finite")
+        if not math.isfinite(value):
+            raise ValueError("report_number_must_be_finite")
         return 0.0 if value == 0 else value
-    if value is None or isinstance(value, (str, int, bool)): return value
-    raise ValueError(f"report_value_not_json:{type(value).__name__}")
+    if isinstance(value, (str, int, bool)):
+        return value
+    raise ValueError(f"report_value_not_json:{cls.__name__}")
 
 
 to_dict = _plain
@@ -175,9 +199,30 @@ def _all_strings(value):
 
 
 def _credential_string(text):
-    lowered = str(text).lower()
-    return any(marker in lowered for marker in ("bearer ", "sk-", "password=",
-                                                "api_key=", "apikey="))
+    return bool(_CREDENTIAL_RE.search(str(text)))
+
+
+def _has_credential_in_payload(value) -> bool:
+    if value is None or type(value) in _SCALAR_TYPES:
+        return bool(_CREDENTIAL_RE.search(value)) if type(value) is str else False
+    if isinstance(value, str):
+        return bool(_CREDENTIAL_RE.search(value))
+    if type(value) in (dict, list, tuple):
+        try:
+            return bool(_CREDENTIAL_RE.search(json.dumps(value, ensure_ascii=False)))
+        except TypeError:
+            pass
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if _credential_string(key) or _has_credential_in_payload(item):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        for item in value:
+            if _has_credential_in_payload(item):
+                return True
+        return False
+    return False
 
 
 def _span_errors(span, label, errors):
@@ -189,9 +234,30 @@ def _span_errors(span, label, errors):
         errors.append(f"{label}:span_order")
 
 
+def _launch_report_dict(report):
+    if isinstance(report, dict):
+        return report, None
+    if type(report) is LaunchParseReport and type(report.case) is dict:
+        try:
+            dumped = json.dumps(report.case, allow_nan=False, ensure_ascii=False)
+        except (TypeError, ValueError):
+            return _plain(report), None
+        shallow = _plain(LaunchParseReport(
+            report.schema_version, report.status, report.source, report.input_format,
+            report.command_index, report.framework_version, report.adapter_id,
+            report.strict, report.setting_ids, report.applied,
+            report.neutral_operational, report.unmodeled_or_unsupported,
+            report.required_inputs, report.effective_overrides, report.assumptions,
+            None, report.coverage, report.diagnostics))
+        shallow["case"] = report.case
+        return shallow, dumped
+    return _as_dict(report), None
+
+
 def validate_launch_report(report) -> tuple[str, ...]:
     """L01-L03 plus status/redaction checks; raise on the first invalid report."""
-    data, errors = _as_dict(report), []
+    data, dumped_case = _launch_report_dict(report)
+    errors = []
     if data.get("schema_version") != "launch-parse/1":
         errors.append("L00:schema_version")
     status = data.get("status")
@@ -247,10 +313,11 @@ def validate_launch_report(report) -> tuple[str, ...]:
     payloads = [data.get("case"), data.get("effective_overrides"),
                 data.get("assumptions")]
     for index, payload in enumerate(payloads):
-        for text in _all_strings(payload):
-            if _credential_string(text):
-                errors.append(f"L03:payload[{index}]:secret_in_payload")
-                break
+        has_cred = (bool(_CREDENTIAL_RE.search(dumped_case))
+                    if index == 0 and dumped_case is not None
+                    else _has_credential_in_payload(payload))
+        if has_cred:
+            errors.append(f"L03:payload[{index}]:secret_in_payload")
     required, unsupported = data.get("required_inputs", ()), buckets["unmodeled_or_unsupported"]
     rules = {
         "completed": (data.get("case") is not None and not required and not unsupported
@@ -387,6 +454,23 @@ def _md_table(headers, rows):
 
 
 def launch_markdown(report) -> str:
+    if isinstance(report, LaunchParseReport):
+        rows = [(item.id, item.name, _plain(item.value), item.effect,
+                 ",".join(item.targets or ()) or "-", item.reason)
+                for bucket in (report.applied, report.neutral_operational,
+                               report.unmodeled_or_unsupported)
+                for item in bucket]
+        src_name = report.source.name if report.source is not None else None
+        lines = [f"# Launch inspection: {report.status}", "",
+                 f"- Source: `{src_name}`",
+                 f"- Adapter: `{report.adapter_id}`",
+                 f"- Coverage: `{report.coverage}`", "",
+                 _md_table(("ID", "Setting", "Value", "Effect", "Targets", "Reason"), rows)]
+        lines += [f"\n## Required inputs\n\n- `{item.name}`: {item.reason}"
+                  for item in report.required_inputs]
+        lines += [f"\n## Diagnostics\n\n- `{item.code}` ({item.severity}): {item.message}"
+                  for item in report.diagnostics]
+        return "\n".join(lines) + "\n"
     data = _as_dict(report)
     rows = [(item.get("id"), item.get("name"), item.get("value"), item.get("effect"),
              ",".join(item.get("targets") or ()) or "-", item.get("reason"))

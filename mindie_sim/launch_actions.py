@@ -24,11 +24,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, fields, is_dataclass, replace
+from copy import deepcopy
+from functools import lru_cache
+import json
 import re
 
+from .compose import compose_case
 from .launch_documents import DocumentInputError, finite_json_loads
 from .launch_json_paths import json_member_paths, json_pointer_join
 from .launch_parser import SourceSpan, Word, is_secret_name
+from .schema.case import Case
+from .schema.model import WorkloadSpec
+from .catalog.types import QuantSpec
 
 #: Report vocabulary fields are contract enums, not user payload.  Scrubbing
 #: a very short credential out of them would invalidate the report itself.
@@ -38,14 +45,11 @@ _PROTECTED_REPORT_FIELDS = frozenset({
 })
 
 _DELETE = object()
+_VALID_BLOBS: set[str] = set()
+_CLEAN_BLOBS: dict[str, tuple[str, str]] = {}
 
 _TOKEN = re.compile(r"(?i)(\"?(?:api[_-]?key|token|secret|password|credential|authorization|bearer)\"?\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;}]+)")
 _NUMBER = re.compile(r"-?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
-from copy import deepcopy
-from .compose import compose_case
-from .schema.model import WorkloadSpec
-from .schema.case import Case
-from .catalog.types import QuantSpec
 
 _SCALAR = {
     "--tensor-parallel-size": ("/runtime/parallel/tp", int), "-tp": ("/runtime/parallel/tp", int),
@@ -170,43 +174,66 @@ def adapter_for(version):
     return None
 
 
-def _scrub_text(text, secrets=()):
+def _ordered_secrets(secrets) -> tuple[str, ...]:
+    if not secrets:
+        return ()
+    return tuple(sorted({str(item) for item in secrets if item}, key=len, reverse=True))
+
+
+def _scrub_text_ordered(text, ordered: tuple[str, ...]) -> str:
     value = str(text)
-    for secret in sorted({str(item) for item in secrets if item}, key=len, reverse=True):
-        if secret:
+    for secret in ordered:
+        if secret in value:
             value = value.replace(secret, "[REDACTED]")
+    if ":" not in value and "=" not in value:
+        return value
     return _TOKEN.sub(lambda match: match.group(1) + "[REDACTED]", value)
 
 
-def _scrub(value, secrets=()):
+def _scrub_text(text, secrets=()):
+    return _scrub_text_ordered(text, _ordered_secrets(secrets))
+
+
+def _scrub_ordered(value, ordered: tuple[str, ...], exact: frozenset[str]):
     if isinstance(value, dict):
         result = {}
         for key, item in value.items():
             # The key itself is a diagnostic surface: a secret-named key may
             # embed the credential value (``R4_CANARY_api_key``), so scrub the
             # key text before deciding that its value is credential material.
-            scrubbed_key = _scrub_text(str(key), secrets)
+            scrubbed_key = _scrub_text_ordered(str(key), ordered)
             if is_secret_name(key):
                 result[scrubbed_key] = "[REDACTED]"
             else:
-                result[scrubbed_key] = _scrub(item, secrets)
+                result[scrubbed_key] = _scrub_ordered(item, ordered, exact)
         return result
     if isinstance(value, (list, tuple)):
-        return [_scrub(item, secrets) for item in value]
+        return [_scrub_ordered(item, ordered, exact) for item in value]
     if isinstance(value, str):
-        if value in {str(item) for item in secrets}:
+        if value in exact:
             return "[REDACTED]"
-        return _scrub_text(value, secrets)
+        return _scrub_text_ordered(value, ordered)
     return value
 
 
-def _scrub_case(value, secrets=()):
-    """Scrub a canonical Case using its typed records as the schema boundary.
+def _scrub(value, secrets=()):
+    ordered = _ordered_secrets(secrets)
+    return _scrub_ordered(value, ordered, frozenset(ordered))
 
-    Dataclass projections own their keys. Free-form mappings (metadata,
-    kernels, catalog facts, etc.) still scrub both keys and values. Hardware's
-    serialized devices/architecture names are aliases of dies/arch_family.
-    """
+
+def _iter_strings(obj):
+    if isinstance(obj, str):
+        yield obj
+    elif isinstance(obj, dict):
+        for key, item in obj.items():
+            yield str(key)
+            yield from _iter_strings(item)
+    elif isinstance(obj, (list, tuple)):
+        for item in obj:
+            yield from _iter_strings(item)
+
+
+def _scrub_case_uncached(value, secrets=()):
     case = Case.from_mapping(value)
 
     def walk(data, record):
@@ -227,6 +254,26 @@ def _scrub_case(value, secrets=()):
     return walk(case.to_dict(), case)
 
 
+def _scrub_case(value, secrets=()):
+    """Scrub a canonical Case using its typed records as the schema boundary.
+
+    Dataclass projections own their keys. Free-form mappings (metadata,
+    kernels, catalog facts, etc.) still scrub both keys and values. Hardware's
+    serialized devices/architecture names are aliases of dies/arch_family.
+    """
+    if isinstance(value, dict):
+        try:
+            blob = json.dumps(value, allow_nan=False)
+        except (TypeError, ValueError):
+            blob = None
+        entry = _CLEAN_BLOBS.get(blob) if blob is not None else None
+        if entry is not None:
+            haystack, scrubbed_blob = entry
+            if not any(str(s) in haystack for s in secrets if s):
+                return json.loads(scrubbed_blob)
+    return _scrub_case_uncached(value, secrets)
+
+
 def _scrub_report(report, secrets=()):
     """Recursively scrub every report string, dictionary key and payload.
 
@@ -234,7 +281,8 @@ def _scrub_report(report, secrets=()):
     occurrence id, a pointer or free-form Case metadata. Fixed record keys
     remain schema; the constructed report is projected before validation.
     """
-    if not secrets:
+    ordered = _ordered_secrets(secrets)
+    if not ordered:
         return report
 
     def walk(value):
@@ -242,7 +290,7 @@ def _scrub_report(report, secrets=()):
             return replace(value, **{
                 field.name: (getattr(value, field.name)
                              if field.name in _PROTECTED_REPORT_FIELDS
-                             else _scrub_case(value.case, secrets)
+                             else _scrub_case(value.case, ordered)
                              if field.name == "case" and value.case is not None
                              else walk(getattr(value, field.name)))
                 for field in fields(value)})
@@ -252,7 +300,7 @@ def _scrub_report(report, secrets=()):
                 # Keys (setting ids, child names and JSON pointers derived
                 # from them) are payload, not labels: redact the credential
                 # substring even when the key also names a secret setting.
-                scrubbed_key = _scrub_text(str(key), secrets)
+                scrubbed_key = _scrub_text_ordered(str(key), ordered)
                 if is_secret_name(key):
                     result[scrubbed_key] = "[REDACTED]"
                 else:
@@ -261,7 +309,7 @@ def _scrub_report(report, secrets=()):
         if isinstance(value, (list, tuple)):
             return type(value)(walk(item) for item in value)
         if isinstance(value, str):
-            return _scrub_text(value, secrets)
+            return _scrub_text_ordered(value, ordered)
         return value
 
     return walk(report)
@@ -506,6 +554,58 @@ def _shadow(drafts):
             continue
         result.append(parents[draft.uid])
     return result
+
+def _register_clean_case(canonical: dict) -> str:
+    blob = json.dumps(canonical, allow_nan=False)
+    _VALID_BLOBS.add(blob)
+    scrubbed = _scrub_case_uncached(canonical, ())
+    scrubbed_blob = json.dumps(scrubbed, allow_nan=False)
+    try:
+        Case.from_mapping(scrubbed)
+        _VALID_BLOBS.add(scrubbed_blob)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        pass
+    haystack = "\x00".join((*_iter_strings(canonical), *_iter_strings(scrubbed)))
+    _CLEAN_BLOBS[blob] = (haystack, scrubbed_blob)
+    return blob
+
+
+@lru_cache(maxsize=None)
+def _cached_mutated_blob(base_blob: str, patches_json: str) -> str:
+    base = json.loads(base_blob)
+    for path, is_del, value in json.loads(patches_json):
+        _set_path(base, path, _DELETE if is_del else value)
+    return _register_clean_case(Case.from_mapping(base).to_dict())
+
+
+@lru_cache(maxsize=None)
+def _cached_composed_bundle(machine: str, model: str, tp: int, dp: int, ep: int,
+                            pp: int, pcp: int, cp: int, workload_json: str | None):
+    wl = None if workload_json is None else json.loads(workload_json)
+    axes = {"tp": tp, "dp": dp, "ep": ep, "pp": pp, "pcp": pcp, "cp": cp}
+    base = _base(machine, model, wl, axes, None)
+    parsed = Case.from_mapping(base)
+    blob = _register_clean_case(parsed.to_dict())
+    return base, parsed, blob
+
+
+def _base_bundle(machine, model, workload, axes, base_case):
+    if base_case is None and isinstance(machine, str) and isinstance(model, str):
+        wl_raw = workload.to_dict() if hasattr(workload, "to_dict") else workload
+        try:
+            wl_json = (None if wl_raw is None
+                       else json.dumps(dict(wl_raw), sort_keys=True, allow_nan=False))
+            cacheable = True
+        except (TypeError, ValueError):
+            wl_json, cacheable = None, False
+        if cacheable:
+            return _cached_composed_bundle(
+                machine, model, int(axes.get("tp", 1)), int(axes.get("dp", 1)),
+                int(axes.get("ep", 1)), int(axes.get("pp", 1)),
+                int(axes.get("pcp", 1)), int(axes.get("cp", 1)), wl_json)
+    base = _base(machine, model, workload, axes, base_case)
+    return base, Case.from_mapping(base), None
+
 
 def _base(machine, model, workload, axes, base_case):
     if base_case is not None:

@@ -17,7 +17,7 @@
 </p>
 
 <p align="center">
-  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0913-highlights--full-fleet-convergence">v0.9.14 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
+  <a href="./README.md">中文</a> · <strong>English</strong> · <a href="#why-sim">Why sim?</a> · <a href="#quick-start">Quick Start</a> · <a href="#v0914-highlights--full-fleet-convergence">v0.9.14 Highlights</a> · <a href="#cli-commands--python-api-reference">CLI & Python API</a> · <a href="#real-world-usage-examples">Examples</a> · <a href="#documentation">Documentation</a> · <a href="https://github.com/mindie-agent/mindie-agent">MindIE Agent Main Repo</a>
 </p>
 
 ---
@@ -194,6 +194,15 @@ The full reproducible NPU profiling benchmark dataset is published on HuggingFac
 | `mindie-sim calibrate` / `bind-profiler` | Import measured primitive samples or Profiler bindings into `PrimitiveStore` | `mindie-sim calibrate /tmp/primitives.db samples.jsonl` |
 | `mindie-sim validate` / `accuracy` | Compare predictions against observations on an explicit timing boundary | `mindie-sim validate pred.json obs.json --boundary body` |
 | `mindie-sim fit-rate` / `fit-service` | Fit a single-resource rate or primitive work-response service curve | `mindie-sim fit-service observations.json` |
+| `mindie-sim compose` | Synthesize a simulation Case from catalog or C7 profile summaries (supports `--recover-ssm`) | `mindie-sim compose --model qwen3-30b-a3b --hardware a3 --recover-ssm` |
+| `mindie-sim advise` / `sweep` / `skew` | Rank counterfactual interventions, sweep parallel/PD Pareto grids, and evaluate MoE skew | `mindie-sim advise examples/quickstart.json` |
+| `mindie-sim inspect-launch` / `sol` / `feature-deltas` | Parse launch manifests, compare against Speed-of-Light (SOL) bounds, and score feature deltas | `mindie-sim sol examples/quickstart.json` |
+| `mindie-sim diff-trace` | 4-way conserving capture residual attribution and `repro-op` reproduction synthesis | `mindie-sim diff-trace examples/quickstart.json capture.json` |
+| `mindie-sim optimize-graph` | Day-0 graph fusion, multi-stream scheduling, and weight-prefetch optimization report | `mindie-sim optimize-graph examples/quickstart.json --phase decode` |
+| `mindie-sim sweep-ep-knee` / `size-xpyd` | Discrete EP knee sweep and SLO-constrained XPyD disaggregated pool sizing | `mindie-sim size-xpyd examples/quickstart.json --total-npus 16` |
+| `mindie-sim memory-breakdown` / `kv-state` | 6-component per-rank HBM ledger and hybrid KV / 7-family `RecoverSSM` state evaluation | `mindie-sim memory-breakdown examples/quickstart.json` |
+| `mindie-sim opflow` / `op-formula` | Universal `OpFlow` pipeline evaluation and explainable per-operator formula diagnostics | `mindie-sim op-formula rms_norm --hardware a3` |
+| `mindie-sim build-accel` | Compile the optional local C11 native event-engine accelerator | `mindie-sim build-accel` |
 
 ### Core Python API
 

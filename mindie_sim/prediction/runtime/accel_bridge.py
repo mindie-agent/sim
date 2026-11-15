@@ -11,7 +11,7 @@
   unloadable library is an explicit ``python_fallback``; under explicit ``c`` it
   is a structured error.
 [Timeouts & Locks] One process-local library memo; normal calls are bounded by
-  the caller's step budget, while an R6-1 output drain uses budget zero and is
+  the caller's step budget, while an output drain uses budget zero and is
   bounded by the fixed wire buffers (each call publishes at least one record).
   No threads, sleeps or I/O after publication.
 [Side-Effect Policy] Loads the cached immutable library and mutates the Engine
@@ -243,11 +243,11 @@ class NativeBackend:
             self.pending_handback = True
             finish_handback(self, engine)
     def _sync_back(self, engine) -> None:
-        """Exact hand-back owned by :mod:`accel_sync` (R4-1/R4-2)."""
+        """Exact hand-back owned by :mod:`accel_sync`."""
         sync_back(self, engine)
     # -- eligibility ---------------------------------------------------
     def _adopt(self, engine, skip: int) -> bool:
-        """Mirror the unstarted pure frontier when ``auto`` attaches (R9)."""
+        """Mirror the unstarted pure frontier when ``auto`` attaches."""
         return adopt_frontier(self, engine, skip)
     def eligible(self, engine, task) -> bool:
         if self.handing_back:
@@ -366,7 +366,7 @@ class NativeBackend:
     def _mixed_reason(self) -> str:
         return "auto_mixed_frontier" if self.mode == "auto" else "mixed_frontier"
     def on_callback_registered(self, engine, event) -> None:
-        """R4-4: a live mirrored row acquired a Python completion observer.
+        """a live mirrored row acquired a Python completion observer.
 
         The kernel can no longer run through that row's completion: it cannot
         invoke the callback at the exact instant and it would publish the epoch
@@ -384,7 +384,7 @@ class NativeBackend:
         self.disable(engine, self._mixed_reason())
         self.made_progress = True
     def _sync_counters(self, engine) -> None:
-        """R7-1: publish counters before another call can fail (no prefix too)."""
+        """publish counters before another call can fail (no prefix too)."""
         if self.arena is None:
             return
         busy, serv = self.arena.counters()
@@ -392,10 +392,10 @@ class NativeBackend:
             engine.busy_ms[name] = busy[i]
             engine.serviced[name] = serv[i]
     def _apply_prefix(self, engine, error: KernelFault) -> None:
-        """R5-2: publish the kernel-accepted prefix of a failing epoch."""
+        """publish the kernel-accepted prefix of a failing epoch."""
         prefix = getattr(error, "prefix", None)
         if prefix is None or not getattr(error, "has_prefix", False):
-            # R7-1: even an accepted-nothing failure must publish the native
+            # even an accepted-nothing failure must publish the native
             # counters already earned by an earlier successful call.
             self._sync_counters(engine)
             return
@@ -426,7 +426,7 @@ class NativeBackend:
         if rc != 0:
             raise KernelFault(int(self.arena.st[1]), "activate")
     def _trace_blocks_epoch(self, engine) -> bool:
-        """R10-1: a bounded trace retaining a release-sensitive row stays Python.
+        """a bounded trace retaining a release-sensitive row stays Python.
 
         ``Engine._complete`` appends the name/owner/metadata/demand/service and
         placement references to ``engine.trace``.  If a native epoch integrates
@@ -448,7 +448,7 @@ class NativeBackend:
         self.made_progress = True
         self.needs_settle = False
     def _settle_instant(self, engine, force: bool = False) -> None:
-        """Publish same-instant admission after a callback completion (R11-2).
+        """Publish same-instant admission after a callback completion.
 
         The kernel holds awakened successors until Python published them.
         """
@@ -479,7 +479,7 @@ class NativeBackend:
                 self.arena.seed([engine.busy_ms[n] for n in self.res_names],
                                 [engine.serviced[n] for n in self.res_names])
                 self.seeded = True
-            self.needs_settle = False  # R12-1: consume the previous round's hold.
+            self.needs_settle = False  # consume the previous round's hold.
             try:
                 now, boundary, steps, ncomp, nstart = self.arena.run(
                     engine.now, engine.now,
@@ -505,10 +505,10 @@ class NativeBackend:
                 from .engine import ExecutionError
                 raise ExecutionError("execution_zero_progress")
     def admit(self, engine) -> None:
-        """Flush queued rows and start every ready row at ``engine.now`` (R11-2)."""
+        """Flush queued rows and start every ready row at ``engine.now``."""
         self._settle_instant(engine, force=True)
     def _translate_fault(self, error: KernelFault) -> None:
-        """Map the R11 arithmetic status to Python's exact underflow error."""
+        """Map the kernel arithmetic status to Python's exact underflow error."""
         st = self.arena.st if self.arena is not None else None
         index = (int(st[7]) - 1) if st is not None else -1
         if error.code == E_ARITH and 0 <= index < len(self.res_names):
@@ -571,7 +571,7 @@ class NativeBackend:
             raise KernelFault(E_STALL, "idle", f"mirrored={len(engine._native_slots)}")
         return steps
     def _apply(self, engine, nstart: int, ncomp: int) -> None:
-        """Publish one kernel result batch exactly once (R4-4/R4-5)."""
+        """Publish one kernel result batch exactly once."""
         tasks = engine._tasks
         slots = engine._native_slots
         self.applying = True
@@ -616,7 +616,7 @@ class NativeBackend:
                 if task is None:
                     continue
                 if moment != engine.now and task.callback:
-                    # R9-2: no observer with a future clock/counter pair.
+                    # no observer with a future clock/counter pair.
                     raise KernelFault(E_STATE, "causal_publication")
                 nlink = len(task.remaining)
                 for res, amount in self.arena.services(svc_start, nlink):
@@ -624,12 +624,11 @@ class NativeBackend:
                     task.service[name] = amount
                 engine._complete_native(task, moment)
             self.live = len(slots)
-            # R12-1: never overwrite an earlier chunk's hold with False.
+            # never overwrite an earlier chunk's hold with False.
             self.needs_settle = self.needs_settle or bool(self.arena.last_held)
         except BaseException:
-            # R10-2: the accepted batch is only partially published.  Mark the
-            # kernel residue non-exportable so a callback-triggered ``disable``
-            # in ``finally`` cannot mask this exception with ``stale_slot``.
+            # The accepted batch is only partially published; mark kernel residue
+            # non-exportable so callback-triggered disable cannot raise stale_slot.
             self.aborted_publication = True
             raise
         finally:
@@ -695,7 +694,9 @@ def make_backend(requested: str | None = None):
     if mode == "c":
         try:
             status = accel_build.build_accel()
-        except (OSError, TimeoutError, RuntimeError) as error:
+        except TimeoutError:
+            raise
+        except (OSError, RuntimeError) as error:
             raise AccelUnavailable(f"build_unavailable:{error}") from error
         if not status.get("ok"):
             raise AccelUnavailable(status.get("reason") or "native_build_unavailable",

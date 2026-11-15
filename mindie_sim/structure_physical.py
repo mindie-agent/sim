@@ -89,12 +89,13 @@ def _recipe_book(encoded):
     return RecipeBook.from_mapping(json.loads(encoded))
 
 
-def _recipe_selection(op, bindings):
+def _recipe_selection(op, bindings, *, book=None):
     """Unbound semantic labels do not distinguish the fallback resource program."""
     from .prediction.services import ResourceService
 
-    encoded = json.dumps(bindings, sort_keys=True, separators=(",", ":"), allow_nan=False)
-    book = _recipe_book(encoded)
+    if book is None:
+        encoded = json.dumps(bindings, sort_keys=True, separators=(",", ":"), allow_nan=False)
+        book = _recipe_book(encoded)
     if op.plan_required or op.recipe in book.recipes:
         return op.recipe, False
     selected = book.select(op)
@@ -114,13 +115,13 @@ def _recipe_selection(op, bindings):
             generic_matrix)
 
 
-def node_physical(op, *, recipe_bindings=None):
+def node_physical(op, *, recipe_bindings=None, book=None):
     """Keep every physical axis in OpSpec except its occurrence identity."""
     declaration = op.to_dict()
     for key in _IDENTITY:
         declaration.pop(key, None)
     declaration["metadata"] = _metadata(declaration["metadata"])
-    declaration["recipe"], generic_matrix = _recipe_selection(op, recipe_bindings or {})
+    declaration["recipe"], generic_matrix = _recipe_selection(op, recipe_bindings or {}, book=book)
     if generic_matrix:
         # catalog.ops has already resolved these selection labels into operand
         # precisions, layouts, scale traffic and work. The fallback matmul

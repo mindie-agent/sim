@@ -14,6 +14,7 @@ import math
 from typing import Mapping
 
 from ..ownership import unit_rates
+from .arbiter_fast_coupled import fast_single_tier_coupled
 
 
 def _max_min_rates(capacity: float, caps: Mapping[int, float]) -> dict[int, float]:
@@ -423,6 +424,9 @@ def _tiered_coupled(resources, tasks, active, solver) -> dict[str, dict[int, flo
     per-unit fill must own the computation to see the owner dimension.
     """
     del solver
+    fast = fast_single_tier_coupled(resources, tasks, active)
+    if fast is not None:
+        return fast
     # One immutable physical ledger for the whole tier walk.  ``orig_capacity``
     # is the per-unit capacity declared by the resource; ``cumulative_terms`` is
     # the single shared list of every committed ``alpha * weight`` term from all

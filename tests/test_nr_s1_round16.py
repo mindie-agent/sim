@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import itertools
 import json
 import shlex
 
@@ -128,30 +129,26 @@ def _public(command, env, layout, *, rejection=None, command_index=None,
             assert next(s for s in settings if s.name == name).redacted
 
 
-@pytest.mark.parametrize("prologue", PROLOGUES)
-@pytest.mark.parametrize("position", ["before", "after"])
-@pytest.mark.parametrize("export", EXPORTS)
-@pytest.mark.parametrize("wrapper", (*WRAPPERS, "sh -c ", "bash -c "))
-def test_r16_env_prologue_first_wrapper_contract(prologue, position, export, wrapper):
-    env = normalize_env(_env(export))
-    command = _lead(prologue, position, export) + wrapper + shlex.quote(SCRIPT)
-    for tail in TAILS:
-        for decode in (_decoded_shell_words, _tolerant_words):
-            script, effective = discovery_wrapper(decode(command + tail, env), env)
-            assert script == SCRIPT and effective["VALUE"] == (SECRET, False)
+def test_r16_env_prologue_first_wrapper_contract():
+    for prologue, position, export, wrapper in itertools.product(
+        PROLOGUES, ["before", "after"], EXPORTS, (*WRAPPERS, "sh -c ", "bash -c ")
+    ):
+        env = normalize_env(_env(export))
+        command = _lead(prologue, position, export) + wrapper + shlex.quote(SCRIPT)
+        for tail in TAILS:
+            for decode in (_decoded_shell_words, _tolerant_words):
+                script, effective = discovery_wrapper(decode(command + tail, env), env)
+                assert script == SCRIPT and effective["VALUE"] == (SECRET, False)
 
 
-@pytest.mark.parametrize("prologue", PROLOGUES)
-@pytest.mark.parametrize("position", ["before", "after"])
-@pytest.mark.parametrize("export", EXPORTS)
-@pytest.mark.parametrize("wrapper", WRAPPERS)
 @pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("tail", TAILS)
-def test_r16_env_prologue_public_reports(prologue, position, export, wrapper,
-                                        layout, tail):
-    command = _lead(prologue, position, export) + wrapper + shlex.quote(SCRIPT) + tail
-    _public(command, _env(export), layout,
-            rejection="unsupported_shell_syntax" if tail else None)
+def test_r16_env_prologue_public_reports(layout):
+    for prologue, position, export, wrapper, tail in itertools.product(
+        PROLOGUES, ["before", "after"], EXPORTS, WRAPPERS, TAILS
+    ):
+        command = _lead(prologue, position, export) + wrapper + shlex.quote(SCRIPT) + tail
+        _public(command, _env(export), layout,
+                rejection="unsupported_shell_syntax" if tail else None)
 
 
 FIRST_COMMANDS = ("vllm serve /first", "python3 -m vllm.entrypoints.openai.api_server",
@@ -167,56 +164,52 @@ def _multi(first, prefix, style):
             "docker run " + forwarding + " image sh -c " + script)
 
 
-@pytest.mark.parametrize("first", FIRST_COMMANDS)
-@pytest.mark.parametrize("prefix", ["", "env "])
-@pytest.mark.parametrize("style", ["literal", "reference", "outer"])
-@pytest.mark.parametrize("layout", LAYOUTS)
-@pytest.mark.parametrize("command_index", [None, 1])
-def test_r16_multi_command_public_reports(first, prefix, style, layout, command_index):
-    command = _multi(first, prefix, style)
-    # Structured command strings currently require an unambiguous command even
-    # when the public caller supplies command_index. Preserve that admission
-    # diagnostic while independently protecting sibling/failure reports.
-    _public(command, _env(), layout, rejection="ambiguous_launch",
-            command_index=command_index, no_decoy=True)
+def test_r16_multi_command_public_reports():
+    for first, prefix, style, layout, command_index in itertools.product(
+        FIRST_COMMANDS, ["", "env "], ["literal", "reference", "outer"], LAYOUTS, [None, 1]
+    ):
+        command = _multi(first, prefix, style)
+        # Structured command strings currently require an unambiguous command even
+        # when the public caller supplies command_index. Preserve that admission
+        # diagnostic while independently protecting sibling/failure reports.
+        _public(command, _env(), layout, rejection="ambiguous_launch",
+                command_index=command_index, no_decoy=True)
 
 
-@pytest.mark.parametrize("first", (*FIRST_COMMANDS,
-                                  "python -m vllm.entrypoints.cli.main"))
-@pytest.mark.parametrize("prefix", ["", "env "])
-@pytest.mark.parametrize("style", ["literal", "reference", "outer"])
-def test_r16_multi_command_walker_discards_inline_values(first, prefix, style):
-    command, env = _multi(first, prefix, style), normalize_env(_env())
-    for tail in TAILS:
-        for decode in (_decoded_shell_words, _tolerant_words):
-            words = decode(command + tail, env)
-            first_wrapper = discovery_wrapper(words, env)
-            if first == FIRST_COMMANDS[-1]:
-                assert first_wrapper == ("vllm serve /first", {})
-            else:
-                assert first_wrapper is None
-            wrappers = list(iter_discovery_wrappers(words, env))
-            assert wrappers[-1][1]["VALUE"] == (SECRET, False)
-            found = set()
-            _shell_taint(command + tail, found, env)
-            assert SECRET in found and DECOY not in found
-    assert env["VALUE"] == (SECRET, False)
+def test_r16_multi_command_walker_discards_inline_values():
+    for first, prefix, style in itertools.product(
+        (*FIRST_COMMANDS, "python -m vllm.entrypoints.cli.main"),
+        ["", "env "], ["literal", "reference", "outer"]
+    ):
+        command, env = _multi(first, prefix, style), normalize_env(_env())
+        for tail in TAILS:
+            for decode in (_decoded_shell_words, _tolerant_words):
+                words = decode(command + tail, env)
+                first_wrapper = discovery_wrapper(words, env)
+                if first == FIRST_COMMANDS[-1]:
+                    assert first_wrapper == ("vllm serve /first", {})
+                else:
+                    assert first_wrapper is None
+                wrappers = list(iter_discovery_wrappers(words, env))
+                assert wrappers[-1][1]["VALUE"] == (SECRET, False)
+                found = set()
+                _shell_taint(command + tail, found, env)
+                assert SECRET in found and DECOY not in found
+        assert env["VALUE"] == (SECRET, False)
 
 
-@pytest.mark.parametrize("prefix", ["", "env "])
-def test_r16_selected_second_shell_launch_redacts_without_local_leak(prefix):
-    # Both the outer script and Docker's inner script have two commands because
-    # the existing adapter passes command_index to both parser invocations.
-    command = ("export VALUE=" + SECRET + "\n" + prefix + "VALUE=" + DECOY +
-               " vllm serve /first\ndocker run -e VALUE image sh -c " +
-               shlex.quote("vllm serve /inner-first\n" + SCRIPT))
-    parsed = parse_shell(command, command_index=1)
-    assert dict(parsed.commands[1].env)["VALUE"] == SECRET
-    for index, code in ((1, None), (None, "ambiguous_launch")):
-        report = parse_launch(command, source=SECRET, command_index=index, **BASE)
-        _safe(report)
-        assert [d.code for d in report.diagnostics] == ([code] if code else [])
-        assert report.status == ("failed" if code else "completed")
+def test_r16_selected_second_shell_launch_redacts_without_local_leak():
+    for prefix in ("", "env "):
+        command = ("export VALUE=" + SECRET + "\n" + prefix + "VALUE=" + DECOY +
+                   " vllm serve /first\ndocker run -e VALUE image sh -c " +
+                   shlex.quote("vllm serve /inner-first\n" + SCRIPT))
+        parsed = parse_shell(command, command_index=1)
+        assert dict(parsed.commands[1].env)["VALUE"] == SECRET
+        for index, code in ((1, None), (None, "ambiguous_launch")):
+            report = parse_launch(command, source=SECRET, command_index=index, **BASE)
+            _safe(report)
+            assert [d.code for d in report.diagnostics] == ([code] if code else [])
+            assert report.status == ("failed" if code else "completed")
 
 
 NEGATIVES = ("env -i\n", "env -u A\n", "env env ", "A=1 export B\n",
@@ -227,19 +220,19 @@ NEGATIVES = ("env -i\n", "env -u A\n", "env env ", "A=1 export B\n",
              "docker run image true\n", "docker run\n")
 
 
-@pytest.mark.parametrize("prefix", NEGATIVES)
-def test_r16_unsupported_statement_never_advances(prefix):
-    command = prefix + WRAPPERS[0] + shlex.quote(SCRIPT)
-    env = normalize_env(_env())
-    for decode in (_decoded_shell_words, _tolerant_words):
-        words = decode(command, env)
-        assert discovery_wrapper(words, env) is None
-        assert list(iter_discovery_wrappers(words, env)) == []
-        words = decode("vllm serve /first\n" + command, env)
-        assert list(iter_discovery_wrappers(words, env)) == []
-    found = set()
-    _shell_taint(command, found, env)
-    assert SECRET not in found
+def test_r16_unsupported_statement_never_advances():
+    for prefix in NEGATIVES:
+        command = prefix + WRAPPERS[0] + shlex.quote(SCRIPT)
+        env = normalize_env(_env())
+        for decode in (_decoded_shell_words, _tolerant_words):
+            words = decode(command, env)
+            assert discovery_wrapper(words, env) is None
+            assert list(iter_discovery_wrappers(words, env)) == []
+            words = decode("vllm serve /first\n" + command, env)
+            assert list(iter_discovery_wrappers(words, env)) == []
+        found = set()
+        _shell_taint(command, found, env)
+        assert SECRET not in found
 
 
 def test_r16_docker_option_and_wrapper_argument_split_never_borrows():
@@ -251,38 +244,36 @@ def test_r16_docker_option_and_wrapper_argument_split_never_borrows():
             assert list(iter_discovery_wrappers(decode(text, env), env)) == []
 
 
-@pytest.mark.parametrize("prefix", ["VALUE=", "env VALUE="])
-@pytest.mark.parametrize("visibility", ["absent", "base", "before", "after"])
-def test_r16_prologue_overlay_compatibility_and_parser_export_visibility(prefix,
-                                                                       visibility):
-    env = {"VALUE": DECOY} if visibility == "base" else {}
-    command = ("export VALUE=" + DECOY + "\n" if visibility == "before" else "")
-    command += prefix + SECRET + "\n"
-    if visibility == "after":
-        command += "export VALUE\n"
-    parsed = parse_shell(command + "docker run -e VALUE image vllm serve /m", env=env)
-    assert ("VALUE" in dict(parsed.commands[0].env)) == (visibility != "absent")
-    # Retain historical conservative prefix discovery, including an unexported
-    # standalone assignment; this does not alter the parser's child visibility.
+def test_r16_prologue_overlay_compatibility_and_parser_export_visibility():
+    for prefix, visibility in itertools.product(
+        ["VALUE=", "env VALUE="], ["absent", "base", "before", "after"]
+    ):
+        env = {"VALUE": DECOY} if visibility == "base" else {}
+        command = ("export VALUE=" + DECOY + "\n" if visibility == "before" else "")
+        command += prefix + SECRET + "\n"
+        if visibility == "after":
+            command += "export VALUE\n"
+        parsed = parse_shell(command + "docker run -e VALUE image vllm serve /m", env=env)
+        assert ("VALUE" in dict(parsed.commands[0].env)) == (visibility != "absent")
+        for decode in (_decoded_shell_words, _tolerant_words):
+            normalized = normalize_env(env)
+            words = decode(command + "sh -c '$VALUE'", normalized)
+            script, effective = discovery_wrapper(words, normalized)
+            assert script == SECRET and effective["VALUE"] == (SECRET, False)
+            assert isinstance(effective, _EnvOverlay) and effective._base is normalized
+
+
+def test_r16_decoder_persists_only_prefix_statements():
     for decode in (_decoded_shell_words, _tolerant_words):
-        normalized = normalize_env(env)
-        words = decode(command + "sh -c '$VALUE'", normalized)
-        script, effective = discovery_wrapper(words, normalized)
-        assert script == SECRET and effective["VALUE"] == (SECRET, False)
-        assert isinstance(effective, _EnvOverlay) and effective._base is normalized
-
-
-@pytest.mark.parametrize("decode", [_decoded_shell_words, _tolerant_words])
-def test_r16_decoder_persists_only_prefix_statements(decode):
-    env = normalize_env({"VALUE": SECRET})
-    command = ("env VALUE=" + DECOY + " vllm serve /first\n"
-               'vllm serve /second --api-key "$VALUE"')
-    assert decode(command, env)[-1] == SECRET
-    command = ('vllm serve /first --served-model-name VALUE=' + DECOY +
-               '\nvllm serve /second --api-key "$VALUE"')
-    assert decode(command, env)[-1] == SECRET
-    command = "env VALUE=" + DECOY + '\nvllm serve /m --api-key "$VALUE"'
-    assert decode(command, env)[-1] == DECOY
+        env = normalize_env({"VALUE": SECRET})
+        command = ("env VALUE=" + DECOY + " vllm serve /first\n"
+                   'vllm serve /second --api-key "$VALUE"')
+        assert decode(command, env)[-1] == SECRET
+        command = ('vllm serve /first --served-model-name VALUE=' + DECOY +
+                   '\nvllm serve /second --api-key "$VALUE"')
+        assert decode(command, env)[-1] == SECRET
+        command = "env VALUE=" + DECOY + '\nvllm serve /m --api-key "$VALUE"'
+        assert decode(command, env)[-1] == DECOY
 
 
 class _NoEnumeration(Mapping):
@@ -389,123 +380,122 @@ def _r25_case(report):
     assert 'prefix_tokens' in report.case['workload']['requests'][0]
 
 
-@pytest.mark.parametrize('word', ('pre', 'head', 'prefix'))
-@pytest.mark.parametrize('position', (0, 1, 3))
-@pytest.mark.parametrize('variant', ('continued', 'contiguous', 'literal'))
-@pytest.mark.parametrize('binding', ('separate', 'attached'))
-@pytest.mark.parametrize('layout', R25_LAYOUTS)
-def test_r25_delimited_operand_preserves_benign_words(word, position, variant, binding, layout):
-    operand = _r25_operand(word, position, variant)
-    text = _r25_document(operand, binding, layout, word)
-    fmt = 'json' if layout == 'json' else 'yaml'
-    inventories = [set(prescan_document_secrets(text, fmt))]
-    if fmt == 'yaml':
-        raw, events = set(), set()
-        raw_document_taint(text, raw, _shell_taint)
-        _event_taint(text, events, _shell_taint)
-        inventories += [raw] + ([events] if HAS_YAML else [])
-    expected = operand.replace('$VA\\\nLUE', R25_SECRET).replace('$VALUE', R25_SECRET)
-    for found in inventories:
-        assert {operand, expected} <= found
-        assert not found.intersection((word, 'start', 'end', 'ordinary_fragment', 'R25_DECOY'))
-        assert (R25_SECRET in found) == (variant != 'literal')
-    for selection in ('a', 'b'):
-        report = parse_launch(text, format=fmt, container=selection, **BASE)
-        if fmt == 'yaml' and not HAS_YAML:
-            assert report.status == 'failed' and report.case is None
-            assert [d.code for d in report.diagnostics] == ['yaml_parser_unavailable']
-            continue
-        _r25_case(report)
-        rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
-        if selection == 'b':
-            served = next(s for s in rows if s.name == '--served-model-name')
-            assert served.value == word and not served.redacted
-        else:
-            assert next(s for s in rows if s.name == '--api-key').value == '[REDACTED]'
-        if variant != 'literal':
-            assert R25_SECRET not in canonical_json(report) + launch_markdown(report)
+def test_r25_delimited_operand_preserves_benign_words():
+    for word, position, variant, binding, layout in itertools.product(
+        ('pre', 'head', 'prefix'), (0, 1, 3), ('continued', 'contiguous', 'literal'),
+        ('separate', 'attached'), R25_LAYOUTS
+    ):
+        operand = _r25_operand(word, position, variant)
+        text = _r25_document(operand, binding, layout, word)
+        fmt = 'json' if layout == 'json' else 'yaml'
+        inventories = [set(prescan_document_secrets(text, fmt))]
+        if fmt == 'yaml':
+            raw, events = set(), set()
+            raw_document_taint(text, raw, _shell_taint)
+            _event_taint(text, events, _shell_taint)
+            inventories += [raw] + ([events] if HAS_YAML else [])
+        expected = operand.replace('$VA\\\nLUE', R25_SECRET).replace('$VALUE', R25_SECRET)
+        for found in inventories:
+            assert {operand, expected} <= found
+            assert not found.intersection((word, 'start', 'end', 'ordinary_fragment', 'R25_DECOY'))
+            assert (R25_SECRET in found) == (variant != 'literal')
+        for selection in ('a', 'b'):
+            report = parse_launch(text, format=fmt, container=selection, **BASE)
+            if fmt == 'yaml' and not HAS_YAML:
+                assert report.status == 'failed' and report.case is None
+                assert [d.code for d in report.diagnostics] == ['yaml_parser_unavailable']
+                continue
+            _r25_case(report)
+            rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
+            if selection == 'b':
+                served = next(s for s in rows if s.name == '--served-model-name')
+                assert served.value == word and not served.redacted
+            else:
+                assert next(s for s in rows if s.name == '--api-key').value == '[REDACTED]'
+            if variant != 'literal':
+                assert R25_SECRET not in canonical_json(report) + launch_markdown(report)
 
 
-@pytest.mark.parametrize('secret', ('pre', 'head', 'prefix', 'model'))
-@pytest.mark.parametrize('binding', ('separate', 'attached'))
-@pytest.mark.parametrize('layout', R25_LAYOUTS)
-def test_r25_real_schema_substring_credentials_keep_case_keys(secret, binding, layout):
-    text = _r25_document(secret, binding, layout, secret)
-    fmt = 'json' if layout == 'json' else 'yaml'
-    assert secret in prescan_document_secrets(text, fmt)
-    for selection in ('a', 'b'):
-        report = parse_launch(text, format=fmt, container=selection, source=secret, **BASE)
-        assert report.source.name == '[REDACTED]'
-        if fmt == 'yaml' and not HAS_YAML:
-            assert report.status == 'failed' and report.case is None
-            continue
-        _r25_case(report)
-        name = '--api-key' if selection == 'a' else '--served-model-name'
-        rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
-        # Fixed labels may contain the same letters; actual credential values may not.
-        setting = next(s for s in rows if s.name == name.replace(secret, '[REDACTED]'))
-        assert setting.value == '[REDACTED]' and setting.redacted
+def test_r25_real_schema_substring_credentials_keep_case_keys():
+    for secret, binding, layout in itertools.product(
+        ('pre', 'head', 'prefix', 'model'), ('separate', 'attached'), R25_LAYOUTS
+    ):
+        text = _r25_document(secret, binding, layout, secret)
+        fmt = 'json' if layout == 'json' else 'yaml'
+        assert secret in prescan_document_secrets(text, fmt)
+        for selection in ('a', 'b'):
+            report = parse_launch(text, format=fmt, container=selection, source=secret, **BASE)
+            assert report.source.name == '[REDACTED]'
+            if fmt == 'yaml' and not HAS_YAML:
+                assert report.status == 'failed' and report.case is None
+                continue
+            _r25_case(report)
+            name = '--api-key' if selection == 'a' else '--served-model-name'
+            rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
+            setting = next(s for s in rows if s.name == name.replace(secret, '[REDACTED]'))
+            assert setting.value == '[REDACTED]' and setting.redacted
 
 
-@pytest.mark.parametrize('shape', ('split', 'string'))
-@pytest.mark.parametrize('binding', ('separate', 'attached'))
-@pytest.mark.parametrize('layout', R25_LAYOUTS)
-def test_r25_mixed_command_fields_keep_operand_boundaries(shape, binding, layout):
-    operand = 'pre $VA\\\nLUE head suffix'
-    text = _r25_document(operand, binding, layout, 'head', shape)
-    found = prescan_document_secrets(text, 'json' if layout == 'json' else 'yaml')
-    assert {operand, 'pre ' + R25_SECRET + ' head suffix', R25_SECRET} <= set(found)
-    assert not set(found).intersection(('pre', 'head', 'suffix'))
+def test_r25_mixed_command_fields_keep_operand_boundaries():
+    for shape, binding, layout in itertools.product(
+        ('split', 'string'), ('separate', 'attached'), R25_LAYOUTS
+    ):
+        operand = 'pre $VA\\\nLUE head suffix'
+        text = _r25_document(operand, binding, layout, 'head', shape)
+        found = prescan_document_secrets(text, 'json' if layout == 'json' else 'yaml')
+        assert {operand, 'pre ' + R25_SECRET + ' head suffix', R25_SECRET} <= set(found)
+        assert not set(found).intersection(('pre', 'head', 'suffix'))
 
 
-@pytest.mark.parametrize('wrapper', ('sh', 'bash', 'eval'))
-def test_r25_only_wrapper_payloads_have_shell_word_boundaries(wrapper):
-    script = 'vllm serve /m --api-key actual_secret ordinary_suffix'
-    argv = [wrapper, '-c', script] if wrapper != 'eval' else [wrapper, script]
-    found = set()
-    _shell_taint(argv, found)
-    assert 'actual_secret' in found and 'ordinary_suffix' not in found
-    found.clear()
-    _shell_taint(['vllm serve /m --api-key hidden_word', '--api-key',
-                  'pre literal suffix'], found)
-    assert found == {'pre literal suffix'}
+def test_r25_only_wrapper_payloads_have_shell_word_boundaries():
+    for wrapper in ('sh', 'bash', 'eval'):
+        script = 'vllm serve /m --api-key actual_secret ordinary_suffix'
+        argv = [wrapper, '-c', script] if wrapper != 'eval' else [wrapper, script]
+        found = set()
+        _shell_taint(argv, found)
+        assert 'actual_secret' in found and 'ordinary_suffix' not in found
+        found.clear()
+        _shell_taint(['vllm serve /m --api-key hidden_word', '--api-key',
+                      'pre literal suffix'], found)
+        assert found == {'pre literal suffix'}
 
 
-@pytest.mark.parametrize('operand', ('pre $VA\\\nLUE suffix', 'head $VALUE prefix',
-                                     'prefix ordinary_fragment head', 'pre', 'head', 'model'))
-@pytest.mark.parametrize('binding', ('separate', 'attached'))
-@pytest.mark.parametrize('layout', R25_LAYOUTS)
-def test_r25_cli_case_consumers_agree(operand, binding, layout, tmp_path, capsys):
+def test_r25_cli_case_consumers_agree(tmp_path, capsys):
     from mindie_sim.feature_cli import main
     source, work, ops = (tmp_path / name for name in ('launch.txt', 'work.json', 'ops.json'))
-    source.write_text(_r25_document(operand, binding, layout))
     work.write_text(json.dumps(BASE['workload']))
     ops.write_text(json.dumps([dict(op_id='matrix', family='matmul', flops=2e9,
                                     hbm_bytes=1048576)]))
-    fmt = 'json' if layout == 'json' else 'yaml'
-    for action in ('inspect-launch', 'sol', 'feature-deltas'):
-        for render in ('json', 'markdown'):
-            argv = [action, str(source), '--input-format', fmt, '--container', 'a',
-                    '--machine', BASE['machine'], '--model', BASE['model'],
-                    '--framework-version', BASE['framework_version'],
-                    '--workload', str(work), '--format', render]
-            if action != 'inspect-launch':
-                argv += ['--scope', 'body', '--ops-json', str(ops), '--context', '128',
-                         '--sequences', '2']
-            if action == 'feature-deltas':
-                argv += ['--features', '']
-            assert main(argv) == (2 if fmt == 'yaml' and not HAS_YAML else 0)
-            out, err = capsys.readouterr()
-            assert out and not err
-            if '$' in operand:
-                assert R25_SECRET not in out
-            if render == 'json':
-                data = json.loads(out)
-                assert data['status'] == ('failed' if fmt == 'yaml' and not HAS_YAML
-                                          else 'completed')
-                if action == 'inspect-launch' and data['case']:
-                    from mindie_sim.schema.case import Case
-                    Case.from_mapping(data['case'])
+    for operand, binding, layout in itertools.product(
+        ('pre $VA\\\nLUE suffix', 'head $VALUE prefix',
+         'prefix ordinary_fragment head', 'pre', 'head', 'model'),
+        ('separate', 'attached'), R25_LAYOUTS
+    ):
+        source.write_text(_r25_document(operand, binding, layout))
+        fmt = 'json' if layout == 'json' else 'yaml'
+        for action in ('inspect-launch', 'sol', 'feature-deltas'):
+            for render in ('json', 'markdown'):
+                argv = [action, str(source), '--input-format', fmt, '--container', 'a',
+                        '--machine', BASE['machine'], '--model', BASE['model'],
+                        '--framework-version', BASE['framework_version'],
+                        '--workload', str(work), '--format', render]
+                if action != 'inspect-launch':
+                    argv += ['--scope', 'body', '--ops-json', str(ops), '--context', '128',
+                             '--sequences', '2']
+                if action == 'feature-deltas':
+                    argv += ['--features', '']
+                assert main(argv) == (2 if fmt == 'yaml' and not HAS_YAML else 0)
+                out, err = capsys.readouterr()
+                assert out and not err
+                if '$' in operand:
+                    assert R25_SECRET not in out
+                if render == 'json':
+                    data = json.loads(out)
+                    assert data['status'] == ('failed' if fmt == 'yaml' and not HAS_YAML
+                                              else 'completed')
+                    if action == 'inspect-launch' and data['case']:
+                        from mindie_sim.schema.case import Case
+                        Case.from_mapping(data['case'])
 
 
 def test_r25_case_metadata_keys_are_still_untrusted():
@@ -521,20 +511,20 @@ def test_r25_case_metadata_keys_are_still_untrusted():
     assert not any(secret in text for text in _strings(metadata) for secret in ('pre', 'head'))
 
 
-@pytest.mark.parametrize('as_mapping', (False, True))
-def test_r25_validator_rejects_corrupt_completed_cases(as_mapping):
+def test_r25_validator_rejects_corrupt_completed_cases():
     from copy import deepcopy
     from dataclasses import replace
     from mindie_sim.feature_reports import ReportValidationError, validate_launch_report
-    report = parse_launch(['vllm', 'serve', '/m'], format='argv', **BASE)
-    case = deepcopy(report.case)
-    layer = case['model']['layer_plans'][0]
-    layer['com[REDACTED]ss_ratio'] = layer.pop('compress_ratio')
-    corrupt = replace(report, case=case)
-    if as_mapping:
-        corrupt = json.loads(canonical_json(corrupt))
-    with pytest.raises(ReportValidationError, match='L02:case_round_trip_invalid'):
-        validate_launch_report(corrupt)
+    for as_mapping in (False, True):
+        report = parse_launch(['vllm', 'serve', '/m'], format='argv', **BASE)
+        case = deepcopy(report.case)
+        layer = case['model']['layer_plans'][0]
+        layer['com[REDACTED]ss_ratio'] = layer.pop('compress_ratio')
+        corrupt = replace(report, case=case)
+        if as_mapping:
+            corrupt = json.loads(canonical_json(corrupt))
+        with pytest.raises(ReportValidationError, match='L02:case_round_trip_invalid'):
+            validate_launch_report(corrupt)
 
 
 def test_r25_parse_never_completes_with_corrupted_scrubbed_case(monkeypatch):
@@ -559,85 +549,86 @@ COMPOSITE_WORDS = (
 )
 
 
-@pytest.mark.parametrize('expression', COMPOSITE_WORDS)
-@pytest.mark.parametrize('binding', ('separate', 'attached', 'assignment'))
-@pytest.mark.parametrize('layout', ('json', 'flow', 'mapping', 'block', 'mixed'))
-def test_composite_shell_credentials_preserve_sibling(expression, binding, layout):
-    full = 'pre literal suffix'
-    command = ('API_KEY=' + expression + ' vllm serve /m' if binding == 'assignment'
-               else 'vllm serve /m --api-key' +
-               (' ' if binding == 'separate' else '=') + expression)
-    other = ['vllm', 'serve', '/m', '--served-model-name', 'pre']
-    if layout in ('json', 'flow'):
-        text = json.dumps({'containers': [dict(name='a', command=command),
-                                         dict(name='b', command=other)]})
-    else:
-        field = ('  command: |-\n' + '\n'.join('    ' + s for s in command.split('\n'))
-                 if layout == 'block' else '  command: ' + json.dumps(command))
-        sibling = ('  command:\n' + '\n'.join('  - ' + json.dumps(s) for s in other)
-                   if layout == 'mapping' else '  command: ' + json.dumps(other))
-        text = 'containers:\n- name: a\n' + field + '\n- name: b\n' + sibling + '\n'
-    fmt = 'json' if layout == 'json' else 'yaml'
-    inventories = [set(prescan_document_secrets(text, fmt))]
-    if fmt == 'yaml':
-        raw, events = set(), set()
-        raw_document_taint(text, raw, _shell_taint)
-        _event_taint(text, events, _shell_taint)
-        inventories += [raw] + ([events] if HAS_YAML else [])
-    for found in inventories:
-        assert full in found and found <= {full, expression}
-    for selection in ('a', 'b'):
-        report = parse_launch(text, format=fmt, container=selection, source=full, **BASE)
-        assert report.source.name == '[REDACTED]'
-        assert not any(full in s for s in _strings(json.loads(canonical_json(report))))
-        assert full not in launch_markdown(report)
-        if fmt == 'yaml' and not HAS_YAML:
-            assert report.status == 'failed' and report.case is None
-            assert [d.code for d in report.diagnostics] == ['yaml_parser_unavailable']
-            continue
-        _r25_case(report)
-        name = ('--served-model-name' if selection == 'b' else
-                'API_KEY' if binding == 'assignment' else '--api-key')
-        rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
-        setting = next(s for s in rows if s.name == name)
-        assert setting.value == ('pre' if selection == 'b' else '[REDACTED]')
-        assert setting.redacted is (selection == 'a')
-    if binding == 'assignment':
-        script = command + ' --served-model-name pre'
-        assert 'pre' not in parse_shell(script).secret_values
-        report = parse_launch(script, **BASE)
-        _r25_case(report)
-        served = next(s for s in report.neutral_operational if s.name == '--served-model-name')
-        assert served.value == 'pre' and not served.redacted
+def test_composite_shell_credentials_preserve_sibling():
+    for expression, binding, layout in itertools.product(
+        COMPOSITE_WORDS, ('separate', 'attached', 'assignment'),
+        ('json', 'flow', 'mapping', 'block', 'mixed')
+    ):
+        full = 'pre literal suffix'
+        command = ('API_KEY=' + expression + ' vllm serve /m' if binding == 'assignment'
+                   else 'vllm serve /m --api-key' +
+                   (' ' if binding == 'separate' else '=') + expression)
+        other = ['vllm', 'serve', '/m', '--served-model-name', 'pre']
+        if layout in ('json', 'flow'):
+            text = json.dumps({'containers': [dict(name='a', command=command),
+                                             dict(name='b', command=other)]})
+        else:
+            field = ('  command: |-\n' + '\n'.join('    ' + s for s in command.split('\n'))
+                     if layout == 'block' else '  command: ' + json.dumps(command))
+            sibling = ('  command:\n' + '\n'.join('  - ' + json.dumps(s) for s in other)
+                       if layout == 'mapping' else '  command: ' + json.dumps(other))
+            text = 'containers:\n- name: a\n' + field + '\n- name: b\n' + sibling + '\n'
+        fmt = 'json' if layout == 'json' else 'yaml'
+        inventories = [set(prescan_document_secrets(text, fmt))]
+        if fmt == 'yaml':
+            raw, events = set(), set()
+            raw_document_taint(text, raw, _shell_taint)
+            _event_taint(text, events, _shell_taint)
+            inventories += [raw] + ([events] if HAS_YAML else [])
+        for found in inventories:
+            assert full in found and found <= {full, expression}
+        for selection in ('a', 'b'):
+            report = parse_launch(text, format=fmt, container=selection, source=full, **BASE)
+            assert report.source.name == '[REDACTED]'
+            assert not any(full in s for s in _strings(json.loads(canonical_json(report))))
+            assert full not in launch_markdown(report)
+            if fmt == 'yaml' and not HAS_YAML:
+                assert report.status == 'failed' and report.case is None
+                assert [d.code for d in report.diagnostics] == ['yaml_parser_unavailable']
+                continue
+            _r25_case(report)
+            name = ('--served-model-name' if selection == 'b' else
+                    'API_KEY' if binding == 'assignment' else '--api-key')
+            rows = (*report.applied, *report.neutral_operational, *report.unmodeled_or_unsupported)
+            setting = next(s for s in rows if s.name == name)
+            assert setting.value == ('pre' if selection == 'b' else '[REDACTED]')
+            assert setting.redacted is (selection == 'a')
+        if binding == 'assignment':
+            script = command + ' --served-model-name pre'
+            assert 'pre' not in parse_shell(script).secret_values
+            report = parse_launch(script, **BASE)
+            _r25_case(report)
+            served = next(s for s in report.neutral_operational if s.name == '--served-model-name')
+            assert served.value == 'pre' and not served.redacted
 
 
-@pytest.mark.parametrize('binding', ('--api-key ', '--api-key=', 'API_KEY='))
-@pytest.mark.parametrize('tail', ('', ' | true', ' "unclosed'))
-def test_composite_raw_recovery_and_json_strings(binding, tail):
-    for reference in ('${VALUE}', '$\\\n{VALUE}', '${VA\\\r\nLUE}'):
-        script = 'vllm serve /m ' + binding + 'pre' + reference + 'suffix' + tail
-        found = set()
-        _shell_taint(script, found, {'VALUE': 'COMPLETE'})
-        assert 'preCOMPLETEsuffix' in found
-        assert found <= {'preCOMPLETEsuffix', 'pre' + reference + 'suffix'}
-    # Shell punctuation inside a word cannot manufacture a shorter credential.
-    for expression, full in (("'pre'bare", 'prebare'), ('pre\\ suffix', 'pre suffix'),
-                             ('pre,tail:part[0]', 'pre,tail:part[0]'),
-                             *((f'pre{space}bare', f'pre{space}bare')
-                               for space in ('\v', '\f', '\u00a0', '\u2003')),
-                             *(("'pre'\\" + nl + '" suffix"', 'pre suffix')
-                               for nl in ('\n', '\r', '\r\n'))):
-        script = 'vllm serve /m ' + binding + expression + tail
-        if binding == 'API_KEY=':
-            from mindie_sim.launch_env import prescan_secret_values
-            assert set(prescan_secret_values(script)) <= {expression, full}
-        for text, fmt in ((script, 'shell'), (json.dumps({'command': script}), 'json')):
-            found = set(prescan_document_secrets(text, fmt))
-            assert full in found and found <= {expression, full}
-    secret = 'COMPOSITE_JSON_SECRET'
-    for script in ("vllm --additional-config '{\"api_key\":\"" + secret + "\"}'",
-                   'vllm ' + binding + '"' + secret,
-                   '"unclosed ' + binding + secret,
-                   'vllm ' + binding + r'\"' + secret + r'\"'):
-        surface = script if script.startswith('"unclosed') else script + tail
-        assert any(secret in value for value in prescan_document_secrets(surface))
+def test_composite_raw_recovery_and_json_strings():
+    for binding, tail in itertools.product(
+        ('--api-key ', '--api-key=', 'API_KEY='), ('', ' | true', ' "unclosed')
+    ):
+        for reference in ('${VALUE}', '$\\\n{VALUE}', '${VA\\\r\nLUE}'):
+            script = 'vllm serve /m ' + binding + 'pre' + reference + 'suffix' + tail
+            found = set()
+            _shell_taint(script, found, {'VALUE': 'COMPLETE'})
+            assert 'preCOMPLETEsuffix' in found
+            assert found <= {'preCOMPLETEsuffix', 'pre' + reference + 'suffix'}
+        for expression, full in (("'pre'bare", 'prebare'), ('pre\\ suffix', 'pre suffix'),
+                                 ('pre,tail:part[0]', 'pre,tail:part[0]'),
+                                 *((f'pre{space}bare', f'pre{space}bare')
+                                   for space in ('\v', '\f', '\u00a0', '\u2003')),
+                                 *(("'pre'\\" + nl + '" suffix"', 'pre suffix')
+                                   for nl in ('\n', '\r', '\r\n'))):
+            script = 'vllm serve /m ' + binding + expression + tail
+            if binding == 'API_KEY=':
+                from mindie_sim.launch_env import prescan_secret_values
+                assert set(prescan_secret_values(script)) <= {expression, full}
+            for text, fmt in ((script, 'shell'), (json.dumps({'command': script}), 'json')):
+                found = set(prescan_document_secrets(text, fmt))
+                assert full in found and found <= {expression, full}
+        secret = 'COMPOSITE_JSON_SECRET'
+        for script in ("vllm --additional-config '{\"api_key\":\"" + secret + "\"}'",
+                       'vllm ' + binding + '"' + secret,
+                       '"unclosed ' + binding + secret,
+                       'vllm ' + binding + r'\"' + secret + r'\"'):
+            surface = script if script.startswith('"unclosed') else script + tail
+            assert any(secret in value for value in prescan_document_secrets(surface))

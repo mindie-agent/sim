@@ -205,7 +205,7 @@ def test_advise_observed_residuals_and_no_forward_leakage() -> None:
         "memory_kv_bound"
 
 
-def test_guardrails_across_catalog() -> None:
+def test_guardrails_across_catalog_a5() -> None:
     # A5 AIV expansion is selectable and contends with Vector work.
     a5 = _small_case(hardware="a5", layers=2, prompt=2048)
     a5_report = advise_case(a5, context=2048, sequences=2, max_interventions=3)
@@ -214,6 +214,8 @@ def test_guardrails_across_catalog() -> None:
     assert "aiv_expansion_vector_contention_risk" in {
         guardrail["id"] for guardrail in aiv["guardrails"]}
 
+
+def test_guardrails_across_catalog_tight_a2() -> None:
     # Tight A2 memory: ACLGraph capture exceeds KV headroom.
     tight = compose_case("deepseek-v2-lite", hardware="a2", tp=4, dp=1, ep=4,
                          layers=2, prompt_tokens=256, output_tokens=32,
@@ -224,6 +226,8 @@ def test_guardrails_across_catalog() -> None:
     assert "aclgraph_capture_memory_exceeds_hbm_headroom" in {
         guardrail["id"] for guardrail in tight_report["recommendations"][0]["guardrails"]}
 
+
+def test_guardrails_across_catalog_long_context_and_high_batch() -> None:
     # Long-context KV quantization, delayed-release async, and missing draft
     # weights are flagged on an A2 MoE profile.
     long_context = compose_case("deepseek-v2-lite", hardware="a2", tp=2, dp=1, ep=2,
@@ -378,7 +382,7 @@ def test_from_profile_c7_capture_and_single_files(tmp_path: Path) -> None:
         "observed_tpot_p50_ms"] == pytest.approx(5.0)
 
 
-def test_p2_review_regressions(tmp_path: Path) -> None:
+def test_p2_review_regressions_submission_and_async() -> None:
     # 1. Pure-device cases do not fabricate host launch/scheduler cost; declared submission differentiates.
     fast_pure = _small_case("deepseek-v2-lite", layers=2, prompt=128, output=16, concurrency=2)
     pure_rep = advise_case(fast_pure, context=128, sequences=2, max_interventions=9)
@@ -406,6 +410,12 @@ def test_p2_review_regressions(tmp_path: Path) -> None:
     assert heavy_async["predicted"]["step_duration_ms"] == pytest.approx(50.0)
     assert heavy_rep["baseline"]["step_duration_ms"] > 50.0
 
+
+def test_p2_review_regressions_kv_sla_and_validation() -> None:
+    case = _small_case(layers=1, prompt=128, output=16, concurrency=2)
+    case["runtime"]["submission"] = {
+        "kernel_launch_ms": 0.02, "graph_replay_ms": 0.005, "scheduler_ms": 0.05,
+    }
     # 2. KV quantization updates model.quant.kv_dtype and shifts KV capacity.
     kv_case = _small_case("deepseek-v2-lite", hardware="a2", layers=2, prompt=512, output=16, concurrency=2)
     kv_case["runtime"]["max_num_seqs"] = 256
@@ -429,6 +439,9 @@ def test_p2_review_regressions(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="draft_acceptance_exceeds_declared_proposals"):
         advise_case(bad_draft, max_interventions=1)
 
+
+def test_p2_review_regressions_calibration_c7_and_speculative(tmp_path: Path) -> None:
+    pure_case = _small_case(layers=1, prompt=128, output=16, concurrency=2)
     # 5. Calibration geometry/hardware/boundary mismatch and insufficient latency evidence.
     obs_case = _small_case(layers=1, prompt=1024, output=32, concurrency=2)
     obs_case["runtime"]["metadata"] = {
@@ -550,6 +563,17 @@ def test_p2_review_regressions(tmp_path: Path) -> None:
     assert "draft_mode" not in disabled_mtp_struct["runtime"]["metadata"]
     assert "draft_proposal_tokens" not in disabled_mtp_struct["runtime"]["metadata"]
 
+
+def test_p2_review_regressions_lifecycle_provenance_and_ttft_sla(tmp_path: Path) -> None:
+    pure_case = _small_case(layers=1, prompt=128, output=16, concurrency=2)
+    case = deepcopy(pure_case)
+    case["runtime"]["submission"] = {
+        "kernel_launch_ms": 0.02, "graph_replay_ms": 0.005, "scheduler_ms": 0.05,
+    }
+    dp_base = compose_case("qwen3.5-35b-a3b", hardware="a3", tp=1, dp=2, ep=2, layers=1,
+                           prompt_tokens=128, output_tokens=16, concurrency=2)
+    dp_spec = load_case_from_profile(dp_base, mtp_proposal_tokens=2, mtp_acceptance_length=2.2)
+
     # 9. Heterogeneous request preservation, SLA probe error handling, prefill KV capacity,
     #    single completion_ms charge in speculative decode, CP/DCP/SP preservation,
     #    client boundary rejection, distinct model prefix check, custom GPU hardware overrides,
@@ -638,6 +662,14 @@ def test_p2_review_regressions(tmp_path: Path) -> None:
 
     hw_over = load_case_from_profile({"model_name": "deepseek-v2-lite", "hardware": "unknown-sku"}, hardware="a3", layers=1)
     assert hw_over["machine"]["sku"] == "Ascend910_9392"
+
+
+def test_p2_review_regressions_ttft_sla_and_workload_overrides(tmp_path: Path) -> None:
+    case = _small_case(layers=1, prompt=128, output=16, concurrency=2)
+    case["runtime"]["submission"] = {
+        "kernel_launch_ms": 0.02, "graph_replay_ms": 0.005, "scheduler_ms": 0.05,
+    }
+    sib_dir = _write_wave5(tmp_path / "sib_wave5_p2", tpot_ms=10.0)
 
     # P1: Multi-sequence decode TTFT evaluated at cfg.sequences, and b_sla capped by TTFT SLA
     ttft_case = deepcopy(case)

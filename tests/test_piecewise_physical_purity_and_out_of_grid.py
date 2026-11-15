@@ -208,31 +208,36 @@ def test_lower_layer_predictions_conserves_layer_and_body_time() -> None:
                     assert adj_pf == pytest.approx(pf_in, abs=1e-6)
 
 
-def test_out_of_grid_prompt_lengths_and_concurrencies_are_monotonic() -> None:
+@pytest.mark.parametrize(("family_name", "indices"), _FAMILIES)
+@pytest.mark.parametrize(("tp", "dp", "ep"), ((1, 1, 1), (2, 2, 4)))
+def test_out_of_grid_prompt_lengths_and_concurrencies_are_monotonic(
+    family_name: str, indices: tuple[int, ...], tp: int, dp: int, ep: int
+) -> None:
     supply = _supply()
-    for family_name, indices in _FAMILIES:
-        model = _compact_model(family_name, indices)
-        for tp, dp, ep in ((1, 1, 1), (2, 2, 4)):
-            pipe = assemble_model(model, supply=supply, features=FeatureConfig.from_model(model, tp=tp, dp=dp, ep=ep), domain=_DOMAIN)
-            pf_s = [float(pipe.forward(WorkloadGeometry((RequestGeometry(t, 0, phase="prefill"),), phase="prefill")).total_ms) for t in INTERLEAVED_TOKENS]
-            dc_s = [float(pipe.forward(WorkloadGeometry.homogeneous(4, 1, t, phase="decode")).total_ms) for t in INTERLEAVED_TOKENS]
-            for prev, curr in zip(pf_s, pf_s[1:]):
-                assert curr > prev
-            for prev, curr in zip(dc_s, dc_s[1:]):
-                assert curr >= prev
-            dc_c = [float(pipe.forward(WorkloadGeometry.homogeneous(c, 1, 1536, phase="decode")).total_ms) for c in INTERLEAVED_CONCURRENCIES]
-            pf_c = [float(pipe.forward(WorkloadGeometry(tuple(RequestGeometry(384, 0, phase="prefill") for _ in range(c)), phase="prefill")).total_ms) for c in INTERLEAVED_CONCURRENCIES]
-            for prev, curr in zip(dc_c, dc_c[1:]):
-                assert curr >= prev - 1e-9
-            for prev, curr in zip(pf_c, pf_c[1:]):
-                assert curr > prev
+    model = _compact_model(family_name, indices)
+    pipe = assemble_model(model, supply=supply, features=FeatureConfig.from_model(model, tp=tp, dp=dp, ep=ep), domain=_DOMAIN)
+    pf_s = [float(pipe.forward(WorkloadGeometry((RequestGeometry(t, 0, phase="prefill"),), phase="prefill")).total_ms) for t in INTERLEAVED_TOKENS]
+    dc_s = [float(pipe.forward(WorkloadGeometry.homogeneous(4, 1, t, phase="decode")).total_ms) for t in INTERLEAVED_TOKENS]
+    for prev, curr in zip(pf_s, pf_s[1:]):
+        assert curr > prev
+    for prev, curr in zip(dc_s, dc_s[1:]):
+        assert curr >= prev
+    dc_c = [float(pipe.forward(WorkloadGeometry.homogeneous(c, 1, 1536, phase="decode")).total_ms) for c in INTERLEAVED_CONCURRENCIES]
+    pf_c = [float(pipe.forward(WorkloadGeometry(tuple(RequestGeometry(384, 0, phase="prefill") for _ in range(c)), phase="prefill")).total_ms) for c in INTERLEAVED_CONCURRENCIES]
+    for prev, curr in zip(dc_c, dc_c[1:]):
+        assert curr >= prev - 1e-9
+    for prev, curr in zip(pf_c, pf_c[1:]):
+        assert curr > prev
 
-    for key in ("deepseek-v4.1-flash", "kimi-k3"):
-        full = _compact_model(key, (1, 2), hidden=load_model(key).hidden_size, intermediate=512, experts=64)
-        pipe_tp2 = assemble_model(full, supply=supply, features=FeatureConfig.from_model(full, tp=2, dp=1, ep=2), domain=_DOMAIN)
-        ms_c2 = float(pipe_tp2.forward(WorkloadGeometry.homogeneous(2, 1, 1024, phase="decode")).total_ms)
-        ms_c3 = float(pipe_tp2.forward(WorkloadGeometry.homogeneous(3, 1, 1024, phase="decode")).total_ms)
-        assert ms_c3 >= ms_c2 - 1e-9, f"{key} tp=2 decode concurrency 2->3 decreased ({ms_c2:.4f} -> {ms_c3:.4f})"
+
+@pytest.mark.parametrize("key", ("deepseek-v4.1-flash", "kimi-k3"))
+def test_out_of_grid_tp2_decode_concurrency_monotonicity(key: str) -> None:
+    supply = _supply()
+    full = _compact_model(key, (1, 2), hidden=load_model(key).hidden_size, intermediate=512, experts=64)
+    pipe_tp2 = assemble_model(full, supply=supply, features=FeatureConfig.from_model(full, tp=2, dp=1, ep=2), domain=_DOMAIN)
+    ms_c2 = float(pipe_tp2.forward(WorkloadGeometry.homogeneous(2, 1, 1024, phase="decode")).total_ms)
+    ms_c3 = float(pipe_tp2.forward(WorkloadGeometry.homogeneous(3, 1, 1024, phase="decode")).total_ms)
+    assert ms_c3 >= ms_c2 - 1e-9, f"{key} tp=2 decode concurrency 2->3 decreased ({ms_c2:.4f} -> {ms_c3:.4f})"
 
 
 def test_grid_boundary_continuity_and_operator_metadata_invariance() -> None:

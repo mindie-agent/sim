@@ -136,7 +136,7 @@ def test_indexer_layernorm_and_quantized_external_producers_keep_distinct_semant
     assert {nodes[key]["family"] for key in group["node_ids"]} == {"indexer", "topk"}
 
 
-def test_hyper_pre_and_attention_residual_include_source_normalization_work():
+def test_hyper_pre_includes_source_normalization_work():
     report = _report(_case("v4f-a3-w8a8-tp8"), tokens=8)
     nodes = {node["node_id"]: node for node in report["nodes"]}
     group = next(g for g in report["subgraphs"] if g["role"] == "hc_pre")
@@ -145,6 +145,9 @@ def test_hyper_pre_and_attention_residual_include_source_normalization_work():
     assert inverse["node_id"] in affine["deps"]
     assert affine["node_id"] in recipes["hc_sinkhorn"]["deps"]
     assert recipes["hc_sinkhorn"]["node_id"] in recipes["hc_pre_mix"]["deps"]
+
+
+def test_attention_residual_includes_source_normalization_work():
     report = _report(_case("kimi-k3-a5"), tokens=8)
     nodes = {node["node_id"]: node for node in report["nodes"]}
     group = next(g for g in report["subgraphs"] if g["role"] == "attention_residual")
@@ -159,7 +162,7 @@ def test_hyper_pre_and_attention_residual_include_source_normalization_work():
     assert group["contract"] is None
 
 
-def test_kda_stage_launches_never_receive_complete_chunk_contract_and_decode_source_is_explicit(profiler_api):
+def test_kda_stage_launches_never_receive_complete_chunk_contract():
     case = _case("kimi-k3-a5")
     kernels = {**case.runtime.kernels, "lowerings": {
         **case.runtime.kernels.get("lowerings", {}), "kda": "vllm_ascend_kda_in_kernel_gates"}}
@@ -168,15 +171,25 @@ def test_kda_stage_launches_never_receive_complete_chunk_contract_and_decode_sou
     groups = [g for g in prefill["subgraphs"] if g["role"] == "kda_chunk"]
     assert groups and all(g["contract"] is None for g in groups)
     assert all(g["coverage"]["kind"] == "multi_launch_stage_unknown" for g in groups)
-    baseline = _report(case, phase="decode", tokens=1, context=32768)
+
+
+@pytest.mark.parametrize("in_kernel_gates", (False, True))
+def test_kda_decode_source_is_explicit(in_kernel_gates, profiler_api):
+    case = _case("kimi-k3-a5")
     observed = [contract for row, contract in _observed("a5_kimi_k3.csv", profiler_api)
                 if row.kind == "RecurrentKda"]
-    baseline_groups = [g for g in baseline["subgraphs"] if g["role"] == "kda_recurrent"]
-    baseline_nodes = {node["node_id"]: node for node in baseline["nodes"]}
-    assert observed and baseline_groups and all(g["contract"] in observed for g in baseline_groups)
-    for group in baseline_groups:
-        members = [baseline_nodes[key] for key in group["node_ids"]]
-        assert all(node["recipe"] not in {"qk_l2norm", "delta_gates"} for node in members)
+    if not in_kernel_gates:
+        baseline = _report(case, phase="decode", tokens=1, context=32768)
+        baseline_groups = [g for g in baseline["subgraphs"] if g["role"] == "kda_recurrent"]
+        baseline_nodes = {node["node_id"]: node for node in baseline["nodes"]}
+        assert observed and baseline_groups and all(g["contract"] in observed for g in baseline_groups)
+        for group in baseline_groups:
+            members = [baseline_nodes[key] for key in group["node_ids"]]
+            assert all(node["recipe"] not in {"qk_l2norm", "delta_gates"} for node in members)
+        return
+    kernels = {**case.runtime.kernels, "lowerings": {
+        **case.runtime.kernels.get("lowerings", {}), "kda": "vllm_ascend_kda_in_kernel_gates"}}
+    selected = replace(case, runtime=replace(case.runtime, kernels=kernels))
     decode = _report(selected, phase="decode", tokens=1, context=32768)
     groups = [g for g in decode["subgraphs"] if g["role"] == "kda_recurrent"]
     assert observed and groups and all(g["contract"] in observed for g in groups)

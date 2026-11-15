@@ -425,7 +425,7 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
     identity = None
     if compiler is not None:
         identity = _compiler_identity(compiler, persist=not check_only)
-    # R8: a success memo is reusable only while its exact artifact still exists
+    # A success memo is reusable only while its exact artifact still exists
     # and the current compiler identity is byte-identical to the memoized one.
     if not force and not check_only:
         with _MEMO_LOCK:
