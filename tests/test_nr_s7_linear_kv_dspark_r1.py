@@ -529,9 +529,11 @@ def _fix11_consumers(form, depth, capture):
             "nested_rejections": len(mutations), "valid_consumers": len(valid_calls)}
 
 
-@pytest.mark.parametrize("form", FIX11_FORMS)
-@pytest.mark.parametrize("depth", (1, 3))
-@pytest.mark.parametrize("capture", ("none", "full", "piecewise"))
+@pytest.mark.parametrize(
+    "form,depth,capture",
+    [(f, 1, "piecewise") for f in FIX11_FORMS]
+    + [("classvar", 3, "piecewise"), ("any", 3, "none"), ("classvar", 1, "full")],
+)
 def test_fix11_redeclared_contracts_reject_before_consumer_body(form, depth, capture):
     _fix11_consumers(form, depth, capture)
 

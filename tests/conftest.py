@@ -54,13 +54,28 @@ def isolated_cache():
         shutil.rmtree(base, ignore_errors=True)
 
 
+@pytest.fixture(scope="session")
+def _worker_runtime_root():
+    root = Path(tempfile.mkdtemp(prefix="nr-s3-runtime-")).resolve()
+    try:
+        yield root
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
+
+
 @pytest.fixture(autouse=True)
-def isolated_runtime(tmp_path, monkeypatch):
-    root = tmp_path.resolve()
-    monkeypatch.setenv("HOME", str(root / "home"))
-    monkeypatch.setenv("MINDIE_CONFIG_HOME", str(root / "config"))
-    monkeypatch.setenv("MINDIE_DATA_HOME", str(root / "data"))
-    monkeypatch.setenv("MINDIE_DIAGNOSTICS_ROOT", str(root / "diagnostics"))
+def isolated_runtime(_worker_runtime_root, monkeypatch):
+    with os.scandir(_worker_runtime_root) as it:
+        dirty = [entry.path for entry in it]
+    for entry_path in dirty:
+        if os.path.isdir(entry_path) and not os.path.islink(entry_path):
+            shutil.rmtree(entry_path, ignore_errors=True)
+        else:
+            os.unlink(entry_path)
+    monkeypatch.setenv("HOME", str(_worker_runtime_root / "home"))
+    monkeypatch.setenv("MINDIE_CONFIG_HOME", str(_worker_runtime_root / "config"))
+    monkeypatch.setenv("MINDIE_DATA_HOME", str(_worker_runtime_root / "data"))
+    monkeypatch.setenv("MINDIE_DIAGNOSTICS_ROOT", str(_worker_runtime_root / "diagnostics"))
 
 
 @pytest.fixture

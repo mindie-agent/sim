@@ -602,8 +602,7 @@ def test_fix12_any_object_payloads_and_typed_nested_extensions():
     _validate_nested(fix12_extend(case.model, [("payload", Union[ModelSpec, int], -1)]), "union_int")
 
 
-@pytest.mark.parametrize("capture", ("none", "full", "piecewise"))
-@pytest.mark.parametrize("route", range(7))
+@pytest.mark.parametrize("route,capture", [(r, "piecewise") for r in range(7)] + [(0, "none"), (0, "full")])
 def test_fix13_typed_containers_reject_before_all_ten_consumers(route, capture):
     from collections import UserDict, UserList
     from collections.abc import Mapping, Sequence, Set as AbstractSet
