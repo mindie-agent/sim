@@ -22,3 +22,7 @@ dist/
 # Local accuracy-round working notes and harness state (not component source)
 .workstreams/
 state/
+
+# Lean 4 formal verification build artifacts
+formal/.lake/
+formal/build/

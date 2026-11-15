@@ -1,0 +1,9 @@
+name = "mindie_sim_spec"
+version = "0.9.14"
+defaultTargets = ["MindIESimSpec", "AxiomCheck"]
+
+[[lean_lib]]
+name = "MindIESimSpec"
+
+[[lean_lib]]
+name = "AxiomCheck"
