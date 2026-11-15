@@ -15,6 +15,9 @@
 """
 from __future__ import annotations
 
+ZERO = 0
+FIRST = 0
+
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from copy import deepcopy
@@ -293,7 +296,12 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
     if not (run_graph or has_kg):
         return graphs, eff_case, None
     ext_in = {"analysis_input": 0} if scope == "body" else None
-    sg = (TargetGraphSet({0: graphs[0]}, kernels=graphs.effective_kernels, selection=graphs.default_selection) if isinstance(graphs, TargetGraphSet) else {0: graphs[0]}) if (len(graphs) > 1 and not has_kg and not eff_case.runtime.parallel.ep_spans_dp) else graphs
+    from .local_tp_groups import rank_zero_graph_reuse
+    sg = (TargetGraphSet({ZERO: graphs[FIRST]}, kernels=graphs.effective_kernels,
+                         selection=graphs.default_selection)
+          if isinstance(graphs, TargetGraphSet) else {ZERO: graphs[FIRST]}) \
+        if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) \
+        else graphs
     sg_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in sg.items()}
     sg = TargetGraphSet(sg_map, kernels=sg.effective_kernels, selection=sg.default_selection) if isinstance(sg, TargetGraphSet) else sg_map
     sched_ms = float(eff_case.runtime.submission.get("scheduler_ms", 0.0) or 0.0)

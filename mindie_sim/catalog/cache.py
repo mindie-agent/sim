@@ -92,6 +92,10 @@ def block_round(rows: int, block_size: int) -> int:
 #: is 32 compressed rows (A's kernel reading: INTERLEAVE=128, CMP=4).
 INDEX_INTERLEAVE_TOKENS = 128
 
+ZERO = 0
+ONE = 1
+FIRST = 0
+
 
 def index_k_block_rows(compress_ratio: int) -> int:
     """Compressed index-K rows in one CP interleave (ownership) block."""
@@ -433,8 +437,40 @@ def owned_token_rows(rows: int, owner_spans, rank: int) -> int | None:
     return owned
 
 
+def _runtime_recover_ssm(runtime) -> bool:
+    if runtime is None:
+        return False
+    if bool(getattr(runtime, "recover_ssm", False)):
+        return True
+    metadata = dict(getattr(runtime, "metadata", ()) or ())
+    return metadata.get("recover_ssm") is True
+
+
+def _active_state_components(model, plan, parallel, *, runtime, sequence_tokens,
+                             query_tokens, phase, capacity_padded):
+    from mindie_sim.catalog.speculative_state import (
+        resolve_speculative_query_tokens, speculative_state_plan,
+    )
+    q = (int(query_tokens) if query_tokens is not None
+         else resolve_speculative_query_tokens(runtime, phase=phase))
+    state = speculative_state_plan(
+        model, plan, parallel, query_tokens=q,
+        recover_ssm=_runtime_recover_ssm(runtime),
+        capacity_padded=capacity_padded,
+        state_contract=getattr(plan, "state_contract", None),
+    )
+    result = {"recurrent_state": state.recurrent_bytes,
+              "conv_state": state.conv_bytes}
+    if state.replay_bytes > ZERO:
+        result["replay_records"] = state.replay_bytes
+    if state.transient_bytes > ZERO:
+        result["state_transient"] = state.transient_bytes
+    return result
+
+
 def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_padded=True,
-                           interleave=128, rank=None, owner_spans=None):
+                           interleave=INDEX_INTERLEAVE_TOKENS, rank=None, owner_spans=None,
+                           runtime=None, query_tokens=None, phase="decode"):
     seq = max(0, int(sequence_tokens))
     tp, cp = parallel.tp, parallel.cp
     result = {}
@@ -449,6 +485,11 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         return (_context_shard_blocks(rows, block, cp) if capacity_padded
                 else rows / cp)
     if plan.attention in _LINEAR_ATTENTION_KINDS:
+        if runtime is not None or query_tokens is not None:
+            return _active_state_components(
+                model, plan, parallel, runtime=runtime,
+                sequence_tokens=seq, query_tokens=query_tokens, phase=phase,
+                capacity_padded=capacity_padded)
         result["recurrent_state"] = plan.recurrent_state_elements / tp * dtype_bytes(plan.recurrent_state_dtype)
         result["conv_state"] = plan.conv_state_elements / tp * dtype_bytes(plan.conv_state_dtype)
         return result
@@ -509,7 +550,7 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
 def stage_cache_components(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
     *, capacity_padded: bool = True, draft_kind: str | None = None,
-    interleave: int = 128,
+    interleave: int = INDEX_INTERLEAVE_TOKENS, runtime=None, query_tokens=None, phase="decode",
 ) -> list[dict[str, float]]:
     pp = max(1, parallel.pp)
     stages = [dict() for _ in range(pp)]
@@ -519,6 +560,7 @@ def stage_cache_components(
         for key, value in layer_cache_components(
             model, plan, parallel, sequence_tokens,
             capacity_padded=capacity_padded, interleave=interleave,
+            runtime=runtime, query_tokens=query_tokens, phase=phase,
         ).items():
             stages[stage][key] = stages[stage].get(key, 0.0) + value
     if draft_kind and getattr(model, "auxiliary", None) is not None:
@@ -536,10 +578,12 @@ def stage_cache_components(
 
 def request_cache_breakdown(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
-    *, draft_kind: str | None = None, interleave: int = 128,
+    *, draft_kind: str | None = None, interleave: int = INDEX_INTERLEAVE_TOKENS,
+    runtime=None, query_tokens=None, phase="decode",
 ) -> dict[str, Any]:
     stages = stage_cache_components(
         model, parallel, sequence_tokens, draft_kind=draft_kind, interleave=interleave,
+        runtime=runtime, query_tokens=query_tokens, phase=phase,
     )
     totals: dict[str, float] = {}
     for stage in stages:
@@ -570,7 +614,7 @@ def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec) -> floa
 
 def cache_bytes_per_token_estimate(
     model: Any, parallel: ParallelSpec, sequence_tokens: int,
-    *, draft_kind: str | None = None, interleave: int = 128,
+    *, draft_kind: str | None = None, interleave: int = INDEX_INTERLEAVE_TOKENS,
 ) -> tuple[float, float]:
     """(max-stage cache bytes per token, total cache bytes at sequence)."""
     seq = max(1, int(sequence_tokens))

@@ -203,6 +203,8 @@ def parser():
     compose.add_argument("--va-recommended", action="store_true",
                          help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
     compose.add_argument("--output", "-o")
+    from .issue34_cli import add_issue34_arguments
+    add_issue34_arguments(compose, command="compose")
     advise = sub.add_parser("advise", help="attribute a Case and rank guarded counterfactual interventions")
     advise.add_argument("case", nargs="?")
     advise.add_argument("--from-profile", help="exported Case, Wave 5 capture, or C7 profile")
@@ -237,6 +239,9 @@ def parser():
     sweep.add_argument("--allow-pp", action="store_true")
     sweep.add_argument("--allow-pcp", action="store_true")
     sweep.add_argument("--output", "-o")
+    add_issue34_arguments(sweep, command="sweep")
+    sweep.add_argument("--hardware-derivations", default=None,
+                       help="JSON file with named derivation records")
     skew = sub.add_parser("skew", help="multi-DP barrier skew, MoE routing imbalance, and chunked-prefill interference")
     skew.add_argument("case")
     skew.add_argument("--mode", choices=("dp-barrier", "moe-imbalance", "chunked-prefill"), default="dp-barrier")
@@ -252,6 +257,7 @@ def parser():
     skew.add_argument("--phase", choices=("decode", "prefill"), default="decode")
     skew.add_argument("--scope", choices=("body", "model"), default="body")
     skew.add_argument("--output", "-o")
+    add_issue34_arguments(skew, command="skew")
     eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
     eff.add_argument("case")
     eff.add_argument("--phase", choices=("decode", "prefill"), default="decode")
@@ -284,6 +290,7 @@ def parser():
         sla.add_argument(flag, type=float)
     sla.add_argument("--scenarios")
     sla.add_argument("--output", "-o")
+    add_issue34_arguments(sla, command="sla")
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")
     accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
@@ -444,6 +451,7 @@ def run(args):
         return fit_service_curve(read_json(args.observations))
     if args.command == "compose":
         from .compose import compose_case
+        from .issue34_cli import compose_cli_kwargs
         if args.from_profile:
             from .advise import load_case_from_profile
             profile_overrides = {
@@ -470,26 +478,7 @@ def run(args):
             raise ValueError("compose_requires_model_or_from_profile")
         return compose_case(
             model=args.model, hardware=args.hardware or "a3",
-            tp=1 if args.tp is None else args.tp, dp=1 if args.dp is None else args.dp,
-            ep=1 if args.ep is None else args.ep, pp=1 if args.pp is None else args.pp,
-            pcp=1 if args.pcp is None else args.pcp, dcp=1 if args.dcp is None else args.dcp,
-            sp=args.sp, num_devices=args.num_devices, ranks_per_node=args.ranks_per_node,
-            quant=args.quant, layers=args.layers, n_routed_experts=args.experts,
-            num_experts_per_tok=args.top_k,
-            prompt_tokens=4096 if args.prompt_tokens is None else args.prompt_tokens,
-            output_tokens=128 if args.output_tokens is None else args.output_tokens,
-            concurrency=1 if args.concurrency is None else args.concurrency,
-            prefix_tokens=0 if args.prefix_tokens is None else args.prefix_tokens,
-            max_num_seqs=args.max_num_seqs,
-            max_num_batched_tokens=args.max_num_batched_tokens,
-            max_model_len=args.max_model_len,
-            async_scheduling=False if args.async_scheduling is None else args.async_scheduling,
-            graph_capture_mode=args.graph_mode or "none",
-            mtp_proposal_tokens=0 if args.mtp_tokens is None else args.mtp_tokens,
-            mtp_acceptance_length=1.0 if args.mtp_accept is None else args.mtp_accept,
-            ttft_slo_ms=5000.0 if args.ttft_slo_ms is None else args.ttft_slo_ms,
-            tpot_slo_ms=50.0 if args.tpot_slo_ms is None else args.tpot_slo_ms,
-            va_recommended=bool(getattr(args, "va_recommended", False)),
+            **compose_cli_kwargs(args),
         )
     if args.command == "advise":
         from .advise import advise_case
@@ -503,7 +492,9 @@ def run(args):
         )
     if args.command == "sweep":
         from .sweep import sweep_pd_disaggregation_ratios, sweep_topology_grid
-        case_data = read_json(args.case)
+        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
+        case_data = apply_case_mapping_overrides(
+            read_json(args.case), issue34_overrides(args))
         if args.mode == "pd":
             decode_data = read_json(args.decode_case) if args.decode_case else case_data
             return sweep_pd_disaggregation_ratios(
@@ -511,11 +502,15 @@ def run(args):
                 prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
                 ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
             )
+        from .issue34_cli import load_hardware_derivations
+        derivations = (load_hardware_derivations(args.hardware_derivations)
+                       if args.hardware_derivations else None)
         return sweep_topology_grid(
             case_data, num_devices=args.num_devices, sla_ms=args.sla_ms,
             context=args.context, output_budget=args.output_budget,
             phase=args.phase, scope=args.scope,
             allow_pp=args.allow_pp, allow_pcp=args.allow_pcp,
+            hardware_derivations=derivations,
         )
     if args.command == "skew":
         from .prediction.skew_analysis import (
@@ -523,7 +518,12 @@ def run(args):
             analyze_moe_routing_imbalance,
             analyze_multi_dp_barrier_skew,
         )
-        case_data = read_json(args.case)
+        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
+        _overrides = issue34_overrides(args)
+        if args.redundant_experts_per_rank:
+            _overrides["redundant_experts_per_rank"] = args.redundant_experts_per_rank
+        case_data = apply_case_mapping_overrides(
+            read_json(args.case), _overrides)
         if args.mode == "moe-imbalance":
             return analyze_moe_routing_imbalance(
                 case_data, context=args.context, sequences=args.sequences,
@@ -567,7 +567,9 @@ def run(args):
         )
     if args.command == "sla":
         from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_hardware_sla_throughput
-        case_data = read_json(args.case)
+        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
+        case_data = apply_case_mapping_overrides(
+            read_json(args.case), issue34_overrides(args))
         has_custom_scale = any(
             v is not None
             for v in (args.hbm_bw_scale, args.cube_flops_scale, args.vector_ops_scale, args.link_bw_scale, args.hbm_capacity_scale)

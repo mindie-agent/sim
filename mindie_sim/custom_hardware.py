@@ -39,6 +39,7 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.compute_arch import ComputeArchSpec
 from mindie_sim.schema.hardware import Hardware
+from mindie_sim.hardware_derivation import derive_hardware_sku
 
 
 _DEFAULT_ARCHETYPE = "ascend_dual_die_ub"
@@ -866,4 +867,5 @@ __all__ = [
     "load_custom_hardware_skus_from_file",
     "resolve_custom_hardware_sku",
     "compose_custom_case",
+    "derive_hardware_sku",
 ]

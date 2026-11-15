@@ -21,7 +21,12 @@ from mindie_sim.prediction.engine import Allocation
 from mindie_sim.prediction.mechanism import OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
-from mindie_sim.schema.common import dtype_bytes
+from mindie_sim.schema.common import ModelingError, dtype_bytes
+
+ZERO = 0
+ONE = 1
+ONE_FLOAT = 1.0
+FOUR = 4
 
 GDN_ARCH35_RECOVER_SSM_RECIPE = "vllm_ascend_recurrent_gated_delta_rule_arch35_fp32_recover_ssm"
 
@@ -46,12 +51,17 @@ def record_slice_bytes(dk: int, slice_width: int, part_index: int, kg_dtype: str
 
 
 def commit_tokens_for_view(view: Any, runtime: Any = None) -> int:
-    q = max(1, int(getattr(view, "q_len", 1)))
-    advanced = int(getattr(view, "draft_advanced_tokens", 0) or 0)
-    if advanced > 0:
+    """Integer commitment only; a configured mean is never rounded here."""
+    q = max(ONE, int(getattr(view, "q_len", ONE)))
+    advanced = int(getattr(view, "draft_advanced_tokens", ZERO) or ZERO)
+    if advanced > ZERO:
         return min(q, advanced)
-    accept = float(getattr(runtime, "mtp_acceptance_length", 0) or 0) if runtime is not None else 0.0
-    return max(1, min(q, int(round(accept)))) if accept > 1.0 else q
+    accept = float(getattr(runtime, "mtp_acceptance_length", ONE) or ONE)
+    if q > ONE and accept > ONE_FLOAT:
+        raise ModelingError(
+            "recover_ssm_commit_requires_resolved_integer_advancement:"
+            + str(getattr(view, "request_id", "")))
+    return q
 
 
 def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[Any],
@@ -66,14 +76,17 @@ def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[An
     total_committed, seq_count = sum(committed), len(spec_views)
     return b.work(
         name, tuple(deps), (total_committed, heads, dk, dv),
-        vector=4 * total_committed * heads * dk * dv,
+        vector=FOUR * total_committed * heads * dk * dv,
         read=seq_count * state_bytes + total_committed * rec_bytes,
         write=seq_count * state_bytes, family="elementwise",
         metadata=(
             ("recover_ssm_stage", "commit"), ("recover_ssm", True),
+            ("recover_ssm_pending_acceptance", True),
             ("recurrent_attention_kind", str(attention_kind)),
             ("sequences", seq_count), ("committed_tokens", committed),
             ("state_checkpoints", seq_count), ("record_bytes_per_token", rec_bytes),
+            ("state_bytes", state_bytes), ("heads", int(heads)),
+            ("dk", int(dk)), ("dv", int(dv)), ("state_dtype", state_dtype),
         ),
     )
 

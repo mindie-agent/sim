@@ -35,6 +35,12 @@ from .runtime.contracts import (
 )
 from .runtime.ledger import Ledger
 
+ZERO = 0
+ONE = 1
+ZERO_FLOAT = 0.0
+ONE_FLOAT = 1.0
+FIRST = 0
+
 
 @dataclass(frozen=True)
 class _LedgerBoundary:
@@ -272,7 +278,8 @@ def _resolve_offload_ratios(case: CaseSpec, policy: MemoryPolicy) -> dict[str, f
 
 
 def _routed_expert_bytes_by_stage(
-    case: CaseSpec, layer_stage: tuple[int, ...], *, workspace_tokens: int = 1,
+    case: CaseSpec, layer_stage: tuple[int, ...], *, workspace_tokens: int = ONE,
+    slot_plans=None,
 ) -> tuple[list[float], list[float], list[float]]:
     """Routed-expert total, payload and active staging bytes per PP stage."""
     parallel = case.runtime.parallel
@@ -288,6 +295,13 @@ def _routed_expert_bytes_by_stage(
         stage = layer_stage[plan.index] if plan.index < len(layer_stage) else 0
         terms = [term for term in layer_weight_terms(plan, case.model)
                  if term.category == "routed_expert"]
+        slots = (slot_plans or {}).get(plan.index)
+        base_count = extra_count = ZERO
+        if slots is not None:
+            from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
+            terms = list(routed_expert_weight_terms(terms, slots, ep_rank=ZERO))
+            base_count = int(slots.base_slots_by_rank[FIRST])
+            extra_count = int(slots.redundant_slots_by_rank[FIRST])
         routed = float(sum(
             term_bytes(term, quant, parallel, case.machine.ranks_per_node)
             for term in terms
@@ -301,9 +315,17 @@ def _routed_expert_bytes_by_stage(
         num_exp = int(plan.num_experts)
         k = min(num_exp, max(1, int(plan.top_k)))
         active_total = float(num_exp) if k >= num_exp else float(num_exp) * (
-            1.0 - ((1.0 - float(k) / float(num_exp)) ** float(tokens))
+            ONE_FLOAT - ((ONE_FLOAT - float(k) / float(num_exp)) ** float(tokens))
         )
-        local_exp = max(1, (num_exp + ep - 1) // ep)
+        local_exp = max(ONE, (num_exp + ep - ONE) // ep)
+        if slots is not None:
+            local_slots = max(ONE, base_count + extra_count)
+            p_slot = (float(k) / float(num_exp)) * (
+                float(base_count) / float(local_slots))
+            active_total = float(local_slots) * (
+                -math.expm1(float(tokens) * math.log1p(-p_slot))
+                if ZERO_FLOAT < p_slot < ONE_FLOAT else float(p_slot > ZERO_FLOAT))
+            local_exp = local_slots
         active_layer_bytes = (active_total / float(ep)) * (routed / float(local_exp))
         staging[stage] = max(staging[stage], min(routed, active_layer_bytes))
     return result, payload, staging
@@ -319,6 +341,7 @@ def _resident_weight_parallel(term, parallel, enable_shared_expert_dp: bool):
 def _weight_ledger_by_stage(
     case: CaseSpec, layer_stage: tuple[int, ...], *, draft_kind: str,
     include_draft: bool, include_engram_tables: bool, enable_shared_expert_dp: bool,
+    slot_plans=None, ep_rank: int | None = None,
 ) -> tuple[list[float], list[float]]:
     """Persistent weight payload and quant metadata per PP stage.
 
@@ -332,6 +355,7 @@ def _weight_ledger_by_stage(
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft, draft_kind=draft_kind or None,
         include_engram_tables=include_engram_tables, layer_partition=layer_stage,
+        slot_plans=slot_plans, ep_rank=ep_rank,
     ):
         total = payload = 0.0
         for term in terms:
@@ -356,11 +380,17 @@ class Memory:
             for stage in range(p.pp)
         ))
         self.layer_stage = tuple(stage for stage, count in enumerate(self.layers) for _ in range(count))
+        from mindie_sim.catalog.speculative_state import resolve_speculative_query_tokens
+        _draft_meta = dict(case.runtime.metadata)
+        _declared = int(_draft_meta.get("draft_proposal_tokens", ZERO) or ZERO)
+        self.query_tokens = (resolve_speculative_query_tokens(case.runtime)
+                             if _declared > ZERO else ONE)
         self.pages = CachePages(
             self.policy.cache_page_groups,
             {layer.index: set(layer_cache_components(
                 case.model, layer, p, case.runtime.max_model_len,
-                capacity_padded=False)) for layer in case.model.layer_plans},
+                capacity_padded=False, runtime=case.runtime,
+                query_tokens=self.query_tokens)) for layer in case.model.layer_plans},
             self.layer_stage,
         )
         self.draft_kind = (dict(case.runtime.metadata).get("draft_mode") or
@@ -376,26 +406,41 @@ class Memory:
         )
         shared_expert_dp = bool(dict(case.runtime.metadata).get(
             "enable_shared_expert_dp", False))
+        self.slot_plans = None
+        if int(getattr(p, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO:
+            from mindie_sim.catalog.expert_slots import expert_slot_plan
+            from mindie_sim.schema.runtime_features import split_routing_features
+            _logical, slot_routing = split_routing_features(
+                dict(case.runtime.routing or {}))
+            self.slot_plans = {
+                plan.index: expert_slot_plan(
+                    case.model, plan, p, routing=slot_routing)
+                for plan in case.model.layer_plans
+                if plan.ffn == "moe" and int(plan.num_experts) > ZERO
+            }
         self.gross_weights = stage_weight_bytes(
             case.model, p, case.machine.ranks_per_node, include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
             layer_partition=self.layers, draft_kind=self.draft_kind or None,
             enable_shared_expert_dp=shared_expert_dp,
+            slot_plans=self.slot_plans,
         )
         weight_totals, weight_payloads = _weight_ledger_by_stage(
             case, self.layers, draft_kind=self.draft_kind,
             include_draft=draft,
             include_engram_tables=not case.runtime.engram_cpu_offload,
             enable_shared_expert_dp=shared_expert_dp,
+            slot_plans=self.slot_plans,
         )
         if any(abs(total - gross) > max(1.0, abs(gross) * 1e-9)
                for total, gross in zip(weight_totals, self.gross_weights)):
             raise ValueError("memory_weight_decomposition_inconsistent")
         resolved_ws_tokens = self._resolve_workspace_tokens(workspace_tokens)
-        if self.offload["expert_ddr_ratio"] > 0.0:
+        if self.offload["expert_ddr_ratio"] > ZERO_FLOAT:
             (self.routed_expert_bytes, self.routed_expert_payload_bytes,
              stage_staging_base) = _routed_expert_bytes_by_stage(
-                case, self.layer_stage, workspace_tokens=max(1, resolved_ws_tokens),
+                case, self.layer_stage, workspace_tokens=max(ONE, resolved_ws_tokens),
+                slot_plans=self.slot_plans,
             )
             self.expert_staging_workspace = [
                 self.offload["expert_ddr_ratio"] * value for value in stage_staging_base
@@ -1214,8 +1259,10 @@ class Memory:
                   if padded else [0.0] * p.pp)
         if model.layer_plans:
             for layer in model.layer_plans:
-                components = layer_cache_components(model, layer, p, tokens, capacity_padded=padded,
-                                                     interleave=case.runtime.kv_block_size)
+                components = layer_cache_components(
+                    model, layer, p, tokens, capacity_padded=padded,
+                    interleave=case.runtime.kv_block_size,
+                    runtime=case.runtime, query_tokens=self.query_tokens)
                 covered = self.pages.covered.get(layer.index, ()) if padded else ()
                 result[self.layer_stage[layer.index]] += sum(
                     value for name, value in components.items() if name not in covered)
@@ -1257,6 +1304,7 @@ class Memory:
                     model, layer, p, valid_tokens, capacity_padded=False,
                     interleave=case.runtime.kv_block_size,
                     rank=rank, owner_spans=self.rank_token_owners,
+                    runtime=case.runtime, query_tokens=self.query_tokens,
                 )
                 stage = stages[self.layer_stage[layer.index]]
                 for name in owned.get(layer_index, ()):
@@ -1357,6 +1405,7 @@ class Memory:
                 model, layer, p, tokens, capacity_padded=padded,
                 interleave=case.runtime.kv_block_size,
                 rank=rank, owner_spans=self.rank_token_owners,
+                runtime=case.runtime, query_tokens=self.query_tokens,
             )
             covered = self.pages.covered.get(layer.index, ()) if skip_covered else ()
             stage = stages[self.layer_stage[layer.index]]
@@ -1414,6 +1463,7 @@ class Memory:
                 model, layer, p, tokens, capacity_padded=padded,
                 interleave=case.runtime.kv_block_size,
                 rank=int(rank), owner_spans=self.rank_token_owners,
+                runtime=case.runtime, query_tokens=self.query_tokens,
             )
             covered = self.pages.covered.get(layer.index, ()) if padded else ()
             result[self.layer_stage[layer.index]] += sum(
@@ -1441,6 +1491,7 @@ class Memory:
                 model, layer, p, tokens, capacity_padded=False,
                 interleave=self.case.runtime.kv_block_size,
                 rank=int(rank), owner_spans=self.rank_token_owners,
+                runtime=self.case.runtime, query_tokens=self.query_tokens,
             )
             st = self.layer_stage[layer.index]
             result[st] = max(result[st], float(sum(comps.values())))
@@ -1618,7 +1669,8 @@ class Memory:
         for layer in model.layer_plans:
             comps = layer_cache_components(
                 model, layer, p, tokens, capacity_padded=False,
-                interleave=self.case.runtime.kv_block_size)
+                interleave=self.case.runtime.kv_block_size,
+                runtime=self.case.runtime, query_tokens=self.query_tokens)
             st = self.layer_stage[layer.index]
             result[st] = max(result[st], float(sum(comps.values())))
         return tuple(result)
@@ -1647,6 +1699,7 @@ class Memory:
             components = layer_cache_components(
                 self.case.model, layer, p, tokens, capacity_padded=False,
                 interleave=self.case.runtime.kv_block_size,
+                runtime=self.case.runtime, query_tokens=self.query_tokens,
             )
             st = self.layer_stage[layer.index]
             for name, val in components.items():

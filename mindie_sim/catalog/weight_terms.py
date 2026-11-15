@@ -10,6 +10,10 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 from mindie_sim.catalog.types import QuantSpec
 
+ZERO = 0
+ONE = 1
+FIRST = 0
+
 
 @dataclass(frozen=True)
 class WeightTerm:
@@ -27,6 +31,12 @@ class WeightTerm:
     quant: QuantSpec | None = None
     runtime_dtype: str = ""
     runtime_quant: QuantSpec | None = None
+    #: Declared dense-subgraph placement role and ownership scope.
+    placement_role: str = ""
+    placement_scope: str = "target"
+    #: Already-resolved physical per-rank multiplicity (expert slots).  It is
+    #: never divided by EP again.
+    resident_count: int | None = None
 
     @property
     def logical_parameters(self) -> float:
@@ -46,6 +56,23 @@ def _local_groups(groups: int, tp: int) -> tuple[int, bool]:
 
 
 def _sharded_shape(
+    term: WeightTerm, parallel: ParallelSpec, node_ranks: int,
+) -> tuple[int, int, int]:
+    from mindie_sim.catalog.projection_placement import (
+        SHARDED_ROLES, placed_weight_shape, role_width,
+    )
+    role = term.placement_role
+    width = role_width(role, parallel) if role in SHARDED_ROLES else ONE
+    if width > ONE or term.resident_count is not None:
+        rows, cols, count = placed_weight_shape(term, parallel, node_ranks)
+        if term.resident_count is not None and term.shard not in {
+                "expert_gate_up", "expert_down"}:
+            count = int(term.resident_count)
+        return rows, cols, count
+    return _legacy_sharded_shape(term, parallel, node_ranks)
+
+
+def _legacy_sharded_shape(
     term: WeightTerm, parallel: ParallelSpec, node_ranks: int,
 ) -> tuple[int, int, int]:
     rows, cols, count = int(term.rows), int(term.cols), int(term.count)

@@ -17,6 +17,7 @@ from .hardware import Hardware
 from .model import ModelSpec, SloSpec, WorkloadSpec
 from .parallel import PARALLEL_AXIS_ALIASES, PARALLEL_SWITCHES, ParallelSpec
 from .common import ModelingError
+from . import runtime_features
 
 
 #: vLLM cudagraph mode -> (simulation graph_capture_mode, full keys, piecewise keys).
@@ -157,6 +158,17 @@ class Software:
     lowering_passes: tuple[str, ...] = ("activation_quantization",)
     memory: dict = field(default_factory=dict)
     metadata: tuple[tuple[str, object], ...] = ()
+    #: AllToAll/AllToAllV startup model: legacy, ring, log2, concurrent
+    #: (direct/concurrent normalize here) or topology (declared by hardware).
+    collective_startup_mode: str = "legacy"
+    #: ``auto`` resolves eligible generic packed FP4 work on FP8 hardware.
+    matrix_compute_policy: str = "auto"
+    #: Shared prefix pools assert that equal keys denote equal immutable tokens.
+    prefix_cache_mode: str = "private"
+    #: Whether the semantic indexer reuses a physical prefix across queries.
+    prefix_read_mode: str = "auto"
+    #: Homogeneous cohort semantic-graph reuse: off, auto or require.
+    homogeneous_graph_reuse: str = "off"
 
     @staticmethod
     def parallel_mapping(raw):
@@ -179,6 +191,7 @@ class Software:
 
     @classmethod
     def from_mapping(cls, raw):
+        raw = runtime_features.normalize_runtime_features(raw)
         names = {f.name for f in fields(cls)}
         axes = ({f.name for f in fields(ParallelSpec)}
                 | set(PARALLEL_AXIS_ALIASES) | set(PARALLEL_SWITCHES))
@@ -259,6 +272,7 @@ class Software:
             raise ModelingError("final_norm_scope_requires_all_or_selected")
         if not isinstance(result.recover_ssm, bool):
             raise ModelingError("runtime_recover_ssm_invalid")
+        runtime_features.validate_runtime_features(result)
         return result
 
     def to_dict(self):

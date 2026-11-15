@@ -37,6 +37,9 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from mindie_sim.schema.common import ModelingError
 
+PARALLEL_MINIMUM = 1
+PARALLEL_ZERO_MINIMUM = 0
+
 _SAFE_SYMBOL = re.compile(r"[^a-z0-9_.:-]+")
 _DTYPE_BYTES = {"fp32": 4.0, "float32": 4.0, "fp16": 2.0, "float16": 2.0,
                 "bf16": 2.0, "bfloat16": 2.0, "int8": 1.0, "fp8": 1.0,
@@ -367,8 +370,10 @@ def _validate_nested(value, path, seen=None):
                     raise ModelingError(f"nr_s7_{label}_invalid:range")
                 if name == "gpu_memory_utilization" and not 0 < item <= 1:
                     raise ModelingError(f"nr_s7_{label}_invalid:range")
-            if "ParallelSpec" in owner_kinds and type(item) is int and item < 1:
-                raise ModelingError(f"nr_s7_{label}_invalid:range")
+            if "ParallelSpec" in owner_kinds and type(item) is int:
+                minimum = PARALLEL_ZERO_MINIMUM if name == "redundant_experts_per_rank" else PARALLEL_MINIMUM
+                if item < minimum:
+                    raise ModelingError(f"nr_s7_{label}_invalid:range")
             if "Hardware" in owner_kinds and name == "dies" and not item:
                 raise ModelingError(f"nr_s7_{label}_invalid:empty")
             if "WorkloadSpec" in owner_kinds and name == "requests" and not item:

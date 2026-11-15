@@ -1836,43 +1836,9 @@ class RecurrentScan:
     """C1 -> vector delta -> C2 -> state update for each dependent chunk."""
 
     def lower(self, context):
-        metadata = dict(context.op.metadata)
-        count, chunk, tokens = metadata["chunks"], metadata["chunk"], metadata["tokens"]
-        matrix = context.resource_names["cube"]
-        vector = context.resource_names["vector"]
-        heads = metadata["heads"]
-        cap = {matrix: min(1, heads / context.core_count) * context.rates[matrix]}
+        from .recurrent_template import lower_recurrent_scan
 
-        tile_cache = {}
-        chunk_vec_total = float(metadata.get("chunk_vector_ops", 0.0))
-
-        def tile(index):
-            valid = min(chunk, tokens - index * chunk)
-            if valid in tile_cache:
-                return tile_cache[valid]
-            fraction = valid / tokens
-            # State moves once per chunk; token operands scale with real tail
-            # rows. Aggregate traffic is conserved, including the last tile.
-            work = {}
-            for key, amount in context.work.items():
-                if key == matrix:
-                    work[key] = amount * fraction
-                elif key == vector and 0.0 < chunk_vec_total <= amount:
-                    work[key] = chunk_vec_total * (1 / count) + (amount - chunk_vec_total) * fraction
-                elif key == vector:
-                    work[key] = amount * fraction
-                else:
-                    work[key] = amount * (1 / count)
-            first = {matrix: work.get(matrix, 0) / 2}
-            last = dict(work)
-            last[matrix] = work.get(matrix, 0) / 2
-            vwork = {vector: last.pop(vector, 0)}
-            res = (Stage("c1", first, caps=cap), Stage("delta", vwork, after=("c1",)),
-                   Stage("c2_update", last, after=("delta",), caps=cap))
-            tile_cache[valid] = res
-            return res
-
-        return PipelineProgram(count, 1, tile, context.minimum_ms, context.setup_ms)
+        return lower_recurrent_scan(context)
 
 
 # ---------------------------------------------------------------------------

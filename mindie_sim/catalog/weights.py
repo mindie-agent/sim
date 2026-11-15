@@ -29,7 +29,10 @@ from dataclasses import replace
 
 import math
 from dataclasses import dataclass
-from typing import Any, Iterable, Sequence
+from typing import Any, Iterable, Mapping, Sequence
+
+ZERO = 0
+ONE = 1
 
 from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
 from mindie_sim.catalog.quant import projection_quant
@@ -63,7 +66,7 @@ def _resident_parallel(term: WeightTerm, parallel: ParallelSpec, shared_expert_d
 
 
 def stage_weight_decomposition(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
@@ -406,6 +409,12 @@ def _ffn_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     return terms
 
 
+def _tag_projection_roles(terms, plan, *, scope="target"):
+    from mindie_sim.catalog.projection_placement import projection_role
+    return [replace(term, placement_role=projection_role(
+        plan, term.name, scope=scope)) for term in terms]
+
+
 def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     quant = projection_quant(model.quant or QuantSpec("bf16"), plan)
     attention = [replace(term, quant=quant) for term in _attention_terms(plan, model)]
@@ -417,13 +426,14 @@ def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                          quant.for_category("mla.q_b" if term.name == "q_b" else term.category),
                          weight_block=(1, 32), scale_format="fp8_e8m0", scale_bytes=1))
                      if term.name in prepared else term for term in attention]
-    return (
+    return _tag_projection_roles(
         _norm_terms(plan, model)
         + attention
         + _mhc_terms(plan, model)
         + [replace(term, quant=quant) for term in _indexer_terms(plan, model)]
         + _compressor_terms(plan, model)
-        + _ffn_terms(plan, model)
+        + _ffn_terms(plan, model),
+        plan,
     )
 
 
@@ -499,7 +509,9 @@ def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     if not model.is_standalone_draft:
         terms.insert(0, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
         if not model.tie_word_embeddings:
-            terms.append(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"))
+            terms.append(replace(
+                _t("lm_head", model.vocab_size, h, "lm_head", "out_tp"),
+                placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):
         terms.extend([
             _t("output_attn_res_norm", h, 1, "norm"),
@@ -595,6 +607,8 @@ def stage_weight_terms(
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None,
+    slot_plans: Mapping[int, Any] | None = None,
+    ep_rank: int | None = None,
 ) -> list[list[WeightTerm]]:
     pp = max(1, parallel.pp)
     if layer_partition is None:
@@ -614,9 +628,15 @@ def stage_weight_terms(
         stage_of = _partition_stage_of(partition)
     stages: list[list[WeightTerm]] = [[] for _ in range(pp)]
     for plan in model.layer_plans:
-        stages[stage_of(plan.index)].extend(layer_weight_terms(plan, model))
+        terms = layer_weight_terms(plan, model)
+        slots = (slot_plans or {}).get(plan.index)
+        if slots is not None:
+            from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
+            terms = list(routed_expert_weight_terms(
+                terms, slots, ep_rank=ZERO if ep_rank is None else int(ep_rank)))
+        stages[stage_of(plan.index)].extend(terms)
     for term in body_head_terms(model):
-        stages[0 if term.name == "embedding" else pp - 1].append(term)
+        stages[ZERO if term.name == "embedding" else pp - ONE].append(term)
     if model.vision is not None:
         stages[0].extend(vision_weight_terms(model))
     tables_in_hbm = include_engram if include_engram_tables is None else include_engram_tables
@@ -649,11 +669,12 @@ def stage_weight_terms(
 
 
 def stage_weight_bytes(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool | None = None,
     source: bool = False, layer_partition: Sequence[int] | None = None,
     draft_kind: str | None = None, enable_shared_expert_dp: bool = False,
+    slot_plans: Mapping[int, Any] | None = None, ep_rank: int | None = None,
 ) -> list[float]:
     quant = model.quant or QuantSpec("bf16")
     result: list[float] = []
@@ -663,6 +684,7 @@ def stage_weight_bytes(
         include_engram=include_engram,
         include_engram_tables=include_engram_tables,
         layer_partition=layer_partition,
+        slot_plans=slot_plans, ep_rank=ep_rank,
     ):
         result.append(float(sum(
             term_bytes(term, quant, _resident_parallel(
@@ -673,7 +695,7 @@ def stage_weight_bytes(
 
 
 def sharded_weight_bytes(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
     include_draft: bool = False, include_engram: bool = True,
     include_engram_tables: bool = True, enable_shared_expert_dp: bool = False,
 ) -> float:
@@ -707,7 +729,7 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
 
 
 def weight_breakdown(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = ONE, *,
     include_engram_tables: bool | None = None,
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,

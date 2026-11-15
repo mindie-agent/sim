@@ -40,6 +40,13 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
 _PARETO_EPS = 1e-12
+ZERO = 0
+ONE = 1
+FIRST = 0
+DEFAULT_SLA_MS = 30.0
+DEFAULT_CONTEXT = 126000
+DEFAULT_OUTPUT_BUDGET = 1024
+DEFAULT_MAX_SEQUENCES = 256
 _BASELINE_SCENARIO: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
 )
@@ -343,12 +350,13 @@ def compute_pareto_frontier(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def sweep_topology_grid(
     case: CaseSpec | Mapping[str, Any], *, candidates: Sequence[Mapping[str, Any]] | None = None,
-    num_devices: int | None = None, sla_ms: float = 30.0, context: int = 126000,
+    num_devices: int | None = None, sla_ms: float = DEFAULT_SLA_MS, context: int = DEFAULT_CONTEXT,
     phase: str = "decode", scope: str = "body", tokens_per_seq: int | None = None,
-    output_budget: int = 1024, max_sequences_per_dp: int = 256,
+    output_budget: int = DEFAULT_OUTPUT_BUDGET, max_sequences_per_dp: int = DEFAULT_MAX_SEQUENCES,
     allow_dp: bool = True, allow_ep: bool = True, allow_pp: bool = False, allow_pcp: bool = False,
     candidate_tps: Sequence[int] | None = None, ep_candidates: Sequence[int] | None = None,
     pp_candidates: Sequence[int] | None = None, pcp_candidates: Sequence[int] | None = None,
+    hardware_derivations: Sequence[Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Sweep parallel sharding candidates and identify the axiomatic Pareto frontier."""
     _check_pos_float("sla_ms", sla_ms)
@@ -361,6 +369,53 @@ def sweep_topology_grid(
         _check_pos_int("tokens_per_seq", tokens_per_seq, minimum=1)
 
     parsed = parse_case(case)
+    if hardware_derivations:
+        from mindie_sim.issue34_cli import _derived_machine
+        combined: list[dict[str, Any]] = []
+        for derivation in hardware_derivations:
+            declare = dict(derivation)
+            sku = str(declare.pop("sku", parsed.machine.sku or "derived"))
+            derived = _derived_machine(parsed.machine, {**declare, "sku": sku})
+            sub = sweep_topology_grid(
+                replace(parsed, machine=derived), candidates=candidates,
+                num_devices=num_devices, sla_ms=sla_ms, context=context,
+                phase=phase, scope=scope, tokens_per_seq=tokens_per_seq,
+                output_budget=output_budget, max_sequences_per_dp=max_sequences_per_dp,
+                allow_dp=allow_dp, allow_ep=allow_ep, allow_pp=allow_pp,
+                allow_pcp=allow_pcp, candidate_tps=candidate_tps,
+                ep_candidates=ep_candidates, pp_candidates=pp_candidates,
+                pcp_candidates=pcp_candidates,
+            )
+            for row in sub["candidates"]:
+                row["derived_sku"] = sku
+                row["derivation"] = {
+                    "sku": derived.sku,
+                    "aic_count": derived.dies[FIRST].compute_units if derived.dies else None,
+                    "aiv_count": (dict(derived.dies[FIRST].resource_units).get("vector")
+                                  if derived.dies else None),
+                    "memory_bytes": derived.dies[FIRST].memory_bytes if derived.dies else None,
+                    "assumptions": dict(derived.assumptions),
+                }
+            combined.extend(sub["candidates"])
+        base_devices = (num_devices if num_devices is not None
+                        else len(parsed.machine.dies))
+        return {
+            "schema": "mindie-sim.topology-sweep/1",
+            "num_devices": base_devices,
+            "sla_ms": sla_ms, "context": context, "phase": phase, "scope": scope,
+            "search_domain": {
+                "num_devices": base_devices, "allow_dp": allow_dp,
+                "allow_ep": allow_ep, "allow_pp": allow_pp,
+                "allow_pcp": allow_pcp, "candidate_count": len(combined),
+                "hardware_derivations": len(hardware_derivations),
+            },
+            "candidates": combined,
+            "pareto_frontier": compute_pareto_frontier(combined),
+            "plan_selection": "reselected_parallel_per_candidate",
+            "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
+            "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
+                       "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
+        }
     target_devices = _check_pos_int("num_devices", num_devices, minimum=1) if num_devices is not None else len(parsed.machine.dies)
     cand_list = (
         [dict(c) for c in candidates]

@@ -21,6 +21,19 @@ from .implementations import select
 from .projections import kda_projections, require_packed_slice
 from .recover_ssm_work import emit_commit_op, record_head_bytes, recover_ssm_enabled
 
+POWER_QUADRATIC = 2
+PRODUCT_VECTOR_BYTES = 256
+PRODUCT_READ_BYTES = 32
+LINEAR_VECTOR_BYTES = 2
+POWER_CUBIC = 3
+TWO_THIRDS = 2.0 / 3.0
+
+
+def _sum_valid_powers(tokens: int, chunk: int, power: int) -> int:
+    """Closed form of sum(min(chunk, tokens - i*chunk)**power)."""
+    full, remainder = divmod(int(tokens), int(chunk))
+    return int(full) * int(chunk) ** int(power) + int(remainder) ** int(power)
+
 
 def _serving_kda_source(runtime, model, views, plan):
     """Shared A5 KDA source selection for ordinary serving."""
@@ -239,7 +252,7 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         span = chunk if view.phase == "prefill" else 1
         last = gated
         if view.phase == "prefill":
-            pairs = sum(min(chunk, q - offset) ** 2 for offset in range(0, q, chunk))
+            pairs = _sum_valid_powers(q, chunk, POWER_QUADRATIC)
             # KDA forms QK and KK before WY with a dk-wide decay gate per head
             # (stored in activation_dtype from delta_gates, accumulated in FP32);
             # only Aqk @ V belongs after the scan.
@@ -254,11 +267,11 @@ def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                            read=prod_read, write=prod_write,
                            family="recurrent_local")
             last = b.work(f"triangular_solve{index}", (local,), (chunks, heads, span, span),
-                          flops=2 / 3 * sum(min(chunk, q - offset) ** 3
-                                           for offset in range(0, q, chunk)) * heads,
-                          vector=pairs * heads * (256 if is_kda else 2),
-                          read=pairs * heads * (32 if is_kda else 2),
-                          write=pairs * heads * (32 if is_kda else 2),
+                          flops=TWO_THIRDS * _sum_valid_powers(
+                              q, chunk, POWER_CUBIC) * heads,
+                          vector=pairs * heads * (PRODUCT_VECTOR_BYTES if is_kda else LINEAR_VECTOR_BYTES),
+                          read=pairs * heads * (PRODUCT_READ_BYTES if is_kda else LINEAR_VECTOR_BYTES),
+                          write=pairs * heads * (PRODUCT_READ_BYTES if is_kda else LINEAR_VECTOR_BYTES),
                           family="triangular_solve")
             prepare_ids.extend((local, last))
             wy_vec = q * heads * (2 * dk + dv) * 4 if is_kda else 0

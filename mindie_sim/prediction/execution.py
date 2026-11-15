@@ -86,6 +86,11 @@ _NO_REV_OPS_CACHE: dict = {}
 _DECLARATION_CACHE: dict = {}
 _DEVICE_UNITS_CACHE: dict = {}
 _META_CACHE_LIMIT = 32768
+ZERO = 0
+ONE = 1
+FIRST = 0
+SECOND = 1
+HOST_LOOKAHEAD_DEFAULT = 8
 
 
 def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
@@ -1104,14 +1109,14 @@ class Execution:
 
     def __init__(
         self, case: CaseSpec, cost: CostModel, *, recipes: RecipeBook | None = None,
-        submission: SubmissionPolicy | None = None, trace_limit: int = 0,
+        submission: SubmissionPolicy | None = None, trace_limit: int = ZERO,
         engine: Engine | None = None, namespace: str = "",
         include_submission: bool = True, on_operator=None,
         include_serving_io: bool = False,
         client_tails=None, memory_policy=None,
         legacy_diagnostics: bool | None = None,
         fragment_state=None, memory=None,
-        lazy_frontier: bool = True, host_lookahead: int = 8,
+        lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
     ):
         self.case, self.cost = case, cost
         self.namespace = namespace
@@ -1177,7 +1182,7 @@ class Execution:
                         "heterogeneous_owners_require_per_rank_execution")
                 self.stage_dies[replica, stage] = dies
                 roles = dict(dies[0].rates)
-                work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
+                work_units = {**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)}
                 rates = {role: (min(dict(d.rates)[role] for d in dies) / 1000,
                                 work_units.get(role, "work")) for role in roles}
                 rates.update({"cube": (1, "peak_ms"), "host": (1, "ms")})
@@ -1191,13 +1196,15 @@ class Execution:
                     names[kind] = name
                 self.stage_names[replica, stage] = names
                 stage_pools = {}
-                for pool in dict(dies[0].buffers):
+                for pool in dict(dies[FIRST].buffers):
                     key = f"{namespace}{pool}@r{replica}:s{stage}"
                     pools[key] = min(dict(d.buffers)[pool] for d in dies)
-                    pool_units[key] = dies[0].pool_units(pool)
+                    pool_units[key] = dies[FIRST].pool_units(pool)
                     stage_pools[str(pool)] = key
                 self.stage_pools[replica, stage] = stage_pools
-        self.topology = Topology(case.machine, p, namespace)
+        self.topology = Topology(
+            case.machine, p, namespace,
+            collective_startup_mode=case.runtime.collective_startup_mode)
         resources.extend(self.topology.resources())
         if engine is None and self.memory is not None:
             # A Memory ledger already adopted by one RuntimeState owns that
@@ -2309,7 +2316,7 @@ class Execution:
             replayable = (
                 Execution.schedule_replay and token is not None
                 and not op.link_bytes and not getattr(recipe, "algorithm", None)
-                and dict(op.metadata).get("group_axis") != "ep"
+                and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}
             )
             if replayable:
                 script_key = _isolated_script_key(prog_key, context, token)
@@ -2488,7 +2495,7 @@ class Execution:
             return _ServiceSetupProgram(body, service.fixed_us / 1000.0)
         return body
 
-    def prepare(self, op, replica=0):
+    def prepare(self, op, replica=ZERO):
         geom = self.stage_geometry[replica, op.stage]
         prep_key = (
             id(self.recipes), _freeze_key(geom), op.stage, op.family, op.recipe, op.phase,
@@ -2510,6 +2517,12 @@ class Execution:
                 metadata=meta,
             ), recipe
         res_op, recipe = self.recipes.prepare(op, geom)
+        stage_dies = self.stage_dies.get((replica, res_op.stage))
+        if stage_dies:
+            from .matrix_precision import resolve_matrix_precision
+            res_op = resolve_matrix_precision(
+                res_op, devices=stage_dies,
+                policy=self.case.runtime.matrix_compute_policy, recipe=recipe)
         orig_meta = dict(op.metadata)
         res_meta = dict(res_op.metadata)
         meta_diff = _meta_diff(orig_meta, res_meta) if orig_meta != res_meta else None
@@ -2539,40 +2552,47 @@ class Execution:
         names = self.stage_names[key]
         return RecipeContext(
             None, {}, names, self.resource_rates,
-            dies[0].aic_count,
+            dies[FIRST].aic_count,
             pool_names={pool: f"{self.namespace}{pool}@r{replica}:s{stage}"
-                        for pool in dict(dies[0].buffers)},
-            resource_units={role: dies[0].units(role) for role in names},
+                        for pool in dict(dies[FIRST].buffers)},
+            resource_units={role: dies[FIRST].units(role) for role in names},
             compute_peaks={dtype: min(d.peak(dtype) for d in dies)
-                           for dtype, _ in dies[0].compute_peaks},
-            pool_units={pool: dies[0].pool_units(pool)
-                        for pool in dict(dies[0].buffers)},
+                           for dtype, _ in dies[FIRST].compute_peaks
+                           if dtype not in dict(dies[FIRST].compute_peak_aliases)},
+            pool_units={pool: dies[FIRST].pool_units(pool)
+                        for pool in dict(dies[FIRST].buffers)},
             pool_capacities={pool: min(dict(d.buffers)[pool] for d in dies)
-                             for pool in dict(dies[0].buffers)},
+                             for pool in dict(dies[FIRST].buffers)},
             record_mapping=self.cost.record_mapping,
-            service_modes={mode: (role, min(dict(d.service_modes)[mode][1] for d in dies))
-                           for mode, (role, _) in dies[0].service_modes},
+            service_modes={mode: (role, min(dict(d.service_modes)[mode][SECOND] for d in dies))
+                           for mode, (role, _) in dies[FIRST].service_modes},
             record_service=self.cost.record_service,
-            work_units={**NATIVE_WORK_UNITS, **dict(dies[0].work_units)},
-            store_queues={name: dict(queue) for name, queue in dies[0].store_queues
+            work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
+            store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
                           if all(dict(d.store_queues).get(name) == queue for d in dies)},
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
         from .services import service_identity
         from .kernel_groups import declaration
-        cost = self.cost.price(op, scope)
+        from .matrix_precision import execution_compute_peaks, resolve_matrix_precision
+        from .collective_waves import RECIPE as STARTUP_WAVES
+        from .collective_waves import startup_waves_selected
+        if startup_waves_selected(op, self.case.runtime.collective_startup_mode):
+            recipe = STARTUP_WAVES
         dies = self.stage_dies[replica, op.stage]
+        op = resolve_matrix_precision(
+            op, devices=dies,
+            policy=self.case.runtime.matrix_compute_policy, recipe=recipe)
+        cost = self.cost.price(op, scope)
         template = self.stage_contexts[replica, op.stage]
         from .direct_peer import resolve_transport_options
         from .topology import TransportOptions
         transport_options = (resolve_transport_options(recipe, op)
                              if recipe is not None else TransportOptions())
         self._transport_options[(str(scope), op.op_id, replica)] = transport_options
-        peaks = template.compute_peaks
-        additional = {dtype for dtype, _ in op.matrix_flops} - peaks.keys()
-        if additional:
-            peaks = {**peaks, **{dtype: min(d.peak(dtype) for d in dies) for dtype in additional}}
+        peaks = execution_compute_peaks(
+            op, devices=dies, base_peaks=template.compute_peaks)
         meta = _metadata_dict(op)
         device = dies[0]
         units_key = _DEVICE_UNITS_CACHE.get(id(device))
@@ -3581,6 +3601,20 @@ class Execution:
                       on_complete=_record_step)
         return step
 
+    def _lower_local_tp_work(self, work: IterationWork, replica: int) -> IterationWork:
+        """Apply the declared node-local dense placement once per graph."""
+        parallel = self.case.runtime.parallel
+        if max(int(parallel.o_proj_tp), int(parallel.linear_proj_tp),
+               int(parallel.lm_head_tp)) <= ONE:
+            return work
+        from .local_projection_tp import lower_local_projection_tp
+
+        ops = lower_local_projection_tp(
+            work.ops, model=self.case.model, runtime=self.case.runtime,
+            machine=self.case.machine, replica=replica,
+            cohort_views={replica: work.plan.requests}, scope="target")
+        return work if ops is work.ops else replace(work, ops=ops)
+
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
             external_inputs=None, emitted_tokens=None,
             memory_bindings=None, state_accesses=None) -> ScheduledIteration:
@@ -3596,6 +3630,7 @@ class Execution:
                         self.case, {replica: work.ops})[replica])
                 else:
                     mark_no_rev_collective(work.ops)
+        work = self._lower_local_tp_work(work, replica)
         engine = self.engine
         prefix = f"{self.namespace}r{replica}:i{work.plan.iteration}"
         ids: dict[str, Event] = dict(external_inputs or {})
@@ -3635,7 +3670,7 @@ class Execution:
                 return hit[1]
             meta = _metadata_dict(op)
             ok = (_declaration_of(op) is None
-                  and meta.get("group_axis") != "ep"
+                  and meta.get("group_axis") not in {"ep", "local_tp"}
                   and not meta.get("peer_traffic")
                   and not meta.get("mc2_phase")
                   and not meta.get("reverse_of_collective"))
@@ -3788,8 +3823,8 @@ class Execution:
             if (self.readiness_report
                     and op.family in {"collective", "allgather", "reduce_scatter",
                                       "allreduce", "transport"}
-                    and op.link_bytes > 0
-                    and dict(op.metadata).get("group_axis") != "ep"):
+                    and op.link_bytes > ZERO
+                    and dict(op.metadata).get("group_axis") not in {"ep", "local_tp"}):
                 from .collective_readiness import bind_pipeline_ready
                 ranks = self.topology.ranks(replica, op.stage)
                 ready_by_rank = {rank: ready for rank in ranks}
@@ -3823,8 +3858,9 @@ class Execution:
             ready = kernel_groups.phase_ready(op, ready, name)
             recipe_name = op.recipe or type(recipe).__name__
             self.recipes_used[recipe_name] = self.recipes_used.get(recipe_name, 0) + 1
-            cross_dp = (dict(op.metadata).get("group_axis") == "ep"
-                        and self.case.runtime.parallel.ep_spans_dp)
+            from .local_tp_groups import collective_requires_cohort
+
+            cross_dp = collective_requires_cohort(op, self.topology)
             if cross_dp and getattr(recipe, "algorithm", None) and self._collectives is None:
                 raise ModelingError("joint_collective_requires_complete_cohort")
             grouped = self._collectives is not None and cross_dp

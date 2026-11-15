@@ -18,6 +18,9 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
 from mindie_sim.schema.common import ModelingError, _unknown
 from mindie_sim.schema.case import Case, Software
 from mindie_sim.schema.hardware import Hardware
+from mindie_sim.schema import runtime_features
+
+ONE = 1
 
 
 def normalize_model(model: ModelSpec) -> ModelSpec:
@@ -66,8 +69,9 @@ def parse_case(value: Case | Mapping) -> Case:
             case = Case(Hardware.from_mapping(case.machine.to_dict()), case.model, case.workload,
                         Software.from_mapping(case.runtime.to_dict()), case.slo)
     else:
+        value = runtime_features.normalize_case_runtime(value)
         _unknown(value, {"machine", "model", "workload", "runtime", "slo",
-                         "schema", "structure_variant"}, "case")
+                         "schema", "structure_variant", "software"}, "case")
         missing = {"machine", "model", "workload"} - value.keys()
         if missing:
             raise ModelingError("case_missing_fields:" + ",".join(sorted(missing)))
@@ -192,6 +196,9 @@ def _normalize_parsed_case(case: Case) -> Case:
                         degraded_submodules=tuple(sorted(degraded)))
         model = replace(model, metadata=tuple(sorted(metadata.items())))
     case.machine.validate_placement(p)
+    if max(int(p.o_proj_tp), int(p.linear_proj_tp), int(p.lm_head_tp)) > ONE:
+        from .local_tp_groups import validate_local_projection_tp
+        validate_local_projection_tp(case)
     case.workload.validate_model(model, runtime)
     metadata = dict(runtime.metadata)
     # Carry the unaltered case machine/model identity with the parsed runtime so

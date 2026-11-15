@@ -363,9 +363,14 @@ class ComputeArchSpec:
                 return item
         raise ModelingError(f"runtime_undeclared:{name}")
 
-    def validate_peaks(self, peaks) -> None:
-        """Every declared native peak needs a declared native compute mode."""
-        _validate_peak_formats(peaks, self.native_modes)
+    def validate_peaks(self, peaks, *, aliases=()) -> None:
+        """Native peaks need a declared native mode; aliases are removed first."""
+        from .compute_peak_aliases import (
+            native_compute_peak_items, validate_compute_peak_aliases)
+
+        validate_compute_peak_aliases(peaks, aliases, self)
+        _validate_peak_formats(dict(native_compute_peak_items(peaks, aliases)),
+                               self.native_modes)
 
     # ---- parsing -----------------------------------------------------------
     @classmethod
