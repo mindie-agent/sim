@@ -5,10 +5,12 @@ on:
     branches: [main]
     paths:
       - "formal/**"
+      - "scripts/check_lean_no_sorry.py"
       - ".github/workflows/formal.yml"
   pull_request:
     paths:
       - "formal/**"
+      - "scripts/check_lean_no_sorry.py"
       - ".github/workflows/formal.yml"
   workflow_dispatch:
 
@@ -19,60 +21,15 @@ jobs:
   lean4-kernel:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    env:
-      ELAN_HOME: ${{ runner.temp }}/elan
     steps:
       - uses: actions/checkout@v4
 
       - name: Audit Lean sources for forbidden sorry, admit, or custom axiom tokens
-        run: |
-          python3 - <<'PY'
-          import pathlib, re, sys
-
-          def strip_lean_comments_and_strings(src: str) -> str:
-              out, i, n, depth = [], 0, len(src), 0
-              while i < n:
-                  if depth == 0 and src[i] == '"':
-                      i += 1
-                      while i < n and src[i] != '"':
-                          i += 2 if src[i] == '\\' else 1
-                      i += 1
-                      out.append('""')
-                  elif src[i:i+2] == '/-':
-                      depth += 1
-                      i += 2
-                  elif depth > 0 and src[i:i+2] == '-/':
-                      depth -= 1
-                      i += 2
-                  elif depth == 0 and src[i:i+2] == '--':
-                      while i < n and src[i] != '\n':
-                          i += 1
-                  else:
-                      if depth == 0:
-                          out.append(src[i])
-                      elif src[i] == '\n':
-                          out.append('\n')
-                      i += 1
-              if depth != 0:
-                  raise ValueError("unclosed Lean block comment")
-              return ''.join(out)
-
-          lean_files = sorted(pathlib.Path("formal").rglob("*.lean"))
-          assert lean_files, "no Lean files found under formal/"
-          forbidden = re.compile(r"\b(?:sorry|sorryAx|admit|axiom)\b")
-          errors = []
-          for path in lean_files:
-              cleaned = strip_lean_comments_and_strings(path.read_text(encoding="utf-8"))
-              for match in forbidden.finditer(cleaned):
-                  line = cleaned.count("\n", 0, match.start()) + 1
-                  errors.append(f"{path}:{line}: forbidden token '{match.group(0)}'")
-          if errors:
-              print("\n".join(errors), file=sys.stderr)
-              sys.exit(1)
-          print(f"Verified {len(lean_files)} Lean files: 0 sorry, 0 admit, 0 custom axiom.")
-          PY
+        run: python3 -B scripts/check_lean_no_sorry.py
 
       - name: Install pinned Lean 4 toolchain via elan
+        env:
+          ELAN_HOME: ${{ runner.temp }}/elan
         run: |
           TOOLCHAIN="$(tr -d '[:space:]' < formal/lean-toolchain)"
           curl -fsSL https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh -o "${RUNNER_TEMP}/elan-init.sh"
@@ -81,6 +38,8 @@ jobs:
 
       - name: Machine-check MindIESimSpec and AxiomCheck
         working-directory: formal
+        env:
+          ELAN_HOME: ${{ runner.temp }}/elan
         run: |
           lean --version
           lake --version
