@@ -847,10 +847,21 @@ class TransportPlan:
         return TransportRun(self, completions, stats, started)
 
 
+STARTUP_PEER_PHASE_DELTA = 1
+STARTUP_ONE = 1
+STARTUP_ZERO_FLOAT = 0.0
+DEFAULT_MAX_PHYSICAL_CHUNKS = 4096
+STARTUP_ZERO = 0
+
+
 class Topology:
-    def __init__(self, machine, parallel, namespace=""):
+    def __init__(self, machine, parallel, namespace="", *,
+                 collective_startup_mode="legacy"):
         self.machine, self.parallel = machine, parallel
         self.namespace = namespace
+        self.collective_startup_mode = collective_startup_mode
+        self.collective_protocols = dict(
+            getattr(machine, "collective_protocols", ()) or ())
         self.links = {link.name: link for link in machine.links}
         self.routes = {}
         width = max(1, int(getattr(machine, "ranks_per_node", 1) or 1))
@@ -878,6 +889,17 @@ class Topology:
         # second IR or a metadata re-parse.  Explicit transport arguments take
         # precedence; T04/SIM-STRUCTURE can also pass the object directly.
         self._transport_bindings = {}
+
+    def startup_descriptor(self, op, group_size):
+        """Resolve this collective's declared startup model once."""
+        from .collective_startup import resolve_collective_startup
+
+        metadata = dict(op.metadata)
+        family = str(metadata.get("collective", op.family)).strip().lower()
+        return resolve_collective_startup(
+            family=family, group_size=int(group_size), metadata=metadata,
+            runtime_mode=self.collective_startup_mode,
+            topology_protocols=self.collective_protocols)
 
     def location(self, rank: int) -> dict:
         """Return the declared die/package/node placement of one rank."""
@@ -998,10 +1020,18 @@ class Topology:
         start = (replica * p.pp + stage) * width
         return tuple(device.rank for device in self.machine.dies[start:start + width])
 
-    def groups(self, axis, replica, stage):
+    def groups(self, axis, replica, stage, *, metadata=None):
         """Rank axes are independent; EP absorbs PCP copies only when it spans them."""
         p = self.parallel
         sources = self.ranks(replica, stage)
+        if axis == "local_tp":
+            from .local_tp_groups import local_tp_groups
+
+            declared = dict(metadata or {})
+            width = int(declared.get("local_tp_width", STARTUP_ZERO) or STARTUP_ZERO)
+            if width <= STARTUP_ZERO:
+                raise ModelingError("local_tp_group_requires_declared_width")
+            return local_tp_groups(self.machine, p, stage=stage, width=width)
         if axis == "cp":
             return tuple(sources[i:i + p.cp] for i in range(0, len(sources), p.cp))
         if axis == "etp":
@@ -1040,6 +1070,11 @@ class Topology:
         axis = metadata.get("group_axis", "tp")
         source_stage = int(metadata.get("source_stage", op.stage))
         sources = self.ranks(replica, source_stage)
+        alltoall = str(family).strip().lower() in {"alltoall", "alltoallv"}
+        if alltoall:
+            # Validate explicit steps before any zero-volume early return.
+            for group in self.groups(axis, replica, source_stage, metadata=metadata):
+                self.startup_descriptor(op, len(group))
         if "peer_traffic" in metadata:
             if family not in {"alltoall", "alltoallv"}:
                 raise ModelingError(
@@ -1056,11 +1091,7 @@ class Topology:
                     raise ModelingError(
                         f"peer_traffic_group_size_mismatch:"
                         f"{peer.size}!={len(group)}")
-                rounds = metadata.get("steps", len(group) - 1)
-                if (not isinstance(rounds, int) or isinstance(rounds, bool)
-                        or rounds != len(group) - 1):
-                    raise ModelingError(
-                        f"communication_round_count_invalid:{rounds}")
+                rounds = self.startup_descriptor(op, len(group)).startup_rounds
                 for index, source in enumerate(group):
                     if source not in sources:
                         continue
@@ -1089,9 +1120,12 @@ class Topology:
         for group in self.groups(axis, replica, source_stage):
             if len(group) <= 1:
                 continue
-            rounds = metadata.get("steps", (2 if family == "allreduce" else 1) * (len(group) - 1))
-            if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
-                raise ModelingError(f"communication_round_count_invalid:{rounds}")
+            if alltoall:
+                rounds = self.startup_descriptor(op, len(group)).startup_rounds
+            else:
+                rounds = metadata.get("steps", (2 if family == "allreduce" else 1) * (len(group) - 1))
+                if not isinstance(rounds, int) or isinstance(rounds, bool) or rounds < 1:
+                    raise ModelingError(f"communication_round_count_invalid:{rounds}")
             for index, source in enumerate(group):
                 if source not in sources:
                     continue
@@ -1145,7 +1179,7 @@ class Topology:
         return RoutedMessage(flow, tuple(hops))
 
     def transport_plan(self, flows, *, chunk_bytes=None, receive_capacity_bytes=None,
-                       hop_startup_us=0.0, max_physical_chunks=4096,
+                       hop_startup_us=STARTUP_ZERO_FLOAT, max_physical_chunks=DEFAULT_MAX_PHYSICAL_CHUNKS,
                        transport=None, receive_buffer_id=None):
         """Plan directed flows with actual routes, chunks and receive credits.
 
@@ -1337,11 +1371,11 @@ class Topology:
                 + ",".join(map(str, unmapped)))
         return metadata.get("collective", op.family), tuple(groups), volume_by_rank, metadata
 
-    def joint_plan(self, op, participants, *, algorithm="ring", max_inflight_per_rank=1,
-                   chunk_bytes=None, hop_startup_us=0.0,
+    def joint_plan(self, op, participants, *, algorithm="ring", max_inflight_per_rank=STARTUP_ONE,
+                   chunk_bytes=None, hop_startup_us=STARTUP_ZERO_FLOAT,
                    receive_capacity_bytes_per_peer=None,
                    receive_buffer_id=None,
-                   max_physical_chunks=4096, transport=None):
+                   max_physical_chunks=DEFAULT_MAX_PHYSICAL_CHUNKS, transport=None):
         """Bind complete cross-DP cohorts without inferring a runtime algorithm."""
         from .collectives import PairwiseGroup, PairwisePlan, RingGroup, RingPlan
 
@@ -1368,15 +1402,20 @@ class Topology:
             self._transport_bindings.clear()
         self._transport_bindings[id(op)] = resolved
         self._transport_bindings[getattr(op, "op_id", id(op))] = resolved
-        if algorithm not in {"ring", "pairwise", "direct_peer"}:
+        if algorithm not in {"ring", "pairwise", "direct_peer", "startup_waves"}:
             raise ModelingError(f"joint_collective_algorithm_unsupported:{algorithm}")
-        if (algorithm != "direct_peer"
+        if (algorithm not in {"direct_peer", "startup_waves"}
                 and (chunk_bytes is not None or hop_startup_us
                      or receive_capacity_bytes_per_peer is not None)):
             raise ModelingError(
                 f"{algorithm}_collective_does_not_accept_chunked_peer_options")
         family, unique_groups, volume_by_rank, metadata = self._joint_groups(
             op, participants)
+        alltoall = str(family).strip().lower() in {"alltoall", "alltoallv"}
+        startup = None
+        if alltoall and unique_groups:
+            startup = self.startup_descriptor(
+                op, len(next(iter(unique_groups))))
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -1422,10 +1461,9 @@ class Topology:
                     if sizes else None)
         groups = []
         for ranks in unique_groups:
-            rounds = max(len(ranks) - 1, 0)
-            if metadata.get("steps", rounds) != rounds:
-                raise ModelingError(
-                    "pairwise_collective_round_count_conflicts_with_schedule")
+            rounds = max(len(ranks) - STARTUP_PEER_PHASE_DELTA, STARTUP_ZERO)
+            if alltoall:
+                startup = self.startup_descriptor(op, len(ranks))
             if peer is not None:
                 if peer.size != len(ranks):
                     raise ModelingError(
@@ -1457,7 +1495,11 @@ class Topology:
             else:
                 groups.append(PairwiseGroup(
                     ranks, tuple(totals), rounds, self, peer_traffic=peer))
-        return PairwisePlan(family, tuple(groups))
+        return PairwisePlan(
+            family, tuple(groups),
+            startup_rounds=(startup.startup_rounds if startup is not None else None),
+            startup_application=("physical_program_owns_arrivals"
+                                 if alltoall else "startup_model"))
 
     def ring_plan(self, op, replica, *, volume=None):
         """Bind a uniform-chunk local ring; no vendor algorithm is inferred."""

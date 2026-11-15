@@ -31,6 +31,8 @@ class RequestView:
     prompt_tokens: int = 0
     global_q_len: int = 0
     query_ranges: tuple[tuple[int, int], ...] = ()
+    #: Physical prefix-pool identity of the request's immutable prefix.
+    prefix_cache_key: str = ""
 
     def __post_init__(self) -> None:
         if not self.semantic_phase:
@@ -76,6 +78,7 @@ class RequestView:
             # the local ``q_len``.
             "global_q_len": self.global_q_len,
             "query_ranges": self.query_ranges,
+            "prefix_cache_key": self.prefix_cache_key,
         }
 
 @dataclass(frozen=True)

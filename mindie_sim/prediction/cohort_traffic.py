@@ -66,7 +66,9 @@ def bind_cohort_traffic(case, graphs):
                if dict(op.metadata).get("reverse_of_collective")]
     if not inverse:
         return graphs
-    topology = Topology(case.machine, case.runtime.parallel)
+    topology = Topology(
+        case.machine, case.runtime.parallel,
+        collective_startup_mode=case.runtime.collective_startup_mode)
     declarations = {}
     for replica, ops in graphs.items():
         for op in ops:
@@ -90,7 +92,7 @@ def bind_cohort_traffic(case, graphs):
             owner_by_stage[stage] = owner
         own_ranks = set(topology.ranks(replica, stage))
         descriptors, totals = [], []
-        for group in topology.groups(axis, replica, stage):
+        for group in topology.groups(axis, replica, stage, metadata=meta):
             cache_key = (stage, axis, source_id, group, _peer_row_widths(meta))
             cached = group_plan_cache.get(cache_key)
             if cached is not None:

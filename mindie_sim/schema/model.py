@@ -24,12 +24,17 @@ import math
 from dataclasses import dataclass, replace
 from typing import Any, Mapping, Sequence
 
-from mindie_sim.schema.common import ModelingError, _DTYPE_BYTES, _int, _mapping, _metadata, _normalize_dtype, _positive_float, _unknown, dtype_bytes
+from mindie_sim.schema.common import (
+    ModelingError, _DTYPE_BYTES, _int, _mapping, _metadata, _normalize_dtype,
+    _positive_float, _unknown, dtype_bytes,
+)
+
+ZERO = 0
+ZERO_FLOAT = 0.0
 from mindie_sim.catalog.types import (
     AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec,
 )
 from mindie_sim.nr_s7_validate import _request_int, _validate_request, _validate_workload
-
 
 @dataclass(frozen=True)
 class MlaSpec:
@@ -89,7 +94,6 @@ class MlaSpec:
         data["qk_head_dim"] = self.qk_head_dim
         return data
 
-
 #: ``LayerPlan.indexer_type`` spelling -> canonical role (per_layer->full).
 INDEXER_TYPE_ALIASES = {
     "": "none",
@@ -103,7 +107,6 @@ INDEXER_TYPE_ALIASES = {
     "c4": "c4",
 }
 INDEXER_TYPES = frozenset({"none", "c4", "full", "shared"})
-
 
 @dataclass(frozen=True)
 class LayerPlan:
@@ -238,7 +241,6 @@ class LayerPlan:
 
     def to_dict(self) -> dict[str, Any]:
         return {key: getattr(self, key) for key in self.__dataclass_fields__}
-
 
 @dataclass(frozen=True)
 class ModelSpec:
@@ -482,7 +484,6 @@ class ModelSpec:
         data["catalog_facts"] = {key: deepcopy(value) for key, value in self.catalog_facts}
         return data
 
-
 def _quant_weight_dtype(quantization: str) -> str:
     q = quantization.lower()
     if q in {"fp8", "w8a8_fp8", "fp8_e4m3"}:
@@ -493,7 +494,6 @@ def _quant_weight_dtype(quantization: str) -> str:
         return "int4"
     return "bf16"
 
-
 def _quant_activation_dtype(quantization: str) -> str:
     q = quantization.lower()
     if "fp8" in q:
@@ -501,7 +501,6 @@ def _quant_activation_dtype(quantization: str) -> str:
     if "int8" in q or q == "w8a8":
         return "int8"
     return "bf16"
-
 
 def _parse_routing(raw: Mapping[str, Any], experts: int) -> tuple[tuple[float, ...], str]:
     value = raw.get("expert_routing", raw.get("expert_routing_histogram"))
@@ -519,7 +518,6 @@ def _parse_routing(raw: Mapping[str, Any], experts: int) -> tuple[tuple[float, .
     if total <= 0:
         return (), "uniform"
     return tuple(v / total for v in entries), "declared_histogram"
-
 
 @dataclass(frozen=True)
 class SloSpec:
@@ -545,12 +543,10 @@ class SloSpec:
     def to_dict(self) -> dict[str, Any]:
         return {"ttft_ms": self.ttft_ms, "tpot_ms": self.tpot_ms, "itl_ms": self.itl_ms, "e2e_ms": self.e2e_ms}
 
-
 def _optional_positive(value: Any, reason: str) -> float | None:
     if value is None:
         return None
     return _positive_float(value, reason)
-
 
 @dataclass(frozen=True)
 class RequestSpec:
@@ -567,6 +563,9 @@ class RequestSpec:
     # plus ``gap_ms`` (never from a measured finish).  chain_id 0 = open loop.
     chain_id: int = 0
     gap_ms: float = 0.0
+    #: Physical prefix-pool identity within this case/DP replica.  Request IDs
+    #: are execution identities, never prefix-token identities.
+    prefix_cache_key: str = ""
 
     def __post_init__(self) -> None:
         arrival, gap = _validate_request(self)
@@ -579,7 +578,8 @@ class RequestSpec:
         _unknown(raw, {"id", "request_id", "arrival_ms", "prompt_tokens", "prompt_len",
                        "text_tokens", "media_tokens", "media_encoded",
                        "output_tokens", "output_len", "prefix_tokens", "prefix_len", "priority",
-                       "chain_id", "gap_ms", "text_prompt_tokens"}, "workload.request")
+                       "chain_id", "gap_ms", "text_prompt_tokens",
+                       "prefix_cache_key"}, "workload.request")
         request_id = raw.get("request_id", raw.get("id", f"r{index}"))
         text_prompt = _request_int("prompt_tokens",
             raw.get("text_prompt_tokens",
@@ -595,13 +595,14 @@ class RequestSpec:
                 raise ModelingError("workload.text_media_prompt_mismatch")
         return cls(
             request_id=request_id,
-            arrival_ms=raw.get("arrival_ms", 0.0), prompt_tokens=prompt,
+            arrival_ms=raw.get("arrival_ms", ZERO_FLOAT), prompt_tokens=prompt,
             output_tokens=raw.get("output_tokens", raw.get("output_len")),
-            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", 0)),
-            priority=raw.get("priority", 0),
+            prefix_tokens=raw.get("prefix_tokens", raw.get("prefix_len", ZERO)),
+            priority=raw.get("priority", ZERO),
             text_prompt_tokens=text_prompt, media_tokens=media_tokens,
             media_encoded=raw.get("media_encoded", False),
-            chain_id=raw.get("chain_id", 0), gap_ms=raw.get("gap_ms", 0.0),
+            chain_id=raw.get("chain_id", ZERO), gap_ms=raw.get("gap_ms", ZERO_FLOAT),
+            prefix_cache_key=raw.get("prefix_cache_key", ""),
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -617,8 +618,8 @@ class RequestSpec:
             "media_encoded": self.media_encoded,
             "chain_id": self.chain_id,
             "gap_ms": self.gap_ms,
+            "prefix_cache_key": self.prefix_cache_key,
         }
-
 
 @dataclass(frozen=True)
 class WorkloadSpec:
@@ -684,14 +685,11 @@ class WorkloadSpec:
             "metadata": dict(self.metadata),
         }
 
-
 def _lengths(value: Any, count: int, reason: str, *, minimum: int = 1) -> list[int]:
     if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
         if len(value) != count:
             raise ModelingError(f"{reason}:length")
         return [_int(item, reason, minimum=minimum) for item in value]
     return [_int(value, reason, minimum=minimum)] * count
-
-
 
 __all__ = ["LayerPlan", "MlaSpec", "ModelSpec", "SloSpec", "RequestSpec", "WorkloadSpec"]

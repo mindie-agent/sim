@@ -29,6 +29,9 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 
+ZERO = 0
+ONE = 1
+
 
 def _safe_bytes(dtype: str) -> float:
     return float(dtype_bytes(dtype))
@@ -108,7 +111,7 @@ def gemm_op(
     *, op_id: str, deps: tuple[str, ...], stage: int, layer: int,
     requests: tuple[str, ...], m: int, n: int, k: int, quant: QuantSpec,
     category: str, phase: str, recipe: str = "", family: str = "gemm",
-    semantic_family: str = "", weight_count: int = 1,
+    semantic_family: str = "", weight_count: int = ONE,
     weight_rows: int | None = None, weight_cols: int | None = None,
     weight_bytes_override: float | None = None,
     semantic_shape: tuple[int, ...] | None = None,
@@ -119,9 +122,14 @@ def gemm_op(
 ) -> OpSpec:
     quant = quant.for_category(category)
     m, n, k = int(m), int(n), int(k)
-    if m < 0 or min(n, k) < 1:
+    if m < ZERO or min(n, k) < ONE:
         raise ModelingError(f"matrix_geometry_invalid:{op_id}:{m},{n},{k}")
+    declared_compute = dict(metadata).get("compute_format")
     compute, act = compute_dtype_for(quant, category)
+    compute_format_origin = "catalog_default"
+    if declared_compute:
+        compute = str(declared_compute)
+        compute_format_origin = "explicit"
     act = activation_dtype or act
     out_dtype = matrix_output_format(
         quant, category, activation_dtype=act, output_dtype=output_dtype or "",
@@ -134,7 +142,7 @@ def gemm_op(
         if weight_bytes_override is not None
         else packed_weight_bytes(
             quant, int(weight_rows or n), int(weight_cols or k), category,
-            count=max(1, int(weight_count)),
+            count=max(ONE, int(weight_count)),
         )
     )
     if not m:
@@ -155,10 +163,11 @@ def gemm_op(
         ("input_format", act),
         ("output_format", out_dtype),
         ("compute_format", compute),
+        ("compute_format_origin", compute_format_origin),
         ("quant_category", category),
         ("catalog_category", category),
         ("packed_weight_bytes", weight_bytes),
-        ("matrix_groups", max(1, int(weight_count))),
+        ("matrix_groups", max(ONE, int(weight_count))),
         ("weight_representation", _layout_name(fmt, quant)),
         ("dequant_before_compute", fmt in {"mxfp4", "fp4", "fp4_e2m1"}),
         *((("activation_group_size", group),
@@ -166,7 +175,7 @@ def gemm_op(
            ("activation_scale_shape", scale_shape),
            ("activation_scale_bytes", float(scale_bytes)),
            ("activation_scale_in_mte2", True))
-          if scale_bytes > 0 else ()),
+          if scale_bytes > ZERO else ()),
     )
     if packed:
         existing_meta = dict(metadata)

@@ -46,6 +46,36 @@ jobs:
           name: sim-${{ matrix.os }}-${{ matrix.python }}
           path: ${{ runner.temp }}/results.xml
 
+  quality:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+      - name: LF line endings
+        run: python3 .github/scripts/check_lf_eol.py
+      - name: Differential numeric literals
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$BASE_SHA"
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          python3 -B scripts/check_no_magic_numbers.py --base "$base" --root .
+      - name: Issue #34 test budget and new-module limits
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: |
+          base="$BASE_SHA"
+          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            base="$(git rev-parse HEAD^)"
+          fi
+          python3 -B scripts/check_issue34_test_budget.py             --pattern 'tests/test_issue34_*.py' --limit-seconds 3             --artifacts "${{ runner.temp }}/issue34-fast" --base "$base"
+
   wheel:
     runs-on: ubuntu-latest
     steps:

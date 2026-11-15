@@ -1,0 +1,232 @@
+"""Physical prefix read reuse for batch index and attention access.
+
+[Role]
+  Separate logical per-query key traffic from unique physical HBM fills.  Shared
+  storage alone does not imply a source kernel reads a prefix once, so reuse is
+  applied only by a declared batch-reuse mechanism; a source program keeps its
+  own per-sequence semantics.
+
+[Invariants]
+  * HBM fill bytes deduplicate identical immutable physical ranges within the
+    declared reuse scope; MTE2/core bytes are reported separately because a
+    resident tile can feed several core transfers.
+  * Score FLOPs, query reads, writes, TopK work and output bytes never shrink.
+  * Prefix ownership and compression determine the prefix extent in index-row
+    space; speculative/private rows remain request-specific.
+  * ``per_sequence`` preserves the old read traffic even with pooled capacity.
+
+[Timeouts & Locks]
+  Bounded by accesses x ranges; no I/O or locks.
+
+[Side-Effect Policy]
+  Pure immutable records.
+"""
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass, replace
+import math
+from typing import Any
+
+from mindie_sim.schema.common import ModelingError
+
+
+ZERO = 0
+ONE = 1
+FIRST = 0
+ZERO_FLOAT = 0.0
+ONE_FLOAT = 1.0
+PAIR = 2
+MODE_AUTO = "auto"
+MODE_PER_SEQUENCE = "per_sequence"
+MODE_BATCH_SHARED = "batch_shared"
+MODES = frozenset({MODE_AUTO, MODE_PER_SEQUENCE, MODE_BATCH_SHARED})
+REUSE_TILE = "tile"
+REUSE_NONE = "none"
+REUSE_PER_SEQUENCE = "per_sequence"
+SUPPORTED_REUSE = frozenset({REUSE_TILE, "batch_tile"})
+NO_REUSE_REASONS = {
+    "mode_not_shared": "prefix_read_mode_not_batch_shared",
+    "single_access": "prefix_read_single_access",
+    "empty_prefix": "prefix_read_empty_shared_prefix",
+    "unsupported_kernel": "prefix_read_kernel_reuse_unsupported",
+}
+
+
+@dataclass(frozen=True)
+class CacheAccess:
+    """One query's declared key-cache access geometry."""
+
+    request_id: str
+    context_tokens: int
+    q_len: int = ONE
+    prefix_tokens: int = ZERO
+    prefix_key: str = ""
+    row_bytes: float = ONE_FLOAT
+    scale_bytes: float = ZERO_FLOAT
+    layer: int = ZERO
+    component: str = "index_k"
+    selected_tokens: tuple[tuple[int, int], ...] = ()
+
+
+@dataclass(frozen=True)
+class PrefixReadPlan:
+    """Logical versus unique-physical prefix read accounting."""
+
+    logical_query_bytes: float
+    unique_hbm_bytes: float
+    l2_to_core_bytes: float
+    query_read_bytes: float
+    scale_read_bytes: float
+    write_bytes: float
+    workspace_bytes: float
+    reuse_mechanism: str
+    read_reuse_applied: bool
+    reason: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "logical_query_bytes": float(self.logical_query_bytes),
+            "unique_hbm_bytes": float(self.unique_hbm_bytes),
+            "l2_to_core_bytes": float(self.l2_to_core_bytes),
+            "query_read_bytes": float(self.query_read_bytes),
+            "scale_read_bytes": float(self.scale_read_bytes),
+            "write_bytes": float(self.write_bytes),
+            "workspace_bytes": float(self.workspace_bytes),
+            "reuse_mechanism": self.reuse_mechanism,
+            "read_reuse_applied": bool(self.read_reuse_applied),
+            "reason": self.reason,
+        }
+
+
+def _access_tokens(access: CacheAccess) -> int:
+    context = max(ZERO, int(access.context_tokens))
+    q = max(ONE, int(access.q_len))
+    if q <= ONE:
+        return context + ONE
+    return context + q
+
+
+def _logical_rows(access: CacheAccess) -> float:
+    context = max(ZERO, int(access.context_tokens))
+    q = max(ONE, int(access.q_len))
+    total = ZERO
+    for index in range(q):
+        total += min(context + index + ONE, context + q)
+    return float(max(ONE, total))
+
+
+def _materialized_prefix(access: CacheAccess, cache_state: Mapping[str, Any] | None) -> int:
+    declared = max(ZERO, int(access.prefix_tokens))
+    if not cache_state:
+        return declared
+    entry = cache_state.get(access.prefix_key, cache_state.get("*"))
+    if entry is None:
+        return ZERO
+    if isinstance(entry, Mapping):
+        limit = entry.get("materialized_tokens", entry.get("valid_tokens"))
+        if limit is None:
+            return declared
+        return max(ZERO, min(declared, int(limit)))
+    if isinstance(entry, (int, float)) and not isinstance(entry, bool):
+        return max(ZERO, min(declared, int(entry)))
+    if isinstance(entry, Sequence) and not isinstance(entry, (str, bytes)):
+        spans = tuple(entry)
+        if spans and all(isinstance(item, Sequence) and len(item) == PAIR for item in spans):
+            return max((int(end) for _start, end in spans), default=ZERO)
+    return declared
+
+
+def plan_prefix_reads(
+    accesses: Sequence[CacheAccess], *, mode: str, kernel_reuse: str,
+    geometry: Any = None, cache_state: Mapping[str, Any] | None = None,
+) -> PrefixReadPlan:
+    """Project logical key reads onto unique physical ranges."""
+    del geometry
+    if mode not in MODES:
+        raise ModelingError(f"prefix_read_mode_unsupported:{mode}")
+    accesses = tuple(accesses)
+    logical = math.fsum(
+        float(_logical_rows(access)) * float(access.row_bytes)
+        + float(access.scale_bytes) * max(ONE, int(access.q_len))
+        for access in accesses)
+    query_reads = math.fsum(
+        float(max(ONE, int(access.q_len))) * float(access.row_bytes)
+        for access in accesses)
+    scale_total = math.fsum(
+        float(access.scale_bytes) * max(ONE, int(access.q_len))
+        for access in accesses)
+    if not accesses or mode == MODE_PER_SEQUENCE:
+        return PrefixReadPlan(
+            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["mode_not_shared"])
+    shared = [access for access in accesses if int(access.prefix_tokens) > ZERO]
+    if len(accesses) <= ONE:
+        return PrefixReadPlan(
+            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["single_access"])
+    if mode == MODE_BATCH_SHARED and kernel_reuse not in SUPPORTED_REUSE:
+        raise ModelingError("shared_prefix_kernel_reuse_unsupported")
+    if mode == MODE_AUTO and kernel_reuse not in SUPPORTED_REUSE:
+        return PrefixReadPlan(
+            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["unsupported_kernel"])
+    if not shared:
+        return PrefixReadPlan(
+            logical, logical, logical, query_reads, scale_total, ZERO, ZERO,
+            REUSE_PER_SEQUENCE, False, NO_REUSE_REASONS["empty_prefix"])
+    unique = ZERO
+    core = ZERO
+    logical_rows = math.fsum(_logical_rows(access) for access in accesses)
+    unique_rows = ZERO
+    groups: dict[tuple[int, str], tuple[int, float]] = {}
+    for access in accesses:
+        context = max(ZERO, int(access.context_tokens))
+        rows = _logical_rows(access)
+        prefix = min(_materialized_prefix(access, cache_state), context)
+        private = max(ZERO, rows - float(prefix))
+        unique += private * float(access.row_bytes)
+        core += private * float(access.row_bytes)
+        unique_rows += private
+        if prefix > ZERO:
+            key = (int(access.layer), str(access.prefix_key))
+            previous = groups.get(key)
+            if previous is None or prefix > previous[ZERO]:
+                groups[key] = (prefix, float(access.row_bytes))
+    for prefix, row in groups.values():
+        unique += float(prefix) * row
+        core += float(prefix) * row
+        unique_rows += float(prefix)
+    if logical_rows > ZERO:
+        unique_scale = scale_total * unique_rows / logical_rows
+    else:
+        unique_scale = scale_total
+    unique += unique_scale
+    core += unique_scale
+    return PrefixReadPlan(
+        logical, unique, core, query_reads, scale_total, ZERO, ZERO,
+        kernel_reuse, True, "")
+
+
+def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan) -> Any:
+    """Apply the plan's key-read delta to one operator record."""
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    metadata.update({
+        "prefix_read_mode": plan.reuse_mechanism,
+        "prefix_read_reuse_applied": bool(plan.read_reuse_applied),
+        "prefix_read_logical_bytes": float(plan.logical_query_bytes),
+        "prefix_read_hbm_bytes": float(plan.unique_hbm_bytes),
+        "prefix_read_l2_core_bytes": float(plan.l2_to_core_bytes),
+        "prefix_read_reason": plan.reason,
+    })
+    delta = float(plan.unique_hbm_bytes) - float(plan.logical_query_bytes)
+    delta_mte2 = float(plan.l2_to_core_bytes) - float(plan.logical_query_bytes)
+    return replace(
+        op,
+        hbm_bytes=max(ZERO, float(getattr(op, "hbm_bytes", ZERO)) + delta),
+        mte2_bytes=max(ZERO, float(getattr(op, "mte2_bytes", ZERO)) + delta_mte2),
+        metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[FIRST])),
+        notes=tuple(getattr(op, "notes", ()) or ()) + (
+            "prefix_read_plan_applied" if plan.read_reuse_applied
+            else "prefix_read_plan_not_applied",),
+    )

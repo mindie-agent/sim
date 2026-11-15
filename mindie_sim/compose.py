@@ -98,6 +98,22 @@ _EXTRA_QUANT_SPECS: dict[str, QuantSpec] = {
     ),
 }
 
+DEFAULT_PARALLEL = 1
+DEFAULT_ZERO = 0
+DEFAULT_PROMPT_TOKENS = 4096
+DEFAULT_OUTPUT_TOKENS = 128
+DEFAULT_PREFIX_TOKENS = 0
+DEFAULT_CONCURRENCY = 1
+DEFAULT_BLOCK_SIZE = 128
+DEFAULT_ARRIVAL_GAP_MS = 0.0
+DEFAULT_MTP_TOKENS = 0
+DEFAULT_MTP_ACCEPT = 1.0
+DEFAULT_TTFT_MS = 5000.0
+DEFAULT_TPOT_MS = 50.0
+DEFAULT_LOCAL_WIDTH = 1
+DEFAULT_REDUNDANT_EXPERTS = 0
+
+
 def _arch_key(sku: str) -> str:
     if sku.startswith(("Ascend950", "Ascend910_95")):
         return "a5"
@@ -368,12 +384,12 @@ def _apply_structural_overrides(
 def compose_case(
     model: str | Path | Mapping[str, Any],
     hardware: str | Mapping[str, Any] = "a3",
-    tp: int = 1,
-    dp: int = 1,
-    ep: int = 1,
-    pp: int = 1,
-    pcp: int = 1,
-    dcp: int = 1,
+    tp: int = DEFAULT_PARALLEL,
+    dp: int = DEFAULT_PARALLEL,
+    ep: int = DEFAULT_PARALLEL,
+    pp: int = DEFAULT_PARALLEL,
+    pcp: int = DEFAULT_PARALLEL,
+    dcp: int = DEFAULT_PARALLEL,
     sp: bool = False,
     num_devices: int | None = None,
     ranks_per_node: int | None = None,
@@ -381,22 +397,22 @@ def compose_case(
     layers: int | None = None,
     n_routed_experts: int | None = None,
     num_experts_per_tok: int | None = None,
-    prompt_tokens: int = 4096,
-    output_tokens: int = 128,
-    concurrency: int = 1,
-    prefix_tokens: int = 0,
-    arrival_gap_ms: float = 0.0,
+    prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
+    output_tokens: int = DEFAULT_OUTPUT_TOKENS,
+    concurrency: int = DEFAULT_CONCURRENCY,
+    prefix_tokens: int = DEFAULT_PREFIX_TOKENS,
+    arrival_gap_ms: float = DEFAULT_ARRIVAL_GAP_MS,
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
     max_model_len: int | None = None,
-    block_size: int = 128,
+    block_size: int = DEFAULT_BLOCK_SIZE,
     enable_chunked_prefill: bool = True,
     async_scheduling: bool = False,
     graph_capture_mode: str = "none",
-    mtp_proposal_tokens: int = 0,
-    mtp_acceptance_length: float = 1.0,
-    ttft_slo_ms: float = 5000.0,
-    tpot_slo_ms: float = 50.0,
+    mtp_proposal_tokens: int = DEFAULT_MTP_TOKENS,
+    mtp_acceptance_length: float = DEFAULT_MTP_ACCEPT,
+    ttft_slo_ms: float = DEFAULT_TTFT_MS,
+    tpot_slo_ms: float = DEFAULT_TPOT_MS,
     inter_node_bw_gbps: float | None = None,
     intra_node_bw_gbps: float | None = None,
     intra_package_bw_gbps: float | None = None,
@@ -415,6 +431,26 @@ def compose_case(
     va_recommended: bool = False,
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
+    *,
+    o_proj_tp: int = DEFAULT_LOCAL_WIDTH,
+    linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
+    lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
+    redundant_experts_per_rank: int = DEFAULT_REDUNDANT_EXPERTS,
+    collective_startup_mode: str = "legacy",
+    matrix_compute_policy: str = "auto",
+    recover_ssm: bool = False,
+    prefix_cache_mode: str = "private",
+    prefix_read_mode: str = "auto",
+    homogeneous_graph_reuse: str = "off",
+    prefix_cache_key: str = "",
+    hardware_derivation: Mapping[str, Any] | None = None,
+    aic_count: int | None = None,
+    aiv_count: int | None = None,
+    memory_bytes: int | None = None,
+    hbm_peak_bytes_per_s: float | None = None,
+    hbm_efficiency: Any = None,
+    mte2_ceiling_bytes_per_s: float | None = None,
+    mte2_efficiency: Any = None,
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -623,6 +659,7 @@ def compose_case(
             "prompt_tokens": int(prompt_tokens),
             "output_tokens": int(output_tokens),
             "prefix_tokens": int(prefix_tokens),
+            "prefix_cache_key": str(prefix_cache_key),
         }
         for idx in range(int(concurrency))
     ]
@@ -639,11 +676,21 @@ def compose_case(
     runtime_dict: dict[str, Any] = {
         "parallel": {
             "dp": dp, "tp": tp, "pp": pp, "ep": ep, "cp": dcp, "dcp": dcp, "pcp": pcp,
-            **({"rank_table": [list(range(g * int(ep), (g + 1) * int(ep)))
+            **({"rank_table": [list(range(g * int(ep), (g + DEFAULT_PARALLEL) * int(ep)))
                                for g in range((int(dp) * int(tp) * int(pcp)) // int(ep))]}
-               if int(pcp) > 1 and int(ep) > int(dp) * int(tp)
-               and (int(dp) * int(tp) * int(pcp)) % int(ep) == 0 else {}),
+               if int(pcp) > DEFAULT_PARALLEL and int(ep) > int(dp) * int(tp)
+               and (int(dp) * int(tp) * int(pcp)) % int(ep) == DEFAULT_ZERO else {}),
+            "o_proj_tp": int(o_proj_tp),
+            "linear_proj_tp": int(linear_proj_tp),
+            "lm_head_tp": int(lm_head_tp),
+            "redundant_experts_per_rank": int(redundant_experts_per_rank),
         },
+        "collective_startup_mode": str(collective_startup_mode),
+        "matrix_compute_policy": str(matrix_compute_policy),
+        "recover_ssm": bool(recover_ssm),
+        "prefix_cache_mode": str(prefix_cache_mode),
+        "prefix_read_mode": str(prefix_read_mode),
+        "homogeneous_graph_reuse": str(homogeneous_graph_reuse),
         "max_num_seqs": resolved_max_seqs,
         "max_num_batched_tokens": resolved_max_batched,
         "max_model_len": resolved_max_model_len,
@@ -719,6 +766,26 @@ def compose_case(
         "slo": {"ttft_ms": float(ttft_slo_ms), "tpot_ms": float(tpot_slo_ms)},
     }
     parse_case(case_dict)
+    derivation = dict(hardware_derivation or {})
+    for key, value in (
+        ("aic_count", aic_count), ("aiv_count", aiv_count),
+        ("memory_bytes", memory_bytes),
+        ("hbm_peak_bytes_per_s", hbm_peak_bytes_per_s),
+        ("hbm_efficiency", hbm_efficiency),
+        ("mte2_ceiling_bytes_per_s", mte2_ceiling_bytes_per_s),
+        ("mte2_efficiency", mte2_efficiency),
+    ):
+        if value is None:
+            continue
+        if key in derivation and derivation[key] != value:
+            raise ModelingError(f"hardware_derivation_conflict:{key}")
+        derivation[key] = value
+    if derivation:
+        from mindie_sim.issue34_cli import _derived_machine
+        parsed = parse_case(case_dict)
+        derived = _derived_machine(parsed.machine, derivation)
+        case_dict["machine"] = _to_jsonable(derived)
+        parse_case(case_dict)
     return case_dict
 
 

@@ -334,6 +334,9 @@ class PairwiseGroup:
 class PairwisePlan:
     family: str
     groups: tuple[PairwiseGroup, ...]
+    #: Declared startup model (abstract); a physical program owns its arrivals.
+    startup_rounds: int | None = None
+    startup_application: str = "startup_model"
 
     @property
     def ranks(self):

@@ -208,3 +208,16 @@ combine different report denominators or claim hardware acceptance. The output
 keeps input hashes, ranked repeated costs, candidate matching limits, separate
 signed/absolute residuals and unpaired predicted cost. No DSH wave or hardware
 experiment is launched by this diagnostic.
+
+## Issue #34 refinement boundaries
+
+Runtime verify-window state/record geometry, local projection placement, prefix
+owner ranges and expert-slot residency are structural refinements of the
+existing records. They add explicit work, residency and communication terms; no
+serving floor, body-total fit, measurement-presence gate or vendor branch is
+introduced. Generic MXA8W4 precision resolves at hardware binding only after
+explicit source/recipe identity is known, so an existing typed or calibrated
+implementation keeps its declared compute identity. Exposed-time attribution is
+a realized-schedule decomposition, not a speedup prediction; `exposed_breakdown`
+does not replace MBU/MFU or isolated operator latency. See
+[`issue34-features.md`](issue34-features.md).

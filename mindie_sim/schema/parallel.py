@@ -9,6 +9,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Sequence
 from mindie_sim.schema.common import ModelingError, _int, _mapping, _unknown
+from mindie_sim.schema.runtime_features import (
+    LOCAL_PARALLEL_DEFAULTS, ONE, PARALLEL_FEATURE_NAMES, ZERO,
+    normalize_parallel_features,
+)
 from typing import Any, Mapping
 
 _CP_PLAN_ALIASES = {
@@ -185,6 +189,14 @@ class ParallelSpec:
     pcp_lane_policy: str = "park_extra_lanes"
     rank_table: tuple[tuple[int, ...], ...] | None = None
     enable_dsa_cp: bool = False
+    #: Node-local dense-subgraph TP widths.  They partition ranks inside one
+    #: node/stage/PCP lane without adding a world axis; global ``tp`` remains
+    #: the attention tensor-parallel degree.
+    o_proj_tp: int = ONE
+    linear_proj_tp: int = ONE
+    lm_head_tp: int = ONE
+    #: Extra resident physical routed-expert slots per EP owner rank.
+    redundant_experts_per_rank: int = ZERO
 
 
     def __post_init__(self) -> None:
@@ -235,6 +247,13 @@ class ParallelSpec:
             value = getattr(self, name)
             if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 1):
                 raise ModelingError(f"{name}_invalid:{value}")
+        for name in ("o_proj_tp", "linear_proj_tp", "lm_head_tp",
+                     "redundant_experts_per_rank"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < ZERO:
+                raise ModelingError(f"{name}_invalid:{value}")
+        if self.o_proj_tp < ONE or self.linear_proj_tp < ONE or self.lm_head_tp < ONE:
+            raise ModelingError("local_projection_tp_must_be_positive")
         table = self.rank_table
         if table is not None:
             if not isinstance(table, tuple) or not table or not all(
@@ -273,6 +292,8 @@ class ParallelSpec:
             "decode_context_parallel_size", "enable_expert_parallel",
             "prefill_cp_plan", "decode_cp_plan",
             "expert_tp", "expert_dp", "pcp_lane_policy", "rank_table",
+            "o_proj_tp", "linear_proj_tp", "kda_proj_tp", "lm_head_tp",
+            "redundant_experts_per_rank",
         }
         # ``prefill_cp_plan``/``decode_cp_plan`` are declaration aliases for
         # ``cp_plan``; they are resolved into the single plan name above and
@@ -357,6 +378,8 @@ class ParallelSpec:
                     row.append(rank)
                 groups.append(tuple(row))
             rank_table = tuple(groups)
+        features = normalize_parallel_features({
+            key: raw[key] for key in PARALLEL_FEATURE_NAMES if key in raw})
         spec = cls(
             dp=dp, tp=tp, ep=ep, pp=pp,
             cp=cp, dcp=cp, pcp=pcp, cp_plan=str(plan_raw),
@@ -364,6 +387,8 @@ class ParallelSpec:
             expert_tp=raw.get("expert_tp"), expert_dp=raw.get("expert_dp"),
             pcp_lane_policy=str(raw.get("pcp_lane_policy", "park_extra_lanes")),
             rank_table=rank_table,
+            **{key: features[key] for key in LOCAL_PARALLEL_DEFAULTS
+               if key in features},
         )
         # ``world_size`` is derived, but when a source declares it the value
         # must agree with the axes.  Silently dropping it would accept a
@@ -518,7 +543,9 @@ class ParallelSpec:
         out = {key: getattr(self, key) for key in (
             "dp", "tp", "ep", "pp", "cp", "pcp", "cp_plan",
             "prefill_cp_plan", "decode_cp_plan", "enable_dsa_cp",
-            "expert_tp", "expert_dp", "pcp_lane_policy")}
+            "expert_tp", "expert_dp", "pcp_lane_policy",
+            "o_proj_tp", "linear_proj_tp", "lm_head_tp",
+            "redundant_experts_per_rank")}
         if self.rank_table is not None:
             out["rank_table"] = [list(group) for group in self.rank_table]
         return out

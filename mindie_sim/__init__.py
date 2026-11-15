@@ -18,6 +18,8 @@ from .study import study
 from .prediction.call import call_costs
 from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
+from .hardware_derivation import derive_hardware_sku
+from .hardware_efficiency import EfficiencyCurve
 from .custom_hardware import (
     HARDWARE_ARCHETYPE_TEMPLATES,
     build_custom_hardware_machine,
@@ -97,12 +99,14 @@ from .public import (
 __version__ = "0.9.14"
 __all__ = ["predict", "predict_pd", "attribute_diff", "effective_operator_rows", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
-           "compose_case", "resolve_hardware_sku", "customize_model_spec",
+           "compose_case", "resolve_hardware_sku", "derive_hardware_sku",
+           "EfficiencyCurve", "customize_model_spec",
            "HARDWARE_ARCHETYPE_TEMPLATES", "export_hardware_sku_template",
            "build_custom_hardware_machine", "register_custom_hardware_sku",
            "unregister_custom_hardware_sku", "clear_custom_hardware_skus",
            "list_custom_hardware_skus", "load_custom_hardware_skus_from_file",
            "resolve_custom_hardware_sku", "compose_custom_case",
+           "derive_hardware_sku",
            "advise_case", "load_case_from_profile",
            "analyze_network_efficiency", "analyze_operator_row", "evaluate_target_efficiency",
            "fit_efficiency_targets", "scale_case_hardware", "solve_hardware_sla_throughput",

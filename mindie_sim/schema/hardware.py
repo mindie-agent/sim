@@ -25,6 +25,13 @@ from .device_input import machine_device_defaults, merge_device_inputs
 from .invocation import InvocationTiming
 from .compute_arch import ComputeArchSpec
 
+ZERO = 0
+ONE = 1
+from .compute_peak_aliases import (
+    native_compute_peak_items, resolve_compute_peak_name,
+    validate_compute_peak_aliases,
+)
+
 
 NATIVE_WORK_UNITS = {
     **dict.fromkeys(("hbm", "mte1", "mte2", "mte2_aic", "mte2_aiv", "mte3",
@@ -72,6 +79,9 @@ class Device:
     instruction_unit_overrides: tuple[str, ...] = ()
     sku: str = ""
     arch_family: str = ""
+    #: Declared reporting/supply aliases (``mxfp4 -> fp8_e4m3``).  These are
+    #: never native operand modes and must carry the target's exact peak.
+    compute_peak_aliases: tuple[tuple[str, str], ...] = ()
 
     @property
     def capability(self) -> ComputeArchSpec:
@@ -82,6 +92,7 @@ class Device:
         """Hashable physical identity without rank/node/package labels."""
         arch = self.compute_arch
         return (self.sku, self.arch_family, self.memory_bytes, self.compute_peaks,
+                self.compute_peak_aliases,
                 self.rates, self.buffers, self.compute_units, self.resource_units,
                 self.buffer_units, self.service_modes, self.work_units,
                 self.launch_us,
@@ -121,13 +132,17 @@ class Device:
 
     def peak(self, dtype):
         peaks = dict(self.compute_peaks)
+        supply = dict(self.compute_peak_aliases)
         aliases = {"bfloat16": "bf16", "float16": "fp16", "float32": "fp32",
                    "fp8_e4m3": "fp8", "fp8_e5m2": "fp8"}
-        name = dtype if dtype in peaks else aliases.get(dtype, dtype)
+        native = (resolve_compute_peak_name(dtype, peaks, supply)
+                  if supply else dtype)
+        name = native if native in peaks else aliases.get(native, native)
         if self.compute_arch.has_native_modes():
             # A rate is not a capability. Registered architectures must name a
             # native operand/accumulator mode before its peak can price work.
-            self.compute_arch.native_mode("matrix", dtype)
+            # An alias resolves to its native target; it never becomes one.
+            self.compute_arch.native_mode("matrix", native)
         if name not in peaks:
             raise ModelingError(f"compute_precision_rate_required:{dtype}")
         return peaks[name]
@@ -200,6 +215,8 @@ class Device:
                 **({"compute_arch": self.compute_arch.to_dict()}
                    if self.compute_arch.instruction_services
                    or self.compute_arch.has_capabilities() else {}),
+                **({"compute_peak_aliases": dict(self.compute_peak_aliases)}
+                   if self.compute_peak_aliases else {}),
                 **({"work_units": dict(self.work_units)} if self.work_units else {}),
                 **({"store_queues": {name: dict(queue) for name, queue in self.store_queues}}
                    if self.store_queues else {}),
@@ -555,6 +572,28 @@ def _transfer_channel(channel: Mapping, name: str = "transfer") -> Link:
     )
 
 
+COLLECTIVE_PROTOCOL_KEYS = frozenset({"alltoall", "alltoallv"})
+COLLECTIVE_PROTOCOL_VALUES = frozenset({"ring", "log2", "concurrent"})
+
+
+def _collective_protocols(value) -> tuple[tuple[str, str], ...]:
+    """Validate a hardware-declared AllToAll startup protocol map."""
+    if value is None or value == ():
+        return ()
+    if not isinstance(value, Mapping):
+        raise ModelingError("collective_protocols_mapping_required")
+    result = {}
+    for key, item in value.items():
+        name = str(key).strip().lower()
+        mode = str(item).strip().lower() if isinstance(item, str) else ""
+        if name not in COLLECTIVE_PROTOCOL_KEYS:
+            raise ModelingError(f"collective_protocol_unknown:{name}")
+        if mode not in COLLECTIVE_PROTOCOL_VALUES:
+            raise ModelingError(f"collective_protocol_unsupported:{name}:{item}")
+        result[name] = mode
+    return tuple(sorted(result.items()))
+
+
 @dataclass(frozen=True)
 class Hardware:
     name: str
@@ -572,6 +611,9 @@ class Hardware:
     topology_options: tuple[tuple[str, object], ...] = field(
         default=(), compare=False, repr=False
     )
+    #: Declared AllToAll/AllToAllV startup protocols.  Empty preserves the
+    #: legacy per-profile behavior; no SKU or latency value implies a protocol.
+    collective_protocols: tuple[tuple[str, str], ...] = ()
 
     @property
     def homogeneous(self) -> bool:
@@ -613,7 +655,7 @@ class Hardware:
                 return device.sku
         raise ModelingError(f"hardware_placement_unknown:{rank}")
 
-    def hardware_context(self, rank: int = 0) -> dict:
+    def hardware_context(self, rank: int = ZERO) -> dict:
         """Minimal neutral hardware context for independent operator/native use.
 
         It carries only the actual placement's facts and the derived
@@ -635,6 +677,7 @@ class Hardware:
             "memory_bytes": device.memory_bytes,
             "compute_units": device.compute_units,
             "compute_peaks": dict(device.compute_peaks),
+            "compute_peak_aliases": dict(device.compute_peak_aliases),
             "rates": dict(device.rates),
             "resource_units": dict(device.resource_units),
             "buffers": dict(device.buffers),
@@ -802,10 +845,16 @@ class Hardware:
                 raise ModelingError(
                     "compute_peaks_without_native_capability:"
                     f"{data.get('sku', arch_family)}")
+            raw_aliases = data.get("compute_peak_aliases")
+            if raw_aliases is None:
+                raw_aliases = (explicit_record.get("compute_peak_aliases")
+                               or raw_in.get("compute_peak_aliases") or {})
+            aliases = dict(raw_aliases) if isinstance(raw_aliases, Mapping) else raw_aliases
+            validate_compute_peak_aliases(peaks, aliases, arch)
             if arch.has_native_modes():
                 # Calibration and explicit overrides go through this same parse:
                 # a rate for an undeclared native mode is rejected, not priced.
-                arch.validate_peaks(peaks)
+                arch.validate_peaks(peaks, aliases=aliases)
             arch_rates, arch_units, arch_work_units, arch_modes = arch.supplies(
                 int(data.get("compute_units", 1)), data.get("resource_units", {}),
                 data.get("rates", {}))
@@ -835,8 +884,8 @@ class Hardware:
                 rank=int(data.get("rank", index)), memory_bytes=memory,
                 compute_peaks=tuple(sorted(peaks.items())), rates=tuple(sorted(rates.items())),
                 buffers=tuple(sorted(buffers.items())),
-                compute_units=int(data.get("compute_units", 1) or 1),
-                launch_us=float(data.get("launch_us", 0)),
+                compute_units=int(data.get("compute_units", ONE) or ONE),
+                launch_us=float(data.get("launch_us", ZERO)),
                 node=int(data.get("node", index // ranks_per_node)),
                 package=int(data.get("package", index // package)),
                 resource_units=tuple(sorted(units.items())),
@@ -850,6 +899,9 @@ class Hardware:
                 store_queues=tuple(sorted((name, tuple(sorted(queue.items())))
                                           for name, queue in data.get("store_queues", {}).items())),
                 compute_arch=arch,
+                compute_peak_aliases=tuple(sorted(dict(
+                    raw_aliases if isinstance(raw_aliases, Mapping) else
+                    tuple(raw_aliases or ())).items())),
                 linked_rate_overrides=tuple(sorted(s.name for s in arch.instruction_services
                     if (s.scale_with or s.clock_hz is not None) and s.name in data.get("rates", {}))),
                 instruction_mode_overrides=tuple(sorted(s.name for s in arch.instruction_services
@@ -894,7 +946,9 @@ class Hardware:
                    topology_options=tuple(sorted(
                        (str(k), raw[k]) for k in _PRESERVED_TOPOLOGY_KEYS
                        if raw.get(k) is not None
-                   )))
+                   )),
+                   collective_protocols=_collective_protocols(
+                       raw_in.get("collective_protocols", ())))
 
     def to_dict(self):
         return {"name": self.name, "architecture": self.arch_family, "hardware_key": self.hardware_key,
@@ -904,7 +958,9 @@ class Hardware:
                 "dies_per_package": self.dies_per_package, "assumptions": dict(self.assumptions),
                 **({"transfer_channels": {
                     name: dict(items) for name, items in self.transfer_channels}}
-                   if self.transfer_channels else {})}
+                   if self.transfer_channels else {}),
+                **({"collective_protocols": dict(self.collective_protocols)}
+                   if self.collective_protocols else {})}
 
 
 def _alias_cores(mapping: Mapping) -> dict:

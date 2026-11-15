@@ -44,7 +44,8 @@ _NUMBER = re.compile(r"-?(?:\d+\.\d*|\.\d+|\d+)(?:[eE][-+]?\d+)?")
 from copy import deepcopy
 from .compose import compose_case
 from .schema.model import WorkloadSpec
-from .schema.case import Case
+from .schema.case import Case, Software
+from .schema.parallel import ParallelSpec
 from .catalog.types import QuantSpec
 
 _SCALAR = {
@@ -212,11 +213,18 @@ def _scrub_case(value, secrets=()):
     def walk(data, record):
         if isinstance(data, dict) and is_dataclass(record):
             aliases = {"devices": "dies", "architecture": "arch_family"}
-            # These validated quantization enums describe schema policy, not
-            # credential payload (e.g. a YAML secret `off` in `scale_offset`).
+            # These validated schema enums describe policy, not credential
+            # payload (e.g. a YAML secret `off` colliding with a runtime mode).
             enums = {"int8_weight_metadata", "runtime_int8_weight_metadata"}
-            return {key: (item if isinstance(record, QuantSpec) and key in enums
-                          and item in {"", "scale_only", "scale_offset"}
+            modes = {"collective_startup_mode", "matrix_compute_policy",
+                     "prefix_cache_mode", "prefix_read_mode",
+                     "homogeneous_graph_reuse", "moe_recipe", "graph_mode",
+                     "graph_capture_mode", "final_norm_scope", "cp_plan",
+                     "pcp_lane_policy"}
+            return {key: (item if (isinstance(record, QuantSpec) and key in enums
+                                  and item in {"", "scale_only", "scale_offset"})
+                          or (isinstance(record, (Software, ParallelSpec))
+                              and key in modes)
                           else walk(item, getattr(record, aliases.get(key, key), None)))
                     for key, item in data.items()}
         if isinstance(data, (list, tuple)) and isinstance(record, (list, tuple)):

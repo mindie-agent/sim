@@ -13,6 +13,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
+ONE = 1
 
 def _local_draft_experts(num_experts: int, ep: int) -> int:
     """Experts held on one EP rank.
@@ -109,7 +110,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
 
 
 def _draft_ffn_terms(
-    draft: DraftSpec, model: ModelSpec, *, ep: int = 1,
+    draft: DraftSpec, model: ModelSpec, *, ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
     terms: list[WeightTerm] = []
@@ -154,7 +155,7 @@ def _draft_ffn_terms(
 
 def draft_terms(
     draft: DraftSpec, model: ModelSpec, *, standalone_heads_only: bool = False,
-    ep: int = 1,
+    ep: int = ONE,
 ) -> list[WeightTerm]:
     h = draft.hidden_size
     terms: list[WeightTerm] = []
@@ -204,7 +205,11 @@ def draft_terms(
         if draft.confidence_enabled and draft.confidence_executes:
             width = draft.confidence_input_width or (h + draft.markov_rank)
             terms.append(_t("confidence_head", 1, width, "norm"))
-    return [replace(term, quant=draft_quant(model, draft)) for term in terms]
+    from mindie_sim.catalog.projection_placement import projection_role
+    return [replace(term, quant=draft_quant(model, draft),
+                    placement_role=projection_role(
+                        None, term.name, scope="draft"))
+            for term in terms]
 
 
 def draft_weight_summary(
