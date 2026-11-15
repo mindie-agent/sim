@@ -29,13 +29,16 @@ from .feature_cli import COMMANDS as FEATURE_COMMANDS, main as feature_main
 __all__ = ["main", "parser", "run", "PUBLIC_COMMANDS", "FEATURE_COMMANDS", "EXTENDED_COMMANDS"]
 
 
+_ARGV_START = 1; _CMD_IDX = 0
+
+
 def main(argv=None):
-    args = list(sys.argv[1:] if argv is None else argv)
-    if args and args[0] in FEATURE_COMMANDS:
+    args = list(sys.argv[_ARGV_START:] if argv is None else argv)
+    if args and args[_CMD_IDX] in FEATURE_COMMANDS:
         return feature_main(args, prog="mindie-sim")
-    if args and args[0] in EXTENDED_COMMANDS:
+    if args and args[_CMD_IDX] in EXTENDED_COMMANDS:
         return extended_main(args, prog="mindie-sim")
-    if args and args[0] in PUBLIC_COMMANDS:
+    if args and args[_CMD_IDX] in PUBLIC_COMMANDS:
         return public_main(args, prog="mindie-sim")
     return _core_main(args)
 

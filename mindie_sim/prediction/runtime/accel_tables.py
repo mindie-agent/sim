@@ -65,10 +65,11 @@ def wide_integer(task) -> bool:
 
 #: Exact non-weakrefable CPython built-ins checked by type identity (`tp_weaklistoffset == 0`).
 _NONE_TYPE = type(None)
+_ROOT_DEPTH = 0
 _INERT_MAX_DEPTH = 8
 
 
-def _is_inert_builtin(obj, depth: int = 0) -> bool:
+def _is_inert_builtin(obj, depth: int = _ROOT_DEPTH) -> bool:
     """Exact immutable built-in (identity-only types).
 
     The depth budget is checked first: an exhausted traversal is unproven and
@@ -152,7 +153,7 @@ def _event_is_stable(event) -> bool:
     return all(type(key) is int for key in event._waiters)
 
 
-def _contains_mutable_container(obj, depth: int = 0) -> bool:
+def _contains_mutable_container(obj, depth: int = _ROOT_DEPTH) -> bool:
     """A caller-aliased container can gain a finalizer after admission.
 
     Reaching the depth budget is unproven, so it fails closed.  Nine

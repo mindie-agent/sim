@@ -276,18 +276,21 @@ class TrafficLedger:
                 f"traffic_ledger_baseline_mismatch:{selected_baseline}:{base}")
 
 
+_ZERO_BYTES = 0; _UNIT_COUNT = 1
+
+
 def traffic_ledger(graph: TypedGraph, members: Iterable[str], *, tile_rows: int,
-                   channel_width: int | None = None, spill_bytes: int = 0,
-                   rows: int | None = None, tensor_parallel: int = 1,
+                   channel_width: int | None = None, spill_bytes: int = _ZERO_BYTES,
+                   rows: int | None = None, tensor_parallel: int = _UNIT_COUNT,
                    reduction_merge: ReductionMerge | None = None) -> TrafficLedger:
     chosen = tuple(dict.fromkeys(members))
     total_rows = int(rows or graph.rows)
-    tile_rows = max(1, min(int(tile_rows), total_rows))
+    tile_rows = max(_UNIT_COUNT, min(int(tile_rows), total_rows))
     external = external_readers(graph, chosen)
     readers: dict[str, int] = {}
     for op_id in chosen:
         for value_id in graph.ops[op_id].inputs:
-            readers[value_id] = readers.get(value_id, 0) + 1
+            readers[value_id] = readers.get(value_id, _ZERO_BYTES) + _UNIT_COUNT
     produced = {v for op_id in chosen for v in graph.ops[op_id].outputs}
     value_rank = _graph_index(graph)["value_rank"]
     touched = sorted(produced | readers.keys(), key=value_rank.__getitem__)

@@ -38,6 +38,7 @@ class ReportValidationError(ValueError):
 
 _FIELD_NAMES: dict[type, tuple[str, ...]] = {}
 _SCALAR_TYPES = frozenset({str, int, bool})
+_ZERO_INT = 0; _ZERO_FLOAT = 0.0
 
 
 def _plain(value):
@@ -66,7 +67,7 @@ def _plain(value):
     if isinstance(value, float):
         if not math.isfinite(value):
             raise ValueError("report_number_must_be_finite")
-        return 0.0 if value == 0 else value
+        return _ZERO_FLOAT if value == _ZERO_INT else value
     if isinstance(value, (str, int, bool)):
         return value
     raise ValueError(f"report_value_not_json:{cls.__name__}")
@@ -314,7 +315,7 @@ def validate_launch_report(report) -> tuple[str, ...]:
                 data.get("assumptions")]
     for index, payload in enumerate(payloads):
         has_cred = (bool(_CREDENTIAL_RE.search(dumped_case))
-                    if index == 0 and dumped_case is not None
+                    if index == _ZERO_INT and dumped_case is not None
                     else _has_credential_in_payload(payload))
         if has_cred:
             errors.append(f"L03:payload[{index}]:secret_in_payload")

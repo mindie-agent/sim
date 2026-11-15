@@ -171,3 +171,83 @@ def test_fast_eval_non_integer_fraction_operands_parity() -> None:
     for expr in cases:
         assert expr.evaluate(env) == expr._slow_evaluate(env)
 
+
+def test_fast_single_tier_coupled_multi_step_private_limit_ulp_safety() -> None:
+    import math
+    from types import SimpleNamespace
+    from mindie_sim.prediction.runtime.arbiter_fast_coupled import fast_single_tier_coupled
+    from mindie_sim.prediction.runtime.arbiter_tiered import _tiered_coupled
+
+    # Exact IEEE-754 witness: u_cap = 0.1, w = 3.0 => lim = 0.1 / 3.0, and at
+    # a1 = lim * 0.052, (a1 + (lim - a1)) > lim and (a1 + (lim - a1)) * 3.0 > 0.1.
+    u_cap = 0.1
+    lim = u_cap / 3.0
+    a1 = lim * 0.052
+    assert (a1 + (lim - a1)) > lim
+    assert (a1 + (lim - a1)) * 3.0 > u_cap
+
+    resources = {
+        "mte1@r0:s0": SimpleNamespace(rate=u_cap * 4.0, units=4, policy="fair"),
+        "shared_a": SimpleNamespace(rate=100.0, units=1, policy="fair"),
+        "shared_b": SimpleNamespace(rate=2.0 * a1, units=1, policy="fair"),
+    }
+    tasks = {
+        0: SimpleNamespace(
+            priority=0, start=0.0, coupled=True, cohort_size=30,
+            remaining={"mte1@r0:s0": 1.0, "shared_a": 1.0},
+            placement={"mte1@r0:s0": (2,), "shared_a": (0,)},
+            caps={},
+        ),
+        1: SimpleNamespace(
+            priority=0, start=0.0, coupled=True, cohort_size=1,
+            remaining={"shared_a": 100.0, "shared_b": 2.0 * a1},
+            placement={"shared_a": (0,), "shared_b": (0,)},
+            caps={},
+        ),
+        2: SimpleNamespace(
+            priority=0, start=0.0, coupled=True, cohort_size=1,
+            remaining={"shared_b": 2.0 * a1},
+            placement={"shared_b": (0,)},
+            caps={},
+        ),
+    }
+    fast = fast_single_tier_coupled(resources, tasks, {0, 1, 2})
+    ref = _tiered_coupled(resources, tasks, {0, 1, 2}, None)
+    assert fast is not None
+    assert fast["mte1@r0:s0"][0] <= u_cap
+    for rname, rows in ref.items():
+        for k, v in rows.items():
+            assert fast[rname][k] == pytest.approx(v, rel=1e-12, abs=1e-12)
+
+
+def test_weights_memo_handles_unhashable_runtime_quant_dict() -> None:
+    from dataclasses import replace
+    from mindie_sim.catalog.types import QuantSpec
+    from mindie_sim.catalog.weights import (
+        stage_weight_bytes, stage_weight_decomposition, weight_breakdown,
+    )
+    from mindie_sim.compose import compose_case
+    from mindie_sim.prediction.structure import parse_case
+
+    case = parse_case(compose_case(
+        "qwen3-30b-a3b", "a3", tp=2, ep=2, layers=2, prompt_tokens=32, output_tokens=4,
+    ))
+    unhashable_quant = QuantSpec(
+        "W4A8_DYNAMIC",
+        weight_format="int8",
+        activation_format="int8",
+        source=(("evidence_identity", {"sha256": "deadbeef", "size_bytes": 42}),),
+    )
+    patched_plans = tuple(
+        replace(plan, owns_index_k=True, indexer=True, index_heads=8, index_dim=64, index_kpool=4)
+        for plan in case.model.layer_plans
+    )
+    model = replace(case.model, quant=unhashable_quant, layer_plans=patched_plans)
+    par = case.runtime.parallel
+    assert stage_weight_bytes(model, par)[0] > 0
+    assert stage_weight_decomposition(model, par)[0]["total_bytes"] > 0
+    assert sum(weight_breakdown(model, par).values()) > 0
+
+
+
+

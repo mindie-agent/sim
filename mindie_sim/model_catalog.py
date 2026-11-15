@@ -750,9 +750,9 @@ def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
         raise ModelingError(f"model_config_unreadable:{key}:{type(exc).__name__}") from exc
     return _build_model_spec(key, config)
 
-
+_DEFAULT_NODE_RANKS = 1
 def sharded_weight_bytes(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1, *,
+    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = _DEFAULT_NODE_RANKS, *,
     include_draft: bool = False, include_engram: bool = True,
 ) -> float:
     """Largest actual PP-stage per-rank weight footprint."""

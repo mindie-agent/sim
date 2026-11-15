@@ -148,7 +148,11 @@ def _periodic_probe(resources, pools, slots, head_records, steady_records, tail_
     return done.time, tuple(sorted(engine.peak_allocated.items()))
 
 
-@lru_cache(maxsize=1024)
+_PERIODIC_CACHE_SIZE = 1024
+_ONE_TILE = 1; _TWO_FACTOR = 2; _THREE_FACTOR = 3; _FOUR_TILES = 4; _DEFAULT_THRESHOLD = 8
+
+
+@lru_cache(maxsize=_PERIODIC_CACHE_SIZE)
 def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_records, max_steady):
     """Verify 3-point periodic convergence and extract (base_w, t0, slope, peaks, converged)."""
     step = max(2, slots)
@@ -156,11 +160,11 @@ def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_r
     def run_for(s_count):
         return _periodic_probe(resources, pools, slots, head_records, steady_records, tail_records, s_count)
 
-    bn = 2 * 2
-    b0 = bn * 2
-    b1 = b0 * (2 + 1)
-    b2 = b1 * (2 + 1)
-    b3 = b2 * 2
+    bn = _FOUR_TILES
+    b0 = bn * _TWO_FACTOR
+    b1 = b0 * _THREE_FACTOR
+    b2 = b1 * _THREE_FACTOR
+    b3 = b2 * _TWO_FACTOR
     for base in (bn, b0, b1, b2, b3):
         w = (base // step) * step
         if w + 2 * step > max_steady:
@@ -229,7 +233,7 @@ def _extract_stage(stage):
 
 
 def compact_periodic_pipeline(
-    context, count, slots, tile_fn, *, head=1, tail=1, threshold=2 * 2 * 2, resident=(),
+    context, count, slots, tile_fn, *, head=_ONE_TILE, tail=_ONE_TILE, threshold=_DEFAULT_THRESHOLD, resident=(),
 ):
     """Compact a periodic PipelineProgram(count, slots, tile_fn) in O(1) time.
 
@@ -248,7 +252,7 @@ def compact_periodic_pipeline(
     })
     special_set = set(special_indices)
     steady_count = count - len(special_set)
-    if count <= threshold or steady_count <= (2 * 2) + 2 * step:
+    if count <= threshold or steady_count <= _FOUR_TILES + _TWO_FACTOR * step:
         return PipelineProgram(count, slots, tile_fn)
     steady_idx = next((i for i in range(head, count - tail) if i not in special_set), None)
     if steady_idx is None:

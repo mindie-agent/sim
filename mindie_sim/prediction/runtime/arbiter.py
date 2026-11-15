@@ -103,13 +103,16 @@ def _needs_unit_tier_solver(resources, tasks, active) -> bool:
     return multi_prio and (any_coupled or any_fair)
 
 
+_ZERO_COUNT = 0
+
+
 def component_rates(resources, tasks, active, *, coupled_solver=None,
                     coupled_active: int | None = None,
                     placed_active: int | None = None) -> dict[str, dict[int, float]]:
     """Return {physical_resource: {task_sequence: native_work/ms}}."""
     if not active:
         return {}
-    if coupled_active == 0:
+    if coupled_active == _ZERO_COUNT:
         first_prio = None
         multi_prio = False
         for key in active:
@@ -123,7 +126,7 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     break
         need_tier = (
             _needs_unit_tier_solver(resources, tasks, active)
-            if (multi_prio or (placed_active != 0 and any(r.policy != "fair" for r in resources.values())))
+            if (multi_prio or (placed_active != _ZERO_COUNT and any(r.policy != "fair" for r in resources.values())))
             else False
         )
     else:

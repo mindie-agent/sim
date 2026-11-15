@@ -44,6 +44,9 @@ def _baseline_access(graph: TypedGraph, op: OpNode,
     return reads, writes
 
 
+_DEGREE_STEP = 1
+
+
 def _topological(nodes: tuple[PlanNode, ...],
                  external: tuple[str, ...] = ()) -> tuple[PlanNode, ...]:
     by_id = {n.node_id: n for n in nodes}
@@ -66,7 +69,7 @@ def _topological(nodes: tuple[PlanNode, ...],
         node = ready.popleft()
         ordered.append(node)
         for other in children[node.node_id]:
-            in_degree[other.node_id] -= 1
+            in_degree[other.node_id] -= _DEGREE_STEP
             if not in_degree[other.node_id]:
                 ready.append(other)
     if len(ordered) != len(nodes):
@@ -117,7 +120,7 @@ def _stable_topological(nodes: tuple[PlanNode, ...],
         _, node = heapq.heappop(heap)
         ordered.append(node)
         for other in children[node.node_id]:
-            in_degree[other.node_id] -= 1
+            in_degree[other.node_id] -= _DEGREE_STEP
             if not in_degree[other.node_id]:
                 heapq.heappush(heap, (rank[other.node_id], other))
     if len(ordered) != len(nodes):

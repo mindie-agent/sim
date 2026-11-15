@@ -37,7 +37,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from mindie_sim.schema.common import ModelingError
 
-PARALLEL_MINIMUM, PARALLEL_ZERO_MINIMUM = 1, 0
+PARALLEL_MINIMUM = 1; PARALLEL_ZERO_MINIMUM = 0; _NEG_ONE = -1; _ZERO_F = 0.0; _SYM_LIMIT = 24; _CODE_LIMIT = 40
 _SAFE_SYMBOL = re.compile(r"[^a-z0-9_.:-]+")
 _DTYPE_BYTES = {"fp32": 4.0, "float32": 4.0, "fp16": 2.0, "float16": 2.0,
                 "bf16": 2.0, "bfloat16": 2.0, "int8": 1.0, "fp8": 1.0,
@@ -106,7 +106,7 @@ def _record_kinds(cls):
     return tuple(base.__name__ for base in _record_bases(cls))
 
 
-def _request_int(name, value, *, minimum=0, reason="workload"):
+def _request_int(name, value, *, minimum=PARALLEL_ZERO_MINIMUM, reason="workload"):
     if not _matches_type(value, int):
         raise ModelingError(f"{reason}_{name}_invalid:type={type(value).__name__}")
     return _int_dom(name, value, minimum=minimum, reason=reason)
@@ -204,7 +204,7 @@ def _validate_record_domain(value, base):
     elif kind == "Software":
         _pos_dom("Software.mtp_acceptance_length", value.mtp_acceptance_length)
         for tokens, accepted in value.mtp_acceptance_by_output_tokens:
-            _int_dom("Software.mtp_output_tokens", tokens, minimum=1)
+            _int_dom("Software.mtp_output_tokens", tokens, minimum=PARALLEL_MINIMUM)
             _pos_dom("Software.mtp_accepted_tokens", accepted)
     if kind in _SCALAR_RECORD_DOMAINS:
         for field in fields(base):
@@ -214,7 +214,7 @@ def _validate_record_domain(value, base):
             label = f"{kind}.{field.name}"
             if field.name in _SCALAR_RECORD_DOMAINS[kind]:
                 _pos_dom(label, item)
-            elif kind == "StepBreakdown" and field.name == "t_non_moe_ms" and value.pp_microbatches > 1:
+            elif kind == "StepBreakdown" and field.name == "t_non_moe_ms" and value.pp_microbatches > PARALLEL_MINIMUM:
                 _num_dom(label, item, minimum=-math.inf)
             else:
                 _num_dom(label, item)
@@ -282,24 +282,24 @@ def _matches_type(value: Any, annotation: Any) -> bool:
     if origin is tuple:
         if cls is not tuple and not isinstance(value, tuple):
             return False
-        if args and args[-1] is not Ellipsis:
+        if args and args[_NEG_ONE] is not Ellipsis:
             return len(value) == len(args) and all(
                 _matches_type(v, t) for v, t in zip(value, args))
-        return not args or all(_matches_type(v, args[0]) for v in value)
+        return not args or all(_matches_type(v, args[PARALLEL_ZERO_MINIMUM]) for v in value)
     if origin is list:
         return (cls is list or isinstance(value, list)) and (
-            not args or all(_matches_type(v, args[0]) for v in value))
+            not args or all(_matches_type(v, args[PARALLEL_ZERO_MINIMUM]) for v in value))
     if origin is Sequence:
         if cls is not tuple and cls is not list and (
                 isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(value, Sequence)):
             return False
-        return not args or all(_matches_type(v, args[0]) for v in value)
+        return not args or all(_matches_type(v, args[PARALLEL_ZERO_MINIMUM]) for v in value)
     if origin in (dict, Mapping):
         ok = (cls is dict) if origin is dict else (cls is dict or isinstance(value, Mapping))
         if not ok and origin is dict:
             ok = isinstance(value, dict)
         return ok and (not args or all(
-            _matches_type(k, args[0]) and _matches_type(v, args[1])
+            _matches_type(k, args[PARALLEL_ZERO_MINIMUM]) and _matches_type(v, args[PARALLEL_MINIMUM])
             for k, v in value.items()))
     if origin in (set, frozenset, AbstractSet):
         return isinstance(value, origin) and (not args or all(
@@ -388,12 +388,12 @@ def _validate_nested(value, path, seen=None):
                 raise ModelingError(f"nr_s7_{label}_invalid:empty")
             if "Device" in owner_kinds:
                 if name in {"memory_bytes", "compute_units"}:
-                    _int_dom(label, item, minimum=1)
+                    _int_dom(label, item, minimum=PARALLEL_MINIMUM)
                 elif name in {"rank", "node", "package", "launch_us"}:
                     _num_dom(label, item)
                 elif name in {"buffers", "resource_units", "buffer_units"}:
                     for key, count in item:
-                        _int_dom(f"{label}.{key}", count, minimum=0 if name == "buffers" else 1)
+                        _int_dom(f"{label}.{key}", count, minimum=PARALLEL_ZERO_MINIMUM if name == "buffers" else PARALLEL_MINIMUM)
             if annotation is not Any and annotation is not object and type(item) not in _ATOMIC:
                 _validate_nested(item, label, seen)
         _validate_record_domains(value)
@@ -433,7 +433,7 @@ def typed_inputs(target=None, *, errors=None):
         signature = inspect.signature(function)
         params = tuple(signature.parameters.values())
         pos = tuple(p.name for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
-        req_pos = sum(1 for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty)
+        req_pos = sum(PARALLEL_MINIMUM for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty)
         fast_pos = (all(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params)
                     and not any(p.kind is p.KEYWORD_ONLY and p.default is p.empty for p in params))
         is_init = function.__name__ == "__init__"
@@ -465,7 +465,7 @@ def typed_inputs(target=None, *, errors=None):
                         _validate_nested(value, name)
                 result = function(*args, **kwargs)
                 if is_init:
-                    _validate_record_domains(args[0] if args else dict(items)["self"])
+                    _validate_record_domains(args[PARALLEL_ZERO_MINIMUM] if args else dict(items)["self"])
                 return result
             except OverflowError as error:
                 raise ModelingError(f"nr_s7_{function.__name__}_invalid:overflow") from error
@@ -498,12 +498,12 @@ def typed_sequence(name: str, value: Any, element_type: type, *,
     return tuple(value)
 
 
-def _int_dom(name: str, value: Any, minimum: int = 0, reason: str = "nr_s7") -> int:
+def _int_dom(name: str, value: Any, minimum: int = PARALLEL_ZERO_MINIMUM, reason: str = "nr_s7") -> int:
     if type(value) is not int or value < minimum or abs(value) > _MAX_NUMBER:
         raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
     return value
 
-def _num_dom(name: str, value: Any, minimum: float = 0.0, allow_none: bool = False, reason: str = "nr_s7") -> float | None:
+def _num_dom(name: str, value: Any, minimum: float = _ZERO_F, allow_none: bool = False, reason: str = "nr_s7") -> float | None:
     if value is None and allow_none:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -517,13 +517,13 @@ def _num_dom(name: str, value: Any, minimum: float = 0.0, allow_none: bool = Fal
     return number
 
 def _pos_dom(name: str, value: Any, reason: str = "nr_s7") -> float:
-    number = _num_dom(name, value, 0.0, False, reason)
-    if number is None or number <= 0.0:
+    number = _num_dom(name, value, _ZERO_F, False, reason)
+    if number is None or number <= _ZERO_F:
         raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
     return number
 
 @typed_inputs
-def strict_int(name: str, value: Any, *, minimum: int = 0, reason: str = "nr_s7") -> int:
+def strict_int(name: str, value: Any, *, minimum: int = PARALLEL_ZERO_MINIMUM, reason: str = "nr_s7") -> int:
     """Return an exact non-negative ``int`` or raise before any cast."""
     return _int_dom(name, value, minimum, reason)
 
@@ -534,7 +534,7 @@ def strict_bool(name: str, value: Any, *, reason: str = "nr_s7") -> bool:
     return value
 
 @typed_inputs
-def strict_number(name: str, value: Any, *, minimum: float = 0.0,
+def strict_number(name: str, value: Any, *, minimum: float = _ZERO_F,
                   allow_none: bool = False, reason: str = "nr_s7") -> float | None:
     return _num_dom(name, value, minimum, allow_none, reason)
 
@@ -575,14 +575,14 @@ def dtype_elem_bytes(name: str, value: Any, *,
 
 @typed_inputs
 def next_power_of_two(value: int) -> int:
-    number = _int_dom("value", value, 0)
+    number = _int_dom("value", value, PARALLEL_ZERO_MINIMUM)
     return 1 << max(0, number - 1).bit_length()
 
 
 @typed_inputs
 def ceil_div(numerator: int, denominator: int) -> int:
-    _int_dom("numerator", numerator, 0)
-    _int_dom("denominator", denominator, 1)
+    _int_dom("numerator", numerator, PARALLEL_ZERO_MINIMUM)
+    _int_dom("denominator", denominator, PARALLEL_MINIMUM)
     return (numerator + denominator - 1) // denominator
 
 
@@ -595,9 +595,9 @@ def bpe_token_upper_bound(text: Any) -> int:
 
 
 @typed_inputs
-def sanitize_symbol(value: Any, *, limit: int = 24) -> str:
+def sanitize_symbol(value: Any, *, limit: int = _SYM_LIMIT) -> str:
     """Map arbitrary text to a bounded ``[a-z0-9_.:-]`` symbol."""
-    limit = _int_dom("limit", limit, 1)
+    limit = _int_dom("limit", limit, PARALLEL_MINIMUM)
     if type(value) is not str:
         return "invalid"
     lowered = value.strip().lower()
@@ -610,9 +610,9 @@ def sanitize_symbol(value: Any, *, limit: int = 24) -> str:
 
 
 @typed_inputs
-def sanitize_code(value: Any, *, limit: int = 40) -> str:
+def sanitize_code(value: Any, *, limit: int = _CODE_LIMIT) -> str:
     """Bounded diagnostic-code sanitizer preserving known code characters."""
-    limit = _int_dom("limit", limit, 1)
+    limit = _int_dom("limit", limit, PARALLEL_MINIMUM)
     if type(value) is not str or not value:
         return "unknown"
     if len(value) > 80 or any(marker in value for marker in
@@ -625,11 +625,11 @@ def sanitize_code(value: Any, *, limit: int = 40) -> str:
 @typed_inputs
 def stage_of_layer(partition: tuple[int, ...], index: int) -> int:
     """Stage owning a contiguous layer index for a declared PP partition."""
-    _int_dom("layer_index", index, 0)
+    _int_dom("layer_index", index, PARALLEL_ZERO_MINIMUM)
     if not isinstance(partition, tuple) or not partition:
         raise ModelingError("nr_s7_partition_invalid")
     for count in partition:
-        _int_dom("partition_count", count, 0)
+        _int_dom("partition_count", count, PARALLEL_ZERO_MINIMUM)
     cursor = 0
     for stage, count in enumerate(partition):
         cursor += count
@@ -651,11 +651,11 @@ class RestoreExtent:
     exact: bool = True
 
     def __post_init__(self) -> None:
-        _int_dom("prefix_hit_tokens", self.prefix_hit_tokens, 0)
-        _int_dom("prompt_tokens", self.prompt_tokens, 0)
-        _int_dom("block_size", self.block_size, 1)
-        _int_dom("hash_block_size", self.hash_block_size, 1)
-        _int_dom("block_hash_count", self.block_hash_count, 0)
+        _int_dom("prefix_hit_tokens", self.prefix_hit_tokens, PARALLEL_ZERO_MINIMUM)
+        _int_dom("prompt_tokens", self.prompt_tokens, PARALLEL_ZERO_MINIMUM)
+        _int_dom("block_size", self.block_size, PARALLEL_MINIMUM)
+        _int_dom("hash_block_size", self.hash_block_size, PARALLEL_MINIMUM)
+        _int_dom("block_hash_count", self.block_hash_count, PARALLEL_ZERO_MINIMUM)
         if type(self.exact) is not bool:
             raise ModelingError(f"nr_s7_exact_invalid:{self.exact!r}")
         if self.block_size % self.hash_block_size:

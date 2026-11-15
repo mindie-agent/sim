@@ -597,6 +597,9 @@ def _cached_composed_bundle(machine: str, model: str, tp: int, dp: int, ep: int,
     return base, parsed, blob
 
 
+_DEFAULT_AXIS_DEGREE = 1
+
+
 def _base_bundle(machine, model, workload, axes, base_case):
     if base_case is None and isinstance(machine, str) and isinstance(model, str):
         wl_raw = workload.to_dict() if hasattr(workload, "to_dict") else workload
@@ -607,10 +610,11 @@ def _base_bundle(machine, model, workload, axes, base_case):
         except (TypeError, ValueError):
             wl_json, cacheable = None, False
         if cacheable:
+            d = _DEFAULT_AXIS_DEGREE
             return _cached_composed_bundle(
-                machine, model, int(axes.get("tp", 1)), int(axes.get("dp", 1)),
-                int(axes.get("ep", 1)), int(axes.get("pp", 1)),
-                int(axes.get("pcp", 1)), int(axes.get("cp", 1)), wl_json)
+                machine, model, int(axes.get("tp", d)), int(axes.get("dp", d)),
+                int(axes.get("ep", d)), int(axes.get("pp", d)),
+                int(axes.get("pcp", d)), int(axes.get("cp", d)), wl_json)
     base = _base(machine, model, workload, axes, base_case)
     return base, Case.from_mapping(base), None
 

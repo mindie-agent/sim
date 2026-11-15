@@ -31,7 +31,7 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-ZERO = 0
+ZERO = 0; ZERO_F = 0.0
 ONE = 1
 
 from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
@@ -66,6 +66,14 @@ def _special_layer_keys(model: ModelSpec) -> set[str]:
     return found
 
 
+def _cache_key(obj: Any) -> Any:
+    try:
+        hash(obj)
+        return obj
+    except TypeError:
+        return None
+
+
 def _iter_model_layer_terms(model: ModelSpec):
     special = _special_layer_keys(model)
     memo: dict[Any, tuple[WeightTerm, ...]] = {}
@@ -73,12 +81,13 @@ def _iter_model_layer_terms(model: ModelSpec):
         if str(plan.index) in special:
             yield plan.index, tuple(layer_weight_terms(plan, model))
             continue
-        shares_kv = 0 <= plan.kv_owner_layer_id < plan.index
-        key = (replace(plan, index=0, native_layer_id=0), shares_kv)
-        cached = memo.get(key)
+        shares_kv = ZERO <= plan.kv_owner_layer_id < plan.index
+        ck = _cache_key((replace(plan, index=ZERO, native_layer_id=ZERO), shares_kv))
+        cached = memo.get(ck) if ck is not None else None
         if cached is None:
             cached = tuple(layer_weight_terms(plan, model))
-            memo[key] = cached
+            if ck is not None:
+                memo[ck] = cached
         yield plan.index, cached
 
 
@@ -89,40 +98,29 @@ def stage_weight_decomposition(
     layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
 ) -> list[dict[str, float]]:
-    """Per-PP-stage weight bytes split into payload and quant metadata.
-
-    ``total == payload + metadata`` for every stage, so a caller can report the
-    scale/zero-point share as an explicit component without moving a single
-    resident byte.  The split is a decomposition of ``stage_weight_bytes``,
-    never an additional charge.
-    """
+    """Per-PP-stage weight bytes split into payload and quant metadata."""
     quant = model.quant or QuantSpec("bf16")
     stages: list[dict[str, float]] = []
-    pair_memo: dict[WeightTerm, tuple[float, float]] = {}
+    pair_memo: dict[Any, tuple[float, float]] = {}
     for terms in stage_weight_terms(
-        model, parallel, include_draft=include_draft,
-        include_engram=include_engram,
-        include_engram_tables=include_engram_tables,
-        layer_partition=layer_partition,
+        model, parallel, include_draft=include_draft, include_engram=include_engram,
+        include_engram_tables=include_engram_tables, layer_partition=layer_partition,
     ):
-        total = 0.0
-        payload = 0.0
+        total = ZERO_F
+        payload = ZERO_F
         for term in terms:
-            pair = pair_memo.get(term)
+            ck = _cache_key(term)
+            pair = pair_memo.get(ck) if ck is not None else None
             if pair is None:
                 placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
-                pair = (
-                    term_bytes(term, quant, placed, node_ranks),
-                    term_payload_bytes(term, quant, placed, node_ranks),
-                )
-                pair_memo[term] = pair
-            total += pair[0]
-            payload += pair[1]
-        stages.append({
-            "total_bytes": float(total),
-            "payload_bytes": float(payload),
-            "quant_metadata_bytes": float(total - payload),
-        })
+                pair = (term_bytes(term, quant, placed, node_ranks),
+                        term_payload_bytes(term, quant, placed, node_ranks))
+                if ck is not None:
+                    pair_memo[ck] = pair
+            total += pair[ZERO]
+            payload += pair[ONE]
+        stages.append({"total_bytes": float(total), "payload_bytes": float(payload),
+                       "quant_metadata_bytes": float(total - payload)})
     return stages
 
 
@@ -701,24 +699,21 @@ def stage_weight_bytes(
 ) -> list[float]:
     quant = model.quant or QuantSpec("bf16")
     result: list[float] = []
-    byte_memo: dict[WeightTerm, float] = {}
+    byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
-        model, parallel, include_draft=include_draft,
-        draft_kind=draft_kind,
-        include_engram=include_engram,
-        include_engram_tables=include_engram_tables,
-        layer_partition=layer_partition,
-        slot_plans=slot_plans, ep_rank=ep_rank,
+        model, parallel, include_draft=include_draft, draft_kind=draft_kind,
+        include_engram=include_engram, include_engram_tables=include_engram_tables,
+        layer_partition=layer_partition, slot_plans=slot_plans, ep_rank=ep_rank,
     ):
-        stage_total = 0.0
+        stage_total = ZERO_F
         for term in terms:
-            val = byte_memo.get(term)
+            ck = _cache_key(term)
+            val = byte_memo.get(ck) if ck is not None else None
             if val is None:
-                val = term_bytes(
-                    term, quant,
-                    _resident_parallel(term, parallel, enable_shared_expert_dp),
-                    node_ranks, source=source)
-                byte_memo[term] = val
+                val = term_bytes(term, quant, _resident_parallel(term, parallel, enable_shared_expert_dp),
+                                 node_ranks, source=source)
+                if ck is not None:
+                    byte_memo[ck] = val
             stage_total += val
         result.append(float(stage_total))
     return result
@@ -766,19 +761,20 @@ def weight_breakdown(
 ) -> dict[str, float]:
     quant = model.quant or QuantSpec("bf16")
     groups: dict[str, float] = {}
-    byte_memo: dict[WeightTerm, float] = {}
+    byte_memo: dict[Any, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_engram=True,
-        include_engram_tables=include_engram_tables,
-        layer_partition=layer_partition,
+        include_engram_tables=include_engram_tables, layer_partition=layer_partition,
     ):
         for term in terms:
-            val = byte_memo.get(term)
+            ck = _cache_key(term)
+            val = byte_memo.get(ck) if ck is not None else None
             if val is None:
                 placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
                 val = term_bytes(term, quant, placed, node_ranks)
-                byte_memo[term] = val
-            groups[term.category] = groups.get(term.category, 0.0) + val
+                if ck is not None:
+                    byte_memo[ck] = val
+            groups[term.category] = groups.get(term.category, ZERO_F) + val
     return groups
 
 

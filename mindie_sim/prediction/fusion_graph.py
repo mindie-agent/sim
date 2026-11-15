@@ -409,12 +409,15 @@ class TypedGraph:
         return ordered
 
 
+_STAMP_SLOT = 0; _INDEX_SLOT = 1
+
+
 def _graph_index(graph: TypedGraph) -> dict[str, Any]:
     stamp = (id(graph.ops), len(graph.ops), id(graph.values), len(graph.values),
              graph.public_outputs)
     cached = getattr(graph, "_cached_idx", None)
-    if cached is not None and cached[0] == stamp:
-        return cached[1]
+    if cached is not None and cached[_STAMP_SLOT] == stamp:
+        return cached[_INDEX_SLOT]
     consumers_lists: dict[str, list[str]] = {}
     dep_children: dict[str, list[str]] = {}
     for op in graph.ops.values():
@@ -465,7 +468,7 @@ def _graph_index(graph: TypedGraph) -> dict[str, Any]:
         current = ready.popleft()
         ordered.append(current)
         for nxt in successors[current]:
-            pending[nxt] -= 1
+            pending[nxt] -= _INDEX_SLOT
             if not pending[nxt]:
                 ready.append(nxt)
     topo_order = tuple(ordered) if len(ordered) == len(graph.ops) else None
@@ -511,7 +514,7 @@ def is_convex(graph: TypedGraph, members: Iterable[str]) -> bool:
     fwd_edges = idx["fwd_edges"]
     rev_edges = idx["rev_edges"]
     if topo_rank is not None and all(m in topo_rank for m in chosen):
-        if len(chosen) == 1:
+        if len(chosen) == _INDEX_SLOT:
             return True
         min_r = min(topo_rank[m] for m in chosen)
         max_r = max(topo_rank[m] for m in chosen)

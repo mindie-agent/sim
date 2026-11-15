@@ -34,6 +34,7 @@ EXTENDED_COMMANDS = (
     "optimize-graph", "sweep-ep-knee", "size-xpyd",
     "memory-breakdown", "kv-state", "opflow", "op-formula",
 )
+_EXIT_OK = 0; _UNIT_COUNT = 1; _EXIT_ERR = 2; _ZERO_RATE = 0.0
 
 
 def _jsonable(value: Any) -> Any:
@@ -94,7 +95,7 @@ def build_parser(prog: str = "mindie-sim") -> argparse.ArgumentParser:
     xpyd.add_argument("--osl", type=int, default=None)
     xpyd.add_argument("--ttft-slo-ms", type=float, default=None)
     xpyd.add_argument("--tpot-slo-ms", type=float, default=None)
-    xpyd.add_argument("--prefix-hit-rate", type=float, default=0.0)
+    xpyd.add_argument("--prefix-hit-rate", type=float, default=_ZERO_RATE)
     xpyd.add_argument("--allow-unqualified", action="store_true")
     xpyd.add_argument("--output", "-o")
 
@@ -129,18 +130,18 @@ def _run_extended(args: argparse.Namespace) -> dict[str, Any]:
 
         parsed = parse_case(read_json(args.case))
         reqs = parsed.workload.requests
-        req = reqs[0] if reqs else None
+        req = reqs[_EXIT_OK] if reqs else None
         tokens = args.tokens if args.tokens is not None else (
-            1 if args.phase == "decode" else (req.prompt_tokens if req else 1))
-        sequences = len(reqs) or 1 if args.sequences is None else args.sequences
+            _UNIT_COUNT if args.phase == "decode" else (req.prompt_tokens if req else _UNIT_COUNT))
+        sequences = len(reqs) or _UNIT_COUNT if args.sequences is None else args.sequences
         context = args.context if args.context is not None else (
-            (req.prompt_tokens if args.phase == "decode" else req.prefix_tokens) if req else 0)
+            (req.prompt_tokens if args.phase == "decode" else req.prefix_tokens) if req else _EXIT_OK)
         ops = next(iter(target_graphs(
             parsed, phase=args.phase, tokens=tokens, context=context, sequences=sequences, scope="body",
         ).values()))
         if args.weight_prefetch is False:
             defs = run_optimizer.__kwdefaults__ or {}
-            plan = canonical_plan(parsed, ops, options={"hardware": {"prefetch_capacity_bytes": 0}})
+            plan = canonical_plan(parsed, ops, options={"hardware": {"prefetch_capacity_bytes": _EXIT_OK}})
             report = _run_canonical(
                 plan, evaluation_budget=defs["evaluation_budget"],
                 per_pass=defs["max_candidates_per_pass"], max_streams=None, wall_budget_s=defs["wall_budget_s"],
@@ -165,7 +166,7 @@ def _run_extended(args: argparse.Namespace) -> dict[str, Any]:
 
         raw_case = read_json(args.case)
         parsed = parse_case(raw_case)
-        req = parsed.workload.requests[0]
+        req = parsed.workload.requests[_EXIT_OK]
         return solve_xpyd_pools(
             raw_case, total_npus=args.total_npus,
             isl=req.prompt_tokens if args.isl is None else args.isl,
@@ -206,13 +207,13 @@ def extended_main(argv: list[str] | None = None, *, prog: str = "mindie-sim") ->
         result = _jsonable(_run_extended(parsed_args))
         emit(result, parsed_args.output)
         if parsed_args.command == "opflow" and not result.get("ok"):
-            return 2
+            return _EXIT_ERR
     except TimeoutError:
         raise
     except (ModelingError, KeyError, TypeError, ValueError, OverflowError, OSError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
-        return 2
-    return 0
+        return _EXIT_ERR
+    return _EXIT_OK
 
 
 __all__ = ["EXTENDED_COMMANDS", "build_parser", "extended_main"]

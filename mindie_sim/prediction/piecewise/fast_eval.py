@@ -30,20 +30,23 @@ from typing import Any, Callable, Mapping
 from mindie_sim.schema.common import ModelingError
 
 EvalPair = Callable[[Mapping[str, Any]], tuple[int, int]]
+_ZERO = 0
+_ONE = 1
+_ZERO_PAIR = (_ZERO, _ONE)
 
 
 def _env_pair(raw: Any) -> tuple[int, int]:
     cls = type(raw)
     if cls is int:
-        return raw, 1
+        return raw, _ONE
     if cls is Fraction:
         return raw.numerator, raw.denominator
     if cls is bool or isinstance(raw, bool):
-        return int(raw), 1
+        return int(raw), _ONE
     if isinstance(raw, Fraction):
         return raw.numerator, raw.denominator
     if isinstance(raw, int):
-        return int(raw), 1
+        return int(raw), _ONE
     if isinstance(raw, float):
         if not math.isfinite(raw):
             raise ModelingError(f"expression_non_finite:{raw!r}")
@@ -53,12 +56,14 @@ def _env_pair(raw: Any) -> tuple[int, int]:
 
 
 def _reduce(num: int, den: int) -> tuple[int, int]:
-    if den < 0:
+    zi = _ZERO
+    oi = _ONE
+    if den < zi:
         num, den = -num, -den
-    if den == 1:
-        return num, 1
-    if num == 0:
-        return 0, 1
+    if den == oi:
+        return num, oi
+    if num == zi:
+        return _ZERO_PAIR
     divisor = math.gcd(num, den)
     return num // divisor, den // divisor
 
@@ -78,6 +83,9 @@ def _compile_node(expr: Any) -> EvalPair:
         Add, CeilDiv, Const, Div, Expr, FloorDiv, Max, Min, Mul, Neg, Sub, Sum, Var,
     )
 
+    zi = _ZERO
+    oi = _ONE
+    zpair = _ZERO_PAIR
     cls = type(expr)
     if cls is Const:
         cn, cd = expr.value.numerator, expr.value.denominator
@@ -85,11 +93,11 @@ def _compile_node(expr: Any) -> EvalPair:
     if cls is Var:
         name = expr.name
 
-        def _eval_var(env: Mapping[str, Any]) -> tuple[int, int]:
+        def _eval_var(env: Mapping[str, Any], u: int = oi) -> tuple[int, int]:
             if name not in env:
                 raise ModelingError(f"expression_variable_unbound:{name}")
             val = env[name]
-            return (val, 1) if type(val) is int else _env_pair(val)
+            return (val, u) if type(val) is int else _env_pair(val)
 
         return _eval_var
     if cls is Neg:
@@ -103,24 +111,25 @@ def _compile_node(expr: Any) -> EvalPair:
     if cls is Sub:
         lfn, rfn = _compile_cached(expr.left), _compile_cached(expr.right)
 
-        def _eval_sub(env: Mapping[str, Any]) -> tuple[int, int]:
+        def _eval_sub(env: Mapping[str, Any], u: int = oi) -> tuple[int, int]:
             ln, ld = lfn(env)
             rn, rd = rfn(env)
-            return (ln - rn, 1) if ld == 1 and rd == 1 else _add_rat(ln, ld, -rn, rd)
+            return (ln - rn, u) if ld == u and rd == u else _add_rat(ln, ld, -rn, rd)
 
         return _eval_sub
     if cls is Add or cls is Sum:
         fns = tuple(_compile_cached(term) for term in expr.terms)
         if not fns:
-            return lambda _env: (0, 1)
-        if len(fns) == 1:
-            return fns[0]
+            return lambda _env, zp=zpair: zp
+        if len(fns) == oi:
+            return fns[zi]
 
-        def _eval_sum(env: Mapping[str, Any]) -> tuple[int, int]:
-            acc_n, acc_d = 0, 1
+        def _eval_sum(env: Mapping[str, Any], z: int = zi, u: int = oi) -> tuple[int, int]:
+            acc_n = z
+            acc_d = u
             for fn in fns:
                 n, d = fn(env)
-                if acc_d == 1 and d == 1:
+                if acc_d == u and d == u:
                     acc_n += n
                 else:
                     acc_n, acc_d = _add_rat(acc_n, acc_d, n, d)
@@ -129,14 +138,15 @@ def _compile_node(expr: Any) -> EvalPair:
         return _eval_sum
     if cls is Mul:
         fns = tuple(_compile_cached(factor) for factor in expr.factors)
-        if len(fns) == 1:
-            return fns[0]
+        if len(fns) == oi:
+            return fns[zi]
 
-        def _eval_mul(env: Mapping[str, Any]) -> tuple[int, int]:
-            acc_n, acc_d = 1, 1
+        def _eval_mul(env: Mapping[str, Any], u: int = oi) -> tuple[int, int]:
+            acc_n = u
+            acc_d = u
             for fn in fns:
                 n, d = fn(env)
-                if acc_d == 1 and d == 1:
+                if acc_d == u and d == u:
                     acc_n *= n
                 else:
                     acc_n, acc_d = _mul_rat(acc_n, acc_d, n, d)
@@ -146,9 +156,9 @@ def _compile_node(expr: Any) -> EvalPair:
     if cls is Div:
         nfn, dfn = _compile_cached(expr.numerator), _compile_cached(expr.denominator)
 
-        def _eval_div(env: Mapping[str, Any]) -> tuple[int, int]:
+        def _eval_div(env: Mapping[str, Any], z: int = zi) -> tuple[int, int]:
             dn, dd = dfn(env)
-            if dn == 0:
+            if dn == z:
                 raise ModelingError("expression_division_by_zero")
             nn, nd = nfn(env)
             return _reduce(nn * dd, nd * dn)
@@ -157,44 +167,46 @@ def _compile_node(expr: Any) -> EvalPair:
     if cls is FloorDiv:
         nfn, dfn = _compile_cached(expr.numerator), _compile_cached(expr.denominator)
 
-        def _eval_fdiv(env: Mapping[str, Any]) -> tuple[int, int]:
+        def _eval_fdiv(env: Mapping[str, Any], z: int = zi, u: int = oi) -> tuple[int, int]:
             dn, dd = dfn(env)
-            if dn == 0:
+            if dn == z:
                 raise ModelingError("expression_floor_div_by_zero")
             nn, nd = nfn(env)
-            if nd == 1 and dd == 1:
-                return (nn // dn if dn > 0 else (-nn) // (-dn)), 1
+            if nd == u and dd == u:
+                return (nn // dn if dn > z else (-nn) // (-dn)), u
             p, q = nn * dd, nd * dn
-            if q < 0:
+            if q < z:
                 p, q = -p, -q
-            return p // q, 1
+            return p // q, u
 
         return _eval_fdiv
     if cls is CeilDiv:
         nfn, dfn = _compile_cached(expr.numerator), _compile_cached(expr.denominator)
 
-        def _eval_cdiv(env: Mapping[str, Any]) -> tuple[int, int]:
+        def _eval_cdiv(env: Mapping[str, Any], z: int = zi, u: int = oi) -> tuple[int, int]:
             dn, dd = dfn(env)
-            if dn == 0:
+            if dn == z:
                 raise ModelingError("expression_ceil_div_by_zero")
             nn, nd = nfn(env)
-            if nd == 1 and dd == 1:
-                return ((nn + dn - 1) // dn if dn > 0 else (-nn - dn - 1) // (-dn)), 1
+            if nd == u and dd == u:
+                return ((nn + dn - u) // dn if dn > z else (-nn - dn - u) // (-dn)), u
             p, q = nn * dd, nd * dn
-            if q < 0:
+            if q < z:
                 p, q = -p, -q
-            return (p + q - 1) // q, 1
+            return (p + q - u) // q, u
 
         return _eval_cdiv
     if cls is Min or cls is Max:
         fns = tuple(_compile_cached(term) for term in expr.terms)
-        if len(fns) == 1:
-            return fns[0]
+        if len(fns) == oi:
+            return fns[zi]
         pick_min = cls is Min
+        head_fn = fns[zi]
+        tail_fns = fns[oi:]
 
         def _eval_ext(env: Mapping[str, Any]) -> tuple[int, int]:
-            bn, bd = fns[0](env)
-            for fn in fns[1:]:
+            bn, bd = head_fn(env)
+            for fn in tail_fns:
                 n, d = fn(env)
                 less = (n < bn) if d == bd else (n * bd < bn * d)
                 if less if pick_min else (not less and (n != bn or d != bd)):
@@ -226,7 +238,7 @@ def evaluate_fast(expr: Any, env: Mapping[str, Any]) -> Fraction:
     except TypeError:
         fn = _compile_node(expr)
     num, den = fn(env)
-    if den == 1:
+    if den == _ONE:
         return Fraction(num)
     if _FROM_COPRIME is not None:
         return _FROM_COPRIME(num, den)

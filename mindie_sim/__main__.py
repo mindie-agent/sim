@@ -627,11 +627,14 @@ def run(args):
     raise ValueError("unknown_command")
 
 
+_ARGV_START = 1; _CMD_IDX = 0
+
+
 def main(argv=None):
-    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    raw_argv = list(sys.argv[_ARGV_START:] if argv is None else argv)
     if raw_argv:
         from .extended_cli import EXTENDED_COMMANDS, extended_main
-        if raw_argv[0] in EXTENDED_COMMANDS:
+        if raw_argv[_CMD_IDX] in EXTENDED_COMMANDS:
             return extended_main(raw_argv, prog="mindie-sim")
     args = parser().parse_args(argv)
     try:

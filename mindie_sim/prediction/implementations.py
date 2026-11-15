@@ -1243,6 +1243,9 @@ def _op_producer_refs(op):
     return refs
 
 
+_LAST_ENTRY = -1; _FIRST_SLOT = 0; _SINGLE_DEP = 1
+
+
 def consumer_index(ops):
     """Index candidate consumers by producer op_id while preserving ``ops`` order."""
     by_producer = {}
@@ -1254,7 +1257,7 @@ def consumer_index(ops):
             bucket = by_producer.get(producer)
             if bucket is None:
                 by_producer[producer] = [item]
-            elif bucket[-1][0] != index:
+            elif bucket[_LAST_ENTRY][_FIRST_SLOT] != index:
                 bucket.append(item)
     return by_id, by_producer
 
@@ -1588,7 +1591,7 @@ def rewire_value_graph(ops, *, replacements, aliases, removed, port_map,
             for key, value in op.metadata
         )
         if not has_dep_alias and not has_port_alias and not has_prod_alias:
-            if len(op.deps) > 1:
+            if len(op.deps) > _SINGLE_DEP:
                 dedup = tuple(dict.fromkeys(op.deps))
                 if dedup != op.deps:
                     return replace(op, deps=dedup)

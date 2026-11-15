@@ -36,26 +36,29 @@ def _full_units(count):
     return tuple(range(count))
 
 
+_ZERO_MASK = 0; _ONE_BIT = 1
+
+
 @lru_cache(maxsize=None)
 def _unit_mask(units):
-    mask = 0
+    mask = _ZERO_MASK
     for unit in units:
-        mask |= 1 << unit
+        mask |= _ONE_BIT << unit
     return mask
 
 
 def _partition_rates(rate, count, caps, placements):
     """Disjoint owner partitions are independent equal-weight resource pools."""
     groups = {}
-    occupied = 0
+    occupied = _ZERO_MASK
     full_u = None
-    full_m = 0
+    full_m = _ZERO_MASK
     for key in caps:
         units = placements.get(key)
         if not units:
             if full_u is None:
                 full_u = _full_units(count)
-                full_m = (1 << count) - 1
+                full_m = (_ONE_BIT << count) - _ONE_BIT
             units = full_u
             u_mask = full_m
         else:
@@ -72,7 +75,7 @@ def _partition_rates(rate, count, caps, placements):
     unit_rate = rate / count
     for units, keys in groups.items():
         capacity = unit_rate * len(units)
-        if len(keys) == 1:
+        if len(keys) == _ONE_BIT:
             key = keys[0]
             cap = caps[key]
             result[key] = capacity if capacity < cap else cap

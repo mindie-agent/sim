@@ -397,7 +397,8 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
     step_cache: dict[int, float] = {cfg.sequences: tpot_step}
     evaluated_b: set[int] = set()
 
-    ttft_infeasible_from = search_cap + 1
+    _ZF = 0.0; _ONE = 1; _TWO = 2
+    ttft_infeasible_from = search_cap + _ONE
 
     def _ttft_at(b: int) -> float:
         nonlocal ttft_infeasible_from
@@ -410,7 +411,7 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
             except (ValueError, ModelingError):
                 ttft_cache[b] = float("inf")
         val = ttft_cache[b]
-        if ttft_ms is not None and not (0.0 < val <= cfg.sla_ttft_ms):
+        if ttft_ms is not None and not (_ZF < val <= cfg.sla_ttft_ms):
             ttft_infeasible_from = min(ttft_infeasible_from, int(b))
         return val
 
@@ -423,7 +424,7 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                 step_cache[b] = float("inf")
         return step_cache[b]
 
-    if tpot_step <= 0.0:
+    if tpot_step <= _ZF:
         b_sla = 0
     elif cfg.context > _SLA_SOLVER_MAX_CONTEXT:
         if tpot_step <= step_budget_ms:
@@ -468,11 +469,11 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                     hi = mid - 1
         if lo > cfg.sequences and ttft_ms is not None:
             t_lo, t_hi = cfg.sequences, lo
-            probe = min(lo, max(cfg.sequences + 1, int(math.ceil(cfg.sequences * cfg.sla_ttft_ms / ttft_ms)) * 2)) if ttft_ms > 0.0 else lo
-            while probe < lo and (0.0 < _ttft_at(probe) <= cfg.sla_ttft_ms):
-                t_lo, probe = probe, min(lo, probe * 2)
-            if probe < lo or not (0.0 < _ttft_at(lo) <= cfg.sla_ttft_ms):
-                t_hi = probe - 1
+            probe = min(lo, max(cfg.sequences + _ONE, int(math.ceil(cfg.sequences * cfg.sla_ttft_ms / ttft_ms)) * _TWO)) if ttft_ms > _ZF else lo
+            while probe < lo and (_ZF < _ttft_at(probe) <= cfg.sla_ttft_ms):
+                t_lo, probe = probe, min(lo, probe * _TWO)
+            if probe < lo or not (_ZF < _ttft_at(lo) <= cfg.sla_ttft_ms):
+                t_hi = probe - _ONE
             else:
                 t_lo = lo
             while t_lo < t_hi:
@@ -490,12 +491,12 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
     # Once the highest-B jointly feasible candidate is verified, smaller probes
     # cannot win max-B selection and need not run redundant prefill graphs.
     candidates: list[dict[str, Any]] = []
-    for b in sorted(evaluated_b | {1, b_sla, min(search_cap, cfg.sequences)}, reverse=True):
+    for b in sorted(evaluated_b | {_ONE, b_sla, min(search_cap, cfg.sequences)}, reverse=True):
         if b <= 0:
             continue
         step = _step_at(b)
         step_ok = bool(b <= search_cap and 0.0 < step <= step_budget_ms)
-        ttft_ok = step_ok and (ttft_ms is None or (b < ttft_infeasible_from and 0.0 < _ttft_at(b) <= cfg.sla_ttft_ms))
+        ttft_ok = step_ok and (ttft_ms is None or (b < ttft_infeasible_from and _ZF < _ttft_at(b) <= cfg.sla_ttft_ms))
         feasible = bool(step_ok and ttft_ok)
         candidates.append({"b": int(b), "step_ms": step, "feasible": feasible})
         if feasible:

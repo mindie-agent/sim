@@ -353,9 +353,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         groups = {group["subgraph_id"]: group for group in subgraphs}
         subgraph_member_sets = {id(other): set(other["node_ids"]) for other in subgraphs}
         subgraphs_by_first_member = defaultdict(list)
+        _FIRST_MEMBER = 0
         for other in subgraphs:
             if other["node_ids"]:
-                subgraphs_by_first_member[other["node_ids"][0]].append(other)
+                subgraphs_by_first_member[other["node_ids"][_FIRST_MEMBER]].append(other)
         for replica, operators in sorted(resource_graphs.items()):
             outputs_by_id, metadata_by_id = {}, {}
             for op in operators:
