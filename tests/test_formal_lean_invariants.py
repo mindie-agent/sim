@@ -19,6 +19,7 @@
 """
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import random
 import re
@@ -26,6 +27,10 @@ import re
 from mindie_sim.catalog.weight_terms import WeightTerm, _ceil_div, _sharded_shape
 from mindie_sim.kv_layout_physics import KvNzPlane, fractal_c0_elements
 from mindie_sim.linear_state_physics import LINEAR_STATE_KINDS
+from mindie_sim.prediction.exposed_breakdown import (
+    ExposedClocks, advance_clocks, finish_breakdown,
+    join_clocks as prod_join_clocks, roofline_clocks,
+)
 from mindie_sim.prediction.runtime.ledger import normalise_ranges, ranges_bytes
 from mindie_sim.prediction.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.parallel import ParallelSpec
@@ -133,6 +138,30 @@ def test_four_clock_max_plus_dag_invariants() -> None:
         terminal = join_clocks(clocks_a)
         buckets = finish(terminal)
         assert all(val >= 0 for val in buckets) and sum(buckets) == terminal[0]
+        prod_nodes: list[ExposedClocks] = []
+        prod_durs = [roofline_clocks(cube_ms=d[3], vector_ms=max(0, d[2] - d[3]),
+                                     memory_ms=max(0, d[1] - d[2]),
+                                     communication_ms=max(0, d[0] - d[1])) for d in durs]
+        # Re-run exact production ExposedClocks against the integer Lean oracle.
+        rng_chk = random.Random(SEED + _ * 17)
+        for node in range(12):
+            p_idx = rng_chk.sample(range(node), rng_chk.randint(1, min(4, node))) if node else []
+            q_idx = list(p_idx)
+            rng_chk.shuffle(q_idx)
+            pa = advance_clocks([prod_nodes[p] for p in p_idx], prod_durs[node])
+            pb = advance_clocks([prod_nodes[p] for p in q_idx], prod_durs[node])
+            assert pa == pb
+            prod_nodes.append(pa)
+        p_term = prod_join_clocks(prod_nodes)
+        rep = finish_breakdown(p_term, duration_ms=p_term.all_ms, boundary="device_step")
+        ms = rep["exposed_breakdown_ms"]
+        assert (ms["cube"], ms["vector"], ms["memory"], ms["communication"]) == (
+            p_term.cube_ms, p_term.compute_ms - p_term.cube_ms,
+            p_term.without_communication_ms - p_term.compute_ms,
+            p_term.all_ms - p_term.without_communication_ms,
+        )
+        if p_term.all_ms > 0:
+            assert abs(math.fsum(rep["exposed_breakdown_pct"].values()) - 100.0) <= 1e-9
 
 
 def test_prefetch_clamp_and_interval_ledger_invariants() -> None:
