@@ -64,7 +64,7 @@ def _source_sparse(model_config):
             and not hasattr(hf_text_config, "compress_ratios")
             and not hasattr(hf_config, "compress_ratios"))
 
-
+@lru_cache(None)
 def sparse_witnesses():
     rows = []
     for wrapper in (NS, SourceConfig, CustomConfig):
@@ -260,8 +260,10 @@ def _invalid_values(annotation):
     return [None, False, 1.0, "x", [], {}]
 
 
+@lru_cache(None)
 def _inventory():
     from nr_s7_fix3_verify import SCOPED
+    rows = []
     for filename in SCOPED:
         if not filename.startswith("mindie_sim/"):
             continue
@@ -272,20 +274,21 @@ def _inventory():
                 continue
             seen.add(id(obj))
             if inspect.isclass(obj) and dc.is_dataclass(obj):
-                yield filename, name, obj, inspect.signature(obj), get_type_hints(obj), {}
+                rows.append((filename, name, obj, inspect.signature(obj), get_type_hints(obj), {}))
                 for method_name, raw in vars(obj).items():
                     if method_name.startswith("_"):
                         continue
                     method = getattr(obj, method_name)
                     if isinstance(raw, classmethod):
-                        yield filename, name + "." + method_name, method, inspect.signature(method), get_type_hints(method), {}
+                        rows.append((filename, name + "." + method_name, method, inspect.signature(method), get_type_hints(method), {}))
                     elif inspect.isfunction(method):
-                        yield filename, name + "." + method_name, method, inspect.signature(method), get_type_hints(method), {"self": object.__new__(obj)}
+                        rows.append((filename, name + "." + method_name, method, inspect.signature(method), get_type_hints(method), {"self": object.__new__(obj)}))
             elif inspect.isfunction(obj) and (not name.startswith("_") or name in getattr(module, "__all__", ())):
                 if name != "typed_inputs":  # decorator configuration, not a modeling input
-                    yield filename, name, obj, inspect.signature(obj), get_type_hints(obj), {}
+                    rows.append((filename, name, obj, inspect.signature(obj), get_type_hints(obj), {}))
+    return tuple(rows)
 
-
+@lru_cache(None)
 def boundary_matrix():
     """Every declared boundary, including output records and exported helpers."""
     files = {}
@@ -410,7 +413,7 @@ def test_f14_structural_any_interfaces_and_forwarding_aliases():
     with pytest.raises(ModelingError):
         _digest({0: 1, "a": 2})
 
-
+@lru_cache(None)
 def fix6_domain_witnesses():
     """Concrete valid controls and inactive/active domain counterexamples."""
     from mindie_sim.hybrid_kv_state_options import (
@@ -507,7 +510,7 @@ def _overflow_values(annotation):
         return [{_sentinel(args[0]): v} for v in _overflow_values(args[1])]
     return []
 
-
+@lru_cache(None)
 def fix6_overflow_matrix():
     """Both signs of 10**400 at every annotated numeric argument/leaf."""
     import sys
@@ -652,7 +655,7 @@ def test_fix6_hybrid_disabled_helpers_validate_declared_domains():
     with pytest.raises(ModelingError):
         _attention_page_bytes(case.model, plan, 128, 2.0, 0)
 
-
+@lru_cache(None)
 def fix7_boundary_witnesses():
     from mindie_sim.parallel_decode_cost import DecodeCostModel
     from mindie_sim.hybrid_kv_state_report import evaluate_hybrid_kv_state as evaluate

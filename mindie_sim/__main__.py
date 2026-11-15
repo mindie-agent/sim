@@ -470,10 +470,14 @@ def run(args):
                 "mtp_acceptance_length": args.mtp_accept,
                 "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
             }
-            return load_case_from_profile(
+            result = load_case_from_profile(
                 args.from_profile,
                 **{key: value for key, value in profile_overrides.items() if value is not None},
             )
+            if getattr(args, "recover_ssm", None) is not None:
+                result.setdefault("runtime", {})["recover_ssm"] = bool(args.recover_ssm)
+                parse_case(result)
+            return result
         if not args.model:
             raise ValueError("compose_requires_model_or_from_profile")
         return compose_case(
@@ -624,6 +628,11 @@ def run(args):
 
 
 def main(argv=None):
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    if raw_argv:
+        from .extended_cli import EXTENDED_COMMANDS, extended_main
+        if raw_argv[0] in EXTENDED_COMMANDS:
+            return extended_main(raw_argv, prog="mindie-sim")
     args = parser().parse_args(argv)
     try:
         result = run(args)

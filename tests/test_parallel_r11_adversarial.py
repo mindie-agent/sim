@@ -47,15 +47,27 @@ def _exact_lifetime(case, p, d, transfer, eplb=0):
 
 def test_r11_01_all_540_absolute_owner_cases():
     case = _dense(layers=1, kv_heads=1, num_devices=64, max_seqs=1)
+    p_specs = {pcp: ParallelSpec(pcp=pcp) for pcp in (1, 2, 3)}
+    p_insts = {pcp: _instance(case, p_specs[pcp], range(pcp)) for pcp in (1, 2, 3)}
+    d_specs = {(cp, dp): ParallelSpec(tp=cp, cp=cp, dp=dp)
+               for cp, dp in product((1, 2, 4), (1, 2, 3))}
+    d_insts = {
+        (cp, dp, pcp): _instance(case, d_specs[cp, dp], range(pcp, pcp + d_specs[cp, dp].world_size))
+        for cp, dp, pcp in product((1, 2, 4), (1, 2, 3), (1, 2, 3))
+    }
+    transfers = {
+        (offset, count): logical_transfer_bytes(
+            case, prompt_tokens=(offset + count) * 128,
+            destination_cached_tokens=offset * 128, prefix_digest="d" * 64)
+        for offset, count in product(range(4), range(1, 6))
+    }
     checks = 0
     for cp, dp, pcp, offset, count in product((1, 2, 4), (1, 2, 3), (1, 2, 3),
                                              range(4), range(1, 6)):
-        p, d = ParallelSpec(pcp=pcp), ParallelSpec(tp=cp, cp=cp, dp=dp)
-        transfer = logical_transfer_bytes(case, prompt_tokens=(offset + count) * 128,
-            destination_cached_tokens=offset * 128, prefix_digest="d" * 64)
+        p, d = p_specs[pcp], d_specs[cp, dp]
+        transfer = transfers[offset, count]
         bridge = _bridge(p, d, transfer)
-        result = _compose(case, [_instance(case, p, range(pcp))],
-                          [_instance(case, d, range(pcp, pcp + d.world_size))], bridge, transfer)
+        result = _compose(case, [p_insts[pcp]], [d_insts[cp, dp, pcp]], bridge, transfer)
         assert result["qualified"], result
         for replica, lane in product(range(dp), range(cp)):
             rank = pcp + replica * cp + lane

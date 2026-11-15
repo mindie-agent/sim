@@ -175,7 +175,12 @@ class Expr:
     """Base class for the exact expression algebra."""
 
     def evaluate(self, env: Mapping[str, Any]) -> Fraction:
-        raise NotImplementedError
+        return evaluate_fast(self, env)
+
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
+        if type(self).evaluate is Expr.evaluate:
+            raise NotImplementedError
+        return self.evaluate(env)
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
         raise NotImplementedError
@@ -299,7 +304,7 @@ class Neg(Expr):
     def __post_init__(self) -> None:
         _require_expression(self.operand, "expression_neg_operand_invalid")
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return -self.operand.evaluate(env)
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -317,7 +322,7 @@ class Add(Expr):
                            _expr_tuple(self.terms, "expression_add_terms_invalid",
                                        minimum=1))
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return sum((term.evaluate(env) for term in self.terms), Fraction(0))
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -338,7 +343,7 @@ class Sub(Expr):
         _require_expression(self.left, "expression_sub_left_invalid")
         _require_expression(self.right, "expression_sub_right_invalid")
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return self.left.evaluate(env) - self.right.evaluate(env)
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -356,7 +361,7 @@ class Mul(Expr):
                            _expr_tuple(self.factors, "expression_mul_factors_invalid",
                                        minimum=1))
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         result = Fraction(1)
         for factor in self.factors:
             result *= factor.evaluate(env)
@@ -380,7 +385,7 @@ class Div(Expr):
         _require_expression(self.numerator, "expression_div_numerator_invalid")
         _require_expression(self.denominator, "expression_div_denominator_invalid")
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         divisor = self.denominator.evaluate(env)
         if divisor == 0:
             raise ModelingError("expression_division_by_zero")
@@ -411,7 +416,7 @@ class FloorDiv(Expr):
         _require_expression(self.numerator, "expression_floor_div_numerator_invalid")
         _require_expression(self.denominator, "expression_floor_div_denominator_invalid")
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         divisor = self.denominator.evaluate(env)
         if divisor == 0:
             raise ModelingError("expression_floor_div_by_zero")
@@ -432,7 +437,7 @@ class CeilDiv(Expr):
         _require_expression(self.numerator, "expression_ceil_div_numerator_invalid")
         _require_expression(self.denominator, "expression_ceil_div_denominator_invalid")
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         divisor = self.denominator.evaluate(env)
         if divisor == 0:
             raise ModelingError("expression_ceil_div_by_zero")
@@ -453,7 +458,7 @@ class Min(Expr):
                            _expr_tuple(self.terms, "expression_min_terms_invalid",
                                        minimum=1))
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return min(term.evaluate(env) for term in self.terms)
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -475,7 +480,7 @@ class Max(Expr):
                            _expr_tuple(self.terms, "expression_max_terms_invalid",
                                        minimum=1))
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return max(term.evaluate(env) for term in self.terms)
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -496,7 +501,7 @@ class Sum(Expr):
         object.__setattr__(self, "terms",
                            _expr_tuple(self.terms, "expression_sum_terms_invalid"))
 
-    def evaluate(self, env: Mapping[str, Any]) -> Fraction:
+    def _slow_evaluate(self, env: Mapping[str, Any]) -> Fraction:
         return sum((term.evaluate(env) for term in self.terms), Fraction(0))
 
     def interval(self, env: Mapping[str, Interval]) -> Interval:
@@ -510,8 +515,12 @@ class Sum(Expr):
 
 # Evaluation and substitution
 
+from .fast_eval import evaluate_fast  # noqa: E402
+
 def evaluate(expr: Expr, env: Mapping[str, Any]) -> Fraction:
-    return expr.evaluate(env)
+    if type(expr) is Const:
+        return expr.value
+    return evaluate_fast(expr, env)
 
 def substitute(expr: Expr, mapping: Mapping[str, Expr]) -> Expr:
     if isinstance(expr, Const):

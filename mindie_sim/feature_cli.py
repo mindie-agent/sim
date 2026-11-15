@@ -210,6 +210,8 @@ def main(argv=None, prog="mindie-sim"):
                 sol_markdown(report)) if args.format == "markdown" else canonical_json(report)
         _emit(text, args.output)
         return code
+    except TimeoutError:
+        raise
     except (LaunchComparisonError, ReportValidationError, LaunchSyntaxError,
             DocumentInputError, ValueError, OSError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)[:300]}), file=sys.stderr)

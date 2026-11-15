@@ -42,18 +42,6 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 def _resident_parallel(term: WeightTerm, parallel: ParallelSpec, shared_expert_dp: bool) -> ParallelSpec:
     """Placement used for one resident term.
 
@@ -63,6 +51,35 @@ def _resident_parallel(term: WeightTerm, parallel: ParallelSpec, shared_expert_d
     if shared_expert_dp and term.category == "shared_expert":
         return replace(parallel, tp=1)
     return parallel
+
+
+def _special_layer_keys(model: ModelSpec) -> set[str]:
+    meta = dict(model.metadata)
+    found: set[str] = set()
+    for name in ("prepared_mx32_matrix", "mla_head_padding",
+                 "kda_input_projection", "causal_conv_update"):
+        block = meta.get(name)
+        if isinstance(block, dict):
+            layers = block.get("layers")
+            if isinstance(layers, dict):
+                found.update(str(k) for k in layers)
+    return found
+
+
+def _iter_model_layer_terms(model: ModelSpec):
+    special = _special_layer_keys(model)
+    memo: dict[Any, tuple[WeightTerm, ...]] = {}
+    for plan in model.layer_plans:
+        if str(plan.index) in special:
+            yield plan.index, tuple(layer_weight_terms(plan, model))
+            continue
+        shares_kv = 0 <= plan.kv_owner_layer_id < plan.index
+        key = (replace(plan, index=0, native_layer_id=0), shares_kv)
+        cached = memo.get(key)
+        if cached is None:
+            cached = tuple(layer_weight_terms(plan, model))
+            memo[key] = cached
+        yield plan.index, cached
 
 
 def stage_weight_decomposition(
@@ -81,6 +98,7 @@ def stage_weight_decomposition(
     """
     quant = model.quant or QuantSpec("bf16")
     stages: list[dict[str, float]] = []
+    pair_memo: dict[WeightTerm, tuple[float, float]] = {}
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft,
         include_engram=include_engram,
@@ -90,17 +108,22 @@ def stage_weight_decomposition(
         total = 0.0
         payload = 0.0
         for term in terms:
-            placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
-            total += term_bytes(term, quant, placed, node_ranks)
-            payload += term_payload_bytes(term, quant, placed, node_ranks)
+            pair = pair_memo.get(term)
+            if pair is None:
+                placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
+                pair = (
+                    term_bytes(term, quant, placed, node_ranks),
+                    term_payload_bytes(term, quant, placed, node_ranks),
+                )
+                pair_memo[term] = pair
+            total += pair[0]
+            payload += pair[1]
         stages.append({
             "total_bytes": float(total),
             "payload_bytes": float(payload),
             "quant_metadata_bytes": float(total - payload),
         })
     return stages
-
-
 
 
 def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -566,8 +589,8 @@ from mindie_sim.catalog.draft_weights import draft_terms, draft_weight_summary
 
 def _body_terms(model: ModelSpec, *, include_engram: bool = True) -> list[WeightTerm]:
     terms: list[WeightTerm] = []
-    for plan in model.layer_plans:
-        terms.extend(layer_weight_terms(plan, model))
+    for _, layer_terms in _iter_model_layer_terms(model):
+        terms.extend(layer_terms)
     terms.extend(body_head_terms(model))
     terms.extend(vision_weight_terms(model))
     if include_engram:
@@ -627,14 +650,14 @@ def stage_weight_terms(
             )
         stage_of = _partition_stage_of(partition)
     stages: list[list[WeightTerm]] = [[] for _ in range(pp)]
-    for plan in model.layer_plans:
-        terms = layer_weight_terms(plan, model)
-        slots = (slot_plans or {}).get(plan.index)
+    for layer_idx, layer_terms in _iter_model_layer_terms(model):
+        terms: Sequence[WeightTerm] = layer_terms
+        slots = (slot_plans or {}).get(layer_idx)
         if slots is not None:
             from mindie_sim.catalog.expert_slots import routed_expert_weight_terms
-            terms = list(routed_expert_weight_terms(
-                terms, slots, ep_rank=ZERO if ep_rank is None else int(ep_rank)))
-        stages[stage_of(plan.index)].extend(terms)
+            terms = routed_expert_weight_terms(
+                layer_terms, slots, ep_rank=ZERO if ep_rank is None else int(ep_rank))
+        stages[stage_of(layer_idx)].extend(terms)
     for term in body_head_terms(model):
         stages[ZERO if term.name == "embedding" else pp - ONE].append(term)
     if model.vision is not None:
@@ -678,6 +701,7 @@ def stage_weight_bytes(
 ) -> list[float]:
     quant = model.quant or QuantSpec("bf16")
     result: list[float] = []
+    byte_memo: dict[WeightTerm, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_draft=include_draft,
         draft_kind=draft_kind,
@@ -686,11 +710,17 @@ def stage_weight_bytes(
         layer_partition=layer_partition,
         slot_plans=slot_plans, ep_rank=ep_rank,
     ):
-        result.append(float(sum(
-            term_bytes(term, quant, _resident_parallel(
-                term, parallel, enable_shared_expert_dp), node_ranks, source=source)
-            for term in terms
-        )))
+        stage_total = 0.0
+        for term in terms:
+            val = byte_memo.get(term)
+            if val is None:
+                val = term_bytes(
+                    term, quant,
+                    _resident_parallel(term, parallel, enable_shared_expert_dp),
+                    node_ranks, source=source)
+                byte_memo[term] = val
+            stage_total += val
+        result.append(float(stage_total))
     return result
 
 
@@ -736,16 +766,19 @@ def weight_breakdown(
 ) -> dict[str, float]:
     quant = model.quant or QuantSpec("bf16")
     groups: dict[str, float] = {}
+    byte_memo: dict[WeightTerm, float] = {}
     for terms in stage_weight_terms(
         model, parallel, include_engram=True,
         include_engram_tables=include_engram_tables,
         layer_partition=layer_partition,
     ):
         for term in terms:
-            placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
-            groups[term.category] = groups.get(term.category, 0.0) + term_bytes(
-                term, quant, placed, node_ranks,
-            )
+            val = byte_memo.get(term)
+            if val is None:
+                placed = _resident_parallel(term, parallel, enable_shared_expert_dp)
+                val = term_bytes(term, quant, placed, node_ranks)
+                byte_memo[term] = val
+            groups[term.category] = groups.get(term.category, 0.0) + val
     return groups
 
 

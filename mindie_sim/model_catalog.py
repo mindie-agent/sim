@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import math
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -39,89 +40,17 @@ from mindie_sim.coverage import model_coverage
 from mindie_sim.catalog.config import flatten_config
 from mindie_sim.catalog.hf_config import model_value_formats
 from mindie_sim.catalog.specs import build_model_spec as _build_model_spec
-from mindie_sim.catalog.fleet import FLEET_CATALOG_ENTRIES, FLEET_MODEL_ALIASES
+from mindie_sim.catalog.fleet import (
+    ARCHITECTURE_PRESET_ALIASES, ARCHITECTURE_PRESET_CATALOG,
+    CORE_CATALOG_ENTRIES as CATALOG, CORE_MODEL_ALIASES as MODEL_ALIASES,
+    FLEET_CATALOG_ENTRIES, FLEET_MODEL_ALIASES,
+)
 from mindie_sim.catalog.weights import (
     body_parameter_count, body_weight_bytes, sharded_weight_bytes as _sharded,
     stage_weight_bytes, stage_weight_terms, weight_breakdown,
 )
 
 CONFIG_DIR = Path(__file__).with_name("model_configs")
-CATALOG: dict[str, str] = {
-    "deepseek-v4-10t": "deepseek-v4-10t.json", "deepseek-v4-flash-0731": "deepseek-v4-flash-0731.json",
-    "deepseek-v4-pro-0813": "deepseek-v4-pro-0813.json", "deepseek-v4.1-flash": "deepseek-v4.1-flash.json",
-    "deepseek-v2-lite": "deepseek-v2-lite.json", "deepseek-v3.2-prune-3l": "deepseek-v3.2-prune-3l.json",
-    "deepseek-v3": "deepseek-v3.json", "deepseek-r1": "deepseek-r1.json", "deepseek-v3.2": "deepseek-v3.2.json",
-    "glm-5.3": "glm-5.3.json", "glm-5.3-flash": "glm-5.3-flash.json",
-    "glm-5.1": "glm-5.1.json", "glm-5.2": "glm-5.2.json",
-    "kimi-k3": "kimi-k3.json", "kimi-k3-dspark": "kimi-k3-dspark.json",
-    "kimi-k3-dspark-block5": "kimi-k3-dspark-block5.json",
-    "kimi-k2": "kimi-k2.json", "kimi-k2-thinking": "kimi-k2-thinking.json", "kimi-k2.5": "kimi-k2.5.json",
-    "qwen3-30b-a3b": "qwen3-30b-a3b.json", "qwen3-32b": "qwen3-32b.json",
-    "qwen3-235b-a22b": "qwen3-235b-a22b.json", "qwen3-next-80b-a3b": "qwen3-next-80b-a3b.json",
-    "qwen3.5-27b": "qwen3.5-27b.json", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b.json",
-    "qwen3.5-397b-a17b": "qwen3.5-397b-a17b.json", "qwen3.6-27b": "qwen3.6-27b.json",
-    "qwen3.8-2.4t-a95b": "qwen3.8-2.4t-a95b.json", "qwen3.8-27b": "qwen3.8-27b.json",
-    **FLEET_CATALOG_ENTRIES,
-}
-
-MODEL_ALIASES = {
-    "deepseek-v4-flash": "deepseek-v4-flash-0731", "deepseek-v4-pro": "deepseek-v4-pro-0813",
-    "deepseek-v4.1": "deepseek-v4.1-flash", "qwen3.8": "qwen3.8-27b",
-    "DeepSeek-V4-10T": "deepseek-v4-10t", "DeepSeek-V4-Flash-0731": "deepseek-v4-flash-0731",
-    "DeepSeek-V4-Pro-0813": "deepseek-v4-pro-0813", "DeepSeek-V4.1-Flash": "deepseek-v4.1-flash",
-    "DeepSeek-V2-Lite": "deepseek-v2-lite", "dsv2lite": "deepseek-v2-lite",
-    "DeepSeek-V3.2-Prune-3L": "deepseek-v3.2-prune-3l", "dsv32prune_L3": "deepseek-v3.2-prune-3l",
-    "DeepSeek-V3": "deepseek-v3", "DeepSeek-V3-0324": "deepseek-v3", "deepseek-v3-0324": "deepseek-v3", "dsv3": "deepseek-v3",
-    "DeepSeek-R1": "deepseek-r1", "DeepSeek-R1-0528": "deepseek-r1", "deepseek-r1-0528": "deepseek-r1", "dsr1": "deepseek-r1",
-    "DeepSeek-V3.2": "deepseek-v3.2", "DeepSeek-V3.2-Exp": "deepseek-v3.2", "deepseek-v3.2-exp": "deepseek-v3.2", "dsv3.2": "deepseek-v3.2",
-    "GLM-5.3": "glm-5.3", "glm5.3": "glm-5.3", "GLM5.3": "glm-5.3", "GLM-5": "glm-5.3", "glm-5": "glm-5.3",
-    "GLM-5.3-Flash": "glm-5.3-flash", "glm5.3-flash": "glm-5.3-flash", "glm53-flash": "glm-5.3-flash",
-    "GLM-5.3-W4A8": "glm-5.3", "GLM-5.3-W4A8-INT": "glm-5.3", "glm-5.3-w4a8": "glm-5.3",
-    "GLM-5.1": "glm-5.1", "glm5.1": "glm-5.1", "GLM5.1": "glm-5.1", "glm51": "glm-5.1",
-    "GLM-5.2": "glm-5.2", "glm5.2": "glm-5.2", "GLM5.2": "glm-5.2", "glm52": "glm-5.2",
-    "Kimi-K3": "kimi-k3", "Kimi-K3-DSpark": "kimi-k3-dspark",
-    "Kimi-K3-DSpark-Block5": "kimi-k3-dspark-block5",
-    "Kimi-K2": "kimi-k2", "Kimi-K2-Instruct": "kimi-k2", "kimi-k2-instruct": "kimi-k2", "kimi_k2": "kimi-k2",
-    "Kimi-K2-Thinking": "kimi-k2-thinking", "kimi-k2-thinking": "kimi-k2-thinking", "kimi_k2_thinking": "kimi-k2-thinking",
-    "Kimi-K2.5": "kimi-k2.5", "kimi_k2.5": "kimi-k2.5", "kimi_k25": "kimi-k2.5", "kimi-k25": "kimi-k2.5",
-    "Qwen3-30B-A3B": "qwen3-30b-a3b", "qwen30ba3b": "qwen3-30b-a3b",
-    "Qwen3-32B": "qwen3-32b", "qwen3_32b": "qwen3-32b",
-    "Qwen3-235B-A22B": "qwen3-235b-a22b", "qwen3_235b_a22b": "qwen3-235b-a22b", "qwen3-235b": "qwen3-235b-a22b",
-    "Qwen3-Next-80B-A3B": "qwen3-next-80b-a3b", "Qwen3-Next-80B-A3B-Instruct": "qwen3-next-80b-a3b",
-    "qwen3-next-80b-a3b-instruct": "qwen3-next-80b-a3b", "qwen3_next_80b_a3b": "qwen3-next-80b-a3b", "qwen3-next-80b": "qwen3-next-80b-a3b",
-    "Qwen3.5-27B": "qwen3.5-27b", "qwen35_27b": "qwen3.5-27b",
-    "Qwen3.8-2.4T-A95B": "qwen3.8-2.4t-a95b", "Qwen3.8-27B": "qwen3.8-27b",
-    "Qwen3.6-27B": "qwen3.6-27b", "qwen3.6-27b": "qwen3.6-27b",
-    "Qwen3.5-35B-A3B": "qwen3.5-35b-a3b", "qwen3.5-35b-a3b": "qwen3.5-35b-a3b",
-    "qwen3_5_moe_a3b": "qwen3.5-35b-a3b",
-    "Qwen3.5-397B-A17B": "qwen3.5-397b-a17b", "qwen3_5_397b_a17b": "qwen3.5-397b-a17b", "qwen3.5-397b": "qwen3.5-397b-a17b",
-    **FLEET_MODEL_ALIASES,
-}
-
-ARCHITECTURE_PRESET_CATALOG: dict[str, str] = {
-    "longcat-flash-lite": "longcat-flash-lite.json",
-    "minimax-m3": "../catalog/configs/minimax-m3.json",
-    "bailing-v3": "bailing-v3.json",
-    "qwen3.5-moe": "qwen3.5-moe.json",
-    "hunyuan-video-dit": "hunyuan-video-dit.json",
-}
-
-ARCHITECTURE_PRESET_ALIASES = {
-    "LongCat-Flash-Lite": "longcat-flash-lite",
-    "longcat_flash_lite": "longcat-flash-lite",
-    "MiniMax-M3": "minimax-m3",
-    "MiniMax-M3-VL": "minimax-m3",
-    "minimax_m3": "minimax-m3",
-    "Bailing-V3": "bailing-v3",
-    "Bailing-Moe-V3": "bailing-v3",
-    "bailing_v3": "bailing-v3",
-    "Qwen3.5-MoE": "qwen3.5-moe",
-    "Qwen3.5-MoE-A35B": "qwen3.5-moe",
-    "qwen3_5_moe": "qwen3.5-moe",
-    "HunyuanVideo": "hunyuan-video-dit",
-    "HunyuanVideo-DiT": "hunyuan-video-dit",
-    "hunyuan_video": "hunyuan-video-dit",
-}
 
 _RECURRENT_KINDS = {"gdn", "kda", "mamba"}
 _TOKEN_KV_KINDS = {"gqa", "mla", "gqa_sparse_indexer"}
@@ -308,40 +237,26 @@ class ModelArchitectureProfile:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "key": self.key,
-            "name": self.name,
-            "model_type": self.model_type,
-            "family": self.family,
-            "num_layers": self.num_layers,
-            "hidden_size": self.hidden_size,
-            "vocab_size": self.vocab_size,
+            "key": self.key, "name": self.name, "model_type": self.model_type, "family": self.family,
+            "num_layers": self.num_layers, "hidden_size": self.hidden_size, "vocab_size": self.vocab_size,
             "attention_type": self.attention_type,
-            "recurrent_layers": len(self.recurrent_layer_indices),
-            "token_kv_layers": len(self.token_kv_layer_indices),
+            "recurrent_layers": len(self.recurrent_layer_indices), "token_kv_layers": len(self.token_kv_layer_indices),
             "physical_kv_owner_layers": list(self.physical_kv_owner_layers),
             "consumer_shared_kv_layers": list(self.consumer_shared_kv_layers),
             "latent_moe_hidden_size": self.latent_moe_hidden_size,
             "moe_dispatch_token_width": self.moe_dispatch_token_width,
             "moe_dispatch_compression_ratio": self.moe_dispatch_compression_ratio,
-            "visual_tokens": self.visual_tokens,
-            "total_dit_tokens": self.total_dit_tokens,
+            "visual_tokens": self.visual_tokens, "total_dit_tokens": self.total_dit_tokens,
             "state_bytes_per_seq_tp1": self.total_state_bytes_per_seq(1, 1),
             "kv_bytes_per_token_tp1": self.kv_bytes_per_token_per_rank(1, 1, 1),
-            "compute_dtype": self.compute_dtype,
-            "output_dtype": self.output_dtype,
-            "rope_theta": self.rope_theta,
-            "rope_type": self.rope_type,
-            "rope_scaling_factor": self.rope_scaling_factor,
-            "partial_rotary_factor": self.partial_rotary_factor,
-            "rotary_dim": self.rotary_dim,
-            "mla_use_nope": self.mla_use_nope,
-            "mrope_section": list(self.mrope_section),
-            "mrope_interleaved": self.mrope_interleaved,
+            "compute_dtype": self.compute_dtype, "output_dtype": self.output_dtype,
+            "rope_theta": self.rope_theta, "rope_type": self.rope_type,
+            "rope_scaling_factor": self.rope_scaling_factor, "partial_rotary_factor": self.partial_rotary_factor,
+            "rotary_dim": self.rotary_dim, "mla_use_nope": self.mla_use_nope,
+            "mrope_section": list(self.mrope_section), "mrope_interleaved": self.mrope_interleaved,
             "max_position_embeddings": self.max_position_embeddings,
-            "index_topk": self.index_topk,
-            "index_n_heads": self.index_n_heads,
-            "sliding_window": self.sliding_window,
-            "quant_method": self.quant_method,
+            "index_topk": self.index_topk, "index_n_heads": self.index_n_heads,
+            "sliding_window": self.sliding_window, "quant_method": self.quant_method,
         }
 
 
@@ -794,11 +709,26 @@ def customize_model_spec(
     return spec
 
 
+@lru_cache(maxsize=None)
+def _load_builtin_model(key: str) -> ModelSpec:
+    entries = {**CATALOG, **ARCHITECTURE_PRESET_CATALOG}
+    path = CONFIG_DIR / entries[key]
+    try:
+        config = json.loads(path.read_text(encoding="utf-8"))
+    except TimeoutError:
+        raise
+    except OSError as exc:
+        raise ModelingError(f"model_config_unreadable:{key}:{type(exc).__name__}") from exc
+    return _build_model_spec(key, config)
+
+
 def load_model(key: str, *, config_root: str | Path | None = None) -> ModelSpec:
     key = str(key)
     key = _catalog_key(key)
-    root = Path(config_root) if config_root is not None else CONFIG_DIR
     entries = {**CATALOG, **ARCHITECTURE_PRESET_CATALOG}
+    if config_root is None and key in entries:
+        return _load_builtin_model(key)
+    root = Path(config_root) if config_root is not None else CONFIG_DIR
     path = root / entries[key] if key in entries else Path(key).expanduser()
     if path.is_dir():
         path = path / "config.json"
@@ -828,30 +758,20 @@ def sharded_weight_bytes(
     """Largest actual PP-stage per-rank weight footprint."""
     parallel.validate(model)
     from mindie_sim.prediction.structure import normalize_model
-    model = normalize_model(model)
-    return _sharded(
-        model, parallel, node_ranks, include_draft=include_draft,
-        include_engram=include_engram,
-    )
+    return _sharded(normalize_model(model), parallel, node_ranks, include_draft=include_draft, include_engram=include_engram)
 
 
-def model_weight_detail(
-    model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1,
-) -> dict[str, Any]:
+def model_weight_detail(model: ModelSpec, parallel: ParallelSpec, node_ranks: int = 1) -> dict[str, Any]:
     stages = stage_weight_bytes(model, parallel, node_ranks)
-    stages_draft = stage_weight_bytes(
-        model, parallel, node_ranks, include_draft=True,
-    )
+    stages_draft = stage_weight_bytes(model, parallel, node_ranks, include_draft=True)
     return {
-        "stage_bytes": stages,
-        "stage_bytes_with_optional_draft": stages_draft,
+        "stage_bytes": stages, "stage_bytes_with_optional_draft": stages_draft,
         "largest_stage_bytes": max(stages) if stages else 0.0,
         "largest_stage_with_draft_bytes": max(stages_draft) if stages_draft else 0.0,
         "largest_stage": max(range(len(stages)), key=lambda i: stages[i]) if stages else 0,
         "category_bytes": weight_breakdown(model, parallel, node_ranks),
         "logical_body_parameters": body_parameter_count(model),
-        "logical_body_weight_bytes": body_weight_bytes(model),
-        "node_ranks": node_ranks,
+        "logical_body_weight_bytes": body_weight_bytes(model), "node_ranks": node_ranks,
     }
 
 
@@ -861,29 +781,19 @@ def list_models() -> list[dict[str, Any]]:
         model = load_model(key)
         facts = dict(model.catalog_facts)
         rows.append({
-            "key": key, "name": model.name, "layers": model.layers,
-            "body_layers": model.body_layers,
-            "hidden_size": model.hidden_size, "heads": model.num_heads,
-            "experts": model.num_experts, "top_k": model.top_k,
-            "parameter_count": model.parameter_count(),
-            "resident_weight_bytes": body_weight_bytes(model),
-            "attention_types": facts.get("attention_types", {}),
-            "ffn_types": facts.get("ffn_types", {}),
-            "has_optional_draft": model.has_optional_draft,
-            "has_vision": model.vision is not None,
-            "engram_tables": facts.get("engram_tables", 0),
-            "facts": facts,
-            **model_coverage(model),
+            "key": key, "name": model.name, "layers": model.layers, "body_layers": model.body_layers,
+            "hidden_size": model.hidden_size, "heads": model.num_heads, "experts": model.num_experts, "top_k": model.top_k,
+            "parameter_count": model.parameter_count(), "resident_weight_bytes": body_weight_bytes(model),
+            "attention_types": facts.get("attention_types", {}), "ffn_types": facts.get("ffn_types", {}),
+            "has_optional_draft": model.has_optional_draft, "has_vision": model.vision is not None,
+            "engram_tables": facts.get("engram_tables", 0), "facts": facts, **model_coverage(model),
         })
     return rows
 
 
 __all__ = [
-    "CATALOG", "MODEL_ALIASES", "ARCHITECTURE_PRESET_CATALOG",
-    "ARCHITECTURE_PRESET_ALIASES", "CONFIG_DIR", "LayerPlan",
-    "ModelArchitectureProfile", "build_architecture_profile",
-    "load_architecture_profile", "list_architecture_profiles",
+    "CATALOG", "MODEL_ALIASES", "ARCHITECTURE_PRESET_CATALOG", "ARCHITECTURE_PRESET_ALIASES", "CONFIG_DIR", "LayerPlan",
+    "ModelArchitectureProfile", "build_architecture_profile", "load_architecture_profile", "list_architecture_profiles",
     "derive_expert_pruned", "customize_model_spec", "load_model", "list_models",
-    "sharded_weight_bytes", "model_weight_detail",
-    "stage_weight_terms", "body_weight_bytes", "body_parameter_count",
+    "sharded_weight_bytes", "model_weight_detail", "stage_weight_terms", "body_weight_bytes", "body_parameter_count",
 ]

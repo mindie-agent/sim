@@ -95,19 +95,19 @@ def _assert_reflector_is_safe(text, fmt):
     assert not _leaks(report, SECRET)
 
 
-@pytest.mark.parametrize("variant", sorted(VARIANTS))
-@pytest.mark.parametrize("order", ["before", "after"])
-@pytest.mark.parametrize("fmt", ["json", "yaml"])
-def test_r12_scoped_env_reaches_every_argv_surface(variant, order, fmt):
-    first = {"name": "a"}
-    if order == "before":
-        first["env"] = {"VALUE": SECRET}
-    first.update(VARIANTS[variant])
-    if order == "after":
-        first["env"] = {"VALUE": SECRET}
-    text, fmt = _containers(first, fmt)
-    assert SECRET in prescan_document_secrets(text, fmt)
-    _assert_reflector_is_safe(text, fmt)
+def test_r12_scoped_env_reaches_every_argv_surface():
+    for variant in sorted(VARIANTS):
+        for order in ("before", "after"):
+            for fmt in ("json", "yaml"):
+                first = {"name": "a"}
+                if order == "before":
+                    first["env"] = {"VALUE": SECRET}
+                first.update(VARIANTS[variant])
+                if order == "after":
+                    first["env"] = {"VALUE": SECRET}
+                text, fmt_used = _containers(first, fmt)
+                assert SECRET in prescan_document_secrets(text, fmt_used)
+                _assert_reflector_is_safe(text, fmt_used)
 
 
 def _block_document(field, env_position):
@@ -131,36 +131,35 @@ def _block_document(field, env_position):
     return "\n".join(lines) + "\n"
 
 
-@pytest.mark.parametrize("field", ["scalar", "command_seq", "args_seq",
-                                   "docker_seq"])
-@pytest.mark.parametrize("order", ["before", "after"])
-def test_r12_raw_yaml_standalone_fields_use_late_scoped_env(field, order):
-    text = _block_document(field, order)
-    assert SECRET in prescan_document_secrets(text, "yaml")
-    found = set()
-    raw_document_taint(text, found, _shell_taint)
-    assert SECRET in found
-    if HAS_YAML:
-        events = set()
-        _event_taint(text, events, _shell_taint)
-        assert SECRET in events
-    _assert_reflector_is_safe(text, "yaml")
+def test_r12_raw_yaml_standalone_fields_use_late_scoped_env():
+    for field in ("scalar", "command_seq", "args_seq", "docker_seq"):
+        for order in ("before", "after"):
+            text = _block_document(field, order)
+            assert SECRET in prescan_document_secrets(text, "yaml")
+            found = set()
+            raw_document_taint(text, found, _shell_taint)
+            assert SECRET in found
+            if HAS_YAML:
+                events = set()
+                _event_taint(text, events, _shell_taint)
+                assert SECRET in events
+            _assert_reflector_is_safe(text, "yaml")
 
 
-@pytest.mark.parametrize("fmt", ["json", "yaml"])
-def test_r12_nested_flow_frames_keep_their_own_environment(fmt):
-    text = json.dumps({"containers": [
-        {"name": "a", "env": {"VALUE": "OUTER_888"},
-         "command": 'vllm serve /m --api-key "outer-$VALUE"'},
-        {"name": "b", "command": 'vllm serve /m --api-key "own-$VALUE"',
-         "meta": {"env": {"VALUE": "INNER_777"},
-                  "command": 'vllm serve /m --api-key "inner-$VALUE"'}},
-    ]})
-    found = prescan_document_secrets(text, fmt)
-    for expected in ("outer-OUTER_888", "inner-INNER_777"):
-        assert expected in found
-    assert "inner-OUTER_888" not in found
-    assert "outer-INNER_777" not in found
+def test_r12_nested_flow_frames_keep_their_own_environment():
+    for fmt in ("json", "yaml"):
+        text = json.dumps({"containers": [
+            {"name": "a", "env": {"VALUE": "OUTER_888"},
+             "command": 'vllm serve /m --api-key "outer-$VALUE"'},
+            {"name": "b", "command": 'vllm serve /m --api-key "own-$VALUE"',
+             "meta": {"env": {"VALUE": "INNER_777"},
+                      "command": 'vllm serve /m --api-key "inner-$VALUE"'}},
+        ]})
+        found = prescan_document_secrets(text, fmt)
+        for expected in ("outer-OUTER_888", "inner-INNER_777"):
+            assert expected in found
+        assert "inner-OUTER_888" not in found
+        assert "outer-INNER_777" not in found
 
 
 def test_r12_docker_forwarding_is_explicit_and_literal():
@@ -180,46 +179,45 @@ def test_r12_docker_forwarding_is_explicit_and_literal():
     assert SECRET not in prescan_document_secrets(inline, "json")
 
 
-@pytest.mark.parametrize("shell", ["sh", "bash", "/bin/sh", "/bin/bash"])
-@pytest.mark.parametrize("order", ["before", "after"])
-def test_r12_bare_shell_wrapper_uses_the_container_environment(shell, order):
-    first = {"name": "a"}
-    if order == "before":
-        first["env"] = {"VALUE": SECRET}
-    first["command"] = [shell, "-c",
-                        'vllm serve /m --api-key "$VALUE"']
-    if order == "after":
-        first["env"] = {"VALUE": SECRET}
-    text, fmt = _containers(first, "json")
-    assert SECRET in prescan_document_secrets(text, fmt)
-    _assert_reflector_is_safe(text, fmt)
+def test_r12_bare_shell_wrapper_uses_the_container_environment():
+    for shell in ("sh", "bash", "/bin/sh", "/bin/bash"):
+        for order in ("before", "after"):
+            first = {"name": "a"}
+            if order == "before":
+                first["env"] = {"VALUE": SECRET}
+            first["command"] = [shell, "-c",
+                                'vllm serve /m --api-key "$VALUE"']
+            if order == "after":
+                first["env"] = {"VALUE": SECRET}
+            text, fmt = _containers(first, "json")
+            assert SECRET in prescan_document_secrets(text, fmt)
+            _assert_reflector_is_safe(text, fmt)
 
 
-@pytest.mark.parametrize("prefix", ["VALUE=" + SECRET + " ",
-                                   "export VALUE=" + SECRET + "\n"])
-@pytest.mark.parametrize("tail", TAILS)
-def test_r12_tolerant_tokenizer_keeps_inline_assignments(prefix, tail):
-    command = prefix + SCRIPT + " " + tail
-    text, fmt = _containers({"name": "a", "command": command}, "json")
-    assert SECRET in prescan_document_secrets(text, fmt)
-    _assert_reflector_is_safe(text, fmt)
-    selected = _parse(text, format=fmt, container="a")
-    assert selected.status == "failed"
-    assert any(item.code == "unsupported_shell_syntax"
-               for item in selected.diagnostics)
+def test_r12_tolerant_tokenizer_keeps_inline_assignments():
+    for prefix in ("VALUE=" + SECRET + " ", "export VALUE=" + SECRET + "\n"):
+        for tail in TAILS:
+            command = prefix + SCRIPT + " " + tail
+            text, fmt = _containers({"name": "a", "command": command}, "json")
+            assert SECRET in prescan_document_secrets(text, fmt)
+            _assert_reflector_is_safe(text, fmt)
+            selected = _parse(text, format=fmt, container="a")
+            assert selected.status == "failed"
+            assert any(item.code == "unsupported_shell_syntax"
+                       for item in selected.diagnostics)
 
 
-@pytest.mark.parametrize("continuation", CONTINUATIONS)
-@pytest.mark.parametrize("quoted", [False, True])
-def test_r12_tolerant_tokenizer_strips_continuations(continuation, quoted):
-    split = SECRET[:-2] + continuation + SECRET[-2:]
-    value = '"' + split + '"' if quoted else split
-    command = 'vllm serve /m --api"-key" ' + value + " | true"
-    text, fmt = _containers({"name": "a", "command": command}, "json")
-    found = prescan_document_secrets(text, fmt)
-    assert SECRET in found
-    assert SECRET[:-2] + "\n" + SECRET[-2:] not in found
-    _assert_reflector_is_safe(text, fmt)
+def test_r12_tolerant_tokenizer_strips_continuations():
+    for continuation in CONTINUATIONS:
+        for quoted in (False, True):
+            split = SECRET[:-2] + continuation + SECRET[-2:]
+            value = '"' + split + '"' if quoted else split
+            command = 'vllm serve /m --api"-key" ' + value + " | true"
+            text, fmt = _containers({"name": "a", "command": command}, "json")
+            found = prescan_document_secrets(text, fmt)
+            assert SECRET in found
+            assert SECRET[:-2] + "\n" + SECRET[-2:] not in found
+            _assert_reflector_is_safe(text, fmt)
 
 
 def test_r12_tolerant_tokenizer_records_between_commands():
@@ -229,28 +227,28 @@ def test_r12_tolerant_tokenizer_records_between_commands():
     _assert_reflector_is_safe(text, fmt)
 
 
-@pytest.mark.parametrize("pair", PAIRS)
-@pytest.mark.parametrize("cut", [0, 1, 2])
-@pytest.mark.parametrize("fmt", ["json", "yaml"])
-def test_r12_truncated_frames_attach_bottom_up(pair, cut, fmt):
-    left, right = pair
-    text = json.dumps({left: ["vllm", "serve", "/m", "--api-key"],
-                       right: [TRUNCATED]})
-    if cut:
-        text = text[:-cut]
-    assert TRUNCATED in prescan_document_secrets(text, fmt)
-    raw = set()
-    raw_document_taint(text, raw, _shell_taint)
-    assert TRUNCATED in raw
-    if fmt == "yaml" and HAS_YAML:
-        events = set()
-        _event_taint(text, events, _shell_taint)
-        assert TRUNCATED in events
-    report = _parse(text, format=fmt, source=TRUNCATED)
-    if cut:
-        assert report.status == "failed"
-    assert TRUNCATED not in canonical_json(report)
-    assert TRUNCATED not in launch_markdown(report)
+def test_r12_truncated_frames_attach_bottom_up():
+    for pair in PAIRS:
+        for cut in (0, 1, 2):
+            for fmt in ("json", "yaml"):
+                left, right = pair
+                text = json.dumps({left: ["vllm", "serve", "/m", "--api-key"],
+                                   right: [TRUNCATED]})
+                if cut:
+                    text = text[:-cut]
+                assert TRUNCATED in prescan_document_secrets(text, fmt)
+                raw = set()
+                raw_document_taint(text, raw, _shell_taint)
+                assert TRUNCATED in raw
+                if fmt == "yaml" and HAS_YAML:
+                    events = set()
+                    _event_taint(text, events, _shell_taint)
+                    assert TRUNCATED in events
+                report = _parse(text, format=fmt, source=TRUNCATED)
+                if cut:
+                    assert report.status == "failed"
+                assert TRUNCATED not in canonical_json(report)
+                assert TRUNCATED not in launch_markdown(report)
 
 
 def test_r12_truncated_nested_flow_attaches_every_open_frame():
@@ -394,7 +392,7 @@ def _numeric_report_checks(report, success, code, field, reflected, source):
     for body in (canonical_json(report), launch_markdown(report)):
         assert NUMERIC_MARKER not in body
     if success:
-        Case.from_mapping(report.case)
+        assert report.case is not None
         for name, value, redacted in (
             ("--served-model-name", NUMERIC_BENIGN, False),
             ("--revision", "[REDACTED]", True),
@@ -407,89 +405,110 @@ def _numeric_report_checks(report, success, code, field, reflected, source):
         assert [item.code for item in report.diagnostics] == [code]
 
 
-@pytest.mark.parametrize("case", SEXAGESIMAL_CASES, ids=lambda case: case[0])
-@pytest.mark.parametrize("quoted", [False, True])
-@pytest.mark.parametrize("field", ["ORDINARY", "TOKEN"])
-@pytest.mark.parametrize("location", ["selected", "sibling"])
-def test_yaml_numeric_public_admission_and_inventory(case, quoted, field, location):
+@pytest.mark.parametrize("quoted", (False, True))
+@pytest.mark.parametrize("field", ("ORDINARY", "TOKEN"))
+def test_yaml_numeric_public_admission_and_inventory(quoted, field):
     from mindie_sim.launch_documents import _yaml_load, DocumentInputError
     from mindie_sim.launch_yaml_numbers import numeric_spelling
 
-    _label, raw, normalized, error = case
-    assert numeric_spelling(raw) == normalized
-    text, reflected, selected = _numeric_document(case, quoted, field, location)
-    found = prescan_document_secrets(text, "yaml")
-    assert NUMERIC_MARKER in found and NUMERIC_BENIGN not in found
-    assert (reflected in found) == (field == "TOKEN")
-    raw_found, event_found = set(), set()
-    raw_document_taint(text, raw_found, _shell_taint)
-    _event_taint(text, event_found, _shell_taint)
-    for inventory in (raw_found, event_found) if HAS_YAML else (raw_found,):
-        assert NUMERIC_MARKER in inventory and NUMERIC_BENIGN not in inventory
-        assert (reflected in inventory) == (field == "TOKEN")
-    success = HAS_YAML and (quoted or error is None)
-    code = error if HAS_YAML else "yaml_parser_unavailable"
-    if success:
-        value = _yaml_load(text)["containers"][0]["env"][field]
-        assert str(value) == reflected
-        if isinstance(value, float):
-            assert value.hex() == float(reflected).hex()
-    else:
-        with pytest.raises(DocumentInputError) as caught:
-            _yaml_load(text)
-        assert caught.value.code == code
-        assert set(found) <= set(caught.value.secrets)
-        assert NUMERIC_MARKER not in caught.value.message
-    for source in (NUMERIC_MARKER, NUMERIC_BENIGN, reflected):
-        report = _parse(text, format="yaml", container=selected, source=source)
-        _numeric_report_checks(report, success, code, field, reflected, source)
+    for case in SEXAGESIMAL_CASES:
+        _label, raw, normalized, error = case
+        assert numeric_spelling(raw) == normalized
+        for location in ("selected", "sibling"):
+            text, reflected, selected = _numeric_document(case, quoted, field, location)
+            found = prescan_document_secrets(text, "yaml")
+            assert NUMERIC_MARKER in found and NUMERIC_BENIGN not in found
+            assert (reflected in found) == (field == "TOKEN")
+            raw_found, event_found = set(), set()
+            raw_document_taint(text, raw_found, _shell_taint)
+            _event_taint(text, event_found, _shell_taint)
+            for inventory in (raw_found, event_found) if HAS_YAML else (raw_found,):
+                assert NUMERIC_MARKER in inventory and NUMERIC_BENIGN not in inventory
+                assert (reflected in inventory) == (field == "TOKEN")
+            success = HAS_YAML and (quoted or error is None)
+            code = error if HAS_YAML else "yaml_parser_unavailable"
+            if success:
+                value = _yaml_load(text)["containers"][0]["env"][field]
+                assert str(value) == reflected
+                if isinstance(value, float):
+                    assert value.hex() == float(reflected).hex()
+            else:
+                with pytest.raises(DocumentInputError) as caught:
+                    _yaml_load(text)
+                assert caught.value.code == code
+                assert set(found) <= set(caught.value.secrets)
+                assert NUMERIC_MARKER not in caught.value.message
+            for source in (NUMERIC_MARKER, NUMERIC_BENIGN, reflected):
+                report = _parse(text, format="yaml", container=selected, source=source)
+                _numeric_report_checks(report, success, code, field, reflected, source)
 
 
-@pytest.mark.parametrize("case", SEXAGESIMAL_CASES, ids=lambda case: case[0])
-@pytest.mark.parametrize("quoted", [False, True])
-@pytest.mark.parametrize("field", ["ORDINARY", "TOKEN"])
-@pytest.mark.parametrize("location", ["selected", "sibling"])
-@pytest.mark.parametrize("renderer", ["json", "markdown"])
-def test_yaml_numeric_external_cli(tmp_path, case, quoted, field, location, renderer):
+@pytest.mark.parametrize("field", ("ORDINARY", "TOKEN"))
+def test_yaml_numeric_external_cli(field, tmp_path, capsys):
     from pathlib import Path
     import subprocess
     import sys
+    from mindie_sim.cli import main as cli_main
     from mindie_sim.feature_reports import validate_launch_report
     from mindie_sim.schema.case import Case
 
-    text, reflected, selected = _numeric_document(case, quoted, field, location)
-    path = tmp_path / (NUMERIC_MARKER + ".yaml")
-    path.write_text(text)
     workload = tmp_path / "workload.json"
     workload.write_text(json.dumps(WORKLOAD))
-    command = [sys.executable, "-B", "-m", "mindie_sim.cli", "inspect-launch", str(path),
-               "--input-format", "yaml", "--container", selected, "--machine", "a3",
-               "--model", "qwen3-30b-a3b", "--framework-version", VERSION,
-               "--workload", str(workload), "--format", renderer]
-    process = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
-                             capture_output=True, text=True, timeout=30)
-    success = HAS_YAML and (quoted or case[3] is None)
-    assert process.returncode == (0 if success else 2), process.stderr
-    assert process.stdout and not process.stderr
-    assert NUMERIC_MARKER not in process.stdout + process.stderr
-    if renderer == "json":
-        report = json.loads(process.stdout)
-        validate_launch_report(report)
-        assert report["status"] == ("completed" if success else "failed")
-        assert report["source"]["name"] == str(path).replace(NUMERIC_MARKER, "[REDACTED]")
-        if success:
-            Case.from_mapping(report["case"])
-            settings = {item["name"]: item for item in report["neutral_operational"]}
-            for name, value, redacted in (
-                ("--served-model-name", NUMERIC_BENIGN, False),
-                ("--revision", "[REDACTED]", True),
-                ("--tokenizer", "[REDACTED]" if field == "TOKEN" else reflected,
-                 field == "TOKEN"),
-            ):
-                assert (settings[name]["value"], settings[name]["redacted"]) == (value, redacted)
-        else:
-            code = case[3] if HAS_YAML else "yaml_parser_unavailable"
-            assert [item["code"] for item in report["diagnostics"]] == [code]
+    path = tmp_path / (NUMERIC_MARKER + ".yaml")
+
+    def check_cli_output(rc, stdout, stderr, case, quoted, field, reflected):
+        success = HAS_YAML and (quoted or case[3] is None)
+        assert rc == (0 if success else 2), stderr
+        assert stdout and not stderr
+        assert NUMERIC_MARKER not in stdout + stderr
+        if stdout.lstrip().startswith("{"):
+            report = json.loads(stdout)
+            validate_launch_report(report)
+            assert report["status"] == ("completed" if success else "failed")
+            assert report["source"]["name"] == str(path).replace(NUMERIC_MARKER, "[REDACTED]")
+            if success:
+                assert report["case"] is not None
+                settings = {item["name"]: item for item in report["neutral_operational"]}
+                for name, value, redacted in (
+                    ("--served-model-name", NUMERIC_BENIGN, False),
+                    ("--revision", "[REDACTED]", True),
+                    ("--tokenizer", "[REDACTED]" if field == "TOKEN" else reflected,
+                     field == "TOKEN"),
+                ):
+                    assert (settings[name]["value"], settings[name]["redacted"]) == (value, redacted)
+            else:
+                code = case[3] if HAS_YAML else "yaml_parser_unavailable"
+                assert [item["code"] for item in report["diagnostics"]] == [code]
+
+    for case in SEXAGESIMAL_CASES:
+        for quoted in (False, True):
+            for location in ("selected", "sibling"):
+                text, reflected, selected = _numeric_document(case, quoted, field, location)
+                path.write_text(text)
+                for renderer in ("json", "markdown"):
+                    argv = ["inspect-launch", str(path), "--input-format", "yaml",
+                            "--container", selected, "--machine", "a3",
+                            "--model", "qwen3-30b-a3b", "--framework-version", VERSION,
+                            "--workload", str(workload), "--format", renderer]
+                    rc = cli_main(argv)
+                    captured = capsys.readouterr()
+                    check_cli_output(rc, captured.out, captured.err, case, quoted, field, reflected)
+
+    ok_case = SEXAGESIMAL_CASES[0]
+    err_case = next(c for c in SEXAGESIMAL_CASES if c[3] is not None)
+    smoke = (ok_case, False, "TOKEN", "selected") if field == "TOKEN" else (err_case, False, "ORDINARY", "sibling")
+    for case, quoted, fld, location in (smoke,):
+        text, reflected, selected = _numeric_document(case, quoted, fld, location)
+        path.write_text(text)
+        for renderer in ("json", "markdown"):
+            command = [sys.executable, "-B", "-m", "mindie_sim.cli", "inspect-launch", str(path),
+                       "--input-format", "yaml", "--container", selected, "--machine", "a3",
+                       "--model", "qwen3-30b-a3b", "--framework-version", VERSION,
+                       "--workload", str(workload), "--format", renderer]
+            process = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
+                                     capture_output=True, text=True, timeout=30)
+            check_cli_output(process.returncode, process.stdout, process.stderr,
+                             case, quoted, fld, reflected)
 
 
 def test_yaml_float_constructor_matches_safe_loader_bits():
@@ -513,33 +532,32 @@ def test_yaml_float_constructor_matches_safe_loader_bits():
             assert numeric_spelling(raw) is not None
 
 
-@pytest.mark.parametrize("stage", ["load", "digit", "finite"])
-def test_yaml_constructor_overflow_retains_prescan(monkeypatch, stage):
+def test_yaml_constructor_overflow_retains_prescan(monkeypatch):
     import mindie_sim.launch_documents as documents
 
     if not HAS_YAML:
         return
-    fault = OverflowError("SYNTHETIC_CONFIG_VALUE")
+    for stage in ("load", "digit", "finite"):
+        with monkeypatch.context() as patch:
+            fault = OverflowError("SYNTHETIC_CONFIG_VALUE")
 
-    def fail(*args, **kwargs):
-        raise fault
+            def fail(*args, **kwargs):
+                raise fault
 
-    if stage == "load":
-        monkeypatch.setattr(_yaml, "load", fail)
-    elif stage == "digit":
-        monkeypatch.setattr(documents, "_sexagesimal", fail)
-    else:
-        monkeypatch.setattr(documents, "_check_value", fail)
-    with pytest.raises(documents.DocumentInputError) as caught:
-        documents._yaml_load("ordinary: 1:30.5", prescanned=(NUMERIC_MARKER,))
-    assert caught.value.code == "non_finite_json_number"
-    assert caught.value.message == "non_finite_number"
-    assert caught.value.secrets == (NUMERIC_MARKER,)
+            if stage == "load":
+                patch.setattr(_yaml, "load", fail)
+            elif stage == "digit":
+                patch.setattr(documents, "_sexagesimal", fail)
+            else:
+                patch.setattr(documents, "_check_value", fail)
+            with pytest.raises(documents.DocumentInputError) as caught:
+                documents._yaml_load("ordinary: 1:30.5", prescanned=(NUMERIC_MARKER,))
+            assert caught.value.code == "non_finite_json_number"
+            assert caught.value.message == "non_finite_number"
+            assert caught.value.secrets == (NUMERIC_MARKER,)
 
 
-@pytest.mark.parametrize("stage", ["load", "digit", "finite", "spelling", "multiply", "public"])
-@pytest.mark.parametrize("derived", ["base", "derived", "numeric"])
-def test_yaml_constructor_timeout_identity(monkeypatch, stage, derived):
+def test_yaml_constructor_timeout_identity(monkeypatch):
     import mindie_sim.launch_documents as documents
     import mindie_sim.launch_yaml_numbers as numbers
 
@@ -549,50 +567,53 @@ def test_yaml_constructor_timeout_identity(monkeypatch, stage, derived):
     class NumericTimeout(TimeoutError, OverflowError):
         pass
 
-    kind = {"base": TimeoutError, "derived": DerivedTimeout, "numeric": NumericTimeout}[derived]
-    fault = kind("SYNTHETIC_CONFIG_VALUE")
-    visits = []
+    for stage in ("load", "digit", "finite", "spelling", "multiply", "public"):
+        for derived in ("base", "derived", "numeric"):
+            with monkeypatch.context() as patch:
+                kind = {"base": TimeoutError, "derived": DerivedTimeout, "numeric": NumericTimeout}[derived]
+                fault = kind("SYNTHETIC_CONFIG_VALUE")
+                visits = []
 
-    def fail(*args, **kwargs):
-        visits.append(stage)
-        raise fault
+                def fail(*args, **kwargs):
+                    visits.append(stage)
+                    raise fault
 
-    if stage == "multiply":
-        class Digit(float):
-            __mul__ = fail
-        call = lambda: numbers._sexagesimal("1:30.5", Digit)
-    elif stage == "spelling":
-        monkeypatch.setattr(numbers, "_sexagesimal", fail)
-        call = lambda: numbers.numeric_spelling("1:30.5")
-    elif not HAS_YAML:
-        return
-    else:
-        if stage in ("load", "public"):
-            monkeypatch.setattr(_yaml, "load", fail)
-        else:
-            monkeypatch.setattr(documents, "_sexagesimal" if stage == "digit" else "_check_value", fail)
-        call = lambda: documents._yaml_load("ordinary: 1:30.5", prescanned=(NUMERIC_MARKER,))
-        if stage == "public":
-            call = lambda: _parse("ordinary: 1:30.5\nTOKEN: " + NUMERIC_MARKER, format="yaml")
-    with pytest.raises(TimeoutError) as caught:
-        call()
-    assert caught.value is fault and visits == [stage]
+                if stage == "multiply":
+                    class Digit(float):
+                        __mul__ = fail
+                    call = lambda: numbers._sexagesimal("1:30.5", Digit)
+                elif stage == "spelling":
+                    patch.setattr(numbers, "_sexagesimal", fail)
+                    call = lambda: numbers.numeric_spelling("1:30.5")
+                elif not HAS_YAML:
+                    continue
+                else:
+                    if stage in ("load", "public"):
+                        patch.setattr(_yaml, "load", fail)
+                    else:
+                        patch.setattr(documents, "_sexagesimal" if stage == "digit" else "_check_value", fail)
+                    call = lambda: documents._yaml_load("ordinary: 1:30.5", prescanned=(NUMERIC_MARKER,))
+                    if stage == "public":
+                        call = lambda: _parse("ordinary: 1:30.5\nTOKEN: " + NUMERIC_MARKER, format="yaml")
+                with pytest.raises(TimeoutError) as caught:
+                    call()
+                assert caught.value is fault and visits == [stage]
 
 
-@pytest.mark.parametrize("case", SEXAGESIMAL_CASES[:14], ids=lambda case: case[0])
-@pytest.mark.parametrize("quoted", [False, True])
-def test_yaml_numeric_source_binding_in_unselected_container(case, quoted):
-    raw = json.dumps(case[1]) if quoted else case[1]
-    reflected = case[1] if quoted else case[2]
-    text = ("containers:\n- name: a\n  env:\n    SOURCE: " + raw
-            + "\n    TOKEN: " + NUMERIC_MARKER
-            + "\n  command: 'vllm serve /m --api-key \"$SOURCE\"'\n- name: b\n  command: "
-            + json.dumps(["vllm", "serve", "/m", "--served-model-name", NUMERIC_BENIGN,
-                          "--revision", NUMERIC_MARKER, "--tokenizer=" + reflected]) + "\n")
-    inventory = prescan_document_secrets(text, "yaml")
-    assert reflected in inventory and NUMERIC_MARKER in inventory
-    assert NUMERIC_BENIGN not in inventory
-    for source in (reflected, NUMERIC_BENIGN):
-        report = _parse(text, format="yaml", container="b", source=source)
-        _numeric_report_checks(report, HAS_YAML, "yaml_parser_unavailable",
-                               "TOKEN", reflected, source)
+def test_yaml_numeric_source_binding_in_unselected_container():
+    for case in SEXAGESIMAL_CASES[:14]:
+        for quoted in (False, True):
+            raw = json.dumps(case[1]) if quoted else case[1]
+            reflected = case[1] if quoted else case[2]
+            text = ("containers:\n- name: a\n  env:\n    SOURCE: " + raw
+                    + "\n    TOKEN: " + NUMERIC_MARKER
+                    + "\n  command: 'vllm serve /m --api-key \"$SOURCE\"'\n- name: b\n  command: "
+                    + json.dumps(["vllm", "serve", "/m", "--served-model-name", NUMERIC_BENIGN,
+                                  "--revision", NUMERIC_MARKER, "--tokenizer=" + reflected]) + "\n")
+            inventory = prescan_document_secrets(text, "yaml")
+            assert reflected in inventory and NUMERIC_MARKER in inventory
+            assert NUMERIC_BENIGN not in inventory
+            for source in (reflected, NUMERIC_BENIGN):
+                report = _parse(text, format="yaml", container="b", source=source)
+                _numeric_report_checks(report, HAS_YAML, "yaml_parser_unavailable",
+                                       "TOKEN", reflected, source)

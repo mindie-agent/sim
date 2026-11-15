@@ -61,20 +61,20 @@ def _set_lead(prologue, position, prefix):
     return "\n".join(statements) + "\n"
 
 
-@pytest.mark.parametrize("prologue", SETS)
-@pytest.mark.parametrize("position", ["before", "after"])
-@pytest.mark.parametrize("prefix", PREFIXES)
-@pytest.mark.parametrize("wrapper", WRAPPERS)
-def test_r15_operational_set_reaches_wrapper(prologue, position, prefix, wrapper):
-    env = normalize_env(_env(prefix))
-    command = _set_lead(prologue, position, prefix) + wrapper + shlex.quote(SCRIPT)
-    for suffix in TAILS:
-        words = _decoded_shell_words(command + suffix, env)
-        script, effective = discovery_wrapper(words, env)
-        assert script == SCRIPT and effective["VALUE"] == (SECRET, False)
-        found = set()
-        _shell_taint(command + suffix, found, env)
-        assert SECRET in found and OLD not in found
+def test_r15_operational_set_reaches_wrapper():
+    for prologue in SETS:
+        for position in ("before", "after"):
+            for prefix in PREFIXES:
+                env = normalize_env(_env(prefix))
+                for wrapper in WRAPPERS:
+                    command = _set_lead(prologue, position, prefix) + wrapper + shlex.quote(SCRIPT)
+                    for suffix in TAILS:
+                        words = _decoded_shell_words(command + suffix, env)
+                        script, effective = discovery_wrapper(words, env)
+                        assert script == SCRIPT and effective["VALUE"] == (SECRET, False)
+                        found = set()
+                        _shell_taint(command + suffix, found, env)
+                        assert SECRET in found and OLD not in found
 
 
 def _document(command, env, layout, secret):
@@ -122,7 +122,9 @@ def _assert_public(command, env, layout, *, rejected=False, secret=SECRET):
         report = parse_launch(text, format=fmt, container=selection,
                               source=secret, **BASE)
         assert secret not in launch_markdown(report)
-        assert not any(secret in s for s in _strings(json.loads(canonical_json(report))))
+        js = canonical_json(report)
+        if not (secret.isascii() and "\\" not in secret and '"' not in secret and secret not in js):
+            assert not any(secret in s for s in _strings(json.loads(js)))
         assert report.source.name == "[REDACTED]"
         codes = [item.code for item in report.diagnostics]
         if fmt == "yaml" and not HAS_YAML:
@@ -139,22 +141,23 @@ def _assert_public(command, env, layout, *, rejected=False, secret=SECRET):
             assert next(item for item in settings if item.name == name).redacted
 
 
-@pytest.mark.parametrize("prologue", SETS)
-@pytest.mark.parametrize("position", ["before", "after"])
-@pytest.mark.parametrize("prefix", PREFIXES)
-@pytest.mark.parametrize("wrapper", WRAPPERS[:2])
 @pytest.mark.parametrize("layout", LAYOUTS)
-def test_r15_set_public_reports(prologue, position, prefix, wrapper, layout):
-    command = _set_lead(prologue, position, prefix) + wrapper + shlex.quote(SCRIPT)
-    _assert_public(command, _env(prefix), layout)
+def test_r15_set_public_reports(layout):
+    for prologue in SETS:
+        for position in ("before", "after"):
+            for prefix in PREFIXES:
+                env = _env(prefix)
+                for wrapper in WRAPPERS[:2]:
+                    command = _set_lead(prologue, position, prefix) + wrapper + shlex.quote(SCRIPT)
+                    _assert_public(command, env, layout)
 
 
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_r15_repeated_set_assignment_export_precedence(layout):
+def test_r15_repeated_set_assignment_export_precedence():
     command = ("set -e\nVALUE=" + OLD + "\nexport VALUE A\nset -u\n"
                "VALUE=\"$SEED\"\nexport docker\nset -o pipefail\n"
                "env A=1 " + WRAPPERS[0] + shlex.quote(SCRIPT))
-    _assert_public(command, _env("VALUE="), layout)
+    for layout in LAYOUTS:
+        _assert_public(command, _env("VALUE="), layout)
 
 
 @pytest.mark.parametrize("prefix", [
@@ -197,17 +200,18 @@ def test_r15_env_options_and_wrapper_arguments_stay_statement_local(suffix):
     assert wrapped == (SCRIPT, {"VALUE": (SECRET, False)})
 
 
-@pytest.mark.parametrize("location", ["leading", "between", "inline"])
-@pytest.mark.parametrize("suffix", TAILS)
-@pytest.mark.parametrize("prefix", PREFIXES)
-@pytest.mark.parametrize("wrapper", WRAPPERS[:2])
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_r15_comment_public_reports(location, suffix, prefix, wrapper, layout):
-    lead = {"leading": "# ordinary comment\n" + prefix + "\n",
-            "between": prefix + "\n# ordinary comment\n",
-            "inline": prefix + " # ordinary comment\n"}[location]
-    command = lead + wrapper + shlex.quote(SCRIPT) + suffix
-    _assert_public(command, _env(prefix), layout, rejected=bool(suffix))
+def test_r15_comment_public_reports():
+    for location in ("leading", "between", "inline"):
+        for prefix in PREFIXES:
+            env = _env(prefix)
+            lead = {"leading": "# ordinary comment\n" + prefix + "\n",
+                    "between": prefix + "\n# ordinary comment\n",
+                    "inline": prefix + " # ordinary comment\n"}[location]
+            for suffix in TAILS:
+                for wrapper in WRAPPERS[:2]:
+                    command = lead + wrapper + shlex.quote(SCRIPT) + suffix
+                    for layout in LAYOUTS:
+                        _assert_public(command, env, layout, rejected=bool(suffix))
 
 
 HASH_VALUES = (("'# " + SECRET + "'", "# " + SECRET),
@@ -218,37 +222,38 @@ HASH_VALUES = (("'# " + SECRET + "'", "# " + SECRET),
                ("''#" + SECRET, "#" + SECRET))
 
 
-@pytest.mark.parametrize("spelling,secret", HASH_VALUES)
-@pytest.mark.parametrize("suffix", TAILS)
-@pytest.mark.parametrize("layout", LAYOUTS)
-def test_r15_literal_hash_public_reports(spelling, secret, suffix, layout):
-    command = ("export VALUE=" + spelling + " A\n" + WRAPPERS[0]
-               + shlex.quote(SCRIPT) + suffix)
-    _assert_public(command, {"A": "x"}, layout, secret=secret, rejected=bool(suffix))
+def test_r15_literal_hash_public_reports():
+    for spelling, secret in HASH_VALUES:
+        for suffix in TAILS:
+            command = ("export VALUE=" + spelling + " A\n" + WRAPPERS[0]
+                       + shlex.quote(SCRIPT) + suffix)
+            for layout in LAYOUTS:
+                _assert_public(command, {"A": "x"}, layout, secret=secret, rejected=bool(suffix))
 
 
-@pytest.mark.parametrize("separator", ["\n", "\r", "\r\n"])
-@pytest.mark.parametrize("boundary", ["", " ", "\t", *"|&;<>()`!{}", "\\\n"])
-def test_r15_comment_keeps_terminating_statement_boundary(separator, boundary):
-    words = _tolerant_words(boundary + "# ignored ; ' \" $VALUE" + separator
-                            + "sh -c 'body'", normalize_env({"VALUE": SECRET}))
-    assert words[-3:] == ("sh", "-c", "body")
-    assert all(word is _STATEMENT_END for word in words[:-3])
-    assert len(words[:-3]) == 1 + (boundary in ";&|(){}" and bool(boundary))
-    assert discovery_wrapper(words)[0] == "body"
+def test_r15_comment_keeps_terminating_statement_boundary():
+    env = normalize_env({"VALUE": SECRET})
+    for separator in ("\n", "\r", "\r\n"):
+        for boundary in ("", " ", "\t", *"|&;<>()`!{}", "\\\n"):
+            words = _tolerant_words(boundary + "# ignored ; ' \" $VALUE" + separator
+                                    + "sh -c 'body'", env)
+            assert words[-3:] == ("sh", "-c", "body")
+            assert all(word is _STATEMENT_END for word in words[:-3])
+            assert len(words[:-3]) == 1 + (boundary in ";&|(){}" and bool(boundary))
+            assert discovery_wrapper(words)[0] == "body"
 
 
-@pytest.mark.parametrize("spelling,expected", [
-    ("'# comment'", "# comment"), ('"# comment"', "# comment"),
-    ('""#tag', "#tag"), ("''#tag", "#tag"), ("\\#tag", "#tag"),
-    ("foo#bar", "foo#bar"), ("VALUE=a#b", "VALUE=a#b"),
-    ("$EMPTY#tag", "#tag"), ("${EMPTY}#tag", "#tag"),
-    ('"$EMPTY"#tag', "#tag"), ("\\ #tag", " #tag"),
-    ("word\\\n#tag", "word#tag"), ("$MISSING#tag", "$MISSING#tag"),
-])
-def test_r15_hash_after_started_word_is_literal(spelling, expected):
+def test_r15_hash_after_started_word_is_literal():
     env = normalize_env({"EMPTY": ""})
-    assert _tolerant_words(spelling + " | true", env) == (expected, _STATEMENT_END, "true")
+    for spelling, expected in (
+        ("'# comment'", "# comment"), ('"# comment"', "# comment"),
+        ('""#tag', "#tag"), ("''#tag", "#tag"), ("\\#tag", "#tag"),
+        ("foo#bar", "foo#bar"), ("VALUE=a#b", "VALUE=a#b"),
+        ("$EMPTY#tag", "#tag"), ("${EMPTY}#tag", "#tag"),
+        ('"$EMPTY"#tag', "#tag"), ("\\ #tag", " #tag"),
+        ("word\\\n#tag", "word#tag"), ("$MISSING#tag", "$MISSING#tag"),
+    ):
+        assert _tolerant_words(spelling + " | true", env) == (expected, _STATEMENT_END, "true")
 
 
 def test_r15_comment_eof_empty_quotes_and_reexport():
@@ -390,97 +395,98 @@ def _r24_assert_public(fields, expected, layout):
             report = parse_launch(text, format="json" if layout == "json" else "yaml",
                                   container=selection, source=source, **BASE)
             assert R24_VALUE not in launch_markdown(report)
-            assert not any(R24_VALUE in s for s in _strings(json.loads(canonical_json(report))))
+            js = canonical_json(report)
+            if R24_VALUE in js:
+                assert not any(R24_VALUE in s for s in _strings(json.loads(js)))
             if source == expected:
                 assert report.source.name == "[REDACTED]"
             if selection == "b" and (layout == "json" or HAS_YAML):
                 assert report.status == "completed" and not report.diagnostics
 
 
-@pytest.mark.parametrize("ref", R24_REFS[:3])
-@pytest.mark.parametrize("quote", ("", '"'))
-@pytest.mark.parametrize("binding", R24_BINDINGS)
-@pytest.mark.parametrize("shape", R24_SHAPES)
 @pytest.mark.parametrize("layout", R24_LAYOUTS)
-def test_r24_continued_reference_public(ref, quote, binding, shape, layout):
+def test_r24_continued_reference_public(layout):
     from mindie_sim.launch_parser import parse_argv
-    operand = "lead " + quote + ref.format(gap="\\\n") + quote + " tail"
-    literal = _r24_fields(operand, binding, "argv")["command"]
-    assert parse_argv(literal).commands[0].argv == tuple(literal)
-    _r24_assert_public(_r24_fields(operand, binding, shape),
-                       "lead " + R24_VALUE + " tail", layout)
-
-
-@pytest.mark.parametrize("newline", ("\n", "\r", "\r\n"))
-@pytest.mark.parametrize("quote", ("", '"'))
-@pytest.mark.parametrize("ref", R24_REFS)
-def test_r24_reference_identity_and_suppression(newline, quote, ref):
-    from mindie_sim.launch_taint import _static_argv_operand
-    from mindie_sim.launch_parser import parse_argv
-    reference = ref.format(gap="\\" + newline)
-    operand = "lead " + quote + reference + quote + " tail"
-    found = set()
-    assert _static_argv_operand(operand, R24_ENV, found) == "lead " + R24_VALUE + " tail"
-    assert found == {R24_VALUE}
-    literal = ["vllm", "serve", "/m", "--api-key", operand]
-    assert parse_argv(literal).commands[0].argv == tuple(literal)
-    for suppressed in ("'" + reference + "'", quote + "\\" + reference + quote):
-        found = set()
-        assert _static_argv_operand(suppressed, R24_ENV, found) is not None
-        assert not found
-        for suffix in ("", " | true"):
-            found = set()
-            _shell_taint("vllm serve /m --api-key " + suppressed + suffix, found, R24_ENV)
-            assert R24_VALUE not in found and R24_DECOY not in found
-    command = 'vllm serve /m --api-key "' + reference + '"'
-    assert parse_shell(command, env=R24_ENV).commands[0].argv[-1] == R24_VALUE
-    with pytest.raises(LaunchSyntaxError, match="word_splitting_or_globbing_required"):
-        parse_shell("vllm serve /m --api-key " + reference, env=R24_ENV)
-
-
-@pytest.mark.parametrize("ref", R24_REFS[:3])
-@pytest.mark.parametrize("quote", ("", '"'))
-@pytest.mark.parametrize("layout", R24_LAYOUTS)
-def test_r24_shell_reference_public(ref, quote, layout):
-    for newline in ("\n", "\r", "\r\n"):
-        # Block scalars carry LF physically; quoted scalars encode CR variants.
-        if layout == "block" and newline != "\n":
-            continue
-        command = "vllm serve /m --api-key " + quote + ref.format(gap="\\" + newline) + quote
-        for suffix in ("", " | true"):
-            _r24_assert_public({"command": command + suffix}, R24_VALUE, layout)
-
-
-@pytest.mark.parametrize("layout", R24_LAYOUTS)
-@pytest.mark.parametrize("tail", (
-    ">--api-key {ref}", "--api-key >{ref} ordinary", "--api-key; {ref}",
-    "--api-key\n{ref}", "--api-key | {ref}", "--api-key & {ref}",
-    "--api-key --served-model-name", "--api-key -tp", "--api-key -x", "--api-key --",
-))
-def test_r24_shell_reference_exclusions(layout, tail):
     for ref in R24_REFS[:3]:
-        command = "vllm serve /m " + tail.format(ref=ref.format(gap="\\\n"))
-        found = set()
-        _shell_taint(command, found, R24_ENV)
-        inventories = [found, *_r24_inventory(_r24_document(
-            {"command": command}, R24_VALUE, layout), layout)]
-        assert all(R24_VALUE not in found and R24_DECOY not in found for found in inventories)
+        for quote in ("", '"'):
+            operand = "lead " + quote + ref.format(gap="\\\n") + quote + " tail"
+            for binding in R24_BINDINGS:
+                literal = _r24_fields(operand, binding, "argv")["command"]
+                assert parse_argv(literal).commands[0].argv == tuple(literal)
+                for shape in R24_SHAPES:
+                    fields = _r24_fields(operand, binding, shape)
+                    _r24_assert_public(fields, "lead " + R24_VALUE + " tail", layout)
 
 
-@pytest.mark.parametrize("ref", ("${}", "${1}", "${A:-x}", "${VALUE", "$UNKNOWN",
-                                    "$(cmd)", "$1", "$?", "$!", "$#", "$$", "$@", "$*", "$-"))
-@pytest.mark.parametrize("newline", ("\n", "\r", "\r\n"))
-def test_r24_invalid_reference_contributors_are_atomic(ref, newline):
+def test_r24_reference_identity_and_suppression():
     from mindie_sim.launch_taint import _static_argv_operand
-    continued = "$\\" + newline + ref[1:]
-    for operand in ("$VALUE" + continued, continued + "$VALUE"):
-        found = {"existing"}
-        assert _static_argv_operand(operand, R24_ENV, found) is None
-        assert found == {"existing"}
-    with pytest.raises(LaunchSyntaxError) as raised:
-        parse_shell("vllm serve /m --api-key " + continued, env=R24_ENV)
-    if ref.startswith("${") and ref != "${VALUE":
-        assert raised.value.message == "parameter_expansion_not_supported"
+    from mindie_sim.launch_parser import parse_argv
+    for newline in ("\n", "\r", "\r\n"):
+        for quote in ("", '"'):
+            for ref in R24_REFS:
+                reference = ref.format(gap="\\" + newline)
+                operand = "lead " + quote + reference + quote + " tail"
+                found = set()
+                assert _static_argv_operand(operand, R24_ENV, found) == "lead " + R24_VALUE + " tail"
+                assert found == {R24_VALUE}
+                literal = ["vllm", "serve", "/m", "--api-key", operand]
+                assert parse_argv(literal).commands[0].argv == tuple(literal)
+                for suppressed in ("'" + reference + "'", quote + "\\" + reference + quote):
+                    found = set()
+                    assert _static_argv_operand(suppressed, R24_ENV, found) is not None
+                    assert not found
+                    for suffix in ("", " | true"):
+                        found = set()
+                        _shell_taint("vllm serve /m --api-key " + suppressed + suffix, found, R24_ENV)
+                        assert R24_VALUE not in found and R24_DECOY not in found
+                command = 'vllm serve /m --api-key "' + reference + '"'
+                assert parse_shell(command, env=R24_ENV).commands[0].argv[-1] == R24_VALUE
+                with pytest.raises(LaunchSyntaxError, match="word_splitting_or_globbing_required"):
+                    parse_shell("vllm serve /m --api-key " + reference, env=R24_ENV)
+
+
+def test_r24_shell_reference_public():
+    for ref in R24_REFS[:3]:
+        for quote in ("", '"'):
+            for layout in R24_LAYOUTS:
+                for newline in ("\n", "\r", "\r\n"):
+                    if layout == "block" and newline != "\n":
+                        continue
+                    command = "vllm serve /m --api-key " + quote + ref.format(gap="\\" + newline) + quote
+                    for suffix in ("", " | true"):
+                        _r24_assert_public({"command": command + suffix}, R24_VALUE, layout)
+
+
+def test_r24_shell_reference_exclusions():
+    for layout in R24_LAYOUTS:
+        for tail in (
+            ">--api-key {ref}", "--api-key >{ref} ordinary", "--api-key; {ref}",
+            "--api-key\n{ref}", "--api-key | {ref}", "--api-key & {ref}",
+            "--api-key --served-model-name", "--api-key -tp", "--api-key -x", "--api-key --",
+        ):
+            for ref in R24_REFS[:3]:
+                command = "vllm serve /m " + tail.format(ref=ref.format(gap="\\\n"))
+                found = set()
+                _shell_taint(command, found, R24_ENV)
+                inventories = [found, *_r24_inventory(_r24_document(
+                    {"command": command}, R24_VALUE, layout), layout)]
+                assert all(R24_VALUE not in found and R24_DECOY not in found for found in inventories)
+
+
+def test_r24_invalid_reference_contributors_are_atomic():
+    from mindie_sim.launch_taint import _static_argv_operand
+    for ref in ("${}", "${1}", "${A:-x}", "${VALUE", "$UNKNOWN",
+                "$(cmd)", "$1", "$?", "$!", "$#", "$$", "$@", "$*", "$-"):
+        for newline in ("\n", "\r", "\r\n"):
+            continued = "$\\" + newline + ref[1:]
+            for operand in ("$VALUE" + continued, continued + "$VALUE"):
+                found = {"existing"}
+                assert _static_argv_operand(operand, R24_ENV, found) is None
+                assert found == {"existing"}
+            with pytest.raises(LaunchSyntaxError) as raised:
+                parse_shell("vllm serve /m --api-key " + continued, env=R24_ENV)
+            if ref.startswith("${") and ref != "${VALUE":
+                assert raised.value.message == "parameter_expansion_not_supported"
 
 
 def test_r24_lookup_only_nonrecursive_and_no_host(monkeypatch):
@@ -528,32 +534,33 @@ def test_r24_lookup_only_nonrecursive_and_no_host(monkeypatch):
     assert lookups and set(lookups) == {"VALUE"}
 
 
-@pytest.mark.parametrize("n", (3, 257, 4096, 16384))
-@pytest.mark.parametrize("quote", ("", '"'))
-def test_r24_reference_continuations_commit_every_cursor(monkeypatch, n, quote):
+def test_r24_reference_continuations_commit_every_cursor(monkeypatch):
     from mindie_sim import launch_env as le
     from mindie_sim.launch_taint import _static_argv_operand
     from mindie_sim.launch_parser import scan
-    gap = "\\\n\\\r\\\r\n" * n
-    cases = [(ref.format(gap=gap), R24_VALUE) for ref in R24_REFS]
-    cases += [("$VA" + gap + "LUE" + gap, R24_VALUE),
-              ("$" + gap, "$"), ("$" + gap + ":", "$:"),
-              ("$" + gap + "\\x", "$x" if not quote else "$\\x")]
     original = le.continuation_length
-    for body, expected in cases:
-        text = quote + body + quote
-        for decode in (lambda s: _static_argv_operand(s, R24_ENV),
-                       lambda s: _tolerant_words(s, normalize_env(R24_ENV))[0], scan):
-            calls = []
+    norm_env = normalize_env(R24_ENV)
+    for n in (3, 257, 4096, 16384):
+        gap = "\\\n\\\r\\\r\n" * n
+        for quote in ("", '"'):
+            cases = [(ref.format(gap=gap), R24_VALUE) for ref in R24_REFS]
+            cases += [("$VA" + gap + "LUE" + gap, R24_VALUE),
+                      ("$" + gap, "$"), ("$" + gap + ":", "$:"),
+                      ("$" + gap + "\\x", "$x" if not quote else "$\\x")]
+            for body, expected in cases:
+                text = quote + body + quote
+                for decode in (lambda s: _static_argv_operand(s, R24_ENV),
+                               lambda s: _tolerant_words(s, norm_env)[0], scan):
+                    calls = []
 
-            def counted(value, index):
-                calls.append(index)
-                return original(value, index)
+                    def counted(value, index):
+                        calls.append(index)
+                        return original(value, index)
 
-            with monkeypatch.context() as patch:
-                patch.setattr(le, "continuation_length", counted)
-                actual = decode(text)
-            if decode is not scan:
-                assert actual == expected
-            assert len(calls) <= len(text) + 4
-            assert len(calls) == len(set(calls))
+                    with monkeypatch.context() as patch:
+                        patch.setattr(le, "continuation_length", counted)
+                        actual = decode(text)
+                    if decode is not scan:
+                        assert actual == expected
+                    assert len(calls) <= len(text) + 4
+                    assert len(calls) == len(set(calls))

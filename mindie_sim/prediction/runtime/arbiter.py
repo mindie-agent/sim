@@ -109,7 +109,26 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
     """Return {physical_resource: {task_sequence: native_work/ms}}."""
     if not active:
         return {}
-    if _needs_unit_tier_solver(resources, tasks, active):
+    if coupled_active == 0:
+        first_prio = None
+        multi_prio = False
+        for key in active:
+            t_chk = tasks[key]
+            if t_chk.remaining:
+                p_chk = t_chk.priority
+                if first_prio is None:
+                    first_prio = p_chk
+                elif p_chk != first_prio:
+                    multi_prio = True
+                    break
+        need_tier = (
+            _needs_unit_tier_solver(resources, tasks, active)
+            if (multi_prio or (placed_active != 0 and any(r.policy != "fair" for r in resources.values())))
+            else False
+        )
+    else:
+        need_tier = _needs_unit_tier_solver(resources, tasks, active)
+    if need_tier:
         if coupled_solver is not None and any(
                 tasks[key].coupled and tasks[key].remaining for key in active):
             return _tiered_coupled(resources, tasks, active, coupled_solver)
@@ -232,8 +251,13 @@ def component_rates(resources, tasks, active, *, coupled_solver=None,
                     result[name] = {k0: c0 if c0 < l0 else l0,
                                     k1: c1 if c1 < l1 else l1}
                     continue
-        pinned = {key: tasks[key].placement[name]
-                  for key in caps if name in tasks[key].placement}
+        pinned = {}
+        for key in caps:
+            pl = tasks[key].placement
+            if pl:
+                u = pl.get(name)
+                if u is not None:
+                    pinned[key] = u
         result[name] = (unit_rates(resource.rate, resource.units, caps, pinned)
                         if pinned else _max_min_rates(resource.rate, caps))
     return result

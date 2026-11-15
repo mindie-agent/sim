@@ -15,7 +15,9 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
+import heapq
 import math
 
 from mindie_sim.prediction.engine import Allocation, Engine, Resource
@@ -51,18 +53,22 @@ def _topological(nodes: tuple[PlanNode, ...],
                if dep not in by_id and dep not in external}
     if missing:
         raise ValueError("plan_dependency_unavailable:" + ",".join(sorted(missing)))
-    remaining = {n.node_id: {d for d in n.deps if d in by_id} for n in nodes}
+    in_degree: dict[str, int] = {}
+    children: dict[str, list[PlanNode]] = {n.node_id: [] for n in nodes}
+    for node in nodes:
+        deps = {d for d in node.deps if d in by_id}
+        in_degree[node.node_id] = len(deps)
+        for dep in deps:
+            children[dep].append(node)
     ordered: list[PlanNode] = []
-    ready = [n for n in nodes if not remaining[n.node_id]]
+    ready = deque(n for n in nodes if not in_degree[n.node_id])
     while ready:
-        node = ready.pop(0)
+        node = ready.popleft()
         ordered.append(node)
-        for other in nodes:
-            if node.node_id in remaining[other.node_id]:
-                remaining[other.node_id].discard(node.node_id)
-                if not remaining[other.node_id] and other not in ordered \
-                        and other not in ready:
-                    ready.append(other)
+        for other in children[node.node_id]:
+            in_degree[other.node_id] -= 1
+            if not in_degree[other.node_id]:
+                ready.append(other)
     if len(ordered) != len(nodes):
         raise ValueError("plan_dependency_cycle")
     return tuple(ordered)
@@ -96,18 +102,26 @@ def _stable_topological(nodes: tuple[PlanNode, ...],
                if dep not in by_id and dep not in external}
     if missing:
         raise ValueError("plan_dependency_unavailable:" + ",".join(sorted(missing)))
-    done: set[str] = set()
+    rank = {n.node_id: idx for idx, n in enumerate(nodes)}
+    in_degree: dict[str, int] = {}
+    children: dict[str, list[PlanNode]] = {n.node_id: [] for n in nodes}
+    for node in nodes:
+        deps = {d for d in node.deps if d in by_id}
+        in_degree[node.node_id] = len(deps)
+        for dep in deps:
+            children[dep].append(node)
+    heap = [(rank[n.node_id], n) for n in nodes if not in_degree[n.node_id]]
+    heapq.heapify(heap)
     ordered: list[PlanNode] = []
-    remaining = list(nodes)
-    while remaining:
-        for index, node in enumerate(remaining):
-            if all(dep in done or dep not in by_id for dep in node.deps):
-                ordered.append(node)
-                done.add(node.node_id)
-                del remaining[index]
-                break
-        else:
-            raise ValueError("plan_dependency_cycle")
+    while heap:
+        _, node = heapq.heappop(heap)
+        ordered.append(node)
+        for other in children[node.node_id]:
+            in_degree[other.node_id] -= 1
+            if not in_degree[other.node_id]:
+                heapq.heappush(heap, (rank[other.node_id], other))
+    if len(ordered) != len(nodes):
+        raise ValueError("plan_dependency_cycle")
     return tuple(ordered)
 
 
@@ -262,6 +276,7 @@ def evaluate_plan(nodes: tuple[PlanNode, ...], hardware: HardwareProfile, *,
         completed: dict[str, float] = {}
         gate_events: list[tuple[object, tuple[object, ...]]] = []
         first_events: dict[str, object] = {}
+        by_id = {n.node_id: n for n in order}
         for node in order:
             predecessors = []
             if node.kind == "kernel":
@@ -275,7 +290,7 @@ def evaluate_plan(nodes: tuple[PlanNode, ...], hardware: HardwareProfile, *,
             if previous_stream and previous_stream not in node.deps:
                 predecessors.append(events[previous_stream])
             for dep in node.deps:
-                parent = next((n for n in order if n.node_id == dep), None)
+                parent = by_id.get(dep)
                 if parent is None or parent.stream == node.stream:
                     continue
                 record = engine.submit(
@@ -332,7 +347,7 @@ def evaluate_plan(nodes: tuple[PlanNode, ...], hardware: HardwareProfile, *,
             gates = []
             for prefetch_node, predecessors in gate_events:
                 consumer = prefetch_node.prefetch_for
-                target = next((n for n in order if n.node_id == consumer), None)
+                target = by_id.get(consumer)
                 ready = tuple(dict.fromkeys(
                     [launch[consumer]] if target is not None and consumer in launch else ()))
                 if target is not None:
@@ -650,7 +665,7 @@ def effective_edges(plan: tuple[PlanNode, ...]) -> tuple[dict, ...]:
     """Read-only projection of every edge the Engine actually evaluated.
 
     The export walks the same topological execution order as ``evaluate_plan``;
-    sorting stream order by the source tuple is the R15 defect.
+    stream order must follow execution order rather than the raw source tuple.
     """
     edges = []
     by_id = {n.node_id: n for n in plan}

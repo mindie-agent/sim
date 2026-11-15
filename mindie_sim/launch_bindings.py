@@ -31,6 +31,7 @@
 """
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import asdict
 from functools import wraps
 import hashlib
@@ -47,8 +48,9 @@ from .launch_parser import LaunchSyntaxError, SourceSpan, is_secret_name
 from .launch_spans import prescan_cli_secret_values
 from .launch_actions import (
     Adapter, BindingFailure, Draft, Occurrence, UnsupportedModeling,
-    _VERSION_SENSITIVE_ENV, _axis, _base, _draft, _occurrences, _scrub,
-    _scrub_report, _scrub_text, _set_path, _shadow, adapter_for,
+    _DELETE, _VALID_BLOBS, _VERSION_SENSITIVE_ENV, _axis, _base_bundle,
+    _cached_mutated_blob, _draft, _occurrences, _scrub, _scrub_report,
+    _scrub_text, _set_path, _shadow, adapter_for,
 )
 from .launch_overrides import _bool_value, _eager_conflict, _resolve
 from .schema.case import Case
@@ -63,10 +65,17 @@ def validate_launch_report(report):
     status = report.get("status") if isinstance(report, dict) else report.status
     case = report.get("case") if isinstance(report, dict) else report.case
     if status == "completed" and case is not None:
-        try:
-            Case.from_mapping(case)
-        except (ValueError, TypeError, KeyError, AttributeError):
-            raise _reports.ReportValidationError(("L02:case_round_trip_invalid",)) from None
+        known = False
+        if isinstance(case, dict):
+            try:
+                known = json.dumps(case, allow_nan=False) in _VALID_BLOBS
+            except (TypeError, ValueError):
+                known = False
+        if not known:
+            try:
+                Case.from_mapping(case)
+            except (ValueError, TypeError, KeyError, AttributeError):
+                raise _reports.ReportValidationError(("L02:case_round_trip_invalid",)) from None
     return errors
 
 
@@ -253,18 +262,18 @@ def parse_launch(text_or_argv, *, format="shell", command_index=None,
             drafts.append(_draft(item, "unmodeled", "malformed_declaration",
                                  reason="Malformed parallel axis was not applied.",
                                  value="[REDACTED]", redacted=True, secrets=secrets))
-        base = parsed = base_error = None
+        base = parsed = base_error = cached_blob = None
         if base_case is not None or (machine is not None and model is not None):
             try:
-                base = _base(machine, model, workload, merged, base_case)
-                parsed = Case.from_mapping(base)
+                base, parsed, cached_blob = _base_bundle(
+                    machine, model, workload, merged, base_case)
             except (ModelingError, ValueError) as exc:
                 message = _scrub_text(str(exc).splitlines()[0], secrets)[:200]
                 base_error = Diagnostic(
                     f"invalid_base_case:{getattr(exc, 'args', ('',))[0]}",
                     "error", message, None, ())
                 diagnostics.append(base_error)
-                base = parsed = None
+                base = parsed = cached_blob = None
             if parsed is not None and (document.device_visibility_declared
                                        or document.unidentified_devices):
                 span = document.command_span or SourceSpan(source_name, 1, 1, 1, 1)
@@ -393,32 +402,54 @@ def parse_launch(text_or_argv, *, format="shell", command_index=None,
                            diagnostics=(Diagnostic("launch_required_inputs", "warning",
                                                    "No Case or latency was fabricated.", None, ()),),
                            command_index=document.command_index, secrets=secrets)
-        _apply(base, drafts)
-        if speculative is not None:
-            from .schema.speculative import SpeculativeSpec
-            spec = (speculative if isinstance(speculative, SpeculativeSpec)
-                    else SpeculativeSpec.from_mapping(dict(speculative)))
-            _set_path(base, "/runtime/metadata/speculative", asdict(spec))
-            _set_path(base, "/runtime/mtp_acceptance_length",
-                      spec.expected_committed_tokens())
-        override_records = []
         items = list(overrides.items() if isinstance(overrides, dict) else (overrides or ()))
-        for path, value in items:
-            secret_path = any(is_secret_name(part)
-                              for part in str(path).strip("/").split("/"))
-            if secret_path and isinstance(value, str):
-                secrets.add(value)
-        for path, value in items:
-            secret_path = any(is_secret_name(part)
-                              for part in str(path).strip("/").split("/"))
-            before = _set_path(base, path, value)
-            if secret_path:
-                redacted_before = redacted_after = "[REDACTED]"
+        has_mutations = (any(d.effective and d.patches for d in drafts)
+                         or speculative is not None or bool(items))
+        if cached_blob is not None and not has_mutations:
+            override_records = []
+            canonical = json.loads(cached_blob)
+        elif cached_blob is not None and speculative is None and not items:
+            override_records = []
+            patch_rows = [(path, val is _DELETE, None if val is _DELETE else val)
+                          for d in drafts if d.effective for path, val in d.patches]
+            try:
+                patches_json = json.dumps(patch_rows, allow_nan=False)
+            except (TypeError, ValueError):
+                patches_json = None
+            if patches_json is not None:
+                canonical = json.loads(_cached_mutated_blob(cached_blob, patches_json))
             else:
-                redacted_before, redacted_after = _scrub(before, secrets), _scrub(value, secrets)
-            override_records.append(Patch(path, redacted_before, redacted_after,
-                                          "Explicit simulator override."))
-        canonical = Case.from_mapping(base).to_dict()
+                base = json.loads(cached_blob)
+                _apply(base, drafts)
+                canonical = Case.from_mapping(base).to_dict()
+        else:
+            if cached_blob is not None:
+                base = json.loads(cached_blob)
+            _apply(base, drafts)
+            if speculative is not None:
+                from .schema.speculative import SpeculativeSpec
+                spec = (speculative if isinstance(speculative, SpeculativeSpec)
+                        else SpeculativeSpec.from_mapping(dict(speculative)))
+                _set_path(base, "/runtime/metadata/speculative", asdict(spec))
+                _set_path(base, "/runtime/mtp_acceptance_length",
+                          spec.expected_committed_tokens())
+            override_records = []
+            for path, value in items:
+                secret_path = any(is_secret_name(part)
+                                  for part in str(path).strip("/").split("/"))
+                if secret_path and isinstance(value, str):
+                    secrets.add(value)
+            for path, value in items:
+                secret_path = any(is_secret_name(part)
+                                  for part in str(path).strip("/").split("/"))
+                before = _set_path(base, path, value)
+                if secret_path:
+                    redacted_before = redacted_after = "[REDACTED]"
+                else:
+                    redacted_before, redacted_after = _scrub(before, secrets), _scrub(value, secrets)
+                override_records.append(Patch(path, redacted_before, redacted_after,
+                                              "Explicit simulator override."))
+            canonical = Case.from_mapping(base).to_dict()
         assumptions = (["container_image_tag_is_provenance_not_a_verified_runtime_version"]
                        if document.image else []) + (
             ["visible_devices_establish_visibility_only"]

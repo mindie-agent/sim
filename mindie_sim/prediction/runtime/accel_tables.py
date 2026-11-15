@@ -48,10 +48,10 @@ UINT64_MAX = (1 << 64) - 1
 
 
 def wide_integer(task) -> bool:
-    """True when a legal Python integer has no exact C ABI cell (R3/R4).
+    """True when a legal Python integer has no exact C ABI cell.
 
     Non-exact integer subclasses are conservatively wide (and declined) before
-    any comparison can dispatch user ``__lt__``/``__eq__`` code (R10-3).
+    any comparison can dispatch user ``__lt__``/``__eq__`` code.
     """
     priority, cohort = task.priority, task.cohort_size
     sequence = task.event.sequence
@@ -69,7 +69,7 @@ _INERT_MAX_DEPTH = 8
 
 
 def _is_inert_builtin(obj, depth: int = 0) -> bool:
-    """R9-2/R10-3/R11/R13-1: exact immutable built-in (identity-only types).
+    """Exact immutable built-in (identity-only types).
 
     The depth budget is checked first: an exhausted traversal is unproven and
     fails closed even for a scalar leaf.  Only exact ``tuple`` recurses; an
@@ -100,7 +100,7 @@ def _eligible_metadata(metadata) -> bool:
 
 
 def _inert_scalar_mapping(mapping) -> bool:
-    """R11-1: exact private ``str`` -> exact ``int``/``float`` dictionary."""
+    """Exact private ``str`` -> exact ``int``/``float`` dictionary."""
     if type(mapping) is not dict:
         return False
     for key, value in mapping.items():
@@ -112,12 +112,12 @@ def _inert_scalar_mapping(mapping) -> bool:
 
 
 def _exact_number_or_none(value) -> bool:
-    """R11-1: no numeric subclass may own a finalizer behind a task cell."""
+    """No numeric subclass may own a finalizer behind a task cell."""
     return value is None or type(value) is int or type(value) is float
 
 
 def _inert_pool_set(pools, engine=None) -> bool:
-    """R11-1/R13-1: only an Engine-retained exact ``frozenset[str]`` is inert.
+    """Only an Engine-retained exact ``frozenset[str]`` is inert.
 
     ``Engine.submit`` keeps the caller's exact frozenset identity for
     ``memory_pools=payload`` (``engine.py:630``), so a caller-owned set is
@@ -135,12 +135,12 @@ def _inert_pool_set(pools, engine=None) -> bool:
 
 
 def _inert_str_tuple(value) -> bool:
-    """R11-1: an engine-owned tuple of exact allocation names."""
+    """An engine-owned tuple of exact allocation names."""
     return type(value) is tuple and all(type(item) is str for item in value)
 
 
 def _event_is_stable(event) -> bool:
-    """R11-1: the owned Event cells carry no user subclass or pending callback."""
+    """The owned Event cells carry no user subclass or pending callback."""
     if type(event.name) is not str or type(event.sequence) is not int:
         return False
     if event.time is not None and type(event.time) is not float:
@@ -153,9 +153,9 @@ def _event_is_stable(event) -> bool:
 
 
 def _contains_mutable_container(obj, depth: int = 0) -> bool:
-    """R10-2: a caller-aliased container can gain a finalizer after admission.
+    """A caller-aliased container can gain a finalizer after admission.
 
-    Reaching the depth budget is unproven, so it fails closed (R11).  Nine
+    Reaching the depth budget is unproven, so it fails closed.  Nine
     exact tuple wrappers around a mutable leaf therefore stay in Python.
     """
     kind = type(obj)
@@ -169,13 +169,13 @@ def _contains_mutable_container(obj, depth: int = 0) -> bool:
 
 
 def metadata_is_stable(metadata) -> bool:
-    """R10-2: the private top-level copy has no caller-aliased mutable value.
+    """The private top-level copy has no caller-aliased mutable value.
 
     ``Engine.submit`` copies the top-level mapping, so its keys are stable.  A
     nested ``list``/``dict``/``set``/``bytearray`` is still the caller's object
     and may acquire a weakrefable value between two ``advance`` calls; an
     exhausted traversal budget is unproven.  Both stay in Python.
-    R12-2/R13-1 make ``_stable_task_payloads`` stricter than this R10 test.
+    ``_stable_task_payloads`` enforces stricter recursive inertness on metadata.
     """
     if type(metadata) is not dict:
         return False
@@ -188,13 +188,13 @@ def metadata_is_stable(metadata) -> bool:
 
 
 def _stable_task_payloads(task, engine=None) -> bool:
-    """R9-2/R10-2/R11-1/R12-2/R13-1: audit *every* retained ``_Task`` payload.
+    """Audit *every* retained ``_Task`` payload for exact built-in types.
 
     A custom subclass in any field can own a finalizer and is retained by a
     Python dict/list or the stage cache at a different instant than the native
     row.  Every test is an identity check, so no user ``__eq__``/``__lt__``
-    runs.  R12-2 admits metadata only when it is ``None`` or one exact private
-    dict of recursively inert built-ins; R13-1 admits pools only through
+    runs.  Admits metadata only when it is ``None`` or one exact private
+    dict of recursively inert built-ins, and admits pools only through
     ``_inert_pool_set`` (Engine-retained sentinels).  Declining keeps every
     release instant exactly the Python reference's.
     """
@@ -380,7 +380,7 @@ def task_flags(task, engine=None) -> int:
         flags |= F_EXT_START | F_CALLBACK
     if (task.callback is not None or "occurrence" in task.metadata
             or callback_capable(task, engine)):
-        # R9-2: a finalizer-capable row ends *time* integration at its own
+        # A finalizer-capable row ends *time* integration at its own
         # completion instant, so any observer registered by that release is
         # causal before later numeric work is irrevocably accepted.
         flags |= F_CALLBACK
@@ -422,7 +422,7 @@ class KernelFault(RuntimeError):
         self.code = int(code)
         self.boundary = boundary
         self.detail = detail
-        #: R5-2: ``(now, boundary, steps, ncomp, nstart)`` accepted by the
+        #: ``(now, boundary, steps, ncomp, nstart)`` accepted by the
         #: kernel before a failure, or None when no prefix exists.  The
         #: ``has_prefix`` bit is the kernel's own trustworthy indicator.
         self.prefix = prefix
@@ -600,7 +600,7 @@ class Arena:
         li = 0
         for i, row in enumerate(tasks):
             seq, flags, prio, cohort, waiting, start, latency, release, links = row
-            # R4: representable bounds are enforced *before* ctypes packing so a
+            # Representable bounds are enforced *before* ctypes packing so a
             # wide Python integer can never wrap into a valid-looking cell.
             if not isinstance(prio, int) or isinstance(prio, bool) or prio < 0 \
                     or prio > 0x7FFFFFFFFFFFFFFF:
@@ -680,7 +680,7 @@ class Arena:
             self.started, 2 * 4096)
         if rc != 0:
             code = int(self.st[1])
-            # R5-2: the kernel publishes an accepted prefix (clock, counts and
+            # the kernel publishes an accepted prefix (clock, counts and
             # records) only when status bit ``ST_PREFIX`` is set.  A preflight
             # or step-0 failure must not fabricate one from stale buffers.
             has_prefix = bool(int(self.st[0]) & ST_PREFIX)
@@ -692,7 +692,7 @@ class Arena:
                 )
             raise KernelFault(code, "run", prefix=prefix,
                               has_prefix=has_prefix)
-        # R11-2: hdr[3] reports that a callback-capable completion ended this
+        # hdr[3] reports that a callback-capable completion ended this
         # call before the awakened ready rows were admitted.
         self.last_held = bool(int(self.hdr[3]))
         return (

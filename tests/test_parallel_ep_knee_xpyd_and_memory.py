@@ -37,7 +37,7 @@ def isolated_home(tmp_path, monkeypatch):
 
 
 def _case(*, sku="Ascend910_9362", topology="a3_16p", num_devices=64,
-          ranks_per_node=16, layers=48, hidden=4096, heads=32, kv_heads=8,
+          ranks_per_node=16, layers=8, hidden=4096, heads=32, kv_heads=8,
           experts=32, top_k=8, moe_inter=1024, tp=1, dp=2, ep=2,
           max_seqs=256, max_model_len=32768, graph="none", inter_node=None):
     machine = {"backend": "ascend", "sku": sku, "num_devices": num_devices,
@@ -200,8 +200,12 @@ def test_mtp_batch_reversal_on_moe_decode():
 
 
 def test_xpyd_joint_sizing_and_d_node_jitter(a5_case):
-    common = dict(total_npus=64, isl=8192, osl=1024, ttft_slo_ms=3000.0,
-                  tpot_slo_ms=50.0, hccl_buffsize_mb=64)
+    common = dict(
+        total_npus=64, isl=8192, osl=1024, ttft_slo_ms=3000.0,
+        tpot_slo_ms=50.0, hccl_buffsize_mb=64, max_pool_instances=6,
+        prefill_configs=({"tp": 2, "dp": 1, "ep": 1},),
+        decode_configs=({"tp": 1, "dp": 2, "ep": 2},),
+    )
     cold = solve_xpyd_pools(a5_case, prefix_hit_rate=0.0,
                             allow_unqualified=True, **common)
     warm = solve_xpyd_pools(a5_case, prefix_hit_rate=0.75,

@@ -397,7 +397,10 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
     step_cache: dict[int, float] = {cfg.sequences: tpot_step}
     evaluated_b: set[int] = set()
 
+    ttft_infeasible_from = search_cap + 1
+
     def _ttft_at(b: int) -> float:
+        nonlocal ttft_infeasible_from
         evaluated_b.add(int(b))
         if b not in ttft_cache:
             try:
@@ -406,7 +409,10 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                 ttft_cache[b] = float(p_res["graph_duration_ms"])
             except (ValueError, ModelingError):
                 ttft_cache[b] = float("inf")
-        return ttft_cache[b]
+        val = ttft_cache[b]
+        if ttft_ms is not None and not (0.0 < val <= cfg.sla_ttft_ms):
+            ttft_infeasible_from = min(ttft_infeasible_from, int(b))
+        return val
 
     def _step_at(b: int) -> float:
         evaluated_b.add(int(b))
@@ -461,15 +467,21 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
                 else:
                     hi = mid - 1
         if lo > cfg.sequences and ttft_ms is not None:
-            if not (0.0 < _ttft_at(lo) <= cfg.sla_ttft_ms):
-                t_lo, t_hi = cfg.sequences, lo - 1
-                while t_lo < t_hi:
-                    mid = (t_lo + t_hi + 1) // 2
-                    if 0.0 < _ttft_at(mid) <= cfg.sla_ttft_ms:
-                        t_lo = mid
-                    else:
-                        t_hi = mid - 1
-                lo = t_lo
+            t_lo, t_hi = cfg.sequences, lo
+            probe = min(lo, max(cfg.sequences + 1, int(math.ceil(cfg.sequences * cfg.sla_ttft_ms / ttft_ms)) * 2)) if ttft_ms > 0.0 else lo
+            while probe < lo and (0.0 < _ttft_at(probe) <= cfg.sla_ttft_ms):
+                t_lo, probe = probe, min(lo, probe * 2)
+            if probe < lo or not (0.0 < _ttft_at(lo) <= cfg.sla_ttft_ms):
+                t_hi = probe - 1
+            else:
+                t_lo = lo
+            while t_lo < t_hi:
+                mid = (t_lo + t_hi + 1) // 2
+                if 0.0 < _ttft_at(mid) <= cfg.sla_ttft_ms:
+                    t_lo = mid
+                else:
+                    t_hi = mid - 1
+            lo = t_lo
         b_sla = lo
         if b_sla > 0:
             tpot_step = _step_at(b_sla)
@@ -483,7 +495,7 @@ def _sla_metrics(case: CaseSpec, cfg: _Config, *, step_ms: float,
             continue
         step = _step_at(b)
         step_ok = bool(b <= search_cap and 0.0 < step <= step_budget_ms)
-        ttft_ok = step_ok and (ttft_ms is None or (0.0 < _ttft_at(b) <= cfg.sla_ttft_ms))
+        ttft_ok = step_ok and (ttft_ms is None or (b < ttft_infeasible_from and 0.0 < _ttft_at(b) <= cfg.sla_ttft_ms))
         feasible = bool(step_ok and ttft_ok)
         candidates.append({"b": int(b), "step_ms": step, "feasible": feasible})
         if feasible:
@@ -763,23 +775,15 @@ def _calibration(baseline: Mapping[str, Any], observed: Mapping[str, Any],
     else:
         status = "latency_bias"
     return {
-        "available": True,
-        "observed_step_ms": observed_step,
-        "predicted_step_ms": predicted_step,
-        "step_delta_ms": step_delta,
-        "step_delta_pct": _pct(step_delta, predicted_step),
-        "observed_tpot_p50_ms": observed_tpot,
-        "predicted_tpot_p50_ms": predicted_tpot,
-        "tpot_delta_ms": tpot_delta,
-        "tpot_delta_pct": _pct(tpot_delta, predicted_tpot),
-        "observed_ttft_p50_ms": observed_ttft,
-        "predicted_ttft_p50_ms": predicted_ttft,
+        "available": True, "observed_step_ms": observed_step, "predicted_step_ms": predicted_step,
+        "step_delta_ms": step_delta, "step_delta_pct": _pct(step_delta, predicted_step),
+        "observed_tpot_p50_ms": observed_tpot, "predicted_tpot_p50_ms": predicted_tpot,
+        "tpot_delta_ms": tpot_delta, "tpot_delta_pct": _pct(tpot_delta, predicted_tpot),
+        "observed_ttft_p50_ms": observed_ttft, "predicted_ttft_p50_ms": predicted_ttft,
         "ttft_delta_pct": _pct(ttft_delta, predicted_ttft),
         "observed_dominant_bottleneck": observed_bottleneck,
         "predicted_dominant_bottleneck": predicted_bottleneck,
-        "bottleneck_aligned": aligned,
-        "share_residuals": residuals,
-        "calibration_status": status,
+        "bottleneck_aligned": aligned, "share_residuals": residuals, "calibration_status": status,
     }
 
 

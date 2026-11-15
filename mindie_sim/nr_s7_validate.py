@@ -1,7 +1,7 @@
-"""Shared strict pre-coercion validators and BPE envelope bounds for NR-S7.
+"""Shared strict pre-coercion validators and BPE envelope bounds.
 
 [Role]
-  One place for the "reject before casting" contract used by every NR-S7
+  One place for the "reject before casting" contract used by every hybrid-state
   adapter: booleans, strings, fractional floats, NaN/Inf, negative dimensions
   and non-positive throughput rates are typed ``ModelingError`` rejections.
   Also provides the dependency-free upper bound on byte-level BPE tokens that
@@ -37,9 +37,7 @@ from typing import Any, Union, get_args, get_origin, get_type_hints
 
 from mindie_sim.schema.common import ModelingError
 
-PARALLEL_MINIMUM = 1
-PARALLEL_ZERO_MINIMUM = 0
-
+PARALLEL_MINIMUM, PARALLEL_ZERO_MINIMUM = 1, 0
 _SAFE_SYMBOL = re.compile(r"[^a-z0-9_.:-]+")
 _DTYPE_BYTES = {"fp32": 4.0, "float32": 4.0, "fp16": 2.0, "float16": 2.0,
                 "bf16": 2.0, "bfloat16": 2.0, "int8": 1.0, "fp8": 1.0,
@@ -111,7 +109,7 @@ def _record_kinds(cls):
 def _request_int(name, value, *, minimum=0, reason="workload"):
     if not _matches_type(value, int):
         raise ModelingError(f"{reason}_{name}_invalid:type={type(value).__name__}")
-    return strict_int(name, value, minimum=minimum, reason=reason)
+    return _int_dom(name, value, minimum=minimum, reason=reason)
 
 
 def _validate_request(value):
@@ -133,8 +131,9 @@ def _validate_request(value):
                  "text_prompt_tokens", "media_tokens", "chain_id"):
         _request_int(name, getattr(value, name, None),
                      minimum=1 if name in {"prompt_tokens", "output_tokens"} else 0)
-    strict_bool("media_encoded", getattr(value, "media_encoded", None), reason="workload")
-    times = tuple(strict_number(name, getattr(value, name, None), reason="workload")
+    if type(getattr(value, "media_encoded", None)) is not bool:
+        raise ModelingError(f"workload_media_encoded_invalid:{getattr(value, 'media_encoded', None)!r}")
+    times = tuple(_num_dom(name, getattr(value, name, None), reason="workload")
                   for name in ("arrival_ms", "gap_ms"))
     if value.prefix_tokens > value.prompt_tokens:
         raise ModelingError("workload.prefix_exceeds_prompt")
@@ -184,11 +183,7 @@ def _validate_record_domains(value):
 
 
 def _validate_record_domain(value, base):
-    """Shared constructor/nested-record domains, without changing inputs.
-
-    Signed GLM gate bounds are diagnostic facts. Zero counts on optional work
-    remain legal; physical supplies and required dimensions must be positive.
-    """
+    """Shared constructor/nested-record domains (zero optional counts remain legal)."""
     kind = base.__name__
     if kind == "RequestSpec":
         _validate_request(value)
@@ -198,19 +193,19 @@ def _validate_record_domain(value, base):
         for field in fields(base):
             item = getattr(value, field.name)
             if item is not None:
-                positive_rate(f"SloSpec.{field.name}", item)
+                _pos_dom(f"SloSpec.{field.name}", item)
     elif kind == "ModelSpec":
-        positive_rate("ModelSpec.norm_eps", value.norm_eps)
-        strict_number("ModelSpec.state_bytes_per_request", value.state_bytes_per_request)
+        _pos_dom("ModelSpec.norm_eps", value.norm_eps)
+        _num_dom("ModelSpec.state_bytes_per_request", value.state_bytes_per_request)
         for fraction in value.expert_routing:
-            strict_number("ModelSpec.expert_routing", fraction)
+            _num_dom("ModelSpec.expert_routing", fraction)
     elif kind == "LayerPlan":
-        strict_number("LayerPlan.state_bytes", value.state_bytes)
+        _num_dom("LayerPlan.state_bytes", value.state_bytes)
     elif kind == "Software":
-        positive_rate("Software.mtp_acceptance_length", value.mtp_acceptance_length)
+        _pos_dom("Software.mtp_acceptance_length", value.mtp_acceptance_length)
         for tokens, accepted in value.mtp_acceptance_by_output_tokens:
-            strict_int("Software.mtp_output_tokens", tokens, minimum=1)
-            positive_rate("Software.mtp_accepted_tokens", accepted)
+            _int_dom("Software.mtp_output_tokens", tokens, minimum=1)
+            _pos_dom("Software.mtp_accepted_tokens", accepted)
     if kind in _SCALAR_RECORD_DOMAINS:
         for field in fields(base):
             item = getattr(value, field.name)
@@ -218,11 +213,11 @@ def _validate_record_domain(value, base):
                 continue
             label = f"{kind}.{field.name}"
             if field.name in _SCALAR_RECORD_DOMAINS[kind]:
-                positive_rate(label, item)
+                _pos_dom(label, item)
             elif kind == "StepBreakdown" and field.name == "t_non_moe_ms" and value.pp_microbatches > 1:
-                strict_number(label, item, minimum=-math.inf)
+                _num_dom(label, item, minimum=-math.inf)
             else:
-                strict_number(label, item)
+                _num_dom(label, item)
         if kind == "DecodeCostModel":
             if value.moe_layers > value.layers or value.top_k > value.num_experts:
                 raise ModelingError("nr_s7_DecodeCostModel_moe_counts_invalid")
@@ -230,7 +225,7 @@ def _validate_record_domain(value, base):
                 raise ModelingError("nr_s7_DecodeCostModel_moe_dimensions_invalid")
             for _, offsets in value.axis_endpoint_offsets:
                 for offset in offsets:
-                    strict_int("axis_endpoint_offset", offset)
+                    _int_dom("axis_endpoint_offset", offset)
         if kind == "GlmKdaExecution":
             strict_dtype("GlmKdaExecution.activation_dtype", value.activation_dtype)
             strict_text("GlmKdaExecution.kind", value.kind)
@@ -241,47 +236,69 @@ def _validate_record_domain(value, base):
             from mindie_sim.parallel_schedule import validate_overlap_mode
             validate_overlap_mode(value.overlap_mode)
             for time in value.pp_stage_ms:
-                strict_number("step_schedule_ms", time)
+                _num_dom("step_schedule_ms", time)
             for s_name, time in value.schedule:
                 s_min = -math.inf if s_name == "non_moe" and value.pp_microbatches > 1 else 0.0
-                strict_number("step_schedule_ms", time, minimum=s_min)
+                _num_dom("step_schedule_ms", time, minimum=s_min)
         if kind == "MemoryLedger":
             for name in ("sharded", "aux", "transient_base", "workspace", "cache_one",
                          "stage_capacity", "comm_rank", "graph_rank", "capacity_rank"):
                 for amount in getattr(value, name):
-                    validator = positive_rate if name in {"stage_capacity", "capacity_rank"} else strict_number
+                    validator = _pos_dom if name in {"stage_capacity", "capacity_rank"} else _num_dom
                     validator(f"MemoryLedger.{name}", amount)
             for row in value.aux_rank:
                 for amount in row:
-                    strict_number("MemoryLedger.aux_rank", amount)
+                    _num_dom("MemoryLedger.aux_rank", amount)
     for name, allowed in _RECORD_ENUMS.get(kind, {}).items():
         if getattr(value, name) not in allowed:
             raise ModelingError(f"nr_s7_{kind}.{name}_invalid:kind")
 
 
+_ATOMIC = (int, float, str, bool, bytes, type(None))
+
+
+@lru_cache(None)
+def _ann_parts(annotation: Any):
+    return get_origin(annotation), get_args(annotation)
+
+
 def _matches_type(value: Any, annotation: Any) -> bool:
     """Check raw types recursively, without casts or equality on untyped data."""
-    if annotation is Any:
+    if annotation is Any or annotation is object:
         return True
-    origin, args = get_origin(annotation), get_args(annotation)
+    cls = type(value)
+    if annotation is int:
+        return cls is int and abs(value) <= _MAX_NUMBER
+    if annotation is bool or annotation is str:
+        return cls is annotation
+    if annotation is float:
+        return ((cls is int and abs(value) <= _MAX_NUMBER)
+                or (cls is float and math.isfinite(value)))
+    if type(annotation) is type:
+        return cls is annotation or isinstance(value, annotation)
+    origin, args = _ann_parts(annotation)
     if origin in (types.UnionType, Union):
         return any(_matches_type(value, item) for item in args)
-    if annotation is int:
-        return type(value) is int and abs(value) <= _MAX_NUMBER
-    if annotation in (bool, str):
-        return type(value) is annotation
-    if annotation is float:
-        return ((type(value) is int and abs(value) <= _MAX_NUMBER)
-                or (type(value) is float and math.isfinite(value)))
-    if origin in (tuple, list, Sequence):
-        if isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(value, origin):
+    if origin is tuple:
+        if cls is not tuple and not isinstance(value, tuple):
             return False
-        if origin is tuple and args and args[-1] is not Ellipsis:
+        if args and args[-1] is not Ellipsis:
             return len(value) == len(args) and all(
                 _matches_type(v, t) for v, t in zip(value, args))
         return not args or all(_matches_type(v, args[0]) for v in value)
+    if origin is list:
+        return (cls is list or isinstance(value, list)) and (
+            not args or all(_matches_type(v, args[0]) for v in value))
+    if origin is Sequence:
+        if cls is not tuple and cls is not list and (
+                isinstance(value, (str, bytes, bytearray, Mapping)) or not isinstance(value, Sequence)):
+            return False
+        return not args or all(_matches_type(v, args[0]) for v in value)
     if origin in (dict, Mapping):
-        return isinstance(value, origin) and (not args or all(
+        ok = (cls is dict) if origin is dict else (cls is dict or isinstance(value, Mapping))
+        if not ok and origin is dict:
+            ok = isinstance(value, dict)
+        return ok and (not args or all(
             _matches_type(k, args[0]) and _matches_type(v, args[1])
             for k, v in value.items()))
     if origin in (set, frozenset, AbstractSet):
@@ -292,13 +309,7 @@ def _matches_type(value: Any, annotation: Any) -> bool:
 
 @lru_cache(None)
 def _record_hints(cls):
-    """Keep every registered base field/type, then check subclass additions.
-
-    ClassVar can erase dataclass fields; Any/object/unions can widen hints.
-    Neither the leaf nor an intermediate subclass owns the base contract.
-    Each entry owns only its base's rules. Retain overlapping fields separately
-    so one base's special annotation cannot weaken another base's contract.
-    """
+    """Keep every registered base field/type, then check subclass additions."""
     required = []
     for base in _record_bases(cls):
         hints = get_type_hints(base)
@@ -315,12 +326,9 @@ def _record_hints(cls):
 
 
 def _validate_nested(value, path, seen=None):
-    """Validate supplied records, including external catalog/schema records.
-
-    Exact Any/object fields remain opaque, including inside unregistered
-    dataclasses; typed fields and container members recurse before body entry.
-    The memo lives for one call tree only; later calls recheck mutable records.
-    """
+    """Validate supplied records, keeping Any/object opaque and one-call memo."""
+    if type(value) in _ATOMIC:
+        return
     if seen is None:
         seen = _RECORD_SCOPE.get()
     if seen is None:
@@ -347,7 +355,7 @@ def _validate_nested(value, path, seen=None):
                             raise ModelingError(f"nr_s7_{label}.{key}_invalid:type={type(rate).__name__}")
                         # A zero optional link means unequipped; compute and
                         # consumed HBM/Vector supplies are never zero sentinels.
-                        validator = strict_number if name == "rates" and key == "link" else positive_rate
+                        validator = _num_dom if name == "rates" and key == "link" else _pos_dom
                         domain = "fp32_flops" if name == "compute_peaks" and key == "fp32" else key
                         validator(f"{label}.{domain}", rate)
                     if not item or (name == "rates" and not {"hbm", "vector"} <= dict(item).keys()):
@@ -380,13 +388,13 @@ def _validate_nested(value, path, seen=None):
                 raise ModelingError(f"nr_s7_{label}_invalid:empty")
             if "Device" in owner_kinds:
                 if name in {"memory_bytes", "compute_units"}:
-                    strict_int(label, item, minimum=1)
+                    _int_dom(label, item, minimum=1)
                 elif name in {"rank", "node", "package", "launch_us"}:
-                    strict_number(label, item)
+                    _num_dom(label, item)
                 elif name in {"buffers", "resource_units", "buffer_units"}:
                     for key, count in item:
-                        strict_int(f"{label}.{key}", count, minimum=0 if name == "buffers" else 1)
-            if annotation is not Any and annotation is not object:
+                        _int_dom(f"{label}.{key}", count, minimum=0 if name == "buffers" else 1)
+            if annotation is not Any and annotation is not object and type(item) not in _ATOMIC:
                 _validate_nested(item, label, seen)
         _validate_record_domains(value)
         if "MemoryBreakdown" in _record_kinds(type(value)):
@@ -396,47 +404,55 @@ def _validate_nested(value, path, seen=None):
             if any(not 0 <= row[1] < stages for row in value.per_rank_bytes):
                 raise ModelingError(f"nr_s7_{path}_rank_stage_invalid")
     # Dataclass containers expose members as well as declared fields.
-    if isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, Mapping)):
+    cls = type(value)
+    if cls is tuple or cls is list or (
+            isinstance(value, Sequence) and not isinstance(value, (str, bytes, bytearray, Mapping))):
         seen[id(value)] = value
         for index, item in enumerate(value):
-            _validate_nested(item, f"{path}[{index}]", seen)
-    elif isinstance(value, Mapping):
+            if type(item) not in _ATOMIC:
+                _validate_nested(item, f"{path}[{index}]", seen)
+    elif cls is dict or isinstance(value, Mapping):
         seen[id(value)] = value
         for key, item in value.items():
-            _validate_nested(key, f"{path}.key", seen)
-            _validate_nested(item, path, seen)
-    elif isinstance(value, AbstractSet):
+            if type(key) not in _ATOMIC:
+                _validate_nested(key, f"{path}.key", seen)
+            if type(item) not in _ATOMIC:
+                _validate_nested(item, path, seen)
+    elif cls in (set, frozenset) or isinstance(value, AbstractSet):
         seen[id(value)] = value
         for item in value:
-            _validate_nested(item, path, seen)
+            if type(item) not in _ATOMIC:
+                _validate_nested(item, path, seen)
 
 
 def typed_inputs(target=None, *, errors=None):
-    """Enforce annotated argument types before entering a public boundary.
-
-    Dataclass constructors and public methods use the same contract. Existing
-    validators and shared record domains own ranges, enums and geometry. ``Any`` deliberately
-    leaves a structural interface to its explicit validator. Only
-    OverflowError is translated to ModelingError, including computed products;
-    unrelated exceptions propagate and caller containers are never changed.
-    """
+    """Enforce annotated argument types before entering a public boundary."""
     if target is None:
         return lambda value: typed_inputs(value, errors=errors)
     def wrap(function, owner=None):
         signature = inspect.signature(function)
+        params = tuple(signature.parameters.values())
+        pos = tuple(p.name for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD))
+        req_pos = sum(1 for p in params if p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD) and p.default is p.empty)
+        fast_pos = (all(p.kind in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY) for p in params)
+                    and not any(p.kind is p.KEYWORD_ONLY and p.default is p.empty for p in params))
+        is_init = function.__name__ == "__init__"
         hints = None
 
         @wraps(function)
         def checked(*args, **kwargs):
             nonlocal hints
             if hints is None:
-                hints = (get_type_hints(owner) if function.__name__ == "__init__"
+                hints = (get_type_hints(owner) if is_init
                          else get_type_hints(function, localns=vars(owner) if owner else None))
-            try:
-                bound = signature.bind(*args, **kwargs)
-            except TypeError as error:
-                raise ModelingError(f"nr_s7_{function.__name__}_arguments_invalid:{error}") from error
-            for name, value in bound.arguments.items():
+            if fast_pos and not kwargs and req_pos <= len(args) <= len(pos):
+                items = tuple(zip(pos, args))
+            else:
+                try:
+                    items = tuple(signature.bind(*args, **kwargs).arguments.items())
+                except TypeError as error:
+                    raise ModelingError(f"nr_s7_{function.__name__}_arguments_invalid:{error}") from error
+            for name, value in items:
                 if name == "minimum" and hints.get(name) is float and type(value) is float and value == -math.inf:
                     continue  # Explicit unbounded lower limit of strict_number.
                 if name in hints and not _matches_type(value, hints[name]):
@@ -444,12 +460,12 @@ def typed_inputs(target=None, *, errors=None):
                     raise ModelingError(f"{code}:type={type(value).__name__}")
             token = _RECORD_SCOPE.set({}) if _RECORD_SCOPE.get() is None else None
             try:
-                for name, value in bound.arguments.items():
-                    if name in hints and hints[name] not in (Any, object):
+                for name, value in items:
+                    if type(value) not in _ATOMIC and name in hints and hints[name] not in (Any, object):
                         _validate_nested(value, name)
                 result = function(*args, **kwargs)
-                if function.__name__ == "__init__":
-                    _validate_record_domains(bound.arguments["self"])
+                if is_init:
+                    _validate_record_domains(args[0] if args else dict(items)["self"])
                 return result
             except OverflowError as error:
                 raise ModelingError(f"nr_s7_{function.__name__}_invalid:overflow") from error
@@ -482,26 +498,12 @@ def typed_sequence(name: str, value: Any, element_type: type, *,
     return tuple(value)
 
 
-@typed_inputs
-def strict_int(name: str, value: Any, *, minimum: int = 0,
-               reason: str = "nr_s7") -> int:
-    """Return an exact non-negative ``int`` or raise before any cast."""
+def _int_dom(name: str, value: Any, minimum: int = 0, reason: str = "nr_s7") -> int:
     if type(value) is not int or value < minimum or abs(value) > _MAX_NUMBER:
         raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
     return value
 
-
-@typed_inputs
-def strict_bool(name: str, value: Any, *, reason: str = "nr_s7") -> bool:
-    if type(value) is not bool:
-        raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
-    return value
-
-
-@typed_inputs
-def strict_number(name: str, value: Any, *, minimum: float = 0.0,
-                  allow_none: bool = False,
-                  reason: str = "nr_s7") -> float | None:
+def _num_dom(name: str, value: Any, minimum: float = 0.0, allow_none: bool = False, reason: str = "nr_s7") -> float | None:
     if value is None and allow_none:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float)):
@@ -514,16 +516,32 @@ def strict_number(name: str, value: Any, *, minimum: float = 0.0,
         raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
     return number
 
-
-@typed_inputs
-def positive_rate(name: str, value: Any, *,
-                  reason: str = "nr_s7") -> float:
-    """A finite, strictly positive throughput/rate; zero is rejected."""
-    number = strict_number(name, value, minimum=0.0, reason=reason)
-    assert number is not None
-    if number <= 0.0:
+def _pos_dom(name: str, value: Any, reason: str = "nr_s7") -> float:
+    number = _num_dom(name, value, 0.0, False, reason)
+    if number is None or number <= 0.0:
         raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
     return number
+
+@typed_inputs
+def strict_int(name: str, value: Any, *, minimum: int = 0, reason: str = "nr_s7") -> int:
+    """Return an exact non-negative ``int`` or raise before any cast."""
+    return _int_dom(name, value, minimum, reason)
+
+@typed_inputs
+def strict_bool(name: str, value: Any, *, reason: str = "nr_s7") -> bool:
+    if type(value) is not bool:
+        raise ModelingError(f"{reason}_{name}_invalid:{value!r}")
+    return value
+
+@typed_inputs
+def strict_number(name: str, value: Any, *, minimum: float = 0.0,
+                  allow_none: bool = False, reason: str = "nr_s7") -> float | None:
+    return _num_dom(name, value, minimum, allow_none, reason)
+
+@typed_inputs
+def positive_rate(name: str, value: Any, *, reason: str = "nr_s7") -> float:
+    """A finite, strictly positive throughput/rate; zero is rejected."""
+    return _pos_dom(name, value, reason)
 
 
 @typed_inputs
@@ -557,26 +575,20 @@ def dtype_elem_bytes(name: str, value: Any, *,
 
 @typed_inputs
 def next_power_of_two(value: int) -> int:
-    number = strict_int("value", value, minimum=0)
+    number = _int_dom("value", value, 0)
     return 1 << max(0, number - 1).bit_length()
 
 
 @typed_inputs
 def ceil_div(numerator: int, denominator: int) -> int:
-    strict_int("numerator", numerator, minimum=0)
-    strict_int("denominator", denominator, minimum=1)
+    _int_dom("numerator", numerator, 0)
+    _int_dom("denominator", denominator, 1)
     return (numerator + denominator - 1) // denominator
 
 
 @typed_inputs
 def bpe_token_upper_bound(text: Any) -> int:
-    """Conservative upper bound on byte-level BPE tokens of ``text``.
-
-    Every token emitted by a byte-level BPE covers at least one UTF-8 byte, so
-    the UTF-8 byte length bounds the token count from above for cl100k_base,
-    o200k_base and every other byte-level vocabulary.  This estimator needs no
-    tokenizer, network access or cache file.
-    """
+    """Conservative upper bound on byte-level BPE tokens of ``text``."""
     if type(text) is not str:
         raise ModelingError(f"nr_s7_bpe_text_invalid:{type(text).__name__}")
     return len(text.encode("utf-8"))
@@ -584,23 +596,15 @@ def bpe_token_upper_bound(text: Any) -> int:
 
 @typed_inputs
 def sanitize_symbol(value: Any, *, limit: int = 24) -> str:
-    """Map arbitrary text to a bounded ``[a-z0-9_.:-]`` symbol.
-
-    A path separator, home marker, quote, whitespace run or non-ASCII byte can
-    therefore never reach a public summary or fact value.
-    """
-    limit = strict_int("limit", limit, minimum=1)
+    """Map arbitrary text to a bounded ``[a-z0-9_.:-]`` symbol."""
+    limit = _int_dom("limit", limit, 1)
     if type(value) is not str:
         return "invalid"
     lowered = value.strip().lower()
-    if not lowered:
-        return "empty"
-    if any(marker in lowered for marker in ("/", "\\", "~", "$")):
-        return "symbolic"
+    if not lowered or any(marker in lowered for marker in ("/", "\\", "~", "$")):
+        return "empty" if type(value) is str and not lowered else "symbolic"
     cleaned = _SAFE_SYMBOL.sub("-", lowered).strip("-")
-    if not cleaned:
-        return "symbolic"
-    if any(marker in cleaned for marker in ("..", "/", "\\", "~", "$")):
+    if not cleaned or any(marker in cleaned for marker in ("..", "/", "\\", "~", "$")):
         return "symbolic"
     return cleaned[:limit]
 
@@ -608,7 +612,7 @@ def sanitize_symbol(value: Any, *, limit: int = 24) -> str:
 @typed_inputs
 def sanitize_code(value: Any, *, limit: int = 40) -> str:
     """Bounded diagnostic-code sanitizer preserving known code characters."""
-    limit = strict_int("limit", limit, minimum=1)
+    limit = _int_dom("limit", limit, 1)
     if type(value) is not str or not value:
         return "unknown"
     if len(value) > 80 or any(marker in value for marker in
@@ -621,14 +625,13 @@ def sanitize_code(value: Any, *, limit: int = 40) -> str:
 @typed_inputs
 def stage_of_layer(partition: tuple[int, ...], index: int) -> int:
     """Stage owning a contiguous layer index for a declared PP partition."""
-    strict_int("layer_index", index, minimum=0)
+    _int_dom("layer_index", index, 0)
     if not isinstance(partition, tuple) or not partition:
         raise ModelingError("nr_s7_partition_invalid")
     for count in partition:
-        strict_int("partition_count", count, minimum=0)
+        _int_dom("partition_count", count, 0)
     cursor = 0
     for stage, count in enumerate(partition):
-        strict_int("partition_count", count, minimum=0)
         cursor += count
         if index < cursor:
             return stage
@@ -648,12 +651,13 @@ class RestoreExtent:
     exact: bool = True
 
     def __post_init__(self) -> None:
-        strict_int("prefix_hit_tokens", self.prefix_hit_tokens, minimum=0)
-        strict_int("prompt_tokens", self.prompt_tokens, minimum=0)
-        strict_int("block_size", self.block_size, minimum=1)
-        strict_int("hash_block_size", self.hash_block_size, minimum=1)
-        strict_int("block_hash_count", self.block_hash_count, minimum=0)
-        strict_bool("exact", self.exact)
+        _int_dom("prefix_hit_tokens", self.prefix_hit_tokens, 0)
+        _int_dom("prompt_tokens", self.prompt_tokens, 0)
+        _int_dom("block_size", self.block_size, 1)
+        _int_dom("hash_block_size", self.hash_block_size, 1)
+        _int_dom("block_hash_count", self.block_hash_count, 0)
+        if type(self.exact) is not bool:
+            raise ModelingError(f"nr_s7_exact_invalid:{self.exact!r}")
         if self.block_size % self.hash_block_size:
             raise ModelingError("nr_s7_restore_block_hash_alignment_invalid")
         if self.prefix_hit_tokens > self.prompt_tokens:

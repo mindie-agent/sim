@@ -2,7 +2,7 @@
 
 [Role] Own the two state journeys of the C accelerator: mirroring an unstarted
   pure Python frontier into the kernel (``adopt_frontier``) and returning every
-  kernel-owned row to the canonical Python Engine (``sync_back``).  R6-1 adds
+  kernel-owned row to the canonical Python Engine (``sync_back``).  Also owns
   ``drain_output``: publish every same-instant output continuation without
   consuming caller step budget or integrating another interval.
 [Invariants] Exactly one frontier owns a task at a time.  Adoption removes the
@@ -33,12 +33,12 @@ from .accel_tables import (
 
 
 def finish_handback(backend, engine) -> None:
-    """R9-1: export only after every accepted output record was published.
+    """Export only after every accepted output record was published.
 
     ``disable()`` records the request during ``_apply()`` or a drain loop and
     returns without touching the kernel.  The outermost publication exit calls
     this entry point; a nested ``_apply``/drain leaves the request pending.
-    R10-2: a batch that aborted before publishing every accepted record never
+    A batch that aborted before publishing every accepted record never
     exports its partially popped kernel state, so the caller sees the primary
     exception instead of a secondary ``stale_slot`` error.
     """
@@ -141,19 +141,19 @@ def flush_pending(backend, engine) -> None:
 
 
 def drain_output(backend, engine) -> int:
-    """R6-1: publish every remaining same-instant output batch.
+    """Publish every remaining same-instant output batch.
 
     Each drain call passes ``max_steps=0`` and ``horizon=ctx->now``, so it
     consumes no caller step budget and can never integrate a positive-dt
     interval.  A callback registration during ``_apply`` records a pending
     hand-back through ``disable``; the loop keeps publishing every
     already-accepted record and only the outermost exit exports the genuinely
-    live residue, after which Python settles rows the callback submitted.  R7-1:
-    a failing allocation inside a
+    live residue, after which Python settles rows the callback submitted.
+    A failing allocation inside a
     zero-budget call follows the same exactly-once prefix publication and
-    error translation as every other native call.  R7-2: the kernel itself
+    error translation as every other native call.  The kernel itself
     resumes an interrupted completion snapshot, so this loop just supplies the
-    next zero-budget output window.  R9-1: a disable requested mid-batch keeps
+    next zero-budget output window.  A disable requested mid-batch keeps
     the loop alive until C has emitted every already-accepted record, and only
     then exports the genuinely live residue.
     """
@@ -174,7 +174,7 @@ def drain_output(backend, engine) -> int:
             engine.advance_steps += steps
             backend._sync_counters(engine)
             backend._apply(engine, nstart, ncomp)
-            # R12-1: every completion and trace eviction published by this
+            # Every completion and trace eviction published by this
             # chunk must settle before another drain call can admit an awakened
             # child.  A retained release-sensitive row hands back instead.
             if backend._trace_blocks_epoch(engine):
@@ -218,7 +218,7 @@ def effective_units(engine, task) -> int:
     An omitted placement means "all declared units" to ``unit_len()`` in the
     kernel, so it must contribute ``resource.units`` here as well.  Counting
     only explicit tuples undercounted the overlap/coupled solver demand and let
-    the kernel fault after admission instead of declining in preflight (R5-1).
+    the kernel fault after admission instead of declining in preflight.
     """
     placement = task.placement or {}
     total = 0
@@ -257,7 +257,7 @@ def purge_adopted(engine, sequences) -> None:
 
 
 def adopt_frontier(backend, engine, skip: int) -> bool:
-    """Mirror the unstarted pure frontier when ``auto`` attaches (R9)."""
+    """Mirror the unstarted pure frontier when ``auto`` attaches."""
     items = [task for _, task in sorted(engine._tasks.items())
              if task.event.sequence != skip]
     if not items:
@@ -294,7 +294,7 @@ def adopt_frontier(backend, engine, skip: int) -> bool:
                       tuple(predecessors[task.event.sequence]))
         engine._native_seqs.add(task.event.sequence)
     # The kernel now owns these releases too: leaving them in Python would pass
-    # an already-consumed boundary back as ``next_release`` (R4-1, run:2).
+    # an already-consumed boundary back as ``next_release``.
     purge_adopted(engine, (task.event.sequence for task in items))
     return True
 
@@ -324,11 +324,11 @@ def requeue_pending(engine, task, pending, releases: set[int]) -> None:
 
 
 def sync_back(backend, engine) -> None:
-    """Return every kernel-owned row to the reference frontier (R4-1/R4-2)."""
+    """Return every kernel-owned row to the reference frontier."""
     arena = backend.arena
     now = engine.now
     if backend.seeded and arena is not None:
-        # R8-2: callbacks below must observe this run's accepted counters.
+        # callbacks below must observe this run's accepted counters.
         backend._sync_counters(engine)
     if arena is not None:
         for sequence, slot in tuple(engine._native_slots.items()):
@@ -340,7 +340,7 @@ def sync_back(backend, engine) -> None:
             buf = (ctypes.c_double * max(2 * n, 1))()
             got = int(arena.library.msim_ctx_export(arena.ctx, slot, buf, 2 * n))
             if got < 0 or got != n:
-                # R9-1: an already-completed C slot must have been settled by
+                # an already-completed C slot must have been settled by
                 # its accepted completion record, never turned back into
                 # positive Python remaining work or silently dropped.
                 raise KernelFault(E_STATE, "export", f"stale_slot:{sequence}")
@@ -349,7 +349,7 @@ def sync_back(backend, engine) -> None:
                     buf[n + index])
                 remaining = float(buf[index])
                 # The Python reference deletes an exhausted key; a stored 0.0
-                # re-enters the coupled solver as a zero scale (R4-2).
+                # re-enters the coupled solver as a zero scale.
                 if remaining > 0.0:
                     task.remaining[name] = remaining
                 else:
@@ -383,7 +383,7 @@ def sync_back(backend, engine) -> None:
                 if task.placement:
                     engine._placed_active += 1
             if not task.remaining and now >= task.start + task.latency:
-                # R7-2: this row already belonged to the kernel's current
+                # this row already belonged to the kernel's current
                 # completion snapshot.  Complete it in sequence order after the
                 # hand-back, before Python may start successors awakened by
                 # earlier records (``engine.py``'s snapshot-drain order).
@@ -408,7 +408,7 @@ def sync_back(backend, engine) -> None:
     backend.epoch_links = backend.epoch_units = 0
     backend.epoch_storage = 0
     backend.epoch_tasks = backend.epoch_edges = 0
-    # R7-2: every native table is gone, so these already-complete snapshot
+    # every native table is gone, so these already-complete snapshot
     # members wake the restored Python frontier exactly once.  Doing this here
     # (rather than leaving them in ``_completable``) keeps the trace order:
     # the interrupted batch settles before awakened successors may start.
@@ -419,7 +419,7 @@ def sync_back(backend, engine) -> None:
         if task.remaining or now < task.start + task.latency:
             continue
         engine._complete(task, moment=now)
-    # R8-1 postcondition: no callback above may leave work in the hand-back.
+    # Postcondition: no callback above may leave work in the hand-back.
     assert not backend.pending
     assert not engine._native_seqs
     assert not engine._native_slots

@@ -28,8 +28,9 @@
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, replace
+from functools import lru_cache
+import math
 from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
@@ -216,20 +217,10 @@ class QuantSpec:
         if not self.category_overrides:
             return self
         cat = str(category)
-        names = [".".join(cat.split(".")[:i + 1]) for i in range(len(cat.split(".")))]
-        if cat == "mla_absorb":
-            names.insert(0, "mla")
-        overrides = dict(self.category_overrides)
-        changes = {}
-        for name in names:
-            changes.update(dict(overrides.get(name, ())))
-        if not changes:
-            return self
-        # A role's weight format denotes that role's matrix, including an
-        # expert matrix; the old global expert default remains independent.
-        if "weight_format" in changes:
-            changes["expert_weight_format"] = changes["weight_format"]
-        return replace(self, **changes, category_overrides=())
+        try:
+            return _resolve_quant_category(self, cat)
+        except TypeError:
+            return _resolve_quant_category.__wrapped__(self, cat)
 
     _MX_METHODS = frozenset({"mx_fp8", "mx_fp4"})
     _FOUR_BIT_WEIGHT_FORMATS = frozenset({
@@ -546,6 +537,22 @@ class VisionSpec:
             "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id,
             "source": dict(self.source),
         }
+
+
+@lru_cache(None)
+def _resolve_quant_category(spec: QuantSpec, cat: str) -> QuantSpec:
+    names = [".".join(cat.split(".")[:i + 1]) for i in range(len(cat.split(".")))]
+    if cat == "mla_absorb":
+        names.insert(0, "mla")
+    overrides = dict(spec.category_overrides)
+    changes = {}
+    for name in names:
+        changes.update(dict(overrides.get(name, ())))
+    if not changes:
+        return spec
+    if "weight_format" in changes:
+        changes["expert_weight_format"] = changes["weight_format"]
+    return replace(spec, **changes, category_overrides=())
 
 
 @dataclass(frozen=True)

@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass
 import math
 from typing import Any, Iterable, Mapping
@@ -387,49 +388,102 @@ class TypedGraph:
                                     f"{key}:{first}:{second}")
 
     def consumers(self, value_id: str) -> tuple[str, ...]:
-        return tuple(op.op_id for op in self.ops.values() if value_id in op.inputs)
+        return _graph_index(self)["consumers"].get(value_id, ())
 
     def successors(self, op_id: str) -> tuple[str, ...]:
         """Forward neighbours only: explicit event successors and readers."""
-        op = self.ops[op_id]
-        found: list[str] = []
-        for value_id in op.outputs:
-            for consumer in self.consumers(value_id):
-                if consumer != op_id and consumer not in found:
-                    found.append(consumer)
-        for other in self.ops.values():
-            if other.op_id != op_id and op_id in other.deps \
-                    and other.op_id not in found:
-                found.append(other.op_id)
-        return tuple(found)
+        if op_id not in self.ops:
+            _ = self.ops[op_id]
+        return _graph_index(self)["successors"][op_id]
 
     def predecessors(self, op_id: str) -> tuple[str, ...]:
         """Backward neighbours only: explicit event predecessors and producers."""
-        op = self.ops[op_id]
-        found: list[str] = []
-        for dep in op.deps:
-            if dep != op_id and dep not in found:
-                found.append(dep)
-        for value_id in op.inputs:
-            producer = self.values[value_id].producer
-            if producer is not None and producer != op_id and producer not in found:
-                found.append(producer)
-        return tuple(found)
+        if op_id not in self.ops:
+            _ = self.ops[op_id]
+        return _graph_index(self)["predecessors"][op_id]
 
     def topological_order(self) -> tuple[str, ...]:
-        pending = {op_id: len(self.predecessors(op_id)) for op_id in self.ops}
-        ready = [op_id for op_id, count in pending.items() if not count]
-        ordered: list[str] = []
-        while ready:
-            current = ready.pop(0)
-            ordered.append(current)
-            for successor in self.successors(current):
-                pending[successor] -= 1
-                if not pending[successor]:
-                    ready.append(successor)
-        if len(ordered) != len(self.ops):
+        ordered = _graph_index(self)["topo_order"]
+        if ordered is None:
             raise FeasibilityError("graph_forward_dependency_cycle")
-        return tuple(ordered)
+        return ordered
+
+
+def _graph_index(graph: TypedGraph) -> dict[str, Any]:
+    stamp = (id(graph.ops), len(graph.ops), id(graph.values), len(graph.values),
+             graph.public_outputs)
+    cached = getattr(graph, "_cached_idx", None)
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    consumers_lists: dict[str, list[str]] = {}
+    dep_children: dict[str, list[str]] = {}
+    for op in graph.ops.values():
+        for value_id in dict.fromkeys(op.inputs):
+            consumers_lists.setdefault(value_id, []).append(op.op_id)
+        for dep in dict.fromkeys(op.deps):
+            if dep in graph.ops and dep != op.op_id:
+                dep_children.setdefault(dep, []).append(op.op_id)
+    consumers = {vid: tuple(ops) for vid, ops in consumers_lists.items()}
+    successors: dict[str, tuple[str, ...]] = {}
+    predecessors: dict[str, tuple[str, ...]] = {}
+    fwd_edges: dict[str, tuple[str, ...]] = {}
+    rev_lists: dict[str, list[str]] = {op_id: [] for op_id in graph.ops}
+    for op_id, op in graph.ops.items():
+        succ: list[str] = []
+        seen_s: set[str] = set()
+        for value_id in op.outputs:
+            for consumer in consumers.get(value_id, ()):
+                if consumer != op_id and consumer not in seen_s:
+                    seen_s.add(consumer)
+                    succ.append(consumer)
+        for child in dep_children.get(op_id, ()):
+            if child not in seen_s:
+                seen_s.add(child)
+                succ.append(child)
+        succ_t = tuple(succ)
+        successors[op_id] = succ_t
+        fwd_edges[op_id] = succ_t
+        for child in succ_t:
+            rev_lists[child].append(op_id)
+        pred: list[str] = []
+        seen_p: set[str] = set()
+        for dep in op.deps:
+            if dep != op_id and dep not in seen_p:
+                seen_p.add(dep)
+                pred.append(dep)
+        for value_id in op.inputs:
+            val = graph.values.get(value_id)
+            producer = val.producer if val is not None else None
+            if producer is not None and producer != op_id and producer not in seen_p:
+                seen_p.add(producer)
+                pred.append(producer)
+        predecessors[op_id] = tuple(pred)
+    pending = {op_id: len(predecessors[op_id]) for op_id in graph.ops}
+    ready = deque(op_id for op_id, count in pending.items() if not count)
+    ordered: list[str] = []
+    while ready:
+        current = ready.popleft()
+        ordered.append(current)
+        for nxt in successors[current]:
+            pending[nxt] -= 1
+            if not pending[nxt]:
+                ready.append(nxt)
+    topo_order = tuple(ordered) if len(ordered) == len(graph.ops) else None
+    topo_rank = ({op_id: idx for idx, op_id in enumerate(topo_order)}
+                 if topo_order is not None else None)
+    idx = {
+        "consumers": consumers,
+        "successors": successors,
+        "predecessors": predecessors,
+        "fwd_edges": fwd_edges,
+        "rev_edges": {op_id: tuple(items) for op_id, items in rev_lists.items()},
+        "topo_order": topo_order,
+        "topo_rank": topo_rank,
+        "public_set": frozenset(graph.public_outputs),
+        "value_rank": {vid: i for i, vid in enumerate(graph.values)},
+    }
+    object.__setattr__(graph, "_cached_idx", (stamp, idx))
+    return idx
 
 
 def is_connected(graph: TypedGraph, members: Iterable[str]) -> bool:
@@ -452,18 +506,42 @@ def is_convex(graph: TypedGraph, members: Iterable[str]) -> bool:
     chosen = set(members)
     if not chosen:
         return False
-    edges = _forward_edges(graph)
-    reachable_from_region = _reachable(edges, chosen)
-    for node in graph.ops:
-        if node in chosen or node not in reachable_from_region:
-            continue
-        if _reachable(edges, (node,)) & chosen:
-            return False
-    return True
+    idx = _graph_index(graph)
+    topo_rank = idx["topo_rank"]
+    fwd_edges = idx["fwd_edges"]
+    rev_edges = idx["rev_edges"]
+    if topo_rank is not None and all(m in topo_rank for m in chosen):
+        if len(chosen) == 1:
+            return True
+        min_r = min(topo_rank[m] for m in chosen)
+        max_r = max(topo_rank[m] for m in chosen)
+        fwd_seen: set[str] = set()
+        stack = list(chosen)
+        while stack:
+            for nxt in fwd_edges.get(stack.pop(), ()):
+                if nxt not in fwd_seen and topo_rank[nxt] <= max_r:
+                    fwd_seen.add(nxt)
+                    stack.append(nxt)
+        outside_fwd = fwd_seen - chosen
+        if not outside_fwd:
+            return True
+        rev_seen: set[str] = set()
+        stack = list(chosen)
+        while stack:
+            for prv in rev_edges.get(stack.pop(), ()):
+                if prv not in rev_seen and topo_rank[prv] >= min_r:
+                    if prv in outside_fwd:
+                        return False
+                    rev_seen.add(prv)
+                    stack.append(prv)
+        return True
+    fwd = _reachable(fwd_edges, chosen)
+    rev = _reachable(rev_edges, chosen)
+    return not ((fwd & rev) - chosen)
 
 
 def _is_public(graph: TypedGraph, value_id: str) -> bool:
-    return graph.values[value_id].public or value_id in graph.public_outputs
+    return graph.values[value_id].public or value_id in _graph_index(graph)["public_set"]
 
 
 def external_readers(graph: TypedGraph, members: Iterable[str]) -> dict[str, tuple[str, ...]]:

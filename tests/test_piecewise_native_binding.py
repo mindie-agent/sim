@@ -12,6 +12,7 @@
 from __future__ import annotations
 
 import copy
+from functools import lru_cache
 import json
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -58,8 +59,20 @@ DOMAIN = AnalysisDomain(max_tokens=10 ** 9, max_moe_rows=10 ** 9,
                         max_batch=10 ** 6)
 
 
+@lru_cache(maxsize=None)
+def _parsed_case(path: Path):
+    return parse_case(json.loads(path.read_text()))
+
+
+@lru_cache(maxsize=None)
+def _cached_instantiated(path: Path, feature_items: tuple[tuple[str, object], ...]):
+    case = _parsed_case(path)
+    features = FeatureConfig.from_model(case.model, **dict(feature_items))
+    return case, instantiate_model(case.model, features)
+
+
 def _case(path: Path, **features):
-    case = parse_case(json.loads(path.read_text()))
+    case = _parsed_case(path)
     return case, FeatureConfig.from_model(case.model, **features)
 
 
@@ -69,25 +82,45 @@ def _compiler(case, cores=64):
         ImplementationPolicy(cores=cores), domain=DOMAIN)
 
 
+@lru_cache(maxsize=None)
+def _compiled_qwen_gdn(idx: int):
+    case, instantiated = _cached_instantiated(
+        QWEN,
+        (("tp", 2), ("dp", 4), ("ep", 1), ("pp", 1), ("cores", 64),
+         ("token_tile", 16), ("kv_tile", 16), ("moe_row_tile", 4),
+         ("split_target", 1000), ("max_splits", 4)),
+    )
+    gdn = [item for layer in instantiated.layers for item in layer.subgraphs
+           if item.kind == "gdn_linear_attn"]
+    assert len(gdn) >= 2
+    return _compiler(case).compile(gdn[idx])
+
+
+@lru_cache(maxsize=None)
+def _compiled_glm_mla(dp: int, meta: tuple[tuple[str, str], ...] = ()):
+    case, instantiated = _cached_instantiated(
+        GLM, (("tp", 1), ("dp", dp), ("ep", dp), ("pp", 1), ("cores", 64))
+    )
+    instance = next(item for layer in instantiated.layers for item in layer.subgraphs
+                    if item.kind in LATENT_ATTENTION_KINDS)
+    return case, instance, _compiler(case).compile(instance, feature_metadata=meta)
+
+
 def _prefill(tokens=1024, batch=1):
     return WorkloadGeometry((RequestGeometry(tokens, tokens, phase="prefill"),),
                             phase="prefill", cohort_batch=batch, local_batch=batch)
 
 
+@lru_cache(maxsize=None)
+def _eval_qwen_gdn_prefill(idx: int, tokens: int):
+    return {
+        cost.name: cost
+        for cost in _compiled_qwen_gdn(idx).evaluate(_prefill(tokens)).operators
+    }
+
+
 def test_gdn_chunk_call_is_one_identity_with_occurrence_and_runtime_children():
-    case, features = _case(QWEN, tp=2, dp=4, ep=1, pp=1, cores=64,
-                           token_tile=16, kv_tile=16, moe_row_tile=4,
-                           split_target=1000, max_splits=4)
-    instantiated = instantiate_model(case.model, features)
-    gdn = [item for layer in instantiated.layers for item in layer.subgraphs
-           if item.kind == "gdn_linear_attn"]
-    assert len(gdn) >= 2
-    compiler, geometry = _compiler(case), _prefill(4096)
-    evaluated = []
-    for instance in gdn[:2]:
-        costs = {cost.name: cost for cost in compiler.compile(instance).evaluate(geometry).operators}
-        evaluated.append(costs)
-    first, second = evaluated
+    first, second = _eval_qwen_gdn_prefill(0, 4096), _eval_qwen_gdn_prefill(1, 4096)
     assert first["gated_delta"].native_call is not None
     assert first["prepare"].native_call is not None
     assert first["gated_delta"].native_call["call_id"] == first["prepare"].native_call["call_id"]
@@ -143,35 +176,45 @@ def test_gdn_chunk_call_is_one_identity_with_occurrence_and_runtime_children():
     assert prepare["g_cumsum_materialization"]["recipe"] == "g_cumsum_export"
     assert prepare["allocation"] == "not_performed"
     assert first["gated_delta"].native_occurrence["prepare_args"]["shapes"]["q"] == [1, 4096, 8, 128]
-    independent = {cost.name: cost for cost in compiler.compile(gdn[0]).evaluate(
-        _prefill(2048)).operators}
+
+
+def test_gdn_chunk_call_independent_and_decode_occurrences():
+    comp0 = _compiled_qwen_gdn(0)
+    call_id = _eval_qwen_gdn_prefill(0, 4096)["gated_delta"].native_call["call_id"]
+    independent = _eval_qwen_gdn_prefill(0, 2048)
     independent_call = independent["gated_delta"]
-    assert independent_call.native_call["call_id"] == call["call_id"]
+    assert independent_call.native_call["call_id"] == call_id
     assert independent_call.native_occurrence["typed"]["shapes"]["q"] == [1, 2048, 8, 128]
     assert independent_call.native_occurrence["prepare"]["arguments"]["cu_seqlens"] == [0, 2048]
+    decode = WorkloadGeometry((RequestGeometry(1, 1024, phase="decode"),),
+                              phase="decode", cohort_batch=1, local_batch=1)
+    decoded = {cost.name: cost for cost in comp0.evaluate(decode).operators}
+    assert decoded["gated_delta"].native_call["api"]["entry"] == "RecurrentGatedDeltaRule"
+    assert "prepare" not in decoded["gated_delta"].native_occurrence
+
+
+def test_gdn_chunk_call_batched_occurrence():
+    comp0 = _compiled_qwen_gdn(0)
+    call_id = _eval_qwen_gdn_prefill(0, 2048)["gated_delta"].native_call["call_id"]
     batch = WorkloadGeometry(
         (RequestGeometry(4096, 4096, phase="prefill"),
          RequestGeometry(4096, 4096, phase="prefill")),
         phase="prefill", cohort_batch=2, local_batch=2)
-    batched = {cost.name: cost for cost in compiler.compile(gdn[0]).evaluate(batch).operators}
+    batched = {cost.name: cost for cost in comp0.evaluate(batch).operators}
     batched_call = batched["gated_delta"]
-    assert batched_call.native_call["call_id"] == call["call_id"]
+    assert batched_call.native_call["call_id"] == call_id
     assert batched_call.native_occurrence["typed"]["shapes"]["q"] == [1, 8192, 8, 128]
     assert batched_call.native_occurrence["prepare"]["arguments"]["cu_seqlens"] == [0, 4096, 8192]
     assert batched_call.native_occurrence["prepare"]["descriptors"]["initial_state"]["shape"] == [2, 24, 128, 128]
     batched_third = batched_call.native_occurrence["prepare"]["physical_presentations"][1]["third_transpose"]
     assert batched_third["source_storage_shape"] == [1, 24, 8192]
     assert batched_third["target_storage_shape"] == [1, 8192, 24]
-    decode = WorkloadGeometry((RequestGeometry(1, 1024, phase="decode"),),
-                              phase="decode", cohort_batch=1, local_batch=1)
-    decoded = {cost.name: cost for cost in compiler.compile(gdn[0]).evaluate(decode).operators}
-    assert decoded["gated_delta"].native_call["api"]["entry"] == "RecurrentGatedDeltaRule"
-    assert "prepare" not in decoded["gated_delta"].native_occurrence
 
 
 def test_ordinary_gqa_fia_accepts_one_token_occurrence_shape():
-    case, features = _case(QWEN_GQA, tp=4, dp=1, ep=1, pp=1, cores=64)
-    instantiated = instantiate_model(case.model, features)
+    case, instantiated = _cached_instantiated(
+        QWEN_GQA, (("tp", 4), ("dp", 1), ("ep", 1), ("pp", 1), ("cores", 64))
+    )
     instance = next(item for layer in instantiated.layers for item in layer.subgraphs
                     if item.kind == "gqa_attention")
     geometry = WorkloadGeometry((RequestGeometry(1, 1024, phase="decode"),),
@@ -184,10 +227,7 @@ def test_ordinary_gqa_fia_accepts_one_token_occurrence_shape():
 
 
 def test_fused_mla_prolog_has_one_call_identity_and_one_charge():
-    case, features = _case(GLM, tp=1, dp=16, ep=16, pp=1, cores=64)
-    instantiated = instantiate_model(case.model, features)
-    attention = [item for layer in instantiated.layers for item in layer.subgraphs
-                 if item.kind in LATENT_ATTENTION_KINDS][0]
+    _case_obj, attention, _compiled = _compiled_glm_mla(16)
     contract = next(item for item in attention.template.fusions if item.name == "mla_prolog")
     from mindie_sim.prediction.piecewise.sfa_prolog import port_spec
     theta = {operator.name: operator.theta for operator in attention.operators}
@@ -214,15 +254,12 @@ def test_fused_mla_prolog_has_one_call_identity_and_one_charge():
 
 
 def test_generic_fused_prolog_is_explicitly_unbound():
-    case, features = _case(GLM, tp=1, dp=16, ep=16, pp=1, cores=64)
-    instantiated = instantiate_model(case.model, features)
-    attention = [item for layer in instantiated.layers for item in layer.subgraphs
-                 if item.kind in LATENT_ATTENTION_KINDS][0]
+    case, attention, compiled = _compiled_glm_mla(16)
     contract = next(item for item in attention.template.fusions if item.name == "mla_prolog")
     state = StateView()
     for layer in range(len(case.model.layer_plans)):
         state = state.mark_kv(layer).mark_index(layer).mark_selection(layer)
-    result = evaluate_serial_split(_compiler(case).compile(attention), _prefill(),
+    result = evaluate_serial_split(compiled, _prefill(),
                                    state, fusion=("mla_prolog",))
     fused = next(item.fused for item in result.fusion_results)
     assert fused.native_call is None
@@ -233,13 +270,7 @@ def test_generic_fused_prolog_is_explicitly_unbound():
 
 
 def test_negative_invocation_rejects_wrong_dtype_layout_shape_and_attr():
-    case, features = _case(QWEN, tp=2, dp=4, ep=1, pp=1, cores=64,
-                           token_tile=16, kv_tile=16, moe_row_tile=4,
-                           split_target=1000, max_splits=4)
-    instantiated = instantiate_model(case.model, features)
-    instance = next(item for layer in instantiated.layers for item in layer.subgraphs
-                    if item.kind == "gdn_linear_attn")
-    cost = next(cost for cost in _compiler(case).compile(instance).evaluate(_prefill()).operators
+    cost = next(cost for cost in _compiled_qwen_gdn(0).evaluate(_prefill()).operators
                 if cost.name == "gated_delta")
     typed = cost.native_call["typed"]
     binding = type("Binding", (), {"typed": typed, "call_id": cost.native_call["call_id"]})()
@@ -335,11 +366,7 @@ def test_forecast_coverage_counts_gdn_phases_once():
 
 
 def test_mxfp8_qbmm_o_projection_has_prepare_arguments_and_independent_m():
-    case, features = _case(GLM, tp=1, dp=32, ep=32, pp=1, cores=64)
-    instantiated = instantiate_model(case.model, features)
-    instance = next(item for layer in instantiated.layers for item in layer.subgraphs
-                    if item.kind in LATENT_ATTENTION_KINDS)
-    compiled = _compiler(case).compile(instance, feature_metadata=R64_METADATA)
+    _case_obj, _instance, compiled = _compiled_glm_mla(32, R64_METADATA)
     evaluated = {}
     for m in (1024, 2048, 2):
         costs = {cost.name: cost for cost in compiled.evaluate(_prefill(m)).operators}
@@ -393,7 +420,7 @@ def test_mxfp8_qbmm_o_projection_has_prepare_arguments_and_independent_m():
         assert occurrence["typed"]["shapes"]["x"] == [expected, 16384]
         assert occurrence["typed"]["shapes"]["output"] == [expected, 4096]
         assert occurrence["typed"]["shapes"]["pertoken_scale"] == [expected, 256, 2]
-    r35 = _compiler(case).compile(instance, feature_metadata=R35_METADATA)
+    _, _, r35 = _compiled_glm_mla(32, R35_METADATA)
     r35_values = {m: {cost.name: cost for cost in
                       r35.evaluate(_prefill(m)).operators}["o_projection"]
                   for m in (1024, 1, 2)}
@@ -421,7 +448,7 @@ def test_mxfp8_qbmm_o_projection_has_prepare_arguments_and_independent_m():
         assert occurrence["typed"]["shapes"]["x"] == [expected, 16384]
         assert occurrence["typed"]["shapes"]["output"] == [expected, 4096]
         assert occurrence["prepare"]["shapes"]["pertoken_scale"] == [expected, 256, 2]
-    unknown = _compiler(case).compile(instance, feature_metadata=UNKNOWN_METADATA)
+    _, _, unknown = _compiled_glm_mla(32, UNKNOWN_METADATA)
     unbound = {cost.name: cost for cost in unknown.evaluate(_prefill(1024)).operators}["o_projection"]
     assert unbound.native_call["api"]["entry"] is None
     assert unbound.native_call["source"] is None
@@ -434,11 +461,7 @@ def test_mxfp8_qbmm_o_projection_has_prepare_arguments_and_independent_m():
 
 
 def test_prepared_qbmm_invocation_plan_validates_r64_occurrence_without_npu():
-    case, features = _case(GLM, tp=1, dp=32, ep=32, pp=1, cores=64)
-    instantiated = instantiate_model(case.model, features)
-    instance = next(item for layer in instantiated.layers for item in layer.subgraphs
-                    if item.kind in LATENT_ATTENTION_KINDS)
-    compiled = _compiler(case).compile(instance, feature_metadata=R64_METADATA)
+    _, _, compiled = _compiled_glm_mla(32, R64_METADATA)
     cost = {item.name: item for item in compiled.evaluate(_prefill(1024)).operators}["o_projection"]
     occurrence = {**cost.native_occurrence, "native_call": cost.native_call}
     plan = prepared_qbmm_plan(occurrence)

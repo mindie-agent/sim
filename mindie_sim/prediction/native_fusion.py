@@ -473,9 +473,10 @@ def _ordered(ops):
 
 def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
     """Apply the one optional resource projection after normal semantic lowering."""
-    from .implementations import (add_input_ports, consumer_value_uses,
-                                  external_value_plan, input_ports,
-                                  produced_values, select, set_input_ports)
+    from .implementations import (add_input_ports, consumer_index,
+                                  consumer_value_uses, external_value_plan,
+                                  input_ports, produced_values, select,
+                                  set_input_ports)
 
     selection = select(runtime.kernels.get("lowerings", {}), "native_fusion")
     if selection is None:
@@ -517,7 +518,9 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             values_by_id[op.op_id] = ()
     aliases, replacements, matched_roles = {}, {}, set()
     port_map, primary_ports, value_port_map = {}, {}, {}
-    for declaration, members in _groups(original):
+    consumer_map = consumer_index(original)
+    groups = list(_groups(original))
+    for declaration, members in groups:
         if declaration["role"] not in roles:
             continue
         view = declaration.get("tensor_view", {})
@@ -572,7 +575,8 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
                 "multi_launch_stage_unknown", "native_boundary_unverified"}:
             raise ModelingError("native_fusion_requires_complete_single_kernel")
         external = external_value_plan(original, members, values_by_id,
-                                       public_outputs=public_outputs)
+                                       public_outputs=public_outputs,
+                                       consumer_map=consumer_map)
         legacy_outputs = [member.op_id for member in members
                           if users[member.op_id] - ids
                           or not users[member.op_id] & ids]
@@ -785,10 +789,12 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             or dict(op.metadata).get("structure_model_scope") == "draft"
             or op.op_id.startswith("draft.")
             for op in original):
-        if not any(d["role"] in {"hc_pre", "hc_post"} for d, _ in _groups(original)):
+        if not any(d["role"] in {"hc_pre", "hc_post"} for d, _ in groups):
             required_roles = required_roles - {"hc_pre", "hc_post"}
     realized_rows = None
     for op in original:
+        if not any(k in {"routing_realization", "source_token_mask"} for k, _ in op.metadata):
+            continue
         metadata = dict(op.metadata)
         record = metadata.get("routing_realization", metadata.get("source_token_mask"))
         if isinstance(record, Mapping) and "rows" in record:

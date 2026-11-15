@@ -17,10 +17,12 @@ from collections.abc import Mapping
 from dataclasses import asdict, replace
 from hashlib import sha256
 import json
+import math
 from pathlib import Path
 import sys
 from types import SimpleNamespace
 
+from .prediction.implementations import produced_values
 from .prediction.operator_analysis import target_graphs
 from .prediction.native_binding import (
     bind_native_call, coverage_from_records, member_physical_view,
@@ -84,6 +86,24 @@ def _intern_tree(value):
 
 
 def _json_value(value):
+    t = type(value)
+    if t is str:
+        return sys.intern(value)
+    if value is None or t is int or t is bool:
+        return value
+    if t is float:
+        if not math.isfinite(value):
+            raise ValueError("Out of range float values are not JSON compliant")
+        return value
+    if t is list or t is tuple:
+        return [_json_value(item) for item in value]
+    if t is dict:
+        out = {}
+        for key, item in value.items():
+            if type(key) is not str:
+                return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
+            out[sys.intern(key)] = _json_value(item)
+        return out
     return _intern_tree(json.loads(json.dumps(value, allow_nan=False)))
 
 
@@ -151,12 +171,11 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
     node_id = _node_id(replica, op.op_id)
     full_operator = op.to_dict(include_work=False)
     structural_op = _without_native_call_evidence(op)
-    operator = structural_op.to_dict(include_work=False)
+    operator = full_operator if structural_op is op else structural_op.to_dict(include_work=False)
     contract = predicted_contract(operator)
     outputs_by_id = {} if outputs_by_id is None else outputs_by_id
     metadata_by_id = {} if metadata_by_id is None else metadata_by_id
     try:
-        from .prediction.implementations import produced_values
         produced = tuple(produced_values(op))
     except (KeyError, ValueError, TypeError):
         # A producer helper may refuse an unsupported declaration.  The
@@ -171,13 +190,20 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
     metadata_by_id[op.op_id] = dict(op.metadata)
     meta = dict(op.metadata)
     semantic = meta.get("semantic_metadata", {})
-    if shared_call is not None:
-        # A fused member keeps the parent call identity and forwards only its
-        # own existing plan work as a view; it never becomes a second charge.
-        binding = member_physical_view(shared_call, plan, op if plan is not None else None)
-    else:
-        binding = bind_native_call(op, contract=contract, plan=plan,
-                                   prepared=op if plan is not None else None)
+    binding = None
+    if native_sink is not None or any(
+        k in meta for k in (
+            "native_call", "native_call_binding", "native_api",
+            "aclnn_symbol", "execution_core", "invocation_class",
+        )
+    ):
+        if shared_call is not None:
+            # A fused member keeps the parent call identity and forwards only its
+            # own existing plan work as a view; it never becomes a second charge.
+            binding = member_physical_view(shared_call, plan, op if plan is not None else None)
+        else:
+            binding = bind_native_call(op, contract=contract, plan=plan,
+                                       prepared=op if plan is not None else None)
 
     payload = {
         "node_id": node_id,
@@ -200,7 +226,7 @@ def _node(op, replica, *, source_call=None, block=None, role=None, structure=Non
         "native_execution": structure_record["native_execution"],
         "representation_gaps": structure_record["gaps"],
         "implementation": native_implementation(operator, contract) or {},
-        **node_physical(structural_op, recipe_bindings=kernels),
+        **node_physical(structural_op, recipe_bindings=kernels, book=book),
         "physical_work_basis": ("prepared_source_plan" if geometry is not None else
                                 "source_declaration_without_resource_geometry")
                                if op.source_boundary == "kernel" else "operator_declaration",
@@ -252,7 +278,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     book = RecipeBook.from_mapping(kernels or {})
     resource_geometries = resource_geometries or {}
     nodes, source_calls, external = [], [], set()
-    native_calls = []
+    native_calls = [] if native_evidence else None
     declarations, entry_dependencies, memberships = {}, defaultdict(set), defaultdict(set)
     for replica, operators in sorted(graphs.items()):
         outputs_by_id, metadata_by_id = {}, {}
@@ -275,7 +301,16 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
             parent = _node_id(replica, op.op_id) if is_expanded else None
             # One shared actual-call descriptor for a fused source call: every
             # declared child kernel keeps this same call_id and one timing owner.
-            call_binding = bind_native_call(op, children=expanded) if is_expanded else None
+            call_binding = (
+                bind_native_call(op, children=expanded)
+                if is_expanded and (native_evidence or any(
+                    k in meta for k in (
+                        "native_call", "native_call_binding", "native_api",
+                        "aclnn_symbol", "execution_core", "invocation_class",
+                    )
+                ))
+                else None
+            )
             if is_expanded:
                 source_calls.append(_json_value({
                     "node_id": parent,
@@ -316,6 +351,11 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     resource_operators = []
     if resource_graphs is not None:
         groups = {group["subgraph_id"]: group for group in subgraphs}
+        subgraph_member_sets = {id(other): set(other["node_ids"]) for other in subgraphs}
+        subgraphs_by_first_member = defaultdict(list)
+        for other in subgraphs:
+            if other["node_ids"]:
+                subgraphs_by_first_member[other["node_ids"][0]].append(other)
         for replica, operators in sorted(resource_graphs.items()):
             outputs_by_id, metadata_by_id = {}, {}
             for op in operators:
@@ -401,10 +441,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
                 for member in members:
                     by_id[member].update(event_matchable=False, resource_boundary=internal,
                                          native_execution=covered)
-                for other in subgraphs:
-                    if other is not group and set(other["node_ids"]) <= members:
-                        other.update(event_matchable=False, resource_boundary=internal,
-                                     native_execution=covered)
+                    for other in subgraphs_by_first_member.get(member, ()):
+                        if other is not group and subgraph_member_sets[id(other)] <= members:
+                            other.update(event_matchable=False, resource_boundary=internal,
+                                         native_execution=covered)
     # Normalize each owned record separately. A whole-payload JSON round trip
     # retained the DAG, its encoded string and a second DAG at the same time.
     payload = {
@@ -421,13 +461,14 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         "resource_operators": resource_operators,
         "external_inputs": sorted(external),
     }
-    digest = sha256()
-    encoder = json.JSONEncoder(sort_keys=True, separators=(",", ":"), allow_nan=False)
-    for chunk in encoder.iterencode(payload):
-        digest.update(chunk.encode("utf-8"))
+    encoded_payload = json.dumps(
+        payload, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
+    digest_hex = sha256(encoded_payload).hexdigest()
+    del encoded_payload
     report = {
         **payload,
-        "graph_id": "sha256:" + digest.hexdigest(),
+        "graph_id": "sha256:" + digest_hex,
         "source": _json_value(source),
     }
     if native_evidence:

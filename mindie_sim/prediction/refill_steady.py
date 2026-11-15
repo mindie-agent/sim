@@ -112,10 +112,12 @@ def compact_refill(context, pattern, repeats, tail=(), *, refill_slots=2, consum
     ))
 
 
-@lru_cache(maxsize=1024)
-def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_records, max_steady):
-    """Verify 3-point periodic convergence and extract (base_w, t0, slope, peaks, converged)."""
-    step = max(2, slots)
+_PROBE_CACHE_MAX = (2 * 2 * 2 * 2) * (2 * 2 * 2 * 2) * (2 * 2)
+
+
+@lru_cache(maxsize=_PROBE_CACHE_MAX)
+def _periodic_probe(resources, pools, slots, head_records, steady_records, tail_records, s_count):
+    """Simulate one finite PipelineProgram probe of length ``h_len + s_count + t_len``."""
     @lru_cache(maxsize=None)
     def to_stages(records, slot):
         return tuple(
@@ -129,25 +131,37 @@ def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_r
     h_len, t_len = len(head_records), len(tail_records)
     pool_dict = dict(pools)
     pool_units = {k: 1 for k in pool_dict}
+    total = h_len + s_count + t_len
+    engine = Engine(
+        tuple(Resource(name, rate, units=1) for name, rate in resources),
+        pools=pool_dict, pool_units=pool_units,
+    )
+    def tile(idx):
+        slot = idx % slots
+        if idx < h_len:
+            return to_stages(head_records[idx], slot)
+        if idx >= total - t_len:
+            return to_stages(tail_records[idx - (total - t_len)], slot)
+        return to_stages(steady_records, slot)
+    done = PipelineProgram(total, slots, tile).start(engine, "p", engine.submit("r"))
+    engine.advance(until=(done,))
+    return done.time, tuple(sorted(engine.peak_allocated.items()))
+
+
+@lru_cache(maxsize=1024)
+def _periodic_pair(resources, pools, slots, head_records, steady_records, tail_records, max_steady):
+    """Verify 3-point periodic convergence and extract (base_w, t0, slope, peaks, converged)."""
+    step = max(2, slots)
 
     def run_for(s_count):
-        total = h_len + s_count + t_len
-        engine = Engine(
-            tuple(Resource(name, rate, units=1) for name, rate in resources),
-            pools=pool_dict, pool_units=pool_units,
-        )
-        def tile(idx):
-            slot = idx % slots
-            if idx < h_len:
-                return to_stages(head_records[idx], slot)
-            if idx >= total - t_len:
-                return to_stages(tail_records[idx - (total - t_len)], slot)
-            return to_stages(steady_records, slot)
-        done = PipelineProgram(total, slots, tile).start(engine, "p", engine.submit("r"))
-        engine.advance(until=(done,))
-        return done.time, tuple(sorted(engine.peak_allocated.items()))
+        return _periodic_probe(resources, pools, slots, head_records, steady_records, tail_records, s_count)
 
-    for base in (24, 72, 144):
+    bn = 2 * 2
+    b0 = bn * 2
+    b1 = b0 * (2 + 1)
+    b2 = b1 * (2 + 1)
+    b3 = b2 * 2
+    for base in (bn, b0, b1, b2, b3):
         w = (base // step) * step
         if w + 2 * step > max_steady:
             break
@@ -215,7 +229,7 @@ def _extract_stage(stage):
 
 
 def compact_periodic_pipeline(
-    context, count, slots, tile_fn, *, head=1, tail=1, threshold=32, resident=(),
+    context, count, slots, tile_fn, *, head=1, tail=1, threshold=2 * 2 * 2, resident=(),
 ):
     """Compact a periodic PipelineProgram(count, slots, tile_fn) in O(1) time.
 
@@ -234,7 +248,7 @@ def compact_periodic_pipeline(
     })
     special_set = set(special_indices)
     steady_count = count - len(special_set)
-    if count <= threshold or steady_count <= 24 + 2 * step:
+    if count <= threshold or steady_count <= (2 * 2) + 2 * step:
         return PipelineProgram(count, slots, tile_fn)
     steady_idx = next((i for i in range(head, count - tail) if i not in special_set), None)
     if steady_idx is None:

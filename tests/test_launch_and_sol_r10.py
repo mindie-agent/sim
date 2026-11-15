@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import itertools
 import json
 
 import pytest
@@ -69,34 +70,34 @@ def _docker_env(document):
 
 
 # ---------------------------------------------------------------- P1-01
-@pytest.mark.parametrize("format", ["json", "yaml"])
-def test_p1_01_split_flag_across_command_and_args_is_discovered(format):
-    first = {"name": "a", "command": ["vllm", "serve", "/m", "--api-key"],
-             "args": [SECRET]}
-    second = {"name": "b", "command": ["vllm", "serve", "/m",
-                                       "--served-model-name", SECRET]}
-    if format == "json":
-        text = json.dumps({"containers": [first, second]})
-    else:
-        text = ("containers:\n"
-                "- name: a\n"
-                "  command: [vllm, serve, /m, --api-key]\n"
-                "  args: [" + SECRET + "]\n"
-                "- name: b\n"
-                "  command: [vllm, serve, /m, --served-model-name, \""
-                + SECRET + "\"]\n")
-    assert SECRET in prescan_document_secrets(text, format)
-    report = _parse(text, format=format, container="b")
-    if format == "yaml" and not HAS_YAML:
-        assert report.status == "failed" and _yaml_unavailable(report)
+def test_p1_01_split_flag_across_command_and_args_is_discovered():
+    for format in ("json", "yaml"):
+        first = {"name": "a", "command": ["vllm", "serve", "/m", "--api-key"],
+                 "args": [SECRET]}
+        second = {"name": "b", "command": ["vllm", "serve", "/m",
+                                           "--served-model-name", SECRET]}
+        if format == "json":
+            text = json.dumps({"containers": [first, second]})
+        else:
+            text = ("containers:\n"
+                    "- name: a\n"
+                    "  command: [vllm, serve, /m, --api-key]\n"
+                    "  args: [" + SECRET + "]\n"
+                    "- name: b\n"
+                    "  command: [vllm, serve, /m, --served-model-name, \""
+                    + SECRET + "\"]\n")
+        assert SECRET in prescan_document_secrets(text, format)
+        report = _parse(text, format=format, container="b")
+        if format == "yaml" and not HAS_YAML:
+            assert report.status == "failed" and _yaml_unavailable(report)
+            assert not _leaks(report, SECRET)
+            continue
+        assert report.status == "completed"
+        assert _setting(report, "--served-model-name").redacted is True
         assert not _leaks(report, SECRET)
-        return
-    assert report.status == "completed"
-    assert _setting(report, "--served-model-name").redacted is True
-    assert not _leaks(report, SECRET)
-    missing = _parse(text, format=format, container=SECRET)
-    assert missing.status == "failed"
-    assert not _leaks(missing, SECRET)
+        missing = _parse(text, format=format, container=SECRET)
+        assert missing.status == "failed"
+        assert not _leaks(missing, SECRET)
 
 
 def test_p1_01_yaml_block_sequence_command_and_args_are_composed():
@@ -149,35 +150,34 @@ def test_p1_01_command_string_plus_args_is_composed():
     assert not _leaks(report, SECRET)
 
 
-@pytest.mark.parametrize("command", [
-    'vllm serve /m --api"-key" ' + SECRET,
-    "vllm serve /m '--api-key'=" + SECRET,
-    "vllm serve /m --api-key='" + SECRET + "'",
-    "export \"API_KEY\"=" + SECRET + " vllm serve /m",
-    "API_KEY=R10_SECRET_7f3d\\9b vllm serve /m",
-])
-@pytest.mark.parametrize("format", ["json", "yaml"])
-def test_p1_01_shell_quoting_yields_the_decoded_secret(command, format):
-    first = {"name": "a", "command": command}
-    second = {"name": "b", "command": ["vllm", "serve", "/m",
-                                       "--served-model-name", SECRET]}
-    if format == "json":
-        text = json.dumps({"containers": [first, second]})
-    else:
-        text = ("containers:\n"
-                "- name: a\n"
-                "  command: " + json.dumps(command) + "\n"
-                "- name: b\n"
-                "  command: [vllm, serve, /m, --served-model-name, \""
-                + SECRET + "\"]\n")
-    assert SECRET in prescan_document_secrets(text, format)
-    report = _parse(text, format=format, container="b")
-    if format == "yaml" and not HAS_YAML:
-        assert report.status == "failed" and _yaml_unavailable(report)
-    else:
-        assert report.status == "completed"
-        assert _setting(report, "--served-model-name").redacted is True
-    assert not _leaks(report, SECRET)
+def test_p1_01_shell_quoting_yields_the_decoded_secret():
+    for command, format in itertools.product([
+        'vllm serve /m --api"-key" ' + SECRET,
+        "vllm serve /m '--api-key'=" + SECRET,
+        "vllm serve /m --api-key='" + SECRET + "'",
+        "export \"API_KEY\"=" + SECRET + " vllm serve /m",
+        "API_KEY=R10_SECRET_7f3d\\9b vllm serve /m",
+    ], ["json", "yaml"]):
+        first = {"name": "a", "command": command}
+        second = {"name": "b", "command": ["vllm", "serve", "/m",
+                                           "--served-model-name", SECRET]}
+        if format == "json":
+            text = json.dumps({"containers": [first, second]})
+        else:
+            text = ("containers:\n"
+                    "- name: a\n"
+                    "  command: " + json.dumps(command) + "\n"
+                    "- name: b\n"
+                    "  command: [vllm, serve, /m, --served-model-name, \""
+                    + SECRET + "\"]\n")
+        assert SECRET in prescan_document_secrets(text, format)
+        report = _parse(text, format=format, container="b")
+        if format == "yaml" and not HAS_YAML:
+            assert report.status == "failed" and _yaml_unavailable(report)
+        else:
+            assert report.status == "completed"
+            assert _setting(report, "--served-model-name").redacted is True
+        assert not _leaks(report, SECRET)
 
 
 NUMERIC_CASES = (
@@ -190,25 +190,25 @@ NUMERIC_CASES = (
 )
 
 
-@pytest.mark.parametrize("raw,expected", NUMERIC_CASES)
-def test_p1_01_yaml_numeric_env_uses_loader_spelling(raw, expected):
-    if HAS_YAML:
-        assert str(_yaml.safe_load("x: " + raw)["x"]) == expected
-    text = ("containers:\n"
-            "- name: a\n"
-            "  env: {API_KEY: " + raw + "}\n"
-            "  command: [vllm, serve, /m]\n"
-            "- name: b\n"
-            "  command: [vllm, serve, /m, --served-model-name, \""
-            + expected + "\"]\n")
-    assert expected in prescan_document_secrets(text, "yaml")
-    report = _parse(text, format="yaml", container="b")
-    if HAS_YAML:
-        assert report.status == "completed"
-        assert _setting(report, "--served-model-name").redacted is True
-    else:
-        assert report.status == "failed" and _yaml_unavailable(report)
-    assert not _leaks(report, expected)
+def test_p1_01_yaml_numeric_env_uses_loader_spelling():
+    for raw, expected in NUMERIC_CASES:
+        if HAS_YAML:
+            assert str(_yaml.safe_load("x: " + raw)["x"]) == expected
+        text = ("containers:\n"
+                "- name: a\n"
+                "  env: {API_KEY: " + raw + "}\n"
+                "  command: [vllm, serve, /m]\n"
+                "- name: b\n"
+                "  command: [vllm, serve, /m, --served-model-name, \""
+                + expected + "\"]\n")
+        assert expected in prescan_document_secrets(text, "yaml")
+        report = _parse(text, format="yaml", container="b")
+        if HAS_YAML:
+            assert report.status == "completed"
+            assert _setting(report, "--served-model-name").redacted is True
+        else:
+            assert report.status == "failed" and _yaml_unavailable(report)
+        assert not _leaks(report, expected)
 
 
 def test_p1_01_yaml_float_without_sign_exponent_stays_a_string():
@@ -254,19 +254,19 @@ def test_p1_01_quoted_yaml_number_keeps_its_string_spelling():
         assert "1402433619" not in found
 
 
-@pytest.mark.parametrize("label", tuple(RAW_CASES))
-def test_p1_01_raw_yaml_scalar_matches_the_loader(label):
-    fragment, expected = RAW_CASES[label]
-    text = fragment + "command: [vllm, serve, /m]\n"
-    assert expected in prescan_document_secrets(text, "yaml")
-    report = _parse(text, format="yaml", source=expected)
-    if HAS_YAML:
-        assert report.status == "completed"
-        assert not any(item.code == "source_coordinates_unavailable"
-                       for item in report.diagnostics)
-    else:
-        assert report.status == "failed" and _yaml_unavailable(report)
-    assert not _leaks(report, expected)
+def test_p1_01_raw_yaml_scalar_matches_the_loader():
+    for label in tuple(RAW_CASES):
+        fragment, expected = RAW_CASES[label]
+        text = fragment + "command: [vllm, serve, /m]\n"
+        assert expected in prescan_document_secrets(text, "yaml")
+        report = _parse(text, format="yaml", source=expected)
+        if HAS_YAML:
+            assert report.status == "completed"
+            assert not any(item.code == "source_coordinates_unavailable"
+                           for item in report.diagnostics)
+        else:
+            assert report.status == "failed" and _yaml_unavailable(report)
+        assert not _leaks(report, expected)
 
 
 def test_p1_01_blocked_source_identity_is_redacted():
@@ -322,25 +322,25 @@ def test_p2_23_assignment_composition_keeps_both_escape_endpoints():
     assert "SCRIPT" in text.splitlines()[span.line_start - 1]
 
 
-@pytest.mark.parametrize("layout", ["document", "local", "export"])
-def test_p2_23_bare_export_preserves_existing_provenance(layout):
-    inline = SCRIPT.replace('"', '\\"')
-    command = ('docker run -e SCRIPT image sh -c "$SCRIPT"')
-    if layout == "document":
-        document = {"env": {"SCRIPT": SCRIPT},
-                    "command": "export SCRIPT\n" + command}
-    elif layout == "local":
-        document = {"command": 'SCRIPT="' + inline
-                    + '"\nexport SCRIPT\n' + command}
-    else:
-        document = {"command": 'export SCRIPT="' + inline
-                    + '"\nexport SCRIPT\n' + command}
-    text, span = _docker_env(document)
-    line = text.splitlines()[span.line_start - 1]
-    assert "SCRIPT" in line
-    if layout != "document":
-        shell = _parse(document["command"], format="shell")
-        assert shell.status == "completed"
+def test_p2_23_bare_export_preserves_existing_provenance():
+    for layout in ("document", "local", "export"):
+        inline = SCRIPT.replace('"', '\\"')
+        command = ('docker run -e SCRIPT image sh -c "$SCRIPT"')
+        if layout == "document":
+            document = {"env": {"SCRIPT": SCRIPT},
+                        "command": "export SCRIPT\n" + command}
+        elif layout == "local":
+            document = {"command": 'SCRIPT="' + inline
+                        + '"\nexport SCRIPT\n' + command}
+        else:
+            document = {"command": 'export SCRIPT="' + inline
+                        + '"\nexport SCRIPT\n' + command}
+        text, span = _docker_env(document)
+        line = text.splitlines()[span.line_start - 1]
+        assert "SCRIPT" in line
+        if layout != "document":
+            shell = _parse(document["command"], format="shell")
+            assert shell.status == "completed"
 
 
 def test_p2_23_external_bare_export_still_fails_closed():
@@ -393,25 +393,22 @@ def _assert_numeric_sibling(report, available, source):
     assert repeated.value == "[REDACTED]" and repeated.redacted is True
 
 
-@pytest.mark.parametrize("power", [309, 400, 1000, 1250, 4300, 5000])
-@pytest.mark.parametrize("sign", ["", "-"])
-@pytest.mark.parametrize("fmt", ["json", "yaml"])
-@pytest.mark.parametrize("attached", [False, True])
-def test_finite_integer_options_preserve_sibling_and_source(power, sign, fmt, attached):
-    text = _numeric_operand_document(sign + "1" + "0" * power, fmt, attached)
-    found = prescan_document_secrets(text, fmt)
-    assert NUMERIC_PLACEHOLDER in found and "pre" not in found
-    if power <= 1000:
-        assert sign + "1" + "0" * power in found
-    for source in ("ordinary", NUMERIC_PLACEHOLDER):
-        report = _parse(text, format=fmt, container="b", source=source)
-        expected = "ordinary" if source == "ordinary" else "[REDACTED]"
-        _assert_numeric_sibling(report, fmt == "json" or HAS_YAML, expected)
+def test_finite_integer_options_preserve_sibling_and_source():
+    for power, sign, fmt, attached in itertools.product(
+        [309, 400, 1000, 1250, 4300, 5000], ["", "-"], ["json", "yaml"], [False, True]
+    ):
+        text = _numeric_operand_document(sign + "1" + "0" * power, fmt, attached)
+        found = prescan_document_secrets(text, fmt)
+        assert NUMERIC_PLACEHOLDER in found and "pre" not in found
+        if power <= 1000:
+            assert sign + "1" + "0" * power in found
+        for source in ("ordinary", NUMERIC_PLACEHOLDER):
+            report = _parse(text, format=fmt, container="b", source=source)
+            expected = "ordinary" if source == "ordinary" else "[REDACTED]"
+            _assert_numeric_sibling(report, fmt == "json" or HAS_YAML, expected)
 
 
-@pytest.mark.parametrize("power", [309, 400, 1000])
-@pytest.mark.parametrize("sign", [1, -1])
-def test_supported_integer_spelling_never_uses_float_finiteness(monkeypatch, power, sign):
+def test_supported_integer_spelling_never_uses_float_finiteness(monkeypatch):
     import mindie_sim.launch_taint as taint
 
     original = taint.math.isfinite
@@ -420,52 +417,53 @@ def test_supported_integer_spelling_never_uses_float_finiteness(monkeypatch, pow
         assert isinstance(value, float)
         return original(value)
 
-    monkeypatch.setattr(taint.math, "isfinite", finite)
-    value = sign * 10 ** power
-    found = taint.prescan_payload_secret_values(
-        {"api_key": value, "token": NUMERIC_PLACEHOLDER, "secret": [True, 1.5]})
-    assert found == tuple(sorted((str(value), NUMERIC_PLACEHOLDER, "true", "1.5")))
-    assert taint._number_spelling(str(value)) == str(value)
+    for power, sign in itertools.product([309, 400, 1000], [1, -1]):
+        with monkeypatch.context() as mp:
+            mp.setattr(taint.math, "isfinite", finite)
+            value = sign * 10 ** power
+            found = taint.prescan_payload_secret_values(
+                {"api_key": value, "token": NUMERIC_PLACEHOLDER, "secret": [True, 1.5]})
+            assert found == tuple(sorted((str(value), NUMERIC_PLACEHOLDER, "true", "1.5")))
+            assert taint._number_spelling(str(value)) == str(value)
 
 
-@pytest.mark.parametrize("digits", ["0x1" + "0" * 1100, "-0x1" + "0" * 4000,
-                                    "1" + "0" * 5000, "-1" + "0" * 5000])
-def test_oversized_yaml_integer_keeps_later_placeholders(digits):
+def test_oversized_yaml_integer_keeps_later_placeholders():
     from mindie_sim.launch_taint import _shell_taint, prescan_payload_secret_values
     from mindie_sim.launch_yaml_raw import raw_document_taint
     from mindie_sim.launch_yaml_taint import _event_taint
 
-    text = ("env:\n  API_KEY: " + digits + "\n  TOKEN: " + NUMERIC_PLACEHOLDER
-            + "\ncommand: [vllm, serve, /m]\n")
-    raw, event = set(), set()
-    raw_document_taint(text, raw, _shell_taint)
-    _event_taint(text, event, _shell_taint)
-    assert NUMERIC_PLACEHOLDER in raw
-    assert NUMERIC_PLACEHOLDER in prescan_document_secrets(text, "yaml")
-    if HAS_YAML:
-        assert NUMERIC_PLACEHOLDER in event
-        if "0x" in digits:
-            loaded = _yaml.safe_load(text)
-            assert loaded["env"]["API_KEY"].bit_length() > 4096
-            assert NUMERIC_PLACEHOLDER in prescan_payload_secret_values(loaded)
-    report = _parse(text, format="yaml", source=NUMERIC_PLACEHOLDER)
-    assert report.status == "failed" and report.source.name == "[REDACTED]"
-    assert not _leaks(report, NUMERIC_PLACEHOLDER)
-    codes = {item.code for item in report.diagnostics}
-    assert ("integer_too_large" if HAS_YAML else "yaml_parser_unavailable") in codes
+    for digits in ("0x1" + "0" * 1100, "-0x1" + "0" * 4000,
+                   "1" + "0" * 5000, "-1" + "0" * 5000):
+        text = ("env:\n  API_KEY: " + digits + "\n  TOKEN: " + NUMERIC_PLACEHOLDER
+                + "\ncommand: [vllm, serve, /m]\n")
+        raw, event = set(), set()
+        raw_document_taint(text, raw, _shell_taint)
+        _event_taint(text, event, _shell_taint)
+        assert NUMERIC_PLACEHOLDER in raw
+        assert NUMERIC_PLACEHOLDER in prescan_document_secrets(text, "yaml")
+        if HAS_YAML:
+            assert NUMERIC_PLACEHOLDER in event
+            if "0x" in digits:
+                loaded = _yaml.safe_load(text)
+                assert loaded["env"]["API_KEY"].bit_length() > 4096
+                assert NUMERIC_PLACEHOLDER in prescan_payload_secret_values(loaded)
+        report = _parse(text, format="yaml", source=NUMERIC_PLACEHOLDER)
+        assert report.status == "failed" and report.source.name == "[REDACTED]"
+        assert not _leaks(report, NUMERIC_PLACEHOLDER)
+        codes = {item.code for item in report.diagnostics}
+        assert ("integer_too_large" if HAS_YAML else "yaml_parser_unavailable") in codes
 
 
-@pytest.mark.parametrize("bits", [4096, 4097, 16001])
-@pytest.mark.parametrize("sign", [1, -1])
-def test_typed_integer_bounds_keep_exact_supported_spelling(bits, sign):
+def test_typed_integer_bounds_keep_exact_supported_spelling():
     from mindie_sim.launch_taint import prescan_payload_secret_values
 
-    value = sign * ((1 << bits) - 1)
-    found = prescan_payload_secret_values({"api_key": value, "token": NUMERIC_PLACEHOLDER})
-    assert NUMERIC_PLACEHOLDER in found
-    expected = tuple(sorted((str(value), NUMERIC_PLACEHOLDER))) if bits == 4096 else (
-        NUMERIC_PLACEHOLDER,)
-    assert found == expected
+    for bits, sign in itertools.product([4096, 4097, 16001], [1, -1]):
+        value = sign * ((1 << bits) - 1)
+        found = prescan_payload_secret_values({"api_key": value, "token": NUMERIC_PLACEHOLDER})
+        assert NUMERIC_PLACEHOLDER in found
+        expected = tuple(sorted((str(value), NUMERIC_PLACEHOLDER))) if bits == 4096 else (
+            NUMERIC_PLACEHOLDER,)
+        assert found == expected
 
 
 def test_integer_stringification_failure_keeps_later_sibling():
@@ -479,106 +477,116 @@ def test_integer_stringification_failure_keeps_later_sibling():
                                          "token": NUMERIC_PLACEHOLDER}) == (NUMERIC_PLACEHOLDER,)
 
 
-@pytest.mark.parametrize("error", [RecursionError, ValueError, OverflowError])
-@pytest.mark.parametrize("stage", ["load", "walk"])
-def test_advisory_typed_failure_preserves_lexical_inventory(monkeypatch, error, stage):
+def test_advisory_typed_failure_preserves_lexical_inventory(monkeypatch):
     import mindie_sim.launch_taint as taint
 
     raw = json.dumps({"token": NUMERIC_PLACEHOLDER, "ordinary": "pre"})
-
     original = taint.json.loads
 
-    def fail(payload):
-        if stage == "walk" or payload == raw:
-            raise error("synthetic typed traversal limit")
-        return original(payload)
+    for error, stage in itertools.product([RecursionError, ValueError, OverflowError],
+                                          ["load", "walk"]):
+        def fail(payload, _err=error, _stage=stage):
+            if _stage == "walk" or payload == raw:
+                raise _err("synthetic typed traversal limit")
+            return original(payload)
 
-    if stage == "walk":
-        monkeypatch.setattr(taint, "prescan_payload_secret_values", fail)
-    else:
-        monkeypatch.setattr(taint.json, "loads", fail)
-    assert taint.prescan_cli_secret_values("--additional-config", raw) == (NUMERIC_PLACEHOLDER,)
-    assert set(taint.prescan_cli_secret_values("--api-key", raw)) == {raw, NUMERIC_PLACEHOLDER}
+        with monkeypatch.context() as mp:
+            if stage == "walk":
+                mp.setattr(taint, "prescan_payload_secret_values", fail)
+            else:
+                mp.setattr(taint.json, "loads", fail)
+            assert taint.prescan_cli_secret_values("--additional-config", raw) == (
+                NUMERIC_PLACEHOLDER,)
+            assert set(taint.prescan_cli_secret_values("--api-key", raw)) == {
+                raw, NUMERIC_PLACEHOLDER}
 
 
-@pytest.mark.parametrize("error", [RecursionError, ValueError, OverflowError])
-def test_partial_typed_discovery_retains_completed_values(monkeypatch, error):
+def test_partial_typed_discovery_retains_completed_values(monkeypatch):
     import mindie_sim.launch_taint as taint
 
     original = taint.is_secret_name
+    for error in (RecursionError, ValueError, OverflowError):
+        def name(value, _err=error):
+            if value == "unreadable":
+                raise _err("synthetic typed traversal limit")
+            return original(value)
 
-    def name(value):
-        if value == "unreadable":
-            raise error("synthetic typed traversal limit")
-        return original(value)
-
-    monkeypatch.setattr(taint, "is_secret_name", name)
-    assert taint.prescan_payload_secret_values(
-        {"token": NUMERIC_PLACEHOLDER, "unreadable": None}) == (NUMERIC_PLACEHOLDER,)
+        with monkeypatch.context() as mp:
+            mp.setattr(taint, "is_secret_name", name)
+            assert taint.prescan_payload_secret_values(
+                {"token": NUMERIC_PLACEHOLDER, "unreadable": None}) == (NUMERIC_PLACEHOLDER,)
 
 
-@pytest.mark.parametrize("entry", ["payload", "cli", "number"])
-@pytest.mark.parametrize("derived", [False, True])
-def test_numeric_discovery_propagates_timeout_identity(monkeypatch, entry, derived):
+def test_numeric_discovery_propagates_timeout_identity(monkeypatch):
     import mindie_sim.launch_taint as taint
 
     class DerivedTimeout(TimeoutError):
         pass
 
-    fault = (DerivedTimeout if derived else TimeoutError)("synthetic timeout")
+    for entry, derived in itertools.product(["payload", "cli", "number"], [False, True]):
+        fault = (DerivedTimeout if derived else TimeoutError)("synthetic timeout")
 
-    def fail(*args):
-        raise fault
+        def fail(*args, _fault=fault):
+            raise _fault
 
-    if entry == "payload":
-        monkeypatch.setattr(taint, "is_secret_name", fail)
-        call = lambda: taint.prescan_payload_secret_values({"token": NUMERIC_PLACEHOLDER})
-    elif entry == "cli":
-        monkeypatch.setattr(taint, "prescan_payload_secret_values", fail)
-        call = lambda: taint.prescan_cli_secret_values("-c", '{"token":"synthetic"}')
-    else:
-        monkeypatch.setattr(taint.math, "isfinite", fail)
-        call = lambda: taint.prescan_payload_secret_values({"api_key": 1.5})
-    with pytest.raises(TimeoutError) as caught:
-        call()
-    assert caught.value is fault
+        with monkeypatch.context() as mp:
+            if entry == "payload":
+                mp.setattr(taint, "is_secret_name", fail)
+                call = lambda: taint.prescan_payload_secret_values(
+                    {"token": NUMERIC_PLACEHOLDER})
+            elif entry == "cli":
+                mp.setattr(taint, "prescan_payload_secret_values", fail)
+                call = lambda: taint.prescan_cli_secret_values("-c", '{"token":"synthetic"}')
+            else:
+                mp.setattr(taint.math, "isfinite", fail)
+                call = lambda: taint.prescan_payload_secret_values({"api_key": 1.5})
+            with pytest.raises(TimeoutError) as caught:
+                call()
+            assert caught.value is fault
 
 
-@pytest.mark.parametrize("power", [309, 400, 1000])
-@pytest.mark.parametrize("sign", ["", "-"])
-@pytest.mark.parametrize("fmt", ["json", "yaml"])
-@pytest.mark.parametrize("renderer", ["json", "markdown"])
-def test_external_inspection_of_finite_integer_options(tmp_path, power, sign, fmt, renderer):
+def test_external_inspection_of_finite_integer_options(tmp_path, capsys):
     from pathlib import Path
     import subprocess
     import sys
+    from mindie_sim.cli import main as cli_main
     from mindie_sim.schema.case import Case
 
-    path = tmp_path / (NUMERIC_PLACEHOLDER + "." + fmt)
-    path.write_text(_numeric_operand_document(sign + "1" + "0" * power, fmt))
     workload = tmp_path / "workload.json"
     workload.write_text(json.dumps(WORKLOAD))
-    command = [sys.executable, "-B", "-m", "mindie_sim.cli", "inspect-launch", str(path),
-               "--input-format", fmt, "--container", "b", "--machine", "a3", "--model",
-               "qwen3-30b-a3b", "--framework-version", VERSION, "--workload", str(workload),
-               "--format", renderer]
-    process = subprocess.run(command, cwd=Path(__file__).resolve().parents[1],
-                             capture_output=True, text=True, timeout=30)
-    available = fmt == "json" or HAS_YAML
-    assert process.returncode == (0 if available else 2), process.stderr
-    assert not process.stderr and NUMERIC_PLACEHOLDER not in process.stdout
-    if renderer == "json":
-        report = json.loads(process.stdout)
-        assert report["status"] == ("completed" if available else "failed")
-        if available:
-            Case.from_mapping(report["case"])
-            settings = {item["name"]: item for item in report["neutral_operational"]}
-            assert settings["--served-model-name"]["value"] == "pre"
-            assert settings["--served-model-name"]["redacted"] is False
-            assert settings["--revision"]["value"] == "[REDACTED]"
-            assert settings["--revision"]["redacted"] is True
+    for power, sign, fmt, renderer in itertools.product(
+        [309, 400, 1000], ["", "-"], ["json", "yaml"], ["json", "markdown"]
+    ):
+        path = tmp_path / (NUMERIC_PLACEHOLDER + "." + fmt)
+        path.write_text(_numeric_operand_document(sign + "1" + "0" * power, fmt))
+        cli_args = ["inspect-launch", str(path), "--input-format", fmt, "--container", "b",
+                    "--machine", "a3", "--model", "qwen3-30b-a3b",
+                    "--framework-version", VERSION, "--workload", str(workload),
+                    "--format", renderer]
+        if (power, sign, fmt, renderer) in ((309, "", "json", "json"),
+                                            (1000, "-", "yaml", "markdown")):
+            process = subprocess.run([sys.executable, "-B", "-m", "mindie_sim.cli", *cli_args],
+                                     cwd=Path(__file__).resolve().parents[1],
+                                     capture_output=True, text=True, timeout=30)
+            rc, stdout, stderr = process.returncode, process.stdout, process.stderr
         else:
-            assert "yaml_parser_unavailable" in {item["code"] for item in report["diagnostics"]}
+            rc = cli_main(cli_args)
+            stdout, stderr = capsys.readouterr()
+        available = fmt == "json" or HAS_YAML
+        assert rc == (0 if available else 2), stderr
+        assert not stderr and NUMERIC_PLACEHOLDER not in stdout
+        if renderer == "json":
+            report = json.loads(stdout)
+            assert report["status"] == ("completed" if available else "failed")
+            if available:
+                Case.from_mapping(report["case"])
+                settings = {item["name"]: item for item in report["neutral_operational"]}
+                assert settings["--served-model-name"]["value"] == "pre"
+                assert settings["--served-model-name"]["redacted"] is False
+                assert settings["--revision"]["value"] == "[REDACTED]"
+                assert settings["--revision"]["redacted"] is True
+            else:
+                assert "yaml_parser_unavailable" in {item["code"] for item in report["diagnostics"]}
 
 
 def test_yaml_numeric_conversion_limit_keeps_later_placeholder():

@@ -16,7 +16,12 @@ from mindie_sim.catalog.types import (
 )
 
 
+_SCALARS = (int, str, bool, float, type(None))
+
+
 def immutable_sequences(value):
+    if type(value) in _SCALARS:
+        return value
     if isinstance(value, (list, tuple)):
         return tuple(immutable_sequences(item) for item in value)
     if isinstance(value, dict):
@@ -83,9 +88,14 @@ def explicit_model(raw):
     # only to replace it below would copy the whole provenance tree twice.
     data = immutable_sequences({
         key: value for key, value in raw.items()
-        if key not in {"metadata", "catalog_facts"}
+        if key not in {"metadata", "catalog_facts", "layer_plans"}
     })
-    data["layer_plans"] = tuple(LayerPlan(**value) for value in data["layer_plans"])
+    raw_plans = raw["layer_plans"]
+    data["layer_plans"] = tuple(
+        LayerPlan(**(value if type(value) is dict and all(type(v) in _SCALARS for v in value.values())
+                     else immutable_sequences(value)))
+        for value in raw_plans
+    )
     data["layers"] = _resolve_layer_count(data["layer_plans"], raw.get("layers"))
     data["metadata"] = metadata
     data["catalog_facts"] = catalog_facts

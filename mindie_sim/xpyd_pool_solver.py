@@ -344,7 +344,11 @@ def  solve_xpyd_pools(
                 continue
             remap_bridge = bridge.to_dict()
             edge_cache = {}
-            lifetime_key = lifetime
+            life_dict = lifetime.to_dict()
+            life_scalars = tuple((k, float(life_dict[k])) for k in ("source_retention_bytes", "destination_retention_bytes", "handoff_staging_bytes", "eplb_rebalance_peak_bytes") if life_dict.get(k) is not None)
+            owners_key = tuple(int(r) for r in getattr(lifetime, "page_owner_ranks", ()) or ())
+            p_key = ("prefill", float(lifetime.phase_peak_bytes("prefill")), tuple(lifetime.phase_rank_peak_bytes("prefill")), life_scalars, owners_key)
+            d_key = ("decode", float(lifetime.phase_peak_bytes("decode")), tuple(lifetime.phase_rank_peak_bytes("decode")), life_scalars, owners_key)
             if replica_lanes:
                 remap = bridge_remap_bytes(bridge)
                 remap_ms = (float(remap["total_bytes"]) / (nic * 1e9) * 1000.0
@@ -356,12 +360,8 @@ def  solve_xpyd_pools(
                 p_ids = tuple(index * wp for index in range(n_p))
                 for n_d in range(1, min(cap, (total - n_p * wp) // wd) + 1):
                     d_ids = tuple(n_p * wp + index * wd for index in range(n_d))
-                    p_inst = [_instance_row(p_row["parallel"], "prefill", start,
-                                            wp, lifetime, lifetime_key)
-                              for start in p_ids]
-                    d_inst = [_instance_row(d_row["parallel"], "decode", start,
-                                            wd, lifetime, lifetime_key)
-                              for start in d_ids]
+                    p_inst = [_instance_row(p_row["parallel"], "prefill", start, wp, lifetime, p_key) for start in p_ids]
+                    d_inst = [_instance_row(d_row["parallel"], "decode", start, wd, lifetime, d_key) for start in d_ids]
                     bad = next((item for item in p_inst + d_inst
                                 if not item.get("feasible")
                                 or (not allow_unqualified
