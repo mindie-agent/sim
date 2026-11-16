@@ -14,10 +14,14 @@
   snapshot, temporary and candidate files.  A build failure never tombstones
   the key and never changes simulation semantics.
 [Timeouts & Locks] One argv-list subprocess with no shell; compile budget 20 s,
-  compiler probe 15 s, ABI validation 15 s.  Publication is an atomic ``os.link``
-  into a fresh generation path; an existing library inode is never replaced.
-  Retention is bounded by ``MAX_CACHED_ARTIFACTS`` and evicts oldest-first via
-  atomic rename; a mapped Windows library defers eviction without failing.
+  compiler probe 15 s, ABI validation 15 s.  Cache inspection, hit refresh,
+  publication and retention share one cross-process advisory lock file with a
+  bounded wait; a hit refreshes its mtime under that lock before pruning, and
+  the loader keeps the lock across ``ctypes.CDLL``.  Publication is an atomic
+  ``os.link`` into a fresh generation path; an existing library inode is never
+  replaced.  Retention is bounded by ``MAX_CACHED_ARTIFACTS`` and evicts
+  oldest-first via atomic rename; a mapped Windows library defers eviction
+  without failing.
 [Side-Effect Policy] Reads the packaged sources and environment; writes and
   prunes only the content-addressed cache directory.  No model, hardware or
   network access.
@@ -36,6 +40,8 @@ import tempfile
 import threading
 import time
 
+from . import accel_cache
+from .accel_cache import MAX_CACHED_ARTIFACTS, library_extension
 from .accel_tables import PROBE_GOLDEN
 
 SOURCE_NAMES = (
@@ -52,9 +58,9 @@ COMPILE_TIMEOUT_SECONDS = 20.0
 PROBE_TIMEOUT_SECONDS = 15.0
 VALIDATE_TIMEOUT_SECONDS = 15.0
 MAX_DIAGNOSTIC_BYTES = 2000
-MAX_CACHED_ARTIFACTS = 16
-MAX_COMPILER_MARKERS = 16
-STALE_TEMP_SECONDS = 3600.0
+IDENTITY_MARKER_HEX = 16
+INVALID_GENERATION = -1
+GENERATION_PART = 0
 _BASE_FLAGS = (
     "-std=c11", "-O3", "-fPIC", "-fno-fast-math", "-ffp-contract=off",
     "-fno-strict-aliasing",
@@ -63,6 +69,15 @@ _STATUS_MEMO: dict[tuple, dict] = {}
 _IDENTITY_MEMO: dict[tuple, str] = {}
 _MEMO_LOCK = threading.Lock()
 _SUBPROCESS_KWARGS = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+#: Retention and locking live in the small coordinator module; these aliases
+#: preserve the established private API used by cache tests and diagnostics.
+MAX_COMPILER_MARKERS = accel_cache.MAX_COMPILER_MARKERS
+STALE_TEMP_SECONDS = accel_cache.STALE_TEMP_SECONDS
+_artifact_paths = accel_cache.artifact_paths
+_mtime_ns = accel_cache._mtime_ns
+_keep_names = accel_cache._keep_names
+_discard_path = accel_cache._discard_path
+_prune_engine_cache = accel_cache.prune_engine_cache
 
 
 def source_dir() -> Path:
@@ -89,14 +104,6 @@ def source_snapshot() -> tuple[bytes, dict[str, bytes]]:
 def source_bytes() -> bytes:
     """Digest over every shipped source byte (the cache-key preimage)."""
     return source_snapshot()[0]
-
-
-def library_extension() -> str:
-    if sys.platform == "darwin":
-        return ".dylib"
-    if os.name == "nt":
-        return ".dll"
-    return ".so"
 
 
 def compiler_flags() -> list[str]:
@@ -192,7 +199,7 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
     if cached is not None:
         return cached
     marker_key = hashlib.sha256(
-        "|".join(("compiler-identity-v2", *key)).encode()).hexdigest()[:16]
+        "|".join(("compiler-identity-v3", *key)).encode()).hexdigest()[:IDENTITY_MARKER_HEX]
     marker = cache_root() / f"compiler-{marker_key}.id"
     if persist:
         try:
@@ -220,8 +227,7 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
     except OSError:
         version = "unavailable"
     identity = (
-        f"{Path(resolved).name}|{footprint}|{version}|{sdkroot}|"
-        f"{platform_identity}")
+        f"{resolved}|{footprint}|{version}|{sdkroot}|{platform_identity}")
     with _MEMO_LOCK:
         _IDENTITY_MEMO[key] = identity
     if persist:
@@ -332,14 +338,31 @@ def _manifest_path(destination: Path) -> Path:
     return destination.with_suffix(destination.suffix + ".json")
 
 
+def _manifest_generation(candidate: Path, digest: str) -> int:
+    """Numeric generation from ``<digest>-<generation>.<ext>.json``."""
+    prefix = digest + "-"
+    if not candidate.name.startswith(prefix):
+        return INVALID_GENERATION
+    text = candidate.name[len(prefix):].partition(".")[GENERATION_PART]
+    try:
+        return int(text)
+    except ValueError:
+        return INVALID_GENERATION
+
+
 def _read_manifest(digest: str) -> Path | None:
+    """Newest valid generation for ``digest``; malformed JSON is ignored.
+
+    Sorting is numeric (generation 10 ahead of 9), never lexicographic, and a
+    non-object payload such as ``[1]`` is treated as absent.
+    """
     root = cache_root()
-    for candidate in sorted(root.glob(f"{digest}-*.json"), reverse=True):
-        try:
-            payload = json.loads(candidate.read_text())
-        except TimeoutError:
-            raise
-        except (OSError, ValueError):
+    candidates = sorted(root.glob(f"{digest}-*.json"),
+                        key=lambda item: (_manifest_generation(item, digest),
+                                          item.name), reverse=True)
+    for candidate in candidates:
+        payload = accel_cache.read_manifest_payload(candidate)
+        if payload is None:
             continue
         path = Path(str(payload.get("library", "")))
         if payload.get("digest") == digest and path.is_file():
@@ -347,146 +370,9 @@ def _read_manifest(digest: str) -> Path | None:
     return None
 
 
-def _artifact_paths(cache_dir: Path) -> list[Path]:
-    """Content-generation libraries: ``<64-hex digest>-<generation>.<ext>``."""
-    extension = library_extension()
-    try:
-        entries = list(cache_dir.iterdir())
-    except TimeoutError:
-        raise
-    except OSError:
-        return []
-    artifacts = []
-    for path in entries:
-        try:
-            if not path.is_file():
-                continue
-        except TimeoutError:
-            raise
-        except OSError:
-            continue
-        name = path.name
-        if not name.endswith(extension):
-            continue
-        stem = name[:-len(extension)]
-        digest, separator, generation = stem.partition("-")
-        if (separator and len(digest) == 64
-                and all(char in "0123456789abcdef" for char in digest)
-                and generation.isdigit()):
-            artifacts.append(path)
-    return artifacts
-
-
-def _mtime_ns(path: Path) -> int:
-    try:
-        return path.stat().st_mtime_ns
-    except TimeoutError:
-        raise
-    except OSError:
-        return 0
-
-
-def _discard_path(path: Path) -> bool:
-    """Atomically quarantine then unlink; mapped Windows files are deferred."""
-    trash = path.with_name(
-        f".trash-{os.getpid()}-{threading.get_ident()}-"
-        f"{time.monotonic_ns()}-{path.name}.tmp")
-    try:
-        os.replace(path, trash)
-    except TimeoutError:
-        raise
-    except PermissionError:
-        return False
-    except OSError:
-        return False
-    try:
-        trash.unlink()
-    except TimeoutError:
-        raise
-    except PermissionError:
-        pass
-    except OSError:
-        pass
-    return True
-
-
-def _keep_names(artifacts: list[Path], keep_key: str | Path | None) -> set[str]:
-    if keep_key is None:
-        return set()
-    if isinstance(keep_key, Path):
-        return {keep_key.name}
-    text = str(keep_key)
-    if any(path.name == text for path in artifacts):
-        return {text}
-    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
-        matches = [path for path in artifacts
-                   if path.name.startswith(text + "-")]
-        if matches:
-            return {max(matches, key=_mtime_ns).name}
-    return {Path(text).name}
-
-
-def _prune_engine_cache(cache_dir: Path, *, keep_key: str | Path | None = None,
-                        max_artifacts: int = MAX_CACHED_ARTIFACTS) -> list[Path]:
-    """Bound engine libraries and manifests by oldest-first atomic eviction.
-
-    The newest ``max_artifacts`` generation files are retained and the current
-    ``keep_key`` (digest, filename or path) is never evicted.  When an older
-    Windows process still maps a ``.dll``/``.pyd``, rename or unlink can fail;
-    that eviction is deferred and its manifest stays valid for a later run.
-    Stale compiler markers beyond 16 entries and temporaries older than one
-    hour are reclaimed independently of artifact retention.
-    """
-    removed: list[Path] = []
-    artifacts = _artifact_paths(cache_dir)
-    keep = _keep_names(artifacts, keep_key)
-    ordered = sorted(artifacts, key=lambda path: (_mtime_ns(path), path.name))
-    remaining = len(ordered)
-    limit = max(0, int(max_artifacts))
-    for path in ordered:
-        if remaining <= limit:
-            break
-        if path.name in keep:
-            continue
-        if not _discard_path(path):
-            continue
-        removed.append(path)
-        remaining -= 1
-        manifest = _manifest_path(path)
-        if _discard_path(manifest):
-            removed.append(manifest)
-    for manifest in sorted(cache_dir.glob("*.json")):
-        try:
-            payload = json.loads(manifest.read_text())
-        except TimeoutError:
-            raise
-        except (OSError, ValueError):
-            payload = None
-        library = Path(str((payload or {}).get("library", "")))
-        try:
-            orphan = not library.is_file()
-        except TimeoutError:
-            raise
-        except OSError:
-            orphan = True
-        if orphan and _discard_path(manifest):
-            removed.append(manifest)
-    markers = sorted(cache_dir.glob("compiler-*.id"),
-                     key=_mtime_ns, reverse=True)
-    for marker in markers[max(0, int(MAX_COMPILER_MARKERS)):]:
-        if _discard_path(marker):
-            removed.append(marker)
-    stale_before = time.time() - STALE_TEMP_SECONDS
-    for temporary in cache_dir.glob("*.tmp"):
-        try:
-            stale = temporary.stat().st_mtime < stale_before
-        except TimeoutError:
-            raise
-        except OSError:
-            continue
-        if stale and _discard_path(temporary):
-            removed.append(temporary)
-    return removed
+def _touch_hit(path: Path) -> None:
+    """Refresh a hit before pruning so it is never the oldest artifact."""
+    accel_cache.touch_artifact(path)
 
 
 def _publish(compiler: str, flags: list[str], destination_dir: Path,
@@ -537,44 +423,48 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
         valid, reason = _validate(temporary)
         if not valid:
             return False, reason, None
-        for generation in range(100001):
-            target = destination_dir / (
-                f"{digest.hex() if isinstance(digest, bytes) else digest}"
-                f"-{generation}{library_extension()}")
+        # Publication and retention are one metadata mutation: hold the
+        # cross-process lock so a concurrent hit cannot observe a library that
+        # is about to be pruned and another builder cannot race the manifest.
+        with accel_cache.cache_lock(destination_dir):
+            for generation in range(100001):
+                target = destination_dir / (
+                    f"{digest.hex() if isinstance(digest, bytes) else digest}"
+                    f"-{generation}{library_extension()}")
+                try:
+                    os.link(temporary, target)
+                except FileExistsError:
+                    continue
+                except TimeoutError:
+                    raise
+                except OSError as error:
+                    return False, f"publication_failed:{error}", None
+                candidate = target
+                break
+            if candidate is None:
+                return False, "cache_generation_exhausted", None
             try:
-                os.link(temporary, target)
-            except FileExistsError:
-                continue
+                os.unlink(temporary)
+                temporary = None
             except TimeoutError:
                 raise
             except OSError as error:
                 return False, f"publication_failed:{error}", None
-            candidate = target
-            break
-        if candidate is None:
-            return False, "cache_generation_exhausted", None
-        try:
-            os.unlink(temporary)
-            temporary = None
-        except TimeoutError:
-            raise
-        except OSError as error:
-            return False, f"publication_failed:{error}", None
-        try:
-            manifest = _manifest_path(candidate)
-            payload = json.dumps({"digest": digest, "library": str(candidate)})
-            manifest_temp = _unique_temp(destination_dir, "manifest", ".tmp")
-            manifest_temp.write_text(payload)
-            os.replace(manifest_temp, manifest)
-            manifest_temp = None
-        except TimeoutError:
-            raise
-        except OSError as error:
-            return False, f"publication_failed:{error}", None
-        published = True
-        _prune_engine_cache(destination_dir, keep_key=candidate,
-                            max_artifacts=MAX_CACHED_ARTIFACTS)
-        return True, "", candidate
+            try:
+                manifest = _manifest_path(candidate)
+                payload = json.dumps({"digest": digest, "library": str(candidate)})
+                manifest_temp = _unique_temp(destination_dir, "manifest", ".tmp")
+                manifest_temp.write_text(payload)
+                os.replace(manifest_temp, manifest)
+                manifest_temp = None
+            except TimeoutError:
+                raise
+            except OSError as error:
+                return False, f"publication_failed:{error}", None
+            published = True
+            _prune_engine_cache(destination_dir, keep_key=candidate,
+                                max_artifacts=MAX_CACHED_ARTIFACTS)
+            return True, "", candidate
     finally:
         if snapshot_dir is not None:
             try:
@@ -640,12 +530,17 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
             cached_status = _STATUS_MEMO.get(key)
         if cached_status is not None:
             path = cached_status.get("cache_path")
-            if (cached_status.get("ok") and path and Path(path).is_file()
-                    and compiler is not None
+            if (cached_status.get("ok") and path and compiler is not None
                     and cached_status.get("compiler_identity") == identity):
-                result = dict(cached_status)
-                result["cache_hit"] = True
-                return result
+                with accel_cache.cache_lock(cache_root()):
+                    if Path(path).is_file():
+                        _touch_hit(Path(path))
+                        _prune_engine_cache(
+                            cache_root(), keep_key=Path(path),
+                            max_artifacts=MAX_CACHED_ARTIFACTS)
+                        result = dict(cached_status)
+                        result["cache_hit"] = True
+                        return result
     if compiler is None:
         status = _failure(reason, check_only=check_only)
         with _MEMO_LOCK:
@@ -668,20 +563,27 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
             "toolchain_ready": True, "library_ready": existing is not None,
         }
     if existing is not None and not force:
-        # Upgrade cleanup: a valid hit still reclaims historical duplicate
-        # generations left by older PATH-keyed releases.
-        _prune_engine_cache(cache_root(), keep_key=existing,
-                            max_artifacts=MAX_CACHED_ARTIFACTS)
-        status = {
-            "ok": True, "backend": "c_native", "reason": None, "detail": "",
-            "compiler": compiler, "compiler_identity": identity, "flags": flags,
-            "digest": digest_hex, "cache_path": str(existing), "cache_hit": True,
-            "check_only": False, "abi": 2, "toolchain_ready": True,
-            "library_ready": True,
-        }
-        with _MEMO_LOCK:
-            _STATUS_MEMO[key] = status
-        return dict(status)
+        # A hit must become the newest entry before retention evicts the
+        # oldest; a concurrent publisher cannot delete the hit between here
+        # and a caller's ``ctypes.CDLL`` because both hold this same lock.
+        with accel_cache.cache_lock(cache_root()):
+            existing = _read_manifest(digest_hex)
+            if existing is not None:
+                _touch_hit(existing)
+                _prune_engine_cache(
+                    cache_root(), keep_key=existing,
+                    max_artifacts=MAX_CACHED_ARTIFACTS)
+                status = {
+                    "ok": True, "backend": "c_native", "reason": None,
+                    "detail": "", "compiler": compiler,
+                    "compiler_identity": identity, "flags": flags,
+                    "digest": digest_hex, "cache_path": str(existing),
+                    "cache_hit": True, "check_only": False, "abi": 2,
+                    "toolchain_ready": True, "library_ready": True,
+                }
+                with _MEMO_LOCK:
+                    _STATUS_MEMO[key] = status
+                return dict(status)
     built, detail, candidate = _publish(compiler, flags, cache_root(), files,
                                         digest_hex)
     if not built:

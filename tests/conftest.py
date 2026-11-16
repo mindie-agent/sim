@@ -4,7 +4,9 @@
   build memos untouched across every test module.
 [Invariants] `isolated_cache` provides one session-local `MINDIE_CACHE_HOME` and
   cleans it on teardown; `isolated_short_root` gives reproducer storage a fresh
-  short ASCII root so concurrent runs cannot collide in ``/tmp/mprof``;
+  short ASCII root under the platform temp parent (or the short POSIX temp when
+  that path is too long for the product's 48-byte contract) so concurrent runs
+  cannot collide in the shared host reproducer directory;
   `isolated_runtime` isolates per-test runtime paths. Every session temporary
   root is also tracked for session/process cleanup.
 [Timeouts & Locks] No threads, sleeps, or external I/O beyond temporary dirs.
@@ -18,11 +20,15 @@ import os
 from pathlib import Path
 import shutil
 import sys
+import tempfile
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 TESTS = Path(__file__).resolve().parent
+#: ``repro_storage`` ignores roots longer than 48 bytes; leave room for
+#: ``mprof-`` plus the 8-character ``mkdtemp`` suffix.
+SHORT_PARENT_MAX_BYTES = 34
 for _entry in (ROOT, TESTS):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
@@ -66,19 +72,42 @@ def isolated_cache():
         shutil.rmtree(base, ignore_errors=True)
 
 
+def _short_root_parent() -> Path:
+    """Platform temp parent, with a short POSIX fallback when it is too long.
+
+    ``repro_storage.short_root`` ignores ``MINDIE_REPRO_SHORT_ROOT`` beyond 48
+    bytes.  ``TMPDIR`` on macOS and some CI hosts is much longer, and a long
+    root would silently send tests to the shared host reproducer directory.
+    Prefer the platform temp directory when it fits and use the platform's
+    short POSIX temp directory only when necessary.
+    """
+    parent = Path(tempfile.gettempdir())
+    parent.mkdir(parents=True, exist_ok=True)
+    if len(os.fspath(parent).encode("utf-8")) <= SHORT_PARENT_MAX_BYTES:
+        return parent
+    if os.name != "nt":
+        fallback = Path("/tmp")
+        try:
+            fallback.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return parent
+        if len(os.fspath(fallback).encode("utf-8")) <= SHORT_PARENT_MAX_BYTES:
+            return fallback
+    return parent
+
+
 @pytest.fixture(autouse=True)
-def isolated_short_root():
-    """Own a fresh short reproducer root instead of the shared ``/tmp/mprof``."""
-    old = os.environ.get("MINDIE_REPRO_SHORT_ROOT")
-    root = tempdir("mprof-", directory="/tmp")
-    os.environ["MINDIE_REPRO_SHORT_ROOT"] = str(root)
+def isolated_short_root(monkeypatch):
+    """Own a fresh short root under the platform temp parent.
+
+    ``monkeypatch`` owns the environment write so it unwinds in the same LIFO
+    order as any test-level override, never restoring a deleted directory.
+    """
+    root = tempdir("mprof-", directory=_short_root_parent())
+    monkeypatch.setenv("MINDIE_REPRO_SHORT_ROOT", str(root))
     try:
         yield root
     finally:
-        if old is None:
-            os.environ.pop("MINDIE_REPRO_SHORT_ROOT", None)
-        else:
-            os.environ["MINDIE_REPRO_SHORT_ROOT"] = old
         shutil.rmtree(root, ignore_errors=True)
 
 

@@ -15,11 +15,13 @@
 
 [Timeouts & Locks]
   One condition variable with a bounded rendezvous timeout; threads join with
-  a bounded timeout and no device or process group is created.
+  a bounded timeout, a timed-out pair is signalled through the abort file and
+  joined briefly, and no device or process group is created.
 
 [Side-Effect Policy]
-  Owns one process-temporary workspace for JSONL/abort records, removes it on
-  every normal, error and timeout path, and leaves no caller cleanup behind.
+  Owns one tracked process-temporary workspace for JSONL/abort records and
+  removes it whenever both workers are quiescent; a still-live worker defers
+  deletion to ``temp_cleanup`` at session/atexit instead of racing its handles.
 """
 
 from __future__ import annotations
@@ -27,13 +29,15 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
-import tempfile
 import threading
 import time
 import types
 
 from mindie_profiler.fabric_probe import emit_fabric_probe_script
+
+from temp_cleanup import tempdir
 
 
 class ProtocolMismatch(RuntimeError):
@@ -465,47 +469,56 @@ def run_ranks(plan, *, sync_actions=None, fail_alloc=None, data_actions=None,
     sys.modules["torch_npu"] = npu
     sys.modules["torch.distributed"] = distributed
     results = {}
-    with tempfile.TemporaryDirectory(
-            prefix="nr4-probe-", ignore_cleanup_errors=True) as workspace:
-        tmp = Path(workspace)
-        try:
-            def runner(rank):
-                namespace = {"__name__": f"round4_probe_{rank}"}
-                script = _rank_script(plan, rank)
-                exec(compile(script, f"<probe-{rank}>", "exec"), namespace)
-                clock = world.clocks[rank]
-                namespace["time"] = types.SimpleNamespace(
-                    monotonic=clock.monotonic,
-                    perf_counter_ns=clock.perf_counter_ns)
-                output = os.path.join(tmp, f"rank{rank}.jsonl")
-                abort_path = os.path.join(tmp, "abort.json")
-                world.abort_path = abort_path
-                try:
-                    code = namespace["main"](["--output", output,
-                                              "--abort-file", abort_path])
-                    results[rank] = (code, [json.loads(line) for line in
-                                            Path(f"{output}.rank{rank}.jsonl").read_text().splitlines()
-                                            if line.strip()])
-                except TimeoutError:
-                    raise
-                except Exception as exc:  # broker mismatch / injected failure
-                    results[rank] = (None, [])
-                    world.errors[rank] = repr(exc)
+    workspace = tempdir("nr4-probe-")
+    tmp = Path(workspace)
+    threads: list[threading.Thread] = []
+    try:
+        def runner(rank):
+            namespace = {"__name__": f"round4_probe_{rank}"}
+            script = _rank_script(plan, rank)
+            exec(compile(script, f"<probe-{rank}>", "exec"), namespace)
+            clock = world.clocks[rank]
+            namespace["time"] = types.SimpleNamespace(
+                monotonic=clock.monotonic,
+                perf_counter_ns=clock.perf_counter_ns)
+            output = os.path.join(tmp, f"rank{rank}.jsonl")
+            abort_path = os.path.join(tmp, "abort.json")
+            world.abort_path = abort_path
+            try:
+                code = namespace["main"](["--output", output,
+                                          "--abort-file", abort_path])
+                results[rank] = (code, [json.loads(line) for line in
+                                        Path(f"{output}.rank{rank}.jsonl").read_text().splitlines()
+                                        if line.strip()])
+            except TimeoutError:
+                raise
+            except Exception as exc:  # broker mismatch / injected failure
+                results[rank] = (None, [])
+                world.errors[rank] = repr(exc)
 
-            threads = [threading.Thread(target=runner, args=(rank,), name=f"rank-{rank}")
-                       for rank in (0, 1)]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout)
-                if thread.is_alive():
-                    world.errors[thread.name] = "thread join timeout"
-        finally:
-            for name, value in old.items():
-                if value is None:
-                    sys.modules.pop(name, None)
-                else:
-                    sys.modules[name] = value
+        threads = [threading.Thread(target=runner, args=(rank,), name=f"rank-{rank}")
+                   for rank in (0, 1)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout)
+        timed_out = [thread for thread in threads if thread.is_alive()]
+        if timed_out:
+            for thread in timed_out:
+                world.errors[thread.name] = "thread join timeout"
+            # The emitted script watches this file and aborts the peer wait;
+            # give both workers a bounded chance to leave the workspace before
+            # any teardown can race their open handles.
+            try:
+                (tmp / "abort.json").write_text(json.dumps({
+                    "kind": "status", "status": "deadline_exceeded",
+                    "reason": "thread_join_timeout", "rank": 0}))
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+            for thread in timed_out:
+                thread.join(1.0)
         abort_file = tmp / "abort.json"
         if abort_file.is_file():
             try:
@@ -514,4 +527,14 @@ def run_ranks(plan, *, sync_actions=None, fail_alloc=None, data_actions=None,
                 raise
             except (OSError, ValueError):
                 world.abort_record = None
+    finally:
+        for name, value in old.items():
+            if value is None:
+                sys.modules.pop(name, None)
+            else:
+                sys.modules[name] = value
+        if not any(thread.is_alive() for thread in threads):
+            shutil.rmtree(workspace, ignore_errors=True)
+        # Otherwise temp_cleanup retains ownership and retries at session
+        # finish/atexit instead of deleting a workspace under a live thread.
     return world, results

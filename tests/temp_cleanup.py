@@ -2,15 +2,16 @@
 
 [Role] Create test roots and guarantee their removal at pytest-session or
   process teardown even when an individual test misses its own ``finally``.
-[Invariants] Every path comes from ``tempfile.mkdtemp`` and is removed at most
-  once; cleanup ignores already-missing paths and never deletes an unregistered
-  root.
+[Invariants] Every path comes from ``tempfile.mkdtemp``; cleanup ignores
+  already-missing paths, never deletes an unregistered root, and drops a path
+  from the ownership list only after it is verifiably gone.
 [Timeouts & Locks] Pure in-process ownership list; no locks or background work.
 [Side-Effect Policy] Deletes only directories created through ``tempdir``.
 """
 from __future__ import annotations
 
 import atexit
+import os
 import shutil
 import tempfile
 from pathlib import Path
@@ -27,9 +28,20 @@ def tempdir(prefix: str, *, directory: str | Path | None = None) -> Path:
 
 
 def cleanup() -> None:
-    """Remove every still-registered root; safe to call repeatedly."""
-    while _ROOTS:
-        shutil.rmtree(_ROOTS.pop(), ignore_errors=True)
+    """Remove every still-registered root; safe to call repeatedly.
+
+    A path is dropped from the ownership list only after it no longer exists,
+    so a transient Windows handle/share violation is retried by the next
+    ``pytest_sessionfinish`` or ``atexit`` call instead of leaking forever.
+    """
+    pending: list[Path] = []
+    for path in _ROOTS:
+        if not os.path.lexists(path):
+            continue
+        shutil.rmtree(path, ignore_errors=True)
+        if os.path.lexists(path):
+            pending.append(path)
+    _ROOTS[:] = pending
 
 
 atexit.register(cleanup)

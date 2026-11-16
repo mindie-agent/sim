@@ -33,6 +33,7 @@ from mindie_profiler import repro_atomic_io as checked_io
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 
 import pytest
@@ -41,6 +42,7 @@ from mindie_profiler.fabric_probe import (
     emit_fabric_probe_script, supervise_probe_processes,
 )
 from mindie_profiler.fabric_probe_fit import fit_calibrated_fabric_profile
+from mindie_profiler import repro_storage
 from mindie_profiler.repro_op import call_mcp_tool
 from mindie_profiler.repro_storage import resolve_repro_artifact, short_root
 from mindie_profiler.token_budget import estimate_tokens
@@ -70,6 +72,12 @@ def _records(results):
 
 def _fresh_short_root():
     return tempdir("r6cas-", directory="/tmp")
+
+
+def _fake_mprof_root() -> Path:
+    """Short, host-independent fallback root for receipt-budget tests."""
+    parent = Path("/tmp") if Path("/tmp").is_dir() else Path(tempfile.gettempdir())
+    return tempdir("mprof-f10-", directory=parent)
 
 
 # ----------------------------------------------------------------------- F1
@@ -330,9 +338,12 @@ def test_f7_abort_record_alone_rejects_a_calibrated_override():
 # ---------------------------------------------------------------------- F10
 def test_f10_unicode_short_root_falls_back_to_a_bounded_ascii_receipt(
         monkeypatch):
+    fake_default = _fake_mprof_root()
+    sentinel = fake_default / "host-sentinel.txt"
+    sentinel.write_text("host-owned data")
+    monkeypatch.setattr(repro_storage, "SHORT_ROOT_DEFAULT", str(fake_default))
     monkeypatch.setenv("MINDIE_REPRO_SHORT_ROOT", "/tmp/" + "界" * 40)
-    assert short_root() == Path("/tmp/mprof")
-    shutil.rmtree("/tmp/mprof", ignore_errors=True)
+    assert short_root() == fake_default
     result = call_mcp_tool("repro_op", {"occurrence": paged_binding()})
     try:
         assert result["status"] == "ready"
@@ -342,7 +353,8 @@ def test_f10_unicode_short_root_falls_back_to_a_bounded_ascii_receipt(
         script = Path(result["artifact_path"])
         manifest = Path(result["manifest_path"])
         assert checked_io.path_is_file(script) and checked_io.path_is_file(manifest)
-        assert "/tmp/mprof/" in result["artifact_path"]
+        assert script.is_relative_to(fake_default)
+        assert sentinel.read_text() == "host-owned data"
         resolved = resolve_repro_artifact(result["artifact_id"])
         assert resolved["resolved"] is True
         assert resolved["script_sha256"] == result["artifact_id"]
@@ -351,7 +363,9 @@ def test_f10_unicode_short_root_falls_back_to_a_bounded_ascii_receipt(
         assert via_tool["resolved"] is True
         assert estimate_tokens(via_tool) <= 250
     finally:
-        shutil.rmtree("/tmp/mprof", ignore_errors=True)
+        # The fallback default is monkeypatched to a pytest-owned directory;
+        # never delete the host's real reproducer root to clean up here.
+        assert sentinel.read_text() == "host-owned data"
 
 def test_f10_registered_slot_is_immutable_and_resolution_verifies_bytes(
         monkeypatch):
@@ -385,13 +399,15 @@ def test_f10_registered_slot_is_immutable_and_resolution_verifies_bytes(
     finally:
         shutil.rmtree(root, ignore_errors=True)
 
-def test_f10_ascii_short_root_is_byte_bounded(monkeypatch):
+def test_f10_ascii_short_root_is_byte_bounded(monkeypatch, tmp_path):
+    fallback = tmp_path / "fallback-mprof"
+    monkeypatch.setattr(repro_storage, "SHORT_ROOT_DEFAULT", str(fallback))
     accepted = "/tmp/" + "a" * 43
     assert len(accepted) == 48
     monkeypatch.setenv("MINDIE_REPRO_SHORT_ROOT", accepted)
     assert short_root() == Path(accepted)
     monkeypatch.setenv("MINDIE_REPRO_SHORT_ROOT", accepted + "a")
-    assert short_root() == Path("/tmp/mprof")
+    assert short_root() == fallback
 
 # ---------------------------------------------------------------------- F11
 def test_f11_generated_fa_plan_missing_required_keyword_raises():

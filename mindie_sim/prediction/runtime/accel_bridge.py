@@ -10,22 +10,24 @@
   zero native calls and zero compilation.  Under ``auto`` a missing toolchain or
   unloadable library is an explicit ``python_fallback``; under explicit ``c`` it
   is a structured error.
-[Timeouts & Locks] One process-local library memo; normal calls are bounded by
-  the caller's step budget, while an output drain uses budget zero and is
-  bounded by the fixed wire buffers (each call publishes at least one record).
-  No threads, sleeps or I/O after publication.
+[Timeouts & Locks] One process-local library memo guarded by the cache
+  coordinator's cross-process lock across build and ``ctypes.CDLL``; normal
+  calls are bounded by the caller's step budget, while an output drain uses
+  budget zero and is bounded by the fixed wire buffers (each call publishes at
+  least one record).  The dispatch loop adds no threads, sleeps or I/O after
+  attach.
 [Side-Effect Policy] Loads the cached immutable library and mutates the Engine
   only at the same points as the Python reference.
 """
 from __future__ import annotations
 
 import ctypes
-import heapq
 import math
 import os
 import weakref
 
-from . import accel_build
+from . import accel_build, accel_cache, accel_loader
+from .accel_loader import AccelUnavailable, load_library
 from .accel_sync import (
     adopt_frontier, deliver_slots, drain_output, effective_units, explicit_units,
     finish_handback, flush_pending, reclaim_arena, solver_capacity_exceeded,
@@ -33,51 +35,19 @@ from .accel_sync import (
 )
 from .accel_tables import (
     ABI_VERSION, Arena, B_IDLE, B_OUTPUT, E_ARITH, E_STALL, E_STATE, INT32_MAX,
-    KernelFault, MAX_L, MAX_OWN, MAX_R, MAX_T, MAX_U, PROBE_GOLDEN,
-    _free_ctx_box, install_signatures, is_inert_trace_entry, needs_external_start,
+    KernelFault, MAX_L, MAX_OWN, MAX_R, MAX_T, MAX_U,
+    _free_ctx_box, is_inert_trace_entry, needs_external_start,
     pure_task, resource_table, wide_integer,
 )
-
-_LOADED: dict[str, ctypes.CDLL] = {}
 
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
 
 #: Callback-free numeric windows run in C unless MINDIE_SIM_ACCEL_EPOCH=0.
 EPOCH_ENABLED = os.environ.get("MINDIE_SIM_ACCEL_EPOCH", "1") != "0"
-class AccelUnavailable(RuntimeError):
-    """Explicit native backend requested without a usable library."""
-    def __init__(self, reason: str, status: dict | None = None) -> None:
-        super().__init__(f"accel_backend_unavailable:{reason}")
-        self.reason = reason
-        self.status = dict(status or {})
-def load_library(status: dict) -> ctypes.CDLL:
-    path = status.get("cache_path")
-    if not path or not os.path.isfile(path):
-        raise AccelUnavailable("library_missing", status)
-    library = _LOADED.get(path)
-    if library is not None:
-        return library
-    try:
-        library = ctypes.CDLL(path)
-        install_signatures(library)
-        if int(library.msim_abi_version()) != ABI_VERSION:
-            raise AccelUnavailable("abi_version_mismatch", status)
-        probe = (ctypes.c_uint64 * 16)()
-        if int(library.msim_abi_probe(probe, 16)) != 0:
-            raise AccelUnavailable("abi_probe_failed", status)
-        if tuple(int(x) for x in probe) != PROBE_GOLDEN:
-            raise AccelUnavailable("abi_probe_mismatch", status)
-    except TimeoutError:
-        raise
-    except OSError as error:
-        raise AccelUnavailable(f"library_load_failed:{error}", status) from error
-    except AttributeError as error:
-        raise AccelUnavailable(f"abi_symbol_missing:{error}", status) from error
-    if len(_LOADED) >= 8:
-        _LOADED.pop(next(iter(_LOADED)))
-    _LOADED[path] = library
-    return library
+def load_accel_cdll(status: dict | None = None):
+    """Build (when needed) and map under one cache lock."""
+    return accel_loader.load_accel_cdll(status)
 def resolve_mode(requested: str | None) -> str:
     value = requested
     if value is None:
@@ -160,21 +130,32 @@ class NativeBackend:
             return False
         if self.arena is None:
             try:
-                status = accel_build.build_accel()
+                # Keep the cache lock across the hit/build and the in-process
+                # mapping: a concurrent publisher may add a 17th generation
+                # and prune, but it cannot unlink this path before CDLL maps it.
+                with accel_cache.cache_lock(accel_build.cache_root()):
+                    try:
+                        status = accel_build.build_accel()
+                    except TimeoutError:
+                        raise
+                    except (OSError, RuntimeError) as error:
+                        status = {"ok": False,
+                                  "reason": f"build_unavailable:{error}"}
+                    if not status.get("ok"):
+                        self.reason = (status.get("reason")
+                                       or "native_build_unavailable")
+                        self.status_dict = dict(status)
+                        self.disabled_reason = self.reason
+                        if self.mode == "c":
+                            raise AccelUnavailable(self.reason, status)
+                        return False
+                    self.status_dict = dict(status)
+                    self.library = load_library(status)
             except TimeoutError:
                 raise
-            except (OSError, RuntimeError) as error:
-                status = {"ok": False, "reason": f"build_unavailable:{error}"}
-            if not status.get("ok"):
-                self.reason = status.get("reason") or "native_build_unavailable"
-                self.status_dict = dict(status)
-                self.disabled_reason = self.reason
-                if self.mode == "c":
-                    raise AccelUnavailable(self.reason, status)
-                return False
-            self.status_dict = dict(status)
+            except (AccelUnavailable, OSError, MemoryError, KernelFault) as error:
+                return self._attach_failed(error)
             try:
-                self.library = load_library(status)
                 self.arena = Arena(self.library)
                 self._finalizer = weakref.finalize(self, Arena.close, self.arena)
             except TimeoutError:
@@ -487,7 +468,8 @@ class NativeBackend:
             except KernelFault as error:
                 self._apply_prefix(engine, error)
                 self._translate_fault(error)
-            self.native_calls += 1; self.native_steps += steps
+            self.native_calls += 1
+            self.native_steps += steps
             engine.now, engine.advance_steps = now, engine.advance_steps + steps
             self._sync_counters(engine)
             self._apply(engine, nstart, ncomp)
@@ -553,7 +535,8 @@ class NativeBackend:
         except KernelFault as error:
             self._apply_prefix(engine, error)
             self._translate_fault(error)
-        self.native_calls += 1; self.native_steps += steps
+        self.native_calls += 1
+        self.native_steps += steps
         engine.now = now
         engine.advance_steps += steps
         self._sync_counters(engine)
