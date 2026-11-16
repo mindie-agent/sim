@@ -12,20 +12,44 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import math
 
-from mindie_sim.catalog.attention_common import AttentionResult, _allreduce, _causal_pairs, dcp_partial_merge_ops
+from mindie_sim.catalog.attention_common import (
+    AttentionResult, _allreduce, _causal_pairs, _long_selected_pairs,
+    active_dcp_degree, dcp_partial_merge_ops, min_positive,
+)
 from .mla import mla
 from .recurrent import linear
 from .partial_attention import projection_only, unmodeled, shared_kv_input
 from .cache_representation import store as representation_store
 from .attention_kv_access import paged_fia_plan
-from mindie_sim.catalog.cache import index_row_bytes, index_selection_cost, local_kv_heads
+from mindie_sim.catalog.cache import (
+    completed_rows, index_row_bytes, index_selection_cost, local_kv_heads,
+)
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.ops import gemm_op, vector_op, cache_store_op, comm_op, barrier_op
 from mindie_sim.catalog.context_parallel import split_causal_pairs, owned_positions
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.tensors import TensorLayout
+from .batch_prefix_attention import (
+    annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
+)
+from .batch_prefix_indexer import apply_indexer_prefix_reads
+from .sparse_attention import sparse_attention_traffic
 from .structure_groups import declare_group
+
+ZERO = 0
+ONE = 1
+TWO = 2
+THREE = 3
+FOUR = 4
+FIVE = 5
+ZERO_FLOAT = 0.0
+READ_WRITE_ONE = 1.0
+NEG_ONE = -1
+DEFAULT_BLOCK_SIZE = 128
+DEFAULT_CP_INTERLEAVE = 128
+DEFAULT_IDX_DIM = 64
+FP32_BYTES = 4
 
 
 _QKV_NORM_ROPE_SOURCE = {
@@ -219,35 +243,39 @@ def _cache_tensor_view(views, kv_heads, width, key_fmt, value_fmt, shared,
     }),)
 
 
-def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode):
+def _decode_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
+                     *, window=None, cp=None):
     if mode not in {"decode", "draft"}:
         return ()
     requests = tuple((view.q_len, view.context) for view in views)
-    # A response for a homogeneous native batch must not also match a ragged
-    # batch merely because its first request has the same shape.
     queries = {query for query, _ in requests}
     contexts = {context for _, context in requests}
+    eff_win = int(plan.window or ZERO) if window is None else int(window)
+    eff_cp = int(parallel.cp) if cp is None else int(cp)
     return (("gqa_decode", {
         "requests": requests,
-        **({"uniform_query_tokens": next(iter(queries))} if len(queries) == 1 else {}),
-        **({"uniform_context_tokens": next(iter(contexts))} if len(contexts) == 1 else {}),
+        **({"uniform_query_tokens": next(iter(queries))} if len(queries) == ONE else {}),
+        **({"uniform_context_tokens": next(iter(contexts))} if len(contexts) == ONE else {}),
         "query_heads": heads, "kv_heads": kv_heads, "head_dim": width,
         "query_dtype": model.activation_dtype, "kv_dtype": quant.kv_dtype,
-        "causal": not plan.noncausal_attention, "window": plan.window or 0,
-        "cp": parallel.cp,
+        "causal": not plan.noncausal_attention, "window": eff_win,
+        "cp": eff_cp,
     }),)
 
 
-def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode):
+def _prefill_contract(views, heads, kv_heads, width, model, quant, parallel, plan, mode,
+                      *, window=None, cp=None):
     """Declare per-request prefill geometry; the explicit recipe validates it."""
     if mode not in {"prefill", "draft_prefill"}:
         return ()
+    eff_win = int(plan.window or ZERO) if window is None else int(window)
+    eff_cp = int(parallel.cp) if cp is None else int(cp)
     return (("gqa_prefill", {
         "requests": tuple((view.q_len, view.context) for view in views),
         "query_heads": heads, "kv_heads": kv_heads, "head_dim": width,
         "query_dtype": model.activation_dtype, "kv_dtype": quant.kv_dtype,
-        "causal": not plan.noncausal_attention, "window": plan.window or 0,
-        "cp": parallel.cp,
+        "causal": not plan.noncausal_attention, "window": eff_win,
+        "cp": eff_cp,
     }),)
 
 
@@ -289,7 +317,7 @@ def _store_cache(ops, *, prefix, deps, rows, width, region, stage, layer,
 
 
 def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
-        padded_tokens, policy=AttentionPolicy(), cp_interleave_size=128,
+        padded_tokens, policy=AttentionPolicy(), cp_interleave_size=DEFAULT_CP_INTERLEAVE,
         runtime=None, cache_ids=None, stage_of=None, topk_ids=None,
         index_cache_ids=None, candidate_ids=None, **_) -> AttentionResult:
     from .implementations import select
@@ -369,12 +397,16 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     # The gather consumes rotary output, so rotary must precede cache writes
     # in the emitted graph order; it is also a dependency of the gather.
     ops.insert(ops.index(gather) if pcp_prefill else len(ops), rope)
+    max_dcp = max((active_dcp_degree(parallel, v.phase) for v in views), default=ONE)
     store_rows = max(
-        sum(owned_positions(v.context,
-                            v.context + (v.global_q_len or v.q_len) - 1,
-                            parallel.cp, cp_interleave_size, rank)
+        sum(
+            (v.global_q_len or v.q_len)
+            if active_dcp_degree(parallel, v.phase) <= ONE else
+            owned_positions(v.context,
+                            v.context + (v.global_q_len or v.q_len) - ONE,
+                            max_dcp, cp_interleave_size, rank)
             for v in views)
-        for rank in range(parallel.cp))
+        for rank in range(max_dcp))
     store_deps = ((store_ready, value_ready)
                   if value_ready and not pcp_prefill else (store_ready,))
     if shared:
@@ -425,11 +457,44 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     eff_topk = int(plan.index_topk) if has_indexer else 0
     index_store_id = candidate_id = None
     topk_id = (topk_ids or {}).get(sel_owner) if sel_owner >= 0 else None
-    if eff_topk > 0 and (plan.indexer or plan.owns_index_k or plan.owns_topk):
-        cost = index_selection_cost(model, plan, max(v.kv_len for v in views))
+    block_size = max(
+        ONE, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
+    configured_families = runtime.kernels.get("families", {}) if runtime else {}
+    user_pinned_idx = (
+        "indexer" in configured_families or "index_scores" in configured_recipes)
+    if eff_topk > ZERO and (plan.indexer or plan.owns_index_k or plan.owns_topk):
+        cost = index_selection_cost(
+            model, plan, max((v.kv_len for v in views), default=ZERO))
         row_bytes = cost.index_row_bytes or index_row_bytes(model, plan.index_dim)
-        idx_heads = max(1, int(plan.index_heads or 1))
-        idx_dim = max(1, int(plan.index_dim or 64))
+        idx_heads = max(ONE, int(plan.index_heads or ONE))
+        idx_dim = max(ONE, int(plan.index_dim or DEFAULT_IDX_DIM))
+        idx_ratio = max(ONE, int(plan.compress_ratio or ONE), int(plan.index_kpool or ONE))
+        cand_cap = (plan.candidate_topk_blocks * plan.candidate_block_size
+                    if plan.candidate_filter else ZERO)
+        new_idx_rows = (
+            sum(completed_rows(v.context + e_p, idx_ratio)
+                - completed_rows(v.context + s_p, idx_ratio)
+                for v in views
+                for s_p, e_p in (v.query_ranges or ((ZERO, v.q_len),))
+                if e_p > s_p)
+            if idx_ratio > ONE else valid
+        )
+        rows_by_view: list[int] = []
+        shared_idx_by_view: list[int] = []
+        for v in views:
+            v_ranges = v.query_ranges or ((ZERO, v.q_len),)
+            v_scored = int(sum(
+                _long_selected_pairs(
+                    e_p - s_p, v.context + s_p, idx_ratio, cand_cap,
+                    noncausal=bool(plan.noncausal_attention), kv_len=v.kv_len)
+                for s_p, e_p in v_ranges if e_p > s_p
+            ))
+            raw_pref = max(ZERO, min(int(getattr(v, "prefix_tokens", ZERO) or ZERO), int(v.context)))
+            aligned_pref = ((raw_pref // block_size) * block_size) // idx_ratio
+            q_cnt = sum(e_p - s_p for s_p, e_p in v_ranges if e_p > s_p)
+            rows_by_view.append(v_scored)
+            shared_idx_by_view.append(min(v_scored, aligned_pref * max(ONE, q_cnt)))
+        scored_rows = sum(rows_by_view)
         idx_wq = gemm_op(
             op_id=prefix + ".index_wq", deps=(deps,), stage=stage, layer=plan.index,
             requests=requests, m=padded_tokens, n=idx_heads * idx_dim, k=model.hidden_size,
@@ -443,128 +508,245 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         idx_store = cache_store_op(
             op_id=prefix + ".index_store", deps=(idx_wk.op_id,), stage=stage,
             layer=plan.index, requests=requests, phase=mode, recipe="index_store",
-            rows=cost.scored_rows, row_bytes=max(1, int(round(row_bytes))),
+            rows=new_idx_rows, row_bytes=max(ONE, int(round(row_bytes))),
             dtype=quant.index_dtype, kind="index")
-        shape = (cost.scored_rows, idx_heads, idx_dim)
+        q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
+        shape = (scored_rows, idx_heads, idx_dim)
         idx_scores = OpSpec(
             op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
             layer=plan.index, requests=requests, semantic_shape=shape, local_shape=shape,
             padded_shape=shape, launch_shape=shape,
-            flops=2 * cost.scored_rows * idx_heads * idx_dim,
-            vector_ops=cost.scored_rows * idx_heads * 3,
-            hbm_bytes=cost.scored_rows * (row_bytes + 4),
-            mte2_bytes=cost.scored_rows * row_bytes, mte3_bytes=cost.scored_rows * 4,
+            flops=float(TWO * scored_rows * idx_heads * idx_dim),
+            vector_ops=float(THREE * scored_rows * idx_heads),
+            hbm_bytes=float(scored_rows * (row_bytes + FP32_BYTES) + q_idx_bytes),
+            mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
+            mte3_bytes=float(scored_rows * FP32_BYTES),
             deps=(idx_wq.op_id, idx_store.op_id), recipe="index_scores",
             dtype=quant.index_dtype)
+        idx_scores = apply_indexer_prefix_reads(
+            idx_scores, views=views, rows_by_view=rows_by_view,
+            shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
+            layer_index=plan.index, runtime=runtime,
+            kernel_reuse="native_per_sequence" if user_pinned_idx else "tile",
+            allow_recipe_rebind=not user_pinned_idx)
         idx_topk = vector_op(
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
-            layer=plan.index, requests=requests, elements=cost.scored_rows,
-            ops_per_element=4, dtype="fp32", family="topk", phase=mode,
-            recipe="index_topk", shape=(valid, eff_topk), read_write=1.0,
+            layer=plan.index, requests=requests, elements=scored_rows,
+            ops_per_element=FOUR, dtype="fp32", family="topk", phase=mode,
+            recipe="index_topk", shape=(valid, eff_topk), read_write=READ_WRITE_ONE,
             metadata=(("selection_output_dtype", "int32"),))
         ops.extend((idx_wq, idx_wk, idx_store, idx_scores, idx_topk))
         index_store_id, topk_id = idx_store.op_id, idx_topk.op_id
-    elif idx_owner >= 0:
+    elif idx_owner >= ZERO:
         index_store_id = (index_cache_ids or {}).get(idx_owner)
-    eff_window = ((min(plan.window, eff_topk) if plan.window else eff_topk)
-                  if eff_topk > 0 else plan.window)
+    eff_window = min_positive(plan.window, eff_topk)
+    dense_win = int(plan.window or ZERO)
     attention_deps = (*store_ids, topk_id) if topk_id else store_ids
-    attention, batches = [], []
+    streams = kv_heads if policy.reuse_kv_across_query_heads else heads
+    kv_row_bytes = (
+        key_fmt.row_bytes(TWO * streams * width) if shared_format
+        else key_fmt.row_bytes(streams * width) + value_fmt.row_bytes(streams * width)
+    )
+    user_pinned_attn = (
+        "attention" in configured_families
+        or attention_recipe in configured_recipes
+        or "flash_attention" in configured_recipes)
+    phase_groups: list[tuple[int, list[tuple[int, object]]]] = []
+    group_map: dict[int, list[tuple[int, object]]] = {}
     for index, view in enumerate(views):
-        q, context = view.q_len, view.context
-        ranges = view.query_ranges or ((0, q),)
-        pairs = (q * view.kv_len if plan.noncausal_attention else
-                 sum(_causal_pairs(end - start, context + start, eff_window) for start, end in ranges if end > start))
-        local_pairs, local_rows = pairs, view.kv_len
-        if parallel.cp > 1:
-            if plan.noncausal_attention:
-                local_pairs = split_causal_pairs(
-                    q, view.kv_len - q, parallel.cp, cp_interleave_size,
-                    window=eff_window, noncausal=True).max_rank
-            else:
-                local_pairs = max(
-                    sum(split_causal_pairs(end - start, context + start, parallel.cp, cp_interleave_size,
-                                           window=eff_window, noncausal=False).per_rank[r]
-                        for start, end in ranges if end > start)
-                    for r in range(parallel.cp)
+        eff_cp = active_dcp_degree(parallel, view.phase)
+        if eff_cp not in group_map:
+            bucket: list[tuple[int, object]] = []
+            group_map[eff_cp] = bucket
+            phase_groups.append((eff_cp, bucket))
+        group_map[eff_cp].append((index, view))
+    attention: list[str] = []
+    multi_group = len(phase_groups) > ONE
+    for grp_idx, (eff_cp, indexed_views) in enumerate(phase_groups):
+        grp_views = tuple(v for _, v in indexed_views)
+        grp_reqs = tuple(v.request_id for v in grp_views)
+        grp_valid = sum(v.q_len for v in grp_views)
+        grp_prefix = f"{prefix}.phase{grp_idx}" if multi_group else prefix
+        rank_pairs = [ZERO_FLOAT] * eff_cp
+        rank_sweeps = [ZERO] * eff_cp
+        rank_rows = [ZERO] * eff_cp
+        per_view_pairs: list[tuple[float, list[float]]] = []
+        per_view_sweeps: list[list[int]] = []
+        per_view_shared: list[list[int]] = []
+        per_view_rows: list[list[int]] = []
+        for _, view in indexed_views:
+            q, context = view.q_len, view.context
+            ranges = view.query_ranges or ((ZERO, q),)
+            selected_q = sum(end - start for start, end in ranges if end > start)
+            if eff_topk > ZERO:
+                pairs = sum(
+                    _long_selected_pairs(
+                        end - start, context + start, ONE, eff_window,
+                        noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
+                    for start, end in ranges if end > start
                 )
-            local_rows = max(owned_positions(0, view.kv_len - 1, parallel.cp, cp_interleave_size, rank)
-                             for rank in range(parallel.cp))
-        # One K/V sweep per query tile, cropped to each tile's causal horizon.
-        # The final tile is real work, not a full padded sequence.
-        sweeps = [0] * parallel.cp
-        for begin, end in ranges:
-            for start in range(begin, end, policy.query_tile):
-                hi = view.kv_len if plan.noncausal_attention else context + min(end, start + policy.query_tile)
-                lo = max(0, context + start + 1 - eff_window) if eff_window else 0
-                for rank in range(parallel.cp):
-                    sweeps[rank] += owned_positions(lo, hi - 1, parallel.cp, cp_interleave_size, rank)
-        streams = kv_heads if policy.reuse_kv_across_query_heads else heads
-        kv_bytes = max(sweeps) * (
-            key_fmt.row_bytes(2 * streams * width) if shared_format
-            else key_fmt.row_bytes(streams * width)
-            + value_fmt.row_bytes(streams * width))
-        input_bytes = q * heads * width * dtype_bytes(model.activation_dtype)
-        shape = (q, view.kv_len, heads, width)
-        op = OpSpec(
-            op_id=f"{prefix}.attention.{index}", family="attention", phase=mode,
-            stage=stage, layer=plan.index, requests=(view.request_id,),
-            semantic_shape=shape, local_shape=(q, local_rows, heads, width),
-            padded_shape=shape, launch_shape=shape, flops=4 * local_pairs * heads * width,
-            vector_ops=5 * local_pairs * heads, hbm_bytes=kv_bytes + 2 * input_bytes,
-            mte2_bytes=kv_bytes + input_bytes, mte3_bytes=input_bytes,
-            deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
-            metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
-                      ("local_pairs", local_pairs), ("kv_streams", streams))
-                     + _decode_contract(
-                         (view,), heads, kv_heads, width, model, quant, parallel, plan, mode)
-                     + _prefill_contract(
-                         (view,), heads, kv_heads, width, model, quant, parallel, plan, mode)
-                     + _attention_tensor_view(
-                         (view,), heads, kv_heads, width, model, quant, parallel,
-                         policy, runtime,
-                         causal=not plan.noncausal_attention),
-        )
-        if selected:
-            op = selected.module.lower_op(
-                op, view=view, plan=plan, key_heads=kv_heads, model=model,
-                runtime=runtime, **selected.options)
-        batches.append(op)
-        last = op.op_id
-        if parallel.cp > 1:
-            ops.append(op)
-            merged, last = dcp_partial_merge_ops(
-                prefix=f"{prefix}.request{index}", view=view, cp=parallel.cp,
+                gathers = sum(
+                    sparse_attention_traffic(
+                        end - start, context + start, eff_window,
+                        query_tile=policy.query_tile,
+                        noncausal=bool(plan.noncausal_attention),
+                        kv_len=view.kv_len).gather_rows
+                    for start, end in ranges if end > start
+                )
+                v_pairs = [float(pairs) / eff_cp] * eff_cp
+                v_sweeps = [math.ceil(gathers / eff_cp)] * eff_cp
+                v_shared = [ZERO] * eff_cp
+            else:
+                visible_kv = min(view.kv_len, dense_win) if dense_win > ZERO else view.kv_len
+                pairs = (
+                    float(selected_q * visible_kv) if plan.noncausal_attention else
+                    sum(_causal_pairs(end - start, context + start, dense_win)
+                        for start, end in ranges if end > start)
+                )
+                if eff_cp == ONE:
+                    v_pairs = [float(pairs)]
+                elif plan.noncausal_attention:
+                    v_pairs = list(split_causal_pairs(
+                        selected_q, view.kv_len - selected_q, eff_cp, cp_interleave_size,
+                        window=dense_win, noncausal=True).per_rank)
+                else:
+                    v_pairs = [
+                        sum(split_causal_pairs(
+                            end - start, context + start, eff_cp, cp_interleave_size,
+                            window=dense_win, noncausal=False).per_rank[r]
+                            for start, end in ranges if end > start)
+                        for r in range(eff_cp)
+                    ]
+                v_sweeps = [ZERO] * eff_cp
+                v_shared = [ZERO] * eff_cp
+                raw_prefix = max(ZERO, min(int(getattr(view, "prefix_tokens", ZERO) or ZERO), int(context)))
+                aligned_prefix = (raw_prefix // block_size) * block_size
+                for begin, end in ranges:
+                    for start in range(begin, end, policy.query_tile):
+                        if plan.noncausal_attention:
+                            hi = view.kv_len
+                            lo = max(ZERO, hi - dense_win) if dense_win > ZERO else ZERO
+                        else:
+                            hi = context + min(end, start + policy.query_tile)
+                            lo = max(ZERO, context + start + ONE - dense_win) if dense_win > ZERO else ZERO
+                        shared_hi = min(hi, aligned_prefix)
+                        for rank in range(eff_cp):
+                            v_sweeps[rank] += owned_positions(
+                                lo, hi - ONE, eff_cp, cp_interleave_size, rank)
+                            if shared_hi > lo:
+                                v_shared[rank] += owned_positions(
+                                    lo, shared_hi - ONE, eff_cp, cp_interleave_size, rank)
+            v_rows = (
+                [owned_positions(ZERO, view.kv_len - ONE, eff_cp, cp_interleave_size, r)
+                 for r in range(eff_cp)]
+                if eff_cp > ONE else [view.kv_len]
+            )
+            for r in range(eff_cp):
+                rank_pairs[r] += v_pairs[r]
+                rank_sweeps[r] += v_sweeps[r]
+                rank_rows[r] += v_rows[r]
+            per_view_pairs.append((float(pairs), v_pairs))
+            per_view_sweeps.append(v_sweeps)
+            per_view_shared.append(v_shared)
+            per_view_rows.append(v_rows)
+        worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
+        batches: list[OpSpec] = []
+        sweeps_by_view: list[int] = []
+        shared_sweeps_by_view: list[int] = []
+        total_pairs_sum = ZERO_FLOAT
+        total_rows_sum = ZERO
+        for v_pos, (orig_idx, view) in enumerate(indexed_views):
+            pairs, v_pairs = per_view_pairs[v_pos]
+            local_pairs = v_pairs[worst_r]
+            view_sweeps = per_view_sweeps[v_pos][worst_r]
+            local_rows = per_view_rows[v_pos][worst_r]
+            sweeps_by_view.append(view_sweeps)
+            shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_r]))
+            total_pairs_sum += pairs
+            total_rows_sum += view.kv_len
+            kv_bytes = view_sweeps * kv_row_bytes
+            input_bytes = view.q_len * heads * width * dtype_bytes(model.activation_dtype)
+            shape = (view.q_len, view.kv_len, heads, width)
+            op = OpSpec(
+                op_id=f"{prefix}.attention.{orig_idx}", family="attention", phase=mode,
+                stage=stage, layer=plan.index, requests=(view.request_id,),
+                semantic_shape=shape, local_shape=(view.q_len, local_rows, heads, width),
+                padded_shape=shape, launch_shape=shape, flops=FOUR * local_pairs * heads * width,
+                vector_ops=FIVE * local_pairs * heads, hbm_bytes=kv_bytes + TWO * input_bytes,
+                mte2_bytes=kv_bytes + input_bytes, mte3_bytes=input_bytes,
+                deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
+                metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
+                          ("local_pairs", local_pairs), ("kv_streams", streams))
+                         + _decode_contract(
+                             (view,), heads, kv_heads, width, model, quant, parallel, plan, mode,
+                             window=eff_window, cp=eff_cp)
+                         + _prefill_contract(
+                             (view,), heads, kv_heads, width, model, quant, parallel, plan, mode,
+                             window=eff_window, cp=eff_cp)
+                         + _attention_tensor_view(
+                             (view,), heads, kv_heads, width, model, quant, parallel,
+                             policy, runtime, causal=not plan.noncausal_attention),
+            )
+            if selected:
+                op = selected.module.lower_op(
+                    op, view=view, plan=plan, key_heads=kv_heads, model=model,
+                    runtime=runtime, **selected.options)
+            batches.append(op)
+        grp_attn: list[str] = []
+        if policy.fused_batch and not selected and batches:
+            fields = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
+            batched = replace(
+                batches[ZERO], op_id=grp_prefix + ".attention", requests=grp_reqs,
+                semantic_shape=(grp_valid, max(v.kv_len for v in grp_views), heads, width),
+                local_shape=(grp_valid, rank_rows[worst_r], heads, width),
+                metadata=(("request_shapes", tuple((v.q_len, v.context) for v in grp_views)),
+                          ("query_tile", policy.query_tile),
+                          ("kv_streams", streams))
+                         + _decode_contract(
+                             grp_views, heads, kv_heads, width, model, quant,
+                             parallel, plan, mode, window=eff_window, cp=eff_cp)
+                         + _prefill_contract(
+                             grp_views, heads, kv_heads, width, model, quant,
+                             parallel, plan, mode, window=eff_window, cp=eff_cp)
+                         + _attention_tensor_view(
+                             grp_views, heads, kv_heads, width, model, quant, parallel,
+                             policy, runtime, causal=not plan.noncausal_attention),
+                **{key: sum(getattr(op, key) for op in batches) for key in fields})
+            if eff_topk > ZERO:
+                batched = annotate_sparse_prefix_unknown(batched, runtime)
+            else:
+                batched = apply_attention_prefix_reads(
+                    batched, views=grp_views, sweeps_by_view=sweeps_by_view,
+                    shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
+                    layer_index=plan.index, runtime=runtime,
+                    kernel_reuse="native_per_sequence" if user_pinned_attn else "tile",
+                    allow_recipe_rebind=not user_pinned_attn,
+                )
+            ops.append(batched)
+            grp_attn = [batched.op_id]
+        elif batches:
+            if eff_topk > ZERO:
+                batches = [annotate_sparse_prefix_unknown(item, runtime) for item in batches]
+            else:
+                batches[ZERO] = apply_attention_prefix_reads(
+                    batches[ZERO], views=grp_views, sweeps_by_view=sweeps_by_view,
+                    shared_sweeps_by_view=shared_sweeps_by_view, row_bytes=float(kv_row_bytes),
+                    layer_index=plan.index, runtime=runtime,
+                    kernel_reuse="native_per_sequence", allow_recipe_rebind=False,
+                )
+            ops.extend(batches)
+            grp_attn = [item.op_id for item in batches]
+        if eff_cp > ONE and grp_attn:
+            merged, merged_last = dcp_partial_merge_ops(
+                prefix=grp_prefix, views=grp_views, cp=eff_cp,
                 local_heads=heads, v_dim=width, stage=stage, layer=plan.index, mode=mode,
-                deps=(last,), total_pairs=pairs, local_pairs=local_pairs,
-                total_rows=view.kv_len, local_rows=local_rows, interleave=cp_interleave_size,
+                deps=tuple(grp_attn), total_pairs=total_pairs_sum, local_pairs=rank_pairs[worst_r],
+                total_rows=total_rows_sum, local_rows=rank_rows[worst_r],
+                interleave=cp_interleave_size,
             )
             ops.extend(merged)
-        attention.append(last)
-    if parallel.cp == 1 and policy.fused_batch and not selected:
-        from dataclasses import replace
-        fields = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
-        batched = replace(batches[0], op_id=prefix + ".attention", requests=requests,
-                          semantic_shape=(valid, max(v.kv_len for v in views), heads, width),
-                          local_shape=(valid, sum(v.kv_len for v in views), heads, width),
-                          metadata=(("request_shapes", tuple((v.q_len, v.context) for v in views)),
-                                    ("query_tile", policy.query_tile),
-                                    ("kv_streams", kv_heads if policy.reuse_kv_across_query_heads else heads))
-                                   + _decode_contract(
-                                       views, heads, kv_heads, width, model, quant,
-                                       parallel, plan, mode)
-                                   + _prefill_contract(
-                                       views, heads, kv_heads, width, model, quant,
-                                       parallel, plan, mode)
-                                   + _attention_tensor_view(
-                                       views, heads, kv_heads, width, model, quant, parallel,
-                                       policy, runtime,
-                                       causal=not plan.noncausal_attention),
-                          **{key: sum(getattr(op, key) for op in batches) for key in fields})
-        ops.append(batched)
-        attention = [batched.op_id]
-    elif parallel.cp == 1:
-        ops.extend(batches)
+            grp_attn = [merged_last]
+        attention.extend(grp_attn)
     if plan.q_output_gate:
         gate_ready = split_copies[-1].op_id if split_copies else qkv.op_id
         gate = vector_op(

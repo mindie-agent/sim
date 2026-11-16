@@ -48,6 +48,10 @@ from mindie_sim.schema.tensors import TensorLayout
 from .families_bridge import (
     FamilyDeclaration, TypedOperand, register_family_operands,
 )
+
+OWNERS_R64 = 32
+ZERO = 0
+ONE = 1
 from .compiler import (
     CompiledOperator, FamilyTemplate, SegmentAxis, _demand, _frac, _out_name,
 )
@@ -182,11 +186,15 @@ def _packed_indexed_hbm(keys_total: int, heads: int, latent: int) -> Fraction:
     return Fraction(total)
 
 
-def _sparse_rows_for_request(request, topk, ratio, kpool=1, always_tail=False):
-    """Sum causal selected rows over this request's real positions only."""
-    total = 0
+def _sparse_rows_for_request(request, topk, ratio, kpool=ONE, always_tail=False,
+                             *, causal=True):
+    """Sum causal or noncausal selected rows over this request's real positions."""
+    if not causal:
+        per_q = selected_token_rows(int(request.kv_len), ratio, topk, kpool, always_tail)
+        return int(request.q_len) * per_q
+    total = ZERO
     for offset in range(int(request.q_len)):
-        total += selected_token_rows(int(request.context) + offset + 1,
+        total += selected_token_rows(int(request.context) + offset + ONE,
                                      ratio, topk, kpool, always_tail)
     return total
 
@@ -300,46 +308,47 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
             compressed_new += req_mult * k1_new_rows(request.kv_len, selected_q_len,
                                                      s["ratio"])
             sel_positions = sel_tiles = 0
-            if positions is None and s["topk"] > 0 and s["kpool"] <= 1:
-                sat = max(0, min(query, s["topk"] * max(1, s["ratio"]) - context - 1))
-                sat_tiles = min(n_qt, _ceil_div((sat + 1) * group, mt) + 1)
-                tile_picks = [0] * sat_tiles
+            if causal and positions is None and s["topk"] > ZERO and s["kpool"] <= ONE:
+                sat = max(ZERO, min(query, s["topk"] * max(ONE, s["ratio"]) - context - ONE))
+                sat_tiles = min(n_qt, _ceil_div((sat + ONE) * group, mt) + ONE)
+                tile_picks = [ZERO] * sat_tiles
                 for index in range(sat):
-                    picked = selected_token_rows(context + index + 1, s["ratio"],
+                    picked = selected_token_rows(context + index + ONE, s["ratio"],
                                                  s["topk"], s["kpool"], s["always_tail"])
                     sel_positions += picked
                     if picked:
                         sel_tiles += _ceil_div(picked, nt)
-                    for ti in range((index * group) // mt, min(sat_tiles, ((index + 1) * group - 1) // mt + 1)):
+                    for ti in range((index * group) // mt, min(sat_tiles, ((index + ONE) * group - ONE) // mt + ONE)):
                         tile_picks[ti] += picked
                 rem = query - sat
-                if rem > 0:
+                if rem > ZERO:
                     sel_positions += rem * s["topk"]
                     sel_tiles += rem * _ceil_div(s["topk"], nt)
-                    for index in range(sat, min(query, (sat_tiles * mt + group - 1) // group)):
-                        for ti in range((index * group) // mt, min(sat_tiles, ((index + 1) * group - 1) // mt + 1)):
+                    for index in range(sat, min(query, (sat_tiles * mt + group - ONE) // group)):
+                        for ti in range((index * group) // mt, min(sat_tiles, ((index + ONE) * group - ONE) // mt + ONE)):
                             tile_picks[ti] += s["topk"]
                     if n_qt > sat_tiles:
-                        full_t = min(n_qt - 1, rows_total // mt - 1)
+                        full_t = min(n_qt - ONE, rows_total // mt - ONE)
                         if full_t >= sat_tiles:
-                            toks = (full_t * mt + mt - 1) // group - (full_t * mt) // group + 1
+                            toks = (full_t * mt + mt - ONE) // group - (full_t * mt) // group + ONE
                             tile_picks.append(toks * s["topk"])
-                        last_toks = (rows_total - 1) // group - ((n_qt - 1) * mt) // group + 1
+                        last_toks = (rows_total - ONE) // group - ((n_qt - ONE) * mt) // group + ONE
                         tile_picks.append(last_toks * s["topk"])
             else:
-                tile_picks = [0] * n_qt
+                tile_picks = [ZERO] * n_qt
                 token_iter = positions if positions is not None else range(query)
                 for index, token in enumerate(token_iter):
-                    picked = selected_token_rows(context + token + 1, s["ratio"],
+                    pos_horizon = (context + token + ONE) if causal else int(request.kv_len)
+                    picked = selected_token_rows(pos_horizon, s["ratio"],
                                                  s["topk"], s["kpool"],
                                                  s["always_tail"])
                     sel_positions += picked
                     if picked:
                         sel_tiles += _ceil_div(picked, nt)
                     first_tile = (index * group) // mt
-                    last_tile = ((index + 1) * group - 1) // mt
+                    last_tile = ((index + ONE) * group - ONE) // mt
                     for tile_index in range(first_tile,
-                                            min(n_qt, last_tile + 1)):
+                                            min(n_qt, last_tile + ONE)):
                         tile_picks[tile_index] += picked
             # DCP shards the SFA KV cache. The replicated indexer/TopK stays
             # global, then the retained source remaps each top-k index to the
@@ -362,7 +371,7 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
                 local_tile_picks = [0] * n_qt
                 token_iter = positions if positions is not None else range(query)
                 for index, token in enumerate(token_iter):
-                    position = context + token + 1
+                    position = (context + token + ONE) if causal else int(request.kv_len)
                     picked = selected_token_rows(
                         position, s["ratio"], s["topk"], s["kpool"],
                         s["always_tail"])
@@ -535,11 +544,11 @@ def _attention_metrics(ctx: CompiledOperator, operator, geometry,
         core_count = max(1, int(s["cores"]))
         per_core = max(1, -(-q_tokens // core_count))
         rows = sum(_sparse_rows_for_request(req, s["topk"], s["ratio"],
-                                            s["kpool"], s["always_tail"])
+                                            s["kpool"], s["always_tail"], causal=causal)
                    for req in geometry.requests)
         per_query = [selected_token_rows(
-            int(req.context) + offset + 1, s["ratio"], s["topk"],
-            s["kpool"], s["always_tail"])
+            (int(req.context) + offset + ONE) if causal else int(req.kv_len),
+            s["ratio"], s["topk"], s["kpool"], s["always_tail"])
             for req in geometry.requests for offset in range(int(req.q_len))]
         aligned = [((value + 15) // 16) * 16 for value in per_query]
         max_core_pairs = max(
@@ -815,7 +824,7 @@ def _finite_double_buffer(stages, *, load_free=0, compute_free=0):
     return last, load_busy, compute_busy
 
 
-def _sparse_mte1_rate(ctx, geometry, q_tokens, static) -> tuple[Fraction | None, dict]:
+def _sparse_mte1_rate(ctx, geometry, q_tokens, static, *, causal=True) -> tuple[Fraction | None, dict]:
     """Resolve the SAT5 scoped sparse MTE1 service through the shared selector."""
     if (q_tokens < 1024 or static.get("heads") != 64
             or static.get("rkv") != 512 or static.get("dv") != 256
@@ -859,7 +868,7 @@ def _sparse_mte1_rate(ctx, geometry, q_tokens, static) -> tuple[Fraction | None,
     selected = select_resource_service(
         records, hardware=hardware, source_identity=source_identity,
         dtype="bf16", q_len=int(req.q_len), context=int(req.context),
-        kv_len=int(req.kv_len), causal=True, owners=32,
+        kv_len=int(req.kv_len), causal=bool(causal), owners=OWNERS_R64,
         phase="prefill", op_state="dynamic",
         mix_block_num=meta.get("mix_block_num"))
     if not selected:
@@ -871,6 +880,7 @@ def _sparse_mte1_rate(ctx, geometry, q_tokens, static) -> tuple[Fraction | None,
 def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
     static = _static_attention(ctx, operator, mla=True)
     axes = _attention_axes(static, ctx)
+    causal = bool(operator.theta.find("causal", ONE))
 
     def binder(geometry, state):
         return _attention_metrics(ctx, operator, geometry, mla=True)
@@ -879,11 +889,11 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
         if not static.get("packed_sparse"):
             return None
         q_tokens = sum(int(req.q_len) for req in geometry.requests)
-        cores = max(1, int(static["cores"]))
-        per_core = max(1, -(-q_tokens // cores))
+        cores = max(ONE, int(static["cores"]))
+        per_core = max(ONE, -(-q_tokens // cores))
         per_query = [selected_token_rows(
-            int(req.context) + offset + 1, static["ratio"], static["topk"],
-            static["kpool"], static["always_tail"])
+            (int(req.context) + offset + ONE) if causal else int(req.kv_len),
+            static["ratio"], static["topk"], static["kpool"], static["always_tail"])
             for req in geometry.requests for offset in range(int(req.q_len))]
         aligned = [((value + 15) // 16) * 16 for value in per_query]
         chunks = [sum(aligned[start:start + per_core])
@@ -897,7 +907,8 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
         vec = Fraction(str(ctx.supply.effective("vector"))) / cores
         mte1 = Fraction(str(ctx.supply.effective("mte1"))) / cores
         measured_rate, measured_meta = _sparse_mte1_rate(
-            ctx, geometry, sum(int(req.q_len) for req in geometry.requests), static)
+            ctx, geometry, sum(int(req.q_len) for req in geometry.requests), static,
+            causal=causal)
         if measured_rate is not None:
             mte1 = measured_rate
         mte3 = Fraction(str(ctx.supply.effective("mte3"))) / cores
@@ -1131,8 +1142,8 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
         cores = max(1, int(static["cores"]))
         per_core = max(1, -(-q_tokens // cores))
         per_query = [selected_token_rows(
-            int(req.context) + offset + 1, static["ratio"], static["topk"],
-            static["kpool"], static["always_tail"])
+            (int(req.context) + offset + ONE) if causal else int(req.kv_len),
+            static["ratio"], static["topk"], static["kpool"], static["always_tail"])
             for req in geometry.requests for offset in range(int(req.q_len))]
         aligned = [((value + 15) // 16) * 16 for value in per_query]
         chunks = [sum(aligned[start:start + per_core])
@@ -1146,7 +1157,8 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
         vec = Fraction(str(ctx.supply.effective("vector"))) / cores
         mte1 = Fraction(str(ctx.supply.effective("mte1"))) / cores
         measured_rate, measured_meta = _sparse_mte1_rate(
-            ctx, geometry, sum(int(req.q_len) for req in geometry.requests), static)
+            ctx, geometry, sum(int(req.q_len) for req in geometry.requests), static,
+            causal=causal)
         if measured_rate is not None:
             mte1 = measured_rate
         mte3 = Fraction(str(ctx.supply.effective("mte3"))) / cores
@@ -1211,8 +1223,8 @@ def _compile_mla(ctx: CompiledOperator, operator) -> FamilyTemplate:
         cores = max(1, int(static["cores"]))
         per_core = max(1, -(-q_tokens // cores))
         per_query = [selected_token_rows(
-            int(req.context) + offset + 1, static["ratio"], static["topk"],
-            static["kpool"], static["always_tail"])
+            (int(req.context) + offset + ONE) if causal else int(req.kv_len),
+            static["ratio"], static["topk"], static["kpool"], static["always_tail"])
             for req in geometry.requests for offset in range(int(req.q_len))]
         aligned = [((value + 15) // 16) * 16 for value in per_query]
         critical_rows = max(

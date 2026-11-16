@@ -41,6 +41,10 @@ from .implementation_selection import (
     annotate as annotate_selections,
 )
 
+ZERO = 0
+ONE = 1
+ZERO_FLOAT = 0.0
+
 
 def _scope(ops, block, role="body"):
     """The composing builder owns scope; operator names do not identify it."""
@@ -522,14 +526,25 @@ class Frontend:
             metadata=(("selection", "all_verify_rows_or_last_prefill_row"),))
 
     @staticmethod
-    def partition_views(views, runtime, padded):
+    def partition_views(views, runtime, padded, *, model=None):
         degree = runtime.parallel.pcp
-        if degree == 1 or not any(v.phase == "prefill" for v in views):
+        if degree == ONE or not any(v.phase == "prefill" for v in views):
             return views, padded, False
-        costs = [0.0] * degree
+        rep_win = ZERO
+        plans = getattr(model, "layer_plans", ()) if model is not None else ()
+        attn_plans = [
+            lp for lp in plans
+            if lp.attention in {"gqa", "mla"} and lp.cache_kind != "recurrent_unmodeled"
+        ]
+        if attn_plans and all(
+            int(lp.window) > ZERO and not lp.compress_ratio and not lp.index_topk
+            for lp in attn_plans
+        ):
+            rep_win = max(int(lp.window) for lp in attn_plans)
+        costs = [ZERO_FLOAT] * degree
         for view in views:
             if view.phase == "prefill":
-                split = split_pcp_pairs(view.q_len, view.context, degree)
+                split = split_pcp_pairs(view.q_len, view.context, degree, window=rep_win)
                 costs = [old + current for old, current in zip(costs, split.per_rank)]
         rank = max(range(degree), key=costs.__getitem__)
         ranges = [pcp_rank_chunk_ranges(view.q_len, degree, rank) for view in views]
@@ -664,7 +679,8 @@ class Frontend:
                                deps=tuple(rename[dep] for dep in op.deps) or (previous,))
                        for op in media.ops)
             previous = rename[media.last]
-        local_views, local_tokens, pcp_prefill = self.partition_views(views, runtime, padded)
+        local_views, local_tokens, pcp_prefill = self.partition_views(
+            views, runtime, padded, model=model)
         if valid:
             embedding = vector_op(
                 op_id="embedding", deps=(previous,), stage=0, layer=-1, requests=requests,

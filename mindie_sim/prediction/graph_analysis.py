@@ -148,6 +148,11 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
     graphs = bind_cohort_traffic(case, graphs)
+    from .local_projection_tp import lower_local_projection_tp_cohort
+    from .local_tp_groups import local_tp_spans_dp
+    if len(graphs) > 1:
+        graphs = lower_local_projection_tp_cohort(
+            graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     scopes = {r: _replay_scope(items, replay_scope) for r, items in graphs.items()}
     if any(value not in {"none", "full", "piecewise"} for value in scopes.values()):
         raise ValueError("graph_replay_scope_invalid")
@@ -156,13 +161,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         raise ValueError("graph_replica_outside_declared_placement")
     for items in graphs.values():
         _validate_graph(items, external)
-    groups = cohorts(case.runtime.parallel)
+    groups = cohorts(case.runtime.parallel, case.machine)
     group_for = {r: group for group in groups for r in group}
     for r, items in graphs.items():
         if case.runtime.parallel.ep_spans_dp and any(
             dict(op.metadata).get("group_axis") == "ep" for op in items
         ) and set(group_for[r]) - graphs.keys():
             raise ValueError("graph_expert_collective_requires_complete_cohort")
+        if local_tp_spans_dp(case.runtime.parallel) and any(
+            dict(op.metadata).get("group_axis") == "local_tp" for op in items
+        ) and set(group_for[r]) - graphs.keys():
+            raise ValueError("graph_local_tp_collective_requires_complete_cohort")
     records, streams = [], {}
     external_times = {_name(r, key): max(value, input_ready_ms)
                       for r in graphs for key, value in external.items()}
@@ -209,11 +218,17 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     # Aggregate recipes retain their rendezvous. Causal transport plans retain
     # rank entry and round dependencies instead of one all-cohort ready gate.
     joins = {}
-    if case.runtime.parallel.ep_spans_dp:
+    has_ltp = local_tp_spans_dp(case.runtime.parallel)
+    if case.runtime.parallel.ep_spans_dp or has_ltp:
         for record in records:
             op, r = record["op"], record["replica"]
-            if dict(op.metadata).get("group_axis") == "ep":
+            meta = dict(op.metadata)
+            axis = meta.get("group_axis")
+            if case.runtime.parallel.ep_spans_dp and axis == "ep":
                 joins.setdefault((group_for[r], op.op_id), []).append(record)
+            elif has_ltp and axis == "local_tp":
+                grp = tuple(meta.get("group_ranks") or group_for[r])
+                joins.setdefault((grp, op.op_id), []).append(record)
     for participants in joins.values():
         if all(item["collective_algorithm"] for item in participants):
             for item in participants:

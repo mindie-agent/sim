@@ -224,7 +224,10 @@ def _compile_node(expr: Any) -> EvalPair:
     raise ModelingError(f"expression_node_unknown:{cls.__name__}")
 
 
-@lru_cache(None)
+_MAX_COMPILED_CACHE = 4096
+
+
+@lru_cache(maxsize=_MAX_COMPILED_CACHE)
 def _compile_cached(expr: Any) -> EvalPair:
     return _compile_node(expr)
 

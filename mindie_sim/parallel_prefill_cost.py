@@ -54,6 +54,8 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 
+ONE = 1
+
 
 def _layer_view(plan: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
     attention = str(getattr(plan, "attention", "gqa") or "gqa").lower()
@@ -301,7 +303,7 @@ def prefill_step_ms(case: CaseSpec | Mapping[str, Any], *, isl: int,
                 groups = stage_groups(plan, stage, axis)
                 value = tp_payload
                 if axis == "dcp":
-                    if int(p.dcp) <= 1:
+                    if int(p.dcp) <= ONE or str(getattr(p, "prefill_cp_plan", "")) != "dcp":
                         continue
                     from mindie_sim.parallel_context import dcp_merge_payloads
                     value = dcp_merge_payloads(int(p.tp), int(p.dcp), size,

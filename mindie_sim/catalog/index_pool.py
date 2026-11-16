@@ -9,6 +9,10 @@
 """
 from dataclasses import dataclass
 
+ZERO = 0
+ONE = 1
+TWO = 2
+
 
 def completed_prefix(tokens, pool_size):
     """Sum floor(n / pool_size) for n in [1, tokens]."""
@@ -33,21 +37,32 @@ class PoolSelection:
     retained_tail_rows: int
 
 
-def pool_selection(query, context, topk, pool_size, *, always_select_tail):
-    """Aggregate independent causal queries, including a pool-crossing call."""
-    if min(query, context) < 0 or pool_size <= 0 or topk <= 0 or topk % pool_size:
+def pool_selection(query, context, topk, pool_size, *, always_select_tail,
+                   noncausal=False, kv_len=None):
+    """Aggregate independent causal or noncausal queries, including pool crossings."""
+    if min(query, context) < ZERO or pool_size <= ZERO or topk <= ZERO or topk % pool_size:
         raise ValueError("index_pool_requires_nonnegative_query_context_and_integral_topk_pools")
+    pool_topk = topk // pool_size
+    completed = (context + query) // pool_size - context // pool_size
+    if noncausal:
+        horizon = max(ZERO, int(kv_len) if kv_len is not None else int(context) + int(query))
+        pools, tail_rem = divmod(horizon, pool_size)
+        scanned = query * pools
+        selected = query * min(pools, pool_topk)
+        tails = query * tail_rem if always_select_tail else ZERO
+        return PoolSelection(
+            scanned, selected, selected * pool_size + tails, tails, completed,
+            context % pool_size if completed else ZERO, min(query, pool_size),
+        )
     scanned = (completed_prefix(context + query, pool_size)
                - completed_prefix(context, pool_size))
-    pool_topk = topk // pool_size
-    unsaturated = min(query, max(0, topk - context - 1))
+    unsaturated = min(query, max(ZERO, topk - context - ONE))
     selected = (completed_prefix(context + unsaturated, pool_size)
                 - completed_prefix(context, pool_size)
                 + (query - unsaturated) * pool_topk)
-    tails = (query * context + query * (query + 1) // 2 - pool_size * scanned
-             if always_select_tail else 0)
-    completed = (context + query) // pool_size - context // pool_size
+    tails = (query * context + query * (query + ONE) // TWO - pool_size * scanned
+             if always_select_tail else ZERO)
     return PoolSelection(
         scanned, selected, selected * pool_size + tails, tails, completed,
-        context % pool_size if completed else 0, min(query, pool_size),
+        context % pool_size if completed else ZERO, min(query, pool_size),
     )

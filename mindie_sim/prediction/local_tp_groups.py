@@ -93,6 +93,30 @@ def local_tp_groups(
     return tuple(groups)
 
 
+def _union_components(keys: Iterable[int], edges: Iterable[tuple[int, int]]) -> tuple[tuple[int, ...], ...]:
+    parent = {int(k): int(k) for k in keys}
+
+    def find(node: int) -> int:
+        root = node
+        while parent[root] != root:
+            root = parent[root]
+        while parent[node] != root:
+            nxt = parent[node]
+            parent[node] = root
+            node = nxt
+        return root
+
+    for left, right in edges:
+        if left in parent and right in parent:
+            a, b = find(left), find(right)
+            if a != b:
+                parent[max(a, b)] = min(a, b)
+    buckets: dict[int, list[int]] = {}
+    for node in sorted(parent):
+        buckets.setdefault(find(node), []).append(node)
+    return tuple(tuple(sorted(items)) for _, items in sorted(buckets.items()))
+
+
 def local_tp_cohorts(
     machine: Any, parallel: Any,
 ) -> tuple[tuple[int, ...], ...]:
@@ -100,41 +124,39 @@ def local_tp_cohorts(
     from mindie_sim.prediction.topology import Topology
 
     topology = Topology(machine, parallel)
-    parent = {rank: rank for rank in _rank_order(machine)}
-
-    def find(rank: int) -> int:
-        root = rank
-        while parent[root] != root:
-            root = parent[root]
-        while parent[rank] != rank:
-            following = parent[rank]
-            parent[rank] = root
-            rank = following
-        return root
-
-    def union(left: int, right: int) -> None:
-        a, b = find(left), find(right)
-        if a != b:
-            if b < a:
-                a, b = b, a
-            parent[b] = a
-
+    edges: list[tuple[int, int]] = []
     replicas = max(ONE, int(parallel.dp) * int(parallel.active_pcp_lanes))
     for stage in range(max(ONE, int(parallel.pp))):
         for replica in range(replicas):
             for group in topology.groups("ep", replica, stage):
-                for rank in group[ONE:]:
-                    if rank in parent and group[ZERO] in parent:
-                        union(group[ZERO], rank)
-    for stage in range(max(ONE, int(parallel.pp))):
+                edges.extend((group[ZERO], rank) for rank in group[ONE:])
         for width in _enabled_widths(parallel):
             for group in local_tp_groups(machine, parallel, stage=stage, width=width):
-                for rank in group[ONE:]:
-                    union(group[ZERO], rank)
-    components: dict[int, list[int]] = {}
-    for rank in sorted(parent):
-        components.setdefault(find(rank), []).append(rank)
-    return tuple(tuple(sorted(ranks)) for _, ranks in sorted(components.items()))
+                edges.extend((group[ZERO], rank) for rank in group[ONE:])
+    return _union_components(_rank_order(machine), edges)
+
+
+def local_tp_replica_cohorts(
+    machine: Any, parallel: Any,
+) -> tuple[tuple[int, ...], ...]:
+    """Projection of physical EP + local-TP connected components onto DP replicas."""
+    from mindie_sim.prediction.topology import Topology
+
+    topology = Topology(machine, parallel)
+    dp = max(ONE, int(parallel.dp))
+    edges: list[tuple[int, int]] = []
+    for stage in range(max(ONE, int(parallel.pp))):
+        owner = {int(rank): r for r in range(dp)
+                 for rank in topology.ranks(r, stage)}
+        for r in range(dp):
+            for group in topology.groups("ep", r, stage):
+                reps = [owner[int(rk)] for rk in group if int(rk) in owner]
+                edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
+        for width in _enabled_widths(parallel):
+            for group in local_tp_groups(machine, parallel, stage=stage, width=width):
+                reps = [owner[int(rk)] for rk in group if int(rk) in owner]
+                edges.extend((reps[ZERO], rep) for rep in reps[ONE:])
+    return _union_components(range(dp), edges)
 
 
 def validate_local_projection_tp(case: Any) -> None:

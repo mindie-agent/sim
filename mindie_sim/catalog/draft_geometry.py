@@ -66,6 +66,22 @@ def _reference_attention_plan(model, draft, index: int) -> LayerPlan | None:
                 index_kpool_always_select_tail=donor.index_kpool_always_select_tail,
                 index_input=donor.index_input,
             )
+    if not ref.owns_long_kv and ZERO <= ref.kv_owner_layer_id < len(model.layer_plans):
+        kv_donor = model.layer_plans[ref.kv_owner_layer_id]
+        if kv_donor.attention == draft.attention_kind and (
+            kv_donor.owns_long_kv or kv_donor.compress_ratio > ZERO
+        ):
+            ref = replace(
+                ref,
+                owns_long_kv=True,
+                compress_ratio=ref.compress_ratio if ref.compress_ratio > ZERO else kv_donor.compress_ratio,
+                compressor_kind=kv_donor.compressor_kind if ref.compressor_kind == "none" else ref.compressor_kind,
+                compressor_width=kv_donor.compressor_width if ref.compressor_kind == "none" else ref.compressor_width,
+                compressor_state_rows=(
+                    kv_donor.compressor_state_rows
+                    if ref.compressor_kind == "none" else ref.compressor_state_rows
+                ),
+            )
     return ref
 
 
@@ -96,7 +112,14 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
 
     swa_only = (
         explicit_ratio == ZERO
-        or (explicit_ratio is None and ref is not None and not ref.owns_long_kv and ref.window > ZERO)
+        or (
+            explicit_ratio is None
+            and ref is not None
+            and not ref.owns_long_kv
+            and ref.compress_ratio == ZERO
+            and ref.kv_owner_layer_id < ZERO
+            and ref.window > ZERO
+        )
     )
     if swa_only:
         window = int(draft.sliding_window or (ref.window if ref else ZERO))
@@ -117,12 +140,24 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         )
 
     if ref is None:
+        standalone_win = int(draft.sliding_window or getattr(draft, "window", ZERO) or ZERO)
+        standalone_comp = int(
+            explicit_ratio if explicit_ratio is not None
+            else (getattr(draft, "compress_ratio", ZERO) or ZERO)
+        )
+        standalone_arch = (
+            "swa" if standalone_win > ZERO and standalone_comp == ZERO else "full"
+        )
+        standalone_ck = "window_compressed" if standalone_comp > ZERO else "dense"
         return LayerPlan(
-            index=index, attention=draft.attention_kind, ffn="moe" if draft.num_experts else "dense",
+            index=index, attention=draft.attention_kind, architecture=standalone_arch,
+            ffn="moe" if draft.num_experts else "dense",
             moe_intermediate_size=draft.expert_intermediate_size, scope="draft",
             noncausal_attention=draft.noncausal_query_block,
             mla_variant=draft.mla_variant, kv_cache_elements=kv_elems,
             qk_norm=qk_norm, q_output_gate=q_gate,
+            cache_kind=standalone_ck, window=standalone_win,
+            compress_ratio=standalone_comp,
             kv_owner_layer_id=index, owns_long_kv=True,
             hyper_connections=bool(mhc), hc_mult=mhc, hc_sinkhorn_iters=mhc_iters,
             **plan_fields,
@@ -134,7 +169,9 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         "shared" if share_index_k
         else (ref.indexer_type if ref.indexer_type in {"full", "c4"} else "full")
     ) if has_indexer else "none"
-    owns_long = True if ref.cache_kind == "dense" else bool(ref.owns_long_kv)
+    owns_long = True if ref.cache_kind == "dense" else bool(
+        ref.owns_long_kv or ref.compress_ratio > ZERO or ref.kv_owner_layer_id >= ZERO
+    )
     window = int(draft.sliding_window or ref.window)
     return LayerPlan(
         index=index, attention=draft.attention_kind, architecture=ref.architecture,

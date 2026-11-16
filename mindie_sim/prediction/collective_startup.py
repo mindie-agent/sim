@@ -104,6 +104,18 @@ def _metadata_steps(metadata: Mapping[str, Any] | None) -> Any:
     return metadata.get("steps")
 
 
+def _resolve_topology_mode(name: str, topology_protocols: Mapping[str, str]) -> str:
+    protocols = {str(key).strip().lower(): str(value).strip().lower()
+                 for key, value in (topology_protocols or {}).items()}
+    protocol = protocols.get(name)
+    if protocol is None:
+        raise ModelingError(f"collective_startup_protocol_undeclared:{name}")
+    resolved = normalize_startup_mode(protocol, origin=ORIGIN_TOPOLOGY)
+    if resolved == "topology":
+        raise ModelingError(f"collective_startup_protocol_undeclared:{name}")
+    return resolved
+
+
 def resolve_collective_startup(
     *, family: str, group_size: int, metadata: Mapping[str, Any],
     runtime_mode: str, topology_protocols: Mapping[str, str],
@@ -124,22 +136,17 @@ def resolve_collective_startup(
         mode = normalize_startup_mode(operator_mode, origin=ORIGIN_OPERATOR)
         if group_size <= ONE:
             return CollectiveStartup(ZERO, ZERO, mode, ORIGIN_OPERATOR)
+        if mode == "topology":
+            resolved = _resolve_topology_mode(name, topology_protocols)
+            return CollectiveStartup(
+                peers, _rounds_for_mode(resolved, group_size), resolved, ORIGIN_TOPOLOGY)
         return CollectiveStartup(
             peers, _rounds_for_mode(mode, group_size), mode, ORIGIN_OPERATOR)
     mode = normalize_startup_mode(runtime_mode, origin=ORIGIN_RUNTIME)
     if group_size <= ONE:
         return CollectiveStartup(ZERO, ZERO, mode, ORIGIN_RUNTIME)
     if mode == "topology":
-        protocols = {str(key).strip().lower(): str(value).strip().lower()
-                     for key, value in (topology_protocols or {}).items()}
-        protocol = protocols.get(name)
-        if protocol is None:
-            raise ModelingError(
-                f"collective_startup_protocol_undeclared:{name}")
-        resolved = normalize_startup_mode(protocol, origin=ORIGIN_TOPOLOGY)
-        if resolved == "topology":
-            raise ModelingError(
-                f"collective_startup_protocol_undeclared:{name}")
+        resolved = _resolve_topology_mode(name, topology_protocols)
         return CollectiveStartup(
             peers, _rounds_for_mode(resolved, group_size), resolved, ORIGIN_TOPOLOGY)
     return CollectiveStartup(

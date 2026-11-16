@@ -31,6 +31,33 @@ from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.common import dtype_bytes
 from mindie_sim.schema.parallel import ParallelSpec
 
+ZERO = 0
+ONE = 1
+ZERO_FLOAT = 0.0
+LSE_SCALAR_WIDTH = 1
+MERGE_OPS_PER_ELEM = 3.0
+UPDATE_TYPE_ZERO = 0
+PREFILL_PHASES = frozenset({"prefill", "draft_prefill"})
+
+
+def min_positive(*bounds: int) -> int:
+    """Minimum of positive bounds, or ``0`` when all bounds are unbounded/disabled."""
+    positives = [int(bound) for bound in bounds if int(bound) > ZERO]
+    return min(positives) if positives else ZERO
+
+
+def active_dcp_degree(parallel: ParallelSpec, phase: str) -> int:
+    """Effective KV-sharding DCP width for ``phase``."""
+    cp = int(getattr(parallel, "cp", ONE) or ONE)
+    if cp <= ONE:
+        return ONE
+    cp_plan = str(getattr(parallel, "cp_plan", "dcp") or "dcp")
+    if cp_plan == "dcp":
+        return cp
+    if cp_plan == "pcp_dcp":
+        return ONE if str(phase) in PREFILL_PHASES else cp
+    return ONE
+
 
 @dataclass
 class AttentionResult:
@@ -85,19 +112,26 @@ def _floor_sum(n: int, m: int, a: int, b: int) -> int:
         m, a = a, m
 
 
-def _long_selected_pairs(q: int, context: int, ratio: int, topk: int) -> float:
-    """Exact sum_{i=1..q} min((context+i)//ratio, topk); topk<=0 means no cap."""
-    q = max(0, int(q))
-    context = max(0, int(context))
+def _long_selected_pairs(
+    q: int, context: int, ratio: int, topk: int, *,
+    noncausal: bool = False, kv_len: int | None = None,
+) -> float:
+    """Exact sum of selected compressed rows; ``topk<=0`` means no cap."""
+    q = max(ZERO, int(q))
+    context = max(ZERO, int(context))
     ratio = int(ratio)
-    if ratio <= 0:
-        return 0.0
+    if ratio <= ZERO:
+        return ZERO_FLOAT
     topk = int(topk)
-    if topk <= 0:
-        return float(_floor_sum(q, ratio, 1, context + 1))
+    if noncausal:
+        horizon = max(ZERO, int(kv_len) if kv_len is not None else context + q)
+        avail = horizon // ratio
+        return float(q * (min(avail, topk) if topk > ZERO else avail))
+    if topk <= ZERO:
+        return float(_floor_sum(q, ratio, ONE, context + ONE))
     threshold = topk * ratio - context
-    unsaturated = min(q, max(0, threshold - 1))
-    floor_sum = _floor_sum(unsaturated, ratio, 1, context + 1)
+    unsaturated = min(q, max(ZERO, threshold - ONE))
+    floor_sum = _floor_sum(unsaturated, ratio, ONE, context + ONE)
     return float(floor_sum + (q - unsaturated) * topk)
 
 
@@ -145,7 +179,8 @@ def _qkv_widths(plan: LayerPlan, parallel: ParallelSpec) -> tuple[int, int, int,
 
 
 def dcp_partial_merge_ops(
-    *, prefix: str, view: Any, cp: int, local_heads: int, v_dim: int,
+    *, prefix: str, view: Any = None, views: Sequence[Any] | None = None,
+    cp: int, local_heads: int, v_dim: int,
     stage: int, layer: int, mode: str, deps: tuple[str, ...],
     total_pairs: float, local_pairs: float, total_rows: int, local_rows: int,
     interleave: int,
@@ -156,13 +191,17 @@ def dcp_partial_merge_ops(
     kernel is a dependent vector op, so the model never hides the merge behind
     the all-gather's ``max`` resource term.
     """
-    q = max(1, int(view.q_len))
+    batch_views = tuple(views) if views is not None else ((view,) if view is not None else ())
+    q = max(ONE, sum(int(item.q_len) for item in batch_views))
+    requests = tuple(item.request_id for item in batch_views)
+    modes = {item.execution_mode for item in batch_views}
+    exec_phase = next(iter(modes)) if len(modes) == ONE else mode
     full, link = merge_payload_bytes(q, local_heads, v_dim, cp)
     merge = comm_op(
         op_id=f"{prefix}.dcp_merge", deps=deps, stage=stage, layer=layer,
-        requests=(view.request_id,), family="dcp_allgather", phase=view.execution_mode,
+        requests=requests, family="dcp_allgather", phase=exec_phase,
         recipe="catalog_dcp_lse_merge", link_bytes=link,
-        shape=(q, local_heads, v_dim + 1),
+        shape=(q, local_heads, v_dim + LSE_SCALAR_WIDTH),
         metadata=(
             ("group_axis", "cp"),
             ("collective", "allgather"),
@@ -180,10 +219,10 @@ def dcp_partial_merge_ops(
     )
     update = vector_op(
         op_id=f"{prefix}.dcp_update", deps=(merge.op_id,), stage=stage,
-        layer=layer, requests=(view.request_id,),
+        layer=layer, requests=requests,
         elements=int(merge_update_elements(q, local_heads, v_dim, cp)),
-        ops_per_element=3.0, dtype="fp32", family="attention_merge",
-        phase=view.execution_mode, recipe="catalog_dcp_attention_update",
+        ops_per_element=MERGE_OPS_PER_ELEM, dtype="fp32", family="attention_merge",
+        phase=exec_phase, recipe="catalog_dcp_attention_update",
         semantic_family="dcp_logsumexp_attention_update",
         shape=(q, local_heads, v_dim),
         metadata=merge_metadata(cp, q, local_heads, v_dim) + (
@@ -192,7 +231,7 @@ def dcp_partial_merge_ops(
                 "selection": None,
                 "conditions": {
                     "scope": "partial_output_and_lse_merge_only",
-                    "update_type": 0, "partials": cp,
+                    "update_type": UPDATE_TYPE_ZERO, "partials": cp,
                     "input_dtype": "fp32", "output_dtype": "fp32",
                     "collective_excluded": True,
                 },

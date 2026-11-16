@@ -397,6 +397,7 @@ class Scheduler:
                 request_id=state.request.request_id, q_len=q, context=state.computed,
                 samples=decode or state.computed + q >= state.prompt_target,
                 phase="decode" if decode else "prefill", prefix_tokens=state.request.prefix_tokens,
+                prefix_cache_key=state.request.prefix_cache_key,
                 priority=state.request.priority, media_encoded=state.media_encoded,
                 draft_verify=bool(proposal), draft_proposal_tokens=proposal,
                 draft_prepare=bool(draft.mode) and remaining > 2,

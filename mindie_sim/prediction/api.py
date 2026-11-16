@@ -30,6 +30,9 @@ from .attention import AttentionPolicy
 from .structure import parse_case
 from mindie_sim.coverage import model_coverage
 
+ZERO = 0
+DEFAULT_TRACE_LIMIT = 2
+
 
 def _event_pending(event) -> bool:
     return event is not None and getattr(event, "done", True) is False
@@ -245,10 +248,10 @@ def _quota_scope(schedulers, quota):
             state.request = request
 
 
-def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=2,
+def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=DEFAULT_TRACE_LIMIT,
                max_model_steps=None, observer=None, token_quotas=None,
-               selected_allocations=None, selected_replica: int = 0,
-               selected_stage: int = 0):
+               selected_allocations=None, selected_replica: int = ZERO,
+               selected_stage: int = ZERO):
     """Event-driven cohort frontier shared by predict/service/assemble adapters.
 
     The caller owns Execution, Scheduler/Memory and the lowerer. This function
@@ -296,7 +299,7 @@ def run_cohort(case, execution, schedulers, memory, lower, *, trace_limit=2,
     scheduler_feedback = {}
     stop_reason = "drained"
     from .dispatch import cohorts, submit_batch
-    groups_to_schedule = cohorts(parallel)
+    groups_to_schedule = cohorts(parallel, case.machine)
 
     while True:
         # 1. Commit only completed actual steps and remove their callbacks.

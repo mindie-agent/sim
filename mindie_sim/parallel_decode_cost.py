@@ -67,6 +67,9 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
+ZERO_FLOAT = 0.0
+THOUSAND_MS = 1000.0
+
 
 
 @typed_inputs
@@ -159,8 +162,7 @@ class DecodeCostModel:
         prefetch = bool(ub_bytes >= per_token_activation) and not uncached
         query_heads = max(1, max(
             (int(plan.num_heads or 0) for plan in plans), default=1) // max(1, p.tp))
-        kv = max(0.0, float(sum(mem.cache_bytes(ctx + 1, padded=False)))
-                 - float(sum(mem.cache_bytes(ctx, padded=False))))
+        kv = max(ZERO_FLOAT, float(sum(mem.cache_bytes(ctx, padded=False))) / float(ctx))
         return cls(
             parsed, non_bytes, expert_bytes, non_params, expert_params,
             float(dict(die.rates)["hbm"]),
@@ -463,9 +465,15 @@ class DecodeCostModel:
             expert_layer = expert_ms / moe_layers if self.moe_layers else 0.0
             straggler_layer = straggler_ms / moe_layers if self.moe_layers else 0.0
             moe_comm_layer = mc2_ms if kind == "mc2" else dispatch_ms + combine_ms
+            kv_read = (
+                max(ZERO_FLOAT, float(sum(Memory(self.case).cache_bytes(ctx, padded=False))))
+                if ctx != self.context_tokens and isinstance(self.case, CaseSpec)
+                and self.case.model.layer_plans
+                else self.kv_per_token * ctx
+            )
             attn_ms = max(self._attn_flops(size, ctx) / self.cube_peak,
-                          size * (self.kv_per_token * ctx + self.state_per_request)
-                          / self.hbm_bw) * 1000.0
+                          size * (kv_read + self.state_per_request)
+                          / self.hbm_bw) * THOUSAND_MS
             stream = two_stream_schedule(
                 self.moe_layers, expert_layer + straggler_layer, moe_comm_layer,
                 overlap_mode, attn_per_layer_ms=attn_ms / moe_layers)

@@ -13,10 +13,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 import inspect
+import math
 from collections.abc import Mapping as _AbcMapping
 from typing import Any, Mapping
 
 from mindie_sim.schema.workload import IterationPlan
+
+ZERO = 0
+ONE = 1
 
 
 @dataclass(frozen=True)
@@ -50,9 +54,23 @@ class BatchBinding:
         }
 
 
-def cohorts(parallel):
+def cohorts(parallel, machine=None):
+    if machine is not None:
+        from .local_tp_groups import local_tp_replica_cohorts, local_tp_spans_dp
+        if local_tp_spans_dp(parallel):
+            return list(local_tp_replica_cohorts(machine, parallel))
     width = parallel.ep_dp_width
-    return [tuple(range(first, first + width)) for first in range(0, parallel.dp, width)]
+    if int(parallel.tp) == ONE:
+        for candidate in (
+            int(parallel.o_proj_tp),
+            int(parallel.linear_proj_tp),
+            int(parallel.lm_head_tp),
+        ):
+            if candidate > ONE:
+                combined = math.lcm(width, candidate)
+                if int(parallel.dp) % combined == ZERO:
+                    width = combined
+    return [tuple(range(first, first + width)) for first in range(ZERO, parallel.dp, width)]
 
 
 _CALLABLE_BINDING_CACHE: dict[Any, tuple[Any, str | None]] = {}

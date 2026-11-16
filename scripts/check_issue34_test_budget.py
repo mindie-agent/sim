@@ -119,7 +119,7 @@ def run_file(root: Path, path: Path, *, limit: float, artifacts: Path) -> dict:
     env = dict(os.environ)
     env.update({
         "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONPATH": f"{root}:{root / 'tests'}",
+        "PYTHONPATH": os.pathsep.join((str(root), str(root / "tests"))),
         "TMPDIR": str(artifacts / "tmp"),
         "MINDIE_CACHE_HOME": str(artifacts / "cache"),
     })

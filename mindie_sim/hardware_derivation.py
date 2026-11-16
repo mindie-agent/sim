@@ -211,26 +211,29 @@ def derive_hardware_sku(
             "hardware_derivation_requires_per_device_core_mapping")
     data = base_hardware.to_dict()
     devices = list(data.get("devices", ()))
+    core_override = aic_count is not None or aiv_count is not None
     base_aic = int(devices[FIRST].get("compute_units", ONE) or ONE)
     base_aiv = int((devices[FIRST].get("resource_units") or {}).get("vector", base_aic))
     new_aic = base_aic if aic_count is None else _positive_count(
         aic_count, "hardware_derivation_aic_count_invalid")
-    s_c = float(new_aic) / float(base_aic)
+    s_c = float(new_aic) / float(base_aic) if core_override else float(ONE)
     if aiv_count is None:
-        new_aiv = _exact_scaled(base_aiv, s_c,
-                                "hardware_derivation_aiv_count_not_integral")
+        new_aiv = (_exact_scaled(base_aiv, s_c,
+                                 "hardware_derivation_aiv_count_not_integral")
+                   if core_override else base_aiv)
     else:
         new_aiv = _positive_count(aiv_count, "hardware_derivation_aiv_count_invalid")
-    s_v = float(new_aiv) / float(base_aiv)
+    s_v = float(new_aiv) / float(base_aiv) if core_override else float(ONE)
     assumptions: dict[str, str] = dict(data.get("assumptions", {}))
     assumptions.update({
         "derivation.base": base_hardware.sku or base_hardware.name,
         "derivation.sku": sku,
-        "derivation.aic_count": str(new_aic),
-        "derivation.aiv_count": str(new_aiv),
         "derivation.aic_scale": repr(s_c),
         "derivation.aiv_scale": repr(s_v),
     })
+    if core_override or base_hardware.homogeneous:
+        assumptions["derivation.aic_count"] = str(new_aic)
+        assumptions["derivation.aiv_count"] = str(new_aiv)
     raw_peak = None if hbm_peak_bytes_per_s is None else _finite_positive(
         hbm_peak_bytes_per_s, "hardware_derivation_hbm_peak_invalid")
     ceiling = None if mte2_ceiling_bytes_per_s is None else _finite_positive(
@@ -249,10 +252,12 @@ def derive_hardware_sku(
                         for key, value in mte2_provenance.items()})
     for device_index, device in enumerate(devices):
         device_arch = base_hardware.dies[device_index].compute_arch
-        device["compute_units"] = new_aic
+        dev_aic = int(device.get("compute_units", ONE) or ONE)
+        dev_aiv = int((device.get("resource_units") or {}).get("vector", dev_aic))
+        device["compute_units"] = new_aic if core_override else dev_aic
         units = _scale_owner_units(
             dict(device.get("resource_units", {})), s_c, s_v)
-        units["vector"] = new_aiv
+        units["vector"] = new_aiv if core_override else dev_aiv
         device["resource_units"] = units
         buffers = dict(device.get("buffer_units", {}))
         for name, value in list(buffers.items()):

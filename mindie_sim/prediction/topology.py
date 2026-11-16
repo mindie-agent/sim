@@ -1031,7 +1031,10 @@ class Topology:
             width = int(declared.get("local_tp_width", STARTUP_ZERO) or STARTUP_ZERO)
             if width <= STARTUP_ZERO:
                 raise ModelingError("local_tp_group_requires_declared_width")
-            return local_tp_groups(self.machine, p, stage=stage, width=width)
+            all_groups = local_tp_groups(self.machine, p, stage=stage, width=width)
+            selected = tuple(group for group in all_groups
+                             if any(rank in sources for rank in group))
+            return selected or all_groups
         if axis == "cp":
             return tuple(sources[i:i + p.cp] for i in range(0, len(sources), p.cp))
         if axis == "etp":
@@ -1079,7 +1082,7 @@ class Topology:
             if family not in {"alltoall", "alltoallv"}:
                 raise ModelingError(
                     "peer_traffic_requires_peer_collective")
-            groups = tuple(self.groups(axis, replica, source_stage))
+            groups = tuple(self.groups(axis, replica, source_stage, metadata=metadata))
             if not groups:
                 return
             sizes = {len(group) for group in groups}
@@ -1117,7 +1120,7 @@ class Topology:
                 if source != destination:
                     yield MessageFlow(source, destination, volume), 1
             return
-        for group in self.groups(axis, replica, source_stage):
+        for group in self.groups(axis, replica, source_stage, metadata=metadata):
             if len(group) <= 1:
                 continue
             if alltoall:
@@ -1343,7 +1346,7 @@ class Topology:
 
         groups, seen, owner = [], {}, {}
         for replica in sorted(values):
-            for ranks in self.groups(axis, replica, stage):
+            for ranks in self.groups(axis, replica, stage, metadata=metadata):
                 if ranks in seen:
                     continue
                 for rank in ranks:
@@ -1492,9 +1495,22 @@ class Topology:
                         receive_capacity_bytes_per_peer,
                     receive_buffer_id=receive_buffer_id,
                     max_physical_chunks=max_physical_chunks))
+            elif algorithm == "startup_waves":
+                from .collective_waves import WaveGroup
+                wave_rounds = (startup.startup_rounds
+                               if startup is not None else rounds)
+                groups.append(WaveGroup(
+                    ranks, tuple(totals), wave_rounds, self, peer_traffic=peer,
+                    max_inflight_per_rank=max_inflight_per_rank))
             else:
                 groups.append(PairwiseGroup(
                     ranks, tuple(totals), rounds, self, peer_traffic=peer))
+        if algorithm == "startup_waves":
+            from .collective_waves import WavePlan
+            return WavePlan(
+                family, tuple(groups),
+                startup_rounds=(startup.startup_rounds
+                                if startup is not None else None))
         return PairwisePlan(
             family, tuple(groups),
             startup_rounds=(startup.startup_rounds if startup is not None else None),

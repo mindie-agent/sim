@@ -19,6 +19,8 @@ from typing import Any, Mapping
 from mindie_sim.schema.subgraphs import ALL_ATTENTION_KINDS, LINEAR_ATTENTION_KINDS
 from mindie_sim.schema.common import ModelingError
 
+ZERO = 0
+
 
 def local_batch(concurrency: int, dp: int) -> int:
     """Requests per DP replica under even scheduler admission."""
@@ -167,9 +169,10 @@ class RequestGeometry:
             return self.q_len
         return sum(end - start for start, end in self.query_ranges)
 
-    def pairs(self, *, window: int = 0, causal: bool = True) -> int:
+    def pairs(self, *, window: int = ZERO, causal: bool = True) -> int:
         if not causal:
-            return self.selected_q_len * self.kv_len
+            visible = min(self.kv_len, window) if window > ZERO else self.kv_len
+            return self.selected_q_len * visible
         ranges = self.query_ranges or ((0, self.q_len),)
         total = 0
         for start, end in ranges:

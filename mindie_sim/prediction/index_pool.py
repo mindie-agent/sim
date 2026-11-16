@@ -18,6 +18,10 @@ from .indexer_representation import index_representation
 from .mla_native import index_layer_norm
 from .structure_groups import declare_group
 
+ZERO = 0
+ONE = 1
+TWO = 2
+
 
 SOURCE = {
     "repository": "vllm-project/vllm-ascend",
@@ -40,12 +44,14 @@ def recipes():
 def _selection_for(view, plan):
     """One request ledger. PCP DualChunkSwap sums each owned query span."""
     tail = plan.index_kpool_always_select_tail
+    noncausal = bool(plan.noncausal_attention)
     ranges = getattr(view, "query_ranges", ()) or ()
     if not ranges:
         return pool_selection(view.q_len, view.context, plan.index_topk, plan.index_kpool,
-                              always_select_tail=tail)
+                              always_select_tail=tail, noncausal=noncausal, kv_len=view.kv_len)
     parts = [pool_selection(end - start, view.context + start, plan.index_topk, plan.index_kpool,
-                            always_select_tail=tail) for start, end in ranges]
+                            always_select_tail=tail, noncausal=noncausal, kv_len=view.kv_len)
+             for start, end in ranges]
     # The request-owned tail ring stays one pool, not one tail per span.
     retained = min(sum(end - start for start, end in ranges), plan.index_kpool)
     return PoolSelection(
@@ -62,18 +68,21 @@ def _geometry(views, plan):
     return tuple(_selection_for(view, plan) for view in views)
 
 
-def _causal_token_pairs(views):
+def _causal_token_pairs(views, *, noncausal=False):
     """Visible token pairs. Owned spans use their global start, not q_len at context."""
-    total = 0
+    total = ZERO
     for view in views:
         ranges = getattr(view, "query_ranges", ()) or ()
-        if ranges:
+        if noncausal:
+            q_cnt = sum(end - start for start, end in ranges if end > start) if ranges else view.q_len
+            total += q_cnt * view.kv_len
+        elif ranges:
             total += sum((end - start) * (view.context + start)
-                         + (end - start) * (end - start + 1) // 2
+                         + (end - start) * (end - start + ONE) // TWO
                          for start, end in ranges)
         else:
             query = view.q_len
-            total += query * view.context + query * (query + 1) // 2
+            total += query * view.context + query * (query + ONE) // TWO
     return total
 
 
@@ -440,7 +449,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     output_width = plan.index_topk + (plan.index_kpool - 1 if plan.index_kpool_always_select_tail else 0)
     common = (("pool_size", plan.index_kpool), ("score_mode", score_mode),
               ("valid_query_rows", valid), ("padded_query_rows", tokens),
-              ("causal_token_pairs", _causal_token_pairs(views)),
+              ("causal_token_pairs", _causal_token_pairs(views, noncausal=bool(plan.noncausal_attention))),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
               ("native_owner_schedule", "not_selected"),

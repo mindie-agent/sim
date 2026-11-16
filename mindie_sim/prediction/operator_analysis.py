@@ -21,10 +21,25 @@ from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_decl
                             effective_body_declaration)
 from .graph import annotate_geometry
 
+ZERO = 0
+ONE = 1
+
+
+def _analysis_prefix_fields(case, index: int, context: int) -> dict:
+    requests = tuple(getattr(getattr(case, "workload", None), "requests", ()) or ())
+    if not requests:
+        return {}
+    spec = requests[index % len(requests)]
+    declared = max(ZERO, min(int(context), int(getattr(spec, "prefix_tokens", ZERO) or ZERO)))
+    key = str(getattr(spec, "prefix_cache_key", "") or "")
+    if not declared and not key:
+        return {}
+    return {"prefix_tokens": declared, "prefix_cache_key": key}
+
 
 def _selected_group(case, selected_replica=None, cohort=None):
     from mindie_sim.prediction.dispatch import cohorts
-    groups = [tuple(group) for group in cohorts(case.runtime.parallel)]
+    groups = [tuple(group) for group in cohorts(case.runtime.parallel, case.machine)]
     if cohort is not None:
         selected = tuple(int(value) for value in cohort)
         if selected not in groups:
@@ -89,12 +104,19 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
                 else group[0])
     view_count = (int(sequences) if type(sequences) is int else
                   int(sequences[group.index(selected)]))
-    views = tuple(RequestView(f"analysis{index}", tokens, context, scope == "model", phase,
-                              draft_prepare=draft_prepare)
-                  for index in range(max(0, view_count)))
+    views = tuple(
+        RequestView(
+            f"analysis{index}", tokens, context, scope == "model", phase,
+            draft_prepare=draft_prepare,
+            **_analysis_prefix_fields(case, index, context),
+        )
+        for index in range(max(ZERO, view_count))
+    )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
+    from .local_tp_groups import local_tp_spans_dp
     if (len(group) > 1
-            and case.runtime.kernels.get("sequence_parallel")):
+            and (case.runtime.kernels.get("sequence_parallel")
+                 or local_tp_spans_dp(case.runtime.parallel))):
         # A single rank cannot resolve cross-DP SP without the complete
         # cohort's query totals. Delegate only the cohort graph binding.
         graphs = target_graphs(
@@ -336,6 +358,7 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
         logical_views[replica] = tuple(RequestView(
             f"analysis{replica}:{i}", tokens, context, scope == "model",
             phase, draft_prepare=draft_prepare,
+            **_analysis_prefix_fields(case, i, context),
         ) for i in range(count))
         if count == 0 and pad_idle:
             # A physical graph row is not a logical request.  A zero-length
@@ -444,7 +467,10 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                            model_programs=model_programs)
             for r, group in views.items()
         }
+    from .local_projection_tp import lower_local_projection_tp_cohort
     graphs = bind_cohort_traffic(case, raw_graphs)
+    graphs = lower_local_projection_tp_cohort(
+        graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     if scope == "body":
         return TargetGraphSet(graphs, kernels=case.runtime.kernels,
                               selection=selection)
@@ -491,8 +517,10 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
     selected = (int(selected_replica) if selected_replica is not None
                 else participants[0])
     views_by_replica = {
-        replica: tuple(RequestView(f"model{replica}:{index}", tokens, context, True,
-                                   phase) for index in range(counts[replica]))
+        replica: tuple(RequestView(
+            f"model{replica}:{index}", tokens, context, True, phase,
+            **_analysis_prefix_fields(case, index, context),
+        ) for index in range(counts[replica]))
         for replica in participants
     }
     plan = IterationPlan(views_by_replica[selected])
@@ -527,10 +555,13 @@ def physical_id(op):
 
 
 def requires_collective_cohort(case, op, recipe):
+    from .local_tp_groups import local_tp_spans_dp
+
+    axis = dict(op.metadata).get("group_axis")
     return bool(
         getattr(recipe, "algorithm", None)
-        and case.runtime.parallel.ep_spans_dp
-        and dict(op.metadata).get("group_axis") == "ep")
+        and ((case.runtime.parallel.ep_spans_dp and axis == "ep")
+             or (local_tp_spans_dp(case.runtime.parallel) and axis == "local_tp")))
 
 
 def _service_regime_row(context, duration):

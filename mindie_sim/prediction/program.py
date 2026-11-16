@@ -1431,7 +1431,11 @@ class RecipeBook:
         balanced_matrix = (families or {}).get("grouped_gemm", generic_grouped)
         from .generic_latent_attention import build as _generic_latent_build
         from .mechanism import PlannedRecipe as _PlannedRecipe
-        self._explicit_recipes = frozenset((recipes or {}).keys())
+        from .batch_prefix_attention import RECIPE as _batch_prefix_attn
+        from .batch_prefix_indexer import RECIPE as _batch_prefix_idx
+        self._explicit_recipes = frozenset((recipes or {}).keys()) | {
+            "batch_prefix_attention", "batch_prefix_indexer",
+        }
         # ``_explicit_recipes`` also receives internally registered source
         # recipes.  Only this set is the caller's own override.
         self._caller_recipes = frozenset((recipes or {}).keys())
@@ -1440,6 +1444,8 @@ class RecipeBook:
         self.recipes = {
             "balanced_grouped_gate_up": balanced_matrix,
             "balanced_grouped_down": balanced_matrix,
+            "batch_prefix_attention": _batch_prefix_attn,
+            "batch_prefix_indexer": _batch_prefix_idx,
             **(recipes or {}),
         }
         self.families = {"recurrent_scan": RecurrentScan(), "recurrent_vector": RecurrentVector(),
@@ -1786,6 +1792,8 @@ class RecipeBook:
 
             return PlannedRecipe(build)
 
+        from .batch_prefix_attention import BatchPrefixAttention
+        from .batch_prefix_indexer import BatchPrefixIndexer
         factories = {"envelope": ResourceEnvelope, "tiled_matmul": TiledMatmul,
                      "hierarchical_matmul": HierarchicalMatmul, "mapped_matmul": MappedMatmul,
                      "phase_matmul": PhaseMatmul,
@@ -1794,6 +1802,8 @@ class RecipeBook:
                      "indexed_attention_packed_int8": indexed_quant_attention,
                      "staged_gqa_decode": staged_gqa_decode,
                      "staged_gqa_prefill": staged_gqa_prefill,
+                     "batch_prefix_attention": BatchPrefixAttention,
+                     "batch_prefix_indexer": BatchPrefixIndexer,
                      "transfer": TransferRecipe, "recurrent_scan": RecurrentScan,
                      "recurrent_vector": RecurrentVector, "tiled_pointwise": TiledPointwise,
                      "aiv_tensor_copy": aiv_tensor_copy,

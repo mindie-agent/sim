@@ -1233,6 +1233,7 @@ class Execution:
         self.conflicts = 0
         self.recipes_used: dict[str, int] = {}
         self._collectives = None
+        self._cohort_views = None
         self.native_group_joins: dict = {}
         # Bounded launch-local evidence: ranks, actual frames/edges, the same
         # per-rank link ledger and the work really submitted by the program.
@@ -1417,10 +1418,21 @@ class Execution:
     def add_group(self, works, release_ms, *, external_inputs=None,
                   emitted_tokens=None, memory_bindings=None,
                   state_accesses=None):
-        """Compile an EP cohort before releasing any of its collective events."""
+        """Compile an EP/local-TP cohort before releasing any collective events."""
         graphs = bind_cohort_traffic(self.case, {r: work.ops for r, work in works.items()})
+        from .local_projection_tp import lower_local_projection_tp_cohort
+        graphs = lower_local_projection_tp_cohort(
+            graphs, model=self.case.model, runtime=self.case.runtime,
+            machine=self.case.machine)
         works = {r: replace(work, ops=graphs[r]) for r, work in works.items()}
         self._collectives = {}
+        self._cohort_views = {
+            int(rank): work.plan.requests
+            for r, work in works.items()
+            if work.plan.requests or work.mode != "graph"
+            for stage in range(max(ONE, int(self.case.runtime.parallel.pp)))
+            for rank in self.topology.ranks(r, stage)
+        }
 
         def per_replica(value, replica):
             if isinstance(value, _AbcMapping) and replica in value:
@@ -1435,7 +1447,15 @@ class Execution:
             state_accesses=per_replica(state_accesses, replica),
         ) for replica, work in works.items()}
         for key, participants in self._collectives.items():
-            if len(participants) != len(works):
+            expected_count = len(works)
+            first_meta = dict(participants[FIRST].context.op.metadata)
+            if first_meta.get("group_axis") == "local_tp" and first_meta.get("group_ranks"):
+                src_stage = int(first_meta.get("source_stage", participants[FIRST].context.op.stage))
+                group_set = {int(rk) for rk in first_meta["group_ranks"]}
+                expected_count = sum(
+                    ONE for r in works
+                    if set(self.topology.ranks(r, src_stage)) & group_set)
+            if len(participants) != expected_count:
                 raise ValueError(f"collective_participants_mismatch:{key}")
             if any(getattr(item.recipe, "algorithm", None) for item in participants):
                 self._start_joint_collective(key, participants)
@@ -1510,6 +1530,7 @@ class Execution:
             self.engine.submit(f"group:{key}", after=completions,
                                on_complete=release, owner="expert_group")
         self._collectives = None
+        self._cohort_views = None
         return steps
 
     def _begin_joint_observation(self, op, key, participants, ready_by_rank,
@@ -2497,9 +2518,11 @@ class Execution:
 
     def prepare(self, op, replica=ZERO):
         geom = self.stage_geometry[replica, op.stage]
+        startup_mode = self.case.runtime.collective_startup_mode
         prep_key = (
-            id(self.recipes), _freeze_key(geom), op.stage, op.family, op.recipe, op.phase,
-            op.dtype, op.layout, op.semantic_shape, op.local_shape, op.padded_shape,
+            id(self.recipes), _freeze_key(geom), startup_mode, op.stage,
+            op.family, op.recipe, op.phase, op.dtype, op.layout,
+            op.semantic_shape, op.local_shape, op.padded_shape,
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
@@ -2517,6 +2540,12 @@ class Execution:
                 metadata=meta,
             ), recipe
         res_op, recipe = self.recipes.prepare(op, geom)
+        from .collective_waves import RECIPE as STARTUP_WAVES, startup_waves_selected
+        if (not getattr(recipe, "source_bound", False)
+                and not getattr(recipe, "native", False)
+                and not getattr(recipe, "algorithm", None)
+                and startup_waves_selected(res_op, startup_mode)):
+            recipe = STARTUP_WAVES
         stage_dies = self.stage_dies.get((replica, res_op.stage))
         if stage_dies:
             from .matrix_precision import resolve_matrix_precision
@@ -3609,10 +3638,17 @@ class Execution:
             return work
         from .local_projection_tp import lower_local_projection_tp
 
+        cohort_views = self._cohort_views
+        if cohort_views is None:
+            cohort_views = (
+                {int(rank): work.plan.requests for rank in self.topology.ranks(replica, ZERO)}
+                if work.plan.requests or work.mode != "graph"
+                else {}
+            )
         ops = lower_local_projection_tp(
             work.ops, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine, replica=replica,
-            cohort_views={replica: work.plan.requests}, scope="target")
+            cohort_views=cohort_views, scope="target")
         return work if ops is work.ops else replace(work, ops=ops)
 
     def add(self, work: IterationWork, replica: int, release_ms: float, *,
@@ -3866,7 +3902,14 @@ class Execution:
             grouped = self._collectives is not None and cross_dp
             if grouped:
                 complete = engine.future(name + ":collective")
-                self._collectives.setdefault(op.op_id, []).append(CollectiveParticipant(
+                op_meta = dict(op.metadata)
+                grp_ranks = op_meta.get("group_ranks")
+                coll_key = (
+                    f"{op.op_id}@{','.join(map(str, grp_ranks))}"
+                    if grp_ranks and op_meta.get("group_axis") == "local_tp"
+                    else op.op_id
+                )
+                self._collectives.setdefault(coll_key, []).append(CollectiveParticipant(
                     replica, ready, context, recipe, name, complete))
             else:
                 physical_hbm = self.stage_pools.get(

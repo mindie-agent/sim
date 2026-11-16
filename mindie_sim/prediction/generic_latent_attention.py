@@ -20,6 +20,11 @@ from .program import KernelProgram, ParallelProgram, Stage
 from .engine import Allocation
 
 KEY_TILE = 128
+ZERO = 0
+ONE = 1
+TWO = 2
+ZERO_FLOAT = 0.0
+MIN_BATCH_MEMBERS = 2
 
 
 def _schedule(op):
@@ -219,9 +224,9 @@ def build(op, geometry):
 
 def batch_ops(ops, outputs, *, runtime, views, prefix):
     """Aggregate same-DP dense decode requests into one structural invocation."""
-    if runtime is None or len(outputs) < 2 or len(outputs) != len(views):
+    if runtime is None or len(outputs) < MIN_BATCH_MEMBERS or len(outputs) != len(views):
         return outputs
-    if runtime.parallel.cp != 1 or runtime.parallel.pcp != 1:
+    if runtime.parallel.pcp != ONE and any(v.phase == "prefill" for v in views):
         return outputs
     policy = getattr(runtime, "attention_policy", None)
     if policy is not None:
@@ -304,3 +309,50 @@ def batch_ops(ops, outputs, *, runtime, views, prefix):
         else:
             new_outputs.append(out_id)
     return new_outputs
+
+
+def batch_general_mla_ops(ops, outputs, *, views, prefix, runtime, policy):
+    """Combine remaining compatible analytic MLA attention ops when fused_batch is enabled."""
+    if len(outputs) < MIN_BATCH_MEMBERS or (policy is not None and not policy.fused_batch):
+        return outputs
+    cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
+    cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
+    if "attention" in cfg_fam:
+        return outputs
+    by_id = {op.op_id: op for op in ops}
+    members = [by_id[out_id] for out_id in outputs if out_id in by_id]
+    if (len(members) != len(outputs)
+            or any(op.plan_required or op.source_boundary or op.recipe in cfg_rec
+                   for op in members)):
+        return outputs
+    ids = {op.op_id for op in members}
+    reqs = tuple(dict.fromkeys(req for op in members for req in op.requests))
+    deps = tuple(dict.fromkeys(dep for op in members for dep in op.deps))
+    first_meta = dict(members[ZERO].metadata)
+    first_meta["request_shapes"] = tuple((v.q_len, v.context) for v in views)
+    first_meta["logical_pairs"] = sum(
+        float(dict(op.metadata).get("logical_pairs", ZERO_FLOAT)) for op in members)
+    first_meta["kv_sweeps"] = sum(
+        int(dict(op.metadata).get("kv_sweeps", ZERO)) for op in members)
+    first_shape = members[ZERO].semantic_shape
+    total_q = sum(int(op.semantic_shape[ZERO]) for op in members)
+    max_kv = max(int(op.semantic_shape[ONE]) for op in members)
+    sem_shape = (total_q, max_kv, *first_shape[TWO:])
+    loc_kv = sum(int(op.local_shape[ONE]) for op in members)
+    loc_shape = (total_q, loc_kv, *members[ZERO].local_shape[TWO:])
+    batched = replace(
+        members[ZERO], op_id=prefix + ".latent_attention_batch",
+        recipe="latent_attention0", requests=reqs, deps=deps,
+        semantic_shape=sem_shape, local_shape=loc_shape,
+        padded_shape=sem_shape, launch_shape=sem_shape,
+        flops=sum(op.flops for op in members),
+        vector_ops=sum(op.vector_ops for op in members),
+        hbm_bytes=sum(op.hbm_bytes for op in members),
+        mte2_bytes=sum(op.mte2_bytes for op in members),
+        mte3_bytes=sum(op.mte3_bytes for op in members),
+        metadata=tuple(first_meta.items()),
+    )
+    first_idx = next(i for i, op in enumerate(ops) if op.op_id in ids)
+    ops[:] = [op for op in ops if op.op_id not in ids]
+    ops.insert(first_idx, batched)
+    return [batched.op_id]

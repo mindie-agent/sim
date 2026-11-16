@@ -36,6 +36,7 @@ ONE = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
+SAVINGS_EPS = 1e-9
 PAIR = 2
 MODE_AUTO = "auto"
 MODE_PER_SEQUENCE = "per_sequence"
@@ -50,6 +51,7 @@ NO_REUSE_REASONS = {
     "single_access": "prefix_read_single_access",
     "empty_prefix": "prefix_read_empty_shared_prefix",
     "unsupported_kernel": "prefix_read_kernel_reuse_unsupported",
+    "no_savings": "prefix_read_no_shared_savings",
 }
 
 
@@ -67,6 +69,7 @@ class CacheAccess:
     layer: int = ZERO
     component: str = "index_k"
     selected_tokens: tuple[tuple[int, int], ...] = ()
+    logical_rows: int = ZERO
 
 
 @dataclass(frozen=True)
@@ -108,6 +111,8 @@ def _access_tokens(access: CacheAccess) -> int:
 
 
 def _logical_rows(access: CacheAccess) -> float:
+    if int(access.logical_rows) > ZERO:
+        return float(int(access.logical_rows))
     context = max(ZERO, int(access.context_tokens))
     q = max(ONE, int(access.q_len))
     total = ZERO
@@ -183,7 +188,8 @@ def plan_prefix_reads(
     for access in accesses:
         context = max(ZERO, int(access.context_tokens))
         rows = _logical_rows(access)
-        prefix = min(_materialized_prefix(access, cache_state), context)
+        limit = int(access.logical_rows) if int(access.logical_rows) > ZERO else context
+        prefix = min(_materialized_prefix(access, cache_state), limit)
         private = max(ZERO, rows - float(prefix))
         unique += private * float(access.row_bytes)
         core += private * float(access.row_bytes)
@@ -203,9 +209,11 @@ def plan_prefix_reads(
         unique_scale = scale_total
     unique += unique_scale
     core += unique_scale
+    applied = bool((logical - unique) > SAVINGS_EPS)
     return PrefixReadPlan(
         logical, unique, core, query_reads, scale_total, ZERO, ZERO,
-        kernel_reuse, True, "")
+        kernel_reuse if applied else REUSE_PER_SEQUENCE, applied,
+        "" if applied else NO_REUSE_REASONS["no_savings"])
 
 
 def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan) -> Any:

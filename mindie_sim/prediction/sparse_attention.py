@@ -11,6 +11,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+ZERO = 0
+ONE = 1
+TWO = 2
+DEFAULT_QUERY_TILE = 128
+DEFAULT_INDEX_BYTES = 4
+
 
 @dataclass(frozen=True)
 class SparseAttentionTraffic:
@@ -61,44 +67,49 @@ def _completed_prefix(tokens, ratio):
     return ratio * groups * (groups - 1) // 2 + groups * (tail + 1)
 
 
-def _window_sweeps(query, context, window, query_tile):
-    if window == 0 or query == 0:
-        return 0
+def _window_sweeps(query, context, window, query_tile, *, noncausal=False, kv_len=None):
+    if window == ZERO or query == ZERO:
+        return ZERO
+    if noncausal:
+        horizon = max(ZERO, int(kv_len) if kv_len is not None else int(context) + int(query))
+        return ((query + query_tile - ONE) // query_tile) * min(horizon, window)
     full, tail = divmod(query, query_tile)
-    unsaturated = min(full, max(0, (window - context - 1) // query_tile))
+    unsaturated = min(full, max(ZERO, (window - context - ONE) // query_tile))
     rows = (unsaturated * context
-            + query_tile * unsaturated * (unsaturated + 1) // 2
+            + query_tile * unsaturated * (unsaturated + ONE) // TWO
             + (full - unsaturated) * window)
-    return rows + (min(context + query, window) if tail else 0)
+    return rows + (min(context + query, window) if tail else ZERO)
 
 
-def sparse_attention_traffic(query, context, topk, *, compression_ratio=1,
-                             window=0, query_tile=128, index_bytes=4,
-                             index_pool_size=1, index_pool_tail=False):
-    """Count causal valid selections and a separate dense-window read path.
-
-    Dense indexed attention passes ``window=0``. A compressed indexed cache can
-    coexist with an uncompressed dense window, whose tile sweeps remain separate.
-    This returns an unsharded ledger; placement belongs to the calling frontend.
-    """
+def sparse_attention_traffic(query, context, topk, *, compression_ratio=ONE,
+                             window=ZERO, query_tile=DEFAULT_QUERY_TILE,
+                             index_bytes=DEFAULT_INDEX_BYTES,
+                             index_pool_size=ONE, index_pool_tail=False,
+                             noncausal=False, kv_len=None):
+    """Count causal/noncausal valid selections and a separate dense-window read path."""
     values = (query, context, topk, compression_ratio, window, query_tile, index_bytes)
     if (any(not isinstance(value, int) or isinstance(value, bool) for value in values)
-            or query < 0 or context < 0 or window < 0
-            or min(topk, compression_ratio, query_tile, index_bytes) <= 0):
+            or query < ZERO or context < ZERO or window < ZERO
+            or min(topk, compression_ratio, query_tile, index_bytes) <= ZERO):
         raise ValueError("sparse_attention_requires_integer_causal_geometry")
-    if index_pool_size > 1:
+    if index_pool_size > ONE:
         from mindie_sim.catalog.index_pool import pool_selection
-        if compression_ratio != 1 or window:
+        if compression_ratio != ONE or window:
             raise ValueError("index_pool_requires_uncompressed_token_kv_without_dense_window")
         rows = pool_selection(query, context, topk, index_pool_size,
-                              always_select_tail=index_pool_tail).selected_tokens
+                              always_select_tail=index_pool_tail,
+                              noncausal=noncausal, kv_len=kv_len).selected_tokens
+    elif noncausal:
+        horizon = max(ZERO, int(kv_len) if kv_len is not None else int(context) + int(query))
+        rows = query * min(horizon // compression_ratio, topk)
     else:
-        unsaturated = min(query, max(0, topk * compression_ratio - 1 - context))
+        unsaturated = min(query, max(ZERO, topk * compression_ratio - ONE - context))
         rows = (_completed_prefix(context + unsaturated, compression_ratio)
                 - _completed_prefix(context, compression_ratio)
                 + (query - unsaturated) * topk)
     return SparseAttentionTraffic(
         gather_rows=rows,
-        window_sweep_rows=_window_sweeps(query, context, window, query_tile),
+        window_sweep_rows=_window_sweeps(query, context, window, query_tile,
+                                         noncausal=noncausal, kv_len=kv_len),
         index_read_bytes=rows * index_bytes,
     )

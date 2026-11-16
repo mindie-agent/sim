@@ -33,6 +33,7 @@ CP_PLAN_PCP = "pcp"
 CP_PLAN_PCP_DCP = "pcp_dcp"
 CP_PLAN_DSA_CP = "dsa_cp"
 CP_PLAN_NONE = "none"
+NO_WINDOW = 0
 CP_PLAN_KINDS = (CP_PLAN_DCP, CP_PLAN_PCP, CP_PLAN_PCP_DCP, CP_PLAN_DSA_CP)
 #: Dual-phase strategy: PCP owns the prefill query shard and K/V gather, DCP
 #: owns the decode KV context shard and the ``npu_attention_update`` LSE merge.
@@ -62,6 +63,8 @@ _CP_CONTEXT_FAMILIES = {
 CP_UNMODELED_SCHEDULES = ("compact_kv_gather",)
 DEFAULT_CP_INTERLEAVE = 128
 _FP32_BYTES = 4.0
+ZERO = 0
+ONE = 1
 
 
 def strategy_for_plan(plan: str) -> str:
@@ -162,7 +165,7 @@ def owned_positions(lo: int, hi: int, cp: int, interleave: int, rank: int) -> in
 
 def split_causal_pairs(
     q_len: int, context: int, cp: int, interleave: int,
-    *, window: int = 0, noncausal: bool = False, padding: bool = False,
+    *, window: int = NO_WINDOW, noncausal: bool = False, padding: bool = False,
 ) -> CpSplit:
     """Exact causal/windowed pair partition across ``cp`` context ranks.
 
@@ -186,9 +189,12 @@ def split_causal_pairs(
         total = float(q_len * rows)
     elif noncausal:
         rows = context + q_len
-        per = tuple(float(q_len * owned_positions(0, rows - 1, cp, interleave, r))
+        win = int(window)
+        lo = max(ZERO, rows - win) if win > ZERO else ZERO
+        visible = max(ZERO, rows - lo)
+        per = tuple(float(q_len * owned_positions(lo, rows - ONE, cp, interleave, r))
                     for r in range(cp))
-        total = float(q_len * rows)
+        total = float(q_len * visible)
     elif int(window) <= 0:
         per = tuple(float(_causal_rank_pairs(q_len, context, cp, interleave, r))
                     for r in range(cp))
@@ -209,7 +215,10 @@ def _pair_total(
     if padding:
         return float(q_len * (context + 1))
     if noncausal:
-        return float(q_len * (context + q_len))
+        rows = context + q_len
+        win = int(window)
+        visible = min(rows, win) if win > ZERO else rows
+        return float(q_len * visible)
     if window <= 0:
         return float(q_len * context + q_len * (q_len + 1) // 2)
     return _causal_pairs(q_len, context, window)

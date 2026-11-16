@@ -78,13 +78,22 @@ def wave_offsets(group_size: int, rounds: int):
 
 
 def startup_waves_selected(op: Any, runtime_mode: str) -> bool:
-    """True for an unbound generic all-to-all with a nonlegacy startup model."""
+    """True for an unbound generic all-to-all with waves or explicit steps."""
     if getattr(op, "source_boundary", ""):
         return False
     metadata = dict(getattr(op, "metadata", ()) or ())
+    if metadata.get("implementation") or metadata.get("hccl_selection"):
+        return False
     family = str(metadata.get("collective", op.family)).strip().lower()
     if family not in ALLTOALL_FAMILIES:
         return False
+    steps = metadata.get("steps")
+    if isinstance(steps, int) and not isinstance(steps, bool) and steps >= ONE:
+        mode_raw = metadata.get("collective_startup_mode", runtime_mode)
+        norm = {"direct": "concurrent"}.get(str(mode_raw).strip().lower(),
+                                            str(mode_raw).strip().lower())
+        if norm in NONLEGACY_STARTUP_MODES:
+            return True
     mode = metadata.get("collective_startup_mode", runtime_mode)
     if not isinstance(mode, str):
         return False
@@ -147,7 +156,7 @@ class WaveGroup:
                     engine.resolve(event)
 
         def enter_next(index: int) -> None:
-            if send_pending[index] or recv_pending[index]:
+            if queued[index] or send_pending[index] or recv_pending[index]:
                 return
             wave_index[index] += ONE
             if wave_index[index] >= len(waves):
@@ -156,12 +165,11 @@ class WaveGroup:
             begin(index)
 
         def deliver(index: int, wave: int, event) -> None:
+            del event
             if wave < wave_index[index]:
                 raise ModelingError("startup_wave_receive_wave_regressed")
             if wave > wave_index[index]:
-                if wave in pending[index]:
-                    raise ModelingError("startup_wave_receive_wave_duplicate")
-                pending[index][wave] = event
+                pending[index][wave] = pending[index].get(wave, ZERO) + ONE
                 return
             recv_pending[index] -= ONE
             if recv_pending[index] < ZERO:
@@ -171,6 +179,7 @@ class WaveGroup:
             enter_next(index)
 
         def send_done(index: int, event) -> None:
+            del event
             send_pending[index] -= ONE
             if send_pending[index] < ZERO:
                 raise ModelingError("startup_wave_send_underflow")
@@ -181,6 +190,7 @@ class WaveGroup:
         def issue(index: int) -> None:
             if not queued[index]:
                 return
+            send_pending[index] += ONE
             source = self.ranks[index]
             wave = wave_index[index]
             offset = queued[index].pop(ZERO)
@@ -228,17 +238,13 @@ class WaveGroup:
         def begin(index: int) -> None:
             start, end = parse_wave(index)
             offsets = tuple(range(start, end + ONE))
-            recv_pending[index] = len(offsets)
+            recv_pending[index] = len(offsets) - int(
+                pending[index].pop(wave_index[index], ZERO))
             queued[index] = list(offsets)
-            buffered = pending[index].pop(wave_index[index], None)
-            while buffered is not None:
-                recv_pending[index] -= ONE
-                buffered = pending[index].pop(wave_index[index], None)
             if recv_pending[index] < ZERO:
                 raise ModelingError("startup_wave_receive_underflow")
             limit = len(offsets) if window is None else min(window, len(offsets))
             for _ in range(limit):
-                send_pending[index] += ONE
                 issue(index)
             enter_next(index)
 
@@ -268,6 +274,11 @@ class WavePlan:
                 engine, f"{name}:group{index}", ready_by_rank, owner=owner)
             events.update(part)
         return events
+
+    def validate_path_model(self, path_model) -> None:
+        if path_model is not None:
+            raise ModelingError(
+                f"startup_waves_path_model_unsupported:{path_model}")
 
 
 @dataclass(frozen=True)

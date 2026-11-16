@@ -413,8 +413,12 @@ _STAMP_SLOT = 0; _INDEX_SLOT = 1
 
 
 def _graph_index(graph: TypedGraph) -> dict[str, Any]:
-    stamp = (id(graph.ops), len(graph.ops), id(graph.values), len(graph.values),
-             graph.public_outputs)
+    stamp = (
+        tuple((op_id, op.inputs, op.outputs, op.deps)
+              for op_id, op in graph.ops.items()),
+        tuple(graph.values.keys()),
+        graph.public_outputs,
+    )
     cached = getattr(graph, "_cached_idx", None)
     if cached is not None and cached[_STAMP_SLOT] == stamp:
         return cached[_INDEX_SLOT]
