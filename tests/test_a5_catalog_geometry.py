@@ -50,10 +50,11 @@ from mindie_sim.structure import export_structure
 from test_prediction_system import case
 
 ROOT = Path(__file__).parents[1]
+EXPECTED_CATALOG_COUNT = 37
 
 
 def test_catalog_key_config_alias_inventory_is_preserved():
-    assert len(CATALOG) == 36
+    assert len(CATALOG) == EXPECTED_CATALOG_COUNT
     assert len(ARCHITECTURE_PRESET_CATALOG) == 5
     for key in (*CATALOG, *ARCHITECTURE_PRESET_CATALOG):
         assert load_model(key).layers > 0
