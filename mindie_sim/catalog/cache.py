@@ -527,7 +527,7 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
         rows = completed_rows(seq, index_ratio)
         from .paired_sfa import execution
         if execution(model).get("dcp_indexer_sharded") and cp > ONE:
-            rows = local_rows(rows)
+            rows = local_rows(rows, max(ONE, interleave // index_ratio))
         elif parallel.cp_plan == "dsa_cp":
             if rank is not None:
                 rows = (

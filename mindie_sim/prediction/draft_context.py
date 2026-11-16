@@ -26,29 +26,33 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
     stores = []
     for layer in range(draft.layers):
         name = prefix + f"context_kv{layer}"
+        layer_common = {**common, "layer": layer}
         qkv = gemm_op(
             op_id=name + ".qkv_a", deps=(norm.op_id,),
             m=rows, n=draft.q_lora_rank + draft.kv_lora_rank + draft.qk_rope_head_dim,
             k=draft.hidden_size, quant=model.quant, category="mla",
-            recipe="draft_context_qkv_a", **{**common, "layer": layer})
+            recipe="draft_context_qkv_a", **layer_common)
         kv_width = draft.kv_lora_rank + draft.qk_rope_head_dim
         # Source .contiguous() copies the KV suffix out of fused QKV-A.
         copied = vector_op(
             op_id=name + ".kv_copy", deps=(qkv.op_id,),
             elements=rows * kv_width, ops_per_element=ZERO,
-            dtype="bf16", family="elementwise", recipe="draft_context_kv_copy", **common)
+            dtype="bf16", family="elementwise", recipe="draft_context_kv_copy",
+            **layer_common)
         normalized = vector_op(
             op_id=name + ".norm", deps=(copied.op_id,),
             elements=rows * draft.kv_lora_rank, ops_per_element=NORM_OPS,
-            dtype="bf16", family="rmsnorm", recipe="draft_context_kv_norm", **common)
+            dtype="bf16", family="rmsnorm", recipe="draft_context_kv_norm",
+            **layer_common)
         rotary = vector_op(
             op_id=name + ".rope", deps=(normalized.op_id,),
             elements=rows * draft.qk_rope_head_dim, ops_per_element=ROPE_OPS,
-            dtype="bf16", family="rotary", recipe="draft_context_rope", **common)
+            dtype="bf16", family="rotary", recipe="draft_context_rope",
+            **layer_common)
         stored = cache_store_op(
             op_id=name + ".store", deps=(rotary.op_id,), rows=rows,
             row_bytes=kv_width * TWO, dtype="bf16", kind="draft_context",
-            recipe="draft_context_store", **common)
+            recipe="draft_context_store", **layer_common)
         ops.extend((qkv, copied, normalized, rotary, stored))
         stores.append(stored.op_id)
     embedding = vector_op(

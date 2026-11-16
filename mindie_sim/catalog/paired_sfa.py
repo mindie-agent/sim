@@ -96,8 +96,12 @@ def page_groups(case, layer_stage, query_tokens):
     mode = metadata.get("mamba_cache_mode", "align")
     if mode not in {"align", "none"}:
         raise ModelingError("paired_sfa_state_cache_mode_not_supported")
+    fallback = max(ZERO, query_tokens - ONE)
+    draft_len = getattr(runtime.dspark, "draft_len", None)
+    if draft_len is not None and "draft_proposal_tokens" not in metadata:
+        fallback = max(ZERO, int(draft_len) - ONE)
     proposals = int(metadata.get("num_speculative_state_blocks",
-                                metadata.get("draft_proposal_tokens", max(ZERO, query_tokens - ONE))))
+                                metadata.get("draft_proposal_tokens", fallback)))
     extra = int(metadata.get("num_prefill_checkpoint_blocks", ZERO))
     if min(proposals, extra) < ZERO:
         raise ModelingError("paired_sfa_negative_state_slots")
@@ -129,7 +133,8 @@ def page_groups(case, layer_stage, query_tokens):
         index = sum(index_row_bytes(model, plan.index_dim)
                     for plan in main if plan.owns_index_k)
         draft_bytes = (block * draft_row(model, draft) * draft.layers
-                       if draft and stage == p.pp - ONE else ZERO)
+                       if draft is not None and stage == p.pp - ONE
+                       and (proposals > ZERO or bool(runtime.dspark)) else ZERO)
         result.append({
             "layers": [plan.index for plan in plans],
             "tokens_per_page": block * p.cp,

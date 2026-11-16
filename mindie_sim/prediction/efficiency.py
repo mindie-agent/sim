@@ -16,7 +16,12 @@
 from __future__ import annotations
 
 ZERO = 0
+ONE = 1
 FIRST = 0
+ZERO_FLOAT = 0.0
+ONE_FLOAT = 1.0
+DEFAULT_CONTEXT = 4096
+DEFAULT_OUTPUT_BUDGET = 1024
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -1078,10 +1083,12 @@ def _stage_rank_capacity_facts(memory: Memory) -> list[dict[str, Any]]:
 
 
 def capacity_window(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", context: int = 4096,
-    tokens_per_seq: int = 1, sequences: int = 1, output_budget: int = 1024,
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode",
+    context: int = DEFAULT_CONTEXT,
+    tokens_per_seq: int = ONE, sequences: int = ONE,
+    output_budget: int = DEFAULT_OUTPUT_BUDGET,
     emitted_tokens_per_seq: float | None = None, async_scheduling: bool | None = None,
-    hbm_capacity_scale: float = 1.0, memory: Memory | None = None,
+    hbm_capacity_scale: float = ONE_FLOAT, memory: Memory | None = None,
 ) -> dict[str, Any]:
     """Project one candidate B onto T08's per-rank supply and the real KV windows.
 
@@ -1144,18 +1151,57 @@ def capacity_window(
         if b >= 2 and delayed_steps > 0 and output_eff > 0:
             staggered_delayed_b = max(1, math.ceil(b * delayed_steps / steps_per_wave))
             wave_delayed_b = retiring_waves * b
-    kv_active = [float(value) for value in ledger.cache_bytes(active_tokens, padded=True)]
-    kv_retiring = ([float(value) for value in ledger.cache_bytes(retiring_tokens, padded=True)]
-                   if delayed_steps > 0 else [0.0] * len(kv_active))
-    kv_wave = ([float(value) for value in ledger.cache_bytes(wave_tokens, padded=True)]
-               if delayed_steps > 0 else list(kv_active))
+    shared_prefix = getattr(
+        scaled.runtime, "prefix_cache_mode", "private") == "shared"
+    prefix_tokens = (
+        int(scaled.workload.requests[FIRST].prefix_tokens)
+        if shared_prefix and scaled.workload.requests else ZERO)
+    if shared_prefix:
+        from .capacity_features import batch_cache_bytes
+
+        def batch_stage_bytes(sequences: int, tokens: int) -> list[float]:
+            if sequences <= ZERO:
+                return [ZERO_FLOAT] * int(scaled.runtime.parallel.pp)
+            return [float(value) for value in batch_cache_bytes(
+                scaled, sequences=sequences, context=context,
+                tokens_per_seq=max(ONE, int(tokens) - context),
+                prefix_tokens=prefix_tokens, phase=phase, padded=True).total_bytes]
+
+        kv_active = batch_stage_bytes(b, active_tokens)
+        kv_retiring = (batch_stage_bytes(staggered_delayed_b, retiring_tokens)
+                       if delayed_steps > ZERO else [ZERO_FLOAT] * len(kv_active))
+        kv_wave = (batch_stage_bytes(b, wave_tokens)
+                   if delayed_steps > ZERO else list(kv_active))
+        kv_wave_retiring = (
+            batch_stage_bytes(wave_delayed_b, retiring_tokens)
+            if wave_delayed_b > ZERO else [ZERO_FLOAT] * len(kv_active))
+    else:
+        def ledger_stage_bytes(tokens: int) -> list[float]:
+            if phase != "decode" or q_tokens == ledger.query_tokens:
+                return [float(value) for value in ledger.cache_bytes(
+                    tokens, padded=True)]
+            return [float(value) for value in ledger.cache_bytes(
+                tokens, padded=True, query_tokens=q_tokens)]
+
+        kv_active = ledger_stage_bytes(active_tokens)
+        kv_retiring = (ledger_stage_bytes(retiring_tokens)
+                       if delayed_steps > ZERO else [ZERO_FLOAT] * len(kv_active))
+        kv_wave = (ledger_stage_bytes(wave_tokens)
+                   if delayed_steps > ZERO else list(kv_active))
+        kv_wave_retiring = kv_retiring
     rows = _stage_rank_capacity_facts(ledger)
     for row in rows:
         stage = int(row["stage"])
-        active = b * kv_active[stage]
-        retiring = staggered_delayed_b * kv_retiring[stage]
-        batch_wave = b * kv_wave[stage]
-        wave_retiring = wave_delayed_b * kv_retiring[stage]
+        if shared_prefix:
+            active = kv_active[stage]
+            retiring = kv_retiring[stage]
+            batch_wave = kv_wave[stage]
+            wave_retiring = kv_wave_retiring[stage]
+        else:
+            active = b * kv_active[stage]
+            retiring = staggered_delayed_b * kv_retiring[stage]
+            batch_wave = b * kv_wave[stage]
+            wave_retiring = wave_delayed_b * kv_retiring[stage]
         peak = max(active + retiring, batch_wave + wave_retiring)
         used = float(row["fixed_bytes"]) + float(row["external_held_bytes"]) + peak
         row.update({

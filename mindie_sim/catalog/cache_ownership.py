@@ -281,6 +281,33 @@ def batch_cache_footprint(
     boundary = [ZERO_FLOAT] * stages
     runtime = case.runtime
     shared_mode = getattr(runtime, "prefix_cache_mode", "private") == "shared"
+    if dict(model.metadata).get("cache_allocator") == "paired_sfa":
+        from mindie_sim.catalog.paired_sfa import page_groups
+        from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+        query_tokens = max((max(ONE, int(getattr(v, "q_len", ONE) or ONE)) for v in requests), default=ONE)
+        groups = page_groups(case, layer_stages, query_tokens)
+        shared_once, seen = [ZERO_FLOAT] * stages, set()
+        for view in requests:
+            length = max(ZERO, int(getattr(view, "kv_len", ZERO) or ZERO))
+            declared = max(ZERO, min(int(getattr(view, "prefix_tokens", ZERO) or ZERO), length))
+            key = ((canonical_prefix_cache_key("shared", getattr(view, "prefix_cache_key", "")))
+                   if shared_mode else f"private:{getattr(view, 'request_id', '')}")
+            for stage, group in enumerate(groups):
+                tokens_per_page = max(ONE, int(group["tokens_per_page"]))
+                page_bytes = float(group["bytes_per_group_page"])
+                prefix_pages = declared // tokens_per_page if shared_mode else ZERO
+                history_pages = (length + tokens_per_page - ONE) // tokens_per_page
+                if prefix_pages > ZERO and (key, stage) not in seen:
+                    shared_once[stage] += prefix_pages * page_bytes
+                    seen.add((key, stage))
+                state_pages = int(group["recycling_pages"])
+                private[stage] += (history_pages - prefix_pages + state_pages) * page_bytes
+                state[stage] += state_pages * page_bytes
+        return BatchCacheFootprint(
+            tuple(shared_once), tuple(private), tuple(state),
+            (ZERO_FLOAT,) * stages, (ZERO_FLOAT,) * stages,
+            tuple(a + b for a, b in zip(shared_once, private)),
+            requests=len(requests), stages=stages)
     interleave = max(ONE, int(getattr(runtime, "kv_block_size", DEFAULT_INTERLEAVE) or DEFAULT_INTERLEAVE))
     draft_kind = _active_draft_kind(model, runtime)
     for view in requests:
