@@ -650,6 +650,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             per_view_shared.append(v_shared)
             per_view_rows.append(v_rows)
         worst_r = max(range(eff_cp), key=lambda r: (rank_pairs[r], rank_sweeps[r]))
+        worst_sweeps_r = max(
+            range(eff_cp), key=lambda r: (rank_sweeps[r], rank_pairs[r]))
         batches: list[OpSpec] = []
         sweeps_by_view: list[int] = []
         shared_sweeps_by_view: list[int] = []
@@ -658,10 +660,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         for v_pos, (orig_idx, view) in enumerate(indexed_views):
             pairs, v_pairs = per_view_pairs[v_pos]
             local_pairs = v_pairs[worst_r]
-            view_sweeps = per_view_sweeps[v_pos][worst_r]
+            view_sweeps = per_view_sweeps[v_pos][worst_sweeps_r]
             local_rows = per_view_rows[v_pos][worst_r]
             sweeps_by_view.append(view_sweeps)
-            shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_r]))
+            shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_sweeps_r]))
             total_pairs_sum += pairs
             total_rows_sum += view.kv_len
             kv_bytes = view_sweeps * kv_row_bytes
@@ -676,7 +678,10 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 mte2_bytes=kv_bytes + input_bytes, mte3_bytes=input_bytes,
                 deps=attention_deps, recipe=attention_recipe, dtype=model.compute_dtype,
                 metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
-                          ("local_pairs", local_pairs), ("kv_streams", streams))
+                          ("local_pairs", local_pairs), ("kv_streams", streams),
+                          ("kv_sweeps", view_sweeps),
+                          ("cp_per_rank_pairs", tuple(v_pairs)),
+                          ("cp_per_rank_sweeps", tuple(per_view_sweeps[v_pos])))
                          + _decode_contract(
                              (view,), heads, kv_heads, width, model, quant, parallel, plan, mode,
                              window=eff_window, cp=eff_cp)
@@ -701,7 +706,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 local_shape=(grp_valid, rank_rows[worst_r], heads, width),
                 metadata=(("request_shapes", tuple((v.q_len, v.context) for v in grp_views)),
                           ("query_tile", policy.query_tile),
-                          ("kv_streams", streams))
+                          ("kv_streams", streams),
+                          ("kv_sweeps", sum(sweeps_by_view)),
+                          ("cp_per_rank_pairs", tuple(rank_pairs)),
+                          ("cp_per_rank_sweeps", tuple(rank_sweeps)),
+                          ("cp_bottleneck_pairs_rank", worst_r),
+                          ("cp_bottleneck_sweeps_rank", worst_sweeps_r))
                          + _decode_contract(
                              grp_views, heads, kv_heads, width, model, quant,
                              parallel, plan, mode, window=eff_window, cp=eff_cp)

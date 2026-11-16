@@ -55,6 +55,7 @@ from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError
 
 ONE = 1
+HALF = 0.5
 
 
 def _layer_view(plan: Any, fallback: Mapping[str, Any]) -> dict[str, Any]:
@@ -104,7 +105,7 @@ def _model_layer_view(model: Any) -> dict[str, Any]:
 
 def prefill_step_ms(case: CaseSpec | Mapping[str, Any], *, isl: int,
                     prefix_hit_rate: float, batch: int, fabric: Any = None,
-                    host_overlap: float = 0.5, microbatches: int = 1,
+                    host_overlap: float = HALF, microbatches: int = ONE,
                     mc2: bool | None = None,
                     endpoints: Sequence[int] | None = None,
                     dtype: str | None = None,

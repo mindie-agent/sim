@@ -67,8 +67,12 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
+ZERO = 0
 ZERO_FLOAT = 0.0
+ONE_FLOAT = 1.0
+HALF = 0.5
 THOUSAND_MS = 1000.0
+DEFAULT_CONTEXT_TOKENS = 4096
 
 
 
@@ -124,7 +128,7 @@ class DecodeCostModel:
 
     @classmethod
     def from_case(cls, case: CaseSpec | Mapping[str, Any], *,
-                  context_tokens: int = 4096) -> "DecodeCostModel":
+                  context_tokens: int = DEFAULT_CONTEXT_TOKENS) -> "DecodeCostModel":
         _int("context_tokens", context_tokens)
         parsed = parse_case(case)
         _validate_nested(parsed, "case")
@@ -202,23 +206,23 @@ class DecodeCostModel:
         return 1.0 - ((self.num_experts - self.top_k) / self.num_experts) ** batch
 
     def step(self, batch_tokens: int, *, context: int | None = None,
-             fabric: Any = None, routing_skew: float = 1.0,
-             eplb_redundant_experts: int = 0, enable_eplb: bool = False,
+             fabric: Any = None, routing_skew: float = ONE_FLOAT,
+             eplb_redundant_experts: int = ZERO, enable_eplb: bool = False,
              mc2: bool | None = None,
              scaling_mode: str = "fixed_per_dp_batch",
              global_batch: int | None = None,
              per_replica_batch: int | None = None,
              active_replicas: int | None = None,
-             host_overlap: float = 0.5,
+             host_overlap: float = HALF,
              eplb_placement: Any = None,
-             extra_expert_bytes_per_rank: float = 0.0,
-             microbatches: int = 1,
+             extra_expert_bytes_per_rank: float = ZERO_FLOAT,
+             microbatches: int = ONE_FLOAT,
              overlap_mode: str = "serial",
-             eplb_rebalance_ms: float = 0.0,
+             eplb_rebalance_ms: float = ZERO_FLOAT,
              endpoints: Sequence[int] | None = None,
              dtype: str | None = None,
              topology: str | None = None,
-             pp_p2p_ms: float = 0.0,
+             pp_p2p_ms: float = ZERO_FLOAT,
              axis_groups: Mapping[str, Any] | None = None,
              ) -> StepBreakdown:
         _int("batch_tokens", batch_tokens)

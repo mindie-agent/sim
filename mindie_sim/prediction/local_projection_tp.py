@@ -22,12 +22,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from math import gcd
 from types import SimpleNamespace
 from typing import Any, Mapping, Sequence
 
 from mindie_sim.catalog.ops import comm_op
-from mindie_sim.catalog.projection_placement import role_from_category
+from mindie_sim.catalog.projection_placement import _padded_local, role_from_category
 from mindie_sim.schema.common import ModelingError, align_up, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
 
@@ -85,12 +84,10 @@ def _quant_for_op(model: Any, metadata: Mapping[str, Any]) -> Any:
 def _local_dimension(size: int, width: int, quant: Any = None) -> int:
     if width <= ONE:
         return int(size)
-    block = getattr(quant, "weight_block", (ZERO, ZERO)) if quant is not None else (ZERO, ZERO)
-    cols = int(block[SECOND]) if block and len(block) > ONE and int(block[SECOND]) > ONE else ONE
-    granule = int(width * cols // gcd(width, cols)) if cols > ONE else width
-    if int(size) % granule == ZERO:
-        return max(ONE, int(size) // width)
-    return max(ONE, int(align_up((int(size) + width - ONE) // width, granule)))
+    # The placement ledger pads the local hint to the weight-scale granule
+    # (for example 512/TP8 with a 128-column block becomes 128, not 64).
+    term = SimpleNamespace(quant=quant)
+    return max(ONE, int(_padded_local(int(size), int(width), term)))
 
 
 def _packed_local_width(metadata: Mapping[str, Any], width: int, total: int, quant: Any = None) -> int:
