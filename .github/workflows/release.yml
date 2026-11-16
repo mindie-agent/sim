@@ -15,7 +15,7 @@ jobs:
     secrets:
       MINDIE_RELEASE_DEPLOY_KEY: ${{ secrets.MINDIE_RELEASE_DEPLOY_KEY }}
     with:
-      release-notes-path: docs/releases/sim-0.9.15.md
+      release-notes-path: docs/releases/sim-0.9.16.md
       python: /tmp/sim-rel-venv/bin/python
       setup-command: |
         uv venv --seed --python 3.13 /tmp/sim-rel-venv && uv pip install --python /tmp/sim-rel-venv/bin/python ".[test]" && rm -rf build dist *.egg-info .venv

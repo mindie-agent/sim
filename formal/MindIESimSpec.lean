@@ -1,5 +1,5 @@
 /-
-  MindIESimSpec: Lean 4 Formal Verification Kernel for mindie-sim v0.9.15.
+  MindIESimSpec: Lean 4 Formal Verification Kernel for mindie-sim v0.9.16.
   Covers five pure algebraic contracts aligned with ASTRA_ISSUE34_SPEC.md:
     1. FourClock         — Ordered critical-span max-plus attribution algebra (§12.2, §12.4)
     2. PrefetchAndLedger — Pass 2.5 MLAPO static prefetch clamp & half-open interval ledger
