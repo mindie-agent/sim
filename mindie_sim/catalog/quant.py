@@ -22,6 +22,8 @@ from dataclasses import replace
 
 from mindie_sim.catalog.types import QuantSpec, merge_source
 
+ONE = 1
+
 
 def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
     """Resolve per-layer native projection defaults before explicit roles.
@@ -44,7 +46,7 @@ def projection_quant(quant: QuantSpec, plan) -> QuantSpec:
         defaults[plan.attention] = fields
         if plan.attention == "mla":
             defaults["indexer_fp8"] = fields
-    if plan.index_kpool > 1:
+    if plan.index_kpool > ONE and plan.attention != "gqa":
         # KPool caches FP32 copies and casts hidden once before both F.linear
         # calls. Query projection still uses its independent native format.
         for category in ("indexer.weights", "indexer.pool_projection", "indexer.pool_gate"):

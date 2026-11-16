@@ -47,6 +47,11 @@ def lower_engram(
     engram = model.engram
     if engram is None:
         raise ModelingError(f"catalog_engram_missing:layer{plan.index}")
+    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, lower_ple
+    if is_qwen4_exp_ple(engram):
+        return lower_ple(prefix=prefix, plan=plan, stage=stage, deps=deps, model=model,
+                         parallel=parallel, quant=quant, mode=mode,
+                         padded_tokens=padded_tokens, views=views, runtime=runtime)
     engram.validate()
     ops: list[OpSpec] = []
     requests = _requests(views)

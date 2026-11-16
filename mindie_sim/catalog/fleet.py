@@ -30,6 +30,8 @@ from mindie_sim.catalog.specs import _model_weight_totals, _set_facts
 from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError
 
+ZERO = 0
+
 FLEET_CATALOG_ENTRIES: dict[str, str] = {
     key: f"../catalog/configs/{key}.json" for key in (
         "minimax-m3", "minimax-m3.1-flash", "gemma-4-26b-a4b",
@@ -45,7 +47,7 @@ CORE_CATALOG_ENTRIES: dict[str, str] = {
     "deepseek-v3": "deepseek-v3.json", "deepseek-r1": "deepseek-r1.json", "deepseek-v3.2": "deepseek-v3.2.json",
     "glm-5.3": "glm-5.3.json", "glm-5.3-flash": "glm-5.3-flash.json",
     "glm-5.1": "glm-5.1.json", "glm-5.2": "glm-5.2.json",
-    "kimi-k3": "kimi-k3.json", "kimi-k3-dspark": "kimi-k3-dspark.json",
+    "kimi-k3": "kimi-k3.json", "kimi-k3.1": "kimi-k3.1.json", "kimi-k3-dspark": "kimi-k3-dspark.json",
     "kimi-k3-dspark-block5": "kimi-k3-dspark-block5.json",
     "kimi-k2": "kimi-k2.json", "kimi-k2-thinking": "kimi-k2-thinking.json", "kimi-k2.5": "kimi-k2.5.json",
     "qwen3-30b-a3b": "qwen3-30b-a3b.json", "qwen3-32b": "qwen3-32b.json",
@@ -99,6 +101,9 @@ FLEET_MODEL_ALIASES: dict[str, str] = {
     "qwen38_flash_next": "qwen3.8-flash-next", "qwen3_8_flash_next": "qwen3.8-flash-next",
     "qwen38-flash-next": "qwen3.8-flash-next", "Qwen3.8-Flash-Next": "qwen3.8-flash-next",
     "Qwen3.8-Flash-Next-w8a8-mxfp8": "qwen3.8-flash-next", "Qwen3.8-Flash-Next-w4a4-mxfp4": "qwen3.8-flash-next",
+    "Qwen3.8-Flash-Next-w8a8-mtp": "qwen3.8-flash-next", "Qwen3.8-Flash-Next-w4a8": "qwen3.8-flash-next",
+    "Qwen3.8-Flash-Next-w4a8-mxfp": "qwen3.8-flash-next", "qwen3.8-flash-next-w8a8-mtp": "qwen3.8-flash-next",
+    "qwen3.8-flash-next-w4a8": "qwen3.8-flash-next", "qwen3.8-flash-next-w4a8-mxfp": "qwen3.8-flash-next",
     "qwen38-flash-next-mxfp8": "qwen3.8-flash-next", "qwen38-flash-next-mxfp4": "qwen3.8-flash-next",
     # Step-5-Preview.
     "step5_preview": "step-5-preview", "step5-preview": "step-5-preview",
@@ -130,7 +135,8 @@ CORE_MODEL_ALIASES: dict[str, str] = {
     "GLM-5.3-W4A8": "glm-5.3", "GLM-5.3-W4A8-INT": "glm-5.3", "glm-5.3-w4a8": "glm-5.3",
     "GLM-5.1": "glm-5.1", "glm5.1": "glm-5.1", "GLM5.1": "glm-5.1", "glm51": "glm-5.1",
     "GLM-5.2": "glm-5.2", "glm5.2": "glm-5.2", "GLM5.2": "glm-5.2", "glm52": "glm-5.2",
-    "Kimi-K3": "kimi-k3", "Kimi-K3-DSpark": "kimi-k3-dspark", "Kimi-K3-DSpark-Block5": "kimi-k3-dspark-block5",
+    "Kimi-K3": "kimi-k3", "Kimi-K3.1": "kimi-k3.1", "kimi_k3_1": "kimi-k3.1", "kimi_k31": "kimi-k3.1",
+    "kimi-k31": "kimi-k3.1", "Kimi-K3-DSpark": "kimi-k3-dspark", "Kimi-K3-DSpark-Block5": "kimi-k3-dspark-block5",
     "Kimi-K2": "kimi-k2", "Kimi-K2-Instruct": "kimi-k2", "kimi-k2-instruct": "kimi-k2", "kimi_k2": "kimi-k2",
     "Kimi-K2-Thinking": "kimi-k2-thinking", "kimi-k2-thinking": "kimi-k2-thinking", "kimi_k2_thinking": "kimi-k2-thinking",
     "Kimi-K2.5": "kimi-k2.5", "kimi_k2.5": "kimi-k2.5", "kimi_k25": "kimi-k2.5", "kimi-k25": "kimi-k2.5",
@@ -178,6 +184,7 @@ def _facts(family: str, config: Mapping[str, Any], c: Mapping[str, Any],
         ("num_nextn_predict_layers", _int(c, "num_nextn_predict_layers")),
         ("source_scope", "structural_config_no_latency_labels"),
     ]
+    facts.append(("hc_lowrank", max((p.hc_lowrank for p in plans), default=ZERO)))
     facts.extend(extra.items())
     return facts
 

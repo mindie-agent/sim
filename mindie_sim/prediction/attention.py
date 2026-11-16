@@ -424,27 +424,26 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     elif shared_format:
         store_ids = (_store_cache(
             ops, prefix=prefix, deps=store_deps, rows=store_rows,
-            width=2 * kv_heads * width, region="gqa_kv",
+            width=(ONE if plan.k_eq_v else TWO) * kv_heads * width, region="gqa_kv",
             stage=stage, layer=plan.index, requests=requests, phase=mode,
             model=model, views=views, kv_heads=kv_heads, head_width=width,
-            parallel=parallel, quant=quant, key_fmt=key_fmt,
-            value_fmt=value_fmt, shared_format=True),)
+            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
+            shared_format=True),)
     else:
         key_store = _store_cache(
-            ops, prefix=prefix, deps=store_deps, rows=store_rows,
-            width=kv_heads * width, region="gqa_kv_key", name="cache_key",
-            stage=stage, layer=plan.index, requests=requests, phase=mode,
-            model=model, views=views, kv_heads=kv_heads, head_width=width,
-            parallel=parallel, quant=quant, key_fmt=key_fmt,
-            value_fmt=value_fmt, shared_format=False)
-        value_store = _store_cache(
-            ops, prefix=prefix, deps=store_deps, rows=store_rows,
-            width=kv_heads * width, region="gqa_kv_value", name="cache_value",
-            stage=stage, layer=plan.index, requests=requests, phase=mode,
-            model=model, views=views, kv_heads=kv_heads, head_width=width,
-            parallel=parallel, quant=quant, key_fmt=key_fmt,
-            value_fmt=value_fmt, shared_format=False)
-        store_ids = (key_store, value_store)
+            ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
+            region="gqa_kv_key", name="cache_key", stage=stage, layer=plan.index, requests=requests,
+            phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
+            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
+        if plan.k_eq_v:
+            store_ids = (key_store,)
+        else:
+            value_store = _store_cache(
+                ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
+                region="gqa_kv_value", name="cache_value", stage=stage, layer=plan.index, requests=requests,
+                phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
+                parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
+            store_ids = (key_store, value_store)
     plans = model.layer_plans
     idx_raw, sel_raw = int(plan.index_k_owner_layer_id), int(plan.topk_owner_layer_id)
     if plan.indexer:
@@ -469,6 +468,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         idx_heads = max(ONE, int(plan.index_heads or ONE))
         idx_dim = max(ONE, int(plan.index_dim or DEFAULT_IDX_DIM))
         idx_ratio = max(ONE, int(plan.compress_ratio or ONE), int(plan.index_kpool or ONE))
+        sel_topk = max(ONE, eff_topk // idx_ratio) if idx_ratio > ONE else eff_topk
         cand_cap = (plan.candidate_topk_blocks * plan.candidate_block_size
                     if plan.candidate_filter else ZERO)
         new_idx_rows = (
@@ -533,7 +533,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
             layer=plan.index, requests=requests, elements=scored_rows,
             ops_per_element=FOUR, dtype="fp32", family="topk", phase=mode,
-            recipe="index_topk", shape=(valid, eff_topk), read_write=READ_WRITE_ONE,
+            recipe="index_topk", shape=(valid, sel_topk), read_write=READ_WRITE_ONE,
             metadata=(("selection_output_dtype", "int32"),))
         ops.extend((idx_wq, idx_wk, idx_store, idx_scores, idx_topk))
         index_store_id, topk_id = idx_store.op_id, idx_topk.op_id
@@ -544,7 +544,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     attention_deps = (*store_ids, topk_id) if topk_id else store_ids
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
-        key_fmt.row_bytes(TWO * streams * width) if shared_format
+        key_fmt.row_bytes((ONE if plan.k_eq_v else TWO) * streams * width)
+        if shared_format else key_fmt.row_bytes(streams * width) if plan.k_eq_v
         else key_fmt.row_bytes(streams * width) + value_fmt.row_bytes(streams * width)
     )
     user_pinned_attn = (

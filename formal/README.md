@@ -1,4 +1,4 @@
-# MindIESimSpec — Lean 4 Formal Verification Kernel (`mindie-sim v0.9.16`)
+# MindIESimSpec — Lean 4 Formal Verification Kernel (`mindie-sim v0.9.17`)
 
 `formal/` contains **`MindIESimSpec`**, a lightweight, zero-runtime-overhead **Lean 4** (`v4.16.0`, zero `Mathlib` dependency) formal verification kernel for the core algebraic invariants of `mindie-sim`.
 

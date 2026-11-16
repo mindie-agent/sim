@@ -110,6 +110,8 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         engram = _engram(c)
     else:
         raise ModelingError(f"model_catalog_profile_unsupported:{family}")
+    if bool(config.get("language_model_only", c.get("language_model_only", False))):
+        aux = replace(aux, include_vision_weights=False) if aux else AuxiliarySpec(include_vision_weights=False)
     from .hf_config import (
         declared_context, declared_rope, declared_weight_dtype, native_coverage,
         resolve_native_formats, resolve_quant,
@@ -290,6 +292,7 @@ def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("auxiliary", aux.to_dict() if aux else None),
         ("source_scope", "structural_config_no_latency_labels"),
     ]
+    facts.append(("hc_lowrank", max((p.hc_lowrank for p in plans), default=ZERO)))
     _set_facts(model, facts)
     from mindie_sim.schema.parallel import ParallelSpec as _ParallelSpec
     from mindie_sim.catalog.weights import (

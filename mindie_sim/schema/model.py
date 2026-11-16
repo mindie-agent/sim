@@ -187,6 +187,7 @@ class LayerPlan:
     hyper_connections: bool = False
     hc_mult: int = 0
     hc_sinkhorn_iters: int = 0
+    hc_lowrank: int = ZERO
     residual_block_size: int = 0
     native_layer_id: int = -1
     scope: str = "body"                 # body | mtp | dspark | standalone_draft

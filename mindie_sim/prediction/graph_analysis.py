@@ -218,7 +218,15 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     case = consume_target_declaration(parse_case(case), ops)
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
-    external = dict(external_inputs or {})
+    if external_inputs is not None:
+        external = dict(external_inputs)
+    elif getattr(ops, "scope", None) == "body":
+        sample = next(iter(ops.values()), ()) if isinstance(ops, Mapping) else ops
+        external = ({"analysis_input": ZERO}
+                    if any("analysis_input" in getattr(op, "deps", ()) for op in sample)
+                    else {})
+    else:
+        external = {}
     if any(value < 0 or not math.isfinite(value) for value in external.values()):
         raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
     book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
