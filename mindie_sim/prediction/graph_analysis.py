@@ -26,6 +26,83 @@ from .operator_analysis import cohort_operator_costs, operator_costs, physical_i
 from .native_binding import bind_native_call
 from .program import RecipeBook
 from .structure import parse_case
+from .exposed_breakdown import ExposedClocks, finish_breakdown, unavailable_breakdown
+
+ZERO = 0
+ONE = 1
+ZERO_FLOAT = 0.0
+RECONCILE_FRACTION = 1e-3
+RECONCILE_MIN_MS = 1.0
+ROLE_CUBE = "cube"
+ROLE_VECTOR = "vector"
+ROLE_MEMORY = "memory"
+ROLE_COMMUNICATION = "communication"
+ROLE_CONTROL = "control"
+NON_COMMUNICATION_ROLES = frozenset({
+    ROLE_CUBE, ROLE_VECTOR, ROLE_MEMORY, ROLE_CONTROL})
+
+
+def _dominant_role(op) -> str:
+    """Dominant/active physical service role of one executed occurrence."""
+    if float(getattr(op, "link_bytes", ZERO) or ZERO) > ZERO:
+        return ROLE_COMMUNICATION
+    if float(getattr(op, "flops", ZERO) or ZERO) > ZERO:
+        return ROLE_CUBE
+    if float(getattr(op, "vector_ops", ZERO) or ZERO) > ZERO:
+        return ROLE_VECTOR
+    metadata = dict(getattr(op, "metadata", ()) or ())
+    memory = sum(float(getattr(op, field, ZERO) or ZERO) for field in (
+        "hbm_bytes", "mte2_bytes", "mte3_bytes"))
+    memory += float(metadata.get("mte1_bytes", ZERO) or ZERO)
+    memory += float(metadata.get("fixpipe_bytes", ZERO) or ZERO)
+    return ROLE_MEMORY if memory > ZERO else ROLE_CONTROL
+
+
+def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
+    """Reduce executed occurrence intervals onto the device-step boundary.
+
+    Intervals are the actual ``[ready, complete]`` spans of one replica's
+    executed operators. A missing periodic cross-stage wait cannot be scaled
+    into agreement: the report is explicitly unavailable instead.
+    """
+    intervals = []
+    for record in records:
+        if record["replica"] != replica or record["op"].family == "barrier":
+            continue
+        ready = record.get("collective_ready_ms", record["ready"].time)
+        start = max(ZERO_FLOAT, float(ready) - float(input_ready_ms))
+        end = max(start, float(record["complete"].time) - float(input_ready_ms))
+        intervals.append((start, end, _dominant_role(record["op"])))
+    if not intervals:
+        return unavailable_breakdown(
+            "exposed_operator_intervals_missing", boundary="device_step")
+    first_start = min(start for start, _end, _role in intervals)
+    if first_start > ZERO_FLOAT:
+        intervals.append((ZERO_FLOAT, first_start, ROLE_CONTROL))
+    span_end = max(end for _start, end, _role in intervals)
+    tolerance = RECONCILE_FRACTION * max(RECONCILE_MIN_MS, float(duration_ms))
+    if abs(span_end - float(duration_ms)) > tolerance:
+        return unavailable_breakdown(
+            "unreconciled_execution_boundary", boundary="device_step")
+
+    def union_end(roles):
+        ends = [end for _start, end, role in intervals if role in roles]
+        return max(ends, default=ZERO_FLOAT)
+
+    clocks = ExposedClocks(
+        float(duration_ms),
+        union_end(NON_COMMUNICATION_ROLES),
+        union_end({ROLE_CUBE, ROLE_VECTOR, ROLE_CONTROL}),
+        union_end({ROLE_CUBE}),
+    )
+    result = finish_breakdown(
+        clocks, duration_ms=float(duration_ms), boundary="device_step",
+        control_ms=first_start)
+    basis = result["exposed_breakdown_basis"]
+    basis["replica"] = int(replica)
+    basis["operator_intervals"] = len(intervals)
+    basis["host_launch_ms"] = float(first_start)
+    return result
 
 
 def _name(replica, identifier):
@@ -117,8 +194,8 @@ def _matrix_wrapper_projection(metadata):
 
 
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
-                input_ready_ms=0, include_submission=False, replay_scope=None,
-                isolated=True, trace_limit=0, compact=False,
+                input_ready_ms=ZERO, include_submission=False, replay_scope=None,
+                isolated=True, trace_limit=ZERO, compact=False,
                 audit_allocations=False):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
@@ -150,7 +227,7 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     graphs = bind_cohort_traffic(case, graphs)
     from .local_projection_tp import lower_local_projection_tp_cohort
     from .local_tp_groups import local_tp_spans_dp
-    if len(graphs) > 1:
+    if len(graphs) > ONE:
         graphs = lower_local_projection_tp_cohort(
             graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     scopes = {r: _replay_scope(items, replay_scope) for r, items in graphs.items()}
@@ -579,6 +656,12 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "execution": execution_summary, "parameters": parameter_summary,
             "events": list(engine.trace),
         }
+    if graphs:
+        result.update(_exposed_breakdown(
+            records, duration, input_ready_ms, min(graphs)))
+    else:
+        result.update(unavailable_breakdown(
+            "exposed_operator_intervals_missing", boundary="device_step"))
     if isolated:
         path = _precedence_bound(records if compact else rows,
                                  external_times, input_ready_ms)

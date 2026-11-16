@@ -426,6 +426,16 @@ def submit_batch(case, schedulers, plans, execution, lower, now, *,
                     case, {replica: work.ops for replica, work in works.items()})
                 works = {replica: replace(work, ops=bound[replica])
                          for replica, work in works.items()}
+        reuse_mode = str(getattr(case.runtime, "homogeneous_graph_reuse", "off"))
+        if len(works) > ONE and reuse_mode != "off":
+            from .cohort_reuse import prepare_cohort_graphs
+            prepared = prepare_cohort_graphs(
+                case, {replica: work.ops for replica, work in works.items()},
+                reuse=reuse_mode)
+            works = {
+                replica: replace(work, ops=tuple(prepared.graphs[replica]))
+                for replica, work in works.items()
+            }
         # SERVICE-CORE owns the integer emission projection. Use the same
         # accept policy that commit_batch will apply after the step completes.
         emitted = {

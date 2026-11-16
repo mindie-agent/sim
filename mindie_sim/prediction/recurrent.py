@@ -52,12 +52,25 @@ def _serving_kda_source(runtime, model, views, plan):
                            "options": opts}}, "kda")
 
 
+def serial_context_parallel(parallel):
+    """Collapse context parallelism while preserving a declared PCP plan.
+
+    KDA state is head-local, so a serial recurrence is valid under PCP. The
+    parallel spec still requires the matching plan; passing ``cp_plan="none"``
+    with ``pcp > 1`` is an invalid declaration, not a supported fallback.
+    """
+    next_plan = "pcp" if parallel.pcp > ONE else "none"
+    return replace(parallel, cp=ONE, dcp=ONE, cp_plan=next_plan)
+
+
 def linear(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
            padded_tokens, policy=None, runtime=None, **_):
     from mindie_sim.catalog.paired_sfa import execution
     from dataclasses import replace
     if execution(model).get("recurrent_context_sharded") is False:
-        parallel = replace(parallel, cp=ONE, dcp=ONE, cp_plan="none")
+        # KDA state is head-local under PCP; collapsing context parallelism must
+        # retain the PCP plan or the parallel spec rejects the serial state.
+        parallel = serial_context_parallel(parallel)
     if (runtime and plan.attention == "gdn" and views
             and all(view.phase == "decode" for view in views)):
         selected = select(runtime.kernels.get("lowerings", {}), "gdn_decode")

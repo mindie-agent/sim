@@ -40,6 +40,8 @@ from .implementation_selection import (
     selection_delivery,
     annotate as annotate_selections,
 )
+from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
+from .recover_ssm_work import recover_ssm_enabled
 
 ZERO = 0
 ONE = 1
@@ -83,6 +85,37 @@ def _without_service_fragments(regions):
                 continue
             kept.append(replace(op, deps=deps))
         result.append(replace(region, ops=tuple(kept)))
+    return tuple(result)
+
+
+def _strip_recover_intents(ops):
+    """Remove deferred commit intents and reconnect their consumers.
+
+    A body/model assembly prices only forward work; the post-acceptance state
+    publication belongs to the service assembly, so a leftover deferred intent
+    must never make a pure body depend on a sampling event.
+    """
+    intents = {op.op_id: op for op in ops if is_recover_ssm_intent(op)}
+    if not intents:
+        return tuple(ops)
+
+    def resolve(dep, seen):
+        if dep not in intents or dep in seen:
+            return (dep,)
+        parents = tuple(
+            parent for parent in intents[dep].deps
+            if parent != dep)
+        return tuple(
+            item for parent in parents
+            for item in resolve(parent, seen | {dep}))
+
+    result = []
+    for op in ops:
+        if op.op_id in intents:
+            continue
+        deps = tuple(dict.fromkeys(
+            parent for dep in op.deps for parent in resolve(dep, frozenset())))
+        result.append(replace(op, deps=deps) if deps != op.deps else op)
     return tuple(result)
 
 
@@ -204,10 +237,11 @@ class Frontend:
         self._prev_homo_env: tuple | None = None
 
     def body(self, model, runtime, views, *, prefix="", ready="", tokens=None,
-             mode="prefill", global_tokens=None, stages=None, replica=0,
+             mode="prefill", global_tokens=None, stages=None, replica=ZERO,
              features=None, source_rows_by_replica=None,
              routing_global_tokens=None, routing_views=None,
-             physical_rank=None, query_position=None):
+             physical_rank=None, query_position=None,
+             include_recover_commits: bool = False):
         p = runtime.parallel
         features = self.features if features is None else features
         requests = tuple(view.request_id for view in views)
@@ -457,7 +491,10 @@ class Frontend:
                 ops.append(trimmed)
                 previous = trimmed.op_id
         from .sparse_mla_metadata import before_forward
-        return before_forward(ops, ready), previous
+        ops = before_forward(ops, ready)
+        if not include_recover_commits:
+            ops = _strip_recover_intents(ops)
+        return ops, previous
 
     def logits(self, model, runtime, views, ready, *, prefix="", mode="decode", stage=None, sample=True,
                input_tokens=None, normalized=False):
@@ -599,7 +636,7 @@ class Frontend:
         )
 
     def __call__(self, plan, model, runtime, machine, *, global_tokens=None, global_views=None,
-                 resource_fusion=None, replica=0, source_rows_by_replica=None,
+                 resource_fusion=None, replica=ZERO, source_rows_by_replica=None,
                  routing_global_tokens=None, routing_views=None,
                  physical_rank=None, query_position=None, assembly="service",
                  dispatch_binding=None, dispatch_fast_step: bool = False):
@@ -652,6 +689,12 @@ class Frontend:
         runtime, selections = resolve_implementations(
             runtime, views, padded_tokens=padded, replay_scope=scope,
             global_views=global_views)
+        # A speculative decode leaves state publication to the service
+        # acceptance boundary. The homogeneous fast path splices one layer
+        # template across copies, which would lose those deferred intents.
+        deferred_commits = bool(recover_ssm_enabled(runtime)) and any(
+            view.phase == "decode" and view.q_len > ONE
+            and not getattr(view, "padding", False) for view in views)
         requests = tuple(view.request_id for view in views)
         ops = []
         entry = barrier_op(
@@ -709,7 +752,7 @@ class Frontend:
             dict(runtime.metadata).get("draft_mode")
             and (preparation_views or global_views and global_preparation)
         )
-        fast_result = self._try_lower_homogeneous(
+        fast_result = None if deferred_commits else self._try_lower_homogeneous(
             entry=entry, pre_ops=tuple(ops), body_ready=previous,
             plan=plan, model=model, runtime=runtime,
             views=views, local_views=local_views,
@@ -736,7 +779,8 @@ class Frontend:
                                    routing_global_tokens=routing_global_tokens,
                                    routing_views=eff_routing_views,
                                    physical_rank=physical_rank,
-                                   query_position=eff_query_pos)
+                                   query_position=eff_query_pos,
+                                   include_recover_commits=(assembly == "service"))
         ops.extend(body)
         if pcp_prefill:
             if runtime.final_norm_scope == "all":
@@ -777,6 +821,38 @@ class Frontend:
             phase=mode, recipe="token_commit", shape=(len(requests),),
         )
         ops.append(replace(committed, family="token_commit"))
+        if deferred_commits:
+            intents = tuple(op for op in ops if is_recover_ssm_intent(op))
+            if intents and assembly == "model":
+                ops = list(_strip_recover_intents(ops))
+            elif intents:
+                spec_views = tuple(
+                    view for view in views
+                    if view.phase == "decode" and view.q_len > ONE
+                    and not bool(getattr(view, "padding", False)))
+                anchor = next(
+                    (op for op in reversed(ops)
+                     if op.family in {"acceptance", "sampling"}), None)
+                if anchor is None:
+                    raise ModelingError(
+                        "recover_ssm_commit_requires_acceptance_boundary")
+                kept = [op for op in ops if not is_recover_ssm_intent(op)]
+                bound = bind_recover_ssm_commits(
+                    intents, views=spec_views,
+                    acceptance_events={view.request_id: anchor.op_id
+                                       for view in spec_views},
+                    state_bindings=None, runtime=runtime)
+                position = next(
+                    index for index, op in enumerate(kept)
+                    if op.op_id == anchor.op_id) + ONE
+                kept[position:position] = bound
+                commit_ids = tuple(op.op_id for op in bound)
+                ops = [
+                    replace(op, deps=tuple(dict.fromkeys(
+                        (*op.deps, *commit_ids))))
+                    if op.family == "token_commit" else op
+                    for op in kept
+                ]
         if has_after_draft:
             from .speculation import draft_program
             after, _ = draft_program(

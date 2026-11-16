@@ -26,9 +26,10 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 ZERO = 0
 ONE = 1
 ONE_FLOAT = 1.0
-FOUR = 4
+LAST = -1
 
 GDN_ARCH35_RECOVER_SSM_RECIPE = "vllm_ascend_recurrent_gated_delta_rule_arch35_fp32_recover_ssm"
+COMMIT_INTENT_STAGE = "commit_intent"
 
 
 def recover_ssm_enabled(runtime: Any) -> bool:
@@ -67,28 +68,44 @@ def commit_tokens_for_view(view: Any, runtime: Any = None) -> int:
 def emit_commit_op(b: Any, *, name: str, deps: Sequence[str], views: Sequence[Any],
                    heads: int, dk: int, dv: int, state_dtype: str, kg_dtype: str = "bf16",
                    runtime: Any = None, attention_kind: str = "kda") -> str | None:
-    spec_views = tuple(v for v in views if getattr(v, "phase", "") == "decode" and int(v.q_len) > 1)
+    """Emit an uncharged deferred commit intent for speculative decode views.
+
+    Integer advancement is accepted only after sampling/acceptance; resolving
+    it here would make a pure body assembly depend on a service event.  The
+    intent therefore carries geometry and remains explicitly pending, and
+    ``recover_ssm_commit`` materializes the physical work at the acceptance
+    boundary.
+    """
+    del runtime
+    spec_views = tuple(
+        view for view in views
+        if getattr(view, "phase", "") == "decode"
+        and int(getattr(view, "q_len", ZERO) or ZERO) > ONE
+        and not bool(getattr(view, "padding", False)))
     if not spec_views:
         return None
-    state_bytes = int(heads) * int(dk) * int(dv) * int(dtype_bytes(state_dtype or "fp32"))
-    rec_bytes = int(heads) * record_head_bytes(dk, dv, kg_dtype)
-    committed = tuple(commit_tokens_for_view(v, runtime) for v in spec_views)
-    total_committed, seq_count = sum(committed), len(spec_views)
-    return b.work(
-        name, tuple(deps), (total_committed, heads, dk, dv),
-        vector=FOUR * total_committed * heads * dk * dv,
-        read=seq_count * state_bytes + total_committed * rec_bytes,
-        write=seq_count * state_bytes, family="elementwise",
+    plan = getattr(b, "plan", None)
+    geometry = {
+        "heads": int(heads), "dk": int(dk), "dv": int(dv),
+        "state_dtype": str(state_dtype), "kg_dtype": str(kg_dtype),
+        "scope": str(getattr(plan, "scope", "target")),
+        "layer": int(getattr(plan, "index", ZERO)),
+    }
+    request_ids = tuple(str(view.request_id) for view in spec_views)
+    op_id = b.work(
+        name, tuple(deps), (len(spec_views), int(heads), int(dk), int(dv)),
+        flops=ZERO, vector=ZERO, read=ZERO, write=ZERO, family="elementwise",
         metadata=(
-            ("recover_ssm_stage", "commit"), ("recover_ssm", True),
+            ("recover_ssm", True), ("recover_ssm_intent", True),
+            ("recover_ssm_stage", COMMIT_INTENT_STAGE),
             ("recover_ssm_pending_acceptance", True),
+            ("recover_ssm_geometry", geometry),
             ("recurrent_attention_kind", str(attention_kind)),
-            ("sequences", seq_count), ("committed_tokens", committed),
-            ("state_checkpoints", seq_count), ("record_bytes_per_token", rec_bytes),
-            ("state_bytes", state_bytes), ("heads", int(heads)),
-            ("dk", int(dk)), ("dv", int(dv)), ("state_dtype", state_dtype),
+            ("requests", request_ids),
         ),
     )
+    b.ops[LAST] = replace(b.ops[LAST], requests=request_ids)
+    return op_id
 
 
 def rewrite_gdn_analytical_scan(scan: Any, *, active_views: Sequence[Any], heads: int,
