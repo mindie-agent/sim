@@ -8,6 +8,8 @@
 """
 from dataclasses import replace
 
+from mindie_sim.catalog.attention_common import active_dcp_degree
+from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.paired_sfa import execution, SOURCE
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .mechanism import OperatorPlan, PlannedRecipe, Work
@@ -18,6 +20,8 @@ TWO = 2
 FP32_BYTES = 4
 MERGE_OPS = 3
 MAX_HEADS = 128
+PACK_LSE_OPS = 4
+FP8_FORMATS = frozenset({"fp8", "fp8_e4m3", "fp8_e5m2"})
 IMPLEMENTATION = "paired_fp8_qsfa_analytic"
 
 
@@ -26,11 +30,14 @@ ZERO = 0
 
 def enabled(model, parallel, views, runtime=None):
     selected = bool(execution(model).get("dcp_query_gather"))
-    if selected and parallel.cp > ONE and (
-            parallel.pcp != ONE or any(view.phase != "decode" for view in views)):
+    nonlocal_phase = any(view.phase != "decode" for view in views)
+    if selected and nonlocal_phase and (parallel.cp > ONE or parallel.pcp != ONE):
         raise ModelingError("gathered_head_dcp_requires_decode_pcp1")
-    if not selected or any(view.phase != "decode" for view in views):
+    if not selected or nonlocal_phase:
         return False
+    # Decode may use DCP even when physical PCP participants remain: every
+    # request resolves to one effective KV-sharding degree.
+    effective_cp = max(active_dcp_degree(parallel, view.phase) for view in views)
     if runtime:
         kernels = runtime.kernels
         if (set(kernels.get("lowerings", {})) & {
@@ -39,7 +46,7 @@ def enabled(model, parallel, views, runtime=None):
                 or "indexed_attention" in kernels.get("programs", {})
                 or "attention" in kernels.get("families", {})):
             raise ModelingError("gathered_head_attention_conflicts_with_explicit_implementation")
-    return selected
+    return selected and effective_cp >= ONE
 
 
 def query_gather(b, query, rope, rows, heads, width, cp):
@@ -59,8 +66,9 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
     if not members:
         return outputs
     meta = dict(members[ZERO].metadata)
-    # Explicit analytical implementation, not a claim about compiled tiling.
-    fp8 = b.model.quant.kv_dtype in {"fp8", "fp8_e4m3", "fp8_e5m2"} and plan.indexer
+    # The resolved cache representation, not the checkpoint's raw kv_dtype,
+    # selects the native QSFA call.
+    fp8 = cache_format(b.model, "mla_kv").dtype in FP8_FORMATS and plan.indexer
     if fp8 and (b.model.activation_dtype != "bf16" or not ONE <= heads <= MAX_HEADS):
         raise ModelingError("fp8_qsfa_requires_bf16_queries_and_native_head_domain")
     meta.update({
@@ -75,6 +83,13 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
     })
     meta.pop("indexed_attention_geometry", None)
     shape = (sum(view.q_len for view in views), heads, plan.kv_lora_rank)
+    out_bytes = dtype_bytes(b.model.activation_dtype)
+    statistics = rows * heads * TWO * FP32_BYTES
+    meta.update({
+        "qsfa_output_bytes": rows * heads * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),
+        "qsfa_statistics_bytes": statistics,
+        "qsfa_output_dtype": b.model.activation_dtype,
+    })
     batch = replace(
         members[ZERO], op_id=b.prefix + ".latent_attention_batch",
         recipe=IMPLEMENTATION if fp8 else "paired_mla_attention_analytic",
@@ -82,18 +97,24 @@ def attention_batch(b, outputs, views, *, plan, heads, local_heads, cp, rows):
         semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
         deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),
         flops=sum(op.flops for op in members), vector_ops=sum(op.vector_ops for op in members),
-        hbm_bytes=sum(op.hbm_bytes for op in members),
-        mte2_bytes=sum(op.mte2_bytes for op in members), mte3_bytes=sum(op.mte3_bytes for op in members),
+        hbm_bytes=sum(op.hbm_bytes for op in members) + (statistics if fp8 else ZERO),
+        mte2_bytes=sum(op.mte2_bytes for op in members),
+        mte3_bytes=sum(op.mte3_bytes for op in members) + (statistics if fp8 else ZERO),
         metadata=tuple(meta.items()))
     b.ops[:] = [op for op in b.ops if op.op_id not in ids]
     b.ops.append(batch)
     if cp == ONE:
         return [batch.op_id]
     # BF16 output plus four BF16 lanes containing the FP32 LSE payload.
-    out_bytes = dtype_bytes(b.model.activation_dtype)
     lse_lanes = TWO * FP32_BYTES // int(out_bytes) if out_bytes != FP32_BYTES else ONE
+    packed_bytes = rows * heads * (plan.kv_lora_rank + lse_lanes) * out_bytes
+    pack = b.work(
+        "dcp_output_pack", (batch.op_id,), (rows, heads, plan.kv_lora_rank),
+        vector=rows * heads * PACK_LSE_OPS,
+        read=rows * heads * (plan.kv_lora_rank * out_bytes + TWO * FP32_BYTES),
+        write=packed_bytes, family="elementwise")
     wire = rows * local_heads * (plan.kv_lora_rank + lse_lanes) * out_bytes * (cp - ONE)
-    gathered = b.communicate("dcp_output_alltoall", (batch.op_id,), wire,
+    gathered = b.communicate("dcp_output_alltoall", (pack,), wire,
                              "alltoall", "cp", source="dcp_a2a_fused")
     elements = rows * local_heads * plan.kv_lora_rank
     merged = b.work("dcp_lse_merge", (gathered,), (rows, local_heads, plan.kv_lora_rank),

@@ -94,7 +94,12 @@ def test_index_history_is_sharded_but_recurrent_heads_are_not():
     assert len([op for op in graph if op.recipe == "dcp_output_alltoall"]) == 24
     assert not any(op.family == "dcp_allgather" for op in graph)
     scan = next(op for op in graph if op.recipe == "index_scores")
-    assert scan.mte2_bytes == sum(131072 + i for i in range(1, 5)) * 2 * 130 / 8
+    # Exact rank-owned visible rows, not a balanced total/CP approximation.
+    from mindie_sim.catalog.context_parallel import owned_positions
+    owned = [sum(owned_positions(0, 131072 + offset, 8, 1536, rank)
+                 for _ in range(2) for offset in range(1, 5))
+             for rank in range(8)]
+    assert scan.mte2_bytes == max(owned) * 130
     candidate = next(op for op in graph if op.recipe == "candidate_gather")
     assert candidate.link_bytes == 8 * 2048 * 8 * 7
     kda = [op for op in graph if op.family in {"recurrent_vector", "recurrent_scan"}]

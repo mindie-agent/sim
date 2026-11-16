@@ -12,14 +12,29 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
+from mindie_sim.catalog.attention_common import (
+    _causal_pairs, _long_selected_pairs, active_dcp_degree, min_positive,
+)
+from mindie_sim.catalog.cache import completed_rows, index_row_bytes
+from mindie_sim.catalog.cache_format import cache_format
+from mindie_sim.catalog.context_parallel import (
+    dsa_cp_token_ranges, owned_positions, split_causal_pairs, split_pcp_pairs,
+)
 from mindie_sim.schema.common import ModelingError
+from .batch_prefix_indexer import apply_indexer_prefix_reads
 from .mechanism import OperatorPlan, Work
+from .mla_structure import declare_indexer
 from .ownership import read_role, unit_group
 from .program import KernelProgram, ParallelProgram, Stage
 from .engine import Allocation
 
 KEY_TILE = 128
+DEFAULT_BLOCK_SIZE = 128
+CANDIDATE_BYTES = 8
+FP32_BYTES = 4
+MIN_LOG_TOPK = 2
 ZERO = 0
 ONE = 1
 TWO = 2
@@ -220,6 +235,408 @@ def build(op, geometry):
             "source_scope": "generic_one_query_owner_online_qk_softmax_pv",
         }},
     )
+
+
+def visible_parts(view):
+    """(query, context) spans whose global starts set the visible KV rows."""
+    ranges = getattr(view, "query_ranges", ()) or ()
+    if not ranges:
+        return ((view.q_len, view.context),)
+    return tuple((hi - lo, view.context + lo) for lo, hi in ranges if hi > lo)
+
+
+def selected_pairs(parts, ratio, topk, *, noncausal=False, kv_len=None):
+    return sum(
+        _long_selected_pairs(query, context, ratio, topk,
+                             noncausal=noncausal, kv_len=kv_len)
+        for query, context in parts
+    )
+
+
+def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
+                            shard, prefix, padded_tokens, runtime=None,
+                            score_rows=None):
+    """Declare the indexer score/TopK pair with local sharded row accounting."""
+    valid = sum(view.q_len for view in views)
+    cand_window = (
+        plan.candidate_topk_blocks * plan.candidate_block_size
+        if plan.candidate_filter else ZERO
+    )
+    ratio = max(ONE, plan.compress_ratio)
+    block_size = max(
+        ONE, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
+    rows_by_view: list[int] = []
+    shared_by_view: list[int] = []
+    for view in views:
+        parts = visible_parts(view)
+        v_rows = int(selected_pairs(
+            parts, ratio, cand_window,
+            noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len))
+        raw_pref = max(ZERO, min(int(getattr(view, "prefix_tokens", ZERO) or ZERO),
+                                 int(view.context)))
+        aligned_pref = ((raw_pref // block_size) * block_size) // ratio
+        q_cnt = sum(q_part for q_part, _ in parts)
+        rows_by_view.append(v_rows)
+        shared_by_view.append(min(v_rows, aligned_pref * max(ONE, q_cnt)))
+    local = score_rows is not None
+    rows = max(ZERO_FLOAT, float(score_rows)) if local else float(sum(rows_by_view))
+    divisor = ONE if local else max(ONE, int(shard))
+    row_b = index_row_bytes(model, plan.index_dim)
+    scores = b.work("index_scores", deps, (valid, plan.index_heads, plan.index_dim),
+                    flops=TWO * rows * plan.index_heads * plan.index_dim / divisor,
+                    vector=rows * plan.index_heads * TWO / divisor,
+                    read=rows * row_b / divisor,
+                    write=rows * FP32_BYTES / divisor, family="indexer",
+                    dtype=quant.index_dtype)
+    if not local and shard == ONE and b.ops:
+        cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
+        cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
+        pinned = "indexer" in cfg_fam or "index_scores" in cfg_rec
+        b.ops[-ONE] = apply_indexer_prefix_reads(
+            b.ops[-ONE], views=views, rows_by_view=rows_by_view,
+            shared_rows_by_view=shared_by_view, row_bytes=float(row_b),
+            layer_index=plan.index, runtime=runtime,
+            kernel_reuse="native_per_sequence" if pinned else "tile",
+            allow_recipe_rebind=not pinned)
+    topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
+                 vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
+                 read=rows * FP32_BYTES / divisor,
+                 write=valid * plan.index_topk * CANDIDATE_BYTES,
+                 family="topk", dtype="fp32",
+                 metadata=(("selection_output_dtype", "int32"),))
+    declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
+                    quant=quant, views=views, padded_tokens=padded_tokens,
+                    scores=scores, topk=topk)
+    return topk
+
+
+def view_causal_pairs(view, query, context, window):
+    ranges = getattr(view, "query_ranges", ()) if view.phase == "prefill" else ()
+    if not ranges:
+        return _causal_pairs(query, context, window)
+    counted = sum(
+        _causal_pairs(end - start, context + start, window)
+        for start, end in ranges if end > start
+    )
+    catalog = sum(
+        split_pcp_pairs(end - start, context + start, ONE,
+                        window=max(ZERO, int(window))).total
+        for start, end in ranges if end > start
+    )
+    if counted != catalog:
+        raise ModelingError(f"pcp_query_range_pairs_diverged:{counted}!={catalog}")
+    return counted
+
+
+def kv_sweeps(parts, plan, view, query_tile, *, dense, topk):
+    """Tile sweeps. Each span's horizon is ``context_before_span + tile_end``."""
+    sweeps = ZERO
+    long_cap = plan.index_topk if topk else view.kv_len
+    dense_cap = min_positive(plan.window, plan.index_topk if topk else ZERO)
+    for query, context in parts:
+        for start in range(ZERO, query, query_tile):
+            horizon = (view.kv_len if plan.noncausal_attention
+                       else context + min(query, start + query_tile))
+            if dense:
+                sweeps += min(horizon, dense_cap) if dense_cap > ZERO else horizon
+            else:
+                window_rows = min(horizon, plan.window) if plan.window else ZERO
+                sweeps += window_rows + min(
+                    completed_rows(horizon, plan.compress_ratio), long_cap)
+    return sweeps
+
+
+def sparse_over_parts(parts, plan, query_tile, *, dense, kv_len=None, topk=None):
+    from .sparse_attention import SparseAttentionTraffic, sparse_attention_traffic
+    cap = plan.index_topk if topk is None else int(topk)
+    gather = ZERO
+    window = ZERO
+    reads = ZERO
+    for query, context in parts:
+        traffic = sparse_attention_traffic(
+            query, context, cap,
+            compression_ratio=ONE if dense else plan.compress_ratio,
+            window=ZERO if dense else plan.window,
+            query_tile=query_tile, index_pool_size=plan.index_kpool,
+            index_pool_tail=plan.index_kpool_always_select_tail,
+            noncausal=bool(plan.noncausal_attention), kv_len=kv_len)
+        gather += traffic.gather_rows
+        window += traffic.window_sweep_rows
+        reads += traffic.index_read_bytes
+    return SparseAttentionTraffic(gather, window, reads)
+
+
+def attention_view_record(view, *, plan, model, quant, query_tile, eff_cp, block,
+                          interleave, tp, dsa, topk_present, heads, latent_dim):
+    """Per-view logical pairs, owned sweeps and batch row vectors."""
+    context, query = view.context, view.q_len
+    parts = dsa_cp_prefill_parts(view, tp) if dsa else visible_parts(view)
+    eff_q = (sum(q_part for q_part, _ in parts)
+             if dsa and view.phase == "prefill" else query)
+    dense_cap = min_positive(plan.window, plan.index_topk if topk_present else ZERO)
+    if plan.cache_kind == "dense":
+        if topk_present:
+            pairs = selected_pairs(
+                parts, ONE, dense_cap,
+                noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
+        elif plan.noncausal_attention:
+            vis_kv = (min(view.kv_len, plan.window)
+                      if plan.window > ZERO else view.kv_len)
+            pairs = float(eff_q * vis_kv)
+        elif dsa and view.phase == "prefill":
+            pairs = sum(_causal_pairs(q_part, c_part, plan.window)
+                        for q_part, c_part in parts)
+        else:
+            pairs = view_causal_pairs(view, query, context, plan.window)
+        sweeps = kv_sweeps(parts, plan, view, query_tile, dense=True,
+                           topk=bool(topk_present))
+    else:
+        if plan.noncausal_attention:
+            long_cap = plan.index_topk if topk_present else view.kv_len
+            pairs = float(eff_q * (
+                (min(view.kv_len, plan.window) if plan.window else ZERO)
+                + min(completed_rows(view.kv_len, plan.compress_ratio), long_cap)
+            ))
+        else:
+            win_p = (
+                sum(_causal_pairs(q_part, c_part, plan.window)
+                    for q_part, c_part in parts)
+                if dsa and view.phase == "prefill"
+                else view_causal_pairs(view, query, context, plan.window)
+            ) if plan.window else ZERO_FLOAT
+            pairs = win_p + selected_pairs(
+                parts, plan.compress_ratio, plan.index_topk if topk_present else ZERO,
+                noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len)
+        sweeps = kv_sweeps(parts, plan, view, query_tile, dense=False,
+                           topk=bool(topk_present))
+    selection_reads, selection_metadata = ZERO, ()
+    if topk_present:
+        traffic = sparse_over_parts(
+            parts, plan, query_tile, dense=plan.cache_kind == "dense",
+            kv_len=view.kv_len,
+            topk=dense_cap if plan.cache_kind == "dense" else plan.index_topk)
+        if plan.index_kpool > ONE:
+            pairs = float(traffic.total_cache_rows)
+        sweeps = traffic.total_cache_rows
+        selection_reads = traffic.index_read_bytes
+        selection_metadata = tuple(traffic.metadata().items()) + (
+            ("program_kind", "indexed_attention"),
+            ("indexed_attention_geometry", {
+                "query": eff_q, "context": context, "topk": plan.index_topk,
+                **({"sequences": parts} if parts != ((eff_q, context),) else {}),
+                "compression_ratio": (ONE if plan.cache_kind == "dense"
+                                      else plan.compress_ratio),
+                "window": ZERO if plan.cache_kind == "dense" else plan.window,
+                "heads": heads, "latent": latent_dim,
+                "rope": plan.qk_rope_head_dim, "cp": eff_cp,
+                "query_dtype": model.activation_dtype,
+                "cache_dtype": quant.kv_dtype,
+                **({"index_pool_size": plan.index_kpool,
+                    "index_pool_tail": plan.index_kpool_always_select_tail}
+                   if plan.index_kpool > ONE else {}),
+            }),
+        )
+    shared = ZERO
+    if eff_cp > ONE and plan.cache_kind == "dense" and not topk_present:
+        if plan.noncausal_attention:
+            v_pairs = list(split_causal_pairs(
+                eff_q, view.kv_len - eff_q, eff_cp, interleave,
+                window=plan.window, noncausal=True).per_rank)
+        else:
+            v_pairs = [
+                sum(split_causal_pairs(
+                    q_part, c_part, eff_cp, interleave,
+                    window=plan.window, noncausal=False).per_rank[rank]
+                    for q_part, c_part in parts)
+                for rank in range(eff_cp)
+            ]
+        v_sweeps = [ZERO] * eff_cp
+        v_shared = [ZERO] * eff_cp
+        raw_pref = max(ZERO, min(
+            int(getattr(view, "prefix_tokens", ZERO) or ZERO), int(context)))
+        aligned_pref = (raw_pref // block) * block
+        for q_part, c_part in parts:
+            for start in range(ZERO, q_part, query_tile):
+                hi = (view.kv_len if plan.noncausal_attention
+                      else c_part + min(q_part, start + query_tile))
+                lo = (
+                    (max(ZERO, hi - plan.window) if plan.noncausal_attention
+                     else max(ZERO, c_part + start + ONE - plan.window))
+                    if plan.window > ZERO else ZERO
+                )
+                sh_hi = min(hi, aligned_pref)
+                for rank in range(eff_cp):
+                    v_sweeps[rank] += owned_positions(
+                        lo, hi - ONE, eff_cp, interleave, rank)
+                    if sh_hi > lo:
+                        v_shared[rank] += owned_positions(
+                            lo, sh_hi - ONE, eff_cp, interleave, rank)
+        v_rows = [owned_positions(ZERO, view.kv_len - ONE, eff_cp, interleave, rank)
+                  for rank in range(eff_cp)]
+    else:
+        v_pairs = [float(pairs) / eff_cp] * eff_cp
+        v_sweeps = [math.ceil(sweeps / eff_cp)] * eff_cp
+        raw_pref = max(ZERO, min(
+            int(getattr(view, "prefix_tokens", ZERO) or ZERO), int(context)))
+        aligned_pref = (raw_pref // block) * block
+        shared_base = ZERO
+        if plan.cache_kind == "dense" and not topk_present:
+            for q_part, c_part in parts:
+                for start in range(ZERO, q_part, query_tile):
+                    hi = (view.kv_len if plan.noncausal_attention
+                          else c_part + min(q_part, start + query_tile))
+                    lo = (
+                        (max(ZERO, hi - plan.window) if plan.noncausal_attention
+                         else max(ZERO, c_part + start + ONE - plan.window))
+                        if plan.window > ZERO else ZERO
+                    )
+                    sh_hi = min(hi, aligned_pref)
+                    if sh_hi > lo:
+                        shared_base += sh_hi - lo
+        shared = math.ceil(shared_base / eff_cp) if eff_cp else shared_base
+        v_shared = [shared] * eff_cp
+        v_rows = [math.ceil(view.kv_len / eff_cp)] * eff_cp
+    return {
+        "view": view, "parts": parts, "query": query, "eff_q": eff_q,
+        "pairs": float(pairs), "sweeps": sweeps, "v_pairs": v_pairs,
+        "v_sweeps": v_sweeps, "v_shared": v_shared, "v_rows": v_rows,
+        "selection_reads": selection_reads,
+        "selection_metadata": selection_metadata,
+    }
+
+
+def window_cache_read(plan, view, parts, sweeps, eff_cp, query_tile, elements, model):
+    """Local window/compressed cache bytes for one view's worst rank."""
+    if plan.cache_kind != "window_compressed":
+        return None
+    original_rows = sum(
+        min(view.kv_len if plan.noncausal_attention
+            else c_part + min(q_part, start + query_tile), plan.window)
+        for q_part, c_part in parts
+        for start in range(ZERO, q_part, query_tile)
+    ) if plan.window else ZERO
+    full = (
+        original_rows * cache_format(model, "window").row_bytes(elements)
+        + (sweeps - original_rows) * cache_format(
+            model, "compressed_kv").row_bytes(elements))
+    return full / eff_cp
+
+
+def dsa_cp_prefill_parts(view, tp):
+    """Worst-rank prefill query span under DSA-CP query-token SP."""
+    if view.phase != "prefill" or tp <= ONE or view.q_len <= ZERO:
+        return visible_parts(view)
+    best_parts = ()
+    best_cost = -ONE
+    for rank in range(tp):
+        lo, hi, _, _ = dsa_cp_token_ranges(view.q_len, tp, rank)
+        if hi <= lo:
+            continue
+        span_q, span_c = hi - lo, view.context + lo
+        cost = span_q * span_c + span_q * (span_q + ONE) // TWO
+        if cost > best_cost:
+            best_cost, best_parts = cost, ((span_q, span_c),)
+    return best_parts
+
+
+def attention_tensor_view(plan, view, heads, model, quant, parallel, *, eff_cp=None):
+    """Declare active latent tensors separately from paged cache allocation."""
+    resolved_cp = int(parallel.cp) if eff_cp is None else int(eff_cp)
+    dense_paged = (
+        plan.mla_variant == "latent_mla" and plan.cache_kind == "dense"
+        and not plan.index_topk
+        and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16"
+    )
+    if parallel.pcp != ONE or (resolved_cp != ONE and not dense_paged):
+        return ()
+    common = {
+        "query_dtype": model.activation_dtype,
+        "cache_dtype": quant.kv_dtype,
+        "output_dtype": model.activation_dtype,
+    }
+    if plan.mla_variant == "latent_mla" and plan.index_topk > ZERO:
+        query = (view.q_len, heads, plan.kv_lora_rank)
+        return (("attention_tensor_view", {
+            **common, "kind": "indexed_latent",
+            "query_shape": query, "output_shape": query,
+            "query_rope_shape": (view.q_len, heads, plan.qk_rope_head_dim),
+            "cache_head_shape": (ONE, plan.kv_lora_rank),
+            "rope_cache_head_shape": (ONE, plan.qk_rope_head_dim),
+        }),)
+    if (plan.mla_variant == "latent_mla" and plan.cache_kind == "dense"
+            and model.activation_dtype == "bf16" and quant.kv_dtype == "bf16"):
+        query = (view.q_len, heads, plan.kv_lora_rank + plan.qk_rope_head_dim)
+        return (("attention_tensor_view", {
+            **common, "kind": "dense_paged_latent",
+            "query_shape": query,
+            "cache_head_shape": (ONE, plan.kv_lora_rank + plan.qk_rope_head_dim),
+            "output_shape": (heads, view.q_len, plan.kv_lora_rank),
+            "page_size": int(getattr(parallel, "kv_block_size", ZERO) or ZERO),
+            "source_scope": "generic_dense_latent_online_attention",
+        }),)
+    if (plan.mla_variant == "latent_mqa" and plan.cache_kind == "window_compressed"
+            and plan.head_dim == plan.qk_nope_head_dim + plan.qk_rope_head_dim):
+        query = (view.q_len, heads, plan.head_dim)
+        regions = dict(model.metadata).get("cache_representations", {})
+        if regions:
+            return (("attention_tensor_view", {
+                "kind": "mixed_quant_shared_kv", "query_shape": query, "output_shape": query,
+                "query_dtype": model.activation_dtype, "output_dtype": model.activation_dtype,
+                "cache_representations": regions,
+                "original_cache_row_bytes": cache_format(model, "window").row_bytes(plan.head_dim),
+                "compressed_cache_row_bytes": cache_format(
+                    model, "compressed_kv").row_bytes(plan.head_dim),
+            }),)
+        return (("attention_tensor_view", {
+            **common, "kind": "shared_kv",
+            "query_shape": query, "output_shape": query,
+            "cache_head_shape": (ONE, plan.head_dim),
+            "compressed_cache": plan.compress_ratio > ZERO,
+        }),)
+    return ()
+
+
+def owned_store_rows(rows_by_view, views, parallel, block, *, contexts=None):
+    """Worst-rank rows written by DCP-owned stores for the supplied view rows."""
+    degrees = [active_dcp_degree(parallel, view.phase) for view in views]
+    starts = [int(view.context) for view in views] if contexts is None else list(contexts)
+    max_degree = max(degrees, default=ONE)
+    block = max(ONE, int(block))
+    best = ZERO
+    for rank in range(max_degree):
+        total = ZERO
+        for start, rows, degree in zip(starts, rows_by_view, degrees):
+            rows = max(ZERO, int(rows))
+            if not rows:
+                continue
+            if degree <= ONE:
+                total += rows
+            elif rank < degree:
+                total += owned_positions(
+                    int(start), int(start) + rows - ONE, degree, block, rank)
+        best = max(best, total)
+    return best
+
+
+def sharded_index_visible_rows(views, parallel, block, ratio):
+    """Worst-rank visible index rows under a sharded indexer."""
+    degrees = [active_dcp_degree(parallel, view.phase) for view in views]
+    max_degree = max(degrees, default=ONE)
+    block = max(ONE, int(block))
+    ratio = max(ONE, int(ratio))
+    per_rank = [ZERO] * max_degree
+    for view, degree in zip(views, degrees):
+        for offset in range(int(view.q_len)):
+            horizon = completed_rows(view.context + offset + ONE, ratio)
+            if horizon <= ZERO:
+                continue
+            if degree <= ONE:
+                per_rank = [value + horizon for value in per_rank]
+            else:
+                for rank in range(degree):
+                    per_rank[rank] += owned_positions(
+                        ZERO, horizon - ONE, degree, block, rank)
+    return max(per_rank, default=ZERO_FLOAT)
 
 
 def batch_ops(ops, outputs, *, runtime, views, prefix):
