@@ -30,6 +30,7 @@ from typing import Any
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from mindie_sim.schema.operators import OpSpec
+from .recover_ssm_work import commit_tokens_for_view
 
 
 ZERO = 0
@@ -123,14 +124,13 @@ def bind_recover_ssm_commits(
     state_bindings: Mapping[str, Any] | None, runtime: Any,
 ) -> tuple[OpSpec, ...]:
     """Materialize acceptance-bound commits for every declared state owner."""
-    del runtime
     active = tuple(view for view in views if _decode_speculative(view))
     if not active:
         return tuple(ops)
     events = dict(acceptance_events or {})
     bindings = dict(state_bindings or {})
     committed_by_request = {
-        str(getattr(view, "request_id", "")): _advanced_tokens(view)
+        str(getattr(view, "request_id", "")): commit_tokens_for_view(view, runtime)
         for view in active
     }
     result: list[OpSpec] = []

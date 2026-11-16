@@ -1162,10 +1162,20 @@ def capacity_window(
         def batch_stage_bytes(sequences: int, tokens: int) -> list[float]:
             if sequences <= ZERO:
                 return [ZERO_FLOAT] * int(scaled.runtime.parallel.pp)
+            if phase == "decode":
+                # The KV horizon grows with emitted tokens, but the verified
+                # query width stays q_tokens; passing the horizon as q_len
+                # would charge one recurrent checkpoint per future token.
+                seq_q = max(ONE, int(q_tokens))
+                seq_ctx = max(ZERO, int(tokens) - seq_q)
+            else:
+                seq_q = max(ONE, int(tokens) - context)
+                seq_ctx = context
             return [float(value) for value in batch_cache_bytes(
-                scaled, sequences=sequences, context=context,
-                tokens_per_seq=max(ONE, int(tokens) - context),
-                prefix_tokens=prefix_tokens, phase=phase, padded=True).total_bytes]
+                scaled, sequences=sequences, context=seq_ctx,
+                tokens_per_seq=seq_q,
+                prefix_tokens=min(prefix_tokens, seq_ctx),
+                phase=phase, padded=True).total_bytes]
 
         kv_active = batch_stage_bytes(b, active_tokens)
         kv_retiring = (batch_stage_bytes(staggered_delayed_b, retiring_tokens)

@@ -233,6 +233,28 @@ def test_require_cohort_refuses_asymmetry_and_rebinds_requests():
             case, {0: template, 1: asymmetric}, reuse="require")
 
 
+@pytest.mark.parametrize("dp", (2, 4))
+def test_local_tp_groups_span_dp_replicas_without_participant_mismatch(dp):
+    width = 2
+    case = parse_case(compose_case(
+        model="longcat-flash-lite", hardware="a5", tp=1, dp=dp, ep=dp,
+        o_proj_tp=width, linear_proj_tp=width, lm_head_tp=width, layers=1,
+        concurrency=1, recover_ssm=True, redundant_experts_per_rank=0,
+        homogeneous_graph_reuse="require"))
+    graphs = target_graphs(case, phase="decode", tokens=1, context=128,
+                           sequences=1, scope="body")
+    for replica, graph in graphs.items():
+        base = replica // width * width
+        expected = tuple(range(base, base + width))
+        groups = {dict(op.metadata)["group_ranks"]
+                  for op in graph if "group_ranks" in dict(op.metadata)}
+        assert groups == {expected}
+    report = graph_costs(
+        case, graphs, external_inputs={"analysis_input": 0},
+        include_submission=False, isolated=False, compact=True)
+    assert report["duration_ms"] > 0
+
+
 def record(replica, family, start, end, *, link=0.0, flops=0.0, vector=0.0,
            hbm=0.0):
     op = SimpleNamespace(

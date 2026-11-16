@@ -34,6 +34,7 @@ KEY_TILE = 128
 DEFAULT_BLOCK_SIZE = 128
 CANDIDATE_BYTES = 8
 FP32_BYTES = 4
+INT32_BYTES = 4
 MIN_LOG_TOPK = 2
 ZERO = 0
 ONE = 1
@@ -301,7 +302,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
                  vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
                  read=rows * FP32_BYTES / divisor,
-                 write=valid * plan.index_topk * CANDIDATE_BYTES,
+                 write=valid * plan.index_topk * INT32_BYTES,
                  family="topk", dtype="fp32",
                  metadata=(("selection_output_dtype", "int32"),))
     declare_indexer(b.ops, prefix=prefix, plan=plan, parallel=parallel, model=model,
@@ -741,6 +742,16 @@ def batch_general_mla_ops(ops, outputs, *, views, prefix, runtime, policy):
     if (len(members) != len(outputs)
             or any(op.plan_required or op.source_boundary or op.recipe in cfg_rec
                    for op in members)):
+        return outputs
+    # Only pure analytic envelope members of one phase share one invocation.
+    # A generic decode schedule or an indexed geometry carries its own private
+    # query/topk recipe; merging it would execute only the first member.
+    first_phase = members[ZERO].phase
+    if any(op.phase != first_phase for op in members) or any(
+            dict(op.metadata).get("program_kind")
+            or dict(op.metadata).get("latent_attention_schedule")
+            or dict(op.metadata).get("indexed_attention_geometry")
+            for op in members):
         return outputs
     ids = {op.op_id for op in members}
     reqs = tuple(dict.fromkeys(req for op in members for req in op.requests))

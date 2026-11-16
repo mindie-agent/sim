@@ -16,6 +16,7 @@ from mindie_sim import target_graphs
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weight_terms import WeightTerm, term_bytes
 from mindie_sim.prediction.attention import AttentionPolicy, gqa
+from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.generic_latent_attention import (
     owned_store_rows, sparse_over_parts,
 )
@@ -130,3 +131,28 @@ def test_kimi_index_store_and_qsfa_publish_owned_rows_and_statistics():
     assert pack.vector_ops == 96 * PACK_LSE_OPS
     alltoall = next(op for op in graph if op.recipe == "dcp_output_alltoall")
     assert alltoall.link_bytes == 12 * (512 + 4) * 2 * (8 - 1)
+
+
+def test_mixed_decode_prefill_mla_keeps_full_prefill_work():
+    from test_mla_head_padding import control
+    parsed = parse_case(control(12, selected=False))
+    decode = RequestView("d0", 1, 16, False, "decode")
+    prefill = RequestView("p0", 512, 0, False, "prefill")
+    standalone, _ = Frontend().body(
+        parsed.model, parsed.runtime, (prefill,), ready="input", tokens=512,
+        mode="prefill")
+    mixed, _ = Frontend().body(
+        parsed.model, parsed.runtime, (decode, prefill), ready="input",
+        tokens=513, mode="decode")
+    expected = next(op for op in standalone if op.family == "attention")
+    members = [op for op in mixed if op.family == "attention"]
+    # The 1-token generic decode schedule must never absorb the prefill and
+    # execute only its own query row.
+    assert len(members) == 2
+    assert sum(int(op.semantic_shape[0]) for op in members) == 513
+    assert max(op.flops for op in members) == expected.flops
+    schedules = [dict(op.metadata).get("latent_attention_schedule")
+                 for op in members]
+    assert sum(item is not None for item in schedules) == 1
+    scheduled = next(item for item in schedules if item is not None)
+    assert scheduled["query_rows"] == 1

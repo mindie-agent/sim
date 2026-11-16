@@ -247,3 +247,26 @@ def test_shared_prefix_capacity_window_charges_pool_pages_once():
         output_budget=8)
     assert private["active_kv_bytes"] == pytest.approx(
         2 * sum(Memory(case).cache_bytes(active)))
+
+
+def test_shared_prefix_decode_keeps_recurrent_state_per_sequence():
+    base = dense_case(layers=1)
+    case = replace(
+        base, model=linear_model("kda", 1),
+        runtime=replace(base.runtime, prefix_cache_mode="shared"),
+        workload=WorkloadSpec((
+            RequestSpec("r", 0.0, 128, 1024, prefix_tokens=64),)))
+    long = capacity_window(
+        case, phase="decode", context=128, tokens_per_seq=1, sequences=2,
+        output_budget=1024)
+    short = capacity_window(
+        case, phase="decode", context=128, tokens_per_seq=1, sequences=2,
+        output_budget=1)
+    # The KV horizon grows with the output budget, but the verified query
+    # width stays one token; each recurring state is charged once.
+    assert long["window"]["active_tokens_per_sequence"] == 128 + 1024
+    assert long["active_kv_bytes"] == pytest.approx(short["active_kv_bytes"])
+    assert long["active_kv_bytes"] == pytest.approx(
+        sum(batch_cache_bytes(
+            case, sequences=2, context=128, tokens_per_seq=1,
+            prefix_tokens=64, phase="decode", padded=True).total_bytes))

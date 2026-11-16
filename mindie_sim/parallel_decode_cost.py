@@ -68,6 +68,7 @@ from mindie_sim.schema.case import Case as CaseSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 ZERO = 0
+ONE = 1
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
 HALF = 0.5
@@ -216,7 +217,7 @@ class DecodeCostModel:
              host_overlap: float = HALF,
              eplb_placement: Any = None,
              extra_expert_bytes_per_rank: float = ZERO_FLOAT,
-             microbatches: int = ONE_FLOAT,
+             microbatches: int = ONE,
              overlap_mode: str = "serial",
              eplb_rebalance_ms: float = ZERO_FLOAT,
              endpoints: Sequence[int] | None = None,

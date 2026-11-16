@@ -27,6 +27,7 @@ from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from .graph_cache import SemanticGraphCache, semantic_graph_key
+from .local_tp_groups import local_tp_groups
 
 
 ZERO = 0
@@ -204,12 +205,14 @@ def rebind_replica_graph(
     request_binding: Mapping[str, str] | None,
     state_bindings: Mapping[str, str] | None,
     physical_rank: int | None = None,
+    case: Any = None,
 ) -> tuple[Any, ...]:
     """Rebind rank/request/state identities of one semantic template."""
     rank_map = {int(key): int(value) for key, value in dict(placement or {}).items()}
     fallback = int(replica if physical_rank is None else physical_rank)
     requests = dict(request_binding or {})
     states = dict(state_bindings or {})
+    topology = None
     rebound = []
     for op in template:
         op_id = str(getattr(op, "op_id", ""))
@@ -220,9 +223,27 @@ def rebind_replica_graph(
             if key in metadata and isinstance(metadata[key], int):
                 metadata[key] = rank_map.get(int(metadata[key]), metadata[key])
         if "group_ranks" in metadata:
-            metadata["group_ranks"] = tuple(
-                rank_map.get(int(rank), int(rank))
-                for rank in metadata["group_ranks"])
+            raw_group = tuple(int(rank) for rank in metadata["group_ranks"])
+            width = int(metadata.get("local_tp_width", ONE) or ONE)
+            if raw_group and all(rank in rank_map for rank in raw_group):
+                metadata["group_ranks"] = tuple(rank_map[rank] for rank in raw_group)
+            elif case is not None and width > ONE:
+                # A node-local projection group can span DP replicas; remapping
+                # it rank-by-rank would collapse it onto duplicate ranks.
+                if topology is None:
+                    from .topology import Topology
+
+                    topology = Topology(case.machine, case.runtime.parallel)
+                stage = int(getattr(op, "stage", ZERO))
+                anchor = topology.ranks(int(replica), stage)[FIRST]
+                metadata["group_ranks"] = next(
+                    (group for group in local_tp_groups(
+                        case.machine, case.runtime.parallel,
+                        stage=stage, width=width) if anchor in group), raw_group)
+            else:
+                mapped = tuple(rank_map.get(rank, rank) for rank in raw_group)
+                metadata["group_ranks"] = (
+                    mapped if len(set(mapped)) == len(raw_group) else raw_group)
         for key in ("state_owner", "recurrent_state_owner", "input_state_version",
                     "published_state_version"):
             if key in metadata and str(metadata[key]) in states:
@@ -303,7 +324,7 @@ def prepare_cohort_graphs(
         rebound[replica] = rebind_replica_graph(
             template, replica=replica, placement=_rank_map(case, replica),
             request_binding=request_binding, state_bindings=None,
-            physical_rank=ranks_by_replica.get(replica, replica))
+            physical_rank=ranks_by_replica.get(replica, replica), case=case)
     return PreparedCohort(
         rebound, proof, True, proof.execution_quotient,
         proof.fallback_reason, cache_stats)
