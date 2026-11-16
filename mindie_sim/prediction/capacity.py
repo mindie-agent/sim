@@ -383,8 +383,7 @@ class Memory:
         from mindie_sim.catalog.speculative_state import resolve_speculative_query_tokens
         _draft_meta = dict(case.runtime.metadata)
         _declared = int(_draft_meta.get("draft_proposal_tokens", ZERO) or ZERO)
-        self.query_tokens = (resolve_speculative_query_tokens(case.runtime)
-                             if _declared > ZERO else ONE)
+        self.query_tokens = resolve_speculative_query_tokens(case.runtime)
         if dict(case.model.metadata).get("cache_allocator") == "paired_sfa" and _declared > ZERO:
             self.query_tokens = _declared + ONE
         from mindie_sim.catalog.paired_sfa import page_groups
@@ -1260,8 +1259,18 @@ class Memory:
                 result[0] = max(result[0], scores + tensors)
         return result
 
-    def cache_bytes(self, tokens: int, *, padded=True) -> tuple[float, ...]:
+    def cache_bytes(self, tokens: int, *, padded=True,
+                    query_tokens: int | None = None) -> tuple[float, ...]:
         case, model, p = self.case, self.case.model, self.case.runtime.parallel
+        declared = int(dict(case.runtime.metadata).get(
+            "draft_proposal_tokens", ZERO) or ZERO)
+        q_tok = (self.query_tokens if query_tokens is None
+                 else max(ONE, int(query_tokens)))
+        if (query_tokens is None and self.draft_kind == "dspark"
+                and not self.paired_sfa and declared <= ZERO):
+            # A bare DSpark spec widens the draft pool/page geometry; the
+            # dense target state keeps its single-row reservation.
+            q_tok = ONE
         result = (self.pages.allocation_stage_bytes(tokens, case.runtime.max_model_len, p.pp)
                   if padded else [0.0] * p.pp)
         if model.layer_plans:
@@ -1269,7 +1278,7 @@ class Memory:
                 components = layer_cache_components(
                     model, layer, p, tokens, capacity_padded=padded,
                     interleave=case.runtime.kv_block_size,
-                    runtime=case.runtime, query_tokens=self.query_tokens)
+                    runtime=case.runtime, query_tokens=q_tok)
                 covered = self.pages.covered.get(layer.index, ()) if padded else ()
                 result[self.layer_stage[layer.index]] += sum(
                     value for name, value in components.items() if name not in covered)
@@ -1278,12 +1287,21 @@ class Memory:
         if self.paired_sfa and mode and not padded:
             result[-ONE] += self._paired_draft_bytes(tokens)
         elif mode and model.auxiliary is not None and not self.paired_sfa:
-            draft = optional_draft_spec(model, mode)
-            row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim) if draft.attention_kind == "mla"
-                   else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
-            draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size) * case.runtime.kv_block_size
-                            if padded else tokens)
-            result[-1] += draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
+            if mode == "mtp" and any(
+                    layer.window > ZERO or layer.compress_ratio > ZERO
+                    for layer in model.layer_plans):
+                from mindie_sim.catalog.cache_ownership import draft_cache_components
+                result[-ONE] += float(draft_cache_components(
+                    model, p, draft_kind=mode, sequence_tokens=tokens,
+                    capacity_padded=padded, runtime=case.runtime,
+                    query_tokens=q_tok)["draft_kv"])
+            else:
+                draft = optional_draft_spec(model, mode)
+                row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim) if draft.attention_kind == "mla"
+                       else 2 * local_kv_heads(draft.num_kv_heads, p.tp) * draft.head_dim)
+                draft_tokens = (math.ceil(tokens / case.runtime.kv_block_size) * case.runtime.kv_block_size
+                                if padded else tokens)
+                result[-1] += draft_tokens * row * dtype_bytes(model.kv_dtype) * draft.layers
         return tuple(result)
 
     def _group_cache_parts(self, tokens: int, rank: int | None = None) -> list[dict]:
@@ -2649,16 +2667,18 @@ class Memory:
         return True
 
     def release_shared_pages(self, replica: int, owner: str) -> bool:
+        released = False
         for key, existing in list(self.shared_pages.items()):
             if key[0] != replica or str(owner) not in existing.get("owners", {}):
                 continue
+            released = True
             existing["owners"][str(owner)] -= 1
             if existing["owners"][str(owner)] <= 0:
                 del existing["owners"][str(owner)]
             existing["refs"] -= 1
-            if existing["refs"] > 0:
+            if existing["refs"] > ZERO:
                 self.budget_version += 1
-                return True
+                continue
             before = self._replica_occupied(replica)
             self._set_ref((replica, "shared", key[1]), ())
             del self.shared_pages[key]
@@ -2669,8 +2689,7 @@ class Memory:
                 "released_bytes": max(0.0, before - self._replica_occupied(replica)),
             })
             self.budget_version += 1
-            return True
-        return False
+        return released
 
     def _update_combined_peak(self, replica: int, stage: int) -> None:
         """Compatibility wrapper: peaks are committed-state only."""

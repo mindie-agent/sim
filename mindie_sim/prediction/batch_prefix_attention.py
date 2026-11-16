@@ -36,8 +36,12 @@ from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
 ZERO = 0
 ONE = 1
 TWO = 2
+THREE = 3
+FOUR = 4
+FIVE = 5
 FIRST = 0
 ZERO_FLOAT = 0.0
+ONE_FLOAT = 1.0
 HALF = 0.5
 TILE_SLOTS = 2
 KEY_TILE_BYTES = 262144.0
@@ -99,7 +103,12 @@ class BatchPrefixAttention:
                 key_fill_work[name] = val - TWO * q_out_b
             else:
                 key_fill_work[name] = val
-        qk_work = _scale_work(matrix_work, HALF)
+        shape = tuple(getattr(context.op, "semantic_shape", ()) or ())
+        qk_share = (
+            float(shape[THREE]) / max(ONE_FLOAT, float(shape[THREE] + shape[FOUR]))
+            if len(shape) >= FIVE else HALF
+        )
+        qk_work = _scale_work(matrix_work, qk_share)
         pv_work = {k: v - qk_work.get(k, ZERO_FLOAT) for k, v in matrix_work.items()
                    if v - qk_work.get(k, ZERO_FLOAT) > ZERO_FLOAT}
         hbm_plan_b = float(metadata.get("prefix_read_hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT)

@@ -26,6 +26,10 @@ from mindie_sim.schema.workload import IterationPlan, RequestView
 from .capacity import Memory
 from .serving_io import TokenTimeline
 
+ZERO = 0
+ONE = 1
+TWO = 2
+
 _PREEMPTED = object()
 @dataclass
 class Progress:
@@ -400,9 +404,9 @@ class Scheduler:
                 prefix_cache_key=state.request.prefix_cache_key,
                 priority=state.request.priority, media_encoded=state.media_encoded,
                 draft_verify=bool(proposal), draft_proposal_tokens=proposal,
-                draft_prepare=bool(draft.mode) and remaining > 2,
-                draft_advanced_tokens=advance if decode else 0,
-                draft_accepted_tokens=advance - 1 if decode else 0,
+                draft_prepare=bool(draft.mode) and remaining > TWO,
+                draft_advanced_tokens=advance if decode else ZERO,
+                draft_accepted_tokens=advance - ONE if decode else ZERO,
                 prompt_tokens=state.request.prompt_tokens,
             ))
             budget -= allocation
