@@ -3,7 +3,7 @@
     "id": "qwen36-a5-tp2-ctx126000-c1",
     "deployment": "qwen36-a5-tp2",
     "input": {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+      "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
       "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
       "size_bytes": 31247
     },
@@ -56,7 +56,7 @@
     }
   ],
   "result": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.json",
+    "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.json",
     "sha256": "b57adfe1b22a12c0915c2fcb665adbb9c15b5ca8109502d4453960128560bfd9",
     "size_bytes": 15148
   },

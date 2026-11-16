@@ -2,7 +2,7 @@
   "schema": "mindie-sim.capture-protocol/1",
   "adapter": "activation_calls",
   "producer": {
-    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/bench_activation.py",
+    "path": "repository://mindie-agent/.workstreams/composability/scripts/bench_activation.py",
     "sha256": "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136"
   },
   "supporting_sources": [
@@ -11,7 +11,7 @@
       "sha256": "621375c098f47ecd5ede0802cf44938ac42376076dd50622aa5bb205660c8198"
     },
     {
-      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/build_activation_artifact.py",
+      "path": "repository://mindie-agent/.workstreams/composability/scripts/build_activation_artifact.py",
       "sha256": "e5ceca2e82f37eb75fa6825fd94f399b728271ce18d9ac56bfd45e16b45c0fc3"
     }
   ],

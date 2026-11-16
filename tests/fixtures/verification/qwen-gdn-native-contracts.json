@@ -10,7 +10,7 @@
         "sha256": "9b8a87bfd6252204ab077e331ed97976ff9f5256935cb153677ac619dd96aac1"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c4-graph.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c4-graph.json",
         "sha256": "8c158cae5304a1e5267a7845d2130cea453e16eaef1b5e2be28132af36e7e1a1",
         "size_bytes": 2110162
       },
@@ -292,7 +292,7 @@
         "sha256": "5612e7cccfb3878cf27b22b1e89c5d186cd100633a44748973349f1bf03872f3"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c64-graph.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c64-graph.json",
         "sha256": "1e4b2377fc30d82e8c07bc870d223d6f9543d8f766217bc2b50fbe5f2adfda3f",
         "size_bytes": 3552771
       },
@@ -574,7 +574,7 @@
         "sha256": "bf35b8b21c078d6fc7223918b280158fda5ee7c1f83009c70c98b16f27b08df5"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c128-graph.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen35-35b-a5-tp4-c128-graph.json",
         "sha256": "c1ca06ada60530c17cc7df146d7a2768d3712bb938c948148605fcd3435c6288",
         "size_bytes": 4111917
       },
@@ -856,7 +856,7 @@
         "sha256": "7e0e459dec657f249ebbf82da9a7ceccf904aa3eff2e161cd8e312d1b04e6d2d"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c1.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c1.json",
         "sha256": "b57c8e353712643b2d0735d42df9b53545f9389578b8baf8935a86c12ecdb3ca",
         "size_bytes": 2401116
       },
@@ -1138,7 +1138,7 @@
         "sha256": "adada115f0f1c6cddaee97dbfed2aba8c5c0e9f1ade856ad2cc4dbd1f4f11841"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c12.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c12.json",
         "sha256": "dc5eb494c0e16b3ca584fd6d408ad772fbd27125beb0b264a751b9c0856cc39a",
         "size_bytes": 2207695
       },
@@ -1420,7 +1420,7 @@
         "sha256": "bd178d03944f57ad7586ee2a7bfae85f18aab7e457dd36c788fb8573bb0ed896"
       },
       "body_extraction_identity": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c96.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-expanded/auto-forward-qwen36-a5-tp2-c96.json",
         "sha256": "963d6dae9d6f6638886b3e3354cb1b2d5c328fc3d49c06de72bea4f78a5b5e79",
         "size_bytes": 1816541
       },

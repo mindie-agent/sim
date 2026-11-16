@@ -221,7 +221,7 @@ def test_padded_idle_keeps_physical_graph_without_a_logical_request():
 def test_native_peer_start_uses_local_ready_and_peer_events():
     from mindie_sim.prediction.engine import Engine, Resource
     from mindie_sim.prediction.execution import Execution
-    from mindie_sim.prediction.piecewise.compiler import NativeProgram
+    from mindie_sim.prediction.program import NativeProgram
     from mindie_sim.prediction.program import KernelProgram, Stage
 
     class _PeerProgram:
@@ -249,7 +249,7 @@ def test_native_peer_start_uses_local_ready_and_peer_events():
     execution = object.__new__(Execution)
     execution.engine = engine
     finish = execution.start_native_participant(
-        NativeProgram(inner, (), 0), "native", ready,
+        NativeProgram(inner, ()), "native", ready,
         local_ready=local, peer_ready={1: peer})
     engine.advance(until=(finish,))
     assert inner.supplied == {1: peer}
@@ -274,8 +274,8 @@ def test_native_peer_start_uses_local_ready_and_peer_events():
 def test_native_cohort_binds_actual_sender_send_and_keeps_cached_program():
     from mindie_sim.prediction.engine import Engine
     from mindie_sim.prediction.execution import launch_native_cohort
-    from mindie_sim.prediction.piecewise.compiler import NativeProgram
-    from mindie_sim.prediction.piecewise.families_moe_mc2 import Mc2LaunchView
+    from mindie_sim.prediction.program import NativeProgram
+    from mindie_sim.prediction.mc2_program import Mc2LaunchView
 
     class _Phase:
         name = "count_status_exchange"
@@ -310,7 +310,7 @@ def test_native_cohort_binds_actual_sender_send_and_keeps_cached_program():
             }
 
     inner = _Inner()
-    program = NativeProgram(inner, (), 0)
+    program = NativeProgram(inner, ())
     original_rank, original_labels = inner.view.rank, inner.view.peer_labels
 
     def run(rank1_ready):
@@ -352,8 +352,8 @@ def test_native_cohort_binds_actual_sender_send_and_keeps_cached_program():
 def test_native_cohort_does_not_invent_idle_phase_send():
     from mindie_sim.prediction.engine import Engine
     from mindie_sim.prediction.execution import launch_native_cohort
-    from mindie_sim.prediction.piecewise.compiler import NativeProgram
-    from mindie_sim.prediction.piecewise.families_moe_mc2 import Mc2LaunchView
+    from mindie_sim.prediction.program import NativeProgram
+    from mindie_sim.prediction.mc2_program import Mc2LaunchView
 
     class _Phase:
         name = "count_status_exchange"
@@ -400,8 +400,8 @@ def test_native_cohort_does_not_invent_idle_phase_send():
                               "phase_complete": {"count_status_exchange": complete}}
 
     engine = Engine([], trace_limit=64)
-    active = NativeProgram(_Active(), (), 0)
-    idle = NativeProgram(_Idle(), (), 0)
+    active = NativeProgram(_Active(), ())
+    idle = NativeProgram(_Idle(), ())
     result = launch_native_cohort(engine, [
         {"program": active, "name": "r0",
          "ready": engine.submit("ready0", release=0.0),
@@ -424,8 +424,8 @@ def test_native_cohort_binds_moe16_payload_frames_to_remote_receive():
     from fractions import Fraction
     from mindie_sim.prediction.engine import Engine, Resource
     from mindie_sim.prediction.execution import launch_native_cohort
-    from mindie_sim.prediction.piecewise.compiler import NativeProgram
-    from mindie_sim.prediction.piecewise.families_moe_mc2 import Mc2LaunchView
+    from mindie_sim.prediction.program import NativeProgram
+    from mindie_sim.prediction.mc2_program import Mc2LaunchView
 
     class _Phase:
         def __init__(self, name):
@@ -516,7 +516,7 @@ def test_native_cohort_binds_moe16_payload_frames_to_remote_receive():
                 "peer_events": peer_events,
             }
 
-    program = NativeProgram(_FrameInner(), (), 0)
+    program = NativeProgram(_FrameInner(), ())
     engine = Engine([Resource("link", 1.0, "work", "fair", 64)],
                     trace_limit=128)
     launches = []

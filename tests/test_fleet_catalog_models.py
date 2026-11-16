@@ -49,14 +49,6 @@ from mindie_sim.model_catalog import (
 )
 from mindie_sim.prediction.gated_activation import gated_activation
 from mindie_sim.prediction.operator_analysis import target_graphs, target_operators
-from mindie_sim.prediction.piecewise.compiler import (
-    ImplementationPolicy, OperatorPiecewiseCompiler, PipeSupply,
-)
-from mindie_sim.prediction.piecewise.geometry import WorkloadGeometry
-from mindie_sim.prediction.piecewise.model_pipeline import (
-    FrameworkConfig, ModelPipeline, predict_framework,
-)
-from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, instantiate_model
 from mindie_sim.schema.model import ModelSpec
 
 ROOT = Path(__file__).parents[1]
@@ -95,13 +87,6 @@ ALIASES = (
     "GLM-5.3-Flash-w8a8-mxfp8", "GLM-5.3-Flash-w4a8-mxfp4",
     "Qwen3.5-397B-A17B-w8a8-mxfp8", "Qwen3.5-397B-A17B-w4a4-mxfp4",
 )
-SUPPLY = PipeSupply((("cube", 1_000_000.0), ("vector", 1_000_000.0),
-    ("hbm", 1_000_000.0), ("mte1", 2_000_000.0), ("mte2", 2_000_000.0),
-    ("mte3", 2_000_000.0), ("fixpipe", 2_000_000.0), ("link", 1_000_000.0)))
-POLICY = ImplementationPolicy(mt=16, nt=16, cores=2, moe_row_tile=4,
-                              split_target=1000, max_splits=4)
-FEATURES = dict(token_tile=16, kv_tile=16, cores=2, moe_row_tile=4,
-                split_target=1000, max_splits=4)
 _TIMING = ("timing", "latency", "throughput", "measured", "benchmark",
            "duration_ms", "tokens_per_second")
 _HOST = ("/Volumes/", "/mnt/", "/Users/")
@@ -287,26 +272,6 @@ def test_fleet_layer_plans_use_supported_attention_cores():
                == (64, 4, 192, True) for p in plans)
 
 
-@pytest.mark.parametrize("key", CANONICAL)
-def test_fleet_models_instantiate_compile_prefill_decode_and_serve(key):
-    model = load_model(key)
-    features = FeatureConfig.from_model(model, **FEATURES)
-    instantiated = instantiate_model(model, features)
-    assert not [hole for hole in instantiated.coverage.holes
-                if hole.reason == "ple_not_instantiated"]
-    pipeline = ModelPipeline(model, features, SUPPLY, POLICY)
-    assert isinstance(pipeline.compiler, OperatorPiecewiseCompiler)
-    compiled = pipeline.compiler.compile(instantiated.layers[0].subgraphs[0])
-    assert compiled.evaluate(WorkloadGeometry.homogeneous(2, 3, 4)).total_ms > 0
-    prefill = pipeline.forward(WorkloadGeometry.homogeneous(2, 3, 4))
-    decode = pipeline.forward(WorkloadGeometry.homogeneous(1, 5, 8))
-    assert prefill.total_ms > 0 and decode.total_ms > 0
-    result = predict_framework(
-        pipeline, [dict(id="fleet", prompt_tokens=3, output_tokens=2)],
-        FrameworkConfig(supply=SUPPLY, policy=POLICY, max_batch=1))
-    assert result.steps and result.steps[0]["body_ms"] > 0
-
-
 def _manifest_files(root: Path) -> set[str]:
     """Expand the local ``MANIFEST.in`` include/recursive-include directives."""
     includes: list[str] = []
@@ -370,7 +335,7 @@ def _fleet_case(key: str, *, tp: int = 1) -> dict:
     model = load_model(key)
     return {
         "machine": {
-            "name": "declared-fleet", "architecture": "cuda", "num_devices": tp,
+            "name": "declared-fleet", "architecture": "declared", "num_devices": tp,
             "device": {"memory_bytes": 1024 ** 4,
                        "compute_peaks": {"bf16": 1e12, "fp32": 1e12},
                        "rates": {"memory": 1e10, "vector": 1e10}, "compute_units": 64},
@@ -408,34 +373,6 @@ def test_fleet_models_lower_gated_activations_in_ordinary_graphs():
             assert operators, (key, phase)
             graphs = target_graphs(case, phase=phase, tokens=1)
             assert graphs and all(items for items in graphs.values()), (key, phase)
-
-
-def test_sparse_attention_orders_indexer_before_attention_and_bounds_kv():
-    for key, layer_index in SPARSE_LAYERS.items():
-        model = load_model(key)
-        instantiated = instantiate_model(
-            model, FeatureConfig.from_model(model, **FEATURES))
-        layer = instantiated.layers[layer_index]
-        kinds = [subgraph.kind for subgraph in layer.subgraphs]
-        attn_kind = next(k for k in kinds if k in {"gqa_attention", "mha_attention", "mqa_attention", "swa_attention"})
-        assert kinds.index("indexer_prolog") < kinds.index(attn_kind), key
-        assert kinds.index("lightning_indexer") < kinds.index(attn_kind), key
-        a0 = layer.find(attn_kind, role="attention")
-        assert int(a0.operator("attention").theta.find("index_topk")) > 0, key
-        i1 = layer.find("lightning_indexer", role="index_select")
-        compiler = OperatorPiecewiseCompiler(SUPPLY, POLICY)
-
-        def cost_at(instance, name, context):
-            evaluation = compiler.compile(instance).evaluate(
-                WorkloadGeometry.homogeneous(1, 1, context))
-            return next(cost for cost in evaluation.operators if cost.name == name)
-
-        high_kv = cost_at(a0, "attention", 32768)
-        low_kv = cost_at(a0, "attention", 16384)
-        assert high_kv.get("KV_ROWS") == low_kv.get("KV_ROWS") > 0, key
-        assert (high_kv.get("KV_LOGICAL_BYTES") == low_kv.get("KV_LOGICAL_BYTES") > 0), key
-        assert (cost_at(i1, "topk", 32768).get("index_rows")
-                > cost_at(i1, "topk", 16384).get("index_rows")), key
 
 
 def test_sparse_target_graphs_bound_attention_traffic_by_index_topk():

@@ -1,7 +1,7 @@
 {
   "schema": "kimi-hccl-native-ledger/1",
   "assignment_identity": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/inputs.json",
+    "path": "repository://sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/inputs.json",
     "sha256": "57c6e44e39f337bc8ff54108361dc3dd3bb2941bcad0931e2ffc6320c63b697f",
     "size_bytes": 55926
   },

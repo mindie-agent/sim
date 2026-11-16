@@ -32,7 +32,7 @@
       },
       "id": "qwen35-a5-tp4-ep4-ctx126000-c4",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen35-a5-tp4-ep4-ctx126000-c4.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen35-a5-tp4-ep4-ctx126000-c4.receipt.json",
         "sha256": "75aa21e26181fb5916388ec2b8169bfdcb62d8c5e30c22f89aeabff0166c19e3",
         "size_bytes": 1946
       },
@@ -191,7 +191,7 @@
       },
       "id": "qwen36-a5-tp2-ctx126000-c1",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx126000-c1.receipt.json",
         "sha256": "0f630472d68aa114ed4d56a78321097aa1f6d982213f245b2b087a43dce138b1",
         "size_bytes": 1930
       },
@@ -327,7 +327,7 @@
       },
       "id": "qwen36-a5-tp2-ctx128999-c1",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx128999-c1.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen36-a5-tp2-ctx128999-c1.receipt.json",
         "sha256": "ad0d446fa973bb955b1314ee43181a0d505d46a31954c7754736892d635a5b9e",
         "size_bytes": 1933
       },
@@ -463,7 +463,7 @@
       },
       "id": "qwen38-a5-tp4-ctx126000-c4",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen38-a5-tp4-ctx126000-c4.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/qwen38-a5-tp4-ctx126000-c4.receipt.json",
         "sha256": "4c360709a267874f292a2b13c7e9c179d2c0c989f1616df48fcc3155a5e36257",
         "size_bytes": 1928
       },
@@ -544,7 +544,7 @@
       },
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c8",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v41-a5-tp1-dp8-ep8-ctx126000-c8.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/v41-a5-tp1-dp8-ep8-ctx126000-c8.receipt.json",
         "sha256": "a695a1b5454be877e3948a091d4c2ed1bdbf3503a473d52c35aeb1b155941fb0",
         "size_bytes": 2207
       },
@@ -755,12 +755,12 @@
       "runtime_after": null,
       "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1-unpadded.receipt.json",
         "sha256": "c5132448767cffd6cc31c52d86e2928b959b6790756caf0f0a98fcd8f89df196",
         "size_bytes": 4831
       },
       "attempt": "original_source_unpadded_domain",
-      "error": "vice-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 222, in <module>\n    worker(entry, OUT / (entry['id'] + '.json'))\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 145, in worker\n    graphs = target_graphs(case, phase='decode', tokens=entry['query_tokens_per_sequence'],\n                           context=entry['context_tokens'], sequences=entry['sequences_by_replica'],\n                           scope='body')\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 162, in target_graphs\n    r: _target_ops(case, group, scope, global_views=global_views,\n       ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   resource_fusion=resource_fusion, cohort_tokens=padded_cohort,\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   phase=phase, replica=r)\n                   ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 104, in _target_ops\n    ops, _ = frontend.body(case.model, case.runtime, local, ready=\"analysis_input\",\n             ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          tokens=local_tokens, mode=views[0].phase if views else phase,\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          global_tokens=global_tokens, replica=replica)\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/frontend.py\", line 189, in body\n    ffn_ops, previous = self.ffn[layer.ffn](\n                        ~~~~~~~~~~~~~~~~~~~^\n        **{**common, \"tokens\": ffn_tokens},\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        runtime=runtime, sequence_plan=sp,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 717, in moe\n    return MOE_RECIPES[moe_recipe](chunks=mc2_chunks, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 115, in alltoall\n    token_partition = moe_token_partition.select(\n        runtime, parallel=parallel, plan=plan, model=model, tokens=tokens,\n        sequence_plan=sequence_plan, reduce_after_join=reduce_after_join)\n  File \"/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/moe_token_partition.py\", line 222, in select\n    raise ModelingError(\"mc2_tp_slice_requires_positive_tp_divisible_physical_rows\")\nmindie_sim.schema.common.ModelingError: mc2_tp_slice_requires_positive_tp_divisible_physical_rows\n"
+      "error": "vice-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 222, in <module>\n    worker(entry, OUT / (entry['id'] + '.json'))\n    ~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py\", line 145, in worker\n    graphs = target_graphs(case, phase='decode', tokens=entry['query_tokens_per_sequence'],\n                           context=entry['context_tokens'], sequences=entry['sequences_by_replica'],\n                           scope='body')\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 162, in target_graphs\n    r: _target_ops(case, group, scope, global_views=global_views,\n       ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   resource_fusion=resource_fusion, cohort_tokens=padded_cohort,\n                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                   phase=phase, replica=r)\n                   ^^^^^^^^^^^^^^^^^^^^^^^\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/operator_analysis.py\", line 104, in _target_ops\n    ops, _ = frontend.body(case.model, case.runtime, local, ready=\"analysis_input\",\n             ~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          tokens=local_tokens, mode=views[0].phase if views else phase,\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n                          global_tokens=global_tokens, replica=replica)\n                          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/frontend.py\", line 189, in body\n    ffn_ops, previous = self.ffn[layer.ffn](\n                        ~~~~~~~~~~~~~~~~~~~^\n        **{**common, \"tokens\": ffn_tokens},\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    ...<4 lines>...\n        runtime=runtime, sequence_plan=sp,\n        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n    )\n    ^\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 717, in moe\n    return MOE_RECIPES[moe_recipe](chunks=mc2_chunks, **kwargs)\n           ~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/feedforward.py\", line 115, in alltoall\n    token_partition = moe_token_partition.select(\n        runtime, parallel=parallel, plan=plan, model=model, tokens=tokens,\n        sequence_plan=sequence_plan, reduce_after_join=reduce_after_join)\n  File \"repository://sim-service-response-domain-next/mindie_sim/prediction/moe_token_partition.py\", line 222, in select\n    raise ModelingError(\"mc2_tp_slice_requires_positive_tp_divisible_physical_rows\")\nmindie_sim.schema.common.ModelingError: mc2_tp_slice_requires_positive_tp_divisible_physical_rows\n"
     },
     {
       "status": "completed",
@@ -778,7 +778,7 @@
       },
       "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
       "receipt": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1.receipt.json",
+        "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1.receipt.json",
         "sha256": "682c2e20f31f2ff049169f32a86a872387c203364dabe26e38e83830efd8da8c",
         "size_bytes": 1950
       },
@@ -878,12 +878,12 @@
       "deployment": "qwen36-a5-tp8",
       "status": "candidate_declared_not_accepted; frozen input preserved",
       "frozen_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
         "sha256": "163d6f8541d710dec6b3c82637227c70d185ee20b7f953a0fd17435b4aa501fe",
         "size_bytes": 10182
       },
       "current_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
         "sha256": "e05a0dd31a516cc41a9c9913ae4592ca827015805197aa61aa36e30328c70370",
         "size_bytes": 48389
       },
@@ -903,12 +903,12 @@
       "deployment": "qwen38-a5-tp4",
       "status": "candidate_declared_not_accepted; frozen input preserved",
       "frozen_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
         "sha256": "2bace0926d283f461a3b0b126c76fd1a0081df118245f11c40fc1f697e3f45f9",
         "size_bytes": 5690
       },
       "current_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
         "sha256": "cd73c65d431f1daba48ee96568f90834878067ed02df0d918b8d969be7d72648",
         "size_bytes": 43864
       },

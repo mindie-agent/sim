@@ -3,15 +3,15 @@
   "revision": "ae923905948f360f4b7ab06df52d0789a0c9316e",
   "sources": [
     {
-      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/quant_parser.py",
+      "path": "repository://vllm-ascend-v41-private/vllm_ascend/quantization/quant_parser.py",
       "sha256": "be06d3ee915671401c31ccb183312c0b2e177dc082b459a37497cf60f2a5d247"
     },
     {
-      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
+      "path": "repository://vllm-ascend-v41-private/vllm_ascend/quantization/methods/w4a8/w4a8_mxfp4.py",
       "sha256": "eb6a3ce767619638eee74451267529233aa81fee67b229bd168c16b42e16926a"
     },
     {
-      "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py",
+      "path": "repository://vllm-ascend-v41-private/vllm_ascend/quantization/methods/w8a8/w8a8_mxfp8.py",
       "sha256": "9f01afd72f299e3617d4e89059840102fd7df93358f82f372daede7a723aaa16"
     }
   ],

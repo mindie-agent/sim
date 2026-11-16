@@ -28,7 +28,7 @@ When optimizing custom kernels or distributed LLM inference (`DP × TP × EP × 
 
 - **"Which hardware resource actually bottlenecks this operator or model?"** — Back-of-the-envelope `FLOPs / peak_tflops` estimates ignore on-chip `UB`/`L1` alignment, tile tails, multi-stream contention, and kernel invocation overheads (`startup_ms` / `minimum_ms`). `mindie-sim` decomposes every operator, subgraph, and network pass into **`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, and `CV_Overlap`**, pinpointing whether work is `memory_bound`, `cube_bound`, `vector_bound`, `link_bound`, or `launch_bound`.
 - **"If we fuse or tune these memory-bound kernels to reach `0.80x MBU`, how many milliseconds will end-to-end Decode drop?"** — Before writing hundreds of lines of AscendC or Triton code, counterfactual Roofline target fitting (`fit_efficiency_targets`) computes the exact latency reduction while preserving physical work conservation and kernel startup floors.
-- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The hardware scaling & SLA solver (`solve_hardware_sla_throughput`) jointly solves the VRAM capacity ceiling (`B*_VRAM`) and SLA latency ceiling (`B*_SLA`) across hardware scaling scenarios (`2x HBM`, `2x Compute`, `1x HW + 0.80x MBU`).
+- **"Under a `<= 30 ms` Decode TPOT SLA, what is the maximum batch size and throughput — and what if we scale HBM bandwidth or compute by `2x`?"** — The hardware scaling & SLA solver (`solve_sla_sizing`) jointly solves the VRAM capacity ceiling (`B*_VRAM`) and SLA latency ceiling (`B*_SLA`) across hardware scaling scenarios (`2x HBM`, `2x Compute`, `1x HW + 0.80x MBU`).
 - **"How do we evaluate isolated operators, subgraphs, callbacks, and full serving with consistent physics?"** — `mindie-sim` uses a **single unified causal engine (`prediction.engine.Engine`)** across isolated operator programs (`operators`), shared-resource target graphs (`graph`), callback protocols (`call`), candidate comparisons (`study`), and full-service scheduling (`predict` / `predict_pd`).
 
 ```mermaid
@@ -74,7 +74,7 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
    ```
 4. **Agent Optimization Workflow**:
    - Before writing or modifying custom kernels, fusion patterns, or parallel layouts (`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`), run `mindie-sim operators`, `mindie-sim graph`, `mindie-sim predict`, or `mindie-sim study` to quantify stage latencies and resource bottlenecks.
-   - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), counterfactual `0.80x MBU` optimization headroom, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `fit_efficiency_targets`, and `solve_hardware_sla_throughput` from `mindie_sim.prediction.efficiency`.
+   - To evaluate 4D efficiency (`Cube_MFU`, `Vec_MFU`, `MBU`, `Link_Util`, `CV_Overlap`), counterfactual `0.80x MBU` optimization headroom, or SLA-constrained maximum throughput, call `analyze_network_efficiency`, `fit_efficiency_targets`, and `solve_sla_sizing` from `mindie_sim.prediction.efficiency`.
 
 </details>
 
@@ -84,7 +84,7 @@ If you are an AI Agent receiving the prompt above, execute the following steps t
 
 `v0.9.17` aligns `Qwen3.8-Flash-Next` (`Qwen4Exp`) end-to-end with `vllm` and `vllm-ascend` ground-truth physics (low-rank gated `HyperConnection` `hc_lowrank=320`, 16-prime `102.4 GB` `PLE` tables with `ETP/TP` sharding, INT8/MXFP8 table modes, host UVA offload, and dilated short convolution, weight-free `4:1` `QSA` sparse attention, and the 12-slot shared `Qwen4KVCacheLayout`), while fixing `MiniMax-M3` / `Step-5` sparse-GQA Decode selection and `index_k` cache accounting, `Gemma-4` `K=V` row widths, and built-in `kimi-k3.1` catalog registration. The complete capability baseline carried from `v0.9.16` follows.
 
-`mindie-sim v0.9.17` (paired with `mindie-profiler v0.5.10+`) extends the unified causal engine with **cross-platform Windows `CP936` UTF-8 / Unix `LF` I/O determinism and strict `TimeoutError` propagation, normalized native-call structural binding & coverage contracts (`native_binding` / `native_coverage`), canonical standalone primitive evaluation (`evaluate_primitive_spec`), packaged offline fleet model catalog configs (`minimax-m3`, `minimax-m3.1-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`, `qwen3.6-35b-a3b`, `qwen3.8-flash-next`, `step-5-preview`, `kimi-k3.1` plus `GeGLU`, sparse `GQA`, and Gemma `K=V` lowering), first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), the four-level piecewise continuous physical solver (`prediction.piecewise` + `prediction.subgraphs`), unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, AFD disaggregated pipeline Pareto solving, and tiered offload modeling** (see [`docs/releases/sim-0.9.17.en.md`](./docs/releases/sim-0.9.17.en.md), [`docs/releases/sim-0.9.16.en.md`](./docs/releases/sim-0.9.16.en.md), [`docs/releases/sim-0.9.15.en.md`](./docs/releases/sim-0.9.15.en.md), [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md), [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md), and [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)).
+`mindie-sim v0.9.17` (paired with `mindie-profiler v0.5.10+`) extends the unified causal engine with **cross-platform Windows `CP936` UTF-8 / Unix `LF` I/O determinism and strict `TimeoutError` propagation, normalized native-call structural binding & coverage contracts (`native_binding` / `native_coverage`), canonical standalone primitive evaluation (`evaluate_primitive_spec`), packaged offline fleet model catalog configs (`minimax-m3`, `minimax-m3.1-flash`, `gemma-4-26b-a4b`, `gemma-4-31b`, `qwen3.6-35b-a3b`, `qwen3.8-flash-next`, `step-5-preview`, `kimi-k3.1` plus `GeGLU`, sparse `GQA`, and Gemma `K=V` lowering), first-principles orthogonal multi-dimensional parallelism & feature superposition with quantitative conservation laws and real-trace replay verification (`TP × DP × EP × PP × PCP × DCP`, `SP`, `MC2`, `AllToAll`, `MTP/DSpark`, `MLA/GQA/KDA/GDN`, `KeyPool/DSA`, `AttnRes`, `W4A8/W8A8/MXFP8`, `enable_shared_expert_dp`, `EPLB` without artificial framework-schedule guards), one causal operator-to-model-to-service physical solver, unified `7,337 / 7,337` multi-tier live-recomputed operator & step physical modeling, official CANN Vector/Cube hardware pipeline specifications across all 15 Ascend SKUs, 4D efficiency attribution, counterfactual multi-pipe Roofline target fitting, hardware scaling SLA throughput solving, A5 hierarchical topology & quantized MoE transport, hierarchical offload policy, and capacity feedback** (see [`docs/releases/sim-0.9.17.en.md`](./docs/releases/sim-0.9.17.en.md), [`docs/releases/sim-0.9.16.en.md`](./docs/releases/sim-0.9.16.en.md), [`docs/releases/sim-0.9.15.en.md`](./docs/releases/sim-0.9.15.en.md), [`docs/releases/sim-0.9.12.en.md`](./docs/releases/sim-0.9.12.en.md), [`docs/releases/sim-0.9.11.en.md`](./docs/releases/sim-0.9.11.en.md), and [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)).
 
 ### 1. 4D Efficiency Decomposition & Bottleneck Attribution (`analyze_operator_row` / `analyze_network_efficiency`)
 
@@ -106,7 +106,7 @@ Want to know how much faster Decode becomes if memory-bound kernels are optimize
 - Reproduces baseline simulator latency with **0.00% drift** at `1.0x` scaling;
 - Computes per-subgraph and whole-network `baseline_ms`, `target_ms`, `saved_ms`, and `speedup_ratio` under configurable targets (e.g., `target_mbu=0.80`, `target_cube_mfu=0.75`, `target_vec_mfu=0.65`).
 
-### 3. Hardware Scaling & SLA Throughput Solver (`scale_case_hardware` / `solve_hardware_sla_throughput`)
+### 3. Hardware Scaling & SLA Throughput Solver (`scale_case_hardware` / `solve_sla_sizing`)
 
 Supports non-mutating counterfactual hardware scaling (`hbm_bw_scale`, `cube_flops_scale`, `vector_ops_scale`, `link_bw_scale`, `hbm_capacity_scale`) and jointly solves maximum throughput under a target Decode latency SLA (e.g., `<= 30.0 ms`):
 - **VRAM Capacity Ceiling (`B*_VRAM`)**: Maximum sequences per replica after accounting for model weights, runtime workspace, draft caches, and per-token KV cache growth;
@@ -203,7 +203,6 @@ The full reproducible NPU profiling benchmark dataset is published on HuggingFac
 | `mindie-sim optimize-graph` | Day-0 graph fusion, multi-stream scheduling, and weight-prefetch optimization report | `mindie-sim optimize-graph examples/quickstart.json --phase decode` |
 | `mindie-sim sweep-ep-knee` / `size-xpyd` | Discrete EP knee sweep and SLO-constrained XPyD disaggregated pool sizing | `mindie-sim size-xpyd examples/quickstart.json --total-npus 16` |
 | `mindie-sim memory-breakdown` / `kv-state` | 6-component per-rank HBM ledger and hybrid KV / 7-family `RecoverSSM` state evaluation | `mindie-sim memory-breakdown examples/quickstart.json` |
-| `mindie-sim opflow` / `op-formula` | Universal `OpFlow` pipeline evaluation and explainable per-operator formula diagnostics | `mindie-sim op-formula rms_norm --hardware a3` |
 | `mindie-sim build-accel` | Compile the optional local C11 native event-engine accelerator | `mindie-sim build-accel` |
 
 ### Core Python API
@@ -221,7 +220,7 @@ from mindie_sim import (
     evaluate_target_efficiency,    # Single-operator counterfactual Roofline target evaluation
     fit_efficiency_targets,        # Whole-network counterfactual Roofline fitting (e.g. 0.80x MBU)
     scale_case_hardware,           # Non-mutating counterfactual hardware bandwidth/compute/VRAM scaling
-    solve_hardware_sla_throughput, # Joint SLA latency & VRAM capacity maximum throughput solver
+    solve_sla_sizing, # Joint SLA latency & VRAM capacity maximum throughput solver
 )
 ```
 
@@ -250,7 +249,7 @@ from pathlib import Path
 from mindie_sim import (
     analyze_network_efficiency,
     fit_efficiency_targets,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 
 case = json.loads(Path("examples/quickstart.json").read_text())
@@ -280,7 +279,7 @@ print(
 )
 
 # 3. Solve maximum throughput under a 30ms Decode SLA across baseline and 2x scaled hardware
-sla_report = solve_hardware_sla_throughput(
+sla_report = solve_sla_sizing(
     case,
     sla_ms=30.0,
     context=4096,

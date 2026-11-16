@@ -16,7 +16,7 @@
     ]
   },
   "catlass": {
-    "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/tile_mmad.hpp",
+    "path": "repository://sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/tile_mmad.hpp",
     "sha256": "66bbf9b29a6fa3be3958c7c850f4409591e46f1e96da1070431a1466aadff209",
     "bytes": 10708,
     "lines": [
@@ -643,7 +643,7 @@
     ]
   },
   "hardware_performance_source": {
-    "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
+    "path": "repository://sim-rewrite-20261027/data/observations/sources/arch3510-physical-services/platform-units/cube_instruction_theoretical_perf_summary.md",
     "sha256": "3a249d10fb6b794849d15f66208e43fa27ccd5edc6b635418911ebf11020f728",
     "bytes": 21427,
     "lines": [

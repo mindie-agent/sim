@@ -44,7 +44,7 @@ from mindie_sim.schema.operators import OpSpec
 #: Current checkout identity, not the historical capture image.  The campaign
 #: manifest records these exact digests.
 SOURCE_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/"
+    "repository://vllm-v0.25.1/vllm/model_executor/layers/"
     "fused_moe/moe_fused_mul_sum.py"
 )
 SOURCE_SHA256 = "30fbb37b84b1cf6a8962d674abd9c3ab4d2be56d028fac82f55833c88d9729e8"
@@ -54,7 +54,7 @@ SOURCE_LINES = (
     "fma 56; store 58-63; heuristic 66-132; wrapper 135-202; launch 177-200"
 )
 CONTRACT_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/"
+    "repository://vllm-v0.25.1/vllm/model_executor/layers/"
     "fused_moe/topk_weight_and_reduce.py"
 )
 CONTRACT_SHA256 = "6a269547fc2bddb5e1784676f78d63a1b3e796699a2c9bfe2c8e446e95fd3425"

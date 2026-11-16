@@ -201,7 +201,7 @@
         "sha256": "44b7b30ac7ef51189fd6d684945e1860aafdc8bac0aaff9c7228c25efb267119"
       },
       "startup": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
         "bytes": 335341,
         "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
       },
@@ -282,12 +282,12 @@
       "accepted_state_scenario": {
         "id": "a5_glm53flash_tp8_c16_p4k",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c16_p4k--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c16_p4k--attention-plus-down.json",
           "sha256": "442aad7aebec489caac5e2c27fff509fc787e2b8c78b9e804e1e9cf387bb1210",
           "size_bytes": 7376
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },

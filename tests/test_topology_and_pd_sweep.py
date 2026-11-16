@@ -22,7 +22,7 @@ from mindie_sim.sweep import (
     compute_pareto_frontier,
     enumerate_parallel_candidates,
     sweep_pd_disaggregation_ratios,
-    sweep_topology_grid,
+    sweep_topologies,
 )
 
 
@@ -184,7 +184,7 @@ def test_enumerate_parallel_candidates_dense_and_moe_8_and_16_devices():
     assert {c["tp"] for c in cands_mla_rep} == {4, 8}
 
 
-def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honesty():
+def test_sweep_topologies_pareto_frontier_node_topology_and_infeasible_honesty():
     """Verify topology grid sweep metrics, node topology preservation, Pareto frontier, and error honesty."""
     raw_moe = _make_mla_moe_case(layers=2, dp=1, tp=4, ep=4)
     original = deepcopy(raw_moe)
@@ -195,7 +195,7 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
         # Structurally invalid candidate: ep=32 exceeds dp*tp=8 and 16 experts
         {"dp": 1, "tp": 8, "ep": 32, "pp": 1, "pcp": 1},
     ]
-    report = sweep_topology_grid(
+    report = sweep_topologies(
         raw_moe,
         candidates=candidates,
         num_devices=8,
@@ -223,7 +223,7 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
 
     # Base case had ranks_per_node=4; scaling to 8, 12, or 16 devices preserves ranks_per_node=4!
     assert all(r["ranks_per_node"] == 4 for r in feasible_rows)
-    scale12_rep = sweep_topology_grid(
+    scale12_rep = sweep_topologies(
         _make_dense_gqa_case(layers=2, dp=2, tp=4),
         candidates=[{"dp": 3, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}],
         num_devices=12,
@@ -232,7 +232,7 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
         max_sequences_per_dp=4,
     )
     assert scale12_rep["candidates"][0]["ranks_per_node"] == 8
-    scale16_rep = sweep_topology_grid(
+    scale16_rep = sweep_topologies(
         raw_moe,
         candidates=[{"dp": 4, "tp": 4, "ep": 4, "pp": 1, "pcp": 1}],
         num_devices=16,
@@ -246,13 +246,13 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
     slow_link = _make_dense_gqa_case(layers=1, dp=1, tp=2)
     slow_link["machine"]["intra_node_bw_gbps"] = 10.0
     slow_link["machine"]["inter_node_bw_gbps"] = 8.0
-    rep_from_dict = sweep_topology_grid(
+    rep_from_dict = sweep_topologies(
         slow_link,
         candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}],
         num_devices=4,
         max_sequences_per_dp=4,
     )
-    rep_from_case = sweep_topology_grid(
+    rep_from_case = sweep_topologies(
         parse_case(slow_link),
         candidates=[{"dp": 1, "tp": 4, "ep": 1, "pp": 1, "pcp": 1}],
         num_devices=4,
@@ -306,7 +306,7 @@ def test_sweep_topology_grid_pareto_frontier_node_topology_and_infeasible_honest
 
     # Auto-enumeration (candidates=None) and SLA-exceeded status check
     dense_1l = _make_dense_gqa_case(layers=1, dp=1, tp=4)
-    auto_rep = sweep_topology_grid(
+    auto_rep = sweep_topologies(
         dense_1l, num_devices=8, sla_ms=0.001, context=1024, max_sequences_per_dp=4
     )
     assert [r["parallel"]["tp"] for r in auto_rep["candidates"]] == [1, 2, 4, 8]

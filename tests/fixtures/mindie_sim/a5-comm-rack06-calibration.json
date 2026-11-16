@@ -68,7 +68,7 @@
         "path": "/Volumes/data/mindie-sim-data/a5/2026-10-21/comm-rack06/a5comm/results/a5-comm-r2-c1/a5-comm-r2-c1.parent.json"
       }
     },
-    "raw_gate_records": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw",
+    "raw_gate_records": "repository://mindie-agent/.workstreams/a5-comm/raw",
     "excluded_blocks": [
       {
         "label": "a5-comm-rack08-r8-c2",
@@ -304,7 +304,7 @@
         "after": []
       },
       "fetch_evidence": {
-        "dir": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r8-c1",
+        "dir": "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r8-c1",
         "files": [
           "a5-comm-r8-c1.parent.json",
           "a5-comm-r8-c1.rank0.json",
@@ -708,7 +708,7 @@
         "after": []
       },
       "fetch_evidence": {
-        "dir": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r4-c1",
+        "dir": "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r4-c1",
         "files": [
           "a5-comm-r4-c1.parent.json",
           "a5-comm-r4-c1.rank0.json",
@@ -976,7 +976,7 @@
         "after": []
       },
       "fetch_evidence": {
-        "dir": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-c1",
+        "dir": "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-c1",
         "files": [
           "a5-comm-r2-c1.parent.json",
           "a5-comm-r2-c1.rank0.json",
@@ -2669,9 +2669,9 @@
     "verify_gate": {
       "status": "present_and_true",
       "paths": [
-        "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r8-c1/verify.json",
-        "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r4-c1/verify.json",
-        "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-c1/verify.json"
+        "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r8-c1/verify.json",
+        "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r4-c1/verify.json",
+        "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-c1/verify.json"
       ],
       "detail": "all three driver gates returned rc=0 with 60/60 conditions completed and every rank 'completed'"
     }
@@ -21294,7 +21294,7 @@
     ],
     "a5_rack08": {
       "status": "measured",
-      "source": "/Users/maoxx241/code/mindie-agent/.workstreams/model-physical/a5-comm-rack08-calibration.json",
+      "source": "repository://mindie-agent/.workstreams/model-physical/a5-comm-rack08-calibration.json",
       "sha256": "9d10ace476297be3754e47740ae82ec921377af16dcf82ebdfef64f1c25415f7",
       "stack": "rack08",
       "machine": {

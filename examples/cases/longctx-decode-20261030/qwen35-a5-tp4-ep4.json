@@ -90,7 +90,7 @@
         "fusion_ops_gmmswigluquant": false,
         "provenance": "campaign_launch_log",
         "launch_log_independently_confirmed": true,
-        "basis": "/Users/maoxx241/code/mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
+        "basis": "repository://mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
         "sim_selection": "ordinary separate grouped GEMM + activation + quantization; no fused MSD lowering"
       },
       "tensor_geometry_candidates": [
@@ -204,12 +204,12 @@
       },
       "grouped_effective_service": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/qwen35-mc2-tp-dsq-source-conditional/qwen35-35b-a5-tp4-c4-mc2-tp-dsq-source.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/qwen35-mc2-tp-dsq-source-conditional/qwen35-35b-a5-tp4-c4-mc2-tp-dsq-source.json",
           "sha256": "c6216528ee9273b4a5299d4ccce5fb22dfbaf96ca80cae8f06bf0e39d0e20798",
           "size_bytes": 12271
         },
         "parameters": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
           "sha256": "f9863f1b4f5d7f1eac3422f59a1dfec2d09b1d87687cef79fcc1b6070bbc740a",
           "size_bytes": 18259
         },
@@ -268,7 +268,7 @@
       },
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-35b-a5-tp4-c4-graph.json",
+          "path": "repository://profiler/examples/structure/cases/decode-qwen35-35b-a5-tp4-c4-graph.json",
           "sha256": "60a19e3738cd95098f6ef0ed8a6841ac57ed78288bcdecc978c32cb01a963ae9",
           "size_bytes": 54057
         },

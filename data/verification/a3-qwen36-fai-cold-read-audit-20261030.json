@@ -227,7 +227,7 @@
     ]
   },
   "source_conditions": {
-    "repository": "/Users/maoxx241/code/refs/ops-transformer",
+    "repository": "repository://refs/ops-transformer",
     "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8",
     "file_identities": [
       {

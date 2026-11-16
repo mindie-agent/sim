@@ -233,9 +233,7 @@ def _authored_rows(produced: Any) -> tuple[int | None, int]:
 
 def _fq5_quant_rows(geometry: Any, kind: str, tp: int) -> tuple[str, Any] | None:
     """Use FQ5 when that module already publishes ``quant_rows``. Do not invent it."""
-    for module_name in (
-            "mindie_sim.prediction.fq5",
-            "mindie_sim.prediction.piecewise.fq5"):
+    for module_name in ("mindie_sim.prediction.fq5",):
         try:
             module = importlib.import_module(module_name)
         except ImportError:

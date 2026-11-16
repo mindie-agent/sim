@@ -1,6 +1,6 @@
 {
   "gpu": "NVIDIA GeForce RTX 4090",
-  "source": "/Users/maoxx241/code/sim-rewrite-20261027/data/measurements/gpu/sim-probe-20261027-234735.stdout",
+  "source": "repository://sim-rewrite-20261027/data/measurements/gpu/sim-probe-20261027-234735.stdout",
   "calibration": "hardware memory service rate from 64/96/128 MiB; 112 MiB held out",
   "peak_device_allocation_mib": 256,
   "fit": {

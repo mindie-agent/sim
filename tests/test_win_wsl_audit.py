@@ -65,4 +65,4 @@ def test_timeout_error_not_swallowed_in_catalog_and_custom_hardware(
 
     monkeypatch.setattr(Path, "read_text", raise_timeout)
     with pytest.raises(TimeoutError):
-        model_catalog.load_architecture_profile(next(iter(model_catalog.ARCHITECTURE_PRESET_CATALOG)))
+        model_catalog.load_model(next(iter(model_catalog.ARCHITECTURE_PRESET_CATALOG)))

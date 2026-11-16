@@ -18,6 +18,6 @@ jobs:
       release-notes-path: docs/releases/sim-0.9.17.md
       python: /tmp/sim-rel-venv/bin/python
       setup-command: |
-        uv venv --seed --python 3.13 /tmp/sim-rel-venv && uv pip install --python /tmp/sim-rel-venv/bin/python ".[test]" && rm -rf build dist *.egg-info .venv
+        uv venv --seed --python 3.13 /tmp/sim-rel-venv && uv pip install --python /tmp/sim-rel-venv/bin/python ".[test]" && rm -rf build dist *.egg-info .venv && MINDIE_CACHE_HOME=/tmp/sim-rel-cache /tmp/sim-rel-venv/bin/python -B -c "import mindie_sim.prediction.runtime.accel_build as b; b.build_accel()"
       test-command: |
-        PYTHONDONTWRITEBYTECODE=1 /tmp/sim-rel-venv/bin/python -B -m pytest -q -n auto -p no:cacheprovider -m "not live_npu"
+        PYTHONDONTWRITEBYTECODE=1 MINDIE_CACHE_HOME=/tmp/sim-rel-cache /tmp/sim-rel-venv/bin/python -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu"

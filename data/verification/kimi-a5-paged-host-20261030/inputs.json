@@ -1,6 +1,6 @@
 {
   "source_case": {
-    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-kimi93-tp8-longctx-source.json",
+    "path": "repository://profiler/examples/structure/cases/a5-kimi93-tp8-longctx-source.json",
     "sha256": "bdd033d8ea89594f5d8197d9985fbe265da2e719fa80aafecf9f18dbc74bc909"
   },
   "cases": [

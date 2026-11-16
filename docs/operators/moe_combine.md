@@ -51,8 +51,8 @@ emulated.
 
 | File | SHA-256 | Bytes | Relevant lines |
 | --- | --- | --- | --- |
-| `/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py` | `30fbb37b84b1cf6a8962d674abd9c3ab4d2be56d028fac82f55833c88d9729e8` | 5999 | kernel 10-63; program ids 25-26; masks 31-33; weight load 41; A load 50-55; FMA 56; store 58-63; heuristic 66-132; wrapper 135-202; launch 177-200 |
-| `/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py` | `6a269547fc2bddb5e1784676f78d63a1b3e796699a2c9bfe2c8e446e95fd3425` | 6018 | Contiguous 80-121; apply flag 107-108 |
+| `repository://vllm-v0.25.1/vllm/model_executor/layers/fused_moe/moe_fused_mul_sum.py` | `30fbb37b84b1cf6a8962d674abd9c3ab4d2be56d028fac82f55833c88d9729e8` | 5999 | kernel 10-63; program ids 25-26; masks 31-33; weight load 41; A load 50-55; FMA 56; store 58-63; heuristic 66-132; wrapper 135-202; launch 177-200 |
+| `repository://vllm-v0.25.1/vllm/model_executor/layers/fused_moe/topk_weight_and_reduce.py` | `6a269547fc2bddb5e1784676f78d63a1b3e796699a2c9bfe2c8e446e95fd3425` | 6018 | Contiguous 80-121; apply flag 107-108 |
 
 Both entries match `tests/fixtures/operator_sources/moe_combine.json`. Source origin is
 recorded in `OpSpec.metadata["source_origin"]` as
@@ -264,14 +264,14 @@ operations, without torch or `ml_dtypes`. Results:
 ## Executed checks
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py \
   mindie_sim.prediction.operators.moe_combine \
   tests/fixtures/operator_cases/moe_combine.json \
   -o data/verification/operators/moe_combine.json
 # {"status": "passed", "cases": 10, "output": "data/verification/operators/moe_combine.json"}
 
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest tests/operators/test_moe_combine.py -q
 # 72 passed
 ```

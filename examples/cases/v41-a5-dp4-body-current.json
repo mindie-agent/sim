@@ -242,12 +242,12 @@
       "graph": "FULL CUDA graphs, capture sizes [1,2,4,8]; APC off; no MTP/speculative decode (speculative_config=None), so every engine step commits exactly one token (tokens/step=1.00)",
       "scope": "target body probe only; geometry supplied through predict(scope=body)",
       "legacy_case_identity": {
-        "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/v41-a5-dp4.json",
+        "path": "repository://sim-rewrite-20261027/examples/cases/v41-a5-dp4.json",
         "bytes": 7164,
         "sha256": "98ddbebea45877210dfec7798d70298703fc829e615f916221124096ead0b745"
       },
       "structure_config_identity": {
-        "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
+        "path": "repository://sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
         "bytes": 3311,
         "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
       },
@@ -262,7 +262,7 @@
         "response_dtype": "bf16",
         "response_bytes": 512,
         "basis": "captured safetensors headers proveFP8x256+E8M0x8=264B; retained registered-host rows x256 at94.42GiB/table",
-        "launch_log": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/v41-flash-a5/async-off-16k/raw/remote/logs/serve.log",
+        "launch_log": "repository://mindie-agent/.workstreams/hp-serving/v41-flash-a5/async-off-16k/raw/remote/logs/serve.log",
         "launch_lines": [
           23,
           30

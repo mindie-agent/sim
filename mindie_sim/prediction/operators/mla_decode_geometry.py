@@ -16,13 +16,13 @@ IMPLEMENTATION = "triton_decode_grouped_mla"
 # campaign metadata.  The coordinator compares these files independently.
 SOURCE_FILES = (
     {
-        "path": "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/backends/mla/triton_mla.py",
+        "path": "repository://vllm-v0.25.1/vllm/v1/attention/backends/mla/triton_mla.py",
         "sha256": "5e9aa13eca7ce718ce0648f11454bb0e0e98e9f5da40ee22bd8d0b05f4ba1d03",
         "lines": "35-47 split auto-selection (not used); 166-171 logit cap rejected; "
                  "199-237 wrapper q-cat/zero-init/cache alias; 241-256 grouped MLA call",
     },
     {
-        "path": "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/ops/triton_decode_attention.py",
+        "path": "repository://vllm-v0.25.1/vllm/v1/attention/ops/triton_decode_attention.py",
         "sha256": "b9823c65eba22d76abf64dad7d7d16a950f67471c86d6cb5b3e983aaf14381ac",
         "lines": "59-65 page stride; 279-467 grouped stage 1; 415-432 latent PV alias; "
                  "486-572 MLA block dispatch; 575-681 stage 2 merge; 719-817 grouped dispatch",

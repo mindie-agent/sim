@@ -144,7 +144,7 @@
         "sha256": "d37c0832db3698a2a4d361a1bc053e4e9580e50ce49a1823297daae91023cab9"
       },
       "startup": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
         "bytes": 335341,
         "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
       },

@@ -171,14 +171,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_qwen35.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a3_qwen35.json",
           "size_bytes": 86996,
           "sha256": "ff13af68893b35b7d99f85042c966c9d0fdab7639a6c55860adc85529215a50c",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/qwen35-a3-tp4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/qwen35-a3-tp4.json",
           "size_bytes": 4648,
           "sha256": "656daf83994dbc343e88bed66bbc38efec6995507f8c71ffe7a03bec77a0457a",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -226,12 +226,12 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen35-lo-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen35-lo-prediction.json",
           "sha256": "5364270699ee6c6f950f72b935bee55ba29c46bf521b09352fe6ddd1c816688d",
           "size_bytes": 98567
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen35-hi-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen35-hi-prediction.json",
           "sha256": "3131fa86ce09f38dffde34bb196c156c9d630f7573050fe2fe822354935bd8e5",
           "size_bytes": 98562
         }
@@ -378,7 +378,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "6c7131f115dca0d3d7b020e3e6a9ac748c314fbd34292d3f923b51d2da352c83",
               "hashed_files": 179,
@@ -387,14 +387,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "6c7131f115dca0d3d7b020e3e6a9ac748c314fbd34292d3f923b51d2da352c83",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "6c7131f115dca0d3d7b020e3e6a9ac748c314fbd34292d3f923b51d2da352c83",
                 "hashed_files": 179,
@@ -993,7 +993,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
               "hashed_files": 179,
@@ -1002,14 +1002,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
@@ -1662,14 +1662,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_qwen36.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a3_qwen36.json",
           "size_bytes": 85345,
           "sha256": "7a41d0f10c7eb1c4f3610bea816ab31cc7063e3cdb86d368cd09be3125e9500e",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/qwen36-a3-tp4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/qwen36-a3-tp4.json",
           "size_bytes": 4509,
           "sha256": "e1c8e9d7d5e2be4d4f7475875a605808917a34ce0849931696a4b2fe7bc45297",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -1710,12 +1710,12 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen36-lo-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen36-lo-prediction.json",
           "sha256": "41ee2ba57a08a0d3605be1bb5f316626cb712d654ffa973b1fe155f34146a279",
           "size_bytes": 86383
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen36-hi-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen36-hi-prediction.json",
           "sha256": "450c4746a22dc2b5f59ec78a126ea45cdbef85afd94eb835964fd7593ead031d",
           "size_bytes": 86387
         }
@@ -1861,7 +1861,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
               "hashed_files": 179,
@@ -1870,14 +1870,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
@@ -2366,7 +2366,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
               "hashed_files": 179,
@@ -2375,14 +2375,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
@@ -2903,14 +2903,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a5_qwen38.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a5_qwen38.json",
           "size_bytes": 75278,
           "sha256": "20d5149ec54a77b38e595d83db884d092257337642e819a1eea3690206f3f14a",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/qwen38-a5.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/qwen38-a5.json",
           "size_bytes": 17975,
           "sha256": "1a83112a68030dc38a89fe05342335eb54a901d367abd47fb7c8e3b6871dc7a6",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -2958,12 +2958,12 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen38-lo-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen38-lo-prediction.json",
           "sha256": "11dfe6f9e4360bce5f523e1002dde3d454298296801256c0c8521e06b063a82d",
           "size_bytes": 89514
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen38-hi-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-qwen38-hi-prediction.json",
           "sha256": "c8dc4e06640af452474b441a2fd1f5693895048ed52e3c613c1087dd993d93f1",
           "size_bytes": 89532
         }
@@ -3108,7 +3108,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
               "hashed_files": 179,
@@ -3117,14 +3117,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
@@ -3603,7 +3603,7 @@
             },
             "identity_issues": [],
             "runtime": {
-              "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+              "import_path": "repository://sim-rewrite-20261027/mindie_sim",
               "version": "0.8.0",
               "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
               "hashed_files": 179,
@@ -3612,14 +3612,14 @@
             "runtime_integrity": {
               "status": "unchanged",
               "before": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
                 "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
               },
               "after": {
-                "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+                "import_path": "repository://sim-rewrite-20261027/mindie_sim",
                 "version": "0.8.0",
                 "package_content_sha256": "f87a6adc9bc6804850f9a9843aa2abef6c7defabedf2f1799cf507b075da95af",
                 "hashed_files": 179,
@@ -4603,22 +4603,22 @@
           },
           "parser_sources": [
             {
-              "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/observations/kernels.py",
+              "path": "repository://sim-rewrite-20261027/mindie_sim/observations/kernels.py",
               "size_bytes": 1145,
               "sha256": "abce13b4a461388847fbaa72924576d621f60f3ce936892488ff9a74c93a1e42"
             },
             {
-              "path": "/Users/maoxx241/code/profiler/mindie_profiler/normalized.py",
+              "path": "repository://profiler/mindie_profiler/normalized.py",
               "size_bytes": 3955,
               "sha256": "568e7aeaf5ca271d80e6e3493a31c974089d00de41c1d0ce0c70110bfa349ef3"
             },
             {
-              "path": "/Users/maoxx241/code/profiler/mindie_profiler/sources_csv.py",
+              "path": "repository://profiler/mindie_profiler/sources_csv.py",
               "size_bytes": 15399,
               "sha256": "c185a73c56a7892acf56e6ca485eba4962de60e0a80c72ef4fe7d397909aef91"
             },
             {
-              "path": "/Users/maoxx241/code/profiler/mindie_profiler/events.py",
+              "path": "repository://profiler/mindie_profiler/events.py",
               "size_bytes": 9560,
               "sha256": "379234004a0560d2d21a7e855e3087131d35d1b06b991ca93324d77fbf7f7af7"
             }
@@ -4726,14 +4726,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_glm53_prefill.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a3_glm53_prefill.json",
           "size_bytes": 74303,
           "sha256": "d09c56669de380209d731de41c160679f4125e2d379f60f2d833f0ab2e9949b8",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/glm53-a3-w4a8.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/glm53-a3-w4a8.json",
           "size_bytes": 5494,
           "sha256": "4671d3c85fc1657556a3fc8b57b20f118275502d6935c25c18189ef62f5f70a3",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -4789,21 +4789,21 @@
         },
         {
           "role": "model_config_comparison_code",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/catalog/glm.py",
+          "path": "repository://sim-rewrite-20261027/mindie_sim/catalog/glm.py",
           "size_bytes": 11995,
           "sha256": "ece0d553bdb10fcc7dbd9b3eb42a60e92519f73b2665138d256c50245749a67e",
           "hash_basis": "computed_current_small_source_2026-10-29"
         },
         {
           "role": "model_config_comparison_code",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/schema/model.py",
+          "path": "repository://sim-rewrite-20261027/mindie_sim/schema/model.py",
           "size_bytes": 29641,
           "sha256": "6d71d6bcae48ee67749e5510cb7ec8e5c49457cc32656085a1266e8b323a5fdb",
           "hash_basis": "computed_current_small_source_2026-10-29"
         },
         {
           "role": "model_config_comparison_code",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/prediction/structure.py",
+          "path": "repository://sim-rewrite-20261027/mindie_sim/prediction/structure.py",
           "size_bytes": 6036,
           "sha256": "0a8203a294420002fa3d4c63c6e70d2e1519ca59ecbadcb666733685e96819f2",
           "hash_basis": "computed_current_small_source_2026-10-29"
@@ -4823,19 +4823,19 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm-communication.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm-communication.json",
           "role": "original_communication_stream_identity_audit",
           "sha256": "7bf1966e4c15de600538a05c0cc2cdf001f6566763629a596297edb420ca523c",
           "size_bytes": 176968
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm-moe-source.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm-moe-source.json",
           "role": "official_source_at_capture_declared_version",
           "size_bytes": 7167,
           "sha256": "5ba999a14da10c350d54a28c821d8f9a5e8ef7d2fb0e3bc391d8c6bc27afdb9f"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm53-phase-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-glm53-phase-prediction.json",
           "sha256": "516f2a52986a7ac286294896859692a0413e8c488aa26dcc35538393764e3f14",
           "size_bytes": 185301
         }
@@ -5029,7 +5029,7 @@
         },
         "identity_issues": [],
         "runtime": {
-          "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+          "import_path": "repository://sim-rewrite-20261027/mindie_sim",
           "version": "0.8.0",
           "package_content_sha256": "ab94fcd14f312200c59d4ef07cd835811a83273bfead02b47bba664b8d13da0e",
           "hashed_files": 179,
@@ -5038,14 +5038,14 @@
         "runtime_integrity": {
           "status": "unchanged",
           "before": {
-            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "import_path": "repository://sim-rewrite-20261027/mindie_sim",
             "version": "0.8.0",
             "package_content_sha256": "ab94fcd14f312200c59d4ef07cd835811a83273bfead02b47bba664b8d13da0e",
             "hashed_files": 179,
             "matrix_sha256": "6ec569e2e89cd979e9c75b48e3058301a3d0d9f0fd93dfa6d3a4f2eda49daac2"
           },
           "after": {
-            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "import_path": "repository://sim-rewrite-20261027/mindie_sim",
             "version": "0.8.0",
             "package_content_sha256": "ab94fcd14f312200c59d4ef07cd835811a83273bfead02b47bba664b8d13da0e",
             "hashed_files": 179,
@@ -5684,14 +5684,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_v4f.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a3_v4f.json",
           "size_bytes": 55551,
           "sha256": "3db36f2642a1a24da3faed92ab696fec0d04e9fb895f01ec2feb0667ff96ef2a",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/v4f-a3-w8a8-tp8.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/v4f-a3-w8a8-tp8.json",
           "size_bytes": 6587,
           "sha256": "2445cf26fce3d99f00de416dc3c79539183c33d328aecde973f1b1500dc1fce3",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -5890,14 +5890,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a5_kimi_k3.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a5_kimi_k3.json",
           "size_bytes": 77545,
           "sha256": "16332655f8b8879a0f5c4a84079ebb49d618327c5acbd34e8e38a28d8c00da31",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "prediction_case_current",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/kimi-k3-a5.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/kimi-k3-a5.json",
           "size_bytes": 4917,
           "sha256": "0a26e134829417a19ea46aee96de8e3269a0def45e493994e0478d6e9bd1943d",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
@@ -5945,7 +5945,7 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-kimi-top.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-kimi-top.json",
           "role": "complete_streamed_native_top5",
           "sha256": "8058782d9ff70f11a51730a80043d5971b197d84a98254a7f6f2c4df937fb644",
           "size_bytes": 4934
@@ -5977,7 +5977,7 @@
     "date": "2026-10-29",
     "scope": "six requested models plus a separate V4 Flash reference; retained A3/A5 captures; no new device run",
     "inventory": {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-observed-inventory.json",
+      "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-observed-inventory.json",
       "role": "normalized_independent_inventory",
       "sha256": "f3967008155728567c350381c987edaaca22dcfb41774ed3162113fb43690da9",
       "size_bytes": 75625

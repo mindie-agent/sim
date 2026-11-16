@@ -99,17 +99,17 @@
       "input_boundary": "full 45-layer target body; placeholder workload is not serving replay",
       "capture_directory": "/Volumes/data/mindie-sim-data/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030",
       "client_summary": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/benchmark_summary.json",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/benchmark_summary.json",
         "bytes": 139849,
         "sha256": "6509330850a82e02a82225b6fe0b17a584c2ab4f5787dcbcde5f862240185251"
       },
       "profile_cell": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/profile_cell.json",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/deliverables/a3/glm5_3_flash_w8a8_high_conc_decode_aclgraph_c64_20261030/profile_cell.json",
         "bytes": 5164,
         "sha256": "341258f771a0c571499e3fc234457ef4af94349858e433aa3d3f4f3a1a5813c9"
       },
       "launch_source": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_glm53f_w8a8.sh",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_glm53f_w8a8.sh",
         "bytes": 3046,
         "sha256": "796b4709dc31226e62c562c3a7718d9f2d09b190fa2fe87a4ae9814ec3d18538"
       },

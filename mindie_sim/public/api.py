@@ -40,7 +40,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware
 from mindie_sim.schema.operators import OpSpec
 
-from .aclnn import _aclnn_execution_projection, simulate_aclnn_call  # noqa: F401
 from .contracts import CORE_PROVIDER, ExtensionContext
 from .environment import ExecutionEnvironment
 from .errors import CapabilityGap, ExtensionError
@@ -685,6 +684,6 @@ def simulate_service(case: Any, *, extensions: Any = None,
 
 
 __all__ = [
-    "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
+    "simulate_operator", "simulate_native_call",
     "simulate_graph", "simulate_model", "simulate_service",
 ]

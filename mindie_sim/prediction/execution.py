@@ -530,7 +530,7 @@ def _bind_native_resource_view(program, resource_names, engine):
     """Shallow launch-local resource view; cached program is not mutated."""
     if not resource_names:
         return program
-    from .piecewise.compiler import NativeProgram
+    from .program import NativeProgram
     inner = copy(program.program)
     names = dict(getattr(inner, "names", {}) or {})
     rates = dict(getattr(inner, "rates", {}) or {})
@@ -546,7 +546,7 @@ def _bind_native_resource_view(program, resource_names, engine):
     inner.names = names
     inner.rates = rates
     inner.units = units
-    return NativeProgram(inner, program.work, program.duration)
+    return NativeProgram(inner, program.work)
 
 
 def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
@@ -562,7 +562,7 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
     that rank's own program finish; the cohort join waits every real finish.
 
     ``launches`` is a sequence of mappings (or attribute objects) with:
-      program: piecewise.compiler.NativeProgram
+      program: NativeProgram
       name: unique launch name
       ready: actual local ready Event
       rank_index: launch-local EP rank index
@@ -573,8 +573,8 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
     Returns finishes, per-rank parents, the genuine global join, launch-local
     handles, and unresolved peer labels.
     """
-    from .piecewise.compiler import NativeProgram
-    from .piecewise.families_moe_mc2 import Mc2LaunchView
+    from .program import NativeProgram
+    from .mc2_program import Mc2LaunchView
 
     def field(raw, key, default=None):
         return (raw.get(key, default) if isinstance(raw, _AbcMapping)
@@ -1469,7 +1469,7 @@ class Execution:
                    for item in participants):
                 programs = {item.replica: self.lower_program(
                     item.context, item.recipe) for item in participants}
-                from .piecewise.compiler import NativeProgram
+                from .program import NativeProgram
                 if all(isinstance(program, NativeProgram)
                        and hasattr(program.program, "start_with_handles")
                        for program in programs.values()):
@@ -1804,7 +1804,7 @@ class Execution:
             started[0] = True
             programs = {item.replica: self.lower_program(
                 item.context, item.recipe) for item in participants}
-            from .piecewise.compiler import NativeProgram
+            from .program import NativeProgram
             if not all(isinstance(program, NativeProgram)
                        and hasattr(program.program, "start_with_handles")
                        for program in programs.values()):
@@ -2022,7 +2022,7 @@ class Execution:
                            intra_latency_ms=None, inter_latency_ms=None,
                            resource_names=None):
         """Immutable per-launch rank/topology view; cached program untouched."""
-        from .piecewise.families_moe_mc2 import Mc2LaunchView
+        from .mc2_program import Mc2LaunchView
         peer_count = int(getattr(inner, "peer_count", 0) or 0)
         if peer_count <= 0 or rank_index is None:
             return None
@@ -2088,7 +2088,7 @@ class Execution:
         ``handles`` are the program's launch-local peer send/receive/check/
         retire and phase-complete Events on this same Engine.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         phase_ready = self._phase_scope(program, peer_ready)
         phase_send = self._phase_scope(program, peer_send)
         start = local_ready if local_ready is not None else ready
@@ -2147,7 +2147,7 @@ class Execution:
         actual peer Events.  Every other program keeps the common cohort
         barrier, so ordinary aggregate recipes are unchanged.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         if isinstance(program, NativeProgram) and (
                 peer_ready is not None or peer_send is not None):
             start = local_ready if local_ready is not None else ready
@@ -2187,7 +2187,7 @@ class Execution:
         placeholder cohort, so it is reported separately from a complete
         cross-DP rendezvous instead of being labelled by family.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         if not isinstance(program, NativeProgram):
             return
         inner = program.program
@@ -2897,7 +2897,7 @@ class Execution:
         host_submits: list[tuple[int, int, Event]] = []
         step_holder: dict[str, Any] = {}
         owner = f"replica:{replica}"
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         compact_exec = (
             not self.legacy_diagnostics
             and (not engine.trace.maxlen or n_ops > engine.trace.maxlen)

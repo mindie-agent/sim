@@ -2,7 +2,7 @@
   "schema": "mindie-sim.capture-protocol/1",
   "adapter": "grouped_calls",
   "producer": {
-    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
+    "path": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
     "sha256": "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a"
   },
   "supporting_sources": [

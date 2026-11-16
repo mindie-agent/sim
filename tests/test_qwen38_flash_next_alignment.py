@@ -28,7 +28,7 @@ from mindie_sim import (
     compose_case,
     graph_costs,
     predict,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
     target_graphs,
 )
 from mindie_sim.catalog.cache import layer_cache_components, request_cache_breakdown
@@ -149,7 +149,7 @@ def test_ascend_five_entrypoint_smoke_matrix():
     assert pred["status"] == "modeled" and pred["metrics"]
     eff = analyze_network_efficiency(qwen, phase="decode", tokens=1, context=512, sequences=2)
     assert isinstance(eff, dict) and eff
-    sla = solve_hardware_sla_throughput(
+    sla = solve_sla_sizing(
         qwen, sla_ms=200.0, context=512, max_sequences_per_dp=2,
         scenarios=({"name": "1x", "compute_scale": 1.0, "hbm_scale": 1.0},),
         b1_analysis=eff,

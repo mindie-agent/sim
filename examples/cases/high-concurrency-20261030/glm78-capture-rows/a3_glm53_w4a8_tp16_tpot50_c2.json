@@ -147,7 +147,7 @@
       },
       "launch_declaration": {
         "source": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
           "sha256": "3642c774841205a58d18951e41c5338989858a35ece0c9c5c3c33c71a404373d",
           "size_bytes": 2199
         },
@@ -181,7 +181,7 @@
           0.32768
         ],
         "acceptance_mode": "marginal",
-        "source": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+        "source": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
         "label": "configured synthetic acceptance; not observed acceptance"
       },
       "profiled_client": {
@@ -223,7 +223,7 @@
         "mc2_allocated_rows": 16,
         "source_parent": "examples/cases/high-concurrency-20261030/glm78/a3_glm53_w4a8_tp16_tpot50_c2.json",
         "source_parent_sha256": "4b1b2260e0b9d0da00261e5fad5875b52dc3d94dd79aaf96555329c1d9c4521e",
-        "native_partition_report": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-service-qwen-a3/glm78-native/a3_glm53_w4a8_tp16_tpot50_c2-native-partitions.json",
+        "native_partition_report": "repository://profiler/examples/structure/acceptance-20261030-service-qwen-a3/glm78-native/a3_glm53_w4a8_tp16_tpot50_c2-native-partitions.json",
         "native_partition_sha256": "bff3391eed6d11b8ddf807b15bb1e4345a7b35a47bb97b20c1652533d6b54dd5",
         "boundary": "MlaProlog/attention/router/shared full input rows; only routed MC2 hidden/logits right-pad to TP; finalize gathers allocated rows then trims",
         "source_token_mask": "valid prefix; destination IDs unobserved; generic balanced expert histogram and uniform-destination expected traffic retained",

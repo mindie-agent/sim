@@ -1,12 +1,12 @@
 {
   "schema": "operator-service-calibration/1",
   "producer": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/fit.py",
+    "path": "repository://sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/fit.py",
     "sha256": "885a027ecee9f1f530318e7da6be53d8f2d0b35136223f8fe9467bdbe350ad9a",
     "size_bytes": 12036
   },
   "native_ledger": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/native.json",
+    "path": "repository://sim-service-response-domain-next/data/observations/a5-qwen35-ep1-grouped-20261030/native.json",
     "sha256": "0e7bba5d8de40d6d920e1550aa275c03ef8ff366fc55218a74b6ec9fcf572860",
     "size_bytes": 47879
   },
@@ -389,7 +389,7 @@
     }
   ],
   "source_case": {
-    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
+    "path": "repository://profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
     "sha256": "fbac3d688d7a92e6e598c1ba6406cef4c2f8addf68dfa9b4dd56c02d9a9b5a53",
     "size_bytes": 2673
   },

@@ -3,7 +3,7 @@
     "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
     "deployment": "v4flash-a3-tp8-ep8",
     "input": {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+      "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
       "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
       "size_bytes": 18244
     },
@@ -56,7 +56,7 @@
     }
   ],
   "result": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1.json",
+    "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030/v4flash-a3-tp8-ep8-ctx126000-c1.json",
     "sha256": "6b908c30fe24a77e54e3c643682314fdab42aa2047e164d86c234b1f4f57f078",
     "size_bytes": 15900
   },

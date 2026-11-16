@@ -332,7 +332,7 @@
         "host_supply": "nominal assumptions retained; not calibrated to this capture"
       },
       "structure_basis": {
-        "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
+        "path": "repository://sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
         "bytes": 3311,
         "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
       },
@@ -381,7 +381,7 @@
       },
       "native_attention": {
         "dsl": {
-          "path": "/Users/maoxx241/code/refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+          "path": "repository://refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
           "bytes": 111124,
           "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f",
           "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
@@ -399,13 +399,13 @@
           ]
         },
         "operator_documentation": {
-          "path": "/Users/maoxx241/code/refs/ops-transformer/torch_extension/cann_ops_transformer/docs/zh/mixed_quant_sparse_flash_mla.md",
+          "path": "repository://refs/ops-transformer/torch_extension/cann_ops_transformer/docs/zh/mixed_quant_sparse_flash_mla.md",
           "bytes": 53292,
           "sha256": "05a69a227d2c253eec1b609f6a68e194a4bdec1a5ff5bfbee3d98c7bba049deb",
           "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
         },
         "historical_caller_stack": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/v41-flash-a5/kvzero-patch.md",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/v41-flash-a5/kvzero-patch.md",
           "bytes": 15961,
           "sha256": "dfd5f79dabeef1377180eb5bd0a4842faca71d51ce9f54c3c1587b788138acbe",
           "lines": [
@@ -455,12 +455,12 @@
       "comparison_coverage": "conditional analytic structure; native mixed-quant attention boundary remains unmodeled",
       "source_scenario": {
         "base_case": {
-          "path": "/Users/maoxx241/code/sim-v41-body-source-cases-20261030/examples/cases/high-concurrency-20261030/v41-dp8/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8.json",
+          "path": "repository://sim-v41-body-source-cases-20261030/examples/cases/high-concurrency-20261030/v41-dp8/a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8.json",
           "sha256": "ecf2a6a2550b59acd682044fd24a74e31db0938bf45dfa69f37a094f7d08df69",
           "bytes": 12777
         },
         "rank0_geometry_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-09811dad/body-operator-a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-v41-dp8.actual.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-09811dad/body-operator-a5_v41_fp8_tp1_dp8_ep8_tpot10ms_c8-v41-dp8.actual.json",
           "sha256": "0150875fae46728125a70bf80220635f792b5669fea7926c003ef68bfa1aac69",
           "bytes": 2444252
         },

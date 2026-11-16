@@ -2,7 +2,7 @@
 
 结论：已核对的本地源码在 **prepare 后的本地物理 token 行**上生成强制路由 ID，且包含 **EP rank 偏移**，并非每个 DP 都从 expert 0 开始。`AllGather` 分支的 prepare 会先聚合输入，必须单独解释。当前 Sim `balanced` 是理想的全 cohort 整数均衡声明，不能称为精确复现这个源码表，更不能称为复现尚未确认身份的 0.30 镜像 helper。
 
-本次没有修改 runtime、默认路由或 capture，也没有远端操作。以下行号及 SHA 已写入 `../../data/verification/force-eplb-dp-scope-audit-20261030.json`。源码基目录为 `/Users/maoxx241/code/vllm-ascend-v41-private`；独立 upstream helper 位于 `/Users/maoxx241/code/vllm-v0.27.1-k3-ops-validation`。
+本次没有修改 runtime、默认路由或 capture，也没有远端操作。以下行号及 SHA 已写入 `../../data/verification/force-eplb-dp-scope-audit-20261030.json`。源码基目录为 `repository://vllm-ascend-v41-private`；独立 upstream helper 位于 `repository://vllm-v0.27.1-k3-ops-validation`。
 
 ## 真实调用顺序
 

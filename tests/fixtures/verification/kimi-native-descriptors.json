@@ -55368,7 +55368,7 @@
   "peak_rss_mib": 43.5,
   "producer": {
     "driver": {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/tools/model_scoreboard_kimi.py",
+      "path": "repository://sim-rewrite-20261027/tools/model_scoreboard_kimi.py",
       "size_bytes": 31276,
       "sha256": "481091082374808996db60e37b453edc83ce50967a79a31ba7ed7040e1e7bae5"
     },
@@ -55385,7 +55385,7 @@
   },
   "parser_sources": [
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/observations/kernels.py",
+      "path": "repository://sim-rewrite-20261027/mindie_sim/observations/kernels.py",
       "size_bytes": 1145,
       "sha256": "abce13b4a461388847fbaa72924576d621f60f3ce936892488ff9a74c93a1e42"
     },

@@ -86,7 +86,7 @@
         "fusion_ops_gmmswigluquant": false,
         "provenance": "campaign_launch_log",
         "launch_log_independently_confirmed": true,
-        "basis": "/Users/maoxx241/code/mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
+        "basis": "repository://mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
         "sim_selection": "ordinary separate grouped GEMM + activation + quantization; no fused MSD lowering"
       },
       "tensor_geometry_candidates": [
@@ -200,12 +200,12 @@
       },
       "grouped_effective_service": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/qwen35-mc2-tp-dsq-source-conditional/qwen35-35b-a5-tp4-c128-mc2-tp-dsq-source.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/qwen35-mc2-tp-dsq-source-conditional/qwen35-35b-a5-tp4-c128-mc2-tp-dsq-source.json",
           "sha256": "5424e603277101fb25ee0d45938e6850f747fab3a596cc92ea70edffbefa7912",
           "size_bytes": 12315
         },
         "parameters": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
           "sha256": "f9863f1b4f5d7f1eac3422f59a1dfec2d09b1d87687cef79fcc1b6070bbc740a",
           "size_bytes": 18259
         },
@@ -493,7 +493,7 @@
               "declared_active_banks": 64,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+                "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
                 "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
                 "size_bytes": 49365
               }
@@ -587,7 +587,7 @@
               "declared_active_banks": 64,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+                "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
                 "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
                 "size_bytes": 49365
               }
@@ -682,7 +682,7 @@
               "declared_active_banks": 48,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
                 "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
                 "size_bytes": 214502
               }
@@ -777,7 +777,7 @@
               "declared_active_banks": 48,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
                 "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
                 "size_bytes": 214502
               }
@@ -986,18 +986,18 @@
           "provenance": {
             "assignment_sources": [
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                 "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                 "size_bytes": 852008
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                 "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                 "size_bytes": 874253
               }
             ],
             "holdout_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
               "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
               "size_bytes": 887805
             },
@@ -1045,18 +1045,18 @@
           "provenance": {
             "assignment_sources": [
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                 "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                 "size_bytes": 852008
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                 "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                 "size_bytes": 874253
               }
             ],
             "holdout_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
               "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
               "size_bytes": 887805
             },

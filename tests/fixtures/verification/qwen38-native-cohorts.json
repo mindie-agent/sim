@@ -306,7 +306,7 @@
     }
   },
   "structure_source": {
-    "case_path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/fusion-cohort-a5_qwen38-reference.case.json",
+    "case_path": "repository://profiler/examples/structure/acceptance-20261029/fusion-cohort-a5_qwen38-reference.case.json",
     "case_sha256": "9048fa43435e5c36ba04e915a8faac8e09bf27c8eb1838e0e551fe58c40bc5cc",
     "recipe_change": {
       "programs.matmul": {

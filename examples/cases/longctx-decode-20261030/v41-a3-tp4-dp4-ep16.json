@@ -4347,7 +4347,7 @@
         "size_bytes": 61131358
       },
       "launch": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_dsv41_flash_w8a8_dspark7.sh",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_dsv41_flash_w8a8_dspark7.sh",
         "size_bytes": 3124,
         "sha256": "548b2b5f31aff1ca886cb1baf9e6c6bb0f15cbd9356b4c7cc324acb23691e717"
       },
@@ -4406,13 +4406,13 @@
         "native graph padding, per-DP active batches, current KV lengths and realized expert routes not observed"
       ],
       "inventory_receipt": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-final6/retained-source-evidence.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-v41-final6/retained-source-evidence.json",
         "sha256": "06e87ec000621c8f5adeac51465644ba69f47898e3625d3e8de773474906f6b8",
         "size_bytes": 312386
       },
       "deployment_evidence": {
         "launch_source": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_dsv41_flash_w8a8_dspark7.sh",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/w10/cases/serve_dsv41_flash_w8a8_dspark7.sh",
           "sha256": "548b2b5f31aff1ca886cb1baf9e6c6bb0f15cbd9356b4c7cc324acb23691e717",
           "size_bytes": 3124
         },
@@ -4455,7 +4455,7 @@
         "same_as_selected_csv": true
       },
       "bounded_physical_rows_reference": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-final6/a3-c4-bounded-physical-rows.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-v41-final6/a3-c4-bounded-physical-rows.json",
         "sha256": "42e9a413458dd0345fb04d8f14fdcba347f6f926b0c42b727519acab3183b60f",
         "size_bytes": 500849,
         "source_capture": "a3_v41_c4",
@@ -4528,7 +4528,7 @@
       "auxiliary_layers_observed_in_c4": 3,
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a3_v41_w8a8_tp4_dp4_ep16_dspark7_c4.json",
+          "path": "repository://profiler/examples/structure/cases/decode-a3_v41_w8a8_tp4_dp4_ep16_dspark7_c4.json",
           "sha256": "ec1cfe7b1e54eccc305b636d6f733b9be73671a8adedbcae188ad1304f9c67fe",
           "size_bytes": 141904
         },

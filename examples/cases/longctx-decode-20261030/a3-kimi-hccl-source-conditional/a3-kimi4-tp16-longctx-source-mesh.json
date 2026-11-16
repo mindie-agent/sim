@@ -454,7 +454,7 @@
       "conditional_hccl_source_control": {
         "basis": "explicit_source_compatible_AICPU_TS_mesh_separate; captured_executor_and_payload_arguments_not_observed",
         "canonical_input": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+          "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
           "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
           "bytes": 15110
         },

@@ -21,7 +21,7 @@ The source checkout is `752a3a504485790a2e8491cacbb35c137339ad34`:
 | `vllm/v1/attention/ops/triton_attention_helpers.py` | `8c730611e7b3c5fb7579ec7846d56a2ab7e348ce06b39136da22072ecc363c95` |
 
 These are the supplied local source files under
-`/Users/maoxx241/code/vllm-v0.25.1`. They do not identify a historical capture's
+`repository://vllm-v0.25.1`. They do not identify a historical capture's
 installed Triton compiler or generated binary.
 
 `query` is the new query length; `context` is the preceding KV prefix. The

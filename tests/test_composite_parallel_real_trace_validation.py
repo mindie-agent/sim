@@ -36,7 +36,7 @@ from mindie_sim.catalog.weights import cache_row_bytes_by_layer, weight_breakdow
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.efficiency import (
     analyze_network_efficiency, extract_hardware_peaks,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 from mindie_sim.prediction.scheduler import DraftPolicy
 from mindie_sim.prediction.structure import parse_case
@@ -391,7 +391,7 @@ def test_shared_expert_dp_mc2_conserves_weights_and_hccl_bytes():
 
 
 def _sla_baseline(case, *, context, output_budget):
-    result = solve_hardware_sla_throughput(
+    result = solve_sla_sizing(
         case, phase="decode", context=context, output_budget=output_budget,
         max_sequences_per_dp=1, scenarios=[{"id": "baseline"}], scope="body")
     return result, result["scenarios"][0]

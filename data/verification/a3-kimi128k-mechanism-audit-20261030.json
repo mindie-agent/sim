@@ -34,7 +34,7 @@
       {
         "tp": 8,
         "case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+          "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
           "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce"
         },
         "groups": {
@@ -169,7 +169,7 @@
       {
         "tp": 16,
         "case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+          "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
           "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7"
         },
         "groups": {
@@ -351,15 +351,15 @@
     {
       "schema": "a3-kimi-hccl-source-body-control/1",
       "status": "completed",
-      "runtime": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+      "runtime": "repository://sim-serving-host-io-20261030",
       "runtime_revision": "c4e918181756049a9f39e58cf4c60aca2d8705ad",
       "canonical_input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
         "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
         "bytes": 17742
       },
       "conditional_input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp8-longctx-source-mesh.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp8-longctx-source-mesh.json",
         "sha256": "340ca138bcb01e020d6874b7613513891275ca123d22472d1a89db6037c0c953",
         "bytes": 18982
       },
@@ -504,15 +504,15 @@
     {
       "schema": "a3-kimi-hccl-source-body-control/1",
       "status": "completed",
-      "runtime": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+      "runtime": "repository://sim-serving-host-io-20261030",
       "runtime_revision": "c4e918181756049a9f39e58cf4c60aca2d8705ad",
       "canonical_input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
         "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
         "bytes": 15110
       },
       "conditional_input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp16-longctx-source-mesh.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/a3-kimi-hccl-source-conditional/a3-kimi4-tp16-longctx-source-mesh.json",
         "sha256": "6b2d11012b0ad85cd267a81579076606e76e2605279dbdcc42ad4f85d3014a21",
         "bytes": 16351
       },
@@ -689,7 +689,7 @@
   ],
   "existing_parameter_transfer": {
     "packet": {
-      "path": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/network-joint-service-regimes.json",
+      "path": "repository://profiler/data/observations/sources/arch3510-physical-services/network-joint-service-regimes.json",
       "sha256": "2a45c2ad359b6df67a793673211a06e2e06ab0c05499899d0467e1014512551b",
       "bytes": 26616
     },
@@ -722,12 +722,12 @@
       "bytes": 4218
     },
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/verification/kimi-body-activity-20261030.json",
+      "path": "repository://sim-serving-host-io-20261030/data/verification/kimi-body-activity-20261030.json",
       "sha256": "1c3a99570f8d018f4748e6e7df5ab50e83173e2556e34a4c200d6160fd34724e",
       "bytes": 125178
     },
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/verification/kimi-body-primitive-residual-20261030.json",
+      "path": "repository://sim-serving-host-io-20261030/data/verification/kimi-body-primitive-residual-20261030.json",
       "sha256": "02b107c449256d8d5051b00dd04cf83d35535b7a47b7f76f1bd6ee460057aaef",
       "bytes": 395889
     },

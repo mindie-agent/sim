@@ -125,7 +125,7 @@
       },
       "frozen_scalar_store_binding": {
         "source_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
+          "path": "repository://profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
           "sha256": "3a5e034267eea4239283206de91559972ba067f18e0c1251a5aeb81b59ae4db0",
           "size_bytes": 4491
         },

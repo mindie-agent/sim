@@ -23,7 +23,7 @@ FWD_H launch.
 ## Source branch
 
 Pinned repository/revision:
-`/Users/maoxx241/code/vllm-ascend-v41-private`,
+`repository://vllm-ascend-v41-private`,
 `ae923905948f360f4b7ab06df52d0789a0c9316e`. The selected branch is the arch35,
 varlen (``cu_seqlens``), key-gated KDA call:
 
@@ -188,7 +188,7 @@ The focused tests independently enumerate the source intervals and establish:
 Focused command:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest tests/test_kda_state_pipeline.py -q
 ```
 

@@ -12,11 +12,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
         "sha256": "7550696cc80966e09519ac9ad54bd47769102bfecea8ae2b2d57721a17e09994",
         "size_bytes": 264893
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -63,12 +63,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
+            "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
             "sha256": "9bdb420ab66a42f42257fac8fdbf6364530e5e870af83c54b3fa00a2932f41e9",
             "size_bytes": 104353
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b1.json",
+            "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b1.json",
             "sha256": "99e4dc7f06270f234a588f35f95ce9a25b178d567053f6771accfb8e3cea4de8",
             "size_bytes": 111529
           }
@@ -134,11 +134,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
         "sha256": "7550696cc80966e09519ac9ad54bd47769102bfecea8ae2b2d57721a17e09994",
         "size_bytes": 264893
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -185,12 +185,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
+            "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
             "sha256": "9bdb420ab66a42f42257fac8fdbf6364530e5e870af83c54b3fa00a2932f41e9",
             "size_bytes": 104353
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b4.json",
+            "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b4.json",
             "sha256": "7bc5baad383347c23c1b24ba8e055f176a18ccccb8ccb3bfba79c1fdbb21ba70",
             "size_bytes": 112906
           }

@@ -240,19 +240,19 @@
   },
   {
     "fixture": "activation_producer.py.txt",
-    "source": "/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/bench_activation.py",
+    "source": "repository://mindie-agent/.workstreams/composability/scripts/bench_activation.py",
     "source_sha256": "ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136",
     "selection": "unchanged complete producer; never executed by importer"
   },
   {
     "fixture": "grouped_producer.py.txt",
-    "source": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
+    "source": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
     "source_sha256": "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a",
     "selection": "unchanged complete producer; never executed by importer"
   },
   {
     "fixture": "served_reducer.py.txt",
-    "source": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/analyze_grouped.py",
+    "source": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/analyze_grouped.py",
     "source_sha256": "4422de3370d03fba25f22bbd9464fd8dbc1c62ecc4b53e4602686fb2b3b6bc89",
     "selection": "unchanged complete producer; never executed by importer"
   }

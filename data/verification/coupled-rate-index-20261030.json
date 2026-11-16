@@ -8,7 +8,7 @@
     "bytes": 3765
   },
   "solver": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/coupled.py",
+    "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/coupled.py",
     "sha256": "ded01c62e242d8dceeb5125ae8058d92411e68dbe221351ef5505721da0dc26b",
     "bytes": 5541
   },
@@ -19,12 +19,12 @@
   },
   "source_pipeline": [
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22.py",
       "sha256": "8e41e94710c1afe598559981b6e55aed7d1334acc746b3db43d6a68f1e50a9ae",
       "bytes": 13615
     },
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22_matrix.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/paged_mla_arch22_matrix.py",
       "sha256": "cecd717d123adc5ca97f9aebed3e7a8ded0a055b470bb4577d1fbfbaddea9cc3",
       "bytes": 3493
     }

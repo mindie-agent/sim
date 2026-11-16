@@ -1,25 +1,23 @@
-"""Unit tests for hierarchical expert/KV offload, prefetch masking, and memory.
+"""Hierarchical expert/KV offload through canonical Memory and prediction.
 
 [Role]
-  Establish the conditional expert-DDR activation contract, the auto-sizing
-  invariant that converts an HBM deficit into a feasible resident plan, the
-  monotonic effects of MTP hit rates, the v1-v4 KV prefetch mask ordering, and
-  the backward-compatible resident-memory accounting in ``capacity.py``.
+  Establish the conditional expert-DDR policy contract, the resident-memory
+  accounting in ``Capacity.Memory``, and the actual transfer/predict effects of
+  a declared offload policy.
 
 [Invariants]
-  * A disabled policy leaves the baseline step, exposed time, and HBM bytes
-    untouched, and ``Memory.to_dict()`` gains no extra key at zero ratios.
-  * Auto-sized expert offload is the minimum ratio that clears the deficit for
-    a single-PP-stage rank and makes ``Memory`` feasible.
-  * Raising either MTP hit rate never raises transfer bytes or time.
-  * v1 -> v4 prefetch masks are non-decreasing, so exposed KV offload time is
-    non-increasing; each report equals baseline plus its own exposed time.
-  * Synthetic link objects prove the effective/peak bandwidth helpers keep the
-    effective value and expose the peak value via ``getattr`` fallback.
+  * A disabled policy leaves the baseline ``Memory.to_dict()`` untouched and
+    gains no ``offload`` key at zero ratios.
+  * An explicit expert ratio reduces resident weight bytes by the declared
+    share while staging remains allocated and recorded.
+  * KV tiering keeps the logical cache extent but bounds live HBM residency
+    so ``resize`` can admit a context that would otherwise not fit.
+  * ``predict`` emits the declared expert-DDR transfer event and never charges
+    an unselected transfer.
 
 [Timeouts & Locks]
   Pure in-memory tests on four-layer catalog cases (< 30s); no device, network,
-  subprocess, or file locks.
+  subprocess or file locks.
 
 [Side-Effect Policy]
   No filesystem writes; composed cases are deep-copied before mutation.
@@ -38,11 +36,7 @@ from mindie_sim.prediction.efficiency import (
     _resolve_link_bw_bytes_per_ms,
     _resolve_link_peak_bw_bytes_per_ms,
 )
-from mindie_sim.prediction.offload import (
-    OffloadPolicy,
-    analyze_kv_cache_offload,
-    prepare_expert_offload,
-)
+from mindie_sim.prediction.offload import OffloadPolicy
 from mindie_sim.prediction.structure import parse_case
 
 
@@ -126,159 +120,11 @@ def test_offload_policy_defaults_and_strict_validation() -> None:
         OffloadPolicy(kvc_ddr_ratio=0.8, kvc_ssd_ratio=0.8)
 
 
-def test_expert_offload_inactive_when_hbm_is_sufficient() -> None:
-    case = _case()
-    result = prepare_expert_offload(case)
-    assert result["schema"] == "mindie-sim.expert-offload/1"
-    assert result["activated"] is False
-    assert result["effective_expert_ddr_ratio"] == 0.0
-    assert result["hbm_saved_bytes_per_rank"] == 0.0
-    assert result["ddr_transfer_ms"] == 0.0
-    assert result["exposed_expert_offload_ms"] == 0.0
-    assert result["offloaded_step_ms"] == pytest.approx(result["baseline_step_ms"])
-    assert result["feasible_after_offload"] is True
-    assert result["hbm_deficit_bytes"] == 0.0
-
-    enabled = prepare_expert_offload(case, {"expert_offload_enabled": True})
-    assert enabled["activated"] is False
-    assert enabled["exposed_expert_offload_ms"] == 0.0
 
 
-def test_expert_offload_forced_activation_accounts_hbm_and_time() -> None:
-    case = _case()
-    policy = OffloadPolicy(force_expert_offload=True, expert_ddr_ratio=0.5)
-    result = prepare_expert_offload(case, policy)
-    assert result["activated"] is True
-    assert result["activation_reason"] == "forced"
-    assert result["effective_expert_ddr_ratio"] == pytest.approx(0.5)
-    assert result["routed_expert_weight_bytes_per_rank"] > 0.0
-    assert result["hbm_saved_bytes_per_rank"] == pytest.approx(
-        0.5 * result["routed_expert_weight_bytes_per_rank"]
-    )
-    assert result["ddr_bytes_total"] > 0.0
-    assert result["ddr_transfer_ms"] > 0.0
-    assert result["mask_window_ms"] > 0.0
-    assert result["mask_window_ms"] <= result["baseline_step_ms"]
-    assert result["exposed_expert_offload_ms"] == pytest.approx(
-        max(0.0, result["ddr_transfer_ms"] - result["mask_window_ms"])
-    )
-    assert result["offloaded_step_ms"] == pytest.approx(
-        result["baseline_step_ms"] + result["exposed_expert_offload_ms"]
-    )
-    assert result["feasible_after_offload"] is True
-    assert result["num_moe_layers"] == 4
 
 
-def test_expert_offload_auto_sizing_makes_hbm_feasible() -> None:
-    case = _tight_case()
-    parsed = parse_case(case)
-    assert Memory(parsed).to_dict()["status"] == "oom"
 
-    result = prepare_expert_offload(case, {"expert_offload_enabled": True})
-    assert result["activated"] is True
-    assert result["activation_reason"] == "hbm_exceeded"
-    ratio = result["effective_expert_ddr_ratio"]
-    assert 0.0 < ratio <= 1.0
-    assert result["hbm_deficit_bytes"] > 0.0
-    assert result["hbm_saved_bytes_per_rank"] > 0.0
-    assert result["feasible_after_offload"] is True
-    assert result["net_hbm_saved_bytes_per_rank"] >= result["hbm_deficit_bytes"] - 1e-6
-    assert ratio > result["hbm_deficit_bytes"] / result["routed_expert_weight_bytes_per_rank"]
-
-    offloaded = Memory(parsed, MemoryPolicy(expert_ddr_ratio=ratio))
-    report = offloaded.to_dict()
-    assert report["status"] == "feasible"
-    assert report["weights_bytes_per_stage_rank"] == pytest.approx(
-        [value - ratio * routed for value, routed in zip(
-            offloaded.gross_weights, offloaded.routed_expert_bytes)]
-    )
-
-
-def test_mtp_ffn_hit_rate_monotonically_reduces_expert_transfer() -> None:
-    case = _case()
-    results = [
-        prepare_expert_offload(case, OffloadPolicy(
-            force_expert_offload=True, expert_ddr_ratio=0.5, mtp_ffn_hit_rate=hit))
-        for hit in (0.0, 0.5, 1.0)
-    ]
-    bytes_seen = [row["ddr_bytes_total"] for row in results]
-    time_seen = [row["ddr_transfer_ms"] for row in results]
-    assert bytes_seen[0] > bytes_seen[1] > bytes_seen[2] >= 0.0
-    assert time_seen[0] > time_seen[1] > time_seen[2] >= 0.0
-    assert all(row["mask_window_ms"] == pytest.approx(results[0]["mask_window_ms"])
-               for row in results)
-
-
-def test_kv_offload_prefetch_versions_are_monotone() -> None:
-    case = _case(tp=2, dp=1, ep=2)
-    reports = {}
-    for version in ("v1", "v2", "v3", "v4"):
-        reports[version] = analyze_kv_cache_offload(
-            case,
-            OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.1,
-                          ddr_bw_gbps=10.0, ssd_bw_gbps=0.5,
-                          kvc_prefetch_version=version),
-            context=4096, sequences=4,
-        )
-
-    for version, report in reports.items():
-        assert report["schema"] == "mindie-sim.kv-offload/1"
-        assert report["activated"] is True
-        assert report["kvc_prefetch_version"] == version
-        assert report["kvc_hbm_ratio"] == pytest.approx(0.4)
-        assert report["total_kv_bytes"] == pytest.approx(
-            report["hbm_resident_kv_bytes"] + report["ddr_kv_bytes"] + report["ssd_kv_bytes"]
-        )
-        assert report["t_ssd_ms"] > report["t_ddr_ms"] > 0.0
-        assert report["exposed_kv_offload_ms"] == pytest.approx(
-            max(0.0, report["transfer_ms"] - report["mask_window_ms"])
-        )
-        assert report["offloaded_step_ms"] == pytest.approx(
-            report["baseline_step_ms"] + report["exposed_kv_offload_ms"]
-        )
-        assert report["prefetch_masks_ms"][version] == pytest.approx(report["mask_window_ms"])
-
-    v1, v2, v3, v4 = (reports[key] for key in ("v1", "v2", "v3", "v4"))
-    assert v1["mask_window_ms"] == 0.0
-    assert v2["mask_window_ms"] > v1["mask_window_ms"]
-    assert v3["mask_window_ms"] > v2["mask_window_ms"]
-    assert v4["mask_window_ms"] == pytest.approx(v4["baseline_step_ms"])
-    exposed = [row["exposed_kv_offload_ms"] for row in (v1, v2, v3, v4)]
-    assert exposed[0] > exposed[1] > exposed[2] > exposed[3] >= 0.0
-
-
-def test_kv_offload_mtp_hit_rate_monotonically_reduces_transfer() -> None:
-    case = _case(tp=2, dp=1, ep=2)
-    reports = [
-        analyze_kv_cache_offload(
-            case,
-            OffloadPolicy(kvc_ddr_ratio=0.5, kvc_ssd_ratio=0.1,
-                          ddr_bw_gbps=10.0, ssd_bw_gbps=0.5,
-                          kvc_prefetch_version="v3", mtp_kvc_hit_rate=hit),
-            context=4096, sequences=4,
-        )
-        for hit in (0.0, 0.5, 1.0)
-    ]
-    assert [row["ddr_transfer_bytes"] for row in reports] == sorted(
-        [row["ddr_transfer_bytes"] for row in reports], reverse=True)
-    assert [row["ssd_transfer_bytes"] for row in reports] == sorted(
-        [row["ssd_transfer_bytes"] for row in reports], reverse=True)
-    assert reports[0]["t_ddr_ms"] > reports[1]["t_ddr_ms"] > reports[2]["t_ddr_ms"] >= 0.0
-    assert reports[0]["t_ssd_ms"] > reports[1]["t_ssd_ms"] > reports[2]["t_ssd_ms"] >= 0.0
-    assert reports[0]["exposed_kv_offload_ms"] > reports[1]["exposed_kv_offload_ms"] > reports[2]["exposed_kv_offload_ms"] >= 0.0
-    assert all(row["mask_window_ms"] == pytest.approx(reports[0]["mask_window_ms"])
-               for row in reports)
-
-
-def test_kv_offload_default_policy_is_inactive() -> None:
-    report = analyze_kv_cache_offload(_case())
-    assert report["activated"] is False
-    assert report["ddr_kv_bytes"] == 0.0
-    assert report["ssd_kv_bytes"] == 0.0
-    assert report["t_ddr_ms"] == 0.0
-    assert report["t_ssd_ms"] == 0.0
-    assert report["exposed_kv_offload_ms"] == 0.0
-    assert report["offloaded_step_ms"] == pytest.approx(report["baseline_step_ms"])
 
 
 def test_memory_default_dict_is_unchanged_and_offload_metadata_applies() -> None:
@@ -291,8 +137,7 @@ def test_memory_default_dict_is_unchanged_and_offload_metadata_applies() -> None
     assert "offload" not in baseline
 
     tight = _tight_case()
-    auto = prepare_expert_offload(tight, {"expert_offload_enabled": True})
-    ratio = auto["effective_expert_ddr_ratio"]
+    ratio = 0.75
     tight["runtime"]["metadata"]["offload"] = {
         "expert_ddr_ratio": ratio,
         "kvc_ddr_ratio": 0.5,
@@ -309,15 +154,14 @@ def test_memory_default_dict_is_unchanged_and_offload_metadata_applies() -> None
 def test_memory_kvc_ratio_scales_resize_and_capacity_is_bounded() -> None:
     case = _tight_case(gpu_memory_utilization=0.048, layers=8)
     parsed = parse_case(case)
-    auto = prepare_expert_offload(case, {"expert_offload_enabled": True}, sequences=20)
-    ratio = auto["effective_expert_ddr_ratio"]
+    ratio = 0.5
 
     no_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=ratio))
     with_kvc = Memory(parsed, MemoryPolicy(expert_ddr_ratio=ratio, kvc_ddr_ratio=0.5))
     assert no_kvc.to_dict()["status"] == "feasible"
     assert with_kvc.to_dict()["status"] == "feasible"
 
-    context = 131072
+    context = 327680
     raw = no_kvc.cache_bytes(context)
     scaled = with_kvc.cache_bytes(context)
     assert scaled == raw
@@ -414,12 +258,10 @@ def test_round3_single_layer_staging_infeasibility_source_grouped_gemm_and_hybri
 
     one_layer = _case(layers=1, tp=1, dp=1, ep=1, prompt_tokens=16, output_tokens=2)
     one_layer["runtime"]["gpu_memory_utilization"] = 0.005
-    prep_1l = prepare_expert_offload(
-        one_layer, {"expert_offload_enabled": True, "expert_ddr_ratio": 1.0},
-        tokens=256, sequences=64,
-    )
-    assert prep_1l["feasible_after_offload"] is False
-    assert Memory(parse_case(one_layer), MemoryPolicy(expert_ddr_ratio=1.0), workspace_tokens=16384).to_dict()["status"] == "oom"
+    memory = Memory(parse_case(one_layer), MemoryPolicy(expert_ddr_ratio=1.0),
+                    workspace_tokens=16384).to_dict()
+    assert memory["status"] == "oom"
+    assert memory["offload"]["expert_ddr_ratio"] == pytest.approx(1.0)
 
     src_base = _case(layers=1, quant="bf16", prompt_tokens=8, output_tokens=1)
     src_base["runtime"]["kernels"] = {"grouped_gemm": "ascendc_grouped_nd_bf16"}
@@ -438,3 +280,38 @@ def test_round3_single_layer_staging_infeasibility_source_grouped_gemm_and_hybri
     assert predict(hyb_off)["metrics"]["e2e_ms"]["mean"] > predict(hyb_base)["metrics"]["e2e_ms"]["mean"]
 
 
+def test_memory_expert_offload_reduces_resident_weights_and_records_share():
+    base = Memory(parse_case(_case())).to_dict()
+    offloaded = Memory(parse_case(_case()), MemoryPolicy(
+        expert_ddr_ratio=0.5)).to_dict()
+    assert offloaded["weights_bytes_per_stage_rank"][0] < (
+        offloaded["offload"]["gross_weights_bytes_per_stage_rank"][0])
+    assert offloaded["weights_bytes_per_stage_rank"][0] < (
+        base["weights_bytes_per_stage_rank"][0])
+    saved = offloaded["offload"]["expert_hbm_saved_bytes_per_stage_rank"][0]
+    assert saved == pytest.approx(
+        offloaded["offload"]["routed_expert_bytes_per_stage_rank"][0] * 0.5)
+    headroom = offloaded["physical_rank_headroom_bytes_per_replica_stage"]
+    assert all(value >= 0 for replica in headroom for stage in replica
+               for value in stage)
+
+
+def test_predict_emits_declared_expert_ddr_transfer():
+    from mindie_sim.prediction.api import predict
+
+    base = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
+    offload = _case(layers=1, tp=2, dp=1, ep=2, prompt_tokens=16, output_tokens=2)
+    offload["runtime"]["metadata"]["offload"] = {
+        "expert_offload_enabled": True, "force_expert_offload": True,
+        "expert_ddr_ratio": 0.5, "ddr_bw_gbps": 0.05, "ddr_latency_us": 1000.0,
+    }
+    report = predict(offload)
+    events = [event for event in report["events"]
+              if event["task"].endswith(":expert_ddr_offload")]
+    assert events, "a selected expert offload must transfer on the shared engine"
+    assert any(event["demand"] for event in events)
+    memory = report["memory"]["offload"]
+    assert memory["expert_ddr_ratio"] == pytest.approx(0.5)
+    assert memory["expert_hbm_saved_bytes_per_stage_rank"][0] > 0
+    assert not any(event["task"].endswith(":expert_ddr_offload")
+                   for event in predict(base)["events"])

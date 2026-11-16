@@ -13,7 +13,6 @@ from mindie_sim.model_catalog import (
     body_weight_bytes,
     build_model_spec,
     customize_model_spec,
-    load_architecture_profile,
     load_model,
 )
 from mindie_sim.schema.common import ModelingError
@@ -57,8 +56,6 @@ def test_wave5_catalog_entries_and_aliases_load_complete_with_positive_weights(k
     weights = body_weight_bytes(spec)
     assert params > 0
     assert weights > 0
-    profile = load_architecture_profile(key)
-    assert profile.num_layers == spec.layers
     for alias in aliases:
         assert MODEL_ALIASES[alias] == key
         alias_spec = load_model(alias)

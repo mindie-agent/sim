@@ -366,7 +366,7 @@
               "declared_active_banks": 64,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+                "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
                 "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
                 "size_bytes": 49365
               }
@@ -460,7 +460,7 @@
               "declared_active_banks": 64,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+                "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
                 "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
                 "size_bytes": 49365
               }
@@ -555,7 +555,7 @@
               "declared_active_banks": 48,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
                 "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
                 "size_bytes": 214502
               }
@@ -650,7 +650,7 @@
               "declared_active_banks": 48,
               "cohort_label": 64,
               "source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
                 "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
                 "size_bytes": 214502
               }
@@ -837,7 +837,7 @@
         "host_supply": "nominal assumptions retained; not calibrated to this capture"
       },
       "structure_basis": {
-        "path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
+        "path": "repository://sim-rewrite-20261027/mindie_sim/model_configs/deepseek-v4.1-flash.json",
         "bytes": 3311,
         "sha256": "8be45ce0476004a3f529fd896115a4a2e800a129ad2d3ec05b16050f52e21879"
       },
@@ -886,7 +886,7 @@
       },
       "native_attention": {
         "dsl": {
-          "path": "/Users/maoxx241/code/refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
+          "path": "repository://refs/cannbot-dsl/samples/mixed_quant_sparse_flash_mla/mixed_quant_sparse_flash_mla.py",
           "bytes": 111124,
           "sha256": "40b5b14ced15bb7c3d3687ab7387d508a19065eb5353dfb0675348e0de22fa3f",
           "revision": "4519e5372a8b9306f7d823688c0cb8141ee34fb1",
@@ -904,13 +904,13 @@
           ]
         },
         "operator_documentation": {
-          "path": "/Users/maoxx241/code/refs/ops-transformer/torch_extension/cann_ops_transformer/docs/zh/mixed_quant_sparse_flash_mla.md",
+          "path": "repository://refs/ops-transformer/torch_extension/cann_ops_transformer/docs/zh/mixed_quant_sparse_flash_mla.md",
           "bytes": 53292,
           "sha256": "05a69a227d2c253eec1b609f6a68e194a4bdec1a5ff5bfbee3d98c7bba049deb",
           "revision": "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
         },
         "historical_caller_stack": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/v41-flash-a5/kvzero-patch.md",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/v41-flash-a5/kvzero-patch.md",
           "bytes": 15961,
           "sha256": "dfd5f79dabeef1377180eb5bd0a4842faca71d51ce9f54c3c1587b788138acbe",
           "lines": [
@@ -960,12 +960,12 @@
       "comparison_coverage": "conditional analytic structure; native mixed-quant attention boundary remains unmodeled",
       "source_scenario": {
         "base_case": {
-          "path": "/Users/maoxx241/code/sim-v41-body-source-cases-20261030/examples/cases/high-concurrency-20261030/v41-dp8/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64.json",
+          "path": "repository://sim-v41-body-source-cases-20261030/examples/cases/high-concurrency-20261030/v41-dp8/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64.json",
           "sha256": "c89a390ef6d697978dc915574db56d7d71e03b43f6f17c8aaa6b765ab6831eaf",
           "bytes": 12779
         },
         "rank0_geometry_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-09811dad/body-operator-a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-v41-dp8.actual.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-09811dad/body-operator-a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-v41-dp8.actual.json",
           "sha256": "40aa392d165e490ee550607e157af8fd07d8c5f5317d21a3ce82caaf8822b5b5",
           "bytes": 2146216
         },
@@ -1072,7 +1072,7 @@
       },
       "composed_arch35": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-v41-source-composed-20261030/examples/cases/high-concurrency-20261030/v41-dynamic-rotary-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-dynamic-rotary-source.json",
+          "path": "repository://sim-v41-source-composed-20261030/examples/cases/high-concurrency-20261030/v41-dynamic-rotary-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-dynamic-rotary-source.json",
           "sha256": "5790f89116c8b0dd15eb246de63c3159279dde554bc6e1559cfc904cea17f50a"
         },
         "runtime_revision": "96b4a043",
@@ -1093,12 +1093,12 @@
       },
       "grouped_effective_service": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/v41-composed-arch35-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-composed-arch35-source.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/examples/cases/high-concurrency-20261030/v41-composed-arch35-conditional/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64-composed-arch35-source.json",
           "sha256": "335a943d3ba00368aac41fac044586fe6d12a1bbc9d356796129cc5894381bb4",
           "size_bytes": 21359
         },
         "parameters": {
-          "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
+          "path": "repository://sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
           "sha256": "f9863f1b4f5d7f1eac3422f59a1dfec2d09b1d87687cef79fcc1b6070bbc740a",
           "size_bytes": 18259
         },
@@ -1108,7 +1108,7 @@
       "effective_service_composition": {
         "parent": "examples/cases/high-concurrency-20261030/grouped-effective-service-conditional/v41-c64-grouped-effective-service.json",
         "parent_sha256": "10bbeacf75b80315f989aed73a2c64df3f83e9160675272cb3b6cef13cf0ba35",
-        "mc2_parameters": "/Users/maoxx241/code/sim-mc2-service-regime-20261030/data/observations/a5-mc2-service-regimes-20261030/parameters.json",
+        "mc2_parameters": "repository://sim-mc2-service-regime-20261030/data/observations/a5-mc2-service-regimes-20261030/parameters.json",
         "mc2_sha256": "6b1ab467a10557627b00d39430e47767f559bc004aa56f886968caa1e2834912",
         "mc2_rules_added": 2,
         "policy": "merge by id; preserve all grouped/DSQ and original source declarations; no Body fit"

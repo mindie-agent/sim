@@ -5,12 +5,12 @@
     {
       "case_id": "a5_glm53flash_tp8_c4_p8k",
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_tp8_c4_p8k.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_glm53flash_tp8_c4_p8k.json",
         "sha256": "a75b3f8c9eaf93bff434878027bb11da5145a44274a0bdc9db437172257a4a86",
         "size_bytes": 50408
       },
       "output_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_tp8_c4_p8k.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_tp8_c4_p8k.json",
         "sha256": "0dbcb36f5b139788ba8574c488bac3bb85388c4020202a44ff30e9b3239efd32",
         "size_bytes": 53465
       },
@@ -55,12 +55,12 @@
     {
       "case_id": "a5_glm53flash_heldout_c12_p4k",
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c12_p4k.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c12_p4k.json",
         "sha256": "e67ed9ecf0239bcef319b3eb6c3e5c3b00e8ff7985fc10249ff3a7ed803813d2",
         "size_bytes": 71970
       },
       "output_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c12_p4k.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c12_p4k.json",
         "sha256": "ba31640db1e4ece39300a668e4be79148b13f106a877bb8085ccb200460caace",
         "size_bytes": 76340
       },
@@ -104,12 +104,12 @@
     {
       "case_id": "a5_glm53flash_heldout_c24_p12k",
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c24_p12k.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c24_p12k.json",
         "sha256": "3d57ddd8081f5da3942c7efcb47af8d0b8641c8103155ceabad358ad56068fb0",
         "size_bytes": 71972
       },
       "output_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c24_p12k.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/pooled-score-migration-20261030/a5_glm53flash_heldout_c24_p12k.json",
         "sha256": "50cab31a62b4f7c8f77c63bdf34920bcdb0f1ecafcd6b48b056ee1a5baf81a43",
         "size_bytes": 76343
       },

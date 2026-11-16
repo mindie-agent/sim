@@ -26,7 +26,7 @@ from mindie_sim.prediction.efficiency import (
     fit_case_roofline_regimes,
     fit_efficiency_targets,
     scale_case_hardware,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import target_graphs
@@ -480,7 +480,7 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     # while MTE pipes stay independent of hbm_bw_scale.
     raw_ml["machine"]["device"]["rates"]["hbm"] = 4e11
     case_ml = parse_case(raw_ml)
-    sla_report = solve_hardware_sla_throughput(
+    sla_report = solve_sla_sizing(
         case_ml,
         sla_ms=1.25,
         context=4096,
@@ -524,11 +524,11 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
     raw_spec["runtime"]["metadata"] = {
         "speculative": {"draft_len": 3, "acceptance": [0.7, 0.7, 0.7], "acceptance_mode": "conditional"}
     }
-    spec_res = solve_hardware_sla_throughput(raw_spec, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
+    spec_res = solve_sla_sizing(raw_spec, sla_ms=30.0, context=4096, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
     assert spec_res["tokens_per_seq"] == 4
     assert math.isclose(spec_res["emitted_tokens_per_seq"], 1.0 + 0.7 + 0.49 + 0.343, rel_tol=1e-9)
     # Explicit tokens_per_seq=1 on a speculative case must emit 1.0 token/step
-    spec_1tok = solve_hardware_sla_throughput(raw_spec, sla_ms=30.0, context=4096, tokens_per_seq=1, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
+    spec_1tok = solve_sla_sizing(raw_spec, sla_ms=30.0, context=4096, tokens_per_seq=1, max_sequences_per_dp=2, scenarios=[{"id": "baseline"}])
     assert spec_1tok["tokens_per_seq"] == 1
     assert math.isclose(spec_1tok["emitted_tokens_per_seq"], 1.0, rel_tol=1e-9)
 
@@ -539,7 +539,7 @@ def test_sla_solver_exact_threshold_and_speculative_tokens():
 
     # Input validation checks
     with pytest.raises(ValueError):
-        solve_hardware_sla_throughput(case_ml, sla_ms=0.0)
+        solve_sla_sizing(case_ml, sla_ms=0.0)
     with pytest.raises(ValueError):
         scale_case_hardware(case_ml, hbm_bw_scale=-1.0)
     with pytest.raises(ValueError):

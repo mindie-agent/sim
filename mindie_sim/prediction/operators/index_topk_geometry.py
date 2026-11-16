@@ -14,26 +14,26 @@ from mindie_sim.schema.common import align_up, dtype_bytes
 
 IMPLEMENTATION = "triton_block_index_topk"
 SOURCE_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/"
+    "repository://vllm-v0.25.1/"
     "vllm/models/minimax_m3/common/ops/index_topk.py"
 )
 SOURCE_SHA256 = "1ca8557aed4260d2f4a742b9eda81d6f774e49d4b016ccc555dde40976c5a1a0"
 SOURCE_BYTES = 37281
 SUPPLEMENTARY_SOURCES = {
     "indexer.py": {
-        "path": "/Users/maoxx241/code/vllm-v0.25.1/"
+        "path": "repository://vllm-v0.25.1/"
                 "vllm/models/minimax_m3/common/indexer.py",
         "sha256": "43787aeb1c8a7fd0f990aa62267e6c47f802b511b8850a00f99de0fad2fb468a",
         "role": "dispatch and supported head/block sizes; Triton indexer is bf16 only",
     },
     "test_minimax_m3.py": {
-        "path": "/Users/maoxx241/code/vllm-v0.25.1/"
+        "path": "repository://vllm-v0.25.1/"
                 "tests/kernels/attention/test_minimax_m3.py",
         "sha256": "0e88afe33ad85542da6ca02ecbaa144af12bbad504546097b062f643a8742bd2",
         "role": "independent dense score/sorted-index reference",
     },
     "amd/ops/index_topk.py": {
-        "path": "/Users/maoxx241/code/vllm-v0.25.1/"
+        "path": "repository://vllm-v0.25.1/"
                 "vllm/models/minimax_m3/amd/ops/index_topk.py",
         "sha256": "6cc2ee849a0d015bca64f4f826be0478c43dd3cd36ae601712b2aa9971d52999",
         "role": "different platform source variant; not selected",

@@ -9,7 +9,7 @@ Source: `cann/ops-transformer` revision
 `a3925fd49cd256ad478d2faf983bf2961b8ae2c8`, dispatch file
 `mc2/moe_distribute_dispatch_v2/op_kernel/arch35/moe_distribute_dispatch_v2_a5_full_mesh.h`.
 The repository revision and current code are inspectable at
-`/Users/maoxx241/code/refs/ops-transformer`. A match to the captured binary has
+`repository://refs/ops-transformer`. A match to the captured binary has
 not been established by this source reference.
 
 ## Source arithmetic and owner contract

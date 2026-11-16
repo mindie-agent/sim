@@ -25,7 +25,7 @@ WIDTH = 2 * 2 * 128 + 6 * 128
 def source_case(lengths=(4,) * 4, *, keys=4, heads=12, units=64, queue=False):
     parsed = parse_case({
         "machine": {
-            "name": "declared-gpu", "architecture": "cuda", "num_devices": 1,
+            "name": "declared-gpu", "architecture": "declared", "num_devices": 1,
             "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
                        "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
             "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,
@@ -1411,35 +1411,3 @@ def test_fn_workspace_runtime_grant_waits_and_frees_once():
                if item["name"].endswith("native_conv_gm_workspace")]
     assert grants1 == [("acquire", "fn:native_conv_gm_workspace"),
                        ("release", "fn:native_conv_gm_workspace")]
-
-
-def test_bridge_uses_actual_slot_table_and_capacity():
-    from types import SimpleNamespace
-    from mindie_sim.prediction.gdn_program_bridge import prefill_conv_program_result
-    from mindie_sim.prediction.operators import native_causal_conv_prefill as native_conv
-
-    supply = SimpleNamespace(
-        rates=(("hbm", 1.0), ("mte2", 1.0), ("mte3", 1.0), ("vector", 1.0),
-               ("reg_issue_slots", 1.0), ("reg_data_writes", 1.0),
-               ("reg_ub_accesses", 1.0), ("reg_alu_lanes", 1.0),
-               ("reg_ub_stores", 1.0), ("reg_special_lanes", 1.0)),
-        resource_units=(("hbm", 64), ("mte2", 64), ("mte3", 64),
-                        ("vector", 64), ("reg_issue_slots", 64),
-                        ("reg_data_writes", 64), ("reg_ub_accesses", 64),
-                        ("reg_alu_lanes", 64), ("reg_ub_stores", 64),
-                        ("reg_special_lanes", 64)),
-        buffers=(), pool_units=(), service_modes=())
-    actual = prefill_conv_program_result(
-        supply, (1, 1), 16, 2, 9, 0, (True, True), cache_indices=(7, 0))
-    uniform = prefill_conv_program_result(
-        supply, (1, 1), 16, 2, 9, 0, (True, True))
-    assert actual[4] != uniform[4]
-    op = native_conv.make_op({
-        "lengths": (1, 1), "dim": 16, "width": 2, "dtype": "bf16",
-        "activation": "silu", "bias": False, "metadata_placement": "device",
-        "has_initial_state": (True, True), "cache_indices": (7, 0),
-        "state_history_slots": 1, "null_block_id": 0, "pad_slot_id": -1,
-        "state_rows": 9})
-    direct = native_conv.build(op, SimpleNamespace(
-        resource_units={"vector": 64}, compute_units=64, buffers={}))
-    assert actual[4] == direct.work.resources

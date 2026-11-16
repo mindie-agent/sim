@@ -28,7 +28,7 @@
 
 - **“这个算子或整网到底卡在哪一维硬件资源？”** —— 仅凭粗略的 `FLOPs / 峰值算力` 估算会忽略片上 `UB`/`L1` 容量对齐、尾块（tile tail）开销、多流并发争用以及 Kernel 启动固定耗时（`startup_ms` / `minimum_ms`）。`mindie-sim` 对每个算子、子图和整网显式分解 **`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util` 与 `CV_Overlap`**，直接指出瓶颈属于 `memory_bound`、`cube_bound`、`vector_bound`、`link_bound` 还是 `launch_bound`。
 - **“如果我把访存带宽利用率优化到 `0.80x MBU`，端到端延迟到底能降多少毫秒？”** —— 在动手重写 AscendC / Triton 融合算子之前，可以通过反事实 Roofline 目标拟合（`fit_efficiency_targets`），在保留真实启动开销与物理工作量守恒的前提下，直接算出优化后的理论耗时与端到端提速比。
-- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过硬件缩放与 SLA 吞吐求解器（`solve_hardware_sla_throughput`），一行调用即可联合求解显存容量上限 `B*_VRAM`、SLA 延迟上限 `B*_SLA` 以及不同硬件缩放场景（如 `2x HBM`、`2x Compute`、`1x HW + 0.80x MBU`）下的最大吞吐（`tokens/s`）。
+- **“在 Decode TPOT `<= 30 ms` 的 SLA 约束下，当前硬件最多能跑多大并发？如果升级带宽或算力呢？”** —— 通过硬件缩放与 SLA 吞吐求解器（`solve_sla_sizing`），一行调用即可联合求解显存容量上限 `B*_VRAM`、SLA 延迟上限 `B*_SLA` 以及不同硬件缩放场景（如 `2x HBM`、`2x Compute`、`1x HW + 0.80x MBU`）下的最大吞吐（`tokens/s`）。
 - **“怎么用同一套机制同时分析单算子、局部子图、算子回调与整网在线服务？”** —— `mindie-sim` 采用**单一统一因果引擎（`prediction.engine.Engine`）**，算子评估（`operators`）、共享设备资源子图（`graph`）、完整回调协议（`call`）、多方案对比（`study`）与整网/PD 分离预测（`predict` / `predict_pd`）全部基于同一套物理工作量与因果资源调度契约。
 
 ```mermaid
@@ -74,7 +74,7 @@ flowchart TB
    ```
 4. **Agent 调优工作流规范**：
    - 在编写或修改算子、融合子图或调整并行配置（`TP`/`DP`/`EP`/`PP`/`DCP`/`DSA-CP`/`PCP`）前，先使用 `mindie-sim operators`、`mindie-sim graph`、`mindie-sim predict` 或 `mindie-sim study` 评估各层耗时与瓶颈。
-   - 需要评估四维效率（`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util`、`CV_Overlap`）、`0.80x MBU` 反事实优化空间或 Decode SLA 最大吞吐时，直接调用 `mindie_sim.prediction.efficiency` 中的 `analyze_network_efficiency`、`fit_efficiency_targets` 与 `solve_hardware_sla_throughput`。
+   - 需要评估四维效率（`Cube_MFU`、`Vec_MFU`、`MBU`、`Link_Util`、`CV_Overlap`）、`0.80x MBU` 反事实优化空间或 Decode SLA 最大吞吐时，直接调用 `mindie_sim.prediction.efficiency` 中的 `analyze_network_efficiency`、`fit_efficiency_targets` 与 `solve_sla_sizing`。
 
 </details>
 
@@ -84,7 +84,7 @@ flowchart TB
 
 `v0.9.17` 系统性对齐 `Qwen3.8-Flash-Next`（`Qwen4Exp`）与 `vllm` / `vllm-ascend` 的低秩门控 `HyperConnection`（`hc_lowrank=320`）、16 质数分表 `102.4 GB` `PLE`（含 `ETP/TP` 切分、INT8/MXFP8 表量化、主机 UVA 卸载与膨胀短卷积）、无权重 `4:1` `QSA` 稀疏注意力及 12 槽共享 `Qwen4KVCacheLayout`，并同步修复 `MiniMax-M3` / `Step-5` 稀疏 `GQA` Decode 调度与 `index_k` 容量、`Gemma-4` `K=V` 缓存行宽及内置 `kimi-k3.1` 目录注册。以下为 `v0.9.16` 延续的完整能力基线。
 
-`mindie-sim v0.9.17`（配套 `mindie-profiler v0.5.10+`）在统一因果资源引擎之上，提供完整的**跨平台 Windows `CP936` UTF-8 / Unix `LF` 确定性 I/O 与 `TimeoutError` 严格透传、标准化原生调用结构绑定与覆盖率核算契约（`native_binding` / `native_coverage`）、独立原语规范评估接口（`evaluate_primitive_spec`）、多机集群扩展模型离线目录（新增 `minimax-m3`、`minimax-m3.1-flash`、`gemma-4-26b-a4b`、`gemma-4-31b`、`qwen3.6-35b-a3b`、`qwen3.8-flash-next`、`step-5-preview`、`kimi-k3.1` 及 `GeGLU` / 稀疏 `GQA` / Gemma `K=V` 建模）、第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、算子—子图—模型—服务四级分段连续物理求解引擎（`prediction.piecewise` + `prediction.subgraphs`）、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、AFD 分离流水线 Pareto 求解与分层卸载建模**（详见 [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md)、[`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md)、[`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md)、[`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md)、[`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) 与 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)）。
+`mindie-sim v0.9.17`（配套 `mindie-profiler v0.5.10+`）在统一因果资源引擎之上，提供完整的**跨平台 Windows `CP936` UTF-8 / Unix `LF` 确定性 I/O 与 `TimeoutError` 严格透传、标准化原生调用结构绑定与覆盖率核算契约（`native_binding` / `native_coverage`）、独立原语规范评估接口（`evaluate_primitive_spec`）、多机集群扩展模型离线目录（新增 `minimax-m3`、`minimax-m3.1-flash`、`gemma-4-26b-a4b`、`gemma-4-31b`、`qwen3.6-35b-a3b`、`qwen3.8-flash-next`、`step-5-preview`、`kimi-k3.1` 及 `GeGLU` / 稀疏 `GQA` / Gemma `K=V` 建模）、第一性原理正交多维并行与特性叠加定量守恒与实测回放验证（`TP × DP × EP × PP × PCP × DCP`、`SP`、`MC2`、`AllToAll`、`MTP/DSpark`、`MLA/GQA/KDA/GDN`、`KeyPool/DSA`、`AttnRes`、`W4A8/W8A8/MXFP8`、`enable_shared_expert_dp`、`EPLB` 无人工框架排期拦截）、单一因果执行引擎上的算子—模型—服务连续物理求解、全量 `7,337 / 7,337` 跨代际无历史缓存实时重算算子与 Step 级物理建模、15 款昇腾 SKU 官方 CANN Vector/Cube 硬件管线规格、四维效率分析、反事实多管线 Roofline 目标拟合、硬件缩放 SLA 吞吐求解器、A5 多级拓扑与 MoE 量化通信建模、分层卸载策略与容量反馈**（详见 [`docs/releases/sim-0.9.17.md`](./docs/releases/sim-0.9.17.md)、[`docs/releases/sim-0.9.16.md`](./docs/releases/sim-0.9.16.md)、[`docs/releases/sim-0.9.15.md`](./docs/releases/sim-0.9.15.md)、[`docs/releases/sim-0.9.12.md`](./docs/releases/sim-0.9.12.md)、[`docs/releases/sim-0.9.11.md`](./docs/releases/sim-0.9.11.md) 与 [`docs/releases/sim-0.9.5.md`](./docs/releases/sim-0.9.5.md)）。
 
 ### 1. 四维效率分解与主导瓶颈归因（`analyze_operator_row` / `analyze_network_efficiency`）
 
@@ -106,7 +106,7 @@ flowchart TB
 - 在 `1.0x` 基准效率下，多管线分解与仿真器原始延迟 **0.00% 漂移**；
 - 支持对指定算子类别（如仅针对 `memory_bound` 算子）设定 `target_mbu=0.80`、`target_cube_mfu=0.75`、`target_vec_mfu=0.65`，直接输出各子图与整网的 `baseline_ms`、`target_ms`、`saved_ms` 与 `speedup_ratio`。
 
-### 3. 硬件缩放与 SLA 最大吞吐求解器（`scale_case_hardware` / `solve_hardware_sla_throughput`）
+### 3. 硬件缩放与 SLA 最大吞吐求解器（`scale_case_hardware` / `solve_sla_sizing`）
 
 支持对 `hbm_bw_scale`、`cube_flops_scale`、`vector_ops_scale`、`link_bw_scale`、`hbm_capacity_scale` 进行无损反事实缩放，并在给定延迟 SLA（如 Decode TPOT `<= 30.0 ms`）下联合求解：
 - **显存容量并发上限 `B*_VRAM`**：扣除模型权重、运行时开销与投机解码草稿缓存后，KV Cache 可承载的最大并发序列数；
@@ -203,7 +203,6 @@ flowchart TB
 | `mindie-sim optimize-graph` | Day-0 计算图融合、多流调度与权重预取优化评估 | `mindie-sim optimize-graph examples/quickstart.json --phase decode` |
 | `mindie-sim sweep-ep-knee` / `size-xpyd` | 离散 EP 拐点扫描与总卡数/SLO 约束下 XPyD 分离池配比求解 | `mindie-sim size-xpyd examples/quickstart.json --total-npus 16` |
 | `mindie-sim memory-breakdown` / `kv-state` | 每 Rank 六分量常驻 HBM 账本与混合 KV / 7 族 `RecoverSSM` 状态评估 | `mindie-sim memory-breakdown examples/quickstart.json` |
-| `mindie-sim opflow` / `op-formula` | 通用算子流（OpFlow）管线评估与可解释单算子理论公式诊断 | `mindie-sim op-formula rms_norm --hardware a3` |
 | `mindie-sim build-accel` | 编译可选本地 C11 原生事件引擎加速核 | `mindie-sim build-accel` |
 
 ### 核心 Python API
@@ -221,7 +220,7 @@ from mindie_sim import (
     evaluate_target_efficiency,    # 单算子反事实 Roofline 目标效率耗时评估
     fit_efficiency_targets,        # 整网反事实 Roofline 目标效率拟合 (如 0.80x MBU)
     scale_case_hardware,           # 硬件带宽/算力/显存容量无损反事实缩放
-    solve_hardware_sla_throughput, # SLA 延迟与显存容量联合约束下的最大并发与吞吐求解
+    solve_sla_sizing, # SLA 延迟与显存容量联合约束下的最大并发与吞吐求解
 )
 ```
 
@@ -250,7 +249,7 @@ from pathlib import Path
 from mindie_sim import (
     analyze_network_efficiency,
     fit_efficiency_targets,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 
 case = json.loads(Path("examples/quickstart.json").read_text())
@@ -280,7 +279,7 @@ print(
 )
 
 # 3. 求解 30ms Decode SLA 约束下，基准硬件与 2x HBM / 2x Compute 缩放方案的最大吞吐
-sla_report = solve_hardware_sla_throughput(
+sla_report = solve_sla_sizing(
     case,
     sla_ms=30.0,
     context=4096,

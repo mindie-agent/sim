@@ -66,9 +66,9 @@ RECIPE_ID = IMPLEMENTATION
 # Mechanism-only references.  These pin the source features being represented;
 # they are not a claim of native instruction, compiler or dispatch fidelity.
 SOURCE_REFERENCES = (
-    "/Users/maoxx241/code/refs/ops-transformer/attention/"
+    "repository://refs/ops-transformer/attention/"
     "fused_infer_attention_score/op_kernel/arch35/fia_kernel_noquant_gqa.h",
-    "/Users/maoxx241/code/refs/ops-transformer/attention/"
+    "repository://refs/ops-transformer/attention/"
     "fused_infer_attention_score/op_kernel/arch35/fia_block_cube_noquant_gqa.h",
 )
 

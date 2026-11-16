@@ -34,7 +34,9 @@ ZERO_FLOAT = 0.0
 from mindie_sim.catalog.types import (
     AuxiliarySpec, DraftSpec, EngramSpec, QuantSpec, VisionSpec,
 )
-from mindie_sim.nr_s7_validate import _request_int, _validate_request, _validate_workload
+from mindie_sim.schema.workload_validation import (
+    _request_int, _validate_request, _validate_workload,
+)
 
 @dataclass(frozen=True)
 class MlaSpec:

@@ -22,6 +22,12 @@ ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
 DEFAULT_CONTEXT = 4096
 DEFAULT_OUTPUT_BUDGET = 1024
+DEFAULT_SLA_MS = 30.0
+DEFAULT_SLA_CONTEXT = 126000
+DEFAULT_MAX_SEQUENCES = 256
+DEFAULT_TARGET_MBU = 0.80
+DEFAULT_TARGET_CUBE_MFU = 0.75
+DEFAULT_TARGET_VEC_MFU = 0.65
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -1360,10 +1366,15 @@ def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> M
     return max(feasible, key=lambda record: int(record["b"])) if feasible else None
 
 
-def solve_hardware_sla_throughput(
-    case: CaseSpec | Mapping[str, Any], *, sla_ms: float = 30.0, context: int = 126000, tokens_per_seq: int | None = None,
-    emitted_tokens_per_seq: float | None = None, max_sequences_per_dp: int = 256, phase: str = "decode", scope: str = "body",
-    output_budget: int = 1024, target_mbu: float = 0.80, target_cube_mfu: float = 0.75, target_vec_mfu: float = 0.65,
+def solve_sla_sizing(
+    case: CaseSpec | Mapping[str, Any], *, sla_ms: float = DEFAULT_SLA_MS,
+    context: int = DEFAULT_SLA_CONTEXT, tokens_per_seq: int | None = None,
+    emitted_tokens_per_seq: float | None = None,
+    max_sequences_per_dp: int = DEFAULT_MAX_SEQUENCES, phase: str = "decode",
+    scope: str = "body", output_budget: int = DEFAULT_OUTPUT_BUDGET,
+    target_mbu: float = DEFAULT_TARGET_MBU,
+    target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU,
+    target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU,
     scenarios: Sequence[Mapping[str, Any]] | None = None, b1_analysis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Solve SLA-constrained maximum concurrency B*_SLA and throughput across hardware scenarios."""

@@ -9,17 +9,38 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
 
 from mindie_sim.catalog.draft import optional_draft_spec, draft_quant
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op
+from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import LayerPlan
 from .structure import stage_map
 from .implementation_selection import resolve, LoweringRegion
 
 
 ONE = 1
+ONE_FLOAT = 1.0
 TWO = 2
 ZERO = 0
+
+
+def compute_speculative_accept_step(accept_rate, draft_tokens) -> float:
+    """Expected accepted tokens in one verification step.
+
+    ``(1 - a**(d+1)) / (1 - a)`` with an exact ``a == 1`` branch.
+    """
+    if isinstance(accept_rate, bool) or not isinstance(accept_rate, (int, float)):
+        raise ModelingError("speculative_accept_rate_invalid")
+    rate = float(accept_rate)
+    if not math.isfinite(rate) or rate < ZERO or rate > ONE_FLOAT:
+        raise ModelingError("speculative_accept_rate_invalid")
+    if (not isinstance(draft_tokens, int) or isinstance(draft_tokens, bool)
+            or draft_tokens < ZERO):
+        raise ModelingError("speculative_draft_tokens_invalid")
+    if math.isclose(rate, ONE_FLOAT):
+        return float(draft_tokens + ONE)
+    return (ONE_FLOAT - rate ** (draft_tokens + ONE)) / (ONE_FLOAT - rate)
 
 
 def _tag_draft_ops(ops, rows_by_request, *, step=0):

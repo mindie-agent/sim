@@ -8,15 +8,26 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 jobs:
   test:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-        python: ['3.11', '3.13']
+        include:
+          - os: ubuntu-latest
+            python: '3.11'
+          - os: ubuntu-latest
+            python: '3.13'
+          - os: windows-latest
+            python: '3.13'
+          - os: macos-latest
+            python: '3.13'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
+    timeout-minutes: 15
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
@@ -36,9 +47,16 @@ jobs:
           VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
         run: uv run --no-project python -c "import pathlib, shutil; [shutil.rmtree(p, ignore_errors=True) for p in [*pathlib.Path('.').glob('*.egg-info'), pathlib.Path('build'), pathlib.Path('dist'), pathlib.Path('.venv')]]"
+      - name: Prebuild C accelerator once
+        env:
+          VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+          MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
+        run: uv run --no-project python -B -c "import mindie_sim.prediction.runtime.accel_build as b; b.build_accel()"
       - env:
           VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+          MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
         run: uv run --no-project python -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider --basetemp="${{ runner.temp }}/pt" -m "not live_npu" --durations=20 --junitxml="${{ runner.temp }}/results.xml"
       - uses: actions/upload-artifact@v4
         if: always()
@@ -66,19 +84,6 @@ jobs:
             base="$(git rev-parse HEAD^)"
           fi
           python3 -B scripts/check_no_magic_numbers.py --base "$base" --root .
-      - name: Issue #34 test budget and new-module limits
-        env:
-          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
-          VIRTUAL_ENV: ${{ runner.temp }}/qual-venv
-          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/qual-venv
-        run: |
-          uv venv "${{ runner.temp }}/qual-venv"
-          uv pip install "pytest>=8,<10" "ijson>=3.4,<4"
-          base="$BASE_SHA"
-          if ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
-            base="$(git rev-parse HEAD^)"
-          fi
-          "${{ runner.temp }}/qual-venv/bin/python" -B scripts/check_issue34_test_budget.py --pattern 'tests/test_issue34_*.py' --limit-seconds 3 --artifacts "${{ runner.temp }}/issue34-fast" --base "$base"
 
   wheel:
     runs-on: ubuntu-latest

@@ -123,12 +123,12 @@
       "accepted_state_scenario": {
         "id": "glm53flash-a3-tp16-c4",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a3-tp16-c4--attention-only.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a3-tp16-c4--attention-only.json",
           "sha256": "5cbab872b80dba99322ce4874456f26002a5431033e14145c5714b7e130ec47e",
           "size_bytes": 4934
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a3-b4-q6.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a3-b4-q6.json",
           "sha256": "84d1b902098e09fd34b68c9b11592a2519258d19528b0bd6753cc5ac828583fa",
           "size_bytes": 6869
         },

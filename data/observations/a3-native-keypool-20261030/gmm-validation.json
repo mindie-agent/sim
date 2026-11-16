@@ -1,12 +1,12 @@
 {
   "scope": "full_45_layer_q6_B7_B8; not_serving_or_independent_routing_validation",
   "case": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool-gmm-service.json",
+    "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool-gmm-service.json",
     "sha256": "96884fb14a384fb0ba5ec01a1e4da48396845e78e298755d863dde9cb30a313d",
     "size_bytes": 29469
   },
   "parameters": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/gmm-parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/gmm-parameters.json",
     "sha256": "0ce5d716d23d810c6c79c007a52417bfa2198f166e4196b0cab740f8df9d5660",
     "size_bytes": 14617
   },

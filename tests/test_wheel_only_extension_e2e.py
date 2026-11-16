@@ -434,37 +434,6 @@ def test_installed_entry_point_package_registers_extension(tmp_path):
     assert context.fingerprint.startswith("sha256:")
 
 
-def test_unmodeled_custom_abi_returns_a_gap_in_the_aclnn_receipt(tmp_path):
-    from mindie_sim.public import GAP_SCHEMA, simulate_aclnn_call
-
-    invocation = {
-        "api": {"namespace": "aclnn", "entry": "aclnnMadeUpCustomOp"},
-        "version": {"api": "cann-9.2.0"},
-        "tensors": {
-            "x1": {"shape": [M, K], "dtype": "bf16", "role": "input"},
-            "x2": {"shape": [K, N], "dtype": "bf16", "role": "input"},
-            "output": {"shape": [M, N], "dtype": "bf16", "role": "output"},
-        },
-        "attrs": {},
-    }
-    payload = simulate_aclnn_call(invocation, hardware=SKU, execute=False)
-    assert payload["status"] == "no_match"
-    assert payload["sdk"]["repriced"] is False
-    gap = payload["sdk"]["gap"]
-    assert gap["schema"] == GAP_SCHEMA
-    assert gap["status"] == "gap"
-    assert gap["capability"] == "native"
-    assert gap["kind"] == "unmodeled_capability"
-    assert gap["code"] == "native_abi_spec_not_declared"
-    assert gap["fallback"] == "not_attempted"
-    assert gap["result_available"] is False
-    assert gap["replayable"] is True
-    assert gap["minimal_replay_input"]["hardware"] == SKU
-    assert "duration_ms" in gap["affected_results"]
-    # No fabricated generic INT8/other-ABI execution: this entry has no handle.
-    assert "actual_execution" not in payload
-    assert payload["execution_handle_available"] is False
-
 
 def test_extension_entries_share_one_physical_program_and_one_charge(tmp_path):
     from mindie_sim.public import (
@@ -518,53 +487,6 @@ def test_extension_entries_share_one_physical_program_and_one_charge(tmp_path):
     # decides.  The declared default is the sole extension provider here.
     assert context.select("operator").name == "acme_demo"
 
-
-def test_aclnn_binding_uses_the_declared_semantic_op_and_receipt_charge(tmp_path):
-    from mindie_sim.public import (
-        CapabilityGap, load_extensions, simulate_aclnn_call,
-    )
-
-    context = load_extensions(paths=[_write_extension(tmp_path)])
-    invocation = {
-        "api": {"namespace": "aclnn", "entry": ACLNN_ENTRY},
-        "version": {"api": "cann-9.2.0"},
-        "tensors": {
-            "x1": {"shape": [M, K], "dtype": "bf16", "role": "input"},
-            "x2": {"shape": [K, N], "dtype": "bf16", "role": "input"},
-            "output": {"shape": [M, N], "dtype": "bf16", "role": "output"},
-        },
-        "attrs": {},
-    }
-    assert context.extension("acme.wheel_demo").id == "acme.wheel_demo"
-    payload = simulate_aclnn_call(
-        invocation, hardware=SKU, execute=True, wait=True)
-    assert payload["status"] == "predicted", payload.get("reasons")
-    assert payload["sdk"]["repriced"] is False
-    assert "gap" not in payload["sdk"]
-    program = payload["program"]["physical"]
-    assert program["mode"] == "matrix_abi"
-    assert program["entry"] == ACLNN_ENTRY
-    assert program["geometry"]["m"] == M
-    assert program["geometry"]["n"] == N
-    assert program["geometry"]["k"] == K
-    work = payload["work"]["bytes"]
-    assert work["total"] == pytest.approx(HBM_BYTES)
-    assert work["input"] + work["weight"] == pytest.approx(MTE2_BYTES)
-    assert work["output"] == pytest.approx(MTE3_BYTES)
-
-    actual = payload["actual_execution"]
-    assert actual["status"] == "completed"
-    assert actual["charge"]["service_accounting"] == "submission_receipt"
-    assert actual["charge"]["physical_id"].startswith("aclnn:")
-    assert actual["charge"]["work"] == actual["handle"].work
-    charged = {resource: amount for resource, amount in actual["charge"]["work"]}
-    assert charged["hbm"] == pytest.approx(HBM_BYTES)
-    assert charged["mte2"] == pytest.approx(MTE2_BYTES)
-    assert charged["mte3"] == pytest.approx(MTE3_BYTES)
-    # One receipt, one charge: no global-delta field and no second price.
-    assert "serviced" not in actual["charge"]
-    assert actual["duration_ms"] == pytest.approx(
-        actual["terminal_ms"] - actual["ready_ms"])
 
 
 def test_missing_capability_is_a_structured_gap_not_a_fallback(tmp_path):

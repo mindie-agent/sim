@@ -1,19 +1,19 @@
 {
   "schema": "kimi-hccl-source-conditional-response/1",
   "training_identity": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/train-native.json",
+    "path": "repository://sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/train-native.json",
     "sha256": "48ae50a53055e7c7de8ef282317a75047ce3f3c075714bc3491351a132ae3cf8",
     "size_bytes": 585748
   },
   "assignment_identity": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/inputs.json",
+    "path": "repository://sim-service-response-domain-next/data/observations/a3-kimi-hccl-joint-20261030/inputs.json",
     "sha256": "57c6e44e39f337bc8ff54108361dc3dd3bb2941bcad0931e2ffc6320c63b697f",
     "size_bytes": 55926
   },
   "physical_domains": {
     "8": {
       "canonical_input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
         "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
         "size_bytes": 17742
       },
@@ -960,7 +960,7 @@
     },
     "16": {
       "canonical_input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
         "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
         "size_bytes": 15110
       },

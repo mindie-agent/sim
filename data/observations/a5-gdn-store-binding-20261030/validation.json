@@ -12,12 +12,12 @@
       "model": "qwen36",
       "tp": 2,
       "source_case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
         "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67",
         "size_bytes": 5829
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen36-tp2-long-context-source.json",
         "sha256": "e7c91925a35870c4e9dc5a3a6f2c0b1a877f0a7f4b1f20cfd705b1ed9baf7d26",
         "size_bytes": 6405
       },
@@ -5316,12 +5316,12 @@
       "model": "qwen36",
       "tp": 4,
       "source_case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp4-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp4-long-context-source.json",
         "sha256": "a6ad5f66acc3b453240502ff80bb83b373b01a72bf559fd3e8f0a7000fd9d7c0",
         "size_bytes": 5820
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen36-tp4-long-context-source.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen36-tp4-long-context-source.json",
         "sha256": "ed6c0359087da6fb7a6e6bdf4fc636e13a9bafaae62c51848e6e18fcc4501b06",
         "size_bytes": 6396
       },
@@ -10624,12 +10624,12 @@
       "model": "qwen38",
       "tp": 2,
       "source_case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen38-tp2-long-context-source.json",
         "sha256": "0bf393628880d3c8ca5a6091e9c45b6324d5f01f82585b9903c226686dffa6ec",
         "size_bytes": 4500
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen38-tp2-long-context-source.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen38-tp2-long-context-source.json",
         "sha256": "fc2571ac582e006bd7f7d6b3892ebfa4a15b152e5c667101bbf632c07ba5f81d",
         "size_bytes": 5076
       },
@@ -15845,12 +15845,12 @@
       "model": "qwen38",
       "tp": 4,
       "source_case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
         "sha256": "3a5e034267eea4239283206de91559972ba067f18e0c1251a5aeb81b59ae4db0",
         "size_bytes": 4491
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen38-tp4-long-context-source.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-store/a5-qwen38-tp4-long-context-source.json",
         "sha256": "fe0a9b2521b691486b63e0ad00e2a4a99a4afde0cb8c6f2d5cf02ba0d695738f",
         "size_bytes": 5067
       },

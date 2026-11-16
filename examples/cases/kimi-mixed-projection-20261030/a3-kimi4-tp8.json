@@ -370,7 +370,7 @@
         "first_k_dense_replace": 1
       },
       "catalog_assumption_source": {
-        "path": "/Users/maoxx241/code/sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
+        "path": "repository://sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
         "bytes": 6991,
         "sha256": "ceb15bb6babc95c3afc948f0887a732b69e8ac126dae36ef7b6aeb1effb2b46f"
       },

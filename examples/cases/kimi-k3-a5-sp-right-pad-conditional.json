@@ -270,7 +270,7 @@
       "mte1_basis": "Inherit Ascend950DT_9582 arch3510 profile: one shared PIPE_MTE1 at 256 B/cycle/AIC * 32 AIC * 1.65 GHz = 13.5168 TB/s. The former 4 TB/s override copied the off-chip transfer declaration without an independent L1-to-L0 basis. Same-campaign npu-smi confirms Ascend950DT/96 GiB; the 9582 suffix and nominal clock remain declared profile assumptions.",
       "configuration_status": "current_checkpoint_conditional; current quant metadata is independent of profiler durations, but was not hashed during the historical capture",
       "sp_padding_control": {
-        "source_case": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/fusion-cohort-a5_kimi_k3_decode_checkpoint-reference.case.json",
+        "source_case": "repository://profiler/examples/structure/acceptance-20261029/fusion-cohort-a5_kimi_k3_decode_checkpoint-reference.case.json",
         "sha256": "2c51fb1e78b8e7999b3f5567e638428ab14778bfeac8292cd67032194436e631",
         "changes": [
           "explicit AllToAll right_to_tp physical rows",

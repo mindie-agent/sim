@@ -13,15 +13,40 @@ import json
 from pathlib import Path
 import sys
 
-from ._diff_support import ProfilerUsageError, load_cli_json
 from . import predict
 from .prediction.structure import parse_case
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 
 
+MAX_CLI_JSON_BYTES = 50 * 1024**2
+
+
+class CliUsageError(RuntimeError):
+    """Local usage rejection; never a profiler runtime dependency."""
+
+
+def load_cli_json(path):
+    """Bounded CLI JSON ingress: size gate, UTF-8 and finite constants."""
+    path = Path(path)
+    if path.stat().st_size > MAX_CLI_JSON_BYTES:
+        raise CliUsageError("JSON input exceeds 50 MiB budget")
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        raise CliUsageError("invalid UTF-8 JSON input") from exc
+
+    def bad_const(token):
+        raise CliUsageError(f"non-finite JSON constant: {token}")
+
+    try:
+        return json.loads(raw, parse_constant=bad_const)
+    except (ValueError, RecursionError) as exc:
+        raise CliUsageError(f"invalid JSON input: {exc}") from exc
+
+
 def read_json(path, *, bounded=False):
     path = Path(path)
-    if path.stat().st_size > 50 * 1024**2:
+    if path.stat().st_size > MAX_CLI_JSON_BYTES:
         raise ValueError("metadata_input_exceeds_50_MiB:use_streaming_observation_import")
     if bounded:
         return load_cli_json(path)
@@ -96,13 +121,6 @@ def parser():
     operators.add_argument("--no-body-defaults", dest="apply_body_defaults", action="store_false")
     _add_supply_arguments(operators)
     operators.add_argument("--output", "-o")
-    native_invoke = sub.add_parser(
-        "native-invoke",
-        help="execute one already-prepared standalone QBMM occurrence once")
-    native_invoke.add_argument("--occurrence", type=Path, required=True)
-    native_invoke.add_argument("--tensors", type=Path, required=True)
-    native_invoke.add_argument("--device", required=True)
-    native_invoke.add_argument("--output", type=Path, required=True)
     graph = sub.add_parser("graph", help="compose a pure target graph on shared device resources")
     graph.add_argument("case")
     graph.add_argument("--phase", choices=("prefill", "decode"), required=True)
@@ -181,7 +199,6 @@ def parser():
     alignment.add_argument("--output", "-o")
     compose = sub.add_parser("compose", help="deterministically synthesize a complete simulation Case")
     compose.add_argument("--model")
-    compose.add_argument("--from-profile", help="exported Case, Wave 5 capture, or C7 profile")
     compose.add_argument("--hardware")
     for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp", "--concurrency"):
         compose.add_argument(flag, type=int)
@@ -203,25 +220,8 @@ def parser():
     compose.add_argument("--va-recommended", action="store_true",
                          help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
     compose.add_argument("--output", "-o")
-    from .issue34_cli import add_issue34_arguments
-    add_issue34_arguments(compose, command="compose")
-    advise = sub.add_parser("advise", help="attribute a Case and rank guarded counterfactual interventions")
-    advise.add_argument("case", nargs="?")
-    advise.add_argument("--from-profile", help="exported Case, Wave 5 capture, or C7 profile")
-    advise.add_argument("--phase", choices=("decode", "prefill"), default="decode")
-    advise.add_argument("--scope", choices=("body", "model"), default="body")
-    advise.add_argument("--context", type=int)
-    advise.add_argument("--sequences", type=int)
-    advise.add_argument("--tokens", type=int)
-    advise.add_argument("--sla-ms", type=float, dest="sla_tpot_ms")
-    advise.add_argument("--ttft-sla-ms", type=float, dest="sla_ttft_ms")
-    advise.add_argument("--hardware")
-    advise.add_argument("--model")
-    advise.add_argument("--tp", type=int)
-    advise.add_argument("--dp", type=int)
-    advise.add_argument("--ep", type=int)
-    advise.add_argument("--max-interventions", type=int, default=10)
-    advise.add_argument("--output", "-o")
+    from .cli_options import add_runtime_arguments
+    add_runtime_arguments(compose, command="compose")
     sweep = sub.add_parser("sweep", help="multi-topology parallel sharding and P/D disaggregation Pareto solver")
     sweep.add_argument("case")
     sweep.add_argument("--mode", choices=("topology", "pd"), default="topology")
@@ -239,25 +239,9 @@ def parser():
     sweep.add_argument("--allow-pp", action="store_true")
     sweep.add_argument("--allow-pcp", action="store_true")
     sweep.add_argument("--output", "-o")
-    add_issue34_arguments(sweep, command="sweep")
+    add_runtime_arguments(sweep, command="sweep")
     sweep.add_argument("--hardware-derivations", default=None,
                        help="JSON file with named derivation records")
-    skew = sub.add_parser("skew", help="multi-DP barrier skew, MoE routing imbalance, and chunked-prefill interference")
-    skew.add_argument("case")
-    skew.add_argument("--mode", choices=("dp-barrier", "moe-imbalance", "chunked-prefill"), default="dp-barrier")
-    skew.add_argument("--dp-contexts", type=int, nargs="+")
-    skew.add_argument("--dp-sequences", type=int, nargs="+")
-    skew.add_argument("--context", type=int, default=32768)
-    skew.add_argument("--sequences", type=int, default=16)
-    skew.add_argument("--tokens-per-seq", type=int, default=1)
-    skew.add_argument("--imbalance-factor", type=float, default=1.0)
-    skew.add_argument("--redundant-experts-per-rank", type=int, default=0)
-    skew.add_argument("--chunk-tokens", type=int, nargs="+", default=[0, 512, 1024, 2048, 4096])
-    skew.add_argument("--tpot-sla-ms", type=float)
-    skew.add_argument("--phase", choices=("decode", "prefill"), default="decode")
-    skew.add_argument("--scope", choices=("body", "model"), default="body")
-    skew.add_argument("--output", "-o")
-    add_issue34_arguments(skew, command="skew")
     eff = sub.add_parser("efficiency", help="operator-level MBU/MFU decomposition and roofline target evaluation")
     eff.add_argument("case")
     eff.add_argument("--phase", choices=("decode", "prefill"), default="decode")
@@ -290,19 +274,11 @@ def parser():
         sla.add_argument(flag, type=float)
     sla.add_argument("--scenarios")
     sla.add_argument("--output", "-o")
-    add_issue34_arguments(sla, command="sla")
+    add_runtime_arguments(sla, command="sla")
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")
     accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
     accel.add_argument("--output", "-o")
-    diff = sub.add_parser("diff-trace", help="4-way conserving why-off attribution")
-    diff.add_argument("--predicted", required=True, help="sim step prediction JSON")
-    diff.add_argument("--captured", required=True, help="profiler steady-state JSON")
-    diff.add_argument("--padding", help="optional bucket/logical operator map")
-    diff.add_argument("--cann-version", default=None, help="explicit CANN release for padding semantics")
-    diff.add_argument("--capture-path", default="capture.json", help="capture path embedded in repro-op commands")
-    diff.add_argument("--top", type=int, default=5)
-    diff.add_argument("--output", "-o")
     return root
 
 
@@ -362,21 +338,6 @@ def run(args):
                 "draft_prepare": args.draft_prepare,
                 "deployment_scope": "first_independent_dp_cohort",
             }
-    if args.command == "native-invoke":
-        from .prediction.piecewise.native_invocation import invoke_qbmm
-        import torch
-        occurrence = read_json(args.occurrence)
-        loaded = torch.load(args.tensors, map_location="cpu", weights_only=True)
-        if not isinstance(loaded, dict):
-            raise ValueError("native_invoke_tensors_mapping_required")
-        tensors = {key: (value.to(args.device) if torch.is_tensor(value) else value)
-                   for key, value in loaded.items()}
-        result = invoke_qbmm(occurrence, tensors, device=args.device)
-        torch.save(result, args.output)
-        return {"entry": "torch_npu.npu_quant_matmul",
-                "output": str(args.output), "shape": list(result.shape),
-                "dtype": str(result.dtype), "device": str(result.device),
-                "runtime_executed": True}
     if args.command == "operators":
         from .prediction.operator_analysis import operator_costs, target_graphs
         case = parse_case(_case_with_supply(args))
@@ -451,54 +412,18 @@ def run(args):
         return fit_service_curve(read_json(args.observations))
     if args.command == "compose":
         from .compose import compose_case
-        from .issue34_cli import compose_cli_kwargs
-        if args.from_profile:
-            from .advise import load_case_from_profile
-            profile_overrides = {
-                "model": args.model, "hardware": args.hardware, "tp": args.tp, "dp": args.dp,
-                "ep": args.ep, "pp": args.pp, "pcp": args.pcp, "dcp": args.dcp,
-                "num_devices": args.num_devices, "ranks_per_node": args.ranks_per_node,
-                "sp": args.sp if args.sp else None, "quant": args.quant, "layers": args.layers,
-                "experts": args.experts, "top_k": args.top_k,
-                "prompt_tokens": args.prompt_tokens, "output_tokens": args.output_tokens,
-                "concurrency": args.concurrency, "prefix_tokens": args.prefix_tokens,
-                "max_num_seqs": args.max_num_seqs,
-                "max_num_batched_tokens": args.max_num_batched_tokens,
-                "max_model_len": args.max_model_len,
-                "async_scheduling": args.async_scheduling, "graph_mode": args.graph_mode,
-                "mtp_proposal_tokens": args.mtp_tokens,
-                "mtp_acceptance_length": args.mtp_accept,
-                "ttft_slo_ms": args.ttft_slo_ms, "tpot_slo_ms": args.tpot_slo_ms,
-            }
-            result = load_case_from_profile(
-                args.from_profile,
-                **{key: value for key, value in profile_overrides.items() if value is not None},
-            )
-            if getattr(args, "recover_ssm", None) is not None:
-                result.setdefault("runtime", {})["recover_ssm"] = bool(args.recover_ssm)
-                parse_case(result)
-            return result
+        from .cli_options import compose_case_kwargs
         if not args.model:
-            raise ValueError("compose_requires_model_or_from_profile")
+            raise ValueError("compose_requires_model")
         return compose_case(
             model=args.model, hardware=args.hardware or "a3",
-            **compose_cli_kwargs(args),
-        )
-    if args.command == "advise":
-        from .advise import advise_case
-        overrides = {key: getattr(args, key) for key in ("hardware", "model", "tp", "dp", "ep")
-                     if getattr(args, key, None) is not None}
-        return advise_case(
-            args.case, from_profile=args.from_profile, phase=args.phase, scope=args.scope,
-            context=args.context, sequences=args.sequences, tokens=args.tokens,
-            sla_tpot_ms=args.sla_tpot_ms, sla_ttft_ms=args.sla_ttft_ms,
-            max_interventions=args.max_interventions, **overrides,
+            **compose_case_kwargs(args),
         )
     if args.command == "sweep":
-        from .sweep import sweep_pd_disaggregation_ratios, sweep_topology_grid
-        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
+        from .sweep import sweep_pd_disaggregation_ratios, sweep_topologies
+        from .cli_options import apply_case_mapping_overrides, case_overrides
         case_data = apply_case_mapping_overrides(
-            read_json(args.case), issue34_overrides(args))
+            read_json(args.case), case_overrides(args))
         if args.mode == "pd":
             decode_data = read_json(args.decode_case) if args.decode_case else case_data
             return sweep_pd_disaggregation_ratios(
@@ -506,46 +431,15 @@ def run(args):
                 prompt_tokens=args.prompt_tokens, output_tokens=args.output_tokens,
                 ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
             )
-        from .issue34_cli import load_hardware_derivations
+        from .cli_options import load_hardware_derivations
         derivations = (load_hardware_derivations(args.hardware_derivations)
                        if args.hardware_derivations else None)
-        return sweep_topology_grid(
+        return sweep_topologies(
             case_data, num_devices=args.num_devices, sla_ms=args.sla_ms,
             context=args.context, output_budget=args.output_budget,
             phase=args.phase, scope=args.scope,
             allow_pp=args.allow_pp, allow_pcp=args.allow_pcp,
             hardware_derivations=derivations,
-        )
-    if args.command == "skew":
-        from .prediction.skew_analysis import (
-            analyze_chunked_prefill_decode_interference,
-            analyze_moe_routing_imbalance,
-            analyze_multi_dp_barrier_skew,
-        )
-        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
-        _overrides = issue34_overrides(args)
-        if args.redundant_experts_per_rank:
-            _overrides["redundant_experts_per_rank"] = args.redundant_experts_per_rank
-        case_data = apply_case_mapping_overrides(
-            read_json(args.case), _overrides)
-        if args.mode == "moe-imbalance":
-            return analyze_moe_routing_imbalance(
-                case_data, context=args.context, sequences=args.sequences,
-                tokens=args.tokens_per_seq, expert_imbalance_factor=args.imbalance_factor,
-                eplb_redundant_experts=args.redundant_experts_per_rank,
-                phase=args.phase, scope=args.scope,
-            )
-        if args.mode == "chunked-prefill":
-            return analyze_chunked_prefill_decode_interference(
-                case_data, decode_sequences=args.sequences, decode_context=args.context,
-                prefill_chunk_tokens=tuple(args.chunk_tokens),
-                sla_tpot_ms=50.0 if args.tpot_sla_ms is None else args.tpot_sla_ms,
-                scope=args.scope,
-            )
-        return analyze_multi_dp_barrier_skew(
-            case_data, dp_contexts=tuple(args.dp_contexts) if args.dp_contexts else (args.context,),
-            dp_sequences=tuple(args.dp_sequences) if args.dp_sequences else args.sequences,
-            tokens=args.tokens_per_seq, phase=args.phase, scope=args.scope,
         )
     if args.command == "efficiency":
         from .prediction.efficiency import analyze_network_efficiency, fit_efficiency_targets
@@ -570,10 +464,10 @@ def run(args):
             pmu_by_op=read_json(args.pmu) if args.pmu else None, run_graph=not args.skip_graph,
         )
     if args.command == "sla":
-        from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_hardware_sla_throughput
-        from .issue34_cli import apply_case_mapping_overrides, issue34_overrides
+        from .prediction.efficiency import DEFAULT_SLA_SCENARIOS, solve_sla_sizing
+        from .cli_options import apply_case_mapping_overrides, case_overrides
         case_data = apply_case_mapping_overrides(
-            read_json(args.case), issue34_overrides(args))
+            read_json(args.case), case_overrides(args))
         has_custom_scale = any(
             v is not None
             for v in (args.hbm_bw_scale, args.cube_flops_scale, args.vector_ops_scale, args.link_bw_scale, args.hbm_capacity_scale)
@@ -598,7 +492,7 @@ def run(args):
             ]
         else:
             scenarios = DEFAULT_SLA_SCENARIOS
-        return solve_hardware_sla_throughput(
+        return solve_sla_sizing(
             case_data, sla_ms=args.sla_ms, context=args.context,
             tokens_per_seq=args.tokens_per_seq, emitted_tokens_per_seq=args.emitted_tokens_per_seq,
             max_sequences_per_dp=args.max_sequences_per_dp, phase=args.phase,
@@ -610,32 +504,11 @@ def run(args):
         from .prediction.runtime.accel_build import build_accel
 
         return build_accel(force=bool(args.force), check_only=bool(args.check))
-    if args.command == "diff-trace":
-        from .diff_trace import attribute_diff
-
-        predicted = read_json(args.predicted, bounded=True)
-        captured = read_json(args.captured, bounded=True)
-        padding = read_json(args.padding, bounded=True) if args.padding else None
-        return attribute_diff(
-            predicted,
-            captured,
-            padding=padding,
-            top_n=args.top,
-            cann_version=args.cann_version,
-            capture_path=args.capture_path,
-        )
     raise ValueError("unknown_command")
 
 
-_ARGV_START = 1; _CMD_IDX = 0
-
 
 def main(argv=None):
-    raw_argv = list(sys.argv[_ARGV_START:] if argv is None else argv)
-    if raw_argv:
-        from .extended_cli import EXTENDED_COMMANDS, extended_main
-        if raw_argv[_CMD_IDX] in EXTENDED_COMMANDS:
-            return extended_main(raw_argv, prog="mindie-sim")
     args = parser().parse_args(argv)
     try:
         result = run(args)
@@ -644,11 +517,9 @@ def main(argv=None):
             return 2
         if args.command == "build-accel" and not result.get("ok"):
             return 2
-        if args.command == "diff-trace" and result.get("status") != "reconciled":
-            return 2
     except TimeoutError:
         raise
-    except (ProfilerUsageError, TypeError, ValueError, OverflowError, OSError) as exc:
+    except (CliUsageError, TypeError, ValueError, OverflowError, OSError) as exc:
         print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
         return 2
     return 0

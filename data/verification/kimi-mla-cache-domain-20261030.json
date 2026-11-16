@@ -36,7 +36,7 @@
   },
   "source_evidence": [
     {
-      "path": "/Users/maoxx241/code/vllm-ascend/vllm_ascend/attention/mla_v1.py",
+      "path": "repository://vllm-ascend/vllm_ascend/attention/mla_v1.py",
       "sha256": "2e732561d9d6e47fe4a3f18dc376b675d9b1be79d0ac722159eb04ceff1c38d8",
       "size_bytes": 95738,
       "lines": [
@@ -46,7 +46,7 @@
       "assertion": "caller passes same k_nope as both K and V"
     },
     {
-      "path": "/Users/maoxx241/code/refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch22/fia_block_cube_nonquant_mla.h",
+      "path": "repository://refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch22/fia_block_cube_nonquant_mla.h",
       "sha256": "5b6e2459788367a0e122dc7edb5d31797abf3a8c1972e1b9d46cf6bed0868a2c",
       "size_bytes": 50603,
       "lines": [
@@ -58,7 +58,7 @@
       "assertion": "QK latent halves and PV N128 slices cover same512dimensions, samepage table and token rows"
     },
     {
-      "path": "/Users/maoxx241/code/refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch22/fia_kernel_nonquant_mla.h",
+      "path": "repository://refs/ops-transformer/attention/fused_infer_attention_score/op_kernel/arch22/fia_kernel_nonquant_mla.h",
       "sha256": "d76c338e39c6845d0c0ada93291cb0839016fb8142d5293ce6d1fd237d6d2a18",
       "size_bytes": 50567,
       "lines": [
@@ -99,7 +99,7 @@
       "size_bytes": 5334
     },
     "census": {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/kimi-mixed-projection-source-control-20261030.json",
+      "path": "repository://sim-service-response-domain-next/data/verification/kimi-mixed-projection-source-control-20261030.json",
       "sha256": "7fd722726388d89b74b110f43dc982d3fe35a4c59d940fa5e59ba48b9d80e5be",
       "size_bytes": 186704
     },
@@ -9606,7 +9606,7 @@
       "local_expert_bank": 112,
       "logical_heads": 12,
       "physical_heads": 16,
-      "source_case": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
+      "source_case": "repository://sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
       "boundary": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
       "operator_count": 61,
       "attention_calls": 1,
@@ -9699,7 +9699,7 @@
       "local_expert_bank": 56,
       "logical_heads": 6,
       "physical_heads": 8,
-      "source_case": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
+      "source_case": "repository://sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
       "boundary": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
       "operator_count": 61,
       "attention_calls": 1,
@@ -9792,7 +9792,7 @@
       "local_expert_bank": 112,
       "logical_heads": 12,
       "physical_heads": 16,
-      "source_case": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
+      "source_case": "repository://sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
       "boundary": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
       "operator_count": 59,
       "attention_calls": 1,
@@ -9885,7 +9885,7 @@
       "local_expert_bank": 56,
       "logical_heads": 6,
       "physical_heads": 8,
-      "source_case": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
+      "source_case": "repository://sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c1_source.json",
       "boundary": "all ordinary target layer 3 operators; external inputs ready at 7ms; no host submission",
       "operator_count": 59,
       "attention_calls": 1,

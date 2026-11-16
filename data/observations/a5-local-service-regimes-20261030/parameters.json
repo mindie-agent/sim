@@ -52,19 +52,19 @@
         },
         "sources": [
           {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
             "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
             "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
             "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
             "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
           }
         ],
@@ -122,19 +122,19 @@
         },
         "sources": [
           {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
             "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
             "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
             "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
             "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
           }
         ],
@@ -192,19 +192,19 @@
         },
         "sources": [
           {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
             "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
             "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
             "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
             "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
           }
         ],
@@ -256,19 +256,19 @@
         },
         "sources": [
           {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
             "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
             "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
             "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
             "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
           }
         ],
@@ -332,19 +332,19 @@
         },
         "sources": [
           {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
             "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
             "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
             "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
           },
           {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
             "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
           }
         ],

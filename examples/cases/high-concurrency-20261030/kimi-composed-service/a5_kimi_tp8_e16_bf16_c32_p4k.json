@@ -503,7 +503,7 @@
         "first_k_dense_replace": 1
       },
       "catalog_assumption_source": {
-        "path": "/Users/maoxx241/code/sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
+        "path": "repository://sim-glm-projection-contracts-20261030/mindie_sim/model_configs/kimi-k3.json",
         "bytes": 6991,
         "sha256": "ceb15bb6babc95c3afc948f0887a732b69e8ac126dae36ef7b6aeb1effb2b46f"
       },
@@ -634,7 +634,7 @@
           ]
         },
         "source_abi_receipt": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-matrix-fix/a5_kimi_tp8_e16_bf16_c32_p4k-matrix-partitions.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-matrix-fix/a5_kimi_tp8_e16_bf16_c32_p4k-matrix-partitions.json",
           "sha256": "1d1fef394340b0ee32ce0b8aa2ac537a50bf5188372a39621eb452d500b22e34",
           "size_bytes": 237978
         }
@@ -1397,7 +1397,7 @@
           "provenance": {
             "boundary": "observable_collective_call_service",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
               "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
               "size_bytes": 2367458
             },
@@ -1439,7 +1439,7 @@
           "provenance": {
             "boundary": "observable_collective_call_service",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
               "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
               "size_bytes": 2367458
             },
@@ -1595,7 +1595,7 @@
           "provenance": {
             "boundary": "native MatMulV3 device-call service, inclusive",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
               "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
               "size_bytes": 48779
             },
@@ -1667,7 +1667,7 @@
           "provenance": {
             "boundary": "native MatMulV3 device-call service, inclusive",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
               "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
               "size_bytes": 48779
             },
@@ -1739,7 +1739,7 @@
           "provenance": {
             "boundary": "native MatMulV3 device-call service, inclusive",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
               "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
               "size_bytes": 48779
             },
@@ -1809,7 +1809,7 @@
           "provenance": {
             "boundary": "native GroupedMatmul BF16 device call, inclusive",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
               "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
               "size_bytes": 2367458
             },
@@ -1885,7 +1885,7 @@
           "provenance": {
             "boundary": "native GroupedMatmul BF16 device call, inclusive",
             "fit_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
               "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
               "size_bytes": 2367458
             },
@@ -1932,7 +1932,7 @@
       },
       "deployment_evidence": {
         "launch_source": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/scripts/ws9/serve_kimi_k3_tp8.sh",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/scripts/ws9/serve_kimi_k3_tp8.sh",
           "sha256": "f3589dfd1d458c8f62557a233b573fe2c380320cd6312aa8e3f500ccc08ca262",
           "size_bytes": 3892
         },
@@ -1983,14 +1983,14 @@
         "context_basis": "not_observed_from_cache_capacity"
       },
       "geometry_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-tp8/geometry-probe.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-tp8/geometry-probe.json",
         "bytes": 116563,
         "sha256": "00a6dec71a4bdb521e6a7df428ad3c6c636a3420451e595ad616a2f981a9ccb5"
       },
       "sp_contract": "source-verified right padding; current captured helper binary not identified",
       "moe_boundary": "native DistributeDispatch/Combine retained in capture; analytic alltoall decomposition is not exact MC2 protocol",
       "representation_source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-tp8/geometry-probe.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-tp8/geometry-probe.json",
         "bytes": 116563,
         "sha256": "00a6dec71a4bdb521e6a7df428ad3c6c636a3420451e595ad616a2f981a9ccb5"
       },

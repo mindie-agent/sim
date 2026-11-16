@@ -12,11 +12,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
         "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
         "size_bytes": 10329
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -63,12 +63,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
             "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
             "size_bytes": 9138
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
             "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
             "size_bytes": 10329
           }
@@ -134,11 +134,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
         "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
         "size_bytes": 11912
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -185,12 +185,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
             "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
             "size_bytes": 10720
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
             "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
             "size_bytes": 11912
           }
@@ -256,11 +256,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
         "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
         "size_bytes": 9000
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -307,12 +307,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
             "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
             "size_bytes": 7809
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
             "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
             "size_bytes": 9000
           }
@@ -378,11 +378,11 @@
         "kind": "csv"
       },
       "model_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
         "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
         "size_bytes": 10582
       },
-      "sim_case_path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+      "sim_case_path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
       "supported_scopes": [
         "body",
         "operators"
@@ -429,12 +429,12 @@
         "target_native_timings_used_in_rules": false,
         "evidence_refs": [
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
             "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
             "size_bytes": 9391
           },
           {
-            "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+            "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
             "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
             "size_bytes": 10582
           }

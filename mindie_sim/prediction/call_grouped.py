@@ -24,12 +24,12 @@ from .program import KernelProgram, RecipeBook, Stage
 
 API = "torch_npu.npu_grouped_matmul"
 PRODUCER_PATH = (
-    "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/"
+    "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/"
     "scripts/probe_grouped_graph.py"
 )
 PRODUCER_SHA256 = "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a"
 NZ_DOC_PATH = (
-    "/Users/maoxx241/code/vllm-ascend/csrc/gmm/"
+    "repository://vllm-ascend/csrc/gmm/"
     "grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h"
 )
 NZ_DOC_SHA256 = "08e07b078ca73626df3a135bff230c9b7b61108b235e0f98f22420f4c94f9733"

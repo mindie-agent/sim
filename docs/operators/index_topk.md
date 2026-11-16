@@ -37,10 +37,10 @@ and case and reports that integration mismatch in the limitations below.
 
 | Role | Path | SHA-256 |
 | --- | --- | --- |
-| Selected source | `/Users/maoxx241/code/vllm-v0.25.1/vllm/models/minimax_m3/common/ops/index_topk.py` | `1ca8557aed4260d2f4a742b9eda81d6f774e49d4b016ccc555dde40976c5a1a0` |
-| Dispatch / supported sizes | `/Users/maoxx241/code/vllm-v0.25.1/vllm/models/minimax_m3/common/indexer.py` | `43787aeb1c8a7fd0f990aa62267e6c47f802b511b8850a00f99de0fad2fb468a` |
-| Independent dense reference test | `/Users/maoxx241/code/vllm-v0.25.1/tests/kernels/attention/test_minimax_m3.py` | `0e88afe33ad85542da6ca02ecbaa144af12bbad504546097b062f643a8742bd2` |
-| AMD variant, not selected | `/Users/maoxx241/code/vllm-v0.25.1/vllm/models/minimax_m3/amd/ops/index_topk.py` | `6cc2ee849a0d015bca64f4f826be0478c43dd3cd36ae601712b2aa9971d52999` |
+| Selected source | `repository://vllm-v0.25.1/vllm/models/minimax_m3/common/ops/index_topk.py` | `1ca8557aed4260d2f4a742b9eda81d6f774e49d4b016ccc555dde40976c5a1a0` |
+| Dispatch / supported sizes | `repository://vllm-v0.25.1/vllm/models/minimax_m3/common/indexer.py` | `43787aeb1c8a7fd0f990aa62267e6c47f802b511b8850a00f99de0fad2fb468a` |
+| Independent dense reference test | `repository://vllm-v0.25.1/tests/kernels/attention/test_minimax_m3.py` | `0e88afe33ad85542da6ca02ecbaa144af12bbad504546097b062f643a8742bd2` |
+| AMD variant, not selected | `repository://vllm-v0.25.1/vllm/models/minimax_m3/amd/ops/index_topk.py` | `6cc2ee849a0d015bca64f4f826be0478c43dd3cd36ae601712b2aa9971d52999` |
 
 The selected file is 37,281 bytes. Selected line map (current file):
 
@@ -583,7 +583,7 @@ and scales q/K/score/output work by tenancy, but it does not change the
 ## Reproduction
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py \
   mindie_sim.prediction.operators.index_topk \
   tests/fixtures/operator_cases/index_topk.json \
@@ -591,7 +591,7 @@ PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
 ```
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest -q tests/operators/test_index_topk.py
 ```
 

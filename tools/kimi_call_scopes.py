@@ -47,16 +47,16 @@ _REFERENCE_STATUS = "declared_semantic_reference_not_native_fused_traffic_or_abi
 _SOURCE_REVISION = "ae923905948f360f4b7ab06df52d0789a0c9316e"
 _KDA_SOURCES = tuple({"name": name, "path": path, "sha256": digest, "lines": lines}
         for name, path, digest, lines in (
-        ("aclnn_chunk_kda_fwd", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp", "4db63cf9151d52d8b6d101abc05f3af1f42eaa88435483662dc9cb5d72370fa2", [[650, 669], [770, 815]]),
-        ("chunk_kda_fwd_kernel", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp", "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0", [[15, 70]]),
-        ("chunk_kda_fwd_common", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd_common.h", "e98c17e528d673a9b6c2f0bbbfce83746bcccf0afaeb413ea0ac41a2809e74f8", [[164, 184], [225, 240]]),
-        ("chunk_kda_fwd_prepare", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_prepare.h", "b808a1a1c6e21c0a3098433764675a1f507b04bc8f77d22eaffedd2c4de866c7", [[2865, 2933]]),
-        ("chunk_kda_fwd_post_wu", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_post_wu.h", "89cfa406c18465b8d34c527791d1611ad3bc423253fe613d8f9a70920656860d", [[1710, 1754], [2001, 2020]]),
-        ("chunk_kda_fwd_finalize", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_finalize.h", "f760d3c30f37b58fc2cf28678951f83f3e5a734859c4e058d8e0f0078a9aac01", [[969, 995]]),
-        ("chunk_kda_fwd_tiling_impl", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/arch35/chunk_kda_fwd_tiling_impl.h", "e7542eff7113d97ce069b7ec4f57b01809f4894f1e3b5e801add5f557991fe59", [[12, 39]]),
-        ("chunk_kda_fwd_tiling", "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/chunk_kda_fwd_tiling.cpp", "72148ca10b26ba4f34919c11e973c3bbcd696cfbc9a938c3cc3bf724e41f813c", [[208, 259]]),
-        ("generic_recurrent", "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/prediction/recurrent.py", "face2ef1b7f1ed121c2ae9b3cb686fa79773b695f46fa0edaf577c856ca3df5f", [[100, 143], [200, 237]]),
-        ("a5_kimi_k3_fixture", "/Users/maoxx241/code/profiler/tests/fixtures/fusion_contracts/a5_kimi_k3.csv", "00beb09f90dbb57c12474b6cc0d0db724223b5c25b724d9b13b222da0aec378b", [[45, 45], [71, 72], [80, 80]]),
+        ("aclnn_chunk_kda_fwd", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp", "4db63cf9151d52d8b6d101abc05f3af1f42eaa88435483662dc9cb5d72370fa2", [[650, 669], [770, 815]]),
+        ("chunk_kda_fwd_kernel", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp", "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0", [[15, 70]]),
+        ("chunk_kda_fwd_common", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd_common.h", "e98c17e528d673a9b6c2f0bbbfce83746bcccf0afaeb413ea0ac41a2809e74f8", [[164, 184], [225, 240]]),
+        ("chunk_kda_fwd_prepare", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_prepare.h", "b808a1a1c6e21c0a3098433764675a1f507b04bc8f77d22eaffedd2c4de866c7", [[2865, 2933]]),
+        ("chunk_kda_fwd_post_wu", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_post_wu.h", "89cfa406c18465b8d34c527791d1611ad3bc423253fe613d8f9a70920656860d", [[1710, 1754], [2001, 2020]]),
+        ("chunk_kda_fwd_finalize", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_finalize.h", "f760d3c30f37b58fc2cf28678951f83f3e5a734859c4e058d8e0f0078a9aac01", [[969, 995]]),
+        ("chunk_kda_fwd_tiling_impl", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/arch35/chunk_kda_fwd_tiling_impl.h", "e7542eff7113d97ce069b7ec4f57b01809f4894f1e3b5e801add5f557991fe59", [[12, 39]]),
+        ("chunk_kda_fwd_tiling", "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/chunk_kda_fwd_tiling.cpp", "72148ca10b26ba4f34919c11e973c3bbcd696cfbc9a938c3cc3bf724e41f813c", [[208, 259]]),
+        ("generic_recurrent", "repository://sim-rewrite-20261027/mindie_sim/prediction/recurrent.py", "face2ef1b7f1ed121c2ae9b3cb686fa79773b695f46fa0edaf577c856ca3df5f", [[100, 143], [200, 237]]),
+        ("a5_kimi_k3_fixture", "repository://profiler/tests/fixtures/fusion_contracts/a5_kimi_k3.csv", "00beb09f90dbb57c12474b6cc0d0db724223b5c25b724d9b13b222da0aec378b", [[45, 45], [71, 72], [80, 80]]),
 ))
 
 

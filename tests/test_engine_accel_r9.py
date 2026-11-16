@@ -37,7 +37,7 @@ BACKENDS = ("python", "c", "auto")
 NATIVE = ("c", "auto")
 COUNTS = (64, 4097)
 CAPACITY_EDGES = 32769
-PACKAGE_FILES = 504
+PACKAGE_FILES = 490
 TOTAL_ENTRIES = 508
 DIST_INFO = frozenset({
     "mindie_sim-0.1.0.dist-info/METADATA",
@@ -400,7 +400,7 @@ from pathlib import Path
 import mindie_sim
 from mindie_sim.backends.ascend import profiles as ascend_profiles
 from mindie_sim.backends.nvidia import profiles as nvidia_profiles
-from mindie_sim.model_catalog import load_architecture_profile, load_model
+from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.engine import Engine, Resource
 
 extract = Path(sys.argv[1]).resolve()
@@ -409,8 +409,6 @@ assert package.is_relative_to(extract), (package, extract)
 assert len(ascend_profiles()) == 15
 assert len(nvidia_profiles()) == 4
 assert type(load_model("qwen3-32b")).__name__ == "ModelSpec"
-assert type(load_architecture_profile("longcat-flash-lite")).__name__ \\
-    == "ModelArchitectureProfile"
 report = {{"package": str(package)}}
 for mode in ("c", "auto"):
     engine = Engine([Resource("r", 4097.0)], backend=mode, trace_limit=3)

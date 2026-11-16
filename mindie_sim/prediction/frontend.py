@@ -30,6 +30,7 @@ from mindie_sim.schema.workload import selected_mode
 from .attention import ATTENTION_BUILDERS, AttentionPolicy
 from .blocks import RESIDUAL_BUILDERS, lowrank_hyper_final_mixer, norm
 from .feedforward import FFN_BUILDERS, RoutingPolicy
+from .frontend_features import FeatureConfig
 from .graph import GraphPolicy, annotate_geometry
 from .routing_realizations import RoutingRealization, select_realization
 from .structure import normalize_model, stage_map
@@ -46,6 +47,11 @@ from .recover_ssm_work import recover_ssm_enabled
 
 ZERO = 0
 ONE = 1
+_ENV_MODEL = 0
+_ENV_RUNTIME = 1
+_ENV_MACHINE = 2
+_ENV_REPLICA = 3
+_ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
 
@@ -669,10 +675,12 @@ class Frontend:
         if resource_fusion is None:
             resource_fusion = self.resource_fusion
         s_env = self._prev_call_env
-        if (s_env is not None and s_env[0] is model
-                and (s_env[1] is runtime or s_env[1] == runtime)
-                and s_env[2] is machine and s_env[3] == replica
-                and s_env[4] is self.features):
+        if (s_env is not None and s_env[_ENV_MODEL] is model
+                and (s_env[_ENV_RUNTIME] is runtime
+                     or s_env[_ENV_RUNTIME] == runtime)
+                and s_env[_ENV_MACHINE] is machine
+                and s_env[_ENV_REPLICA] == replica
+                and s_env[_ENV_FEATURES] is self.features):
             _, _, _, _, _, model, auto_rank, features = s_env
             if physical_rank is None:
                 physical_rank = auto_rank
@@ -686,7 +694,6 @@ class Frontend:
                     replica, 0)[0]
             except Exception:
                 auto_rank = None
-            from .subgraphs.instantiate import FeatureConfig
             features = (self.features if self.features is not None else
                         FeatureConfig.from_runtime(runtime, model, machine=machine))
             self._prev_call_env = (

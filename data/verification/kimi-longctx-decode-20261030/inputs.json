@@ -156,7 +156,7 @@
     }
   ],
   "base": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-k3-a5-sp-right-pad-conditional.json",
+    "path": "repository://sim-service-response-domain-next/examples/cases/kimi-k3-a5-sp-right-pad-conditional.json",
     "sha256": "6c55c4fa02b6cc20d6a7eb2ee2a6aff8ec7e4ae29a404609c58618e9c7e0cd57",
     "size_bytes": 10492
   },

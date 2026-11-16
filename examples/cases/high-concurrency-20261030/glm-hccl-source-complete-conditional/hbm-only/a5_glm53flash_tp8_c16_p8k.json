@@ -217,7 +217,7 @@
         "sha256": "d291b80f51ceb6c669479749d40e69784f08d9b3d38985402177b2a64f4af848"
       },
       "startup": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
         "bytes": 335341,
         "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
       },
@@ -298,12 +298,12 @@
       "accepted_state_scenario": {
         "id": "a5_glm53flash_tp8_c16_p8k",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c16_p8k--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c16_p8k--attention-plus-down.json",
           "sha256": "6d00befc78bbdc751f79c64f967188f8c7add2fa59a5d42aaf58ef0a642e0c40",
           "size_bytes": 7375
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },
@@ -334,7 +334,7 @@
       },
       "hccl_composed_condition": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c16_p8k.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c16_p8k.json",
           "sha256": "fcbbb178fa6957353eb2a81c7873515450673d699192c01222c334f1dafb94f9"
         },
         "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",

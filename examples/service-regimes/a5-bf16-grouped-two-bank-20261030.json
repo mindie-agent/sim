@@ -41,7 +41,7 @@
       "provenance": {
         "boundary": "native GroupedMatmul BF16 device call, inclusive",
         "fit_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
           "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
           "size_bytes": 2367458
         },
@@ -117,7 +117,7 @@
       "provenance": {
         "boundary": "native GroupedMatmul BF16 device call, inclusive",
         "fit_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.actual.json",
           "sha256": "96932e700f5e798136ca3f582b594dd8f89ce9bf74a60be08c5fd33c8d549ad3",
           "size_bytes": 2367458
         },

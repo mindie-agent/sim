@@ -22,7 +22,7 @@
     "scope": "body"
   },
   "previous_hccl_comparison": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-gdn-store-binding-20261030/hccl-frozen-validation.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a5-gdn-store-binding-20261030/hccl-frozen-validation.json",
     "sha256": "3407413a70bf6e76ae790e8272ec46542324b214b0a133df44cba1dcf729266e",
     "size_bytes": 130274
   },
@@ -31,12 +31,12 @@
       "model": "qwen36",
       "tp": 2,
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp2-b4-caller-fused.json",
         "sha256": "8942bee7d2b45625c0302e477275d6e65a31b895aad16131a1b9a76efae7b1e6",
         "size_bytes": 10329
       },
       "baseline_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
         "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
         "size_bytes": 9138
       },
@@ -524,12 +524,12 @@
       "model": "qwen36",
       "tp": 4,
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen36-tp4-b4-caller-fused.json",
         "sha256": "ebd725429a1235daecd7509a06d347c08e8adecaefcced543b8ec0730c05de0d",
         "size_bytes": 11912
       },
       "baseline_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
         "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
         "size_bytes": 10720
       },
@@ -580,18 +580,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -1092,12 +1092,12 @@
       "model": "qwen38",
       "tp": 2,
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp2-b4-caller-fused.json",
         "sha256": "e424cb9e8fc8c4f626062cc5b40efc1cb6afe946c7f342d597e275befb979307",
         "size_bytes": 9000
       },
       "baseline_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
         "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
         "size_bytes": 7809
       },
@@ -1394,12 +1394,12 @@
       "model": "qwen38",
       "tp": 4,
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-caller-fused/a5-qwen38-tp4-b4-caller-fused.json",
         "sha256": "0bb03a39d31bcc37ca2cdb4ff5addb992fba045cffe468ff878a19ebc8799b0e",
         "size_bytes": 10582
       },
       "baseline_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
         "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
         "size_bytes": 9391
       },
@@ -1450,18 +1450,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },

@@ -43,7 +43,7 @@
       "provenance": {
         "boundary": "native MatMulV3 device-call service, inclusive",
         "fit_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
           "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
           "size_bytes": 48779
         },
@@ -115,7 +115,7 @@
       "provenance": {
         "boundary": "native MatMulV3 device-call service, inclusive",
         "fit_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
           "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
           "size_bytes": 48779
         },
@@ -187,7 +187,7 @@
       "provenance": {
         "boundary": "native MatMulV3 device-call service, inclusive",
         "fit_source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261030-kimi-logical96-operators/full-matrix-canonical/body-operator-a5_kimi_tp8_e16_bf16_c32_p4k-logical96-full-matrix.mapping.json",
           "sha256": "8d241605f39a28c80c3de0efe4fc7bed71134e0d15d83ba7c74de37bc45b8d31",
           "size_bytes": 48779
         },

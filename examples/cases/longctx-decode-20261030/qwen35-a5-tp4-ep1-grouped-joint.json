@@ -818,7 +818,7 @@
       "runtime_recipe_basis": "uncalibrated catalog baseline; no high-concurrency EP/MC2 policy transferred",
       "native_grouped_response": {
         "source_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
+          "path": "repository://profiler/examples/structure/cases/longctx-a5-qwen35-tp4-source-model.json",
           "sha256": "fbac3d688d7a92e6e598c1ba6406cef4c2f8addf68dfa9b4dd56c02d9a9b5a53",
           "size_bytes": 2673
         },

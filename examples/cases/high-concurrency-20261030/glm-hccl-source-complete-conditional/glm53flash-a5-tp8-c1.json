@@ -137,12 +137,12 @@
       "accepted_state_scenario": {
         "id": "glm53flash-a5-tp8-c1",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c1--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c1--attention-plus-down.json",
           "sha256": "2a6390f9709d6e20b51aa6437050487988b133b45e0fa087267b72ccfad24e42",
           "size_bytes": 5064
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },
@@ -173,7 +173,7 @@
       },
       "hccl_composed_condition": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/glm53flash-a5-tp8-c1.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/glm53flash-a5-tp8-c1.json",
           "sha256": "52bc56ba0870bc405c053932d32b54f939ec15123c36dbea350a8f85fe563097"
         },
         "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",

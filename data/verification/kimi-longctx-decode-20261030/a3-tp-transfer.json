@@ -1,7 +1,7 @@
 {
   "schema": "mindie-kimi-a3-tp-transfer-geometry/1",
   "base": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c64_source.json",
+    "path": "repository://sim-service-response-domain-next/examples/cases/high-concurrency-20261030/kimi-source/a3_kimi4_tp8_w4a8_c64_source.json",
     "sha256": "f3edbf8756c1af1c6e77e78baaa3b5744344fb261463b39c13b0e4835ef58cc4",
     "size_bytes": 17893
   },

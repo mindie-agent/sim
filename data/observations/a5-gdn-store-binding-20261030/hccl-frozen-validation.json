@@ -2,7 +2,7 @@
   "scope": "unchanged_HCCL_response_transfer_to_independent_long_context",
   "revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
   "manifest": {
-    "path": "/Users/maoxx241/code/profiler/examples/structure/cases.json",
+    "path": "repository://profiler/examples/structure/cases.json",
     "sha256": "c7d9a87c33a9ed7695949d6a4f2e1de58cc674f988c6a6330727d96637202795",
     "size_bytes": 2753512
   },
@@ -34,12 +34,12 @@
         "output_query_rows": 4
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
         "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
         "size_bytes": 9138
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       },
@@ -290,7 +290,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       }
@@ -309,12 +309,12 @@
         "output_query_rows": 16
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
         "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
         "size_bytes": 9138
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       },
@@ -526,7 +526,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       }
@@ -545,12 +545,12 @@
         "output_query_rows": 96
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp2-mesh_oneshot-frozen.json",
         "sha256": "0f1dd3d818738215887c95b336c5f7a31a1a5c034533634c0eb98a851660a145",
         "size_bytes": 9138
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       },
@@ -746,7 +746,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp2-mesh_oneshot.json",
         "sha256": "dc1b2cf90332eff0d5812c1f748a029ceb3c82577c056f918ab42c83bc002e49",
         "size_bytes": 7137
       }
@@ -765,12 +765,12 @@
         "output_query_rows": 4
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-frozen.json",
         "sha256": "b17d53308f7f41db4b19262d1a6816b7230659eb287318d8bc9bf40188fb21cb",
         "size_bytes": 10588
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-control.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-b1-mesh_oneshot-control.json",
         "sha256": "8ac2aae6dbd5bcf73cd3602a99181d672147fa2752c2d8aa4edc5b06dbf535d8",
         "size_bytes": 6999
       },
@@ -943,7 +943,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
         "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
         "size_bytes": 7131
       }
@@ -962,12 +962,12 @@
         "output_query_rows": 16
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
         "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
         "size_bytes": 10720
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
         "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
         "size_bytes": 7131
       },
@@ -1143,18 +1143,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -1245,18 +1245,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -1290,7 +1290,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
         "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
         "size_bytes": 7131
       }
@@ -1309,12 +1309,12 @@
         "output_query_rows": 32
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen36-tp4-mesh_twoshot-frozen.json",
         "sha256": "7a3fd131b024fc5928407a57a1bbeef2600bb40b67faa022cb730489b6712286",
         "size_bytes": 10720
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
         "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
         "size_bytes": 7131
       },
@@ -1490,18 +1490,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -1592,18 +1592,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -1637,7 +1637,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen36-tp4-mesh_twoshot.json",
         "sha256": "09d35f578843f1930d1399cee6276d05548dbcd56a957a91f39c5274a812c62c",
         "size_bytes": 7131
       }
@@ -1656,12 +1656,12 @@
         "output_query_rows": 4
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
         "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
         "size_bytes": 7809
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       },
@@ -1912,7 +1912,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       }
@@ -1931,12 +1931,12 @@
         "output_query_rows": 16
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
         "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
         "size_bytes": 7809
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       },
@@ -2148,7 +2148,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       }
@@ -2167,12 +2167,12 @@
         "output_query_rows": 96
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
         "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
         "size_bytes": 7809
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       },
@@ -2368,7 +2368,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp2-mesh_oneshot.json",
         "sha256": "b7aa0d5400edf6157ccc8c6d6aea329f3b9d0474ba49bf09d54008d0c6c2eb03",
         "size_bytes": 5808
       }
@@ -2387,12 +2387,12 @@
         "output_query_rows": 4
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-frozen.json",
         "sha256": "ebb7c7006b622f7abe0e1f342ae2bb98d4969f018ef85195ca2c62b69d9120e5",
         "size_bytes": 9259
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-control.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-b1-mesh_oneshot-control.json",
         "sha256": "afe81f15ff17f4f1788831e1994704a92e29377759f2e30c9d8e47e85a5da0cc",
         "size_bytes": 5670
       },
@@ -2565,7 +2565,7 @@
       },
       "execution_relation": "one_Body_requested; unchanged_analytic_program_domain_miss_verified_in_primitive",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
         "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
         "size_bytes": 5802
       }
@@ -2584,12 +2584,12 @@
         "output_query_rows": 16
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
         "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
         "size_bytes": 9391
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
         "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
         "size_bytes": 5802
       },
@@ -2765,18 +2765,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -2867,18 +2867,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -2912,7 +2912,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
         "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
         "size_bytes": 5802
       }
@@ -2931,12 +2931,12 @@
         "output_query_rows": 32
       },
       "case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp4-mesh_twoshot-frozen.json",
         "sha256": "dd563e25fd8a67b7effa40a368fd8066eb34f829da83888f808a514bb88784d8",
         "size_bytes": 9391
       },
       "control_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
         "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
         "size_bytes": 5802
       },
@@ -3112,18 +3112,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -3214,18 +3214,18 @@
             "provenance": {
               "assignment_sources": [
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                   "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                   "size_bytes": 852008
                 },
                 {
-                  "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                  "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                   "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                   "size_bytes": 874253
                 }
               ],
               "holdout_source": {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
                 "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
                 "size_bytes": 887805
               },
@@ -3259,7 +3259,7 @@
       },
       "execution_relation": "both_complete_Bodies_requested; see individual status",
       "base_source_case": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-source/a5-qwen38-tp4-mesh_twoshot.json",
         "sha256": "54cacae4b5564ed8d09f976303b6ae221527127a5e0f6a5458ce3b4561a01f93",
         "size_bytes": 5802
       }

@@ -231,7 +231,7 @@
         "sha256": "3be236b669ed8255b875cac99fd9e118fa93b43221c04e9da726041ec5a3e0ab"
       },
       "startup": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
         "bytes": 335341,
         "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
       },
@@ -312,12 +312,12 @@
       "accepted_state_scenario": {
         "id": "a5_glm53flash_tp8_c4_p8k",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c4_p8k--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c4_p8k--attention-plus-down.json",
           "sha256": "44d4c798e8eec1fed78e9551511c436e9a762e328fea5809a62fbb47e2e78a82",
           "size_bytes": 7371
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },
@@ -348,7 +348,7 @@
       },
       "hccl_composed_condition": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c4_p8k.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c4_p8k.json",
           "sha256": "b9bfd96a4a084ef3318c7119f82c9033800c0ddcd8f90d9050889d9a7aff5f3f"
         },
         "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",
@@ -388,11 +388,11 @@
         "runner": "vllm_ascend/ops/fused_moe/fused_moe.py:199-237,269-349",
         "runtime_guard": "vllm_ascend/ops/register_custom_ops.py:127-155",
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/a5_glm53flash_tp8_c4_p8k.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/a5_glm53flash_tp8_c4_p8k.json",
           "sha256": "b1dbb0fe601daebc39d270402f537734a8e712deee9d3feffcbd7b89b2edbe04"
         },
         "source_audit": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
           "sha256": "61f3b6426f2805fdee225975cb48dfa8c189c253b0bf6ca7f8a40d8599ab7b95"
         },
         "parallel_condition": "EP=DP=CP=PCP=1; no SP/latent output transform; TP-sharded shared weights",

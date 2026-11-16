@@ -781,9 +781,9 @@ def compose_case(
             raise ModelingError(f"hardware_derivation_conflict:{key}")
         derivation[key] = value
     if derivation:
-        from mindie_sim.issue34_cli import _derived_machine
+        from mindie_sim.hardware_derivation import derived_machine
         parsed = parse_case(case_dict)
-        derived = _derived_machine(parsed.machine, derivation)
+        derived = derived_machine(parsed.machine, derivation)
         case_dict["machine"] = _to_jsonable(derived)
         parse_case(case_dict)
     return case_dict

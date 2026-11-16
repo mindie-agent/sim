@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 import json
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
@@ -297,6 +298,50 @@ def stage_from_fragment(fragment: ProgramFragment, *, name: str = "",
 
 class Program(Protocol):
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event: ...
+
+
+@dataclass(frozen=True)
+class NativeProgram:
+    """Canonical executable native program plus its exact source ledger.
+
+    The contract preserves the native owner's own ``start`` /
+    ``start_with_handles`` readiness, peer sends, send placeholders, launch
+    handles and transport bindings.  It stores no duration: a caller binds
+    and measures the actual completion Event on the shared Engine instead of
+    reusing a precomputed time.
+    """
+
+    program: Any
+    work: tuple[tuple[str, Fraction], ...]
+    fidelity: str = "native_program"
+
+    def start(self, engine: Any, name: str, ready: Any, *,
+              peer_ready: Any = None, peer_send: Any = None,
+              launch: Any = None, source_send: Any = None,
+              send_placeholders: Any = None, transport: Any = None) -> Any:
+        if (peer_ready is None and peer_send is None and launch is None
+                and source_send is None and send_placeholders is None
+                and transport is None):
+            return self.program.start(engine, name, ready)
+        arguments = dict(
+            peer_ready=peer_ready, peer_send=peer_send, launch=launch,
+            source_send=source_send, send_placeholders=send_placeholders)
+        if transport is not None:
+            arguments["transport"] = transport
+        return self.program.start(engine, name, ready, **arguments)
+
+    def start_with_handles(self, engine: Any, name: str, ready: Any, *,
+                           peer_ready: Any = None, peer_send: Any = None,
+                           launch: Any = None, source_send: Any = None,
+                           send_placeholders: Any = None,
+                           transport: Any = None):
+        arguments = dict(
+            peer_ready=peer_ready, peer_send=peer_send, launch=launch,
+            source_send=source_send, send_placeholders=send_placeholders)
+        if transport is not None:
+            arguments["transport"] = transport
+        return self.program.start_with_handles(
+            engine, name, ready, **arguments)
 
 
 @dataclass(frozen=True)

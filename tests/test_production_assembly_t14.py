@@ -14,10 +14,6 @@ from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.scheduler import Scheduler
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import AllocationEffect
-from mindie_sim.prediction.piecewise.compiler import PipeSupply
-from mindie_sim.prediction.piecewise.model_pipeline import (
-    FrameworkConfig, predict_framework,
-)
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.capacity import Memory, MemoryPolicy
 from test_prediction_system import case, linear_work
@@ -185,26 +181,6 @@ def test_direct_run_cohort_waits_only_its_own_delivery_tail_not_external_timer()
     assert run["serving_end"] >= 6
     assert timer.done is False
 
-
-def test_pw_core_c14_predict_framework_calls_the_same_run_cohort_context():
-    raw = case(requests=[{"id": "r", "prompt_tokens": 2, "output_tokens": 1}])
-    parsed = parse_case(raw)
-    memory = Memory(parsed)
-    scheduler = Scheduler(parsed, list(parsed.workload.requests), memory, 0)
-    execution = Execution(parsed, CostModel(parsed), include_serving_io=True,
-                          memory_policy=memory.policy)
-    execution.engine.now = 0
-    supply = PipeSupply((("cube", 1_000_000.0), ("vector", 1_000_000.0),
-                         ("hbm", 1_000_000.0), ("mte1", 2_000_000.0),
-                         ("mte2", 2_000_000.0), ("mte3", 2_000_000.0),
-                         ("fixpipe", 2_000_000.0), ("link", 1_000_000.0)))
-    result = predict_framework(
-        parsed.model, list(parsed.workload.requests),
-        FrameworkConfig(supply=supply, max_batch=2),
-        case=parsed, execution=execution, schedulers=[scheduler], memory=memory)
-    assert execution.memory is memory
-    assert result.body_duration_ms >= 0
-    assert [row.request_id for row in result.requests] == ["r"]
 
 
 def test_framework_occurrences_use_the_same_bounded_online_observer():

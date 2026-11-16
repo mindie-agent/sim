@@ -2,7 +2,7 @@
   "schema": "mindie-sim.copy-joint-service/1",
   "provenance": {
     "kind": "conditional_joint_source_program_busy",
-    "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+    "source": "repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
     "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
     "train_batches": [
       16,
@@ -75,7 +75,7 @@
     },
     "provenance": {
       "kind": "conditional_joint_source_program_busy",
-      "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+      "source": "repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
       "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
       "train_batches": [
         16,
@@ -108,7 +108,7 @@
         "per_owner_rate": 1000000000.0,
         "provenance": {
           "kind": "conditional_joint_source_program_busy",
-          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "source": "repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
           "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
           "train_batches": [
             16,
@@ -139,7 +139,7 @@
         "per_owner_rate": 1000000000.0,
         "provenance": {
           "kind": "conditional_joint_source_program_busy",
-          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "source": "repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
           "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
           "train_batches": [
             16,
@@ -170,7 +170,7 @@
         "per_owner_rate": 1000000000.0,
         "provenance": {
           "kind": "conditional_joint_source_program_busy",
-          "source": "/Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
+          "source": "repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json",
           "sha256": "2d3ca3bafaf08cd89be467694dfe2672b98ba32286778a1461c08a5edb3afbb1",
           "train_batches": [
             16,

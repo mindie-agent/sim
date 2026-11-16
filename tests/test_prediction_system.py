@@ -18,7 +18,7 @@ def case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None):
     ranks = dp * tp * pp
     return {
         "machine": {
-            "name": "declared-gpu", "architecture": "cuda", "num_devices": ranks,
+            "name": "declared-gpu", "architecture": "declared", "num_devices": ranks,
             "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
                        "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
             "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,

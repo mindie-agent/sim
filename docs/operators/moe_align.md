@@ -34,8 +34,8 @@ the supplied CUDA kernels.
 
 | Path | SHA-256 | Bytes | Selected lines |
 | --- | --- | ---: | --- |
-| `/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/fused_moe/moe_align_block_size.py` | `c3f7fc2087836f0160a32ab99ceb1d8f6e87c793679da34dd672e225cb7fa31b` | 8339 | 74-103 |
-| `/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu` | `e2bdb00824895cf7f43569159910ca369db3d7ad1da08c51cff2325d03d2e68b` | 40399 | 85-185, 187-293, 295-324, 326-351, 453-466, 582-680 |
+| `repository://vllm-v0.25.1/vllm/model_executor/layers/fused_moe/moe_align_block_size.py` | `c3f7fc2087836f0160a32ab99ceb1d8f6e87c793679da34dd672e225cb7fa31b` | 8339 | 74-103 |
+| `repository://vllm-v0.25.1/csrc/libtorch_stable/moe/moe_align_sum_kernels.cu` | `e2bdb00824895cf7f43569159910ca369db3d7ad1da08c51cff2325d03d2e68b` | 40399 | 85-185, 187-293, 295-324, 326-351, 453-466, 582-680 |
 
 These hashes match the coordinator-owned wave4 manifest at
 `tests/fixtures/operator_sources/moe_align.json`.
@@ -46,7 +46,7 @@ selected CUDA lines add the small-fill barriers (205-216) and the first worker
 barrier (240) to the earlier 187-293 span.
 
 The wrapper imports `round_up()` from
-`/Users/maoxx241/code/vllm-v0.25.1/vllm/utils/math_utils.py` (lines 20-22),
+`repository://vllm-v0.25.1/vllm/utils/math_utils.py` (lines 20-22),
 which is outside the manifest. That helper is `((x + y - 1) // y) * y` for
 positive integers, SHA-256
 `23d9d5af62ee43dc55fd647822265f5e20b813bf89e5510130065932c7868fa6`.
@@ -410,12 +410,12 @@ and does not reuse the planner's formulas:
 Commands run in this worktree:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py mindie_sim.prediction.operators.moe_align \
   tests/fixtures/operator_cases/moe_align.json \
   -o data/verification/operators/moe_align.json
 
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest -q tests/operators/test_moe_align.py
 ```
 

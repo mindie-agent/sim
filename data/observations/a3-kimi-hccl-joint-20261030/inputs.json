@@ -2,23 +2,23 @@
   "schema": "kimi-hccl-retrospective-source-assignment/1",
   "status": "frozen_before_new_HCOM_duration_extraction",
   "source_inventory": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/kimi-mla-cache-domain-20261030.json",
+    "path": "repository://sim-service-response-domain-next/data/verification/kimi-mla-cache-domain-20261030.json",
     "sha256": "3b3576eb5f3bcf7b5779732dfeb91606b765152c7ba23536e5f8b2bae36d80a8",
     "size_bytes": 380897
   },
   "extraction_report_identity": {
-    "path": "/Users/maoxx241/code/profiler/examples/structure/results/decode.json",
+    "path": "repository://profiler/examples/structure/results/decode.json",
     "sha256": "61ebcbd6d48e9e9eb5e349dc2ec827252656e615683e49eb180a823dcbba824f",
     "size_bytes": 4665107
   },
   "canonical_cases": [
     {
-      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
+      "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp8-longctx-source.json",
       "sha256": "69d44345c9edd804c0fd677f0a8485ff9f5188478c414d09c3bf6c0997ae5fce",
       "size_bytes": 17742
     },
     {
-      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
+      "path": "repository://profiler/examples/structure/cases/a3-kimi4-tp16-longctx-source.json",
       "sha256": "7d50920f678fd5317e9b37edcfc97fafd0029f65cf97940b6bbdcd263f5bc2c7",
       "size_bytes": 15110
     }
@@ -40,7 +40,7 @@
   },
   "caller_source": [
     {
-      "repository": "/Users/maoxx241/code/vllm-ascend",
+      "repository": "repository://vllm-ascend",
       "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
       "path": "vllm_ascend/models/kimi_k3.py",
       "sha256": "af6a25c85fcf1677673f0180cb24eeab1ddd7d3715704432e551483f5407c2f3",
@@ -52,7 +52,7 @@
       "captured_binary_identity": "not_established"
     },
     {
-      "repository": "/Users/maoxx241/code/vllm-ascend",
+      "repository": "repository://vllm-ascend",
       "revision": "8c30e4f491f73cba737a1dacc522894e437cdf3d",
       "path": "vllm_ascend/ops/fused_moe/shared_experts.py",
       "sha256": "c25f66f94b5a8485c9afca7243a774954eda5db5a43daa7af788c17e242bcb9f",
@@ -63,7 +63,7 @@
       "captured_binary_identity": "not_established"
     },
     {
-      "repository": "/Users/maoxx241/code/vllm-v0.27.1-k3-ops-validation",
+      "repository": "repository://vllm-v0.27.1-k3-ops-validation",
       "revision": "6e448d0ea9bf3d88d898b65449ca6dc2aec170ac",
       "path": "vllm/models/common/ops/sequence_parallel.py",
       "sha256": "699fde98360fc8d604055e2987d93108ee489e87cc5563949d2a3dcd838eb8bd",

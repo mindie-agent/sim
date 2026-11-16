@@ -8,7 +8,7 @@ opt-in identity `arch35_gqmm_mix_nz`.
 
 ## Source identity
 
-Source checkout: `/Users/maoxx241/code/refs/ops-transformer`, revision
+Source checkout: `repository://refs/ops-transformer`, revision
 `a3925fd49cd256ad478d2faf983bf2961b8ae2c8`.
 
 | File | sha256 | Role |
@@ -185,7 +185,7 @@ claimed full-call integration.
 Focused command:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest -q tests/test_quant_grouped_schedule.py
 ```
 

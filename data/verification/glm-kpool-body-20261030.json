@@ -1,6 +1,6 @@
 {
   "source": {
-    "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-glm53flash-heldout-tp16.json",
+    "path": "repository://profiler/examples/structure/cases/a3-glm53flash-heldout-tp16.json",
     "sha256": "18c65290b6794a859e873324526b06def428284e322c9c0f00fc886cf2fa38d6",
     "size_bytes": 18735
   },

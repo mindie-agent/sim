@@ -32,7 +32,6 @@ import time
 import pytest
 
 import mindie_sim
-from mindie_sim import advise_case
 from mindie_sim.catalog.cache import cache_row_split
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.cache_pages import KVPageAllocation
@@ -52,7 +51,7 @@ from mindie_sim.prediction.capacity import (
 from mindie_sim.prediction.communication import MessageFlow
 from mindie_sim.prediction.efficiency import (
     evaluate_fixed_plan, evaluate_resource_counterfactual, prepare_fixed_plan,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 from mindie_sim.prediction.engine import (
     Allocation as EngineAllocation, Engine, ExecutionError, Resource,
@@ -101,7 +100,7 @@ def _compact_case(*, dp: int = 1, tp: int = 1, pp: int = 1, ep: int = 1,
     ranks = dp * tp * pp
     return {
         "machine": {
-            "name": "declared-compact", "architecture": "cuda", "num_devices": ranks,
+            "name": "declared-compact", "architecture": "declared", "num_devices": ranks,
             "device": {
                 "memory_bytes": 1024 ** 3, "compute_units": 4,
                 "compute_peaks": {"bf16": 1e9, "fp32": 1e9, "int8": 2e9},
@@ -701,12 +700,11 @@ def test_chain_e_counterfactuals_sla_and_source_separation() -> None:
     assert cf_hbm["counterfactual"]["graph_duration_ms"] > baseline["graph_duration_ms"]
     assert cf_cap["counterfactual"]["capacity"] != cf_cap["baseline"]["capacity"]
 
-    sla_rep = solve_hardware_sla_throughput(
+    sla_rep = solve_sla_sizing(
         base_case, sla_ms=80.0, context=64, output_budget=8, max_sequences_per_dp=4,
         scenarios=[{"id": "baseline"}, {"id": "tight_hbm", "hbm_capacity_scale": 0.35}],
     )
-    adv_rep = advise_case(base_case, max_interventions=2, counterfactual_resources=[{"resource": "hbm_bw", "factor": 0.5}])
-    assert len(sla_rep["scenarios"]) == 2 and adv_rep["resource_counterfactuals"][0]["evaluation_consistency"]["matched_advise_baseline"] is True
+    assert len(sla_rep["scenarios"]) == 2
 
     cands = [
         (dict(base_case, runtime=dict(base_case["runtime"], max_num_seqs=seqs, graph_capture_mode="full", graph_capture_keys=keys)), seqs)

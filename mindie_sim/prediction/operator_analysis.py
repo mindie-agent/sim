@@ -16,6 +16,7 @@ from mindie_sim.coverage import model_coverage
 from .cost import CostModel
 from .cohort_traffic import bind_cohort_traffic
 from .execution import CollectiveParticipant, Execution
+from .frontend_features import FeatureConfig
 from .structure import parse_case, parse_model
 from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_declaration,
                             effective_body_declaration)
@@ -176,14 +177,13 @@ def _check_draft_preparation(case, phase, scope, enabled):
 
 
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
-                cohort_tokens=None, phase=None, replica=0, active_rows=None,
+                cohort_tokens=None, phase=None, replica=ZERO, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, physical_rank=None, query_position=None,
                 model_programs=None):
     from mindie_sim.schema.workload import IterationPlan
     from .attention import AttentionPolicy
     from .frontend import Frontend
-    from .subgraphs.instantiate import FeatureConfig
     from .transforms import lower_implementations
     from .implementation_selection import resolve, annotate
 
@@ -515,7 +515,6 @@ def model_program(value, *, phase, tokens, context=ZERO, sequences=ONE,
     from mindie_sim.schema.workload import IterationPlan, RequestView
     from .attention import AttentionPolicy
     from .frontend import Frontend
-    from .subgraphs.instantiate import FeatureConfig
 
     case = parse_model(value)
     _check_geometry(phase, tokens, 1, context, "model")
@@ -809,7 +808,7 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         engine = execution.engine
         ready = engine.submit("input_ready", release=input_ready_ms)
         program = execution.lower_program(context, recipe)
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         if isinstance(program, NativeProgram):
             # An isolated native call still uses its declared physical rank
             # ports; it is the same launch view, not an unbound synthetic one.

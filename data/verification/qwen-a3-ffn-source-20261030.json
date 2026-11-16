@@ -1,22 +1,22 @@
 {
   "schema": "mindie-qwen-a3-ffn-source-audit/1",
   "input": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+    "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
     "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
     "size_bytes": 5852
   },
   "control_input": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+    "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
     "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
     "size_bytes": 4234
   },
   "source_contract": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/tests/fixtures/verification/qwen35-a3-ffn-contract.json",
+    "path": "repository://sim-service-response-domain-next/tests/fixtures/verification/qwen35-a3-ffn-contract.json",
     "sha256": "c42b158e6f7bda51edd3fe607355a1a37633e920c35fd1be51cb75ebfb579f1a",
     "size_bytes": 24111
   },
   "producer": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/qwen-a3-ffn-source-20261030.producer.py",
+    "path": "repository://sim-service-response-domain-next/data/verification/qwen-a3-ffn-source-20261030.producer.py",
     "sha256": "d8d5facdd9a9759b2cc83a9765bed8d8011acdb21f76ed12eba6ef38ffd0bfa3",
     "size_bytes": 8277
   },

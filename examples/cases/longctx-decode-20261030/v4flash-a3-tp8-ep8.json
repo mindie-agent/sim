@@ -116,7 +116,7 @@
       },
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-v4flash-a3-tp8-c4.json",
+          "path": "repository://profiler/examples/structure/cases/decode-v4flash-a3-tp8-c4.json",
           "sha256": "927c5c83f55d68b26a47dc2a08801a64f60c94a8a38fc812e641ff1ad9a88a1c",
           "size_bytes": 16577
         },

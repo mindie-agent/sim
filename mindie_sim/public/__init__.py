@@ -18,7 +18,6 @@
 """
 from __future__ import annotations
 
-from .aclnn import simulate_aclnn_call
 from .api import (
     simulate_graph, simulate_model, simulate_native_call,
     simulate_operator, simulate_service,
@@ -40,6 +39,6 @@ __all__ = [
     "ExecutionEnvironment",
     "Extension", "ExtensionContext", "Provider", "UserProfile",
     "ExtensionError", "CapabilityGap", "load_extensions", "load_user_profile",
-    "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
+    "simulate_operator", "simulate_native_call",
     "simulate_graph", "simulate_model", "simulate_service",
 ]

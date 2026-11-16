@@ -6,7 +6,7 @@
   TTFT/TPOT SLA constraints.
 [Invariants] Strictly closed-world, deterministic, axiomatic evaluation:
   physical weight/KV memory bounds come from Memory, step latencies and SLA
-  ceilings come from solve_hardware_sla_throughput and _lower_and_run_graph,
+  ceilings come from solve_sla_sizing and _lower_and_run_graph,
   and Pareto optimality uses exact multi-objective dominance without heuristic
   weights or subjective scores. Structurally invalid candidates are recorded as
   infeasible with their exact failure reason and never silently dropped.
@@ -24,13 +24,12 @@ import math
 from typing import Any
 
 from mindie_sim.backends.ascend import materialize as ascend_materialize, profiles as ascend_profiles
-from mindie_sim.prediction.afd import solve_afd_pareto
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
     DEFAULT_SLA_SCENARIOS,
     _lower_and_run_graph,
     _resolve_speculative_tokens,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.case import Case as CaseSpec
@@ -47,6 +46,11 @@ DEFAULT_SLA_MS = 30.0
 DEFAULT_CONTEXT = 126000
 DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_MAX_SEQUENCES = 256
+DEFAULT_PROMPT_TOKENS = 4096
+DEFAULT_OUTPUT_TOKENS = 1024
+DEFAULT_TTFT_SLA_MS = 3000.0
+DEFAULT_KV_TRANSFER_BW_GBPS = 100.0
+ONE_FLOAT = 1.0
 _BASELINE_SCENARIO: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0, "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
 )
@@ -348,7 +352,7 @@ def compute_pareto_frontier(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [r for r in rows if r.get("pareto_optimal")]
 
 
-def sweep_topology_grid(
+def sweep_topologies(
     case: CaseSpec | Mapping[str, Any], *, candidates: Sequence[Mapping[str, Any]] | None = None,
     num_devices: int | None = None, sla_ms: float = DEFAULT_SLA_MS, context: int = DEFAULT_CONTEXT,
     phase: str = "decode", scope: str = "body", tokens_per_seq: int | None = None,
@@ -370,13 +374,13 @@ def sweep_topology_grid(
 
     parsed = parse_case(case)
     if hardware_derivations:
-        from mindie_sim.issue34_cli import _derived_machine
+        from mindie_sim.hardware_derivation import derived_machine
         combined: list[dict[str, Any]] = []
         for derivation in hardware_derivations:
             declare = dict(derivation)
             sku = str(declare.pop("sku", parsed.machine.sku or "derived"))
-            derived = _derived_machine(parsed.machine, {**declare, "sku": sku})
-            sub = sweep_topology_grid(
+            derived = derived_machine(parsed.machine, {**declare, "sku": sku})
+            sub = sweep_topologies(
                 replace(parsed, machine=derived), candidates=candidates,
                 num_devices=num_devices, sla_ms=sla_ms, context=context,
                 phase=phase, scope=scope, tokens_per_seq=tokens_per_seq,
@@ -454,7 +458,7 @@ def sweep_topology_grid(
             mem = Memory(cand_case, workspace_tokens=1)
             weight_bytes_per_die = float(max(mem.weights))
             kv_bytes_per_token_per_die = float(max(mem.cache_bytes(seq_probe, padded=False)) / seq_probe)
-            sla_res = solve_hardware_sla_throughput(
+            sla_res = solve_sla_sizing(
                 cand_case, sla_ms=sla_ms, context=context, phase=phase, scope=scope,
                 tokens_per_seq=tokens_per_seq, output_budget=output_budget,
                 max_sequences_per_dp=max_sequences_per_dp, scenarios=_BASELINE_SCENARIO,
@@ -535,10 +539,13 @@ def _pool_kv_hbm_ms(parsed_pool: CaseSpec, mem_pool: Memory, tokens: int) -> flo
 
 
 def sweep_pd_disaggregation_ratios(
-    prefill_case: CaseSpec | Mapping[str, Any], decode_case: CaseSpec | Mapping[str, Any], *,
-    total_dies: int, prompt_tokens: int = 4096, output_tokens: int = 1024,
-    decode_context: int | None = None, ttft_sla_ms: float = 3000.0,
-    tpot_sla_ms: float = 30.0, kv_transfer_bw_gbps: float = 100.0,
+    prefill_case: CaseSpec | Mapping[str, Any],
+    decode_case: CaseSpec | Mapping[str, Any], *, total_dies: int,
+    prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
+    output_tokens: int = DEFAULT_OUTPUT_TOKENS,
+    decode_context: int | None = None, ttft_sla_ms: float = DEFAULT_TTFT_SLA_MS,
+    tpot_sla_ms: float = DEFAULT_SLA_MS,
+    kv_transfer_bw_gbps: float = DEFAULT_KV_TRANSFER_BW_GBPS,
 ) -> dict[str, Any]:
     """Sweep disaggregated Prefill/Decode instance counts and KV handoff bottlenecks."""
     n_total_dies = _check_pos_int("total_dies", total_dies, minimum=1)
@@ -577,7 +584,7 @@ def sweep_pd_disaggregation_ratios(
 
     d_mem = Memory(d_parsed)
     decode_tokens_needed = n_output - 1
-    if decode_tokens_needed <= 0:
+    if decode_tokens_needed <= ZERO:
         kv_bytes_per_request = 0.0
         kv_transfer_ms_per_request = 0.0
         rps_p1 = ((p_dp * 1000.0) / max(prefill_step_ms, 1e-12)) if (prefill_sla_ok and prefill_hbm_ok) else 0.0
@@ -619,9 +626,11 @@ def sweep_pd_disaggregation_ratios(
             d_parsed, output_budget=n_output, tokens_per_seq=None, emitted_tokens_per_seq=None,
         )
         step_budget_ms = decode_budget_ms * max(1.0, float(d_emit_est))
-        d_sla_res = solve_hardware_sla_throughput(
-            d_parsed, sla_ms=max(step_budget_ms, 1e-9) if step_budget_ms > 0.0 else tpot_sla_ms * max(1.0, float(d_emit_est)),
-            context=eff_decode_ctx, phase="decode", output_budget=n_output, scenarios=[DEFAULT_SLA_SCENARIOS[0]],
+        d_sla_res = solve_sla_sizing(
+            d_parsed, sla_ms=(max(step_budget_ms, _PARETO_EPS)
+                              if step_budget_ms > ZERO
+                              else tpot_sla_ms * max(ONE_FLOAT, float(d_emit_est))),
+            context=eff_decode_ctx, phase="decode", output_budget=n_output, scenarios=[DEFAULT_SLA_SCENARIOS[FIRST]],
         )
         d_scen = d_sla_res["scenarios"][0]
         emit_tokens = float(d_sla_res["emitted_tokens_per_seq"])
@@ -652,9 +661,9 @@ def sweep_pd_disaggregation_ratios(
         raw_rps_d1 = (max(1, int(d_scen["b_feasible"])) * d_dp * emit_tokens * 1000.0) / (max(decode_step_ms, 1e-12) * float(decode_tokens_needed))
 
     rows: list[dict[str, Any]] = []
-    for n_p in range(1, (n_total_dies // d_p) + 1):
+    for n_p in range(ONE, (n_total_dies // d_p) + ONE):
         max_nd = (n_total_dies - n_p * d_p) // d_d
-        for n_d in range(1, max_nd + 1):
+        for n_d in range(ONE, max_nd + ONE):
             used_dies = n_p * d_p + n_d * d_d
             r_p = n_p * rps_p1
             r_kv = r_p if decode_tokens_needed <= 0 else n_p * rps_kv1
@@ -662,7 +671,7 @@ def sweep_pd_disaggregation_ratios(
             feasible = bool(infeasible_reason is None and min(r_p, r_kv, r_d) > 0.0)
             r_sys = min(r_p, r_kv, r_d) if feasible else 0.0
             sustainable_tps = r_sys * float(n_output)
-            if decode_tokens_needed <= 0:
+            if decode_tokens_needed <= ZERO:
                 bottleneck_stage = "prefill"
             else:
                 stage_rates = (("prefill", r_p), ("kv_transfer", r_kv), ("decode", r_d if decode_budget_ms > 0.0 else n_d * raw_rps_d1))
@@ -730,4 +739,4 @@ def sweep_pd_disaggregation_ratios(
     }
 
 
-__all__ = ["compute_pareto_frontier", "enumerate_parallel_candidates", "solve_afd_pareto", "sweep_pd_disaggregation_ratios", "sweep_topology_grid"]
+__all__ = ["compute_pareto_frontier", "enumerate_parallel_candidates", "sweep_pd_disaggregation_ratios", "sweep_topologies"]

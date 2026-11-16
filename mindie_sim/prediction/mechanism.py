@@ -94,11 +94,10 @@ class OperatorPlan:
 
     def lower(self, context: RecipeContext) -> Program:
         if self.native:
-            from fractions import Fraction
-            from .piecewise.compiler import NativeProgram
+            from .program import NativeProgram
             inner = self.program(replace(context, setup_ms=0, minimum_ms=0))
             return NativeProgram(
-                inner, tuple(getattr(inner, "work", ()) or ()), Fraction(0))
+                inner, tuple(getattr(inner, "work", ()) or ()))
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
             Stage("body", after=("setup",),

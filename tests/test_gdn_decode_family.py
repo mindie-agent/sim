@@ -17,7 +17,7 @@ from mindie_sim.schema.workload import IterationPlan, RequestView
 def _recurrent_case():
     parsed = parse_case({
         "machine": {
-            "name": "declared-gpu", "architecture": "cuda", "num_devices": 1,
+            "name": "declared-gpu", "architecture": "declared", "num_devices": 1,
             "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
                        "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
             "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,

@@ -213,7 +213,7 @@
     }
   ],
   "fixture_provenance": {
-    "source": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-priority/priority-three-level-scoreboard.json",
+    "source": "repository://profiler/examples/structure/acceptance-20261030-priority/priority-three-level-scoreboard.json",
     "selection": "One exact completed/failed GLM c96 pair; compact fields, population counts recomputed for subset"
   }
 }

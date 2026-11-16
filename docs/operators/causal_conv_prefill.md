@@ -4,14 +4,14 @@
 
 | Item | Value |
 | --- | --- |
-| Source | `/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/mamba/ops/causal_conv1d.py` |
+| Source | `repository://vllm-v0.25.1/vllm/model_executor/layers/mamba/ops/causal_conv1d.py` |
 | SHA-256 | `5f3d16d730fd6dc427cf6981a3de58b1e1e625e624ae8fa0fe77891f58b8bd5c` |
 | Bytes | 49533 |
 | Kernel | `_causal_conv1d_fwd_kernel`, lines 16-465 |
 | Wrapper | `causal_conv1d_fn`, lines 468-745 |
 | Selected implementation | `triton_causal_conv1d_fwd` |
 | Selected wrapper paths | explicit `null_block_id=None` (`HAS_NULL_BLOCK=False`) and the literal wrapper default `null_block_id=0` (`HAS_NULL_BLOCK=True`) |
-| Auxiliary constant source | `/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/backends/utils.py` lines 45-46, `PAD_SLOT_ID = -1` and `NULL_BLOCK_ID = 0`; SHA-256 `192e6b5df24ff52ae57a6a23d6cf58d1b4dd34f14c9283ce268e5f88b1123b96` |
+| Auxiliary constant source | `repository://vllm-v0.25.1/vllm/v1/attention/backends/utils.py` lines 45-46, `PAD_SLOT_ID = -1` and `NULL_BLOCK_ID = 0`; SHA-256 `192e6b5df24ff52ae57a6a23d6cf58d1b4dd34f14c9283ce268e5f88b1123b96` |
 | Layout | channel-last `x:(channels, sum(lengths))`; `out` same shape |
 | Element dtype | `bf16` for every campaign case; fp16/fp32 are representable by the same work model |
 
@@ -416,7 +416,7 @@ source-grid CTA, including null-block CTAs in cases where one is selected.
 Command and result:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py \
   mindie_sim.prediction.operators.causal_conv_prefill \
   tests/fixtures/operator_cases/causal_conv_prefill.json \
@@ -433,7 +433,7 @@ hardware accuracy evidence and none of their durations is used as a parameter.
 Focused tests:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest tests/operators/test_causal_conv_prefill.py -q
 # 43 passed
 ```

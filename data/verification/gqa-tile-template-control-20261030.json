@@ -4,7 +4,7 @@
   "scope": "preserves every finite task and dependency; no new timing or contention approximation",
   "reference_revision": "21422237",
   "runtime_file": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
+    "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
     "sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
     "bytes": 32018
   },
@@ -26,7 +26,7 @@
       "context_tokens": 126000
     },
     "case": {
-      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+      "path": "repository://profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
       "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408",
       "bytes": 151098
     },

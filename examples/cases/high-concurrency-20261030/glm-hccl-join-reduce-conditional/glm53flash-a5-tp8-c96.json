@@ -137,12 +137,12 @@
       "accepted_state_scenario": {
         "id": "glm53flash-a5-tp8-c96",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c96--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/glm53flash-a5-tp8-c96--attention-plus-down.json",
           "sha256": "9a78a7abccdc070d1ba413cff5f203dfde4862bd0c02e0270192cec2049f043b",
           "size_bytes": 5070
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },
@@ -173,7 +173,7 @@
       },
       "hccl_composed_condition": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/glm53flash-a5-tp8-c96.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/glm53flash-a5-tp8-c96.json",
           "sha256": "414af1f3ff2e2e901566e394a81fc5dbe14f75415e870ea886d07095c659848e"
         },
         "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",
@@ -213,11 +213,11 @@
         "runner": "vllm_ascend/ops/fused_moe/fused_moe.py:199-237,269-349",
         "runtime_guard": "vllm_ascend/ops/register_custom_ops.py:127-155",
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/glm53flash-a5-tp8-c96.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/glm53flash-a5-tp8-c96.json",
           "sha256": "a40616da45466593a2a33ab42f569af17be51b7116325eacf43d69b213456745"
         },
         "source_audit": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
           "sha256": "61f3b6426f2805fdee225975cb48dfa8c189c253b0bf6ca7f8a40d8599ab7b95"
         },
         "parallel_condition": "EP=DP=CP=PCP=1; no SP/latent output transform; TP-sharded shared weights",

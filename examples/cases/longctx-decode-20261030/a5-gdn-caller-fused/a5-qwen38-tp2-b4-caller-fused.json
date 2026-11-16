@@ -164,7 +164,7 @@
       },
       "frozen_scalar_store_binding": {
         "source_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp2-long-context-source.json",
+          "path": "repository://profiler/examples/structure/cases/a5-qwen38-tp2-long-context-source.json",
           "sha256": "0bf393628880d3c8ca5a6091e9c45b6324d5f01f82585b9903c226686dffa6ec",
           "size_bytes": 4500
         },
@@ -191,7 +191,7 @@
       },
       "frozen_hccl_transfer": {
         "parameter_source": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+          "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
           "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
           "size_bytes": 31247
         },
@@ -204,7 +204,7 @@
       },
       "native_norm_caller_binding": {
         "source_case": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
+          "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a5-gdn-hccl-frozen/a5-qwen38-tp2-mesh_oneshot-frozen.json",
           "sha256": "762774059603a5278c5f3ae99e77ac55ebab227e08d3e588a4d4c7bf351765e5",
           "size_bytes": 7809
         },

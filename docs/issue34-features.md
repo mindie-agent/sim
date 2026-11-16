@@ -90,8 +90,6 @@ when both specify the same field. `--memory-gib` is exactly `2**30` bytes.
 
 ```sh
 python3 -B scripts/check_no_magic_numbers.py --base <base> --root .
-python3 -B scripts/check_issue34_test_budget.py \
-  --pattern 'tests/test_issue34_*.py' --limit-seconds 3
 python3 .github/scripts/check_lf_eol.py
 ```
 

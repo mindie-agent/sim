@@ -205,7 +205,7 @@ def _normalize_parsed_case(case: Case) -> Case:
     # Carry the unaltered case machine/model identity with the parsed runtime so
     # every ordinary FeatureConfig/compiled feature record receives it.  This is
     # the deployment identity, not a measured supply or model-label branch.
-    from .subgraphs.instantiate import _identity_metadata
+    from .frontend_features import _identity_metadata
     metadata.update(_identity_metadata(case.machine, model))
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:

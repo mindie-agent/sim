@@ -283,7 +283,7 @@ def test_cli_compose_efficiency_and_sla_end_to_end(tmp_path: Path) -> None:
     assert scaled_b >= base_b
 
 
-def test_cli_sweep_and_skew_modes(tmp_path: Path) -> None:
+def test_cli_sweep_modes(tmp_path: Path) -> None:
     case_path = tmp_path / "case.json"
     case_dict = compose_case("qwen3.5-35b-a3b", hardware="a3", tp=2, dp=2, ep=4, layers=1)
     case_dict["runtime"]["max_num_seqs"] = 4
@@ -303,27 +303,6 @@ def test_cli_sweep_and_skew_modes(tmp_path: Path) -> None:
         "-o", str(pd_out),
     ]) == 0
     assert "pd" in json.loads(pd_out.read_text(encoding="utf-8"))["schema"]
-
-    dp_out = tmp_path / "skew_dp.json"
-    assert main([
-        "skew", str(case_path), "--mode", "dp-barrier", "--dp-contexts", "1024", "4096",
-        "--dp-sequences", "2", "4", "-o", str(dp_out),
-    ]) == 0
-    assert json.loads(dp_out.read_text(encoding="utf-8"))["schema"] == "mindie-sim.multi-dp-skew/1"
-
-    moe_out = tmp_path / "skew_moe.json"
-    assert main([
-        "skew", str(case_path), "--mode", "moe-imbalance", "--imbalance-factor", "2.0",
-        "--redundant-experts-per-rank", "1", "-o", str(moe_out),
-    ]) == 0
-    assert json.loads(moe_out.read_text(encoding="utf-8"))["schema"] == "mindie-sim.moe-imbalance/1"
-
-    cp_out = tmp_path / "skew_cp.json"
-    assert main([
-        "skew", str(case_path), "--mode", "chunked-prefill", "--chunk-tokens", "512", "1024",
-        "--context", "2048", "--sequences", "2", "-o", str(cp_out),
-    ]) == 0
-    assert json.loads(cp_out.read_text(encoding="utf-8"))["schema"] == "mindie-sim.chunked-prefill-interference/1"
 
 
 def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:

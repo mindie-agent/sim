@@ -85,7 +85,7 @@
       "mtp_policy": "metadata proves 3 proposed tokens per draft event; actual target query geometry awaits tensor extraction",
       "gdn_primitive_parameters": {
         "identity": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
+          "path": "repository://sim-rewrite-20261027/data/observations/gating-probe-20261028/native-queue-holdout/parameters.json",
           "sha256": "6dd37dd1fe824e7fed73262d84f27c1aa385498fc508d3582759467348bdacfb",
           "bytes": 1046
         },
