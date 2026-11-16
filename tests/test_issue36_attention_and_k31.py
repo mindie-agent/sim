@@ -156,3 +156,19 @@ def test_mixed_decode_prefill_mla_keeps_full_prefill_work():
     assert sum(item is not None for item in schedules) == 1
     scheduled = next(item for item in schedules if item is not None)
     assert scheduled["query_rows"] == 1
+
+
+def _prefill_dcp_roles(cp_plan, cp, pcp, devices):
+    from test_parallel_r7_adversarial import _dense
+    from mindie_sim.parallel_prefill_cost import prefill_step_ms
+    case = _dense(tp=2, cp=cp, pcp=pcp, kv_heads=1, num_devices=devices,
+                  max_seqs=1)
+    parallel = replace(case.runtime.parallel, cp_plan=cp_plan)
+    case = replace(case, runtime=replace(case.runtime, parallel=parallel))
+    step = prefill_step_ms(case, isl=256, prefix_hit_rate=0.0, batch=1)
+    return {operation.role for operation in step["comm_ledger"].operations}
+
+
+def test_prefill_dcp_plan_keeps_dcp_comm_and_pcp_dcp_suppresses_it():
+    assert "dcp" in _prefill_dcp_roles("dcp", 2, 1, 2)
+    assert "dcp" not in _prefill_dcp_roles("pcp_dcp", 2, 2, 4)

@@ -33,6 +33,7 @@ from collections.abc import Mapping, Sequence
 import math
 from typing import Any
 
+from mindie_sim.catalog.attention_common import active_dcp_degree
 from mindie_sim.fabric_topology import HierarchicalFabricTree
 from mindie_sim.parallel_comm_ledger import (CommLedgerBuilder, empty_ledger,
                                              merge_ledgers, reduce_route_evidence)
@@ -304,7 +305,7 @@ def prefill_step_ms(case: CaseSpec | Mapping[str, Any], *, isl: int,
                 groups = stage_groups(plan, stage, axis)
                 value = tp_payload
                 if axis == "dcp":
-                    if int(p.dcp) <= ONE or str(getattr(p, "prefill_cp_plan", "")) != "dcp":
+                    if active_dcp_degree(p, "prefill") <= ONE:
                         continue
                     from mindie_sim.parallel_context import dcp_merge_payloads
                     value = dcp_merge_payloads(int(p.tp), int(p.dcp), size,
