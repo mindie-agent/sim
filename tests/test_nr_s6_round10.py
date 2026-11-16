@@ -44,7 +44,6 @@ from pathlib import Path
 from mindie_profiler import repro_atomic_io as checked_io
 import subprocess
 import sys
-import tempfile
 
 import pytest
 
@@ -59,6 +58,7 @@ from mindie_sim.diff_trace import (attribute_diff, call_mcp_tool as diff_mcp, re
 )
 
 from nr_s6_support import paged_binding
+from temp_cleanup import tempdir
 from test_nr_s6_round2_closure import _ready_bindings
 
 PROJECT_ROOT = Path(checked_io.__file__).resolve().parents[1]
@@ -138,7 +138,7 @@ SCOPED = ("mindie_profiler/op_api_registry.py", "mindie_profiler/op_api_paging.p
 )
 
 def _fresh_root(prefix="nr_s6_r10_"):
-    return Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    return tempdir(prefix, directory="/tmp")
 
 def _compact(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
@@ -403,7 +403,7 @@ def test_r10_mcp_literal_ellipsis_handles_are_structured(handle):
     assert estimate_tokens(envelope) <= 250
 
 def test_r10_mcp_literal_ellipsis_in_a_valid_root(monkeypatch):
-    root = Path(tempfile.mkdtemp(prefix="r10...-", dir="/tmp"))
+    root = tempdir("r10...-", directory="/tmp")
     monkeypatch.setenv("MINDIE_REPRO_SHORT_ROOT", str(root))
     import shutil
     try:

@@ -1,34 +1,25 @@
 #!/usr/bin/env python3
 """Per-file Issue #34 test wall-time and new-module budget gate.
 
-[Role]
-  Run every new Issue #34 test file in its own pytest subprocess, measure the
-  whole subprocess with a monotonic clock and fail at or above the declared
-  limit.  Also check every new Python module for the four-section header and its
-  line budget, and report oversized legacy integration deltas.
-
-[Invariants]
-  * No retries or best-of sampling: one wall clock around the entire subprocess
-    including collection and fixtures; a timeout is a failure.
-  * Header/line budgets read actual files; a long docstring is never waived.
-  * Legacy deltas are reported, never silently ignored.
-
-[Timeouts & Locks]
-  Each subprocess has an explicit timeout; no background work or locks.
-
-[Side-Effect Policy]
-  Writes only JUnit/basetemp artifacts under the supplied directory.
+[Role] Run every new Issue #34 test file in its own pytest subprocess, measure
+  the whole subprocess with a monotonic clock and fail at or above the declared
+  limit; also check module header/line budgets and legacy integration deltas.
+[Invariants] No retries or best-of sampling: one wall clock around the entire
+  subprocess; a timeout is a failure. Header/line budgets read actual files.
+[Timeouts & Locks] Each subprocess has an explicit timeout; no background work.
+[Side-Effect Policy] Writes only JUnit/basetemp artifacts under the supplied
+  directory and removes an internally created directory on every exit path.
 """
 from __future__ import annotations
 
 import argparse
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
 import time
-
 SCRIPT_DIR = Path(__file__).resolve().parent
 DEFAULT_LIMIT_SECONDS = 3.0
 TIMEOUT_MULTIPLIER = 10.0
@@ -152,20 +143,7 @@ def run_file(root: Path, path: Path, *, limit: float, artifacts: Path) -> dict:
             "over_budget": elapsed >= limit, "output_tail": output[-2000:]}
 
 
-def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--pattern", default="tests/test_issue34_*.py")
-    parser.add_argument("--limit-seconds", type=float,
-                        default=DEFAULT_LIMIT_SECONDS)
-    parser.add_argument("--artifacts", default=None)
-    parser.add_argument("--root", default=None)
-    parser.add_argument("--base", default=None)
-    parser.add_argument("--skip-tests", action="store_true")
-    args = parser.parse_args(argv)
-    root = Path(args.root or SCRIPT_DIR.parent).resolve()
-    artifacts = Path(args.artifacts or tempfile.mkdtemp(
-        prefix="issue34-budget-")).resolve()
-    artifacts.mkdir(parents=True, exist_ok=True)
+def _run(args, root: Path, artifacts: Path) -> int:
     files = sorted(root.glob(args.pattern))
     problems = check_new_modules(root)
     problems.extend(f"{path.relative_to(root)}: {len(path.read_text().splitlines())}"
@@ -194,6 +172,28 @@ def main(argv: list[str] | None = None) -> int:
     print(f"issue34 budget: {len(results)} test files under "
           f"{args.limit_seconds}s; headers/line limits ok")
     return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--pattern", default="tests/test_issue34_*.py")
+    parser.add_argument("--limit-seconds", type=float,
+                        default=DEFAULT_LIMIT_SECONDS)
+    parser.add_argument("--artifacts", default=None)
+    parser.add_argument("--root", default=None)
+    parser.add_argument("--base", default=None)
+    parser.add_argument("--skip-tests", action="store_true")
+    args = parser.parse_args(argv)
+    root = Path(args.root or SCRIPT_DIR.parent).resolve()
+    created_temp = args.artifacts is None
+    artifacts = Path(args.artifacts or tempfile.mkdtemp(
+        prefix="issue34-budget-")).resolve()
+    artifacts.mkdir(parents=True, exist_ok=True)
+    try:
+        return _run(args, root, artifacts)
+    finally:
+        if created_temp:
+            shutil.rmtree(artifacts, ignore_errors=True)
 
 
 if __name__ == "__main__":

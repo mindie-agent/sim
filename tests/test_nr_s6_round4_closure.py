@@ -223,8 +223,8 @@ def test_f6_pre_and_post_sync_failures_keep_one_collective_protocol():
         (None, {1: True}),
     )
     for sync, alloc in cases:
-        world, results, _ = run_ranks(_probe_plan(), sync_actions=sync,
-                                      fail_alloc=alloc)
+        world, results = run_ranks(
+            _probe_plan(), sync_actions=sync, fail_alloc=alloc)
         _assert_order(world, results)
         assert not any(item.get("validated") is True
                        for _, records in results.values() for item in records)
@@ -234,7 +234,7 @@ def test_f7_post_sync_deadline_rejects_the_final_sample():
     plan["deadline"]["measurement_budget_s"] = 0.9
     plan["deadline"]["cleanup_allowance_s"] = 0.1
     plan["deadline"]["max_wall_s"] = 1.0
-    world, results, _ = run_ranks(
+    world, results = run_ranks(
         plan, sync_actions={0: {4: ("advance", 2.0)},
                             1: {4: ("advance", 2.0)}})
     _assert_order(world, results)

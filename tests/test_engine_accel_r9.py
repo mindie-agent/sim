@@ -21,13 +21,13 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import warnings
 import weakref
 import zipfile
 
 import pytest
 
+from temp_cleanup import tempdir
 from mindie_sim.prediction.engine import Engine, Resource
 from mindie_sim.prediction.runtime.accel_tables import _is_inert_builtin
 
@@ -439,7 +439,7 @@ def test_r9_3_universal_wheel_ships_every_runtime_resource():
     workspace = {path.relative_to(ROOT).as_posix(): path.read_bytes()
                  for path in _package_files()}
     assert len(workspace) >= PACKAGE_FILES
-    base = Path(tempfile.mkdtemp(prefix="nr-s3-r9-wheel-"))
+    base = tempdir("nr-s3-r9-wheel-")
     try:
         wheel = _build_wheel(base)
         import mindie_sim

@@ -36,7 +36,6 @@ from mindie_profiler import repro_atomic_io as checked_io
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 import time
 
@@ -63,6 +62,7 @@ from mindie_sim.diff_trace import (
 
 from nr_s6_round4_probe import BrokerDist, World, run_ranks
 from nr_s6_support import paged_binding
+from temp_cleanup import tempdir
 from test_nr_s6_round2_closure import _ready_bindings
 
 
@@ -97,7 +97,7 @@ def _samples(results):
 
 
 def _fresh_root():
-    return Path(tempfile.mkdtemp(prefix="r7cas-", dir="/tmp"))
+    return tempdir("r7cas-", directory="/tmp")
 
 
 # ----------------------------------------------------------------------- F1
@@ -273,7 +273,7 @@ def test_f7_two_size_plan_covers_every_completion_edge():
     assert plan["status"] == "admitted"
     assert plan["budget_s"] == 1.0
     assert plan["deadline"]["measurement_budget_s"] == 0.9
-    baseline, healthy, _tmp = run_ranks(plan, sync_actions=_latency())
+    baseline, healthy = run_ranks(plan, sync_actions=_latency())
     assert baseline.errors == {}
     assert _codes(healthy) == [0, 0]
     base_samples = _samples(healthy)
@@ -285,7 +285,7 @@ def test_f7_two_size_plan_covers_every_completion_edge():
     final_gate = len(baseline.broker.decision_logs[1])
     assert final_gate > 0
 
-    late_min, late_min_results, _tmp = run_ranks(
+    late_min, late_min_results = run_ranks(
         plan, sync_actions=_latency(), decision_delay=(1, final_gate, 2.0))
     assert late_min.errors == {}
     late_min_codes = _codes(late_min_results)
@@ -299,7 +299,7 @@ def test_f7_two_size_plan_covers_every_completion_edge():
     assert late_min_profile["run_evidence_blocked"] is True
     assert late_min_profile["usable_for_link_override"] is False
 
-    late_destroy, late_destroy_results, _tmp = run_ranks(
+    late_destroy, late_destroy_results = run_ranks(
         plan, sync_actions=_latency(), destroy_delay={1: 2.0})
     assert late_destroy.errors == {}
     late_destroy_codes = _codes(late_destroy_results)
@@ -313,7 +313,7 @@ def test_f7_two_size_plan_covers_every_completion_edge():
     assert late_destroy_profile["run_evidence_blocked"] is True
     assert late_destroy_profile["usable_for_link_override"] is False
 
-    failed, failed_results, _tmp = run_ranks(
+    failed, failed_results = run_ranks(
         plan, sync_actions=_latency(), fail_destroy={1: True})
     assert failed.errors == {}
     failed_codes = _codes(failed_results)
@@ -324,7 +324,7 @@ def test_f7_two_size_plan_covers_every_completion_edge():
 
 def test_f7_cleanup_control_survives_direct_and_cli_fit(tmp_path):
     plan = _two_size_plan()
-    world, results, _tmp = run_ranks(
+    world, results = run_ranks(
         plan, sync_actions=_latency(), fail_destroy={1: True})
     assert world.errors == {}
     records = _rows(results)
@@ -353,7 +353,7 @@ def test_f7_cleanup_control_survives_direct_and_cli_fit(tmp_path):
     assert payload["run_evidence_blocked"] is True
     assert payload["usable_for_link_override"] is False
 
-    healthy, healthy_results, _tmp = run_ranks(
+    healthy, healthy_results = run_ranks(
         plan, sync_actions=_latency())
     assert _codes(healthy_results) == [0, 0]
     clean = parse_fabric_probe_samples(_rows(healthy_results))

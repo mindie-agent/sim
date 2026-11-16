@@ -1,5 +1,5 @@
 name = "mindie_sim_spec"
-version = "0.9.14"
+version = "0.9.15"
 defaultTargets = ["MindIESimSpec", "AxiomCheck"]
 
 [[lean_lib]]

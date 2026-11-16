@@ -18,13 +18,12 @@
   a bounded timeout and no device or process group is created.
 
 [Side-Effect Policy]
-  Writes only the caller-supplied temporary JSONL paths.
+  Owns one process-temporary workspace for JSONL/abort records, removes it on
+  every normal, error and timeout path, and leaves no caller cleanup behind.
 """
 
 from __future__ import annotations
 
-import contextlib
-import io
 import json
 import os
 from pathlib import Path
@@ -255,6 +254,8 @@ class World:
         self.destroy_delay = {0: 0.0, 1: 0.0}
         self.names = {"rank-0": 0, "rank-1": 1}
         self.barrier = threading.Barrier(2)
+        self.abort_path = None
+        self.abort_record = None
 
     def rank(self):
         name = threading.current_thread().name
@@ -464,43 +465,53 @@ def run_ranks(plan, *, sync_actions=None, fail_alloc=None, data_actions=None,
     sys.modules["torch_npu"] = npu
     sys.modules["torch.distributed"] = distributed
     results = {}
-    tmp = tempfile.mkdtemp(prefix="nr4-probe-")
-    try:
-        def runner(rank):
-            namespace = {"__name__": f"round4_probe_{rank}"}
-            script = _rank_script(plan, rank)
-            exec(compile(script, f"<probe-{rank}>", "exec"), namespace)
-            clock = world.clocks[rank]
-            namespace["time"] = types.SimpleNamespace(
-                monotonic=clock.monotonic,
-                perf_counter_ns=clock.perf_counter_ns)
-            output = os.path.join(tmp, f"rank{rank}.jsonl")
-            abort_path = os.path.join(tmp, "abort.json")
-            world.abort_path = abort_path
+    with tempfile.TemporaryDirectory(
+            prefix="nr4-probe-", ignore_cleanup_errors=True) as workspace:
+        tmp = Path(workspace)
+        try:
+            def runner(rank):
+                namespace = {"__name__": f"round4_probe_{rank}"}
+                script = _rank_script(plan, rank)
+                exec(compile(script, f"<probe-{rank}>", "exec"), namespace)
+                clock = world.clocks[rank]
+                namespace["time"] = types.SimpleNamespace(
+                    monotonic=clock.monotonic,
+                    perf_counter_ns=clock.perf_counter_ns)
+                output = os.path.join(tmp, f"rank{rank}.jsonl")
+                abort_path = os.path.join(tmp, "abort.json")
+                world.abort_path = abort_path
+                try:
+                    code = namespace["main"](["--output", output,
+                                              "--abort-file", abort_path])
+                    results[rank] = (code, [json.loads(line) for line in
+                                            Path(f"{output}.rank{rank}.jsonl").read_text().splitlines()
+                                            if line.strip()])
+                except TimeoutError:
+                    raise
+                except Exception as exc:  # broker mismatch / injected failure
+                    results[rank] = (None, [])
+                    world.errors[rank] = repr(exc)
+
+            threads = [threading.Thread(target=runner, args=(rank,), name=f"rank-{rank}")
+                       for rank in (0, 1)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout)
+                if thread.is_alive():
+                    world.errors[thread.name] = "thread join timeout"
+        finally:
+            for name, value in old.items():
+                if value is None:
+                    sys.modules.pop(name, None)
+                else:
+                    sys.modules[name] = value
+        abort_file = tmp / "abort.json"
+        if abort_file.is_file():
             try:
-                code = namespace["main"](["--output", output,
-                                          "--abort-file", abort_path])
-                results[rank] = (code, [json.loads(line) for line in
-                                        Path(f"{output}.rank{rank}.jsonl").read_text().splitlines()
-                                        if line.strip()])
+                world.abort_record = json.loads(abort_file.read_text())
             except TimeoutError:
                 raise
-            except Exception as exc:  # broker mismatch / injected failure
-                results[rank] = (None, [])
-                world.errors[rank] = repr(exc)
-
-        threads = [threading.Thread(target=runner, args=(rank,), name=f"rank-{rank}")
-                   for rank in (0, 1)]
-        for thread in threads:
-            thread.start()
-        for thread in threads:
-            thread.join(timeout)
-            if thread.is_alive():
-                world.errors[thread.name] = "thread join timeout"
-    finally:
-        for name, value in old.items():
-            if value is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = value
-    return world, results, tmp
+            except (OSError, ValueError):
+                world.abort_record = None
+    return world, results

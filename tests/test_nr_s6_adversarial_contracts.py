@@ -34,11 +34,13 @@ import types
 
 import pytest
 
+from temp_cleanup import tempdir
+
 @pytest.fixture(autouse=True)
 def _isolate_short_root(monkeypatch):
-    import shutil as _shutil, tempfile as _tempfile
-    short = _tempfile.mkdtemp(prefix='mp_', dir='/tmp')
-    monkeypatch.setenv('MINDIE_REPRO_SHORT_ROOT', short)
+    import shutil as _shutil
+    short = tempdir('mp_', directory='/tmp')
+    monkeypatch.setenv('MINDIE_REPRO_SHORT_ROOT', str(short))
     try:
         yield
     finally:

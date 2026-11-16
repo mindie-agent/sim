@@ -96,7 +96,7 @@ from .public import (
     simulate_service,
 )
 
-__version__ = "0.9.14"
+__version__ = "0.9.15"
 __all__ = ["predict", "predict_pd", "attribute_diff", "effective_operator_rows", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
            "call_costs", "build_call",
            "compose_case", "resolve_hardware_sku", "derive_hardware_sku",

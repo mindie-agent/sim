@@ -19,10 +19,11 @@ import ctypes
 from pathlib import Path
 import shutil
 import subprocess
-import tempfile
 from unittest.mock import patch
 
 import pytest
+
+from temp_cleanup import tempdir
 
 ROOT = Path(__file__).resolve().parents[1]
 RUNTIME = ROOT / "mindie_sim" / "prediction" / "runtime"
@@ -78,7 +79,7 @@ def fault_library():
     """Compile the unchanged kernel with a one-shot failing ``realloc``."""
     compiler, _ = accel_build.discover_compiler()
     assert compiler, "a C compiler is required for the R7 fault probes"
-    directory = tempfile.mkdtemp(prefix="nr-s3-r7-fault-")
+    directory = tempdir("nr-s3-r7-fault-")
     source = Path(directory) / "fault_wrapper.c"
     source.write_text(WRAPPER, encoding="ascii")
     output = Path(directory) / f"fault_wrapper{accel_build.library_extension()}"

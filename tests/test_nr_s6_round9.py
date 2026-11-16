@@ -32,7 +32,6 @@ from mindie_profiler import repro_atomic_io as checked_io
 import shutil
 import subprocess
 import sys
-import tempfile
 import threading
 from unittest.mock import patch
 
@@ -52,6 +51,7 @@ from mindie_sim.diff_trace import (
 )
 
 from nr_s6_support import paged_binding
+from temp_cleanup import tempdir
 from test_nr_s6_round2_closure import _ready_bindings
 from test_nr_s6_round8 import _r16_fds, _r16_no_leaks
 
@@ -94,7 +94,7 @@ PADDINGS = {
 }
 
 def _fresh_root(prefix):
-    return Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    return tempdir(prefix, directory="/tmp")
 
 def _sha(path):
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()

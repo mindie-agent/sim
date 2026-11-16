@@ -214,7 +214,7 @@ def test_f6_late_local_clock_cannot_break_the_shared_protocol():
     plan["deadline"]["measurement_budget_s"] = 0.9
     plan["deadline"]["max_wall_s"] = 1.0
     plan["deadline"]["cleanup_allowance_s"] = 0.1
-    world, results, _tmp = run_ranks(
+    world, results = run_ranks(
         plan, decision_delay=(1, 6, 2.0))
     assert world.errors == {}
     assert world.broker.mismatches == []
@@ -223,7 +223,7 @@ def test_f6_late_local_clock_cannot_break_the_shared_protocol():
     assert world.broker.decision_logs[1][-1] == 0
 
 def test_f6_latency_excludes_min_gate_coordination_time():
-    world, results, _tmp = run_ranks(
+    world, results = run_ranks(
         _probe_plan(iterations=2, warmup=0), decision_advance=0.010)
     samples = _samples(results)
     assert world.errors == {}
@@ -233,7 +233,7 @@ def test_f6_latency_excludes_min_gate_coordination_time():
 
 def test_f6_data_failure_signals_peer_abort_without_timeout():
     plan = _probe_plan(iterations=2, warmup=0)
-    world, results, tmp = run_ranks(plan, data_actions={1: {2: "raise"}})
+    world, results = run_ranks(plan, data_actions={1: {2: "raise"}})
     assert world.errors == {}
     assert world.broker.mismatches == []
     assert world.broker.aborted is True
@@ -242,15 +242,15 @@ def test_f6_data_failure_signals_peer_abort_without_timeout():
                 if item.get("kind") == "failed"]
     assert "collective_failed" in statuses
     assert "peer_aborted" in statuses
-    assert checked_io.path_is_file(Path(tmp, "abort.json"))
-    assert json.loads(Path(tmp, "abort.json").read_text())["rank"] == 1
+    assert world.abort_record is not None
+    assert world.abort_record["rank"] == 1
 
 def test_f7_late_telemetry_disqualifies_completion_on_both_ranks():
     plan = _probe_plan(iterations=1, warmup=0)
     plan["budget_s"] = 1.0
     plan["deadline"]["measurement_budget_s"] = 0.9
     plan["deadline"]["max_wall_s"] = 1.0
-    world, results, _tmp = run_ranks(plan, clock_advance=2.0)
+    world, results = run_ranks(plan, clock_advance=2.0)
     samples = _samples(results)
     assert world.errors == {}
     assert world.broker.mismatches == []
@@ -261,7 +261,7 @@ def test_f7_late_telemetry_disqualifies_completion_on_both_ranks():
 
 def test_f7_cleanup_failure_is_recorded_and_returns_two():
     plan = _probe_plan(iterations=1, warmup=0)
-    world, results, _tmp = run_ranks(
+    world, results = run_ranks(
         plan, fail_destroy={0: True, 1: True})
     assert world.errors == {}
     assert world.broker.mismatches == []

@@ -5,16 +5,22 @@
   subprocess, and publish it under an immutable content+generation address.
 [Invariants] The wheel ships source only: no build-time native extension, no
   compiler download and no network.  The cache key hashes every shipped source
-  byte, compiler identity/version, platform/pointer-width/endianness identity and
-  every semantic flag.  A validated library path is never overwritten: each
-  build publishes a fresh generation file plus an atomic readiness manifest.
-  Temporary names are unique per process, thread and monotonic tick.  A build
-  failure never tombstones the key and never changes simulation semantics.
+  byte, the resolved compiler binary/version, platform/pointer-width/endianness
+  identity and every semantic flag; the caller's raw ``PATH`` is not an input,
+  so every virtualenv resolving the same system compiler shares one artifact.
+  A validated library path is never overwritten: each build publishes a fresh
+  generation file plus an atomic readiness manifest.  Temporary names are unique
+  per process, thread and monotonic tick, and failed publications remove their
+  snapshot, temporary and candidate files.  A build failure never tombstones
+  the key and never changes simulation semantics.
 [Timeouts & Locks] One argv-list subprocess with no shell; compile budget 20 s,
   compiler probe 15 s, ABI validation 15 s.  Publication is an atomic ``os.link``
   into a fresh generation path; an existing library inode is never replaced.
-[Side-Effect Policy] Reads the packaged sources and environment; writes only the
-  content-addressed cache directory.  No model, hardware or network access.
+  Retention is bounded by ``MAX_CACHED_ARTIFACTS`` and evicts oldest-first via
+  atomic rename; a mapped Windows library defers eviction without failing.
+[Side-Effect Policy] Reads the packaged sources and environment; writes and
+  prunes only the content-addressed cache directory.  No model, hardware or
+  network access.
 """
 from __future__ import annotations
 
@@ -46,6 +52,9 @@ COMPILE_TIMEOUT_SECONDS = 20.0
 PROBE_TIMEOUT_SECONDS = 15.0
 VALIDATE_TIMEOUT_SECONDS = 15.0
 MAX_DIAGNOSTIC_BYTES = 2000
+MAX_CACHED_ARTIFACTS = 16
+MAX_COMPILER_MARKERS = 16
+STALE_TEMP_SECONDS = 3600.0
 _BASE_FLAGS = (
     "-std=c11", "-O3", "-fPIC", "-fno-fast-math", "-ffp-contract=off",
     "-fno-strict-aliasing",
@@ -141,26 +150,49 @@ def _unique_temp(directory: Path, prefix: str, suffix: str) -> Path:
     return Path(name)
 
 
-def _identity_paths(compiler: str) -> str:
-    """Environment paths that can change which toolchain answers ``cc``."""
-    return "|".join(os.environ.get(name, "") for name in ("PATH", "SDKROOT"))
-
-
-def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
+def _resolve_compiler(compiler: str) -> str:
+    """Resolve a compiler name to the executable that PATH actually selects."""
+    found = shutil.which(compiler) or compiler
     try:
-        stat = os.stat(compiler)
+        return str(Path(found).resolve())
+    except TimeoutError:
+        raise
+    except OSError:
+        return os.path.abspath(found)
+
+
+def _compiler_context(compiler: str) -> tuple[str, str, str]:
+    """Resolved binary, Stat footprint and SDK root for a toolchain identity.
+
+    The caller's ``PATH`` is deliberately absent: distinct virtualenvs or
+    benchmark slots that resolve the same system compiler must share one cache
+    key.  Only the selected executable and explicit SDK root are inputs.
+    """
+    resolved = _resolve_compiler(compiler)
+    try:
+        stat = os.stat(resolved)
         footprint = f"{stat.st_size}:{stat.st_mtime_ns}"
     except TimeoutError:
         raise
     except OSError:
         footprint = "unknown"
-    key = (compiler, footprint, _identity_paths(compiler))
+    sdkroot = os.environ.get("SDKROOT", "")
+    if sdkroot:
+        sdkroot = os.path.normpath(os.path.abspath(
+            os.path.expanduser(sdkroot)))
+    return resolved, footprint, sdkroot
+
+
+def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
+    resolved, footprint, sdkroot = _compiler_context(compiler)
+    platform_identity = _platform_identity()
+    key = (resolved, footprint, sdkroot, platform_identity)
     with _MEMO_LOCK:
         cached = _IDENTITY_MEMO.get(key)
     if cached is not None:
         return cached
     marker_key = hashlib.sha256(
-        f"{compiler}|{footprint}|{key[2]}".encode()).hexdigest()[:16]
+        "|".join(("compiler-identity-v2", *key)).encode()).hexdigest()[:16]
     marker = cache_root() / f"compiler-{marker_key}.id"
     if persist:
         try:
@@ -176,7 +208,7 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
     version = "unknown"
     try:
         completed = subprocess.run(
-            [compiler, "--version"], capture_output=True, text=True,
+            [resolved, "--version"], capture_output=True, text=True,
             timeout=PROBE_TIMEOUT_SECONDS, check=False, **_SUBPROCESS_KWARGS)
         lines = (completed.stdout or completed.stderr or "").splitlines()
         if lines:
@@ -187,19 +219,31 @@ def _compiler_identity(compiler: str, *, persist: bool = False) -> str:
         version = "timeout"
     except OSError:
         version = "unavailable"
-    identity = f"{Path(compiler).name}|{footprint}|{version}|{key[2]}"
+    identity = (
+        f"{Path(resolved).name}|{footprint}|{version}|{sdkroot}|"
+        f"{platform_identity}")
     with _MEMO_LOCK:
         _IDENTITY_MEMO[key] = identity
     if persist:
+        temporary = None
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
             temporary = _unique_temp(marker.parent, "identity", ".tmp")
             temporary.write_text(identity)
             os.replace(temporary, marker)
+            temporary = None
         except TimeoutError:
             raise
         except OSError:
             pass
+        finally:
+            if temporary is not None:
+                try:
+                    temporary.unlink(missing_ok=True)
+                except TimeoutError:
+                    raise
+                except OSError:
+                    pass
     return identity
 
 
@@ -303,11 +347,156 @@ def _read_manifest(digest: str) -> Path | None:
     return None
 
 
+def _artifact_paths(cache_dir: Path) -> list[Path]:
+    """Content-generation libraries: ``<64-hex digest>-<generation>.<ext>``."""
+    extension = library_extension()
+    try:
+        entries = list(cache_dir.iterdir())
+    except TimeoutError:
+        raise
+    except OSError:
+        return []
+    artifacts = []
+    for path in entries:
+        try:
+            if not path.is_file():
+                continue
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+        name = path.name
+        if not name.endswith(extension):
+            continue
+        stem = name[:-len(extension)]
+        digest, separator, generation = stem.partition("-")
+        if (separator and len(digest) == 64
+                and all(char in "0123456789abcdef" for char in digest)
+                and generation.isdigit()):
+            artifacts.append(path)
+    return artifacts
+
+
+def _mtime_ns(path: Path) -> int:
+    try:
+        return path.stat().st_mtime_ns
+    except TimeoutError:
+        raise
+    except OSError:
+        return 0
+
+
+def _discard_path(path: Path) -> bool:
+    """Atomically quarantine then unlink; mapped Windows files are deferred."""
+    trash = path.with_name(
+        f".trash-{os.getpid()}-{threading.get_ident()}-"
+        f"{time.monotonic_ns()}-{path.name}.tmp")
+    try:
+        os.replace(path, trash)
+    except TimeoutError:
+        raise
+    except PermissionError:
+        return False
+    except OSError:
+        return False
+    try:
+        trash.unlink()
+    except TimeoutError:
+        raise
+    except PermissionError:
+        pass
+    except OSError:
+        pass
+    return True
+
+
+def _keep_names(artifacts: list[Path], keep_key: str | Path | None) -> set[str]:
+    if keep_key is None:
+        return set()
+    if isinstance(keep_key, Path):
+        return {keep_key.name}
+    text = str(keep_key)
+    if any(path.name == text for path in artifacts):
+        return {text}
+    if len(text) == 64 and all(char in "0123456789abcdef" for char in text):
+        matches = [path for path in artifacts
+                   if path.name.startswith(text + "-")]
+        if matches:
+            return {max(matches, key=_mtime_ns).name}
+    return {Path(text).name}
+
+
+def _prune_engine_cache(cache_dir: Path, *, keep_key: str | Path | None = None,
+                        max_artifacts: int = MAX_CACHED_ARTIFACTS) -> list[Path]:
+    """Bound engine libraries and manifests by oldest-first atomic eviction.
+
+    The newest ``max_artifacts`` generation files are retained and the current
+    ``keep_key`` (digest, filename or path) is never evicted.  When an older
+    Windows process still maps a ``.dll``/``.pyd``, rename or unlink can fail;
+    that eviction is deferred and its manifest stays valid for a later run.
+    Stale compiler markers beyond 16 entries and temporaries older than one
+    hour are reclaimed independently of artifact retention.
+    """
+    removed: list[Path] = []
+    artifacts = _artifact_paths(cache_dir)
+    keep = _keep_names(artifacts, keep_key)
+    ordered = sorted(artifacts, key=lambda path: (_mtime_ns(path), path.name))
+    remaining = len(ordered)
+    limit = max(0, int(max_artifacts))
+    for path in ordered:
+        if remaining <= limit:
+            break
+        if path.name in keep:
+            continue
+        if not _discard_path(path):
+            continue
+        removed.append(path)
+        remaining -= 1
+        manifest = _manifest_path(path)
+        if _discard_path(manifest):
+            removed.append(manifest)
+    for manifest in sorted(cache_dir.glob("*.json")):
+        try:
+            payload = json.loads(manifest.read_text())
+        except TimeoutError:
+            raise
+        except (OSError, ValueError):
+            payload = None
+        library = Path(str((payload or {}).get("library", "")))
+        try:
+            orphan = not library.is_file()
+        except TimeoutError:
+            raise
+        except OSError:
+            orphan = True
+        if orphan and _discard_path(manifest):
+            removed.append(manifest)
+    markers = sorted(cache_dir.glob("compiler-*.id"),
+                     key=_mtime_ns, reverse=True)
+    for marker in markers[max(0, int(MAX_COMPILER_MARKERS)):]:
+        if _discard_path(marker):
+            removed.append(marker)
+    stale_before = time.time() - STALE_TEMP_SECONDS
+    for temporary in cache_dir.glob("*.tmp"):
+        try:
+            stale = temporary.stat().st_mtime < stale_before
+        except TimeoutError:
+            raise
+        except OSError:
+            continue
+        if stale and _discard_path(temporary):
+            removed.append(temporary)
+    return removed
+
+
 def _publish(compiler: str, flags: list[str], destination_dir: Path,
              files: dict[str, bytes], digest: str) -> tuple[bool, str, Path | None]:
     """Compile an immutable snapshot and publish it under a fresh generation."""
     snapshot_dir = None
     temporary = None
+    manifest_temp = None
+    candidate = None
+    published = False
     try:
         destination_dir.mkdir(parents=True, exist_ok=True)
         snapshot_dir = Path(tempfile.mkdtemp(
@@ -348,7 +537,6 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
         valid, reason = _validate(temporary)
         if not valid:
             return False, reason, None
-        candidate = None
         for generation in range(100001):
             target = destination_dir / (
                 f"{digest.hex() if isinstance(digest, bytes) else digest}"
@@ -375,13 +563,17 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
         try:
             manifest = _manifest_path(candidate)
             payload = json.dumps({"digest": digest, "library": str(candidate)})
-            handle = _unique_temp(destination_dir, "manifest", ".tmp")
-            handle.write_text(payload)
-            os.replace(handle, manifest)
+            manifest_temp = _unique_temp(destination_dir, "manifest", ".tmp")
+            manifest_temp.write_text(payload)
+            os.replace(manifest_temp, manifest)
+            manifest_temp = None
         except TimeoutError:
             raise
         except OSError as error:
             return False, f"publication_failed:{error}", None
+        published = True
+        _prune_engine_cache(destination_dir, keep_key=candidate,
+                            max_artifacts=MAX_CACHED_ARTIFACTS)
         return True, "", candidate
     finally:
         if snapshot_dir is not None:
@@ -398,12 +590,28 @@ def _publish(compiler: str, flags: list[str], destination_dir: Path,
                 raise
             except OSError:
                 pass
+        if manifest_temp is not None:
+            try:
+                manifest_temp.unlink(missing_ok=True)
+            except TimeoutError:
+                raise
+            except OSError:
+                pass
+        if candidate is not None and not published:
+            _discard_path(candidate)
+            _discard_path(_manifest_path(candidate))
 
 
-def _memo_key(digest: bytes) -> tuple:
+def _memo_key(digest: bytes, compiler: str | None,
+              identity: str | None) -> tuple:
+    """Memoize by source, resolved compiler identity, flags and cache root.
+
+    ``PATH`` is intentionally not part of this key: it only selects the
+    compiler, and the resolved identity already captures that choice.
+    """
     return (
-        digest, str(cache_root()), os.environ.get("MINDIE_SIM_CC", ""),
-        os.environ.get("PATH", ""), tuple(compiler_flags()),
+        digest, str(cache_root()), compiler, identity,
+        tuple(compiler_flags()),
     )
 
 
@@ -420,11 +628,11 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
         raise
     except OSError as error:
         return _failure("source_unavailable", detail=str(error), check_only=check_only)
-    key = _memo_key(data)
     compiler, reason = discover_compiler()
     identity = None
     if compiler is not None:
         identity = _compiler_identity(compiler, persist=not check_only)
+    key = _memo_key(data, compiler, identity)
     # A success memo is reusable only while its exact artifact still exists
     # and the current compiler identity is byte-identical to the memoized one.
     if not force and not check_only:
@@ -460,6 +668,10 @@ def build_accel(*, check_only: bool = False, force: bool = False) -> dict:
             "toolchain_ready": True, "library_ready": existing is not None,
         }
     if existing is not None and not force:
+        # Upgrade cleanup: a valid hit still reclaims historical duplicate
+        # generations left by older PATH-keyed releases.
+        _prune_engine_cache(cache_root(), keep_key=existing,
+                            max_artifacts=MAX_CACHED_ARTIFACTS)
         status = {
             "ok": True, "backend": "c_native", "reason": None, "detail": "",
             "compiler": compiler, "compiler_identity": identity, "flags": flags,

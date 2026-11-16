@@ -3,9 +3,13 @@
 [Role] Keep user HOME/config/data/diagnostics/cache directories and accelerator
   build memos untouched across every test module.
 [Invariants] `isolated_cache` provides one session-local `MINDIE_CACHE_HOME` and
-  cleans it on teardown; `isolated_runtime` isolates per-test runtime paths.
+  cleans it on teardown; `isolated_short_root` gives reproducer storage a fresh
+  short ASCII root so concurrent runs cannot collide in ``/tmp/mprof``;
+  `isolated_runtime` isolates per-test runtime paths. Every session temporary
+  root is also tracked for session/process cleanup.
 [Timeouts & Locks] No threads, sleeps, or external I/O beyond temporary dirs.
-[Side-Effect Policy] Writes only temporary directories created by pytest/tempfile.
+[Side-Effect Policy] Writes and removes only temporary directories created by
+  pytest/tempfile.
 """
 from __future__ import annotations
 
@@ -14,21 +18,29 @@ import os
 from pathlib import Path
 import shutil
 import sys
-import tempfile
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+TESTS = Path(__file__).resolve().parent
+for _entry in (ROOT, TESTS):
+    if str(_entry) not in sys.path:
+        sys.path.insert(0, str(_entry))
 
+from temp_cleanup import cleanup as cleanup_tempdirs  # noqa: E402
+from temp_cleanup import tempdir  # noqa: E402
 from mindie_sim.observations.kernels import PROFILER_API_REQUIREMENT  # noqa: E402
 from mindie_sim.prediction.runtime import accel_build  # noqa: E402
 
 
+def pytest_sessionfinish(session, exitstatus):
+    """Remove tracked temporary roots even if a fixture teardown was skipped."""
+    cleanup_tempdirs()
+
+
 @pytest.fixture(scope="session", autouse=True)
 def isolated_cache():
-    base = tempfile.mkdtemp(prefix="nr-s3-accel-")
+    base = tempdir("nr-s3-accel-")
     names = (
         "MINDIE_CACHE_HOME",
         "MINDIE_DATA_HOME",
@@ -38,7 +50,7 @@ def isolated_cache():
         "MINDIE_SIM_CC",
     )
     old = {name: os.environ.get(name) for name in names}
-    os.environ["MINDIE_CACHE_HOME"] = base
+    os.environ["MINDIE_CACHE_HOME"] = str(base)
     for name in names[1:]:
         os.environ.pop(name, None)
     accel_build.reset_build_memo()
@@ -54,9 +66,25 @@ def isolated_cache():
         shutil.rmtree(base, ignore_errors=True)
 
 
+@pytest.fixture(autouse=True)
+def isolated_short_root():
+    """Own a fresh short reproducer root instead of the shared ``/tmp/mprof``."""
+    old = os.environ.get("MINDIE_REPRO_SHORT_ROOT")
+    root = tempdir("mprof-", directory="/tmp")
+    os.environ["MINDIE_REPRO_SHORT_ROOT"] = str(root)
+    try:
+        yield root
+    finally:
+        if old is None:
+            os.environ.pop("MINDIE_REPRO_SHORT_ROOT", None)
+        else:
+            os.environ["MINDIE_REPRO_SHORT_ROOT"] = old
+        shutil.rmtree(root, ignore_errors=True)
+
+
 @pytest.fixture(scope="session")
 def _worker_runtime_root():
-    root = Path(tempfile.mkdtemp(prefix="nr-s3-runtime-")).resolve()
+    root = tempdir("nr-s3-runtime-").resolve()
     try:
         yield root
     finally:

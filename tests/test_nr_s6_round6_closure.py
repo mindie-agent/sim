@@ -33,7 +33,6 @@ from mindie_profiler import repro_atomic_io as checked_io
 import shutil
 import subprocess
 import sys
-import tempfile
 import time
 
 import pytest
@@ -50,6 +49,7 @@ from mindie_sim.diff_trace_release import release_delays, tail_gap
 
 from nr_s6_round4_probe import BrokerDist, run_ranks
 from nr_s6_support import paged_binding
+from temp_cleanup import tempdir
 from test_nr_s6_round4_closure import _probe_plan
 from test_nr_s6_round5_closure import (
     _READY_TYPES, _invoke_all_ready, _ready_invoke_setup,
@@ -69,7 +69,7 @@ def _records(results):
 
 
 def _fresh_short_root():
-    return Path(tempfile.mkdtemp(prefix="r6cas-", dir="/tmp"))
+    return tempdir("r6cas-", directory="/tmp")
 
 
 # ----------------------------------------------------------------------- F1
@@ -186,7 +186,7 @@ def test_f1_captured_terminal_gap_replaces_not_adds_to_the_baseline():
 # ----------------------------------------------------------------------- F6
 def test_f6_validation_data_failure_signals_abort_without_timeout():
     plan = _probe_plan(iterations=1, warmup=0)
-    world, results, tmp = run_ranks(plan, data_actions={1: {1: "raise"}})
+    world, results = run_ranks(plan, data_actions={1: {1: "raise"}})
     assert world.errors == {}
     assert world.broker.mismatches == []
     assert world.broker.aborted is True
@@ -195,7 +195,8 @@ def test_f6_validation_data_failure_signals_abort_without_timeout():
                 if item.get("kind") == "failed"}
     assert "collective_failed" in statuses
     assert "peer_aborted" in statuses
-    abort = json.loads(Path(tmp, "abort.json").read_text())
+    abort = world.abort_record
+    assert abort is not None
     assert abort["rank"] == 1
     assert abort["step"] == "validation_data_collective"
 
@@ -206,7 +207,7 @@ def test_f6_file_only_peer_wakeup_without_private_hooks():
     plan = _probe_plan(iterations=1, warmup=0)
     assert "_mindie_" not in emit_fabric_probe_script(plan)["script"]
     started = time.monotonic()
-    world, results, _tmp = run_ranks(plan, data_actions={1: {2: "raise"}})
+    world, results = run_ranks(plan, data_actions={1: {2: "raise"}})
     elapsed = time.monotonic() - started
     assert world.errors == {}
     assert world.broker.mismatches == []
@@ -222,7 +223,7 @@ def _spawn(code, *args):
 
 
 def test_f6_supervisor_terminates_a_blocked_peer_promptly():
-    tmp = tempfile.mkdtemp(prefix="r6sup-")
+    tmp = tempdir("r6sup-")
     abort = Path(tmp, "abort.json")
     writer = (
         "import json, sys;"
@@ -277,10 +278,10 @@ def test_f7_late_final_min_gate_cannot_certify_a_sample():
     plan["deadline"]["cleanup_allowance_s"] = 0.1
     assert plan["status"] == "admitted"
     latency = {0: {4: ("advance", 0.0001)}, 1: {4: ("advance", 0.0001)}}
-    baseline, base_results, _tmp = run_ranks(plan, sync_actions=latency)
+    baseline, base_results = run_ranks(plan, sync_actions=latency)
     assert _codes(base_results) == [0, 0]
     assert len(baseline.broker.decision_logs[1]) == 8
-    world, results, tmp = run_ranks(
+    world, results = run_ranks(
         plan, sync_actions=latency, decision_delay=(1, 8, 2.0))
     assert world.errors == {}
     assert world.broker.mismatches == []
@@ -294,7 +295,8 @@ def test_f7_late_final_min_gate_cannot_certify_a_sample():
     assert all(item["validated"] is False for item in samples)
     assert all(item["disqualified_reason"] == "deadline_exceeded"
                for item in samples)
-    abort = json.loads(Path(tmp, "abort.json").read_text())
+    abort = world.abort_record
+    assert abort is not None
     assert abort["reason"] == "deadline_exceeded"
     profile = fit_calibrated_fabric_profile(plan, _records(results),
                                             abort_record=abort)
@@ -310,7 +312,7 @@ def test_f7_abort_record_alone_rejects_a_calibrated_override():
     plan["budget_s"] = 1.0
     plan["deadline"]["measurement_budget_s"] = 0.9
     plan["deadline"]["max_wall_s"] = 1.0
-    world, results, tmp = run_ranks(
+    world, results = run_ranks(
         plan, sync_actions={0: {4: ("advance", 0.0001)},
                             1: {4: ("advance", 0.0001)}})
     assert world.errors == {}
@@ -318,10 +320,9 @@ def test_f7_abort_record_alone_rejects_a_calibrated_override():
     rows = [item for item in _records(results)
             if item.get("schema") == "mindie-fabric-probe-sample/2"]
     assert rows and all(item["latency_us"] > 0 for item in rows)
-    abort = json.loads(Path(tmp, "abort.json").read_text()) \
-        if checked_io.path_is_file(Path(tmp, "abort.json")) else {
-            "kind": "status", "status": "deadline_exceeded",
-            "reason": "deadline_exceeded", "rank": 1}
+    abort = world.abort_record or {
+        "kind": "status", "status": "deadline_exceeded",
+        "reason": "deadline_exceeded", "rank": 1}
     profile = fit_calibrated_fabric_profile(plan, rows, abort_record=abort)
     assert profile["usable_for_link_override"] is False
     assert profile["run_evidence_blocked"] is True

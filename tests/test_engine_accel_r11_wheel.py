@@ -20,8 +20,9 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
-import tempfile
 import zipfile
+
+from temp_cleanup import tempdir
 
 ROOT = Path(__file__).resolve().parents[1]
 NATIVE = ("c", "auto")
@@ -150,7 +151,7 @@ print(json.dumps(out))
 
 def test_r11_fixes_hold_on_the_installed_pep517_wheel():
     """The built wheel reproduces both R11 closures from its shipped sources."""
-    base = Path(tempfile.mkdtemp(prefix="nr-s3-r11-wheel-"))
+    base = tempdir("nr-s3-r11-wheel-")
     try:
         wheel = _wheel(base)
         _verify_wheel(wheel)

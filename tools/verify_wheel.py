@@ -4,7 +4,9 @@
 [Invariants] Use real captures for imports; heldout fixtures never calibrate
   the serving examples. Installation must not resolve the source package.
 [Timeouts & Locks] Environment setup <= 120 s; each CLI call <= 60 s.
-[Side-Effect Policy] Creates a temporary virtualenv and the requested report.
+[Side-Effect Policy] Creates a temporary virtualenv and the requested report;
+  removes the workspace on all paths unless a caller-owned directory or
+  ``--keep-work`` is supplied.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ from copy import deepcopy
 import json
 import math
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -297,9 +300,7 @@ def verify_source_boundaries(run, root, work):
                for row in situ["isolated"]["operators"])
 
 
-def verify(wheel, root, output, *, profiler_wheel=None):
-    root, wheel = Path(root).resolve(), Path(wheel).resolve()
-    work = Path(tempfile.mkdtemp(prefix="sim-wheel-"))
+def _verify_workspace(wheel, root, output, work, *, profiler_wheel=None):
     env = work / "env"
     win_kw = {"creationflags": getattr(subprocess, "CREATE_NO_WINDOW", 0)} if sys.platform == "win32" else {}
     subprocess.run(["uv", "venv", "--python", sys.executable, str(env)],
@@ -552,8 +553,9 @@ def verify(wheel, root, output, *, profiler_wheel=None):
         "graph-balanced-expert-cohort")
     balanced_serving = run(
         ["predict", work / "balanced-cohort.json"], "predict-balanced-expert-cohort")
-    wire = lambda report: {key: value for key, value in report["execution"]["serviced"].items()
-                           if key.startswith("link:")}
+    def wire(report):
+        return {key: value for key, value in report["execution"]["serviced"].items()
+                if key.startswith("link:")}
     assert balanced_graph["replicas"] == [0, 1]
     assert balanced_serving["status"] == "modeled"
     assert wire(balanced_graph) == wire(balanced_serving)
@@ -840,6 +842,32 @@ def verify(wheel, root, output, *, profiler_wheel=None):
     return report
 
 
+def verify(wheel, root, output, *, profiler_wheel=None, work_dir=None,
+           keep_work=False):
+    """Run the installed-wheel verification in a cleanup-owned workspace.
+
+    A workspace created here is removed on every success, failure and timeout
+    path.  ``work_dir`` adopts a caller-owned directory and is never removed;
+    ``keep_work`` retains an internally created workspace for diagnosis.
+    """
+    root, wheel = Path(root).resolve(), Path(wheel).resolve()
+    owned = work_dir is None
+    if owned:
+        work = Path(tempfile.mkdtemp(prefix="sim-wheel-"))
+    else:
+        work = Path(work_dir).expanduser().resolve()
+        work.mkdir(parents=True, exist_ok=True)
+    try:
+        return _verify_workspace(wheel, root, output, work,
+                                 profiler_wheel=profiler_wheel)
+    finally:
+        if owned:
+            if keep_work:
+                print(f"kept verification workspace: {work}", file=sys.stderr)
+            else:
+                shutil.rmtree(work, ignore_errors=True)
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("wheel")
@@ -847,6 +875,12 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output", required=True)
     parser.add_argument("--profiler-wheel",
                         help="local companion wheel for optional profiling import checks")
+    parser.add_argument("--work-dir",
+                        help="caller-owned workspace (never removed automatically)")
+    parser.add_argument("--keep-work", action="store_true",
+                        help="retain an internally created workspace for diagnosis")
     args = parser.parse_args()
     print(json.dumps(verify(args.wheel, args.root, args.output,
-                            profiler_wheel=args.profiler_wheel), indent=2))
+                            profiler_wheel=args.profiler_wheel,
+                            work_dir=args.work_dir,
+                            keep_work=args.keep_work), indent=2))

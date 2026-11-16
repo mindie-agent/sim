@@ -42,7 +42,6 @@ from mindie_profiler.fabric_probe import emit_fabric_probe_script
 from pathlib import Path
 from mindie_profiler import repro_atomic_io as checked_io
 import shutil
-import tempfile
 
 import pytest
 
@@ -62,6 +61,7 @@ from mindie_sim.diff_trace import (
 )
 
 from nr_s6_support import paged_binding
+from temp_cleanup import tempdir
 
 
 TOPOLOGY = {"tiers": [{"tier": "intra_node_hccs", "ranks": [0, 1],
@@ -104,7 +104,7 @@ def _assert_blocked(profile):
 
 
 def _fresh_root(prefix="nr_s6_r8_"):
-    return Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    return tempdir(prefix, directory="/tmp")
 
 
 def _cli_profile(tmp_path, samples_text):

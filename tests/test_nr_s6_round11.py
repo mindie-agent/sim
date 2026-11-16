@@ -35,7 +35,6 @@ from pathlib import Path
 __import__("pytest").importorskip("mindie_profiler")
 from mindie_profiler import repro_atomic_io as checked_io
 import shutil
-import tempfile
 import builtins
 import io
 import sys
@@ -58,6 +57,7 @@ from mindie_sim.diff_trace import (
 )
 from nr_s6_support import paged_binding
 from mindie_profiler import repro_storage as storage
+from temp_cleanup import tempdir
 from test_nr_s6_round8 import _r16_fds, _r16_no_leaks, _r16_probe_namespace
 
 
@@ -78,7 +78,7 @@ def _real(value, encoders):
 
 
 def _root(prefix="nr_s6_r11_"):
-    base = Path(tempfile.mkdtemp(prefix=prefix, dir="/tmp"))
+    base = tempdir(prefix, directory="/tmp")
     return base, base / "cas"
 
 
@@ -173,7 +173,7 @@ def test_r11_resolve_long_path_is_a_structured_transition(monkeypatch):
 @pytest.mark.parametrize("root_length", [33, 48])
 def test_r11_resolve_33_and_48_byte_roots_do_not_raise(
         monkeypatch, root_length):
-    base = Path(tempfile.mkdtemp(prefix="nr_s6_r11root_", dir="/tmp"))
+    base = tempdir("nr_s6_r11root_", directory="/tmp")
     root = base / ("r" * max(1, root_length - len(str(base)) - 1))
     assert len(str(root)) == root_length
     try:
