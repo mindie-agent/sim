@@ -13,6 +13,8 @@ from mindie_sim.catalog.types import QuantSpec
 ZERO = 0
 ONE = 1
 FIRST = 0
+ZERO_FLOAT = 0.0
+NODE_RANKS_DEFAULT = 1
 
 
 @dataclass(frozen=True)
@@ -37,10 +39,13 @@ class WeightTerm:
     #: Already-resolved physical per-rank multiplicity (expert slots).  It is
     #: never divided by EP again.
     resident_count: int | None = None
+    #: Runtime residency ownership.  A source-only checkpoint tensor is not a
+    #: resident copy; a runtime-only prepared copy is not a logical parameter.
+    runtime_owned: bool = True
 
     @property
-    def logical_parameters(self) -> float:
-        return float(self.rows) * float(self.cols) * float(self.count)
+    def logical_parameters(self) -> int:
+        return int(self.rows) * int(self.cols) * int(self.count)
 
 
 def _ceil_div(value: int, divisor: int) -> int:
@@ -116,10 +121,12 @@ def _legacy_sharded_shape(
 
 def term_bytes(
     term: WeightTerm, quant: QuantSpec, parallel: ParallelSpec,
-    node_ranks: int = 1, *, source: bool = False,
+    node_ranks: int = NODE_RANKS_DEFAULT, *, source: bool = False,
 ) -> float:
     if source and not term.source_owned:
-        return 0.0
+        return ZERO_FLOAT
+    if not source and not term.runtime_owned:
+        return ZERO_FLOAT
     rows, cols, count = _sharded_shape(term, parallel, node_ranks)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)
@@ -130,11 +137,13 @@ def term_bytes(
 
 def term_payload_bytes(
     term: WeightTerm, quant: QuantSpec, parallel: ParallelSpec,
-    node_ranks: int = 1, *, source: bool = False,
+    node_ranks: int = NODE_RANKS_DEFAULT, *, source: bool = False,
 ) -> float:
     """Packed payload bytes of one term (quant scales/zero-points excluded)."""
     if source and not term.source_owned:
-        return 0.0
+        return ZERO_FLOAT
+    if not source and not term.runtime_owned:
+        return ZERO_FLOAT
     rows, cols, count = _sharded_shape(term, parallel, node_ranks)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)

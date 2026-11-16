@@ -110,7 +110,7 @@ def test_qwen38_flash_next_qsa_indexer_and_lowrank_hc_invariants():
             "ple_gate", "ple_short_conv"} <= recipes
     assert recipes.isdisjoint({"hc_sinkhorn", "hc_values_fp32"})
 
-    cost = graph_costs(case, graphs)
+    cost = graph_costs(case, graphs, external_inputs={"analysis_input": 0})
     assert cost["duration_ms"] > 0
 
 
@@ -166,4 +166,4 @@ def test_ascend_five_entrypoint_smoke_matrix():
             layers=6, prompt_tokens=32, output_tokens=1,
         )
         graphs = target_graphs(case, phase="decode", tokens=1, context=512, scope="body")
-        assert graph_costs(case, graphs)["duration_ms"] > 0
+        assert graph_costs(case, graphs, external_inputs={"analysis_input": 0})["duration_ms"] > 0

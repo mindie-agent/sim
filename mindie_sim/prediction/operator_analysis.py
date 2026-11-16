@@ -549,17 +549,14 @@ def model_program(value, *, phase, tokens, context=ZERO, sequences=ONE,
 
 
 def physical_signature(op):
-    """All work/implementation axes, excluding only graph identity."""
-    data = op.to_dict()
-    for key in ("op_id", "deps", "stage", "layer", "requests", "stream", "notes"):
-        data.pop(key, None)
-    for key in ("collective_id", "reverse_of_collective"):
-        data["metadata"].pop(key, None)
-    return json.dumps(data, sort_keys=True, separators=(",", ":"))
+    """Deterministic serialization of the canonical physical key."""
+    from .physical_key import physical_signature as _signature
+    return _signature(op)
 
 
 def physical_id(op):
-    return sha256(physical_signature(op).encode()).hexdigest()
+    from .physical_key import physical_id as _identifier
+    return _identifier(op)
 
 
 def requires_collective_cohort(case, op, recipe):
@@ -599,9 +596,10 @@ def _cost_row(execution, op, recipe, context, *, identity, count, duration,
             "work_basis": "native_joint_service; operator_work_is_unexecuted_analytical_reference"}
            if context.joint_native_service is not None else {}),
         **_service_regime_row(context, duration),
-        "service_delta": {key: serviced.get(key, 0) - context.work.get(key, 0)
-                          for key in serviced.keys() | context.work.keys()
-                          if serviced.get(key, 0) != context.work.get(key, 0)},
+        "service_delta": {
+            key: serviced.get(key, ZERO) - context.work.get(key, ZERO)
+            for key in serviced.keys() | context.work.keys()
+            if serviced.get(key, ZERO) != context.work.get(key, ZERO)},
         "duration_ms": duration, "total_ms": duration * count,
         "input_ready_ms": input_ready_ms, "service_before_input": early_service,
         "serviced": {key: value for key, value in serviced.items() if value},
@@ -619,9 +617,16 @@ def _communication_description(accounting, recipe):
 
 
 def cohort_operator_costs(case, ops, *, recipes, primitives=None,
-                          replay_scope="none", input_ready_ms=0):
+                          replay_scope="none", input_ready_ms=ZERO,
+                          evaluation=None):
     """Isolate one complete transport cohort, attributing wire to source ranks."""
-    execution = Execution(case, CostModel(case, primitives), recipes=recipes)
+    from .cost import CostLedger
+    from .evaluation import EvaluationContext, context_for
+    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
+           else EvaluationContext.create(case, recipes, primitives))
+    execution = Execution(
+        case, ctx.cost, recipes=recipes,
+        bindings=ctx.bindings, ledger=CostLedger())
     engine, participants, identities, replica_scopes = execution.engine, [], {}, {}
     for replica, original in ops.items():
         identities[replica] = physical_id(original)
@@ -674,7 +679,8 @@ def cohort_operator_costs(case, ops, *, recipes, primitives=None,
     }
 
 
-def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_ms):
+def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_ms,
+                  evaluation=None):
     """Isolate joint transports once, retaining each replica's local programs."""
     from .dispatch import cohorts
 
@@ -712,7 +718,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
         if key not in cache:
             result = cohort_operator_costs(
                 case, dict(sorted(members.items())), recipes=recipes, primitives=primitives,
-                replay_scope={rank: scopes[rank] for rank in members}, input_ready_ms=input_ready_ms)
+                replay_scope={rank: scopes[rank] for rank in members},
+                input_ready_ms=input_ready_ms, evaluation=evaluation)
             result.update(id=f"cohort{len(cache)}", occurrences=0)
             for row in result["operators"]:
                 row.update(cohort_id=result["id"], occurrences=0, total_ms=0)
@@ -728,7 +735,8 @@ def _cohort_costs(case, graphs, recipes, primitives, replay_scope, input_ready_m
         local = tuple(op for op in items if (rank, op.op_id) not in joint_nodes)
         result = operator_costs(
             case, local, recipes=recipes, primitives=primitives,
-            replay_scope=scopes[rank], input_ready_ms=input_ready_ms, replica=rank)
+            replay_scope=scopes[rank], input_ready_ms=input_ready_ms, replica=rank,
+            evaluation=evaluation)
         rows.extend({"replica": rank, **row} for row in result["operators"])
     isolation_modes = {item[-1] for item in isolation}
     return {
@@ -765,17 +773,21 @@ def _replay_scope(ops, declared):
 
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
-                    input_ready_ms=ZERO, replica=ZERO):
+                    input_ready_ms=ZERO, replica=ZERO, evaluation=None):
     """Price local operators or complete replica->operators cohort mappings."""
     from .program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("operator_input_ready_time_must_be_finite_and_nonnegative")
+    from .evaluation import EvaluationContext, context_for
     case = consume_target_declaration(parse_case(case), ops)
+    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
+           else EvaluationContext.create(case, recipes, primitives))
     recipes = recipes or RecipeBook.from_mapping(case.runtime.kernels)
     if isinstance(ops, Mapping):
         from .exposed_breakdown import unavailable_breakdown
         result = _cohort_costs(
-            case, ops, recipes, primitives, replay_scope, input_ready_ms)
+            case, ops, recipes, primitives, replay_scope, input_ready_ms,
+            evaluation=ctx)
         result.update(unavailable_breakdown(
             "operator_only", boundary="operator_sum"))
         return result
@@ -798,7 +810,10 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
     rows = []
     for group in groups.values():
         op = group["op"]
-        execution = Execution(case, CostModel(case, primitives), recipes=recipes)
+        from .cost import CostLedger
+        execution = Execution(
+            case, ctx.cost, recipes=recipes,
+            bindings=ctx.bindings, ledger=CostLedger())
         identity = physical_id(op)
         op, recipe = execution.prepare(op, replica)
         if requires_collective_cohort(case, op, recipe):

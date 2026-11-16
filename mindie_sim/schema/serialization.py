@@ -71,9 +71,16 @@ def engram(raw):
 
 def auxiliary(raw):
     data = dict(raw)
+    derived = ("input_width", "proposal_tokens")
     for name in ("mtp", "dspark"):
         if data.get(name) is not None:
-            data[name] = DraftSpec(**data[name])
+            draft = {key: value for key, value in dict(data[name]).items()
+                     if key not in derived}
+            plans = tuple(
+                LayerPlan(**(dict(plan) if isinstance(plan, Mapping) else plan))
+                for plan in draft.get("layer_plans", ()))
+            draft["layer_plans"] = plans
+            data[name] = DraftSpec(**draft)
     return AuxiliarySpec(**data)
 
 

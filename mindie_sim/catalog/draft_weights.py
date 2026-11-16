@@ -29,10 +29,7 @@ def _local_draft_experts(num_experts: int, ep: int) -> int:
     width = max(1, int(ep))
     if experts <= 0:
         return 0
-    if experts % width != 0 and width % experts != 0:
-        raise ModelingError(
-            f"draft_experts_not_divisible_by_ep:{experts}%{width}")
-    return max(1, experts // width)
+    return max(ONE, (experts + width - ONE) // width)
 
 
 def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTerm]:

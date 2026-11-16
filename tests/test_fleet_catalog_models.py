@@ -197,7 +197,7 @@ def test_fleet_layer_plans_use_supported_attention_cores():
     assert all(p.architecture == "gemma4" and p.qk_norm for p in gemma26.layer_plans)
     assert all((p.num_kv_heads, p.head_dim, p.kv_cache_elements) == (8, 256, 2 * 8 * 256)
                for p in local26)
-    assert all((p.num_kv_heads, p.head_dim, p.kv_cache_elements) == (2, 512, 2 * 512)
+    assert all((p.num_kv_heads, p.head_dim, p.kv_cache_elements) == (2, 512, 2 * 2 * 512)
                for p in global26)
     assert all((p.ffn, p.num_experts, p.top_k, p.moe_intermediate_size,
                 p.num_shared_experts, p.shared_intermediate_size, p.ffn_activation)
@@ -400,7 +400,7 @@ def test_sparse_target_graphs_bound_attention_traffic_by_index_topk():
             assert attention.hbm_bytes == low_attention.hbm_bytes > 0, key
 
 
-def test_gemma4_k_eq_v_omits_value_projection_and_halves_cache_plane():
+def test_gemma4_k_eq_v_omits_value_projection_and_retains_two_cache_planes():
     model = load_model("gemma-4-26b-a4b")
     global_plan, local_plan = model.layer_plans[5], model.layer_plans[0]
     assert global_plan.k_eq_v and not local_plan.k_eq_v
@@ -426,7 +426,7 @@ def test_gemma4_k_eq_v_omits_value_projection_and_halves_cache_plane():
     assert qkv_width(graphs, 5) == 9216
     assert qkv_width(operators, 0) == 16 * 256 + 2 * 8 * 256 == 8192
     assert qkv_width(graphs, 0) == 8192
-    assert global_plan.cache_row_elements == 1 * 2 * 512
+    assert global_plan.cache_row_elements == 2 * 2 * 512
 
 
 def test_gemma4_inline_config_without_intermediate_size_builds():

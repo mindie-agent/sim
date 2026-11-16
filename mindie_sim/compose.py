@@ -65,7 +65,8 @@ HARDWARE_ALIASES: dict[str, str] = {
     "910b1": "Ascend910B1", "910b2": "Ascend910B2", "910b3": "Ascend910B3",
     "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
     "910_9382": "Ascend910_9382",
-    "a5": "Ascend910_9599", "950": "Ascend910_9599", "910_9599": "Ascend910_9599",
+    "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
+    "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
     "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
     "b300": "NVIDIA_B300",
     "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
@@ -82,6 +83,8 @@ HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
     "800i-a3-16p": ("Ascend910_9392", "a3_16p"),
     "a3-pod": ("Ascend910_9392", "a3_superpod"),
+    "a5-pod": ("Ascend950DT_9581", "a5_pod"),
+    "atlas-950-superpod": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-dt": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-pr": ("Ascend950PR_9579", "a5_pod"),
     "a5-server-dt": ("Ascend950DT_9581", "a5_server"),
@@ -112,6 +115,25 @@ DEFAULT_TTFT_MS = 5000.0
 DEFAULT_TPOT_MS = 50.0
 DEFAULT_LOCAL_WIDTH = 1
 DEFAULT_REDUNDANT_EXPERTS = 0
+
+
+CAPTURE_BASE_KEYS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+CAPTURE_MIN_SEQUENCES = 1
+CAPTURE_MIN_STRIDE = 1
+CAPTURE_DEFAULT_MTP = 0
+
+
+def capture_keys(max_num_seqs: int,
+                 mtp_proposal_tokens: int = CAPTURE_DEFAULT_MTP) -> list[int]:
+    """Capture buckets up to ``max_num_seqs * (1 + mtp)`` including strides."""
+    sequences = max(CAPTURE_MIN_SEQUENCES, int(max_num_seqs))
+    stride = max(CAPTURE_MIN_STRIDE,
+                 CAPTURE_MIN_STRIDE + int(mtp_proposal_tokens))
+    keys = set(CAPTURE_BASE_KEYS)
+    keys.update(stride * step for step in range(CAPTURE_MIN_SEQUENCES,
+                                                sequences + CAPTURE_MIN_SEQUENCES))
+    keys.add(sequences * stride)
+    return sorted(keys)
 
 
 def _arch_key(sku: str) -> str:
@@ -199,10 +221,7 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def _ensure_registered_profiles() -> dict[str, Any]:
-    reg = ascend_profiles()
-    if "Ascend910_9599" not in reg and "Ascend950DT_9582" in reg:
-        reg["Ascend910_9599"] = deepcopy(reg["Ascend950DT_9582"])
-    return reg
+    return ascend_profiles()
 
 
 def resolve_hardware_sku(hardware: str) -> str:
@@ -429,6 +448,7 @@ def compose_case(
     intra_bw_4p_gbps: float | None = None,
     intra_bw_8p_gbps: float | None = None,
     va_recommended: bool = False,
+    raw_eager: bool = False,
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
     *,
@@ -564,10 +584,15 @@ def compose_case(
     if preset:
         machine = {**machine, "topology_preset": preset}
 
+    if raw_eager and va_recommended:
+        raise ModelingError("raw_eager_conflicts_with_explicit_fusion")
+    if raw_eager:
+        sp = False
+        graph_capture_mode = "none"
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     va_profile: dict[str, Any] | None = None
-    if va_recommended and backend == "ascend":
+    if va_recommended and backend == "ascend" and not raw_eager:
         model_id = str(model) if isinstance(model, str) else str(model_spec.name)
         va_profile = va_recommended_config(model_id, sku)
         va_profile["quantization_action"] = (
@@ -666,6 +691,7 @@ def compose_case(
     runtime_meta: dict[str, Any] = {
         "sp": bool(sp),
         "moe_dispatch_quantization": "routed_expert",
+        **({"raw_eager": True} if raw_eager else {}),
     }
     if int(mtp_proposal_tokens) > 0:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
@@ -703,8 +729,8 @@ def compose_case(
         "metadata": runtime_meta,
     }
     if graph_capture_mode == "full":
-        max_cap = max(1, resolved_max_seqs * max(1, 1 + int(mtp_proposal_tokens)))
-        runtime_dict["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max_cap})
+        runtime_dict["graph_capture_keys"] = capture_keys(
+            resolved_max_seqs, mtp_proposal_tokens)
     elif graph_capture_mode == "piecewise":
         runtime_dict["piecewise_capture_keys"] = sorted(
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, resolved_max_batched}
@@ -1348,7 +1374,8 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         rt["graph_mode"] = "full"
         rt["graph_capture_mode"] = "full"
         max_seqs = int(rt.get("max_num_seqs", 16))
-        rt["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max(1, max_seqs)})
+        rt["graph_capture_keys"] = capture_keys(
+            max_seqs, int(rt.get("mtp_proposal_tokens", DEFAULT_ZERO) or DEFAULT_ZERO))
     meta = dict(rt.get("metadata", {}))
     meta["va_recommended"] = True
     meta["va_profile"] = deepcopy(va_profile)

@@ -39,6 +39,16 @@ A5 = {
 }
 A3_BUFFERS = {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 131072, "ub": 196608}
 A5_BUFFERS = {"l1": 524288, "l0a": 65536, "l0b": 65536, "l0c": 262144, "ub": 253952}
+L2_BY_SKU = {
+    "Ascend910B1": 201326592, "Ascend910B2": 201326592,
+    "Ascend910B2C": 201326592, "Ascend910B3": 201326592,
+    "Ascend910B4": 100663296, "Ascend910B4-1": 100663296,
+    "Ascend910_9391": 201326592, "Ascend910_9392": 201326592,
+    "Ascend910_9381": 201326592, "Ascend910_9382": 201326592,
+    "Ascend910_9372": 201326592, "Ascend910_9362": 176160768,
+    "Ascend950DT_9581": 134217728, "Ascend950DT_9582": 134217728,
+    "Ascend950PR_9579": 134217728,
+}
 
 
 def sku_case(sku):
@@ -124,7 +134,9 @@ def test_a3_hardware_parses_each_sku_clock_counts_and_recomputed_rates(sku):
     assert device.launch_us == 0
     assert device.compute_units == aic
     assert dict(device.rates)["hbm"] == pytest.approx(hbm)
-    assert dict(device.buffers) == A3_BUFFERS
+    buffers = dict(device.buffers)
+    assert buffers.pop("l2") == L2_BY_SKU[sku]
+    assert buffers == A3_BUFFERS
     assert dict(device.buffer_units)["ub"] == aiv
     assert device.units("mte1") == aic
     assert device.units("mte2_aic") == aic
@@ -205,7 +217,9 @@ def test_a3_capacity_and_intra_package_link_are_preserved():
     hardware = Hardware.from_mapping({"backend": "ascend", "sku": "Ascend910_9391", "num_devices": 2})
     assert [device.memory_bytes for device in hardware.dies] == [68719476736] * 2
     assert hardware.dies[0].launch_us == 0
-    assert dict(hardware.dies[0].buffers) == A3_BUFFERS
+    buffers = dict(hardware.dies[0].buffers)
+    assert buffers.pop("l2") == L2_BY_SKU["Ascend910_9391"]
+    assert buffers == A3_BUFFERS
     links = {link.name: link for link in hardware.links}
     link = links["d2d_intra_package:0"]
     assert link.capacity_bytes_per_ms == pytest.approx(448 * 1e6)
@@ -222,7 +236,9 @@ def test_a5_hardware_uses_arch3510_units_modes_and_retains_sku_memory(sku):
     assert device.launch_us == 0
     assert device.compute_units == aic
     assert dict(device.rates)["hbm"] == pytest.approx(hbm)
-    assert dict(device.buffers) == A5_BUFFERS
+    buffers = dict(device.buffers)
+    assert buffers.pop("l2") == L2_BY_SKU[sku]
+    assert buffers == A5_BUFFERS
     assert dict(device.buffer_units)["ub"] == aiv
 
     expected = {
@@ -294,7 +310,9 @@ def test_a5_same_work_scales_with_each_sku_hbm_not_9582_capacity(sku, expected_m
 def test_a5_capacity_and_ub_mesh_link_are_preserved():
     hardware = Hardware.from_mapping({"backend": "ascend", "sku": "Ascend950PR_9579", "num_devices": 2})
     assert [device.memory_bytes for device in hardware.dies] == [68719476736] * 2
-    assert dict(hardware.dies[0].buffers) == A5_BUFFERS
+    buffers = dict(hardware.dies[0].buffers)
+    assert buffers.pop("l2") == L2_BY_SKU["Ascend950PR_9579"]
+    assert buffers == A5_BUFFERS
     links = {link.name: link for link in hardware.links}
     link = links["d2d_intra_node:0"]
     assert link.capacity_bytes_per_ms == pytest.approx(392 * 1e6)

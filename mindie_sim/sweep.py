@@ -114,7 +114,10 @@ def _ep_layout_valid(spec: ParallelSpec) -> bool:
     return True
 
 
-def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, Any]) -> dict[str, Any]:
+def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, Any] | str) -> dict[str, Any]:
+    if isinstance(case_or_model, str):
+        from mindie_sim.model_catalog import load_model
+        return _extract_model_geometry(load_model(case_or_model))
     if isinstance(case_or_model, CaseSpec):
         return _extract_model_geometry(case_or_model.model)
     if isinstance(case_or_model, ModelSpec):
@@ -160,7 +163,7 @@ def _extract_model_geometry(case_or_model: CaseSpec | ModelSpec | Mapping[str, A
 
 
 def enumerate_parallel_candidates(
-    case_or_model: CaseSpec | ModelSpec | Mapping[str, Any], *, num_devices: int,
+    case_or_model: CaseSpec | ModelSpec | Mapping[str, Any] | str, *, num_devices: int,
     allow_dp: bool = True, allow_ep: bool = True, allow_pp: bool = False, allow_pcp: bool = False,
     candidate_tps: Sequence[int] | None = None, ep_candidates: Sequence[int] | None = None,
     pp_candidates: Sequence[int] | None = None, pcp_candidates: Sequence[int] | None = None,
@@ -206,9 +209,9 @@ def enumerate_parallel_candidates(
                 dcp = 1
                 ep_options = (
                     [d for d in _divisors(dp * tp * pcp)
-                     if num_experts % d == 0 and _ep_layout_valid(
+                     if num_experts >= ZERO and _ep_layout_valid(
                          ParallelSpec(dp=dp, tp=tp, pp=pp, ep=d, cp=dcp, dcp=dcp, pcp=pcp))]
-                    if (num_experts > 0 and allow_ep) else [1]
+                    if (num_experts > ZERO and allow_ep) else [ONE]
                 )
                 if allowed_eps is not None:
                     ep_options = [e for e in ep_options if e in allowed_eps]

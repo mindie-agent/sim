@@ -544,7 +544,7 @@ def predict(
                                            float(values["release_ms"]))
     cost = CostModel(case, primitives)
     execution = Execution(
-        case, cost, recipes=recipes, submission=submission,
+        case, cost, ledger=cost.ledger, recipes=recipes, submission=submission,
         trace_limit=event_limit, include_serving_io=True,
         include_submission=include_submission, memory_policy=memory.policy,
         memory=memory,

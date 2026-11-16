@@ -31,6 +31,11 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError
 
 ZERO = 0
+ONE = 1
+TWO = 2
+NEG_ONE = -1
+KV_CACHE_PLANES = 2
+NORM_WEIGHT_OFFSET = 1.0
 
 FLEET_CATALOG_ENTRIES: dict[str, str] = {
     key: f"../catalog/configs/{key}.json" for key in (
@@ -264,23 +269,31 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
         full = kind == "full_attention"
         layer_kv = global_kv_heads if full else kv_heads
         layer_hd = global_head_dim if full else head_dim
-        factor = 1 if (full and k_eq_v) else 2
+        # Two cache planes are retained even when the projection is shared.
+        factor = KV_CACHE_PLANES
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gemma4",
-            ffn="moe" if moe else "dense", window=0 if full else window,
+            ffn="moe" if moe else "dense",
+            window=ZERO if full else window,
             num_heads=heads, num_kv_heads=layer_kv, head_dim=layer_hd,
-            intermediate_size=0 if moe else intermediate, num_experts=experts,
-            top_k=top_k, moe_intermediate_size=moe_i, num_shared_experts=shared,
-            shared_intermediate_size=shared_i, qk_norm=True, ffn_activation="gelu",
+            intermediate_size=ZERO if moe else intermediate,
+            num_experts=experts,
+            top_k=top_k, moe_intermediate_size=moe_i,
+            num_shared_experts=shared,
+            shared_intermediate_size=shared_i, qk_norm=True,
+            ffn_activation="gelu",
             kv_cache_elements=factor * layer_kv * layer_hd,
             kv_owner_layer_id=index, owns_long_kv=True, k_eq_v=bool(full and k_eq_v),
             native_layer_id=index, scope="body",
         ))
     gemma_facts = {
-        "gemma4": 1, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
-        "gemma4_ple_width": ple_width, "gemma4_ple_tables": 1,
-        "gemma4_ple_gated": True, "gemma4_k_eq_v_all": 0,
-        "gemma4_k_eq_v_layers": k_layers, "norm_weight_offset": 1.0,
+        "gemma4": ONE, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
+        "gemma4_ple_width": ple_width, "gemma4_ple_tables": ONE,
+        "gemma4_ple_gated": True,
+        "gemma4_ple_vocab": _int(c, "vocab_size_per_layer_input") or vocab,
+        "gemma4_k_eq_v_all": ZERO,
+        "gemma4_k_eq_v_layers": k_layers,
+        "norm_weight_offset": NORM_WEIGHT_OFFSET,
         "attention_schedule": schedule,
     }
     gaps = ("vision_encoder_and_projector:language_backbone_only",) if vision_raw else ()
@@ -334,22 +347,27 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             index=index, attention="gqa", architecture="gqa",
             ffn="moe" if moe else "dense", num_heads=heads,
             num_kv_heads=kv_heads, head_dim=head_dim,
-            intermediate_size=0 if moe else dense_i,
-            num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-            moe_intermediate_size=moe_i if moe else 0,
-            num_shared_experts=shared if moe else 0,
-            shared_intermediate_size=shared_i if moe else 0,
-            router_input_size=hidden if moe else 0,
+            intermediate_size=ZERO if moe else dense_i,
+            num_experts=experts if moe else ZERO,
+            top_k=top_k if moe else ZERO,
+            moe_intermediate_size=moe_i if moe else ZERO,
+            num_shared_experts=shared if moe else ZERO,
+            shared_intermediate_size=shared_i if moe else ZERO,
+            router_input_size=hidden if moe else ZERO,
             router_mode=str(c.get("scoring_func", "softmax")),
             qk_norm=qk_norm, q_output_gate=gate, ffn_activation="silu",
             indexer=active, indexer_type="full" if active else "none",
-            owns_index_k=active, index_k_owner_layer_id=index if active else -1,
-            owns_topk=active, topk_owner_layer_id=index if active else -1,
-            index_heads=index_heads if active else 0, index_dim=index_dim if active else 0,
-            index_topk=(topk_blocks + local_blocks) * block if active else 0,
-            candidate_block_size=block if active else 1,
-            candidate_topk_blocks=topk_blocks + local_blocks if active else 0,
-            kv_cache_elements=2 * kv_heads * head_dim,
+            owns_index_k=active,
+            index_k_owner_layer_id=index if active else NEG_ONE,
+            owns_topk=active,
+            topk_owner_layer_id=index if active else NEG_ONE,
+            index_heads=index_heads if active else ZERO,
+            index_dim=index_dim if active else ZERO,
+            index_topk=(topk_blocks + local_blocks) * block if active else ZERO,
+            candidate_block_size=block if active else ONE,
+            candidate_topk_blocks=(topk_blocks + local_blocks if active
+                                   else ZERO),
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
@@ -415,26 +433,34 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         sparse_layer = bool(sparse_on and kind in apply_types)
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
-            ffn="moe" if moe else "dense", window=0 if full else window,
+            ffn="moe" if moe else "dense",
+            window=ZERO if full else window,
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-            intermediate_size=0 if moe else intermediate,
-            num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-            moe_intermediate_size=moe_i if moe else 0,
-            num_shared_experts=1 if moe else 0,
-            shared_intermediate_size=shared_i if moe else 0,
-            router_input_size=hidden if moe else 0, router_mode="softmax",
-            q_output_gate=gate, ffn_activation="silu",
-            indexer=sparse_layer, indexer_type="full" if sparse_layer else "none",
-            owns_index_k=sparse_layer, index_k_owner_layer_id=index if sparse_layer else -1,
-            owns_topk=sparse_layer, topk_owner_layer_id=index if sparse_layer else -1,
-            index_heads=idx_heads if sparse_layer else 0,
-            index_dim=idx_dim if sparse_layer else 0,
-            index_topk=topk_regions * block if sparse_layer else 0,
-            index_kpool=block if sparse_layer else 1,
-            index_kpool_compress=bool(sparse_layer and block > 1),
-            candidate_block_size=block if sparse_layer else 1,
-            candidate_topk_blocks=topk_regions if sparse_layer else 0,
-            kv_cache_elements=2 * kv_heads * head_dim,
+            intermediate_size=ZERO if moe else intermediate,
+            num_experts=experts if moe else ZERO,
+            top_k=top_k if moe else ZERO,
+            moe_intermediate_size=moe_i if moe else ZERO,
+            num_shared_experts=ONE if moe else ZERO,
+            shared_intermediate_size=shared_i if moe else ZERO,
+            router_input_size=hidden if moe else ZERO,
+            router_mode="softmax",
+            q_output_gate_kind="headwise" if gate else "none",
+            q_gate_projection="separate" if gate else "packed_q",
+            ffn_activation="silu",
+            indexer=sparse_layer,
+            indexer_type="full" if sparse_layer else "none",
+            owns_index_k=sparse_layer,
+            index_k_owner_layer_id=index if sparse_layer else NEG_ONE,
+            owns_topk=sparse_layer,
+            topk_owner_layer_id=index if sparse_layer else NEG_ONE,
+            index_heads=idx_heads if sparse_layer else ZERO,
+            index_dim=idx_dim if sparse_layer else ZERO,
+            index_topk=topk_regions * block if sparse_layer else ZERO,
+            index_kpool=block if sparse_layer else ONE,
+            index_kpool_compress=bool(sparse_layer and block > ONE),
+            candidate_block_size=block if sparse_layer else ONE,
+            candidate_topk_blocks=topk_regions if sparse_layer else ZERO,
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))

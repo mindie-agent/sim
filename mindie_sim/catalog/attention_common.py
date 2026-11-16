@@ -173,7 +173,7 @@ def _group_plan(plan: LayerPlan, parallel: ParallelSpec) -> tuple[bool, int]:
 def _qkv_widths(plan: LayerPlan, parallel: ParallelSpec) -> tuple[int, int, int, int]:
     local_heads = max(1, plan.num_heads // parallel.tp)
     local_kv = local_kv_heads(plan.num_kv_heads, parallel.tp)
-    q_width = (2 if plan.q_output_gate else 1) * local_heads * plan.head_dim
+    q_width = plan.q_projection_width(local_heads, plan.head_dim)
     kv_width = local_kv * plan.head_dim
     return local_heads, local_kv, q_width, kv_width
 

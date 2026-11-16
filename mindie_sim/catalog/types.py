@@ -37,6 +37,8 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 ZERO = 0
 ZERO_MHC_LOWRANK = ZERO
+ZERO_VALUE = 0
+ONE_VALUE = 1
 
 _FP32_CATEGORIES = {
     "param_fp32", "mhc", "ape", "conv_weight_f32", "a_log", "dt_bias",
@@ -567,7 +569,7 @@ class DraftSpec:
     attention_kind: str = "gqa"
     mla_variant: str = "latent_mla"
     kv_cache_elements: int = 0
-    input_mode: str = "concat"
+    input_mode: str = "concat"   # concat | normalized_concat | separate
     weight_category: str = ""
     qk_norm: bool = False
     q_output_gate: bool = False
@@ -603,11 +605,23 @@ class DraftSpec:
     mhc_lowrank: int = ZERO_MHC_LOWRANK
     activation_dtype: str = "bf16"
     input_projection_category: str = "dspark_input"
+    #: Explicit auxiliary execution plan.  ``stack`` runs every declared block
+    #: per proposal; ``cyclic_nextn`` executes block ``i % len(layer_plans)``
+    #: for proposal step ``i``.
+    layer_plans: tuple[Any, ...] = ()
+    execution_mode: str = "stack"
+    input_application: str = "per_proposal"
+    input_count: int = ONE_VALUE
+    embedding_owned: bool = False
+    embedding_count: int = ZERO_VALUE
+    output_head_owned: bool = False
+    output_head_count: int = ZERO_VALUE
     source: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        for key in ("target_layer_ids", "draft_compress_ratios", "pp_capability"):
+        for key in ("target_layer_ids", "draft_compress_ratios", "pp_capability",
+                    "layer_plans"):
             raw = getattr(self, key)
             if isinstance(raw, (list, tuple)) and not isinstance(raw, tuple):
                 object.__setattr__(self, key, tuple(int(v) for v in raw))
@@ -647,6 +661,11 @@ class DraftSpec:
             raise ModelingError("catalog_dspark_block_missing")
         if self.kind in {"dspark", "mtp_dspark", "standalone_draft"} and self.markov_rank <= 0:
             raise ModelingError("catalog_dspark_markov_missing")
+        if self.execution_mode not in {"stack", "cyclic_nextn"}:
+            raise ModelingError(
+                f"catalog_draft_execution_mode_invalid:{self.execution_mode}")
+        if self.execution_mode == "cyclic_nextn" and not self.layer_plans:
+            raise ModelingError("catalog_draft_cyclic_nextn_requires_layer_plans")
         if self.confidence_enabled:
             expected = self.hidden_size + self.markov_rank
             if self.confidence_input_width not in {0, expected}:
@@ -675,7 +694,20 @@ class DraftSpec:
             "proposal_tokens": self.proposal_tokens, "vocab_size": self.vocab_size,
             "mhc_mult": self.mhc_mult, "mhc_sinkhorn_iters": self.mhc_sinkhorn_iters,
             "mhc_lowrank": self.mhc_lowrank,
-            "activation_dtype": self.activation_dtype, "source": dict(self.source), "notes": list(self.notes),
+            "activation_dtype": self.activation_dtype,
+            "input_mode": self.input_mode, "weight_category": self.weight_category,
+            "qk_norm": self.qk_norm, "q_output_gate": self.q_output_gate,
+            "input_projection_category": self.input_projection_category,
+            "layer_plans": [plan.to_dict() if hasattr(plan, "to_dict") else dict(plan)
+                            for plan in self.layer_plans],
+            "execution_mode": self.execution_mode,
+            "input_application": self.input_application,
+            "input_count": self.input_count,
+            "embedding_owned": self.embedding_owned,
+            "embedding_count": self.embedding_count,
+            "output_head_owned": self.output_head_owned,
+            "output_head_count": self.output_head_count,
+            "source": dict(self.source), "notes": list(self.notes),
         }
 
 

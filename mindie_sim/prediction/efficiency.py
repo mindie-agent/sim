@@ -17,6 +17,9 @@ from __future__ import annotations
 
 ZERO = 0
 ONE = 1
+DEFAULT_TOKENS = 1
+DEFAULT_CONTEXT = 4096
+DEFAULT_SEQUENCES = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
@@ -49,7 +52,6 @@ from .operator_analysis import operator_costs, target_graphs
 from .scheduler import DraftPolicy
 from .structure import parse_case
 
-_STRIP_METADATA_KEYS = frozenset({"structure_subgraph_memberships", "structure_subgraph_entries", "structure_subgraphs", "graph_segment", "fusion_group_key", "topk_ids_producer", "payload_producer", "input_conversion_subgraphs", "inverse_index_producer", "topk_weights_producer"})
 _HBM_ROLES = frozenset({"hbm", "memory", "gm_hbm_cacheline_128b"})
 _CUBE_ROLES = frozenset({"cube", "aic"})
 _VEC_ROLES = frozenset({"vector", "vbitsort32", "scalar_store_issue", "ub_copy", "aiv", "reg_issue_slots", "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores"})
@@ -301,7 +303,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     }
 
 
-def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
+def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else target_graphs(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
     if not (run_graph or has_kg):
@@ -313,55 +315,44 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
           if isinstance(graphs, TargetGraphSet) else {ZERO: graphs[FIRST]}) \
         if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) \
         else graphs
-    sg_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in sg.items()}
-    sg = TargetGraphSet(sg_map, kernels=sg.effective_kernels, selection=sg.default_selection) if isinstance(sg, TargetGraphSet) else sg_map
-    sched_ms = float(eff_case.runtime.submission.get("scheduler_ms", 0.0) or 0.0)
-    overlap = bool(overlap_async_scheduler and include_submission and phase == "decode" and eff_case.runtime.async_scheduling and sched_ms > 0.0)
-    run_case = replace(eff_case, runtime=replace(eff_case.runtime, submission={**eff_case.runtime.submission, "scheduler_ms": 0.0})) if overlap else eff_case
-    report = graph_costs(run_case, sg, external_inputs=ext_in, include_submission=include_submission, isolated=False)
-    if overlap:
-        report = {**report, "duration_ms": max(float(report["duration_ms"]), sched_ms)}
+    # Submission work is represented by the declared scheduler resource on the
+    # ordinary submission path; no duration max() is synthesized here.
+    report = graph_costs(eff_case, sg, external_inputs=ext_in,
+                         include_submission=include_submission, isolated=False,
+                         evaluation=evaluation_context)
     return graphs, eff_case, report
 
 
-def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Lower target graphs once and deduplicate layer-lineage metadata for fast pricing."""
-    graphs, eff_case, graph_rep = precomputed_graph or _lower_and_run_graph(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, run_graph=run_graph)
+def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None, evaluation_context: Any | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Lower target graphs once and price both reports from one evaluation."""
+    from .evaluation import EvaluationContext
+    from .local_tp_groups import local_tp_spans_dp, rank_zero_graph_reuse
+    if precomputed_graph is None:
+        ctx = evaluation_context or EvaluationContext.create(case)
+        graphs, eff_case, graph_rep = _lower_and_run_graph(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=run_graph,
+            evaluation_context=ctx)
+    else:
+        graphs, eff_case, graph_rep = precomputed_graph
+        ctx = evaluation_context or EvaluationContext.create(eff_case)
     r0_ops = graphs[0]
-    cleaned_r0 = tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in r0_ops)
-    if isinstance(r0_ops, TargetOperators):
-        cleaned_r0 = TargetOperators(cleaned_r0, kernels=r0_ops.effective_kernels, selection=r0_ops.default_selection)
-    try:
-        op_rep = operator_costs(eff_case, cleaned_r0, replica=0)
-    except ValueError:
-        cleaned_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in graphs.items()}
+    parallel = eff_case.runtime.parallel
+    needs_cohort = bool(parallel.ep_spans_dp or local_tp_spans_dp(parallel))
+    has_kg = any("device_kernel_group" in dict(op.metadata) for op in r0_ops)
+    if needs_cohort and not rank_zero_graph_reuse(parallel, len(graphs), has_kg):
+        selection = graphs if isinstance(graphs, Mapping) else {ZERO: graphs}
         if isinstance(graphs, TargetGraphSet):
-            cleaned_map = TargetGraphSet(cleaned_map, kernels=graphs.effective_kernels, selection=graphs.default_selection)
-        cohort_rep = operator_costs(eff_case, cleaned_map)
+            selection = TargetGraphSet(selection, kernels=graphs.effective_kernels,
+                                       selection=graphs.default_selection)
+        cohort_rep = operator_costs(eff_case, selection, evaluation=ctx)
         r0_rows = [row for row in cohort_rep["operators"] if row.get("replica", 0) == 0]
-        op_rep = {**cohort_rep, "operator_occurrences": sum(r["occurrences"] for r in r0_rows), "operator_sum_ms": sum(r["total_ms"] for r in r0_rows), "operators": r0_rows}
-
-    if any("device_kernel_group" in dict(op.metadata) for op in r0_ops) and graph_rep is not None:
-        group_by_op = {op.op_id: str(dict(op.metadata)["device_kernel_group"]["id"]) for op in r0_ops if isinstance(dict(op.metadata).get("device_kernel_group"), Mapping) and dict(op.metadata)["device_kernel_group"].get("id")}
-        extra_by_group: dict[str, float] = defaultdict(float)
-        for tl in graph_rep.get("timeline", ()):
-            if tl.get("replica", 0) == 0 and tl.get("recipe") == "hccl_exit" and float(tl.get("elapsed_ms", 0.0) or 0.0) > 0 and str(tl.get("op_id", "")) in group_by_op:
-                extra_by_group[group_by_op[str(tl["op_id"])]] += float(tl["elapsed_ms"])
-        if extra_by_group:
-            rows_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for r in op_rep["operators"]:
-                raw_m = r["operator"].get("metadata") or ()
-                dkg = (dict(raw_m) if isinstance(raw_m, Mapping) else {k: v for k, v in raw_m}).get("device_kernel_group")
-                if isinstance(dkg, Mapping) and dkg.get("id"):
-                    rows_by_group[str(dkg["id"])].append(r)
-            for gid, g_extra in extra_by_group.items():
-                g_rows = rows_by_group.get(gid, ())
-                target_rows = [r for r in g_rows if r["operator"].get("link_bytes", 0.0) > 0] or list(g_rows)
-                occ = sum(r["occurrences"] for r in target_rows)
-                for r in (target_rows if occ > 0 else ()):
-                    r["duration_ms"] += g_extra / occ
-                    r["total_ms"] = r["duration_ms"] * r["occurrences"]
-            op_rep["operator_sum_ms"] = sum(r["total_ms"] for r in op_rep["operators"])
+        op_rep = {**cohort_rep,
+                  "operator_occurrences": sum(r["occurrences"] for r in r0_rows),
+                  "operator_sum_ms": sum(r["total_ms"] for r in r0_rows),
+                  "operators": r0_rows}
+    else:
+        op_rep = operator_costs(eff_case, r0_ops, replica=ZERO, evaluation=ctx)
     return op_rep, graph_rep
 
 
@@ -808,7 +799,7 @@ def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, reso
 
 
 def analyze_network_efficiency(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
     observed_durations_ms: Mapping[str, float] | None = None, pmu_by_op: Mapping[str, Mapping[str, float]] | None = None,
     run_graph: bool = True, _precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None,
@@ -817,7 +808,12 @@ def analyze_network_efficiency(
     _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
     if operator_report is None:
-        operator_report, auto_graph = _fast_operator_and_graph_reports(parsed, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, run_graph=run_graph, precomputed_graph=_precomputed_graph)
+        from .evaluation import EvaluationContext
+        evaluation = EvaluationContext.create(parsed)
+        operator_report, auto_graph = _fast_operator_and_graph_reports(
+            parsed, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=run_graph,
+            precomputed_graph=_precomputed_graph, evaluation_context=evaluation)
         graph_report = auto_graph if graph_report is None else graph_report
 
     raw_rows = [r for r in operator_report["operators"] if r.get("replica", 0) == 0] or list(operator_report["operators"])

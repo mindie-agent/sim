@@ -196,7 +196,7 @@ def _matrix_wrapper_projection(metadata):
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=ZERO, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=ZERO, compact=False,
-                audit_allocations=False):
+                audit_allocations=False, evaluation=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -218,17 +218,16 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     case = consume_target_declaration(parse_case(case), ops)
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
-    if external_inputs is not None:
-        external = dict(external_inputs)
-    elif getattr(ops, "scope", None) == "body":
-        sample = next(iter(ops.values()), ()) if isinstance(ops, Mapping) else ops
-        external = ({"analysis_input": ZERO}
-                    if any("analysis_input" in getattr(op, "deps", ()) for op in sample)
-                    else {})
-    else:
-        external = {}
+    # A cut dependency is a declared input, never an implicit body default.
+    # Callers that intentionally cut a body graph provide the boundary
+    # explicitly (efficiency/body entry points pass ``{"analysis_input": 0}``);
+    # an undeclared cut raises ``graph_dependency_unavailable`` below.
+    external = {} if external_inputs is None else dict(external_inputs)
     if any(value < 0 or not math.isfinite(value) for value in external.values()):
         raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
+    from .evaluation import EvaluationContext, context_for
+    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
+           else EvaluationContext.create(case, recipes, primitives))
     book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
@@ -275,8 +274,10 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "collective_algorithm": getattr(book.select(op), "algorithm", None),
         })
 
-    cost = CostModel(case, primitives)
-    execution = Execution(case, cost, recipes=book, include_submission=include_submission,
+    from .cost import CostLedger
+    cost = ctx.cost
+    execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
+                          ledger=CostLedger(), include_submission=include_submission,
                           on_operator=observe, trace_limit=trace_limit)
     engine = execution.engine
     engine.now = input_ready_ms
@@ -558,7 +559,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "operator_occurrences": sum(
             record["op"].family != "barrier" for record in records),
     }
-    execution_summary, parameter_summary = execution.summary(), cost.summary()
+    execution_summary = execution.summary()
+    parameter_summary = execution.cost.summary()
     if compact:
         result = {
             **head, "resources": resources,

@@ -39,6 +39,8 @@ from .structure_groups import declare_group
 
 ZERO = 0
 ONE = 1
+GATE_SIGMOID_OPS_PER_ELEMENT = 4
+GATE_APPLY_OPS_PER_ELEMENT = 1
 TWO = 2
 THREE = 3
 FOUR = 4
@@ -342,7 +344,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     else:
         attention_recipe = "flash_attention"
     requests = tuple(view.request_id for view in views)
-    q_width = heads * width * (2 if plan.q_output_gate else 1)
+    gate_separate = plan.q_gate_separate
+    q_width = plan.q_projection_width(heads, width)
     qkv = gemm_op(
         op_id=prefix + ".qkv", deps=(deps,), stage=stage, layer=plan.index,
         requests=requests, m=padded_tokens, n=q_width + kv_planes * projected_kv_heads * width,
@@ -351,10 +354,29 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     )
     ops = [qkv]
     ready = qkv.op_id
+    separate_gate = None
+    if gate_separate:
+        gate_proj = gemm_op(
+            op_id=prefix + ".g_proj", deps=(deps,), stage=stage, layer=plan.index,
+            requests=requests, m=padded_tokens, n=heads, k=model.hidden_size,
+            quant=quant, category="attn.gate", phase=mode,
+            family="gate_projection", recipe="attention_q_gate_projection",
+        )
+        gate_sigmoid = vector_op(
+            op_id=prefix + ".g_sigmoid", deps=(gate_proj.op_id,), stage=stage,
+            layer=plan.index, requests=requests, elements=padded_tokens * heads,
+            ops_per_element=GATE_SIGMOID_OPS_PER_ELEMENT, dtype="fp32",
+            family="sigmoid", phase=mode,
+            recipe="attention_q_gate_sigmoid",
+            shape=(padded_tokens, heads),
+        )
+        ops.extend((gate_proj, gate_sigmoid))
+        separate_gate = gate_sigmoid.op_id
     split_views, split_copies = {}, []
     if plan.qk_norm:
         split_views = _qkv_views(
-            padded_tokens, heads, projected_kv_heads, width, plan.q_output_gate, plan.k_eq_v)
+            padded_tokens, heads, projected_kv_heads, width,
+            plan.q_output_gate and not gate_separate, plan.k_eq_v)
         normalized = vector_op(
             op_id=prefix + ".qk_norm", deps=(ready,), stage=stage, layer=plan.index,
             requests=requests, elements=padded_tokens * (heads + projected_kv_heads) * width,
@@ -758,7 +780,18 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             ops.extend(merged)
             grp_attn = [merged_last]
         attention.extend(grp_attn)
-    if plan.q_output_gate:
+    if gate_separate:
+        gate = vector_op(
+            op_id=prefix + ".output_gate", deps=tuple(attention) + (separate_gate,),
+            stage=stage, layer=plan.index, requests=requests,
+            elements=padded_tokens * heads * width,
+            ops_per_element=GATE_APPLY_OPS_PER_ELEMENT,
+            dtype=model.activation_dtype, family="elementwise", phase=mode,
+            recipe="attention_gate",
+        )
+        ops.append(gate)
+        attention = [gate.op_id]
+    elif plan.q_output_gate:
         gate_ready = split_copies[-1].op_id if split_copies else qkv.op_id
         gate = vector_op(
             op_id=prefix + ".output_gate", deps=tuple(attention) + (gate_ready,),

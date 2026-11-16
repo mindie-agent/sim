@@ -118,7 +118,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         or dict(getattr(runtime, "metadata", ()) or ()).get(
             "overlap_shared_expert", False))
     group_tokens = global_tokens if global_tokens is not None else pre_sp_tokens
-    local_experts = max(1, plan.num_experts // parallel.ep)
+    local_experts = max(ONE, (int(plan.num_experts) + int(parallel.ep) - ONE)
+                        // int(parallel.ep))
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
                           min(parallel.tp, parallel.ep)))

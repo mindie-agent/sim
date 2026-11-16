@@ -80,6 +80,7 @@ _LAYER_INDEX_RE = re.compile(r'"layer":\s*\d+')
 #: duration, a schedule or a served amount - only the declaration text.
 _META_TEXT_CACHE: dict = {}
 _META_ID_CACHE: dict = {}
+_META_KEY_CACHE: dict = {}
 _META_DICT_CACHE: dict = {}
 _META_SCAN_CACHE: dict = {}
 _NO_REV_OPS_CACHE: dict = {}
@@ -88,6 +89,8 @@ _DEVICE_UNITS_CACHE: dict = {}
 _META_CACHE_LIMIT = 32768
 ZERO = 0
 ONE = 1
+TWO = 2
+THREE = 3
 FIRST = 0
 SECOND = 1
 HOST_LOOKAHEAD_DEFAULT = 8
@@ -98,8 +101,8 @@ def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
     if not metadata:
         return False, False, False
     hit = _META_SCAN_CACHE.get(id(metadata))
-    if hit is not None and hit[0] is metadata:
-        return hit[1], hit[2], hit[3]
+    if hit is not None and hit[FIRST] is metadata:
+        return hit[SECOND], hit[TWO], hit[THREE]
     if isinstance(metadata, _AbcMapping):
         has_reb = any(k in _SCAN_REBIND_KEYS for k in metadata)
         has_rev = bool(metadata.get("reverse_of_collective"))
@@ -189,6 +192,19 @@ def _project_meta_pair(pair):
 
 
 def op_meta_key_from_metadata(metadata) -> Any:
+    """Layer-zero canonical projection of one immutable metadata declaration."""
+    from .physical_key import operator_metadata_key
+    hit = _META_KEY_CACHE.get(id(metadata))
+    if hit is not None and hit[FIRST] is metadata:
+        return hit[SECOND]
+    key = operator_metadata_key(metadata, ZERO, ZERO)
+    if len(_META_KEY_CACHE) >= _META_CACHE_LIMIT:
+        _META_KEY_CACHE.clear()
+    _META_KEY_CACHE[id(metadata)] = (metadata, key)
+    return key
+
+
+def _legacy_op_meta_key_from_metadata(metadata) -> Any:
     id_hit = _META_ID_CACHE.get(id(metadata))
     if id_hit is not None and id_hit[0] is metadata:
         return id_hit[1]
@@ -231,8 +247,9 @@ def op_meta_key_from_metadata(metadata) -> Any:
 
 
 def _op_meta_key(op) -> Any:
-    """Deterministic, layer-independent projection of one operator's metadata."""
-    return op_meta_key_from_metadata(op.metadata)
+    """Canonical occurrence-relative projection of one operator's metadata."""
+    from .physical_key import operator_metadata_key
+    return operator_metadata_key(op.metadata, op.stage, op.layer)
 
 
 def _op_meta_key_slow_meta(metadata) -> Any:
@@ -1101,6 +1118,96 @@ class _ServiceSetupProgram:
         return self.body.start(engine, name, ready=setup, owner=owner)
 
 
+class _LedgerBoundCost:
+    """CostModel view whose diagnostic records belong to one execution.
+
+    Pricing logic and immutable hardware/service declarations stay on the
+    shared model; every mutable counter, mapping, invocation and regime record
+    goes to this execution's private ``CostLedger``.  This is the read/write
+    boundary that keeps an isolated row's ``basis`` isolated while preserving
+    the historical ``execution.cost`` public surface.
+    """
+
+    def __init__(self, model, ledger):
+        self.model, self.ledger = model, ledger
+
+    @property
+    def case(self):
+        return self.model.case
+
+    @property
+    def primitives(self):
+        return self.model.primitives
+
+    @property
+    def counts(self):
+        return self.ledger.counts
+
+    @property
+    def services(self):
+        return self.ledger.services
+
+    @property
+    def mappings(self):
+        return self.ledger.mappings
+
+    @property
+    def invocations(self):
+        return self.ledger.invocations
+
+    @property
+    def regimes(self):
+        return self.ledger.regimes
+
+    @property
+    def joint_native(self):
+        return self.ledger.joint_native
+
+    @property
+    def diagnostic_primitive_lookups(self):
+        return self.ledger.diagnostic_primitive_lookups
+
+    @property
+    def diagnostic_primitive_hits(self):
+        return self.ledger.diagnostic_primitive_hits
+
+    def price(self, op, scope):
+        return self.model.price(op, scope, ledger=self.ledger)
+
+    def lookup_diagnostic(self, op, scope):
+        return self.model.lookup_diagnostic(op, scope, ledger=self.ledger)
+
+    def record_mapping(self, mapping):
+        return self.model.record_mapping(mapping, ledger=self.ledger)
+
+    def record_service(self, curve, basis, *, capacity_limited=False):
+        return self.model.record_service(
+            curve, basis, capacity_limited=capacity_limited, ledger=self.ledger)
+
+    def record_invocation(self, record):
+        return self.model.record_invocation(record, ledger=self.ledger)
+
+    def record_regime(self, *args, **kwargs):
+        return self.model.record_regime(*args, ledger=self.ledger, **kwargs)
+
+    def record_joint_native(self, selection, reference_cost):
+        return self.model.record_joint_native(
+            selection, reference_cost, ledger=self.ledger)
+
+    def summary(self, ledger=None):
+        return self.model.summary(self.ledger if ledger is None else ledger)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+
+def _ledger_recorder(method, ledger):
+    """Bind one CostModel recorder to this execution's private ledger."""
+    def record(*args, **kwargs):
+        return method(*args, ledger=ledger, **kwargs)
+    return record
+
+
 class Execution:
     # Identical private schedules replay across ranks and later layers.
     # Experimental: off in the shipped default. Opt-in only; no shape or input auto-enable.
@@ -1117,8 +1224,16 @@ class Execution:
         legacy_diagnostics: bool | None = None,
         fragment_state=None, memory=None,
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
+        bindings=None, ledger=None,
     ):
+        from .cost import CostLedger
         self.case, self.cost = case, cost
+        self.bindings = bindings
+        # Mutable diagnostic records belong to this execution, not to the
+        # shared immutable pricing model.
+        self.ledger = ledger if ledger is not None else CostLedger()
+        self.cost_model = cost
+        self.cost = _LedgerBoundCost(cost, self.ledger)
         self.namespace = namespace
         self.memory = memory
         if legacy_diagnostics is None:
@@ -1202,9 +1317,12 @@ class Execution:
                     pool_units[key] = dies[FIRST].pool_units(pool)
                     stage_pools[str(pool)] = key
                 self.stage_pools[replica, stage] = stage_pools
-        self.topology = Topology(
-            case.machine, p, namespace,
-            collective_startup_mode=case.runtime.collective_startup_mode)
+        self.topology = (
+            bindings.topology
+            if bindings is not None and bindings.topology is not None
+            and not namespace
+            else Topology(case.machine, p, namespace,
+                          collective_startup_mode=case.runtime.collective_startup_mode))
         resources.extend(self.topology.resources())
         if engine is None and self.memory is not None:
             # A Memory ledger already adopted by one RuntimeState owns that
@@ -1250,6 +1368,10 @@ class Execution:
         self._compact_step: bool = False
         self._last_invocation_record = None
         self._service_identity_cache: dict = {}
+        # Per-execution occurrence -> canonical metadata projection.  The
+        # identity guard makes this a pure memo of one immutable declaration,
+        # not a cross-case prediction cache.
+        self._op_key_cache: dict = {}
         self._transport_options: dict = {}
         self.replay_counts = {"record": 0, "shadow": 0, "replay": 0, "real": 0}
         self._trace_key = None
@@ -1302,6 +1424,21 @@ class Execution:
                        if isinstance(profile, _AbcMapping) else ()):
             service = normalize_resource_service(record)
             self.resource_services[service.service_id] = service
+
+    def _op_key(self, op):
+        key = self._op_key_cache.get(id(op))
+        if key is not None and key[FIRST] is op:
+            return key[SECOND]
+        from .physical_key import operator_metadata_key
+        value = operator_metadata_key(op.metadata, op.stage, op.layer)
+        if len(self._op_key_cache) >= _META_CACHE_LIMIT:
+            self._op_key_cache.clear()
+        self._op_key_cache[id(op)] = (op, value)
+        return value
+
+    def ledger_recorder(self, method):
+        """Bind one CostModel recorder to this execution's private ledger."""
+        return _ledger_recorder(method, self.ledger)
 
     @property
     def fragment_state(self):
@@ -2326,7 +2463,7 @@ class Execution:
                 op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
                 op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
                 op.link_scope, op.source_boundary, op.returns,
-                _op_meta_key(op), context.setup_ms, context.minimum_ms,
+                self._op_key(op), context.setup_ms, context.minimum_ms,
                 (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
                 _freeze_key(context.joint_native_service),
                 tuple(sorted(context.work.items())),
@@ -2526,7 +2663,7 @@ class Execution:
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
-            _op_meta_key(op),
+            self._op_key(op),
         )
         if prep_key in self._prepare_cache:
             cached_op, meta_diff, recipe = self._prepare_cache[prep_key]
@@ -2632,7 +2769,7 @@ class Execution:
             _DEVICE_UNITS_CACHE[id(device)] = units_key
         sid_key = (
             replica, op.stage, device.rank, device.compute_units,
-            units_key[1],
+            units_key[SECOND],
             op.family, op.recipe, op.dtype, op.layout, scope,
             meta.get("kernel"), meta.get("kernel_name"),
             _freeze_key(meta.get("implementation")),
@@ -2641,7 +2778,7 @@ class Execution:
             # One metadata projection for both the prepared-program and the
             # service-identity caches: it is layer-normalized, so two layers
             # with the same declared kernel share the resolved identity.
-            _op_meta_key(op),
+            self._op_key(op),
         )
         sid = self._service_identity_cache.get(sid_key)
         if sid is None:
@@ -3051,7 +3188,7 @@ class Execution:
                 else:
                     stg_id_cache = stage_id_caches[op.stage]
                     hit = stg_id_cache.get(id(op))
-                    if hit is not None and hit[0] is op:
+                    if hit is not None and hit[FIRST] is op:
                         entry = hit[1]
                     else:
                         live_rates = stage_rates_map[op.stage]
@@ -3061,31 +3198,33 @@ class Execution:
                             op.semantic_shape, op.local_shape, op.padded_shape, op.launch_shape,
                             op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
                             op.vector_ops, op.hbm_bytes, op.link_bytes, op.link_scope,
-                            op.source_boundary, op.returns, _op_meta_key(op),
+                            op.source_boundary, op.returns, self._op_key(op),
                         )
                         entry = lazy_cache.get(lazy_key)
                         if entry is not None and entry is not False:
                             if len(stg_id_cache) >= 16384:
                                 stg_id_cache.clear()
                             stg_id_cache[id(op)] = (op, entry)
-                if entry is not None and entry is not False and entry[1] is not False:
+                if (entry is not None and entry is not False
+                        and entry[SECOND] is not False):
                     if cur_l_entries is not None:
                         cur_l_entries[idx] = entry
                     (res_op_tmpl, _mdiff, _rmem, _rec, _ctx_tmpl,
-                     submit, transport_options, inv_cell, _rname, _oname, _wdeltas) = entry[0]
+                     submit, transport_options, inv_cell, _rname, _oname,
+                     _wdeltas) = entry[FIRST]
                     cost_counts["analytic_work"] += 1
                     if not same_step_op:
                         trans_opts[(scope_str, op.op_id, replica)] = transport_options
                     if inv_cell is not None:
-                        if inv_cell[2] is cost_invs and inv_cell[3] is not None:
+                        if inv_cell[TWO] is cost_invs and inv_cell[THREE] is not None:
                             inv_cell[3]["invocations"] += 1
-                        elif inv_cell[0] in cost_invs:
+                        elif inv_cell[FIRST] in cost_invs:
                             li = cost_invs[inv_cell[0]]
                             inv_cell[2] = cost_invs
                             inv_cell[3] = li
                             li["invocations"] += 1
                         else:
-                            self.cost.record_invocation(inv_cell[1])
+                            self.cost.record_invocation(inv_cell[SECOND])
                             inv_cell[2] = cost_invs
                             inv_cell[3] = cost_invs.get(inv_cell[0])
                     res_stg = res_op_tmpl.stage
@@ -3640,11 +3779,34 @@ class Execution:
 
         cohort_views = self._cohort_views
         if cohort_views is None:
-            cohort_views = (
-                {int(rank): work.plan.requests for rank in self.topology.ranks(replica, ZERO)}
-                if work.plan.requests or work.mode != "graph"
-                else {}
-            )
+            parallel = self.case.runtime.parallel
+            local_width = max(int(parallel.tp), int(parallel.o_proj_tp),
+                              int(parallel.linear_proj_tp),
+                              int(parallel.lm_head_tp))
+            if (int(parallel.tp) == ONE and local_width > ONE
+                    and (work.plan.requests or work.mode != "graph")):
+                # A homogeneous single-replica evaluation still represents the
+                # complete node-local TP cohort.  Populate every peer's actual
+                # request rows so the rewritten GEMM receives the full node
+                # token count with 1/local_width features, not 1/local_width
+                # of the tokens.
+                from .local_tp_groups import local_tp_replica_cohorts
+                cohorts = local_tp_replica_cohorts(
+                    self.case.machine, parallel)
+                peers = next((group for group in cohorts if replica in group),
+                             (replica,))
+                cohort_views = {
+                    int(rank): work.plan.requests
+                    for peer in peers
+                    for rank in self.topology.ranks(peer, ZERO)
+                }
+            else:
+                cohort_views = (
+                    {int(rank): work.plan.requests
+                     for rank in self.topology.ranks(replica, ZERO)}
+                    if work.plan.requests or work.mode != "graph"
+                    else {}
+                )
         ops = lower_local_projection_tp(
             work.ops, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine, replica=replica,
@@ -3702,8 +3864,8 @@ class Execution:
             if not op.metadata:
                 return True
             hit = safe_cache.get(id(op))
-            if hit is not None and hit[0] is op:
-                return hit[1]
+            if hit is not None and hit[FIRST] is op:
+                return hit[SECOND]
             meta = _metadata_dict(op)
             ok = (_declaration_of(op) is None
                   and meta.get("group_axis") not in {"ep", "local_tp"}

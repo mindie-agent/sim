@@ -48,10 +48,15 @@ def test_resolve_hardware_sku_aliases_and_errors() -> None:
     assert resolve_hardware_sku("a3") == "Ascend910_9392"
     assert resolve_hardware_sku("910c") == "Ascend910_9392"
     assert resolve_hardware_sku("910_9382") == "Ascend910_9382"
-    assert resolve_hardware_sku("a5") == "Ascend910_9599"
-    assert resolve_hardware_sku("950") == "Ascend910_9599"
+    assert resolve_hardware_sku("a5") == "Ascend950DT_9582"
+    assert resolve_hardware_sku("950") == "Ascend950DT_9582"
+    assert resolve_hardware_sku("a5-pod") == "Ascend950DT_9581"
+    assert resolve_hardware_sku("atlas-950-superpod") == "Ascend950DT_9581"
+    assert resolve_hardware_sku("a5-pod-pr") == "Ascend950PR_9579"
     assert resolve_hardware_sku("Ascend950DT_9582") == "Ascend950DT_9582"
-    assert set(HARDWARE_ALIASES).issuperset({"a2", "a3", "a5", "910b4", "910_9392", "910_9599"})
+    assert set(HARDWARE_ALIASES).issuperset({"a2", "a3", "a5", "910b4", "910_9392"})
+    with pytest.raises(ModelingError, match="unknown_hardware_sku"):
+        resolve_hardware_sku("910_9599")
 
     with pytest.raises(ModelingError, match="unknown_hardware_sku"):
         resolve_hardware_sku("unknown_gpu_999")
@@ -62,13 +67,13 @@ def test_resolve_hardware_sku_aliases_and_errors() -> None:
     [
         ("qwen3.5-35b-a3b", "a2", "Ascend910B4", 4, 1, 4),
         ("qwen3.5-35b-a3b", "a3", "Ascend910_9392", 4, 2, 8),
-        ("qwen3.5-35b-a3b", "a5", "Ascend910_9599", 4, 2, 8),
+        ("qwen3.5-35b-a3b", "a5", "Ascend950DT_9582", 4, 2, 8),
         ("glm-5.3-flash", "a2", "Ascend910B4", 4, 1, 4),
         ("glm-5.3-flash", "a3", "Ascend910_9392", 4, 2, 8),
-        ("glm-5.3-flash", "a5", "Ascend910_9599", 4, 2, 8),
+        ("glm-5.3-flash", "a5", "Ascend950DT_9582", 4, 2, 8),
         ("deepseek-v4-flash", "a2", "Ascend910B4", 8, 1, 8),
         ("deepseek-v4-flash", "a3", "Ascend910_9392", 8, 2, 16),
-        ("deepseek-v4-flash", "a5", "Ascend910_9599", 8, 2, 16),
+        ("deepseek-v4-flash", "a5", "Ascend950DT_9582", 8, 2, 16),
     ],
 )
 def test_compose_case_catalog_models_across_a2_a3_a5(

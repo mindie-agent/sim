@@ -173,7 +173,7 @@ def test_a5_pcie_16p_has_4p_8p_16p_and_inter_tiers():
     sixteen = _link(machine, "d2d_intra_node", range(16))
     inter = _link(machine, "d2d_inter_node")
     assert machine.ranks_per_node == 16
-    assert machine.dies_per_package == 2
+    assert machine.dies_per_package == 1
     assert four.capacity_bytes_per_ms == pytest.approx(288e6 * 0.85)
     assert four.effective_peak_capacity_bytes_per_ms == pytest.approx(288e6)
     assert eight.capacity_bytes_per_ms == pytest.approx(128e6 * 0.85)

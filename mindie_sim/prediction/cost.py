@@ -13,12 +13,15 @@
 from __future__ import annotations
 
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Mapping
 
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.schema.case import Case as CaseSpec
 from .primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
+
+MAX_RECORDED_MAPPINGS = 32
+ZERO = 0
 
 
 @dataclass(frozen=True)
@@ -123,29 +126,97 @@ def _resource_service_context(context):
     return view
 
 
+class CostLedger:
+    """Mutable diagnostic records owned by exactly one isolated execution.
+
+    ``CostModel`` supplies immutable hardware/service declarations and pricing
+    logic.  Counts of what was priced, recorded mappings/invocations/regimes
+    and diagnostic primitive lookups live here, so an isolated row's ``basis``
+    contains only its own records and the main graph cannot absorb later
+    isolated-analysis counts.
+    """
+
+    __slots__ = (
+        "counts", "services", "mappings", "unrecorded_mappings",
+        "invocations", "regimes", "joint_native",
+        "diagnostic_primitive_lookups", "diagnostic_primitive_hits",
+    )
+
+    def __init__(self) -> None:
+        self.counts = {"measured_primitive": 0, "analytic_work": 0}
+        self.services: dict[str, dict[str, Any]] = {}
+        self.mappings: dict[str, dict[str, Any]] = {}
+        self.unrecorded_mappings = 0
+        self.invocations: dict[str, dict[str, Any]] = {}
+        self.regimes: dict[str, dict[str, Any]] = {}
+        self.joint_native: dict[Any, dict[str, Any]] = {}
+        self.diagnostic_primitive_lookups = 0
+        self.diagnostic_primitive_hits = 0
+
+    def account(self, basis: str) -> None:
+        self.counts[basis] = self.counts.get(basis, ZERO) + COUNT_STEP
+
+    def summary(self, model: "CostModel") -> dict[str, Any]:
+        return model.summary(self)
+
+
+COUNT_STEP = 1
+
+
 class CostModel:
-    def __init__(self, case: CaseSpec, primitives: PrimitiveStore | None = None):
+    def __init__(
+        self, case: CaseSpec, primitives: PrimitiveStore | None = None,
+        *, hardware: "FrozenHardwareView | None" = None, ledger: CostLedger | None = None,
+    ):
         self.case = case
         # The store is retained only for explicit diagnostic reads.  It is not
         # consulted by price() and cannot set a production completion floor.
         self.primitives = primitives
-        self.diagnostic_primitive_lookups = 0
-        self.diagnostic_primitive_hits = 0
-        self.hardware = {
-            "identity": case.machine.hardware_key or case.machine.sku,
-            "dies": [die.to_dict() for die in case.machine.dies],
-            "compute_peaks": dict(case.machine.compute_peaks),
-        }
-        self.counts = {"measured_primitive": 0, "analytic_work": 0}
-        self.services = {}
-        self.mappings = {}
-        self.unrecorded_mappings = 0
-        self.invocations = {}
-        self.regimes = {}
-        self.joint_native = {}
+        if hardware is None:
+            from .evaluation import FrozenHardwareView
+            hardware = FrozenHardwareView.from_machine(case.machine)
+        self.hardware_view = hardware
+        self.hardware = hardware.payload()
+        self.ledger = ledger if ledger is not None else CostLedger()
         self.resource_service_profile = None
         self.resource_services = ()
         self._load_resource_services()
+
+    @property
+    def counts(self):
+        return self.ledger.counts
+
+    @property
+    def services(self):
+        return self.ledger.services
+
+    @property
+    def mappings(self):
+        return self.ledger.mappings
+
+    @property
+    def unrecorded_mappings(self):
+        return self.ledger.unrecorded_mappings
+
+    @property
+    def invocations(self):
+        return self.ledger.invocations
+
+    @property
+    def regimes(self):
+        return self.ledger.regimes
+
+    @property
+    def joint_native(self):
+        return self.ledger.joint_native
+
+    @property
+    def diagnostic_primitive_lookups(self):
+        return self.ledger.diagnostic_primitive_lookups
+
+    @property
+    def diagnostic_primitive_hits(self):
+        return self.ledger.diagnostic_primitive_hits
 
     def _load_resource_services(self):
         metadata = dict(getattr(self.case.runtime, "metadata", ()) or ())
@@ -170,15 +241,16 @@ class CostModel:
         self.resource_service_profile = loaded
         self.resource_services = normalized
 
-    def lookup_diagnostic(self, op: OpSpec, replay_scope: str):
+    def lookup_diagnostic(self, op: OpSpec, replay_scope: str, *, ledger: CostLedger | None = None):
         """Explicit primitive-evidence read; never a production price or floor."""
         if self.primitives is None:
             return None
+        ledger = self.ledger if ledger is None else ledger
         key = primitive_key(self.case, op, replay_scope, hardware=self.hardware)
-        self.diagnostic_primitive_lookups += 1
+        ledger.diagnostic_primitive_lookups += COUNT_STEP
         timing = self.primitives.lookup(key)
         if timing is not None:
-            self.diagnostic_primitive_hits += 1
+            ledger.diagnostic_primitive_hits += COUNT_STEP
         return {"key": key, "timing": timing}
 
     def select_resource_service(self, context: Mapping[str, Any], *,
@@ -216,7 +288,7 @@ class CostModel:
             op, service, resource_role=resource_role, phase=phase or op.phase,
             work_unit=service.work_unit, conditions=context)
 
-    def price(self, op: OpSpec, replay_scope: str) -> OpCost:
+    def price(self, op: OpSpec, replay_scope: str, *, ledger: CostLedger | None = None) -> OpCost:
         if op.matrix_flops:
             import math
             if not math.isclose(sum(v for _, v in op.matrix_flops), op.flops, rel_tol=1e-12):
@@ -233,44 +305,52 @@ class CostModel:
         for resource, amount in dict(metadata.get("resource_work", {})).items():
             work[resource] = work.get(resource, 0) + amount
         result = OpCost(op, None, {k: float(v) for k, v in work.items() if v})
-        self.counts[result.basis] += 1
+        (self.ledger if ledger is None else ledger).account(result.basis)
         return result
 
-    def record_service(self, curve, basis, *, capacity_limited=False):
-        if curve.model_id not in self.services:
+    def record_service(self, curve, basis, *, capacity_limited=False, ledger: CostLedger | None = None):
+        ledger = self.ledger if ledger is None else ledger
+        services = ledger.services
+        if curve.model_id not in services:
             data = curve.to_dict()
-            self.services[curve.model_id] = {
+            services[curve.model_id] = {
                 "model_id": curve.model_id, "resource": curve.resource,
                 "work_unit": curve.work_unit, "identity": data["identity"],
                 "boundary": curve.boundary, "active_units": curve.active_units,
                 "provenance": data["provenance"], "queries": {},
-                "capacity_limited_queries": 0,
+                "capacity_limited_queries": ZERO,
             }
-        record = self.services[curve.model_id]
+        record = services[curve.model_id]
         record["queries"][basis] = record["queries"].get(basis, 0) + 1
         record["capacity_limited_queries"] += int(capacity_limited)
 
-    def record_mapping(self, mapping):
+    def record_mapping(self, mapping, *, ledger: CostLedger | None = None):
         import json
+        ledger = self.ledger if ledger is None else ledger
         key = json.dumps(mapping, sort_keys=True, separators=(",", ":"))
-        if key in self.mappings:
-            self.mappings[key]["invocations"] += 1
-        elif len(self.mappings) < 32:
-            self.mappings[key] = {**mapping, "invocations": 1}
+        mappings = ledger.mappings
+        if key in mappings:
+            mappings[key]["invocations"] += COUNT_STEP
+        elif len(mappings) < MAX_RECORDED_MAPPINGS:
+            mappings[key] = {**mapping, "invocations": COUNT_STEP}
         else:
-            self.unrecorded_mappings += 1
+            ledger.unrecorded_mappings += COUNT_STEP
 
-    def record_invocation(self, record):
+    def record_invocation(self, record, *, ledger: CostLedger | None = None):
+        ledger = self.ledger if ledger is None else ledger
         key = record["id"]
-        if key not in self.invocations:
-            self.invocations[key] = {**record, "invocations": 0}
-        self.invocations[key]["invocations"] += 1
+        invocations = ledger.invocations
+        if key not in invocations:
+            invocations[key] = {**record, "invocations": ZERO}
+        invocations[key]["invocations"] += COUNT_STEP
 
     def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
                       response_basis=None, mismatched_axes=(), continuity_group=None,
                       execution_mode=None, exterior_policy=None, issued_work=None,
-                      rate_flops_per_s=None, active_owners=None, stage=None):
-        record = self.regimes.setdefault(key, {
+                      rate_flops_per_s=None, active_owners=None, stage=None,
+                      ledger: CostLedger | None = None):
+        ledger = self.ledger if ledger is None else ledger
+        record = ledger.regimes.setdefault(key, {
             "model_id": key, **model, "queries": {}, "response_us_min": None,
             "response_us_max": None})
         record["queries"][basis] = record["queries"].get(basis, 0) + 1
@@ -310,14 +390,17 @@ class CostModel:
             record["response_ms_total"] = record.get("response_ms_total", 0.0) + duration_us / 1000
             record["response_ms_max"] = max(record.get("response_ms_max", 0.0), duration_us / 1000)
 
-    def record_joint_native(self, selection, reference_cost):
+    def record_joint_native(self, selection, reference_cost, *, ledger: CostLedger | None = None):
+        ledger = self.ledger if ledger is None else ledger
         declaration = dict(selection.execution or {})
-        self.counts[reference_cost.basis] -= 1
-        self.counts["joint_native_service"] = self.counts.get("joint_native_service", 0) + 1
+        counts = ledger.counts
+        counts[reference_cost.basis] -= COUNT_STEP
+        counts["joint_native_service"] = counts.get(
+            "joint_native_service", ZERO) + COUNT_STEP
         key = declaration["native_kernel"], declaration["resource"]
-        row = self.joint_native.setdefault(key, {
-            **declaration, "invocations": 0, "analytical_reference_work": {},
-            "replaced_primitive_count": 0,
+        row = ledger.joint_native.setdefault(key, {
+            **declaration, "invocations": ZERO, "analytical_reference_work": {},
+            "replaced_primitive_count": ZERO,
             "execution_basis": "declared_joint_native_service_queue",
             "unmodeled": ["internal_resource_occupancy", "internal_buffer_occupancy"]})
         row["invocations"] += 1
@@ -359,30 +442,35 @@ class CostModel:
         for role, value in reference_cost.work.items():
             row["analytical_reference_work"][role] = row["analytical_reference_work"].get(role, 0) + value
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, ledger: CostLedger | None = None) -> dict[str, Any]:
+        ledger = self.ledger if ledger is None else ledger
+        counts, services = ledger.counts, ledger.services
+        regimes, invocations = ledger.regimes, ledger.invocations
+        mappings, joint_native = ledger.mappings, ledger.joint_native
         sources = dict(self.case.runtime.metadata).get("primitive_parameter_sources", ())
         calibration = []
-        if self.diagnostic_primitive_hits:
+        if ledger.diagnostic_primitive_hits:
             calibration.append("diagnostic_primitive_evidence_not_production")
         if sources:
             calibration.append("declared_primitive_service_parameters")
-        if self.services:
+        if services:
             calibration.append("resource_service_curves")
-        selected_regimes = {r["id"] for r in self.regimes.values()
-                            if (r["queries"].get("observable_response")
-                                or r["queries"].get("joint_native_service")
-                                or r["queries"].get("linear_outside_support"))}
-        queried_regimes = {r["id"] for r in self.regimes.values()
+        selected_regimes = {
+            r["id"] for r in regimes.values()
+            if (r["queries"].get("observable_response")
+                or r["queries"].get("joint_native_service")
+                or r["queries"].get("linear_outside_support"))}
+        queried_regimes = {r["id"] for r in regimes.values()
                            if set(r["queries"]) - {"physical_identity_mismatch"}}
         if any(r["id"] in selected_regimes and r["response"].get("kind") != "roofline"
-               for r in self.regimes.values()):
+               for r in regimes.values()):
             calibration.append("observable_kernel_regimes")
         declared_regimes = [row["id"] for row in self.case.runtime.kernels.get("service_regimes", ())]
         return {
-            "operator_occurrences": dict(self.counts),
+            "operator_occurrences": dict(counts),
             "production_price_basis": "physical_work_only",
-            "diagnostic_primitive_lookups": self.diagnostic_primitive_lookups,
-            "diagnostic_primitive_hits": self.diagnostic_primitive_hits,
+            "diagnostic_primitive_lookups": ledger.diagnostic_primitive_lookups,
+            "diagnostic_primitive_hits": ledger.diagnostic_primitive_hits,
             "calibration": "+".join(calibration) or "none",
             "declared_parameter_sources": sources,
             **({"resource_services": [item.service_id
@@ -391,17 +479,17 @@ class CostModel:
                     self.resource_service_profile.get("source"))
                 if isinstance(self.resource_service_profile, Mapping) else None}
                if self.resource_services else {}),
-            **({"invocation_models": list(self.invocations.values())} if self.invocations else {}),
-            **({"service_models": list(self.services.values())} if self.services else {}),
-            **({"service_regimes": list(self.regimes.values())} if self.regimes else {}),
-            **({"joint_native_services": list(self.joint_native.values()),
+            **({"invocation_models": list(invocations.values())} if invocations else {}),
+            **({"service_models": list(services.values())} if services else {}),
+            **({"service_regimes": list(regimes.values())} if regimes else {}),
+            **({"joint_native_services": list(joint_native.values()),
                 "work_basis": "logical_and_analytical_reference; joint_native_queues_replace_selected_service"}
-               if self.joint_native else {}),
+               if joint_native else {}),
             **({"regime_selection": {"declared": declared_regimes,
                 "unmatched": sorted(set(declared_regimes) - queried_regimes),
                 "unselected": sorted(set(declared_regimes) - selected_regimes)}}
                if declared_regimes else {}),
-            **({"matrix_mappings": list(self.mappings.values()),
-                "unrecorded_mapping_invocations": self.unrecorded_mappings}
-               if self.mappings else {}),
+            **({"matrix_mappings": list(mappings.values()),
+                "unrecorded_mapping_invocations": ledger.unrecorded_mappings}
+               if mappings else {}),
         }

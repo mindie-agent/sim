@@ -117,7 +117,7 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
         "inter_pod_latency_us": 10.0,
     },
     "a5_pod": {
-        "ranks_per_node": 64, "dies_per_package": 2, "superpod_size": 8192,
+        "ranks_per_node": 64, "dies_per_package": 1, "superpod_size": 8192,
         "intra_node_bw_gbps": 800.0, "intra_node_bw_util": 0.85,
         "superpod_bw_gbps": 800.0, "inter_pod_bw_gbps": 100.0,
         "inter_node_bw_util": 0.80,
@@ -125,14 +125,14 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
         "inter_pod_latency_us": 10.0,
     },
     "a5_server": {
-        "ranks_per_node": 8, "dies_per_package": 2,
+        "ranks_per_node": 8, "dies_per_package": 1,
         "intra_bw_4p_gbps": 560.0, "intra_bw_8p_gbps": 640.0,
         "intra_node_bw_gbps": 640.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_gbps": 200.0, "inter_node_bw_util": 0.80,
         "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
     },
     "a5_pcie_16p": {
-        "ranks_per_node": 16, "dies_per_package": 2,
+        "ranks_per_node": 16, "dies_per_package": 1,
         "intra_bw_4p_gbps": 288.0, "intra_bw_8p_gbps": 128.0,
         "intra_node_bw_gbps": 116.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_gbps": 50.0, "inter_node_bw_util": 0.80,

@@ -109,6 +109,13 @@ INDEXER_TYPE_ALIASES = {
     "c4": "c4",
 }
 INDEXER_TYPES = frozenset({"none", "c4", "full", "shared"})
+Q_OUTPUT_GATE_KINDS = frozenset({"none", "elementwise", "headwise"})
+Q_PROJECTION_PACKED_WIDTH = 2
+Q_PROJECTION_PLAIN_WIDTH = 1
+KV_CACHE_PLANES = 2
+DEFAULT_NORM_EPS = 1e-6
+Q_GATE_PROJECTIONS = frozenset({"packed_q", "separate"})
+ACCOUNTING_SCOPES = frozenset({"text_backbone", "full_checkpoint"})
 
 @dataclass(frozen=True)
 class LayerPlan:
@@ -148,7 +155,11 @@ class LayerPlan:
     mla_variant: str = "none"           # none | latent_mqa | latent_mla
     mla_output_gate: bool = False
     mla_qkv_a_gate_fused: bool = False
+    #: Declared Q output-gate shape.  ``None`` means the legacy boolean was
+    #: supplied; ``__post_init__`` resolves it to a canonical kind.
     q_output_gate: bool = False
+    q_output_gate_kind: str | None = None   # none | elementwise | headwise
+    q_gate_projection: str = "packed_q"     # packed_q | separate
     noncausal_attention: bool = False
     expert_latent_size: int = 0
     expert_latent_norm_position: str = "pre"  # pre | post | none
@@ -224,6 +235,34 @@ class LayerPlan:
             raise ModelingError(f"layer_plan_indexer_type_unknown:{raw}")
         if role != self.indexer_type:
             object.__setattr__(self, "indexer_type", role)
+        kind = self.q_output_gate_kind
+        if kind is None or (kind == "none" and self.q_output_gate):
+            # The legacy boolean is a compatibility alias for a headwise gate.
+            kind = "headwise" if self.q_output_gate else "none"
+        if kind not in Q_OUTPUT_GATE_KINDS:
+            raise ModelingError(f"layer_plan_q_output_gate_kind_unknown:{kind}")
+        projection = str(self.q_gate_projection or "packed_q")
+        if projection not in Q_GATE_PROJECTIONS:
+            raise ModelingError(
+                f"layer_plan_q_gate_projection_unknown:{projection}")
+        if kind == "none" and projection != "packed_q":
+            raise ModelingError(
+                "layer_plan_q_gate_projection_requires_gate")
+        object.__setattr__(self, "q_output_gate_kind", kind)
+        object.__setattr__(self, "q_gate_projection", projection)
+        object.__setattr__(self, "q_output_gate", kind != "none")
+
+    def q_projection_width(self, local_heads: int, head_dim: int) -> int:
+        if self.q_gate_separate:
+            return int(local_heads) * int(head_dim) * Q_PROJECTION_PLAIN_WIDTH
+        width = (Q_PROJECTION_PACKED_WIDTH if self.q_output_gate
+                 else Q_PROJECTION_PLAIN_WIDTH)
+        return int(local_heads) * int(head_dim) * width
+
+    @property
+    def q_gate_separate(self) -> bool:
+        """True when the declared gate owns a separate g_proj matrix."""
+        return bool(self.q_output_gate and self.q_gate_projection == "separate")
 
     @property
     def indexer_executes(self) -> bool:
@@ -235,7 +274,9 @@ class LayerPlan:
             return int(self.kv_cache_elements)
         if self.attention == "mla":
             return int(self.kv_lora_rank + self.qk_rope_head_dim)
-        return int((1 if self.k_eq_v else 2) * self.num_kv_heads * self.head_dim)
+        # k_eq_v shares projection weights; post-norm/RoPE K and V cache
+        # tensors remain distinct planes.
+        return int(KV_CACHE_PLANES * self.num_kv_heads * self.head_dim)
 
     @property
     def state_bytes_total(self) -> float:
@@ -280,6 +321,16 @@ class ModelSpec:
     engram: EngramSpec | None = None
     auxiliary: AuxiliarySpec | None = None
     body_layers: int = 0
+    #: ``text_backbone`` excludes undeclared multimodal towers; a
+    #: ``full_checkpoint`` scope requires exact tower/projector declarations.
+    accounting_scope: str = "text_backbone"
+
+    def __post_init__(self) -> None:
+        scope = str(self.accounting_scope or "text_backbone")
+        if scope not in ACCOUNTING_SCOPES:
+            raise ModelingError(f"model_accounting_scope_unknown:{scope}")
+        if scope != self.accounting_scope:
+            object.__setattr__(self, "accounting_scope", scope)
 
     @property
     def is_standalone_draft(self) -> bool:
@@ -348,6 +399,7 @@ class ModelSpec:
             "num_shared_experts", "expert_routing", "expert_routing_histogram",
             "expert_routing_distribution", "mla", "tie_word_embeddings",
             "catalog_key", "model_catalog_key", "preset", "metadata",
+            "accounting_scope",
             "n_layers", "num_hidden_layers", "d_model", "hidden_dim", "n_heads",
             "n_kv_heads", "d_head", "ffn_dim", "n_experts", "num_experts_per_tok",
             "moe_inter_dim", "dtype", "attention_type", "ffn_type",
@@ -457,10 +509,11 @@ class ModelSpec:
             top_k=top_k, moe_intermediate_size=moe_intermediate,
             num_shared_experts=shared, expert_routing=routing,
             expert_routing_source=routing_source, mla=mla,
-            norm_eps=float(raw.get("norm_eps", 1e-6)), quant=quant,
+            norm_eps=float(raw.get("norm_eps", DEFAULT_NORM_EPS)), quant=quant,
             auxiliary=auxiliary(immutable_sequences(raw["auxiliary"])) if raw.get("auxiliary") else None,
             tie_word_embeddings=bool(raw.get("tie_word_embeddings", False)),
             metadata=_metadata(raw),
+            accounting_scope=str(raw.get("accounting_scope", "text_backbone")),
         )
 
     @property

@@ -1,0 +1,116 @@
+{
+  "models": {
+    "deepseek-v4-10t": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v4-flash-0731": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v4-pro-0813": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v4.1-flash": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v2-lite": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v3.2-prune-3l": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v3": {
+      "scope": "text_backbone"
+    },
+    "deepseek-r1": {
+      "scope": "text_backbone"
+    },
+    "deepseek-v3.2": {
+      "scope": "text_backbone"
+    },
+    "glm-5.3": {
+      "scope": "text_backbone"
+    },
+    "glm-5.3-flash": {
+      "scope": "text_backbone"
+    },
+    "glm-5.1": {
+      "scope": "text_backbone"
+    },
+    "glm-5.2": {
+      "scope": "text_backbone"
+    },
+    "kimi-k3": {
+      "scope": "text_backbone"
+    },
+    "kimi-k3.1": {
+      "scope": "text_backbone"
+    },
+    "kimi-k3-dspark": {
+      "scope": "text_backbone"
+    },
+    "kimi-k3-dspark-block5": {
+      "scope": "text_backbone"
+    },
+    "kimi-k2": {
+      "scope": "text_backbone"
+    },
+    "kimi-k2-thinking": {
+      "scope": "text_backbone"
+    },
+    "kimi-k2.5": {
+      "scope": "text_backbone"
+    },
+    "qwen3-30b-a3b": {
+      "scope": "text_backbone"
+    },
+    "qwen3-32b": {
+      "scope": "text_backbone"
+    },
+    "qwen3-235b-a22b": {
+      "scope": "text_backbone"
+    },
+    "qwen3-next-80b-a3b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.5-27b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.5-35b-a3b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.5-397b-a17b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.6-27b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.8-2.4t-a95b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.8-27b": {
+      "scope": "text_backbone"
+    },
+    "minimax-m3": {
+      "scope": "text_backbone"
+    },
+    "minimax-m3.1-flash": {
+      "scope": "text_backbone"
+    },
+    "gemma-4-26b-a4b": {
+      "scope": "text_backbone"
+    },
+    "gemma-4-31b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.6-35b-a3b": {
+      "scope": "text_backbone"
+    },
+    "qwen3.8-flash-next": {
+      "scope": "text_backbone"
+    },
+    "step-5-preview": {
+      "scope": "text_backbone"
+    }
+  },
+  "source": "declared structural conservation reference"
+}
