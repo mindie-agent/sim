@@ -25,6 +25,7 @@ from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError
+from .runtime.exposed_intervals import service_role
 
 
 ZERO = 0.0
@@ -67,6 +68,25 @@ class StageDescriptor:
                 raise ModelingError(f"exposed_stage_duration_negative:{name}")
 
 
+MATRIX_PREFIXES = ("matrix@", "cube@")
+VECTOR_PREFIXES = ("vector@", "scalar@")
+MEMORY_PREFIXES = ("mte", "fixpipe", "l2@", "ub", "l0")
+
+
+def _resource_role(name: str) -> str:
+    """Semantic role of one scoped physical resource or legacy alias."""
+    role = service_role(name)
+    if role != ROLE_CONTROL:
+        return role
+    if name.startswith(MATRIX_PREFIXES):
+        return ROLE_CUBE
+    if name.startswith(VECTOR_PREFIXES):
+        return ROLE_VECTOR
+    if name.startswith(MEMORY_PREFIXES):
+        return ROLE_MEMORY
+    return ROLE_CONTROL
+
+
 def _role_times(work: Mapping[str, float], rates: Mapping[str, float]) -> dict[str, float]:
     cube = vector = memory = communication = ZERO
     for name, amount in dict(work or {}).items():
@@ -77,14 +97,18 @@ def _role_times(work: Mapping[str, float], rates: Mapping[str, float]) -> dict[s
         if rate <= ZERO:
             raise ModelingError(f"exposed_stage_rate_missing:{name}")
         service = value / rate
-        if name in CUBE_RESOURCES:
+        role = _resource_role(str(name))
+        if role == ROLE_CUBE:
             cube = max(cube, service)
-        elif name in VECTOR_RESOURCES:
+        elif role == ROLE_VECTOR:
             vector = max(vector, service)
-        elif name in MEMORY_RESOURCES:
+        elif role == ROLE_MEMORY:
             memory = max(memory, service)
-        elif name in COMMUNICATION_RESOURCES:
+        elif role == ROLE_COMMUNICATION:
             communication = max(communication, service)
+        else:
+            # Host launch/control is a vector/control service node.
+            vector = max(vector, service)
     return {"cube_ms": cube, "vector_ms": vector,
             "memory_ms": memory, "communication_ms": communication}
 

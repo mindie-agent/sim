@@ -35,6 +35,7 @@ from mindie_sim.schema.common import ModelingError
 ZERO = 0
 ONE = 1
 FIRST = 0
+ZERO_FLOAT = 0.0
 POLICY_BALANCED = "balanced_expectation"
 POLICY_EXPLICIT = "explicit"
 
@@ -51,11 +52,19 @@ class PhysicalSlotWork:
     global_tokens: int
     expected_rows_by_rank: tuple[float, ...]
     active_slots_by_rank: tuple[int, ...]
+    #: ``[rank][slot_pos]`` logical-expert weight bytes; empty keeps the
+    #: historical uniform ``packed_weight_bytes`` fallback.
+    slot_weight_bytes: tuple[tuple[float, ...], ...] = ()
 
     def weight_read_bytes(self, rank: int) -> float:
         """Routed weight bytes read by one rank under this realization."""
         rows = self.per_rank_slot_rows[rank]
         probabilities = self.active_probabilities[rank]
+        if self.slot_weight_bytes:
+            weights = self.slot_weight_bytes[rank]
+            return float(math.fsum(
+                float(weights[index]) * probability
+                for index, probability in enumerate(probabilities)))
         if self.routing_mode == POLICY_EXPLICIT:
             return float(math.fsum(
                 float(self.packed_weight_bytes[index])
@@ -118,6 +127,8 @@ def _balanced(
 ) -> PhysicalSlotWork:
     copies = slots.copies_per_expert()
     copy_index = _copy_index(slots)
+    slot_bytes = tuple(tuple(float(weights[expert]) for expert in ids)
+                       for ids in slots.expert_ids_by_rank)
     rows = [[ZERO] * len(ids) for ids in slots.expert_ids_by_rank]
     probabilities = [[ZERO] * len(ids) for ids in slots.expert_ids_by_rank]
     weight_reads = [[ZERO] * len(ids) for ids in slots.expert_ids_by_rank]
@@ -143,6 +154,7 @@ def _balanced(
         POLICY_BALANCED, int(tokens),
         tuple(float(sum(row)) for row in rows),
         tuple(int(round(sum(row))) for row in probabilities),
+        slot_bytes,
     )
 
 
@@ -204,6 +216,8 @@ def physical_slot_work(
                 rows[rank][position] += ONE
     probabilities = tuple(
         tuple(ONE if value > ZERO else ZERO for value in row) for row in rows)
+    slot_bytes = tuple(tuple(float(weights[expert]) for expert in ids)
+                       for ids in slot_plan.expert_ids_by_rank)
     return PhysicalSlotWork(
         tuple(tuple(float(value) for value in row) for row in rows),
         probabilities,
@@ -212,6 +226,7 @@ def physical_slot_work(
         POLICY_EXPLICIT, int(global_tokens),
         tuple(float(sum(row)) for row in rows),
         tuple(sum(ONE for value in row if value > ZERO) for row in rows),
+        slot_bytes,
     )
 
 
@@ -235,11 +250,15 @@ def bind_expert_slot_work(ops: Sequence[Any], *, slot_work: PhysicalSlotWork) ->
             "physical_slot_active": slot_work.active_slots_by_rank[rank],
             "physical_slot_weight_bytes": active_bytes,
             "routed_weight_read_bytes": active_bytes,
+            "packed_weight_bytes": active_bytes,
+            "expert_slot_active_weight_bytes": active_bytes,
             "expert_slot_routing_mode": slot_work.routing_mode,
         })
         result.append(replace(
             op,
-            hbm_bytes=max(ZERO, float(getattr(op, "hbm_bytes", ZERO))
+            mte2_bytes=max(ZERO_FLOAT, float(getattr(op, "mte2_bytes", ZERO))
+                           - previous + active_bytes),
+            hbm_bytes=max(ZERO_FLOAT, float(getattr(op, "hbm_bytes", ZERO))
                           - previous + active_bytes),
             metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[FIRST])),
         ))

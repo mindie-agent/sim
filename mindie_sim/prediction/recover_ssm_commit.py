@@ -79,12 +79,34 @@ def _state_bytes(metadata: Mapping[str, Any]) -> float:
     return float(heads * dk * dv) * float(dtype_bytes(dtype))
 
 
+def _decode_speculative(view: Any) -> bool:
+    """A verify view is decode-only; a prefill multi-token query is not spec."""
+    return (str(getattr(view, "phase", "")) == "decode"
+            and int(getattr(view, "q_len", ZERO) or ZERO) > ONE
+            and not bool(getattr(view, "padding", False)))
+
+
 def _owner(metadata: Mapping[str, Any], op: OpSpec) -> str:
     return str(metadata.get("state_owner") or
                metadata.get("recurrent_state_owner") or f"layer{op.layer}")
 
 
-def _is_intent(op: OpSpec) -> bool:
+def _geometry(metadata: Mapping[str, Any]) -> Mapping[str, Any]:
+    value = metadata.get("recover_ssm_geometry")
+    return value if isinstance(value, Mapping) else {}
+
+
+def _scope(metadata: Mapping[str, Any]) -> str:
+    return str(_geometry(metadata).get("scope", metadata.get("scope", "")))
+
+
+def _layer(metadata: Mapping[str, Any], op: OpSpec) -> int:
+    declared = _geometry(metadata).get("layer", metadata.get("layer", op.layer))
+    return int(declared if declared is not None else op.layer)
+
+
+def is_recover_ssm_intent(op: OpSpec) -> bool:
+    """Whether this operator is the deferred, uncharged commit intent."""
     metadata = dict(op.metadata)
     return bool(metadata.get("recover_ssm_intent")) or str(
         metadata.get("recover_ssm_stage", "")) == INTENT_STAGE
@@ -102,10 +124,7 @@ def bind_recover_ssm_commits(
 ) -> tuple[OpSpec, ...]:
     """Materialize acceptance-bound commits for every declared state owner."""
     del runtime
-    active = tuple(
-        view for view in views
-        if int(getattr(view, "q_len", ZERO) or ZERO) > ONE
-        and not bool(getattr(view, "padding", False)))
+    active = tuple(view for view in views if _decode_speculative(view))
     if not active:
         return tuple(ops)
     events = dict(acceptance_events or {})
@@ -115,16 +134,16 @@ def bind_recover_ssm_commits(
         for view in active
     }
     result: list[OpSpec] = []
-    emitted: set[tuple[str, str]] = set()
+    emitted: set[tuple[str, str, int, str]] = set()
     for op in ops:
-        if not (_is_intent(op) or _is_pending_commit(op)):
+        if not (is_recover_ssm_intent(op) or _is_pending_commit(op)):
             result.append(op)
             continue
         metadata = dict(op.metadata)
         owner = _owner(metadata, op)
         version = str(metadata.get("input_state_version",
                                   metadata.get("state_version", "")))
-        key = (owner, version)
+        key = (owner, _scope(metadata), _layer(metadata, op), version)
         if key in emitted:
             raise ModelingError(
                 f"recover_ssm_duplicate_commit:{owner}:{version}")
@@ -148,6 +167,13 @@ def bind_recover_ssm_commits(
         if binding is not None:
             dependencies.append(str(binding))
         total = sum(count for _request, count in selected)
+        geometry = _geometry(metadata)
+        if geometry:
+            metadata["heads"] = int(geometry.get("heads", ONE))
+            metadata["dk"] = int(geometry.get("dk", ONE))
+            metadata["dv"] = int(geometry.get("dv", ONE))
+            metadata["state_dtype"] = str(geometry.get("state_dtype", "fp32"))
+            metadata["record_kg_dtype"] = str(geometry.get("kg_dtype", "bf16"))
         record = _record_bytes_per_token(metadata)
         state = _state_bytes(metadata)
         read = float(len(selected)) * state + float(total) * record
@@ -168,6 +194,10 @@ def bind_recover_ssm_commits(
                 if str(getattr(view, "request_id", "")) in dict(sequence)),
             "committed_tokens": sequence,
             "record_bytes_per_token": record,
+            "state_bytes": state,
+            "heads": heads,
+            "dk": dk,
+            "dv": dv,
             "input_state_version": version,
             "published_state_version": str(metadata.get(
                 "published_state_version", version)),
@@ -191,15 +221,12 @@ def bind_declared_body_commits(
     ops: Sequence[OpSpec], *, views: Sequence[Any],
 ) -> tuple[OpSpec, ...]:
     """Body-only assembly: require the declared integer advancement explicitly."""
-    active = tuple(
-        view for view in views
-        if int(getattr(view, "q_len", ZERO) or ZERO) > ONE
-        and not bool(getattr(view, "padding", False)))
+    active = tuple(view for view in views if _decode_speculative(view))
     for view in active:
         _advanced_tokens(view)
     rewritten = []
     for op in ops:
-        if _is_intent(op) or _is_pending_commit(op):
+        if is_recover_ssm_intent(op) or _is_pending_commit(op):
             metadata = dict(op.metadata)
             metadata["acceptance_boundary"] = BODY_BOUNDARY
             rewritten.append(replace(

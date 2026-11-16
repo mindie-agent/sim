@@ -85,7 +85,7 @@ class ModelGraphSet(dict):
         return self.programs[replica]
 
 
-def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
+def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="body",
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True,
                      routing_views=None, physical_rank=None, query_position=None,
@@ -114,7 +114,7 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
     )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
     from .local_tp_groups import local_tp_spans_dp
-    if (len(group) > 1
+    if (len(group) > ONE
             and (case.runtime.kernels.get("sequence_parallel")
                  or local_tp_spans_dp(case.runtime.parallel))):
         # A single rank cannot resolve cross-DP SP without the complete
@@ -326,7 +326,7 @@ def _routing_views_for(value, replica):
     return value
 
 
-def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
+def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="model",
                   media_tokens_per_sequence=None, resource_fusion=True,
                   draft_prepare=False, apply_body_defaults=True,
                   padded_idle=False, routing_views=None, physical_rank=None,
@@ -471,6 +471,15 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
     graphs = bind_cohort_traffic(case, raw_graphs)
     graphs = lower_local_projection_tp_cohort(
         graphs, model=case.model, runtime=case.runtime, machine=case.machine)
+    reuse_mode = str(getattr(case.runtime, "homogeneous_graph_reuse", "off"))
+    if len(graphs) > ONE and reuse_mode != "off":
+        # The same ordinary cohort producer proves and rebinds replicas; a
+        # "require" declaration therefore fails before pricing an unproved
+        # asymmetric cohort instead of silently running full duplicates.
+        from .cohort_reuse import prepare_cohort_graphs
+        prepared = prepare_cohort_graphs(case, graphs, reuse=reuse_mode)
+        graphs = {replica: tuple(prepared.graphs[replica])
+                  for replica in graphs}
     if scope == "body":
         return TargetGraphSet(graphs, kernels=case.runtime.kernels,
                               selection=selection)
@@ -493,8 +502,8 @@ def model_graphs(value, *, phase, tokens, context=0, sequences=1, scope="model",
         pure_model=True, **options)
 
 
-def model_program(value, *, phase, tokens, context=0, sequences=1,
-                  assembly="model", selected_replica=0, cohort=None,
+def model_program(value, *, phase, tokens, context=ZERO, sequences=ONE,
+                  assembly="model", selected_replica=ZERO, cohort=None,
                   apply_body_defaults=False, **options):
     """Assemble a pure-model forward through the existing ``Frontend.program``.
 
@@ -757,7 +766,7 @@ def _replay_scope(ops, declared):
 
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
-                    input_ready_ms=0, replica=0):
+                    input_ready_ms=ZERO, replica=ZERO):
     """Price local operators or complete replica->operators cohort mappings."""
     from .program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
@@ -765,8 +774,12 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
     case = consume_target_declaration(parse_case(case), ops)
     recipes = recipes or RecipeBook.from_mapping(case.runtime.kernels)
     if isinstance(ops, Mapping):
-        return _cohort_costs(
+        from .exposed_breakdown import unavailable_breakdown
+        result = _cohort_costs(
             case, ops, recipes, primitives, replay_scope, input_ready_ms)
+        result.update(unavailable_breakdown(
+            "operator_only", boundary="operator_sum"))
+        return result
     ops = tuple(recipes.expand(ops))
     unbound_inverse = any(dict(op.metadata).get("reverse_of_collective")
                           and "peer_traffic" not in dict(op.metadata) for op in ops)
@@ -824,6 +837,7 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
                     op, replica, replay_scope)), recipe)}
                if context.native_work.get("link") else {}),
         })
+    from .exposed_breakdown import unavailable_breakdown
     return {
         "schema": "mindie-sim.operators/1",
         **model_coverage(case.model),
@@ -831,4 +845,5 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         "operator_occurrences": sum(row["occurrences"] for row in rows),
         "operator_sum_ms": sum(row["total_ms"] for row in rows),
         "operators": rows,
+        **unavailable_breakdown("operator_only", boundary="operator_sum"),
     }

@@ -12,9 +12,12 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
+from mindie_sim.catalog.expert_slots import expert_slot_plan
 from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, barrier_op
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from mindie_sim.schema.runtime_features import split_routing_features
+from .expert_slot_work import bind_expert_slot_work, physical_slot_work
 from .structure_groups import declare_group, source_reference
 from .gated_activation import gated_activation, declare_situ_quant, SITU_SOURCE
 from .deepep import (deepep_exchange_factor, resolve_exchange_options,
@@ -23,6 +26,11 @@ from .deepep import (deepep_exchange_factor, resolve_exchange_options,
                      split_deepep_up_overlap)
 from .moe_callers import RoutingPolicy, local_expert_reduce_recipe, tp_join_reduce
 from . import deepep, moe_transport, moe_token_partition
+
+ZERO = 0
+ONE = 1
+TWO = 2
+ZERO_FLOAT = 0.0
 
 
 def _latent_norm(prefix, source, stage, plan, requests, tokens, latent, model, mode):
@@ -142,6 +150,14 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
              ("routing_realization", routing_realization.to_dict())))
     if token_partition:
         routing_metadata += token_partition.metadata()
+    # The local EP owner this graph represents. Base and redundant physical
+    # slots are a property of that owner, not of the logical expert ledger.
+    local_ep_rank = int(
+        getattr(routing_realization, "representative_rank", ZERO) or ZERO)
+    runtime_routing = dict(getattr(runtime, "routing", {}) or {})
+    has_slots = (
+        int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
+        or "expert_slot_map" in runtime_routing)
     balanced = (routing_realization is not None
                 and routing_realization.basis in {"forced_balanced_integer_counts",
                                                   "source_force_eplb_masked_integer_counts"})
@@ -473,7 +489,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         )
         # Probability moments stay fractional; explicit realization counts stay
         # integer. Both paths price active experts without reading empty banks.
-        def routed_work(op, n, k, weights):
+        def routed_work(op, n, k, weights, weight_kind):
             fraction = local_rows / op.local_shape[0]
             read = (op.mte2_bytes - weights) * fraction + weights
             write = op.mte3_bytes * fraction
@@ -483,6 +499,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             # an explicit source grouped planner still owns its actual rows.
             metadata["matrix_mapping_domain"] = "aggregate_experts"
             metadata["matrix_weight_bank_groups"] = local_experts
+            metadata["routed_weight_read_bytes"] = weights
+            metadata["expert_slot_weight_kind"] = weight_kind
+            metadata["ep_rank"] = local_ep_rank
             if routing_realization is not None:
                 metadata["matrix_mapping_domain"] = "equal_expert_groups"
                 metadata["matrix_groups"] = active
@@ -513,8 +532,8 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
                            padded_shape=padded_shape,
                            recipe=("balanced_" + op.recipe) if balanced else op.recipe,
                            metadata=tuple(metadata.items()) + routing_metadata)
-        gate = routed_work(gate, 2 * expert_width, latent, gate_weight)
-        down = routed_work(down, latent, expert_width, down_weight)
+        gate = routed_work(gate, TWO * expert_width, latent, gate_weight, "gate_up")
+        down = routed_work(down, latent, expert_width, down_weight, "down")
         if dispatch_quant_meta and transport is None:
             gate = replace(gate, metadata=gate.metadata + (
                 ("activation_producer", "explicit_transport_quantization"),
@@ -840,6 +859,58 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             reduction = caller.tag_reduce(reduction)
         ops.append(reduction)
         last = reduction.op_id
+    if (has_slots and runtime is not None and int(plan.num_experts) > ZERO
+            and routed_tokens > ZERO):
+        # Redundant physical copies change residency and active weight reads,
+        # never logical assignments or aggregate FLOPs. Bind the exact
+        # per-owner slot bytes after routing and before native graph lowering.
+        _, slot_routing = split_routing_features(runtime_routing)
+        slot_plan = expert_slot_plan(model, plan, parallel, routing=slot_routing)
+        declared = tuple(getattr(routing_realization, "expert_rows", ()) or ())
+        if declared and len(declared) == int(plan.num_experts):
+            assignments = sum(float(value) for value in declared)
+            denominator = assignments / max(ONE, int(plan.top_k))
+            inclusions = tuple(
+                float(value) / denominator if denominator > ZERO_FLOAT
+                else ZERO_FLOAT for value in declared)
+        else:
+            rows, _active = routing.expert_moments(
+                model, plan, int(group_tokens))
+            denominator = float(group_tokens)
+            inclusions = tuple(
+                float(value) / denominator if denominator > ZERO_FLOAT
+                else ZERO_FLOAT for value in rows)
+        experts = max(ONE, int(plan.num_experts))
+        gate_unit = float(model.quant.matrix_bytes(
+            TWO * expert_width, latent, "routed_expert"))
+        down_unit = float(model.quant.matrix_bytes(
+            latent, expert_width, "routed_expert"))
+        gate_work = physical_slot_work(
+            slot_plan=slot_plan, logical_inclusions=inclusions,
+            global_tokens=int(group_tokens),
+            packed_weight_bytes=tuple([gate_unit] * experts))
+        down_work = physical_slot_work(
+            slot_plan=slot_plan, logical_inclusions=inclusions,
+            global_tokens=int(group_tokens),
+            packed_weight_bytes=tuple([down_unit] * experts))
+        kinds = {
+            op.op_id: str(dict(op.metadata).get("expert_slot_weight_kind", ""))
+            for op in ops
+        }
+        gate_bound = {
+            op.op_id: op for op in bind_expert_slot_work(
+                tuple(op for op in ops if kinds[op.op_id] == "gate_up"),
+                slot_work=gate_work)
+        }
+        down_bound = {
+            op.op_id: op for op in bind_expert_slot_work(
+                tuple(op for op in ops if kinds[op.op_id] == "down"),
+                slot_work=down_work)
+        }
+        ops = [
+            gate_bound.get(op.op_id, down_bound.get(op.op_id, op))
+            for op in ops
+        ]
     from .mc2_graph import lower as lower_native_mc2
     destination_rows = (
         tuple(int(value) for value in routing_realization.rank_assignment_rows)
