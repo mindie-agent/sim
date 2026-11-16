@@ -117,7 +117,7 @@ class TargetOperators(tuple):
                                "selection": self.default_selection}
 
 
-def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=True):
+def effective_body_declaration(case, phase, *, tokens=ONE, scope="body", enabled=True):
     """Resolve one body declaration before either structure or timing lowers it."""
     if scope != "body" or not enabled:
         return case, {"profile": "explicit_declaration_preserved",
@@ -132,7 +132,8 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
         # Compression must not enable the opt-in mapping search. Keep the
         # original 128x128 output-owner grid. K64 is a capacity alternative
         # when two FP32 K128 operand buffers do not fit a declared L0 pool.
-        programs["matmul"] = _steady_matmul_default(candidates=True)
+        programs["matmul"] = _steady_matmul_default(
+            candidates=True, a5=case.machine.sku.startswith("Ascend950"))
         # Grouped matrices already had a mapped Steady fallback before the
         # body default. Do not narrow their independent expert-bank domain.
         families = case.runtime.kernels.setdefault("families", {})
@@ -158,15 +159,35 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
     return case, selection
 
 
-def _steady_matmul_default(*, candidates=False):
+DEFAULT_MATMUL_CANDIDATES = (
+    (256, 256, 64),
+    (128, 256, 128),
+    (256, 128, 128),
+    (128, 256, 64),
+    (128, 128, 128),
+    (128, 128, 64),
+    (64, 256, 128),
+    (64, 128, 128),
+    (32, 128, 256),
+    (32, 128, 128),
+    (32, 64, 256),
+    (32, 32, 256),
+    (16, 128, 256),
+    (16, 64, 256),
+)
+LEGACY_MATMUL_CANDIDATES = ((128, 128, 128), (128, 128, 64))
+
+
+def _steady_matmul_default(*, candidates=False, a5=False):
     """The compact finite-K matrix program, including symmetric owner cohorts.
 
-    The grouped-matrix family keeps its own unconstrained candidate domain; only
-    the dense ``matmul`` program declares the two 128-output-grid candidates.
+    Candidate tiles are declared architecture policy, not a dense-only
+    128-output narrowing. The mapping still screens L1/L0A/L0B/L0C capacity.
     """
     program = {"kind": "steady_matmul", "owner_cohorts": True}
     if candidates:
-        program["candidates"] = [[128, 128, 128], [128, 128, 64]]
+        tiles = DEFAULT_MATMUL_CANDIDATES if a5 else LEGACY_MATMUL_CANDIDATES
+        program["candidates"] = [list(item) for item in tiles]
     return program
 
 
@@ -186,7 +207,8 @@ def service_program_defaults(case):
     if "matmul" in (kernels.get("programs") or {}):
         return case
     programs = {**kernels.get("programs", {}),
-                "matmul": _steady_matmul_default(candidates=True)}
+                "matmul": _steady_matmul_default(
+        candidates=True, a5=case.machine.sku.startswith("Ascend950"))}
     families = dict(kernels.get("families", {}))
     families.setdefault("grouped_gemm", _steady_matmul_default())
     return replace(case, runtime=replace(

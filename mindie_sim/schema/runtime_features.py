@@ -170,6 +170,14 @@ def normalize_runtime_features(raw: Mapping[str, Any]) -> dict[str, Any]:
         result[PARALLEL_KEY] = normalized_parallel
     if routing is not None:
         result[ROUTING_KEY] = routing_copy
+    overlap_aliases = ("enable_shared_expert_overlap", "overlap_shared_expert")
+    for alias in overlap_aliases:
+        if alias in result:
+            result["multistream_overlap_shared_expert"] = _feature_bool(result.pop(alias), alias)
+    dbo_aliases = ("dbo", "dual_batch_overlap", "enable_dual_batch_overlap")
+    for alias in dbo_aliases:
+        if alias in result:
+            result["enable_dbo"] = _feature_bool(result.pop(alias), alias)
     for name in RUNTIME_MODE_DEFAULTS:
         if name in result:
             result[name] = _feature_mode(result[name], name, _MODES[name])

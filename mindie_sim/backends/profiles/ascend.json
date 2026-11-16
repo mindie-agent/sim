@@ -87,6 +87,179 @@
           "resource": "mte1",
           "rate": 5683200000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A2",
@@ -422,6 +595,179 @@
         "mte1_l0b": {
           "resource": "mte1",
           "rate": 5529600000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
         }
       }
     },
@@ -759,6 +1105,179 @@
           "resource": "mte1",
           "rate": 5529600000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A2",
@@ -1095,6 +1614,179 @@
           "resource": "mte1",
           "rate": 4608000000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A2",
@@ -1430,6 +2122,179 @@
         "mte1_l0b": {
           "resource": "mte1",
           "rate": 3840000000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 100663296,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 100663296,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
         }
       }
     },
@@ -1768,6 +2633,179 @@
           "resource": "mte1",
           "rate": 4224000000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 100663296,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A2",
+            "l2_capacity_bytes": 100663296,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A2",
@@ -2103,6 +3141,179 @@
         "mte1_l0b": {
           "resource": "mte1",
           "rate": 5683200000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
         }
       }
     },
@@ -2449,6 +3660,179 @@
           "resource": "mte1",
           "rate": 5529600000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A3",
@@ -2793,6 +4177,179 @@
         "mte1_l0b": {
           "resource": "mte1",
           "rate": 4608000000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
         }
       }
     },
@@ -3139,6 +4696,179 @@
           "resource": "mte1",
           "rate": 4224000000000.0
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A3",
@@ -3483,6 +5213,179 @@
         "mte1_l0b": {
           "resource": "mte1",
           "rate": 4224000000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 201326592,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 201326592,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
         }
       }
     },
@@ -3829,6 +5732,179 @@
             "selection": "reported approximate value"
           }
         }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 176160768,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "declared_profile",
+            "arch": "A3",
+            "l2_capacity_bytes": 176160768,
+            "l2_effective_fraction": 0.75,
+            "calibrated": false
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 512,
+          "decode_max_q": 16
+        },
+        "indexer": {
+          "query_tile": 64,
+          "fused_score_topk": false
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2
+        },
+        "collective": {
+          "alpha_us": 0.0
+        }
       }
     },
     "architecture": "A3",
@@ -4113,8 +6189,8 @@
         "hbm": 4000000000000.0,
         "vector": 6758400000000.0,
         "mte1": 13516800000000.0,
-        "mte2_aic": 4224000000000.0,
-        "mte2_aiv": 4224000000000.0,
+        "mte2_aic": 13516800000000.0,
+        "mte2_aiv": 6758400000000.0,
         "fixpipe": 6758400000000.0,
         "mte3": 13516800000000.0,
         "reg_data_writes": 211200000000.0,
@@ -4124,7 +6200,8 @@
         "reg_special_lanes": 3379200000000.0,
         "reg_reduce_lanes": 6758400000000.0,
         "reg_shuffle_lanes": 6758400000000.0,
-        "scalar_store_issue": 5657458563.535912
+        "scalar_store_issue": 5657458563.535912,
+        "l2": 13516800000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -4150,7 +6227,8 @@
         "reg_special_lanes": 64,
         "reg_reduce_lanes": 64,
         "reg_shuffle_lanes": 64,
-        "scalar_store_issue": 64
+        "scalar_store_issue": 64,
+        "l2": 1
       },
       "buffer_units": {
         "l1": 32,
@@ -4302,43 +6380,23 @@
       },
       "kernel_invocations": {
         "vector": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001312,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000877,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582 (arch3510)",
-            "observed_us": 1.312,
-            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
-            "scope": "ordinary nonempty vector class default extrapolated across arch3510 A5 SKUs; not a universal hardware lower bound",
-            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
-            "excludes": [
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "body_residual_fit"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIV completion minimum; not additive startup"
           }
         },
         "cube": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001578,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001237,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
-            "observed_us": 1.578,
-            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
-            "scope": "ordinary nonempty Cube default extrapolated across arch3510 A5 SKUs; not a universal hardware bound or measured startup",
-            "excludes": [
-              "empty_aic",
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "6_to_7us_matrix_residual"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIC completion minimum; not additive startup"
           }
         },
         "empty_aic": {
@@ -4382,6 +6440,16 @@
               "body_residual_fit"
             ]
           }
+        },
+        "norm": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001387,
+          "provenance": {
+            "basis": "stream_saturated_event_median",
+            "boundary": "device_kernel_completion",
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS tiny norm inclusive completion minimum; not additive startup"
+          }
         }
       },
       "work_units": {
@@ -4408,6 +6476,220 @@
         "reg_issue_slots": {
           "resource": "vector",
           "rate": 211200000000.0
+        },
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 13516800000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 6758400000000.0
+        },
+        "mte2_aic_l2": {
+          "resource": "mte2_aic",
+          "rate": 13516800000000.0
+        },
+        "mte2_aic_dram": {
+          "resource": "mte2_aic",
+          "rate": 2217600000000.0
+        },
+        "mte2_aiv_l2": {
+          "resource": "mte2_aiv",
+          "rate": 6758400000000.0
+        },
+        "mte2_aiv_dram": {
+          "resource": "mte2_aiv",
+          "rate": 3326400000000.0
+        },
+        "hbm_atomic_rmw": {
+          "resource": "hbm",
+          "rate": 772000000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 134217728,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "a5_live_silicon_benchmarks",
+            "arch": "DAV_3510",
+            "clock_hz": 1650000000.0,
+            "l2_capacity_bytes": 134217728,
+            "l2_effective_fraction": 0.75,
+            "calibrated": true
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 128,
+          "decode_max_q": 8,
+          "fia_min_keys_per_split": 1024,
+          "max_fia_kv_splits": 16,
+          "score_bytes": 4,
+          "online_softmax_exp_class": "special_lane"
+        },
+        "indexer": {
+          "query_tile": 64,
+          "heap_comparison_multiplier": 1,
+          "fused_score_topk": true,
+          "score_hbm_write_bytes": 0
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2,
+          "norm_minimum_ms": 0.001387,
+          "vector_minimum_ms": 0.000877
+        },
+        "collective": {
+          "peer_effective_bytes_per_s": 47500000000.0,
+          "peer_peak_bytes_per_s": 56000000000.0,
+          "alpha_us": 12.0,
+          "hierarchical_inter_node_bytes_per_s": 50000000000.0,
+          "hierarchical_inter_node_alpha_us": 5.0
         }
       }
     },
@@ -4443,21 +6725,22 @@
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
-        "protocol": "UB_MESH",
-        "uni_peak_bw_gbps": 392.0,
-        "bi_peak_bw_gbps": 725.2,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "UB_DIRECT_K8_MESH",
+        "uni_peak_bw_gbps": 56.0,
+        "bi_peak_bw_gbps": 103.6,
+        "calibrated_uni_bw_gbps": 47.5,
+        "calibrated_bi_bw_gbps": 95.0,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 392.0,
-        "effective_bi_bw_gbps": 725.2,
+        "bandwidth_provenance": "silicon_calibrated_per_pair",
+        "effective_uni_bw_gbps": 47.5,
+        "effective_bi_bw_gbps": 95.0,
         "pageable_uni_bw_gbps": null,
-        "alpha_us": 1.8,
+        "alpha_us": 12.0,
         "transport_mode": "direct_fabric",
-        "channel_semantics": "unknown",
-        "notes": null
+        "channel_semantics": "per_pair",
+        "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
+        "bw_utilization": 0.8482142857142857
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -4610,8 +6893,8 @@
         "hbm": 4000000000000.0,
         "vector": 6758400000000.0,
         "mte1": 13516800000000.0,
-        "mte2_aic": 4224000000000.0,
-        "mte2_aiv": 4224000000000.0,
+        "mte2_aic": 13516800000000.0,
+        "mte2_aiv": 6758400000000.0,
         "fixpipe": 6758400000000.0,
         "mte3": 13516800000000.0,
         "reg_data_writes": 211200000000.0,
@@ -4621,7 +6904,8 @@
         "reg_special_lanes": 3379200000000.0,
         "reg_reduce_lanes": 6758400000000.0,
         "reg_shuffle_lanes": 6758400000000.0,
-        "scalar_store_issue": 5657458563.535912
+        "scalar_store_issue": 5657458563.535912,
+        "l2": 13516800000000.0
       },
       "service_modes": {
         "mte1_l1_ub": {
@@ -4635,6 +6919,34 @@
         "reg_issue_slots": {
           "resource": "vector",
           "rate": 211200000000.0
+        },
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 13516800000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 6758400000000.0
+        },
+        "mte2_aic_l2": {
+          "resource": "mte2_aic",
+          "rate": 13516800000000.0
+        },
+        "mte2_aic_dram": {
+          "resource": "mte2_aic",
+          "rate": 2217600000000.0
+        },
+        "mte2_aiv_l2": {
+          "resource": "mte2_aiv",
+          "rate": 6758400000000.0
+        },
+        "mte2_aiv_dram": {
+          "resource": "mte2_aiv",
+          "rate": 3326400000000.0
+        },
+        "hbm_atomic_rmw": {
+          "resource": "hbm",
+          "rate": 772000000000.0
         }
       },
       "buffers": {
@@ -4661,7 +6973,8 @@
         "reg_special_lanes": 64,
         "reg_reduce_lanes": 64,
         "reg_shuffle_lanes": 64,
-        "scalar_store_issue": 64
+        "scalar_store_issue": 64,
+        "l2": 1
       },
       "buffer_units": {
         "l1": 32,
@@ -4813,43 +7126,23 @@
       },
       "kernel_invocations": {
         "vector": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001312,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000877,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582",
-            "observed_us": 1.312,
-            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
-            "scope": "ordinary nonempty vector class default; not a universal hardware lower bound",
-            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
-            "excludes": [
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "body_residual_fit"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIV completion minimum; not additive startup"
           }
         },
         "cube": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001578,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001237,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582",
-            "observed_us": 1.578,
-            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
-            "scope": "ordinary nonempty Cube default; not a universal hardware bound or measured startup",
-            "excludes": [
-              "empty_aic",
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "6_to_7us_matrix_residual"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIC completion minimum; not additive startup"
           }
         },
         "empty_aic": {
@@ -4894,6 +7187,16 @@
               "body_residual_fit"
             ]
           }
+        },
+        "norm": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001387,
+          "provenance": {
+            "basis": "stream_saturated_event_median",
+            "boundary": "device_kernel_completion",
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS tiny norm inclusive completion minimum; not additive startup"
+          }
         }
       },
       "work_units": {
@@ -4906,6 +7209,192 @@
           "granule_bytes": 128,
           "response_ms": 9.125e-05,
           "row_control_ms": 7e-06
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 134217728,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "a5_live_silicon_benchmarks",
+            "arch": "DAV_3510",
+            "clock_hz": 1650000000.0,
+            "l2_capacity_bytes": 134217728,
+            "l2_effective_fraction": 0.75,
+            "calibrated": true
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 128,
+          "decode_max_q": 8,
+          "fia_min_keys_per_split": 1024,
+          "max_fia_kv_splits": 16,
+          "score_bytes": 4,
+          "online_softmax_exp_class": "special_lane"
+        },
+        "indexer": {
+          "query_tile": 64,
+          "heap_comparison_multiplier": 1,
+          "fused_score_topk": true,
+          "score_hbm_write_bytes": 0
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2,
+          "norm_minimum_ms": 0.001387,
+          "vector_minimum_ms": 0.000877
+        },
+        "collective": {
+          "peer_effective_bytes_per_s": 47500000000.0,
+          "peer_peak_bytes_per_s": 56000000000.0,
+          "alpha_us": 12.0,
+          "hierarchical_inter_node_bytes_per_s": 50000000000.0,
+          "hierarchical_inter_node_alpha_us": 5.0
         }
       }
     },
@@ -4943,21 +7432,22 @@
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
-        "protocol": "UB_MESH",
-        "uni_peak_bw_gbps": 392.0,
-        "bi_peak_bw_gbps": 725.2,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "UB_DIRECT_K8_MESH",
+        "uni_peak_bw_gbps": 56.0,
+        "bi_peak_bw_gbps": 103.6,
+        "calibrated_uni_bw_gbps": 47.5,
+        "calibrated_bi_bw_gbps": 95.0,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 392.0,
-        "effective_bi_bw_gbps": 725.2,
+        "bandwidth_provenance": "silicon_calibrated_per_pair",
+        "effective_uni_bw_gbps": 47.5,
+        "effective_bi_bw_gbps": 95.0,
         "pageable_uni_bw_gbps": null,
-        "alpha_us": 1.8,
+        "alpha_us": 12.0,
         "transport_mode": "direct_fabric",
-        "channel_semantics": "unknown",
-        "notes": null
+        "channel_semantics": "per_pair",
+        "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
+        "bw_utilization": 0.8482142857142857
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",
@@ -5110,8 +7600,8 @@
         "hbm": 1600000000000.0,
         "vector": 6758400000000.0,
         "mte1": 13516800000000.0,
-        "mte2_aic": 4224000000000.0,
-        "mte2_aiv": 4224000000000.0,
+        "mte2_aic": 13107200000000.0,
+        "mte2_aiv": 6553600000000.0,
         "fixpipe": 6758400000000.0,
         "mte3": 13516800000000.0,
         "reg_data_writes": 211200000000.0,
@@ -5121,7 +7611,8 @@
         "reg_special_lanes": 3379200000000.0,
         "reg_reduce_lanes": 6758400000000.0,
         "reg_shuffle_lanes": 6758400000000.0,
-        "scalar_store_issue": 5657458563.535912
+        "scalar_store_issue": 5657458563.535912,
+        "l2": 13107200000000.0
       },
       "buffers": {
         "l1": 524288,
@@ -5147,7 +7638,8 @@
         "reg_special_lanes": 64,
         "reg_reduce_lanes": 64,
         "reg_shuffle_lanes": 64,
-        "scalar_store_issue": 64
+        "scalar_store_issue": 64,
+        "l2": 1
       },
       "buffer_units": {
         "l1": 32,
@@ -5299,43 +7791,23 @@
       },
       "kernel_invocations": {
         "vector": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001312,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.000877,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ordinary library Add [1,4096] minimum across 50 calls on Ascend950DT_9582 (arch3510)",
-            "observed_us": 1.312,
-            "source": "data/verification/a5-microbench-boundary-review-20261030.json",
-            "scope": "ordinary nonempty vector class default extrapolated across arch3510 A5 SKUs; not a universal hardware lower bound",
-            "counterexample": "custom AscendC FP32 tiny Add minimum 0.876us; explicit execution classes or invocation rules override this ordinary-library assumption",
-            "excludes": [
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "body_residual_fit"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIV completion minimum; not additive startup"
           }
         },
         "cube": {
-          "startup_ms": 0,
-          "minimum_ms": 0.001578,
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001237,
           "provenance": {
-            "basis": "declared_engineering_extrapolation",
-            "declared_on": "2026-10-30",
+            "basis": "stream_saturated_event_median",
             "boundary": "device_kernel_completion",
-            "observed_scope": "BF16 ND MatMulV3 [1,64]@[64,64], AI_CORE BlockNum1, minimum across 50 calls on Ascend950DT_9582 (arch3510)",
-            "observed_us": 1.578,
-            "source": "data/verification/a5-tiny-cube-boundary-review-20261030.json",
-            "scope": "ordinary nonempty Cube default extrapolated across arch3510 A5 SKUs; not a universal hardware bound or measured startup",
-            "excludes": [
-              "empty_aic",
-              "host_submission",
-              "stream_launch_cadence",
-              "additive_startup",
-              "6_to_7us_matrix_residual"
-            ]
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS inclusive AIC completion minimum; not additive startup"
           }
         },
         "empty_aic": {
@@ -5379,6 +7851,16 @@
               "body_residual_fit"
             ]
           }
+        },
+        "norm": {
+          "startup_ms": 0.0,
+          "minimum_ms": 0.001387,
+          "provenance": {
+            "basis": "stream_saturated_event_median",
+            "boundary": "device_kernel_completion",
+            "source": "a5_live_silicon_benchmarks.json",
+            "scope": "RTS tiny norm inclusive completion minimum; not additive startup"
+          }
         }
       },
       "work_units": {
@@ -5405,6 +7887,220 @@
         "reg_issue_slots": {
           "resource": "vector",
           "rate": 211200000000.0
+        },
+        "mte1_l0a": {
+          "resource": "mte1",
+          "rate": 13107200000000.0
+        },
+        "mte1_l0b": {
+          "resource": "mte1",
+          "rate": 6553600000000.0
+        },
+        "mte2_aic_l2": {
+          "resource": "mte2_aic",
+          "rate": 13107200000000.0
+        },
+        "mte2_aic_dram": {
+          "resource": "mte2_aic",
+          "rate": 887040000000.0
+        },
+        "mte2_aiv_l2": {
+          "resource": "mte2_aiv",
+          "rate": 6553600000000.0
+        },
+        "mte2_aiv_dram": {
+          "resource": "mte2_aiv",
+          "rate": 1330560000000.0
+        },
+        "hbm_atomic_rmw": {
+          "resource": "hbm",
+          "rate": 308800000000.0
+        }
+      },
+      "physical_mechanisms": {
+        "memory_hierarchy": {
+          "l2_capacity_bytes": 134217728,
+          "l2_effective_fraction": 0.75,
+          "cache_line_bytes": 128,
+          "write_allocate": true,
+          "provenance": {
+            "basis": "a5_live_silicon_benchmarks",
+            "arch": "DAV_3510",
+            "clock_hz": 1600000000.0,
+            "l2_capacity_bytes": 134217728,
+            "l2_effective_fraction": 0.75,
+            "calibrated": true
+          }
+        },
+        "matrix": {
+          "base_tiles": [
+            [
+              128,
+              128
+            ],
+            [
+              128,
+              256
+            ],
+            [
+              256,
+              128
+            ],
+            [
+              256,
+              256
+            ]
+          ],
+          "refill_k_tiles": [
+            64,
+            128,
+            256
+          ],
+          "micro_tiles_by_dtype": {
+            "bf16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp16": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "fp32": [
+              [
+                128,
+                128,
+                64
+              ],
+              [
+                64,
+                64,
+                64
+              ],
+              [
+                16,
+                16,
+                16
+              ]
+            ],
+            "int8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ],
+            "fp8": [
+              [
+                128,
+                128,
+                128
+              ],
+              [
+                64,
+                64,
+                128
+              ],
+              [
+                16,
+                16,
+                32
+              ]
+            ]
+          },
+          "input_slots": 2,
+          "compute_slots": 2,
+          "split_k_candidates": [
+            1,
+            2,
+            4,
+            8,
+            16,
+            32
+          ],
+          "min_k_per_split": 64,
+          "swizzle_windows": [
+            [
+              1,
+              1
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              4,
+              8
+            ]
+          ],
+          "supported_output_paths": [
+            "gm",
+            "l0c_to_ub",
+            "onchip_reduce"
+          ]
+        },
+        "attention": {
+          "query_tile": 128,
+          "page_block": 128,
+          "decode_max_q": 8,
+          "fia_min_keys_per_split": 1024,
+          "max_fia_kv_splits": 16,
+          "score_bytes": 4,
+          "online_softmax_exp_class": "special_lane"
+        },
+        "indexer": {
+          "query_tile": 64,
+          "heap_comparison_multiplier": 1,
+          "fused_score_topk": true,
+          "score_hbm_write_bytes": 0
+        },
+        "vector": {
+          "min_tile_bytes": 4096,
+          "double_buffer_slots": 2,
+          "norm_minimum_ms": 0.001387,
+          "vector_minimum_ms": 0.000877
+        },
+        "collective": {
+          "peer_effective_bytes_per_s": 47500000000.0,
+          "peer_peak_bytes_per_s": 56000000000.0,
+          "alpha_us": 12.0,
+          "hierarchical_inter_node_bytes_per_s": 50000000000.0,
+          "hierarchical_inter_node_alpha_us": 5.0
         }
       }
     },
@@ -5440,21 +8136,22 @@
       },
       "d2d_intra_node": {
         "channel": "d2d_intra_node",
-        "protocol": "UB_MESH",
-        "uni_peak_bw_gbps": 392.0,
-        "bi_peak_bw_gbps": 725.2,
-        "calibrated_uni_bw_gbps": null,
-        "calibrated_bi_bw_gbps": null,
+        "protocol": "UB_DIRECT_K8_MESH",
+        "uni_peak_bw_gbps": 56.0,
+        "bi_peak_bw_gbps": 103.6,
+        "calibrated_uni_bw_gbps": 47.5,
+        "calibrated_bi_bw_gbps": 95.0,
         "derived_uni_bw_gbps": null,
         "derived_bi_bw_gbps": null,
-        "bandwidth_provenance": "declared_peak",
-        "effective_uni_bw_gbps": 392.0,
-        "effective_bi_bw_gbps": 725.2,
+        "bandwidth_provenance": "silicon_calibrated_per_pair",
+        "effective_uni_bw_gbps": 47.5,
+        "effective_bi_bw_gbps": 95.0,
         "pageable_uni_bw_gbps": null,
-        "alpha_us": 1.8,
+        "alpha_us": 12.0,
         "transport_mode": "direct_fabric",
-        "channel_semantics": "unknown",
-        "notes": null
+        "channel_semantics": "per_pair",
+        "notes": "8-NPU K_8 direct UB mesh: 7 dedicated peer links/NPU; per-rank aggregate active busbw = (W - 1) * 47.5 GB/s (56.0 GB/s raw/pair)",
+        "bw_utilization": 0.8482142857142857
       },
       "d2d_inter_node": {
         "channel": "d2d_inter_node",

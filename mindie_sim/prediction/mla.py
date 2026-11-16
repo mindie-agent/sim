@@ -23,6 +23,8 @@ from .lowering import Builder
 from .compression import compressor
 from .indexer_representation import index_representation
 from .mla_native import batched_matrix_metadata, index_layer_norm
+from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
+                             default_hierarchy, plan_attention_traffic)
 from .projections import mla_input_projections
 from . import mla_head_padding
 from .cache_representation import store as representation_store
@@ -410,6 +412,24 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 topk = quant_indexer.module.declare(
                     b, deps=selection_deps, views=views, plan=plan,
                     quant=quant, parallel=parallel, **quant_indexer.options)
+                if (runtime is not None
+                        and runtime.prefix_cache_mode == "shared"
+                        and b.ops and b.ops[-ONE].op_id == topk):
+                    from .batch_prefix_indexer import apply_indexer_prefix_reads
+                    ratio = max(ONE, int(plan.compress_ratio or ONE))
+                    row_b = float(index_row_bytes(b.model, plan.index_dim))
+                    logical = tuple(
+                        max(ZERO, int(view.q_len) * min(
+                            max(ZERO, int(view.kv_len) // ratio),
+                            int(plan.index_topk))) for view in views)
+                    shared = tuple(
+                        min(rows, max(ZERO, int(view.context) // ratio))
+                        for rows, view in zip(logical, views))
+                    b.ops[-ONE] = apply_indexer_prefix_reads(
+                        b.ops[-ONE], views=views, rows_by_view=logical,
+                        shared_rows_by_view=shared, row_bytes=row_b,
+                        layer_index=plan.index, runtime=runtime,
+                        kernel_reuse="batch_tile", allow_recipe_rebind=False)
             elif (bf16_indexer is not None and len(views) == ONE
                   and parallel.cp == ONE and not plan.candidate_filter):
                 from . import family_lightning_indexer as li
@@ -563,8 +583,42 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             local_cache_read = window_cache_read(
                 plan, view, parts, sweeps, eff_cp, query_tile,
                 plan.cache_row_elements, model)
+            traffic = plan_attention_traffic(
+                AttentionAccessSpec(
+                    q_lengths=(int(eff_q),),
+                    context_lengths=(int(max(ZERO, view.kv_len - eff_q)),),
+                    unique_rows=int(max(ZERO, local_rows)),
+                    refill_rows=int(max(ZERO, local_sweeps)),
+                    selected_rows=int(max(ZERO, local_sweeps)) if topk else ZERO,
+                    row_bytes=float(kv_row_b),
+                    phase=mode,
+                    topk=int(plan.index_topk) if topk else ZERO,
+                    representation=("absorbed_mla" if latent else "gqa"),
+                    cache_identity=str(getattr(view, "prefix_key", "") or ""),
+                ),
+                default_hierarchy(),
+                AttentionSchedule(query_tile=query_tile),
+            )
             if local_cache_read is None:
-                local_cache_read = local_sweeps * kv_row_b
+                local_cache_read = traffic.hbm_read_bytes
+            elif local_sweeps > ZERO:
+                traffic = plan_attention_traffic(
+                    AttentionAccessSpec(
+                        q_lengths=(int(eff_q),),
+                        context_lengths=(int(max(ZERO, view.kv_len - eff_q)),),
+                        unique_rows=int(max(ZERO, local_rows)),
+                        refill_rows=int(max(ZERO, local_sweeps)),
+                        selected_rows=(int(max(ZERO, local_sweeps))
+                                       if topk else ZERO),
+                        row_bytes=float(local_cache_read) / float(local_sweeps),
+                        phase=mode,
+                        topk=int(plan.index_topk) if topk else ZERO,
+                        cache_identity=str(getattr(view, "prefix_key", "") or ""),
+                    ),
+                    default_hierarchy(),
+                    AttentionSchedule(query_tile=query_tile),
+                )
+                local_cache_read = traffic.hbm_read_bytes
             vis_keys = (
                 min(local_rows, plan.window) if (plan.window > ZERO and eff_cp == ONE)
                 else local_sweeps if (plan.cache_kind == "dense" and not topk
@@ -586,7 +640,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 read=local_cache_read + rec["selection_reads"] + q_read,
                 write=out_write, family="attention",
                 metadata=(("query_tile", query_tile), ("logical_pairs", pairs),
-                          ("kv_sweeps", sweeps))
+                          ("kv_sweeps", sweeps),
+                          ("attention_traffic_plan", traffic.to_dict()))
                          + rec["selection_metadata"]
                          + attention_tensor_view(plan, view, attn_heads, model, quant,
                                                  parallel, eff_cp=eff_cp)
@@ -675,7 +730,10 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                         op_item, views=grp_views, sweeps_by_view=sweeps_by_view,
                         shared_sweeps_by_view=shared_by_view, row_bytes=float(kv_row_b),
                         layer_index=plan.index, runtime=runtime,
-                        kernel_reuse="native_per_sequence" if pinned_attn else "tile",
+                        kernel_reuse=("batch_tile"
+                                      if runtime is not None
+                                      and runtime.prefix_cache_mode == "shared"
+                                      else ("native_per_sequence" if pinned_attn else "tile")),
                         allow_recipe_rebind=not pinned_attn)
         if eff_cp > ONE and grp_outputs:
             out_set = set(grp_outputs)

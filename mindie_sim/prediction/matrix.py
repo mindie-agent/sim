@@ -21,6 +21,9 @@ from .refill import RefillPipeline
 from .matrix_epilogue import MatrixEpilogue
 from .ownership import read_role
 
+DEFAULT_SPLIT_K = 1
+MAX_SPLIT_K = 32
+
 
 def operand_transfer(context, left, right, *, directional=False):
     """A/B instructions share one MTE1 pipe; a source may select its modes."""
@@ -581,6 +584,7 @@ class HierarchicalMatmul:
     compute_slots: int = 2
     reuse_inputs: bool = True
     reuse_weights: bool = True
+    k_splits: int = DEFAULT_SPLIT_K
 
     def lower(self, context, *, owner_tiles=None, group_rows=None, output=None,
               serial_tiles=False, directional_mte1=False):

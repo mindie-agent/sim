@@ -65,6 +65,7 @@ class Geometry:
     resource_units: Mapping[str, int] = field(default_factory=dict)
     buffers: Mapping[str, int] = field(default_factory=dict)
     buffer_units: Mapping[str, int] = field(default_factory=dict)
+    physical_mechanisms: object = None
 
     @classmethod
     def from_devices(cls, devices):
@@ -79,6 +80,7 @@ class Geometry:
              **{name: first.units(role) for name, (role, _) in modes.items()}},
             {pool: min(dict(device.buffers)[pool] for device in devices) for pool in pools},
             {pool: first.pool_units(pool) for pool in pools},
+            first.physical_mechanisms,
         )
 
 

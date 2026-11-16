@@ -12,8 +12,8 @@ from mindie_sim.catalog.attention_common import active_dcp_degree
 from mindie_sim.catalog.cache_format import cache_format
 from mindie_sim.catalog.paired_sfa import execution, SOURCE
 from mindie_sim.schema.common import ModelingError, dtype_bytes
+from .attention_pipeline import TiledFlashAndPagedAttentionRecipe
 from .mechanism import OperatorPlan, PlannedRecipe, Work
-from .program import ResourceEnvelope
 
 ONE = 1
 TWO = 2
@@ -130,8 +130,8 @@ def _build(op, geometry):
     work = Work(matrix={op.dtype: op.flops}, resources={
         "hbm": op.hbm_bytes, "mte2": op.mte2_bytes,
         "mte3": op.mte3_bytes, "vector": op.vector_ops})
-    return OperatorPlan(work, ResourceEnvelope().lower,
-                        {"fidelity": "analytic_resource_envelope", "source": SOURCE})
+    return OperatorPlan(work, TiledFlashAndPagedAttentionRecipe().lower,
+                        {"fidelity": "class_a_tiled_attention", "source": SOURCE})
 
 
 def recipes():

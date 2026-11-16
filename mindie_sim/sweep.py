@@ -364,6 +364,9 @@ def sweep_topologies(
     candidate_tps: Sequence[int] | None = None, ep_candidates: Sequence[int] | None = None,
     pp_candidates: Sequence[int] | None = None, pcp_candidates: Sequence[int] | None = None,
     hardware_derivations: Sequence[Mapping[str, Any]] | None = None,
+    lock_parallel: bool = False,
+    fixed_parallel: Mapping[str, int] | None = None,
+    lock_program: bool = False,
 ) -> dict[str, Any]:
     """Sweep parallel sharding candidates and identify the axiomatic Pareto frontier."""
     _check_pos_float("sla_ms", sla_ms)
@@ -376,6 +379,12 @@ def sweep_topologies(
         _check_pos_int("tokens_per_seq", tokens_per_seq, minimum=1)
 
     parsed = parse_case(case)
+    if lock_parallel and fixed_parallel is not None:
+        candidates = (dict(fixed_parallel),)
+    elif lock_parallel and candidates is None:
+        base = parsed.runtime.parallel
+        candidates = ({"dp": base.dp, "tp": base.tp, "ep": base.ep,
+                       "pp": base.pp, "pcp": base.pcp},)
     if hardware_derivations:
         from mindie_sim.hardware_derivation import derived_machine
         combined: list[dict[str, Any]] = []
@@ -418,7 +427,11 @@ def sweep_topologies(
             },
             "candidates": combined,
             "pareto_frontier": compute_pareto_frontier(combined),
-            "plan_selection": "reselected_parallel_per_candidate",
+            "plan_selection": ("fixed_parallel" if lock_parallel
+                               else "reselected_parallel_per_candidate"),
+            "program_selection": "fixed" if lock_program else "reselected",
+            "parallel_signature": str(fixed_parallel or {}),
+            "changed_hardware_fields": (),
             "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
             "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
                        "frontier_is_selected_candidates_not_a_global_optimum_proof": True},
@@ -523,7 +536,11 @@ def sweep_topologies(
             "allow_pp": allow_pp, "allow_pcp": allow_pcp, "candidate_count": len(rows),
         },
         "candidates": rows, "pareto_frontier": pareto_frontier,
-        "plan_selection": "reselected_parallel_per_candidate",
+        "plan_selection": ("fixed_parallel" if lock_parallel
+                           else "reselected_parallel_per_candidate"),
+        "program_selection": "fixed" if lock_program else "reselected",
+        "parallel_signature": str(fixed_parallel or ""),
+        "changed_hardware_fields": (),
         "comparison_boundary": "each_row_is_one_complete_candidate_no_cross_candidate_metric_stitching",
         "pareto": {"basis": "exact_multi_objective_dominance_on_single_candidate_metrics",
                    "frontier_is_selected_candidates_not_a_global_optimum_proof": True},

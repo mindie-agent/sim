@@ -23,6 +23,10 @@ from mindie_sim.catalog.ops import vector_op
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 from .implementations import append_audit, typed_value
 
+DEFAULT_TOKENS = 1
+DEFAULT_CONTEXT = 4096
+DEFAULT_SEQUENCES = 16
+
 
 def _validate_eplb(value):
     try:
@@ -796,8 +800,9 @@ def split_deepep_down_overlap(down, options):
 
 
 def analyze_shared_expert_overlap(
-    case, *, phase: str = "decode", tokens: int = 1, context: int = 4096,
-    sequences: int = 16, scope: str = "body",
+    case, *, phase: str = "decode", tokens: int = DEFAULT_TOKENS,
+    context: int = DEFAULT_CONTEXT,
+    sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
 ) -> dict[str, Any]:
     """Evaluate the causal engine with and without the shared-expert stream."""
     from mindie_sim.prediction.efficiency import analyze_network_efficiency
@@ -808,7 +813,10 @@ def analyze_shared_expert_overlap(
     def evaluate(enabled):
         metadata = {**dict(parsed.runtime.metadata),
                     "overlap_shared_expert": bool(enabled)}
-        runtime = replace(parsed.runtime, metadata=tuple(sorted(metadata.items())))
+        runtime = replace(
+            parsed.runtime,
+            multistream_overlap_shared_expert=bool(enabled),
+            metadata=tuple(sorted(metadata.items())))
         report = analyze_network_efficiency(
             replace(parsed, runtime=runtime), phase=phase, tokens=tokens,
             context=context, sequences=sequences, scope=scope)

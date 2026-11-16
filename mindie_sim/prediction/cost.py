@@ -14,6 +14,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from dataclasses import dataclass, field
+import math
 from typing import Any, Mapping
 
 from mindie_sim.schema.operators import OpSpec
@@ -22,6 +23,8 @@ from .primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
 
 MAX_RECORDED_MAPPINGS = 32
 ZERO = 0
+ZERO_FLOAT = 0.0
+MATRIX_FLOPS_REL_TOL = 1e-9
 
 
 @dataclass(frozen=True)
@@ -289,12 +292,16 @@ class CostModel:
             work_unit=service.work_unit, conditions=context)
 
     def price(self, op: OpSpec, replay_scope: str, *, ledger: CostLedger | None = None) -> OpCost:
-        if op.matrix_flops:
-            import math
-            if not math.isclose(sum(v for _, v in op.matrix_flops), op.flops, rel_tol=1e-12):
-                raise ValueError("matrix_precision_work_must_sum_to_operator_flops")
+        matrix_sum = (sum(float(value) for _, value in op.matrix_flops)
+                      if op.matrix_flops else ZERO_FLOAT)
+        declared_flops = float(op.flops)
+        if (op.matrix_flops and declared_flops > ZERO_FLOAT
+                and not math.isclose(matrix_sum, declared_flops,
+                                     rel_tol=MATRIX_FLOPS_REL_TOL)):
+            raise ValueError("matrix_precision_work_must_sum_to_operator_flops")
+        cube_flops = matrix_sum if op.matrix_flops else declared_flops
         work = {
-            "cube": op.flops, "vector": op.vector_ops, "hbm": op.hbm_bytes,
+            "cube": cube_flops, "vector": op.vector_ops, "hbm": op.hbm_bytes,
             "mte2": op.mte2_bytes, "mte3": op.mte3_bytes, "link": op.link_bytes,
         }
         metadata = dict(op.metadata)
@@ -303,6 +310,8 @@ class CostModel:
             if value:
                 work[resource] = value
         for resource, amount in dict(metadata.get("resource_work", {})).items():
+            if resource == "cube" and cube_flops > ZERO_FLOAT:
+                continue
             work[resource] = work.get(resource, 0) + amount
         result = OpCost(op, None, {k: float(v) for k, v in work.items() if v})
         (self.ledger if ledger is None else ledger).account(result.basis)

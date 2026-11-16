@@ -23,6 +23,10 @@ from .ownership import read_role
 from .program import (KernelProgram, ParallelProgram, PipelineProgram,
                       PipelineTemplateProgram, Stage)
 
+DEFAULT_SPLIT_K = 1
+ONE = 1
+SECOND = 1
+
 
 @lru_cache(maxsize=1024)
 def _cycle(load, steps, count, slots, compute_slots, tail_load, tail_steps):
@@ -82,6 +86,17 @@ class SteadyMatmul(MappedMatmul):
                                       else "individual_serial_tiles"),
             "geometry": geometry.to_dict(),
         })
+        if (getattr(recipe, "k_splits", DEFAULT_SPLIT_K) > DEFAULT_SPLIT_K
+                and "mte2_aic_dram" in context.service_modes):
+            record.update({
+                "execution_abstraction": "finite_split_k",
+                "split_k": recipe.k_splits,
+                "partial_policy": "independent_aic_k_slices_then_bounded_merge",
+            })
+            if context.record_mapping is not None:
+                context.record_mapping(record)
+            from .matrix_splitk import splitk_program
+            return splitk_program(context, recipe.k_splits)
         if context.record_mapping is not None:
             context.record_mapping(record)
         op, names = context.op, context.resource_names
@@ -95,6 +110,11 @@ class SteadyMatmul(MappedMatmul):
         count, tail = divmod(k, recipe.tile_k)
         epilogue = MatrixEpilogue.from_op(op)
         inputs, weights = epilogue.operands(op)
+        dram_mode = dict(context.service_modes).get("mte2_aic_dram")
+        single_m_hbm_cap = (
+            {names["hbm"]: float(dram_mode[SECOND])
+             / max(ONE, int(context.core_count))}
+            if (nm == ONE and dram_mode and "hbm" in names) else {})
         operand_read = read_role(names)
         scale_read = read_role(names, aiv=0)
         width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))
@@ -183,7 +203,8 @@ class SteadyMatmul(MappedMatmul):
             stages = [
                 Stage("load", load0.work, acquire=buffers, placement=load0.placement),
                 Stage("steady", work, after=("load",), placement=placement, coupled=True,
-                      caps={key: amount / span for key, amount in work.items()} if span else {}),
+                      caps=({key: amount / span for key, amount in work.items()}
+                            if span else {}) | single_m_hbm_cap),
                 Stage("matrix", final.work, after=("steady",), placement=final.placement),
             ]
             predecessor = "matrix"
@@ -252,6 +273,9 @@ class SteadyMatmul(MappedMatmul):
             # Per-owner outputs remain nominally serial. External contention
             # shares their coupled fluid body, just like the inner K pipeline.
             caps = {key: value / total_span for key, value in work.items()}
+            caps = caps | {
+                key: min(value, single_m_hbm_cap[key])
+                for key, value in single_m_hbm_cap.items() if key in caps}
             return KernelProgram((
                 Stage("load", load.work, acquire=load.acquire, placement=load.placement),
                 Stage("owner_run", work, after=("load",), placement=placement,

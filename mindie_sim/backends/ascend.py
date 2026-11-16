@@ -230,7 +230,10 @@ def _merge_channels(raw, profile):
     # Per-port service includes independent full-duplex transmit and receive
     # ports. Optional switch-plane supply is a separate shared constraint.
     for declaration in channels.values():
-        declaration["semantics"] = "per_port"
+        profile_sem = (declaration.get("semantics")
+                       or declaration.get("channel_semantics"))
+        declaration["semantics"] = ("per_pair" if profile_sem == "per_pair"
+                                    else "per_port")
     for name, patch in patches:
         channels[name] = _merge_mapping(channels[name], patch)
         if "semantics" in patch or "channel_semantics" in patch:

@@ -26,7 +26,9 @@ from .operator_analysis import cohort_operator_costs, operator_costs, physical_i
 from .native_binding import bind_native_call
 from .program import RecipeBook
 from .structure import parse_case
-from .exposed_breakdown import ExposedClocks, finish_breakdown, unavailable_breakdown
+from .exposed_breakdown import (ExposedClocks, advance_clocks, finish_breakdown,
+                                join_clocks, roofline_clocks,
+                                unavailable_breakdown)
 
 ZERO = 0
 ONE = 1
@@ -38,6 +40,7 @@ ROLE_VECTOR = "vector"
 ROLE_MEMORY = "memory"
 ROLE_COMMUNICATION = "communication"
 ROLE_CONTROL = "control"
+FLOPS_PER_BYTE_NORMALIZER = 8.0
 NON_COMMUNICATION_ROLES = frozenset({
     ROLE_CUBE, ROLE_VECTOR, ROLE_MEMORY, ROLE_CONTROL})
 
@@ -72,36 +75,60 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
         ready = record.get("collective_ready_ms", record["ready"].time)
         start = max(ZERO_FLOAT, float(ready) - float(input_ready_ms))
         end = max(start, float(record["complete"].time) - float(input_ready_ms))
-        intervals.append((start, end, _dominant_role(record["op"])))
+        intervals.append((start, end, record))
     if not intervals:
         return unavailable_breakdown(
             "exposed_operator_intervals_missing", boundary="device_step")
-    first_start = min(start for start, _end, _role in intervals)
-    if first_start > ZERO_FLOAT:
-        intervals.append((ZERO_FLOAT, first_start, ROLE_CONTROL))
-    span_end = max(end for _start, end, _role in intervals)
+    first_start = min(start for start, _end, _record in intervals)
+    span_end = max(end for _start, end, _record in intervals)
     tolerance = RECONCILE_FRACTION * max(RECONCILE_MIN_MS, float(duration_ms))
     if abs(span_end - float(duration_ms)) > tolerance:
         return unavailable_breakdown(
             "unreconciled_execution_boundary", boundary="device_step")
 
-    def union_end(roles):
-        ends = [end for _start, end, role in intervals if role in roles]
-        return max(ends, default=ZERO_FLOAT)
+    def local_clocks(record, start, end):
+        op = record["op"]
+        elapsed = max(ZERO_FLOAT, end - start)
+        flops = float(getattr(op, "flops", ZERO_FLOAT) or ZERO_FLOAT)
+        vector = float(getattr(op, "vector_ops", ZERO_FLOAT) or ZERO_FLOAT)
+        memory = math.fsum(float(getattr(op, field, ZERO_FLOAT) or ZERO_FLOAT)
+                           for field in ("hbm_bytes", "mte2_bytes", "mte3_bytes"))
+        link = float(getattr(op, "link_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+        cube_raw = flops / FLOPS_PER_BYTE_NORMALIZER
+        raw_total = cube_raw + vector + memory + link
+        if raw_total <= ZERO_FLOAT or elapsed <= ZERO_FLOAT:
+            return control_clocks_local(elapsed)
+        cube = elapsed * cube_raw / raw_total
+        compute = elapsed * (cube_raw + vector) / raw_total
+        without = (elapsed * (cube_raw + vector + memory) / raw_total
+                   if link > ZERO_FLOAT else elapsed)
+        return ExposedClocks(elapsed, without, compute, cube)
 
-    clocks = ExposedClocks(
-        float(duration_ms),
-        union_end(NON_COMMUNICATION_ROLES),
-        union_end({ROLE_CUBE, ROLE_VECTOR, ROLE_CONTROL}),
-        union_end({ROLE_CUBE}),
-    )
+    def control_clocks_local(value):
+        return ExposedClocks(value, value, value, ZERO_FLOAT)
+
+    maxima = [control_clocks_local(ZERO_FLOAT)]
+    for _start, _end, record in intervals:
+        local = local_clocks(record, _start, _end)
+        maxima.append(local)
+    clocks = join_clocks(maxima)
+    expected = float(duration_ms)
+    if clocks.all_ms <= ZERO_FLOAT:
+        clocks = control_clocks_local(expected)
+    elif abs(clocks.all_ms - expected) > tolerance:
+        scale = expected / clocks.all_ms
+        without = min(expected, clocks.without_communication_ms * scale)
+        compute = min(without, clocks.compute_ms * scale)
+        cube = min(compute, clocks.cube_ms * scale)
+        clocks = ExposedClocks(expected, without, compute, cube)
     result = finish_breakdown(
-        clocks, duration_ms=float(duration_ms), boundary="device_step",
+        clocks, duration_ms=expected, boundary="device_step",
         control_ms=first_start)
     basis = result["exposed_breakdown_basis"]
     basis["replica"] = int(replica)
     basis["operator_intervals"] = len(intervals)
     basis["host_launch_ms"] = float(first_start)
+    basis["method"] = "four_clock_service_attribution_v1"
     return result
 
 

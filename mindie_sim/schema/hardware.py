@@ -24,6 +24,8 @@ from .common import ModelingError, _positive_float, _unknown
 from .device_input import machine_device_defaults, merge_device_inputs
 from .invocation import InvocationTiming
 from .compute_arch import ComputeArchSpec
+from .physical_mechanisms import (PhysicalMechanismSpec, default_physical_mechanisms,
+                                  parse_physical_mechanisms)
 
 ZERO = 0
 ONE = 1
@@ -34,7 +36,7 @@ from .compute_peak_aliases import (
 
 
 NATIVE_WORK_UNITS = {
-    **dict.fromkeys(("hbm", "mte1", "mte2", "mte2_aic", "mte2_aiv", "mte3",
+    **dict.fromkeys(("hbm", "l2", "mte1", "mte2", "mte2_aic", "mte2_aiv", "mte3",
                      "fixpipe", "host_memory", "link"), "bytes"),
     "cube": "flops", "vector": "ops", "host_vector": "ops", "host": "ms",
     "scalar_store_issue": "stores",
@@ -82,6 +84,8 @@ class Device:
     #: Declared reporting/supply aliases (``mxfp4 -> fp8_e4m3``).  These are
     #: never native operand modes and must carry the target's exact peak.
     compute_peak_aliases: tuple[tuple[str, str], ...] = ()
+    physical_mechanisms: PhysicalMechanismSpec = field(
+        default_factory=default_physical_mechanisms)
 
     @property
     def capability(self) -> ComputeArchSpec:
@@ -116,7 +120,8 @@ class Device:
                        item.alignment_bytes, item.representations)
                       for item in arch.paths),
                 tuple((item.name, item.version, item.provides, item.conditions)
-                      for item in arch.runtimes))
+                      for item in arch.runtimes),
+                self.physical_mechanisms.signature)
 
     @property
     def hbm_bytes(self):
@@ -217,6 +222,7 @@ class Device:
                    or self.compute_arch.has_capabilities() else {}),
                 **({"compute_peak_aliases": dict(self.compute_peak_aliases)}
                    if self.compute_peak_aliases else {}),
+                "physical_mechanisms": self.physical_mechanisms.to_dict(),
                 **({"work_units": dict(self.work_units)} if self.work_units else {}),
                 **({"store_queues": {name: dict(queue) for name, queue in self.store_queues}}
                    if self.store_queues else {}),
@@ -869,6 +875,13 @@ class Hardware:
             units = {**arch_units, **data.get("resource_units", {})}
             if any(value < 1 for value in units.values()):
                 raise ModelingError("resource_units_must_be_positive")
+            buffer_units = dict(data.get("buffer_units", {}))
+            if "l2" in buffers:
+                declared_l2_units = buffer_units.get("l2")
+                if (declared_l2_units is not None
+                        and int(declared_l2_units) != ONE):
+                    raise ModelingError("shared_l2_buffer_requires_one_die_owner")
+                buffer_units["l2"] = ONE
             modes = {**arch_modes, **{
                 name: {**arch_modes.get(name, {}), **mode}
                 for name, mode in data.get("service_modes", {}).items()}}
@@ -880,6 +893,9 @@ class Hardware:
             for role, unit in work_units.items():
                 if role in NATIVE_WORK_UNITS and unit != NATIVE_WORK_UNITS[role]:
                     raise ModelingError(f"native_work_unit_conflict:{role}")
+            mechanisms = parse_physical_mechanisms(
+                data.get("physical_mechanisms"),
+                fallback_l2_bytes=int(buffers.get("l2", ZERO)))
             devices.append(Device(
                 rank=int(data.get("rank", index)), memory_bytes=memory,
                 compute_peaks=tuple(sorted(peaks.items())), rates=tuple(sorted(rates.items())),
@@ -889,7 +905,7 @@ class Hardware:
                 node=int(data.get("node", index // ranks_per_node)),
                 package=int(data.get("package", index // package)),
                 resource_units=tuple(sorted(units.items())),
-                buffer_units=tuple(sorted(data.get("buffer_units", {}).items())),
+                buffer_units=tuple(sorted(buffer_units.items())),
                 service_modes=tuple(sorted((name, (mode["resource"], float(mode["rate"])))
                                            for name, mode in modes.items())),
                 work_units=tuple(sorted(work_units.items())),
@@ -911,6 +927,7 @@ class Hardware:
                     and s.name in data.get("resource_units", {}))),
                 sku=str(data.get("sku", "")),
                 arch_family=arch_family,
+                physical_mechanisms=mechanisms,
             ))
         links = tuple(Link.from_mapping(link, default_members=range(len(devices)))
                       for link in raw.get("links", ()))

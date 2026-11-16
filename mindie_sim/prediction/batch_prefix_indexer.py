@@ -43,23 +43,18 @@ class BatchPrefixIndexer:
     algorithm = RECIPE_NAME
 
     def lower(self, context):
-        from .program import KernelProgram, Stage
+        from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
 
-        metadata = dict(getattr(context.op, "metadata", ()) or {})
+        metadata = dict(getattr(context.op, "metadata", ()) or ())
         if metadata.get("prefix_read_reuse_applied") is not True:
             raise ModelingError("batch_prefix_indexer_requires_applied_read_plan")
         component = str(metadata.get("component", "index_k"))
         if component not in SUPPORTED_AXES:
             raise ModelingError(f"batch_prefix_indexer_axis_unsupported:{component}")
         if context.collective_plan is None and "link" in context.native_work:
-            # A transport-only op is not an indexer scan.
             raise ModelingError("batch_prefix_indexer_requires_index_work")
-        stages = (
-            (Stage("setup", latency=context.setup_ms),
-             Stage("key_tiles", context.work, after=("setup",)))
-            if context.setup_ms else (Stage("key_tiles", context.work),)
-        )
-        return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        return TiledSparseIndexerRecipe().lower(context)
+
 
 
 RECIPE = BatchPrefixIndexer()

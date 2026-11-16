@@ -17,7 +17,7 @@ import math
 from typing import Mapping
 
 from mindie_sim.schema.common import ModelingError
-from .program import KernelProgram, ResourceEnvelope, Stage
+from .program import KernelProgram, Stage
 
 
 _COMMUNICATION_FAMILIES = frozenset({
@@ -263,7 +263,8 @@ class ResourceService:
         from .mechanism import Work
         curve = self.model
         if not context.work:
-            return ResourceEnvelope().lower(context)
+            return KernelProgram((Stage("empty_boundary", keep_empty=True),),
+                                 minimum_ms=context.minimum_ms)
         if curve.identity != context.service_identity:
             raise ModelingError(f"service_identity_mismatch:{curve.model_id}")
         if curve.boundary != context.service_boundary:

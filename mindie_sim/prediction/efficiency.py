@@ -23,6 +23,12 @@ DEFAULT_SEQUENCES = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
+MS_PER_S = 1000.0
+FULL_PERCENT = 100.0
+EPSILON = 1e-12
+TOP_BOTTLENECKS = 15
+DEFAULT_STAGE = 0
+DEFAULT_REPLICA = 0
 DEFAULT_CONTEXT = 4096
 DEFAULT_OUTPUT_BUDGET = 1024
 DEFAULT_SLA_MS = 30.0
@@ -49,6 +55,8 @@ from .body_defaults import TargetGraphSet, TargetOperators, consume_target_decla
 from .capacity import Memory
 from .graph_analysis import graph_costs
 from .operator_analysis import operator_costs, target_graphs
+from .roofline_graph import (PhysicalWorkGraph, PhysicalWorkNode,
+                             RooflineTargets, critical_path_roofline)
 from .scheduler import DraftPolicy
 from .structure import parse_case
 
@@ -132,7 +140,7 @@ def _resolve_cube_peak(hw: Mapping[str, Any], dtype: str, default_dtype: str = "
     return min(float(d.peak(target)) for d in (hw.get("dies") or (hw["die"],)))
 
 
-def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = 0, replica: int = 0) -> dict[str, Any]:
+def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = DEFAULT_STAGE, replica: int = DEFAULT_REPLICA) -> dict[str, Any]:
     """Extract conservative stage-level Cube, Vector, HBM, MTE, and Link peak rates in SI units (/s)."""
     parsed = parse_case(case)
     p = parsed.runtime.parallel
@@ -146,9 +154,23 @@ def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = 0
     mte1_peak, fixpipe_peak = min(float(r.get("mte1", 0.0)) for r in rates_list), min(float(r.get("fixpipe", 0.0)) for r in rates_list)
     mte2_peak, mte3_peak = min(float(r.get("mte2_aic", r.get("mte2", r["hbm"]))) for r in rates_list), min(float(r.get("mte3", r["hbm"])) for r in rates_list)
     links = parsed.machine.links
-    intra_bw = max((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links if "intra_package" in lnk.channel or len(lnk.members) <= parsed.machine.dies_per_package), default=0.0)
-    inter_bw = min((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links), default=0.0)
-    link_peak = (intra_bw if max(p.tp, p.ep if p.ep > 1 else 1) <= parsed.machine.dies_per_package and intra_bw > 0 else inter_bw) if links else 0.0
+    active_width = max(p.tp, p.ep if p.ep > ONE else ONE)
+    intra_links = [lnk for lnk in links
+                   if "intra_package" in lnk.channel
+                   or "intra_node" in lnk.channel
+                   or len(lnk.members) <= parsed.machine.dies_per_package]
+    intra_bw = max((
+        lnk.capacity_bytes_per_ms * MS_PER_S * (
+            max(ONE, min(active_width, len(lnk.members)) - ONE)
+            if lnk.semantics == "per_pair" else ONE_FLOAT)
+        for lnk in intra_links), default=ZERO_FLOAT)
+    inter_bw = min((lnk.capacity_bytes_per_ms * MS_PER_S for lnk in links),
+                   default=ZERO_FLOAT)
+    link_peak = (
+        intra_bw if (active_width <= max(parsed.machine.dies_per_package,
+                                         parsed.machine.ranks_per_node)
+                     and intra_bw > ZERO_FLOAT) else inter_bw
+    ) if links else ZERO_FLOAT
     is_lane_issue = "lane operation per cycle" in str(dict(parsed.machine.assumptions).get("vector_issue", ""))
     return {
         "die": dies[0], "dies": dies, "compute_peaks": compute_peaks, "default_dtype": parsed.model.compute_dtype or "bf16",
@@ -220,6 +242,33 @@ def legacy_service_regime_diagnostics(case: CaseSpec | Mapping[str, Any]) -> dic
             "rules": deepcopy(rules)}
 
 
+def _resolve_operator_link_peak(parsed, op, hw) -> float:
+    """Physical per-rank link peak for this operator's declared group axis."""
+    metadata = dict(op.get("metadata") or ())
+    axis = str(metadata.get("group_axis") or "tp")
+    parallel = parsed.runtime.parallel
+    width = max(ONE, int(getattr(parallel, axis, ONE) or ONE))
+    links = parsed.machine.links
+    candidates = [lnk for lnk in links
+                  if lnk.members and min(len(lnk.members), width) >= width]
+    if not candidates:
+        candidates = list(links)
+    if not candidates:
+        return float(hw.get("link_peak_bytes_per_s", ZERO_FLOAT) or ZERO_FLOAT)
+    within_node = width <= max(ONE, parsed.machine.ranks_per_node)
+    selected = [lnk for lnk in candidates
+                if ("intra_node" in lnk.channel or "intra_package" in lnk.channel)
+                == within_node] or candidates
+    link = min(selected, key=lambda item: item.capacity_bytes_per_ms)
+    peak = float(link.peak_capacity_bytes_per_ms
+                 or link.capacity_bytes_per_ms) * MS_PER_S
+    if link.semantics == "per_pair":
+        peak *= max(ONE, width - ONE)
+    elif link.semantics == "shared":
+        peak /= max(ONE, width)
+    return peak
+
+
 def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, Any], *, peaks: Mapping[str, Any] | None = None, observed_duration_ms: float | None = None, pmu: Mapping[str, float] | None = None) -> dict[str, Any]:
     """Compute 4D efficiency (Cube_MFU, Vec_MFU, MBU, Link_Util) & CV-overlap for one operator."""
     parsed, op, count = parse_case(case), row["operator"], int(row.get("occurrences", 1))
@@ -242,9 +291,13 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     comm_res = dict(comm_info.get("resources") or {})
     _non_lnk = ("memory@", "vector@", "matrix@", "mte", "fixpipe@", "l2@", "ub", "reg_", "sreg_", "vreg_", "scalar_", "vbitsort", "host", "scheduler@", "native_call_service")
     if has_jn:
-        serv_link = 0.0
+        serv_link = ZERO_FLOAT
     elif comm_wire:
-        serv_link = sum(float(v) for v in comm_wire.values())
+        pair_sources = {str(key).split(":pair", ONE)[ZERO]
+                        for key in comm_wire if ":pair" in str(key)}
+        rank_div = max(ONE, len(comm_info.get("useful_bytes_by_rank") or ())
+                       or len(pair_sources))
+        serv_link = sum(float(v) for v in comm_wire.values()) / rank_div
     elif comm_info.get("wire_bytes") is not None:
         is_per_port = any(":tx:port" in k or ":rx:port" in k for k in comm_res)
         rank_div = (max(1, len(comm_info.get("useful_bytes_by_rank") or ()) or len(dies)) if is_per_port else 1)
@@ -267,7 +320,10 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     t_hbm_ideal_ms = (hbm_bytes / hw["hbm_peak_bytes_per_s"]) * 1000.0 if hbm_bytes > 0 else 0.0
     logical_link_bytes = max(float(op.get("link_bytes", 0.0) or 0.0) + float(res_work.get("link", 0.0) or 0.0), float(ref_work.get("link", 0.0) or 0.0))
     link_bytes = max(logical_link_bytes, serv_link)
-    t_link_ideal_ms = (link_bytes / hw["link_peak_bytes_per_s"]) * 1000.0 if (link_bytes > 0 and hw["link_peak_bytes_per_s"] > 0) else 0.0
+    op_link_peak = _resolve_operator_link_peak(parsed, op, hw)
+    t_link_ideal_ms = ((link_bytes / op_link_peak) * MS_PER_S
+                       if (link_bytes > ZERO_FLOAT and op_link_peak > ZERO_FLOAT)
+                       else ZERO_FLOAT)
 
     total_ms, safe_t = duration_ms * count, max(duration_ms, 1e-12)
     operator_kind = "cv_fused" if (flops > 0 and vector_ops > 0) else "cube" if flops > 0 else "vector" if vector_ops > 0 else "communication" if link_bytes > 0 else "memory_only"
@@ -871,9 +927,9 @@ def analyze_network_efficiency(
     }
 
 
-def evaluate_target_efficiency(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
-    target_mbu: float = 0.80, target_cube_mfu: float = 0.75, target_vec_mfu: float = 0.65, target_link_util: float | None = None,
+def _evaluate_target_efficiency_legacy(
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
+    target_mbu: float = DEFAULT_TARGET_MBU, target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU, target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU, target_link_util: float | None = None,
     fixed_launch_us: float | None = None, family_targets: Mapping[str, Mapping[str, float]] | None = None,
     mode: str = "clamp_to_target", baseline_analysis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -930,6 +986,65 @@ def evaluate_target_efficiency(
         "current_network_roofline_efficiency": base["network_roofline_efficiency"], "target_network_roofline_efficiency": base["total_roofline_ideal_ms"] / safe_tgt,
         "top_bottlenecks": sorted(evaluated_ops, key=lambda r: -r["gap_ms"])[:15], "operators": evaluated_ops,
     }
+
+
+def evaluate_target_efficiency(
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode",
+    tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT,
+    sequences: int = DEFAULT_SEQUENCES,
+    scope: str = "body", target_mbu: float = DEFAULT_TARGET_MBU,
+    target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU,
+    target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU,
+    target_link_util: float | None = None,
+    fixed_launch_us: float | None = None,
+    family_targets: Mapping[str, Mapping[str, float]] | None = None,
+    mode: str = "clamp_to_target",
+    baseline_analysis: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Target roofline with DAG critical-path and resource conservation."""
+    result = _evaluate_target_efficiency_legacy(
+        case, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope, target_mbu=target_mbu,
+        target_cube_mfu=target_cube_mfu, target_vec_mfu=target_vec_mfu,
+        target_link_util=target_link_util, fixed_launch_us=fixed_launch_us,
+        family_targets=family_targets, mode=mode,
+        baseline_analysis=baseline_analysis)
+    operators = result["operators"]
+    nodes = tuple(PhysicalWorkNode(
+        node_id=str(row.get("physical_id") or row.get("op_id") or index),
+        cube_ms=float(row.get("t_cube_ideal_ms") or ZERO_FLOAT),
+        vector_ms=float(row.get("t_vec_ideal_ms") or ZERO_FLOAT),
+        hbm_ms=float(row.get("t_hbm_ideal_ms") or ZERO_FLOAT),
+        link_ms=float(row.get("t_link_ideal_ms") or ZERO_FLOAT),
+        launch_ms=float(row.get("fixed_ms") or ZERO_FLOAT),
+    ) for index, row in enumerate(operators))
+    targets = RooflineTargets(
+        cube=target_cube_mfu, vector=target_vec_mfu, hbm=target_mbu,
+        link=target_link_util if target_link_util is not None else ONE_FLOAT)
+    roofline = critical_path_roofline(PhysicalWorkGraph(nodes), targets)
+    cur_step = float(result["current_step_duration_ms"])
+    physical_ideal = max(roofline.physical_ideal_ms, ZERO_FLOAT)
+    raw_target = max(roofline.target_duration_ms, physical_ideal)
+    target_step = (raw_target if mode == "exact_target"
+                   else max(physical_ideal, min(cur_step, raw_target)))
+    result.update({
+        "physical_ideal_ms": physical_ideal,
+        "physical_ideal_1x_step_ms": physical_ideal,
+        "raw_target_duration_ms": raw_target,
+        "target_step_duration_ms": target_step,
+        "target_faster_than_prediction": bool(raw_target < cur_step),
+        "critical_path_nodes": roofline.critical_path_nodes,
+        "resource_cut_bounds": dict(roofline.resource_cut_bounds),
+        "target_step_basis": "dag_critical_path_and_resource_conservation",
+    })
+    safe_target = max(target_step, EPSILON)
+    result["saved_ms"] = cur_step - target_step
+    result["speedup_ratio"] = cur_step / safe_target
+    result["step_speedup"] = result["speedup_ratio"]
+    result["speedup_pct"] = (result["speedup_ratio"] - ONE_FLOAT) * FULL_PERCENT
+    result["latency_reduction_pct"] = (
+        result["saved_ms"] / max(cur_step, EPSILON)) * FULL_PERCENT
+    return result
 
 
 def _operator_fit_signature(op: Mapping[str, Any]) -> str:

@@ -1314,6 +1314,8 @@ class RecipeContext:
     #: Stable serializable projection of transport_options (separate from the
     #: service identity used for curve matching).
     transport_identity: Mapping | None = None
+    #: Immutable typed physical declaration selected for this device cohort.
+    physical_mechanisms: object = None
 
     def __post_init__(self):
         # T04 historically folded the typed option into service_identity.  Keep
@@ -1417,16 +1419,10 @@ class Recipe(Protocol):
 
 
 class ResourceEnvelope:
-    """Aggregate independent work where no instruction-stage recipe is declared."""
+    """Removed production fallback; retained only to reject legacy bindings."""
 
     def lower(self, context: RecipeContext) -> KernelProgram:
-        stages = (
-            (Stage("setup", latency=context.setup_ms),
-             Stage("service", context.work, after=("setup",)))
-            if context.setup_ms
-            else (Stage("service", context.work),)
-        )
-        return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        raise ModelingError("resource_envelope_banned")
 
 
 @dataclass(frozen=True)
@@ -1478,6 +1474,8 @@ class RecipeBook:
         from .mechanism import PlannedRecipe as _PlannedRecipe
         from .batch_prefix_attention import RECIPE as _batch_prefix_attn
         from .batch_prefix_indexer import RECIPE as _batch_prefix_idx
+        from .physical_recipe_registry import (physical_family_bindings,
+                                               physical_recipe_bindings)
         self._explicit_recipes = frozenset((recipes or {}).keys()) | {
             "batch_prefix_attention", "batch_prefix_indexer",
         }
@@ -1487,20 +1485,24 @@ class RecipeBook:
         self._explicit_families = frozenset((families or {}).keys())
         self._family_kinds = {}
         self.recipes = {
+            **physical_recipe_bindings(),
             "balanced_grouped_gate_up": balanced_matrix,
             "balanced_grouped_down": balanced_matrix,
             "batch_prefix_attention": _batch_prefix_attn,
             "batch_prefix_indexer": _batch_prefix_idx,
             **(recipes or {}),
         }
-        self.families = {"recurrent_scan": RecurrentScan(), "recurrent_vector": RecurrentVector(),
-                         "engram_rh2d": HostStaging(),
-                         "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
-                         **(families or {})}
+        self.families = {
+            **physical_family_bindings(),
+            "recurrent_scan": RecurrentScan(), "recurrent_vector": RecurrentVector(),
+            "engram_rh2d": HostStaging(),
+            "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
+            **(families or {}),
+        }
         self.programs = {"matmul": TiledMatmul(128, 128),
                          "dense_latent_attention": _PlannedRecipe(_generic_latent_build),
                          **(programs or {})}
-        self.default = default or ResourceEnvelope()
+        self.default = default
         self._select_id_cache: dict[int, tuple[object, Recipe]] = {}
         self._expand_id_cache: dict[int, tuple[object, tuple]] = {}
         self._prev_expand: tuple | None = None
@@ -1564,7 +1566,7 @@ class RecipeBook:
                 recipe = _shared_recipe()
             else:
                 recipe = self.recipes.get(recipe_name, self.families.get(
-                    op.family, self.programs.get(kind, self.default)))
+                    op.family, self.programs.get(kind)))
         elif (family_name == "grouped_gemm"
               and "grouped_gemm" in self._explicit_families
               and recipe_name in generic_grouped):
@@ -1587,7 +1589,16 @@ class RecipeBook:
                     _mxfp4_config(op)
         else:
             recipe = self.recipes.get(recipe_name, self.families.get(
-                op.family, self.programs.get(kind, self.default)))
+                op.family, self.programs.get(kind)))
+        if recipe is None:
+            from .physical_recipe_registry import PROJECTION_FAMILIES
+            if family_name in PROJECTION_FAMILIES:
+                recipe = self.programs.get("matmul")
+            elif self.default is not None:
+                recipe = self.default
+            else:
+                from .physical_recipe_registry import resolve_physical_recipe
+                recipe = resolve_physical_recipe(op)
         if "matrix_group_rows" in meta:
             from .grouped_rows import adapt
             recipe = adapt(recipe, op)
@@ -1839,7 +1850,7 @@ class RecipeBook:
 
         from .batch_prefix_attention import BatchPrefixAttention
         from .batch_prefix_indexer import BatchPrefixIndexer
-        factories = {"envelope": ResourceEnvelope, "tiled_matmul": TiledMatmul,
+        factories = {"tiled_matmul": TiledMatmul,
                      "hierarchical_matmul": HierarchicalMatmul, "mapped_matmul": MappedMatmul,
                      "phase_matmul": PhaseMatmul,
                      "steady_matmul": SteadyMatmul,

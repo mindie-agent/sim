@@ -11,6 +11,8 @@ from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, cache_store_op
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.catalog.quant import projection_quant
 
+ZERO = 0
+
 
 class Builder:
     def __init__(self, prefix, plan, stage, views, model, mode):
@@ -56,12 +58,14 @@ class Builder:
             metadata=tuple(sorted({"group_axis": axis, **metadata}.items())), **self.common,
         ))
 
-    def work(self, name, deps, shape, *, flops=0, vector=0, read=0, write=0,
-             family="attention", dtype=None, recipe=None, metadata=()):
+    def work(self, name, deps, shape, *, flops=ZERO, matrix_flops=(), vector=ZERO,
+             read=ZERO, write=ZERO, family="attention", dtype=None, recipe=None,
+             metadata=()):
         return self.add(OpSpec(
             op_id=self.prefix + "." + name, deps=tuple(deps), recipe=recipe or name, family=family,
             semantic_shape=shape, local_shape=shape, padded_shape=shape, launch_shape=shape,
-            flops=flops, vector_ops=vector, hbm_bytes=read + write,
+            flops=flops, matrix_flops=tuple(matrix_flops), vector_ops=vector,
+            hbm_bytes=read + write,
             mte2_bytes=read, mte3_bytes=write, dtype=dtype or self.model.compute_dtype,
             metadata=tuple(metadata), **self.common,
         ))

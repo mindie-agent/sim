@@ -55,12 +55,12 @@ Timing detail is a choice within that structure:
 
 | Level | Representation | When to use |
 | --- | --- | --- |
-| Resource envelope | Arithmetic and traffic served by declared resources, with explicit setup where applicable | Simple independent work, a first estimate, or an inexpensive screening baseline. It does not imply native kernel fidelity. |
+| Physical aggregate (legacy, not a production default) | Arithmetic and traffic in one aggregate stage | Historical diagnostic only; a production operator must bind a declared multi-stage physical recipe or raise `unmodeled_operator_mechanism`. |
 | Phase/tile model | A small sequence/DAG of load, compute, reduction, exchange and store; tile tails, reuse and participating units where they matter | Preferred working model when overlap, limited parallelism, reduction or state movement changes trends. Reuse existing program classes. |
 | Detailed local program | Instruction-class demand, finite queues or finer dependency stages | A diagnosed hotspot whose simpler model misses a material cost, bottleneck transition or configuration ordering. Keep it local. |
 
 These are modeling choices, not new engines or a mandatory ladder. A
-source-derived planner can emit a compact phase or envelope program while
+source-derived planner can emit a compact physical phase program while
 retaining its actual call boundary, declared work and implementation identity.
 `plan_required` means a selected implementation must bind a planner; it does
 not mean that planner must enumerate instructions.
@@ -83,8 +83,8 @@ Change the default development pressure: a source line is evidence for a
 mechanism, not a task to reproduce that line's instruction sequence. Shared
 phase/tile primitives should carry most operators. Existing fine GDN programs
 can be diagnostic references while reusable family models are evaluated.
-Do not replace a selected implementation with a generic envelope merely because
-it produces a closer number.
+Do not replace a selected implementation with a generic aggregate merely because
+it produces a closer number. Unmodeled mechanisms raise an explicit error.
 
 The current calibration interface also has limits:
 

@@ -21,6 +21,8 @@ from .recurrent import linear
 from .partial_attention import projection_only, unmodeled, shared_kv_input
 from .cache_representation import store as representation_store
 from .attention_kv_access import paged_fia_plan
+from .memory_traffic import (AttentionAccessSpec, AttentionSchedule,
+                             default_hierarchy, plan_attention_traffic)
 from mindie_sim.catalog.cache import (
     completed_rows, index_row_bytes, index_selection_cost, local_kv_heads,
 )
@@ -533,6 +535,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             rows=new_idx_rows, row_bytes=max(ONE, int(round(row_bytes))),
             dtype=quant.index_dtype, kind="index")
         q_idx_bytes = valid * idx_heads * idx_dim * dtype_bytes(quant.index_dtype)
+        unique_idx_rows = sum(
+            max(ONE, int(v.kv_len) // idx_ratio) for v in views)
+        l2_bounded_index_read = float(min(scored_rows, unique_idx_rows)) * row_bytes
         shape = (scored_rows, idx_heads, idx_dim)
         idx_scores = OpSpec(
             op_id=prefix + ".index_scores", family="indexer", phase=mode, stage=stage,
@@ -540,16 +545,18 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             padded_shape=shape, launch_shape=shape,
             flops=float(TWO * scored_rows * idx_heads * idx_dim),
             vector_ops=float(THREE * scored_rows * idx_heads),
-            hbm_bytes=float(scored_rows * (row_bytes + FP32_BYTES) + q_idx_bytes),
+            hbm_bytes=float(l2_bounded_index_read + q_idx_bytes),
             mte2_bytes=float(scored_rows * row_bytes + q_idx_bytes),
-            mte3_bytes=float(scored_rows * FP32_BYTES),
+            mte3_bytes=float(ZERO_FLOAT),
             deps=(idx_wq.op_id, idx_store.op_id), recipe="index_scores",
             dtype=quant.index_dtype)
         idx_scores = apply_indexer_prefix_reads(
             idx_scores, views=views, rows_by_view=rows_by_view,
             shared_rows_by_view=shared_idx_by_view, row_bytes=float(row_bytes),
             layer_index=plan.index, runtime=runtime,
-            kernel_reuse="native_per_sequence" if user_pinned_idx else "tile",
+            kernel_reuse=("batch_tile" if runtime is not None
+                          and runtime.prefix_cache_mode == "shared"
+                          else ("native_per_sequence" if user_pinned_idx else "tile")),
             allow_recipe_rebind=not user_pinned_idx)
         idx_topk = vector_op(
             op_id=prefix + ".index_topk", deps=(idx_scores.op_id,), stage=stage,
@@ -689,7 +696,27 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             shared_sweeps_by_view.append(min(view_sweeps, per_view_shared[v_pos][worst_sweeps_r]))
             total_pairs_sum += pairs
             total_rows_sum += view.kv_len
-            kv_bytes = view_sweeps * kv_row_bytes
+            traffic = plan_attention_traffic(
+                AttentionAccessSpec(
+                    q_lengths=(int(view.q_len),),
+                    context_lengths=(int(max(ZERO, view.kv_len - view.q_len)),),
+                    kv_heads=int(kv_heads), q_heads=int(heads),
+                    key_dim=int(width), value_dim=int(width),
+                    row_bytes=float(kv_row_bytes),
+                    unique_rows=int(max(ZERO, local_rows)),
+                    refill_rows=int(max(ZERO, view_sweeps)),
+                    selected_rows=(int(max(ZERO, view_sweeps))
+                                   if int(getattr(plan, "index_topk", ZERO) or ZERO) > ZERO
+                                   else ZERO),
+                    phase=mode,
+                    topk=int(getattr(plan, "index_topk", ZERO) or ZERO),
+                    representation="gqa",
+                    cache_identity=str(getattr(view, "prefix_key", "") or ""),
+                ),
+                default_hierarchy(),
+                AttentionSchedule(query_tile=policy.query_tile),
+            )
+            kv_bytes = traffic.hbm_read_bytes
             input_bytes = view.q_len * heads * width * dtype_bytes(model.activation_dtype)
             shape = (view.q_len, view.kv_len, heads, width)
             op = OpSpec(
@@ -703,6 +730,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                 metadata=(("query_tile", policy.query_tile), ("causal_pairs", pairs),
                           ("local_pairs", local_pairs), ("kv_streams", streams),
                           ("kv_sweeps", view_sweeps),
+                          ("attention_traffic_plan", traffic.to_dict()),
                           ("cp_per_rank_pairs", tuple(v_pairs)),
                           ("cp_per_rank_sweeps", tuple(per_view_sweeps[v_pos])))
                          + _decode_contract(

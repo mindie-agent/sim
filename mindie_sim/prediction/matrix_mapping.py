@@ -23,6 +23,18 @@ from .matrix_epilogue import MatrixEpilogue
 from .ownership import read_role
 
 
+ZERO = 0
+ONE = 1
+FIRST = 0
+LAST = -1
+SECOND_LAST = -2
+LAST_THREE = -3
+REFILL_M = 128
+MIN_NARROW_N = 32
+MAX_SPLIT_K = 32
+A5_L2_MTE2_RATE = 1e13
+A5_BF16_PEAK_FLOOR = 4e14
+
 DEFAULT_CANDIDATES = ((128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128),
                       (256, 128, 64), (256, 128, 128), (256, 256, 64), (256, 256, 128))
 NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
@@ -508,10 +520,10 @@ def mapping_bound(context, recipe, *, geometry=None):
     demands = {}
     for role, values in (
         (read_role(names), private),
-        (read_role(names, aiv=0), scales),
+        (read_role(names, aiv=FIRST), scales),
         ("mte1", inner),
         ("mte3", [context.op.mte3_bytes * area / (total_m * n) for _, _, _, area in owners]),
-        ("cube", [context.work.get(names["cube"], 0) * area / (total_m * n)
+        ("cube", [context.work.get(names["cube"], ZERO) * area / (total_m * n)
                   for _, _, _, area in owners]),
         ("vector", [epilogue.operations_per_output * area for _, _, _, area in owners]),
     ):
@@ -573,9 +585,9 @@ def _op_matrix_key(op):
     return (
         op.local_shape, op.semantic_shape, op.padded_shape,
         op.dtype, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
-        meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
-        meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
-        meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
+        meta.get("matrix_groups", ONE), meta.get("compute_format"), meta.get("output_format"),
+        meta.get("packed_weight_bytes", ZERO), meta.get("row_scale_bytes", ZERO),
+        meta.get("column_scale_bytes", ZERO), meta.get("epilogue_ops_per_element", ZERO),
         MatrixEpilogue.from_op(op),
     )
 
@@ -600,6 +612,7 @@ class MappedMatmul:
             tuple(sorted(context.work.items())),
             tuple(sorted(context.resource_units.items())),
             tuple(sorted(context.pool_capacities.items())),
+            getattr(context.physical_mechanisms, "signature", None),
         )
         if cache_key in _SELECT_CACHE:
             recipe, record = _SELECT_CACHE[cache_key]
@@ -608,17 +621,23 @@ class MappedMatmul:
         selected = None
         selected_geometry = None
         meta = dict(context.op.metadata)
-        groups = int(meta.get("matrix_groups", 1))
-        if groups < 1 or context.op.local_shape[-3] % groups:
+        groups = int(meta.get("matrix_groups", ONE))
+        if groups < ONE or context.op.local_shape[LAST_THREE] % groups:
             raise ModelingError("matrix_groups_require_equal_integer_rows")
         compute_format = meta.get("compute_format", context.op.dtype or "bf16")
-        automatic_subtiles = self.candidates is None and compute_format == "fp32"
+        m = context.op.local_shape[LAST_THREE] // groups
+        n = context.op.local_shape[SECOND_LAST]
+        default_grid = math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+        a5_l2_supply = (
+            float(context.rates.get("mte2_aic", ZERO)) >= A5_L2_MTE2_RATE
+            or float(context.compute_peaks.get("bf16", ZERO)) >= A5_BF16_PEAK_FLOOR)
+        automatic_subtiles = a5_l2_supply and (
+            self.candidates is None
+            or m < context.core_count * REFILL_M
+            or default_grid < context.core_count)
         narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
                   ) if self.narrow_candidates is None else self.narrow_candidates
-        narrow = narrow if context.op.local_shape[-2] <= 32 else ()
-        m = context.op.local_shape[-3] // groups
-        n = context.op.local_shape[-2]
-        default_grid = math.ceil(m / 128) * math.ceil(n / 128) * groups
+        narrow = narrow if n <= MIN_NARROW_N else ()
         underfilled = (UNDERFILLED_CANDIDATES if automatic_subtiles else ()
                        ) if self.underfilled_candidates is None else self.underfilled_candidates
         underfilled = underfilled if default_grid < context.core_count else ()
@@ -627,13 +646,24 @@ class MappedMatmul:
         candidates.extend((tile, True) for tile in narrow)
         candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
         for (tm, tn, tk), is_narrow in candidates:
-            cm = min(self.compute_m, tm) if is_narrow else self.compute_m
-            cn = min(self.compute_n, tn) if is_narrow else self.compute_n
+            del is_narrow
+            cm = min(self.compute_m, tm)
+            cn = min(self.compute_n, tn)
+            k = context.op.local_shape[LAST]
+            output_tiles = (math.ceil(m / tm) * math.ceil(n / tn) * groups)
+            split_k = ONE
+            if output_tiles < context.core_count and k > tk:
+                split_k = min(
+                    k // tk,
+                    max(ONE, context.core_count // max(ONE, output_tiles)),
+                    MAX_SPLIT_K,
+                )
             recipe = HierarchicalMatmul(
                 tm, tn, tk, cm, cn,
-                self.slots, self.compute_slots, self.reuse_inputs, self.reuse_weights)
+                self.slots, self.compute_slots, self.reuse_inputs,
+                self.reuse_weights, split_k)
             if min(tm, tn, tk, self.compute_m, self.compute_n,
-                   self.slots, self.compute_slots) < 1:
+                   self.slots, self.compute_slots) < ONE:
                 raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
             if tm % cm or tn % cn:
                 raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
@@ -643,7 +673,8 @@ class MappedMatmul:
                         if pool in context.pool_capacities and size > context.pool_capacities[pool]}
             bound = None if exceeded else mapping_bound(context, recipe, geometry=geometry)
             waves = math.ceil(math.ceil(m / tm) * math.ceil(n / tn) * groups / context.core_count)
-            records.append({"tile": [tm, tn, tk], "footprint_bytes_per_owner": buffers,
+            records.append({"tile": [tm, tn, tk], "split_k": split_k,
+                            "footprint_bytes_per_owner": buffers,
                             "exceeded_pools": exceeded, "resource_bound_ms": bound,
                             "maximum_owner_output_tiles": waves,
                             "logical_shape": list(geometry.logical_shape),
@@ -658,30 +689,30 @@ class MappedMatmul:
                 # Equal resource bounds can hide another serial output-tile
                 # drain/prologue on an owner. Avoid those extra waves before
                 # minimizing residency; smaller buffers alone are not faster.
-                score = (bound, waves, -tk, sum(buffers.values()), tm, tn)
+                score = (bound, waves, -split_k, -tk, sum(buffers.values()), tm, tn)
                 if selected is None or score < selected[0]:
                     selected = (score, recipe)
                     selected_geometry = geometry
         if selected is None:
             raise ModelingError(f"matrix_no_feasible_declared_mapping:"
                                 f"shape={context.op.local_shape}:groups={groups}:dtype={context.op.dtype}")
-        res = selected[1], {
+        res = selected[ONE], {
             "basis": "declared_candidates_resource_lower_bound",
-            "shape": list(context.op.local_shape[-3:]),
+            "shape": list(context.op.local_shape[LAST_THREE:]),
             "groups": groups,
             "default_128_grid_tiles": default_grid,
             "physical_compute_owners": context.core_count,
-            "subtile_policy": ("fp32_default_or_explicit" if automatic_subtiles
-                               else "explicit_only"),
+            "subtile_policy": ("all_dtype_underfilled_or_explicit"
+                               if automatic_subtiles else "explicit_only"),
             "underfilled_grid_candidates": bool(underfilled),
             "geometry": selected_geometry.to_dict(),
-            "selected": asdict(selected[1]), "candidates": records,
+            "selected": asdict(selected[ONE]), "candidates": records,
             "compute_precision_peaks": dict(context.compute_peaks),
             "capacity_screening": "declared_pools_only",
             "declared_pools": dict(context.pool_capacities),
             "read_role_bindings": {
                 "matrix_operands": read_role(context.resource_names),
-                "output_scales": read_role(context.resource_names, aiv=0),
+                "output_scales": read_role(context.resource_names, aiv=FIRST),
             },
             "unmodeled_transfer_roles": [role for role in (
                                         "mte1", read_role(context.resource_names),

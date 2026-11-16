@@ -2469,6 +2469,7 @@ class Execution:
                 tuple(sorted(context.work.items())),
                 live_rates,
                 context.group_buffers,
+                getattr(context.physical_mechanisms, "signature", None),
             )
             token = _rank_token(context)
             replayable = (
@@ -2664,6 +2665,8 @@ class Execution:
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
             self._op_key(op),
+            getattr(geom, "physical_mechanisms").signature
+            if getattr(geom, "physical_mechanisms", None) is not None else None,
         )
         if prep_key in self._prepare_cache:
             cached_op, meta_diff, recipe = self._prepare_cache[prep_key]
@@ -2736,6 +2739,7 @@ class Execution:
             work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
             store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
                           if all(dict(d.store_queues).get(name) == queue for d in dies)},
+            physical_mechanisms=dies[FIRST].physical_mechanisms,
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
