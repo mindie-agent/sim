@@ -31,8 +31,12 @@ import math
 from dataclasses import dataclass
 from typing import Any, Iterable, Mapping, Sequence
 
-ZERO = 0; ZERO_F = 0.0
+ZERO = 0
+ZERO_F = 0.0
 ONE = 1
+TWO = 2
+THREE = 3
+FOUR = 4
 
 from mindie_sim.catalog.types import DraftSpec, QuantSpec, VisionSpec
 from mindie_sim.catalog.quant import projection_quant
@@ -126,10 +130,8 @@ def stage_weight_decomposition(
 
 def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
-    terms = [
-        _t("input_norm", h, 1, "norm"),
-        _t("post_attn_norm", h, 1, "norm"),
-    ]
+    terms = ([] if plan.hc_lowrank > ZERO else
+             [_t("input_norm", h, ONE, "norm"), _t("post_attn_norm", h, ONE, "norm")])
     if plan.attention == "mla":
         if plan.q_lora_rank:
             terms.append(_t("q_a_norm", plan.q_lora_rank, 1, "norm"))
@@ -152,24 +154,27 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
 
 
 def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
-    if not plan.hyper_connections or plan.hc_mult <= 0:
+    if not plan.hyper_connections or plan.hc_mult <= ZERO:
         return []
-    h = model.hidden_size
-    mix = (2 + plan.hc_mult) * plan.hc_mult
-    hc_dim = plan.hc_mult * h
+    if plan.hc_lowrank > ZERO:
+        from mindie_sim.catalog.qwen4_exp import lowrank_hc_layer_terms
+        return lowrank_hc_layer_terms(plan, model)
+    h, mix, hc_dim = model.hidden_size, (TWO + plan.hc_mult) * plan.hc_mult, plan.hc_mult * model.hidden_size
     terms = []
     for part in ("attn", "ffn"):
-        terms.append(_t(f"hc_{part}_fn", mix, hc_dim, "mhc"))
-        terms.append(_t(f"hc_{part}_base", mix, 1, "param_fp32"))
-        terms.append(_t(f"hc_{part}_scale", 3, 1, "param_fp32"))
+        terms.extend([_t(f"hc_{part}_fn", mix, hc_dim, "mhc"), _t(f"hc_{part}_base", mix, ONE, "param_fp32"),
+                      _t(f"hc_{part}_scale", THREE, ONE, "param_fp32")])
     return terms
 
 
 def _indexer_terms(plan, model):
     if not (plan.owns_index_k or plan.owns_topk or plan.indexer or plan.index_query_per_layer):
         return []
-    if plan.index_heads <= 0 or plan.index_dim <= 0:
+    if plan.index_heads <= ZERO or plan.index_dim <= ZERO:
         raise ModelingError(f"indexer_dimensions_missing:{plan.index}")
+    if plan.attention == "gqa" and plan.index_kpool > ONE:
+        from mindie_sim.catalog.qwen4_exp import qsa_indexer_terms
+        return qsa_indexer_terms(plan, model)
     terms = []
     if plan.owns_index_k:
         width = plan.head_dim if plan.index_input == "compressed" else model.hidden_size
@@ -460,7 +465,7 @@ def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
 
 def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
     vision = model.vision
-    if vision is None:
+    if vision is None or (model.auxiliary is not None and not model.auxiliary.include_vision_weights):
         return []
     terms = [
         _t("vision_patch", vision.hidden_size, vision.patch_input_width, "vision"),
@@ -526,25 +531,20 @@ def vision_weight_terms(model: ModelSpec) -> list[WeightTerm]:
 
 def body_head_terms(model: ModelSpec) -> list[WeightTerm]:
     h = model.hidden_size
-    terms = [_t("final_norm", h, 1, "norm")]
+    lowrank_hc = any(plan.hc_lowrank > ZERO for plan in model.layer_plans)
+    terms = [] if lowrank_hc else [_t("final_norm", h, ONE, "norm")]
     if not model.is_standalone_draft:
-        terms.insert(0, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
+        terms.insert(ZERO, _t("embedding", model.vocab_size, h, "embedding", "embedding"))
         if not model.tie_word_embeddings:
-            terms.append(replace(
-                _t("lm_head", model.vocab_size, h, "lm_head", "out_tp"),
-                placement_role="logits"))
+            terms.append(replace(_t("lm_head", model.vocab_size, h, "lm_head", "out_tp"), placement_role="logits"))
     if any(plan.residual_block_size for plan in model.layer_plans):
-        terms.extend([
-            _t("output_attn_res_norm", h, 1, "norm"),
-            _t("output_attn_res_proj", 1, h, "norm"),
-        ])
-    if any(plan.hyper_connections for plan in model.layer_plans):
-        hc = max((p.hc_mult for p in model.layer_plans), default=0)
-        terms.extend([
-            _t("hc_head_fn", 4, 4 * h, "mhc"),
-            _t("hc_head_base", 4, 1, "param_fp32"),
-            _t("hc_head_scale", 1, 1, "param_fp32"),
-        ])
+        terms.extend([_t("output_attn_res_norm", h, ONE, "norm"), _t("output_attn_res_proj", ONE, h, "norm")])
+    if lowrank_hc:
+        from mindie_sim.catalog.qwen4_exp import lowrank_hc_head_terms
+        terms.extend(lowrank_hc_head_terms(model))
+    elif any(plan.hyper_connections for plan in model.layer_plans):
+        terms.extend([_t("hc_head_fn", FOUR, FOUR * h, "mhc"), _t("hc_head_base", FOUR, ONE, "param_fp32"),
+                      _t("hc_head_scale", ONE, ONE, "param_fp32")])
     return terms
 
 
@@ -552,17 +552,20 @@ def engram_table_terms(model: ModelSpec) -> list[WeightTerm]:
     engram = model.engram
     if engram is None:
         return []
-    return [
-        WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width,
-                   "engram_table", "node", 1)
-        for table in engram.tables
-    ]
+    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_table_terms
+    if is_qwen4_exp_ple(engram):
+        return ple_table_terms(model)
+    return [WeightTerm(f"engram_table_{table.table_id}", table.rows, table.width, "engram_table", "node", ONE)
+            for table in engram.tables]
 
 
 def engram_gate_terms_by_layer(model: ModelSpec) -> dict[int, list[WeightTerm]]:
     engram = model.engram
     if engram is None:
         return {}
+    from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_gate_terms_by_layer
+    if is_qwen4_exp_ple(engram):
+        return ple_gate_terms_by_layer(model)
     hc = max((p.hc_mult for p in model.layer_plans), default=0)
     columns = engram.columns_per_table
     by_layer: dict[int, list[WeightTerm]] = {}
@@ -743,8 +746,8 @@ def cache_row_bytes_by_layer(model: ModelSpec) -> tuple[tuple[int, int], ...]:
     rows = []
     for plan in model.layer_plans:
         if (plan.attention in {"gqa", "projection_only"} and plan.cache_kind == "dense"
-                and not 0 <= plan.kv_owner_layer_id < plan.index):
-            row = 2 * plan.num_kv_heads * plan.head_dim * kv_bytes
+                and not ZERO <= plan.kv_owner_layer_id < plan.index):
+            row = (ONE if plan.k_eq_v else TWO) * plan.num_kv_heads * plan.head_dim * kv_bytes
         elif plan.attention == "mla":
             row = plan.cache_row_elements * kv_bytes
         else:

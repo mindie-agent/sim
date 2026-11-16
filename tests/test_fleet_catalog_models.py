@@ -260,7 +260,7 @@ def test_fleet_layer_plans_use_supported_attention_cores():
     assert len([p for p in plans38 if p.attention == "gdn"]) == 36
     assert len([p for p in plans38 if p.attention == "gqa"]) == 12
     assert (qwen38.hidden_size, qwen38.num_experts, qwen38.top_k) == (2560, 512, 10)
-    assert all(p.hyper_connections and p.hc_mult == 4 for p in plans38)
+    assert all(p.hyper_connections and p.hc_mult == 4 and p.hc_lowrank == 320 for p in plans38)
     assert all(p.linear_value_heads == 48 for p in plans38 if p.attention == "gdn")
     assert all(p.q_output_gate for p in plans38)
     indexers = [p for p in plans38 if p.indexer]
@@ -269,9 +269,9 @@ def test_fleet_layer_plans_use_supported_attention_cores():
                 p.index_kpool, p.index_kpool_compress)
                == ("full", 4, 128, 2048, 4, True) for p in indexers)
     assert qwen38.engram is not None
-    assert [table.layer_id for table in qwen38.engram.tables] == [2]
-    assert (qwen38.engram.tables[0].rows, qwen38.engram.tables[0].width) == (20_000_000, 160)
-    assert plans38[2].engram
+    assert [table.layer_id for table in qwen38.engram.tables] == [1]
+    assert (qwen38.engram.tables[0].rows, qwen38.engram.tables[0].width) == (320_001_536, 160)
+    assert plans38[1].engram and not plans38[2].engram
 
     step = load_model("step-5-preview")
     plans = step.layer_plans

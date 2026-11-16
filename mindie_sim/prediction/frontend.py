@@ -14,6 +14,7 @@ from dataclasses import dataclass, replace
 import math
 
 from mindie_sim.catalog.engram import lower_engram
+from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, lower_ple
 from mindie_sim.catalog.media import lower_media
 from mindie_sim.catalog.ops import barrier_op, comm_op, gemm_op, vector_op
 from mindie_sim.catalog.context_parallel import pcp_rank_chunk_ranges, split_pcp_pairs
@@ -27,7 +28,7 @@ from mindie_sim.schema.subgraphs import (
 )
 from mindie_sim.schema.workload import selected_mode
 from .attention import ATTENTION_BUILDERS, AttentionPolicy
-from .blocks import RESIDUAL_BUILDERS, norm
+from .blocks import RESIDUAL_BUILDERS, lowrank_hyper_final_mixer, norm
 from .feedforward import FFN_BUILDERS, RoutingPolicy
 from .graph import GraphPolicy, annotate_geometry
 from .routing_realizations import RoutingRealization, select_realization
@@ -46,6 +47,7 @@ from .recover_ssm_work import recover_ssm_enabled
 ZERO = 0
 ONE = 1
 ZERO_FLOAT = 0.0
+FINAL_LAYER = -1
 
 
 def _scope(ops, block, role="body"):
@@ -282,7 +284,8 @@ class Frontend:
                           residual_sources=tuple(residual_sources),
                           features=features,
                           source_rows_by_replica=source_rows_by_replica)
-            residual = self.residuals["hyper" if layer.hyper_connections else
+            residual = self.residuals["lowrank_hyper" if getattr(layer, "hc_lowrank", ZERO) > ZERO else
+                                      "hyper" if layer.hyper_connections else
                                       "attention" if layer.residual_block_size else "plain"]
             if tokens:
                 if attn_state is not None:
@@ -291,15 +294,22 @@ class Frontend:
                     ops.extend(_scope(prepared.ops, "attention", "residual"))
                     hidden = prepared.hidden_id
                 else:
+                    if layer.engram and is_qwen4_exp_ple(model.engram):
+                        extra, previous = lower_ple(
+                            prefix=name, plan=layer, stage=stage, deps=previous,
+                            model=model, parallel=p, quant=model.quant, mode=mode,
+                            padded_tokens=tokens, views=views, runtime=runtime)
+                        ops.extend(extra)
                     pre, hidden, saved = residual.before(
                         {**common, "prefix": name + ".attention", "structure_block": "attention"}, previous)
                     ops.extend(_scope(pre, "attention", "residual"))
-                    normalization = norm(
-                        name=name + ".norm1", deps=(hidden,), stage=stage, layer=index,
-                        requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
-                    )
-                    ops.extend(_scope((normalization,), "attention"))
-                    hidden = normalization.op_id
+                    if getattr(layer, "hc_lowrank", ZERO) <= ZERO:
+                        normalization = norm(
+                            name=name + ".norm1", deps=(hidden,), stage=stage, layer=index,
+                            requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+                        )
+                        ops.extend(_scope((normalization,), "attention"))
+                        hidden = normalization.op_id
                 attention_ready = hidden
                 if sp:
                     gathered = sequence_parallel.allgather(
@@ -348,7 +358,7 @@ class Frontend:
                                                     "structure_block": "attention"},
                                                     attention.last, saved)
                     ops.extend(_scope(post, "attention", "residual"))
-                if layer.engram:
+                if layer.engram and not is_qwen4_exp_ple(model.engram):
                     if attn_state is not None:
                         raise ModelingError("attn_res_selected_with_engram_unsupported")
                     extra, previous = lower_engram(
@@ -363,12 +373,13 @@ class Frontend:
                     pre, hidden, saved = residual.before(
                         {**common, "prefix": name + ".ffn", "structure_block": "ffn"}, previous)
                     ops.extend(_scope(pre, "ffn", "residual"))
-                    normalization = norm(
-                        name=name + ".norm2", deps=(hidden,), stage=stage, layer=index,
-                        requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
-                    )
-                    ops.extend(_scope((normalization,), "ffn"))
-                    hidden = normalization.op_id
+                    if getattr(layer, "hc_lowrank", ZERO) <= ZERO:
+                        normalization = norm(
+                            name=name + ".norm2", deps=(hidden,), stage=stage, layer=index,
+                            requests=requests, tokens=tokens, width=model.hidden_size, model=model, mode=mode,
+                        )
+                        ops.extend(_scope((normalization,), "ffn"))
+                        hidden = normalization.op_id
             else:
                 hidden = previous
             if tokens or layer.ffn == "moe":
@@ -496,6 +507,18 @@ class Frontend:
             ops = _strip_recover_intents(ops)
         return ops, previous
 
+    @staticmethod
+    def final_mixer(model, ready, *, prefix, mode, stage, tokens, requests):
+        """Emit the Qwen4Exp stream collapse, or the ordinary final norm."""
+        if any(getattr(plan, "hc_lowrank", ZERO) > ZERO for plan in model.layer_plans):
+            return lowrank_hyper_final_mixer(
+                prefix=prefix + "final", deps=ready, stage=stage,
+                requests=requests, tokens=tokens, model=model, mode=mode)
+        final = norm(name=prefix + "final_norm", deps=(ready,), stage=stage,
+                     layer=FINAL_LAYER, requests=requests, tokens=tokens,
+                     width=model.hidden_size, model=model, mode=mode)
+        return [final], final.op_id
+
     def logits(self, model, runtime, views, ready, *, prefix="", mode="decode", stage=None, sample=True,
                input_tokens=None, normalized=False):
         p = runtime.parallel
@@ -506,11 +529,9 @@ class Frontend:
         requests = tuple(view.request_id for view in sampled)
         ops, last = [], ready
         if not normalized and runtime.final_norm_scope == "all" and input_tokens:
-            final = norm(name=prefix + "final_norm", deps=(last,), stage=stage, layer=-1,
-                         requests=tuple(view.request_id for view in views), tokens=input_tokens,
-                         width=model.hidden_size, model=model, mode=mode)
-            ops.append(final)
-            last = final.op_id
+            finals, last = self.final_mixer(model, last, prefix=prefix, mode=mode,
+                stage=stage, tokens=input_tokens, requests=tuple(view.request_id for view in views))
+            ops.extend(finals)
         if not rows:
             return ops, last
         if rows != input_tokens:
@@ -518,10 +539,9 @@ class Frontend:
             ops.append(select)
             last = select.op_id
         if not normalized and runtime.final_norm_scope == "selected":
-            final = norm(name=prefix + "final_norm", deps=(last,), stage=stage, layer=-1,
-                         requests=requests, tokens=rows, width=model.hidden_size, model=model, mode=mode)
-            ops.append(final)
-            last = final.op_id
+            finals, last = self.final_mixer(model, last, prefix=prefix, mode=mode,
+                stage=stage, tokens=rows, requests=requests)
+            ops.extend(finals)
         logits = gemm_op(
             op_id=prefix + "logits", deps=(last,), stage=stage, layer=-1, requests=requests,
             m=rows, n=math.ceil(model.vocab_size / p.tp), k=model.hidden_size, quant=model.quant,
@@ -784,11 +804,9 @@ class Frontend:
         ops.extend(body)
         if pcp_prefill:
             if runtime.final_norm_scope == "all":
-                final = norm(name="final_norm", deps=(previous,), stage=runtime.parallel.pp - 1,
-                             layer=-1, requests=requests, tokens=local_tokens, width=model.hidden_size,
-                             model=model, mode=mode)
-                ops.append(final)
-                previous = final.op_id
+                finals, previous = self.final_mixer(model, previous, prefix="", mode=mode,
+                    stage=runtime.parallel.pp + FINAL_LAYER, tokens=local_tokens, requests=requests)
+                ops.extend(finals)
             select = self.select_hidden(model, views, previous, mode=mode, stage=runtime.parallel.pp - 1)
             ops.append(select)
             previous = select.op_id

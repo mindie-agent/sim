@@ -13,6 +13,7 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.parallel import ParallelSpec
 
+ZERO = 0
 ONE = 1
 
 def _local_draft_experts(num_experts: int, ep: int) -> int:
@@ -101,11 +102,12 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
             _t("draft_o", h, draft.num_heads * draft.head_dim, "attn.o", "in_tp"),
         ])
         if draft.qk_norm:
-            terms.extend([_t("draft_q_norm", draft.head_dim, 1, "norm"),
-                          _t("draft_k_norm", draft.head_dim, 1, "norm")])
-    terms.extend([_t("draft_input_norm", h, 1, "norm"),
-                  _t("draft_post_norm", h, 1, "norm"),
-                  _t("draft_final_norm", h, 1, "norm")])
+            terms.extend([_t("draft_q_norm", draft.head_dim, ONE, "norm"),
+                          _t("draft_k_norm", draft.head_dim, ONE, "norm")])
+    if draft.mhc_lowrank <= ZERO:
+        terms.extend([_t("draft_input_norm", h, ONE, "norm"),
+                      _t("draft_post_norm", h, ONE, "norm"),
+                      _t("draft_final_norm", h, ONE, "norm")])
     return terms
 
 
@@ -143,7 +145,10 @@ def _draft_ffn_terms(
             _t("draft_up", i, h, "dense_mlp", "dense_up"),
             _t("draft_down", h, i, "dense_mlp", "dense_down"),
         ])
-    if draft.mhc_mult:
+    if draft.mhc_lowrank > ZERO:
+        from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_terms
+        terms.extend(lowrank_hc_draft_terms(draft))
+    elif draft.mhc_mult:
         mix = (2 + draft.mhc_mult) * draft.mhc_mult
         hc_dim = draft.mhc_mult * h
         for part in ("attn", "ffn"):
@@ -189,9 +194,12 @@ def draft_terms(
         else:
             terms.append(_t("draft_input_proj", h, draft.input_width,
                             draft.input_projection_category, "out_tp"))
-        for _ in range(max(0, draft.layers)):
+        for _ in range(max(ZERO, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
+        if draft.mhc_lowrank > ZERO:
+            from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
+            terms.extend(lowrank_hc_draft_head_terms(draft))
     if draft.kind == "mtp" and draft.target_shared_lm_head:
         terms.append(WeightTerm(
             "target_lm_head_alias", draft.vocab_size, h,

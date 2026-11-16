@@ -27,6 +27,14 @@ from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, merge_source
 from mindie_sim.schema.model import LayerPlan
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
+NEG_ONE = -1
+ZERO = 0
+ONE = 1
+TWO = 2
+FOUR = 4
+EIGHT = 8
+SIXTEEN = 16
+
 
 def _qwen_normalization(c: Mapping[str, Any]) -> dict[str, Any]:
     """The model class declares Gemma's weight shift independently of hardware."""
@@ -87,6 +95,7 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
     conv_width = 2 * key_heads * key_dim + value_heads * value_dim
     gate = _qwen_output_gate(c)
     hc_count = _int(c, "hc_count")
+    hc_lowrank = _int(c, "hc_lowrank")
     indexer_heads = _int(c, "indexer_n_heads")
     indexer_dim = _int(c, "indexer_head_dim")
     indexer_budget = _int(c, "indexer_budget")
@@ -110,11 +119,11 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 index=index, attention="gdn", architecture="gdn",
                 ffn="moe" if moe else "dense",
                 num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-                intermediate_size=dense_i if not moe else 0,
-                num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-                moe_intermediate_size=moe_i if moe else 0,
-                num_shared_experts=1 if moe else 0,
-                shared_intermediate_size=shared_i if moe else 0,
+                intermediate_size=dense_i if not moe else ZERO,
+                num_experts=experts if moe else ZERO, top_k=top_k if moe else ZERO,
+                moe_intermediate_size=moe_i if moe else ZERO,
+                num_shared_experts=ONE if moe else ZERO,
+                shared_intermediate_size=shared_i if moe else ZERO,
                 shared_expert_gate=bool(moe),
                 router_input_size=h, router_mode=router_mode,
                 router_norm_topk=router_norm_topk,
@@ -124,25 +133,25 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 conv_kernel=conv_k, conv_width=conv_width,
                 recurrent_state_elements=value_heads * key_dim * value_dim,
                 recurrent_state_dtype=ssm_dtype,
-                conv_state_elements=conv_width * (conv_k - 1),
+                conv_state_elements=conv_width * (conv_k - ONE),
                 conv_state_dtype="bf16",
                 state_bytes=float(value_heads * key_dim * value_dim * dtype_bytes(ssm_dtype)
-                                  + conv_width * (conv_k - 1) * dtype_bytes("bf16")),
+                                  + conv_width * (conv_k - ONE) * dtype_bytes("bf16")),
                 q_output_gate=gate,
-                hyper_connections=hc_count > 0, hc_mult=hc_count,
+                hyper_connections=hc_count > ZERO, hc_mult=hc_count, hc_lowrank=hc_lowrank,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",
             ))
-        elif kind == "full_attention":
+        elif kind in {"full_attention", "qwen_sparse_attention", "indexed_attention"}:
             plans.append(LayerPlan(
                 index=index, attention="gqa", architecture="gated_gqa" if gate else "gqa",
                 ffn="moe" if moe else "dense",
                 num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-                intermediate_size=dense_i if not moe else 0,
-                num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-                moe_intermediate_size=moe_i if moe else 0,
-                num_shared_experts=1 if moe else 0,
-                shared_intermediate_size=shared_i if moe else 0,
+                intermediate_size=dense_i if not moe else ZERO,
+                num_experts=experts if moe else ZERO, top_k=top_k if moe else ZERO,
+                moe_intermediate_size=moe_i if moe else ZERO,
+                num_shared_experts=ONE if moe else ZERO,
+                shared_intermediate_size=shared_i if moe else ZERO,
                 shared_expert_gate=bool(moe),
                 router_input_size=h, router_mode=router_mode,
                 router_norm_topk=router_norm_topk,
@@ -150,16 +159,16 @@ def _qwen_plans(c: Mapping[str, Any]) -> list[LayerPlan]:
                 # Qwen3.5 reuses this attention class for its full-attention layers.
                 qk_norm=True,
                 q_output_gate=gate,
-                hyper_connections=hc_count > 0, hc_mult=hc_count,
+                hyper_connections=hc_count > ZERO, hc_mult=hc_count, hc_lowrank=hc_lowrank,
                 indexer=indexer, indexer_type="full" if indexer else "none",
-                owns_index_k=indexer, index_k_owner_layer_id=index if indexer else -1,
-                owns_topk=indexer, topk_owner_layer_id=index if indexer else -1,
-                index_heads=indexer_heads if indexer else 0,
-                index_dim=indexer_dim if indexer else 0,
-                index_topk=indexer_budget if indexer else 0,
-                index_kpool=max(1, indexer_ratio) if indexer else 1,
-                index_kpool_compress=indexer and indexer_ratio > 1,
-                kv_cache_elements=2 * kv_heads * head_dim,
+                owns_index_k=indexer, index_k_owner_layer_id=index if indexer else NEG_ONE,
+                owns_topk=indexer, topk_owner_layer_id=index if indexer else NEG_ONE,
+                index_heads=indexer_heads if indexer else ZERO,
+                index_dim=indexer_dim if indexer else ZERO,
+                index_topk=indexer_budget if indexer else ZERO,
+                index_kpool=max(ONE, indexer_ratio) if indexer else ONE,
+                index_kpool_compress=indexer and indexer_ratio > ONE,
+                kv_cache_elements=TWO * kv_heads * head_dim,
                 kv_owner_layer_id=index,
                 native_layer_id=index, scope="body",
             ))
@@ -182,18 +191,20 @@ def _aux_qwen(c: Mapping[str, Any]) -> AuxiliarySpec:
     mtp = DraftSpec(
         kind="mtp", layers=nextn, hidden_size=h, intermediate_size=moe_i,
         num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-        q_width=(2 if gate else 1) * heads * head_dim,
+        q_width=(TWO if gate else ONE) * heads * head_dim,
         kv_width=kv_heads * head_dim, attention_kind="gqa",
-        kv_cache_elements=2 * kv_heads * head_dim,
+        kv_cache_elements=TWO * kv_heads * head_dim,
+        input_mode="dual_normalized" if _int(c, "hc_lowrank") else "concat",
         weight_category="mtp", qk_norm=True, q_output_gate=gate,
-        num_experts=experts, top_k=_int(c, "num_experts_per_tok") if experts else 0,
+        num_experts=experts, top_k=_int(c, "num_experts_per_tok") if experts else ZERO,
         expert_intermediate_size=moe_i,
-        num_shared_experts=1 if experts else 0,
-        block_size=1, markov_rank=0, confidence_enabled=False,
+        num_shared_experts=ONE if experts else ZERO,
+        block_size=ONE, markov_rank=ZERO, confidence_enabled=False,
         target_shared_embedding=True, target_shared_lm_head=True,
-        base_logits=True, pp_capability=(1, 2, 4, 8, 16),
+        base_logits=True, pp_capability=(ONE, TWO, FOUR, EIGHT, SIXTEEN),
         vocab_size=int(c["vocab_size"]),
         mhc_mult=_int(c, "hc_count"),
+        mhc_lowrank=_int(c, "hc_lowrank"),
         source=merge_source({"kind": "qwen_mtp"}),
         notes=("Qwen body excludes the optional MTP layer",),
     )

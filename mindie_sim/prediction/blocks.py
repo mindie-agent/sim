@@ -15,6 +15,29 @@ from mindie_sim.catalog.types import norm_role
 from mindie_sim.schema.common import dtype_bytes
 from .structure_groups import declare_group, source_reference
 
+ZERO = 0
+ONE = 1
+TWO = 2
+FOUR = 4
+FIVE = 5
+SIXTEEN = 16
+FINAL_LAYER = -1
+
+# Qwen4Exp's Ascend HC kernels are not yet in structure_groups' source
+# registry; this release consumes the local worktree source directly.
+_QWEN4_HC_SOURCE = {
+    "repository": "vllm-ascend",
+    "base_revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
+    "source_state": "local_worktree",
+    "sha256": "28c6c8c6f26ff6c92023334eaed86d3c8606200dd27a67446cef1d624a0c1f91",
+    "path": "vllm_ascend/ops/triton/qwen4_exp/hc.py",
+    "scope": "independent_source_semantics; not_capture_binary_identity",
+}
+
+
+def _qwen4_hc_source(symbol):
+    return {**_QWEN4_HC_SOURCE, "symbol": symbol}
+
 
 def norm(*, name, deps, stage, layer, requests, tokens, width, model, mode):
     semantics = dict(model.catalog_facts).get("normalization", {})
@@ -151,6 +174,135 @@ class HyperConnection:
         return ops, op.op_id
 
 
+class LowRankHyperConnection:
+    """Qwen4Exp GatedResidual: grouped Gemma norm, low-rank injections."""
+
+    def before(self, context, ready):
+        c = context
+        plan, model = c["plan"], c["model"]
+        h = model.hidden_size
+        hc = max(ONE, int(plan.hc_mult or ONE))
+        lr = int(getattr(plan, "hc_lowrank", ZERO) or ZERO)
+        tokens = c["tokens"]
+        hc_dim = hc * h
+        act_bytes = dtype_bytes(model.activation_dtype)
+        down_out = ((lr + hc + SIXTEEN - ONE) // SIXTEEN) * SIXTEEN
+        common = dict(stage=c["stage"], layer=plan.index,
+                      requests=c["requests"], phase=c["mode"])
+        hc_norm = vector_op(
+            op_id=c["prefix"] + ".hc_norm", deps=(ready,),
+            elements=tokens * hc_dim, ops_per_element=FIVE,
+            dtype=model.activation_dtype, family="rmsnorm",
+            recipe="grouped_gemma_rmsnorm", shape=(tokens, hc_dim),
+            read_bytes_override=(tokens * hc_dim + hc_dim) * act_bytes,
+            write_bytes_override=tokens * hc_dim * act_bytes, **common)
+        hc_down_inject = gemm_op(
+            op_id=c["prefix"] + ".hc_down_inject", deps=(hc_norm.op_id,),
+            m=tokens, n=down_out, k=hc_dim, quant=model.quant, category="linear_param_bf16",
+            recipe="hc_lowrank_down_inject", family="gemm", **common)
+        hc_silu = vector_op(
+            op_id=c["prefix"] + ".hc_silu", deps=(hc_down_inject.op_id,),
+            elements=tokens * lr, ops_per_element=FOUR,
+            dtype=model.activation_dtype, family="activation",
+            recipe="hc_silu", shape=(tokens, lr),
+            read_bytes_override=tokens * lr * act_bytes,
+            write_bytes_override=tokens * lr * act_bytes, **common)
+        hc_up = gemm_op(
+            op_id=c["prefix"] + ".hc_up", deps=(hc_silu.op_id,),
+            m=tokens, n=hc_dim, k=lr, quant=model.quant, category="linear_param_bf16",
+            recipe="hc_lowrank_up", family="gemm", **common)
+        hc_gate_mix = vector_op(
+            op_id=c["prefix"] + ".hc_gate_mix", deps=(hc_norm.op_id, hc_up.op_id),
+            elements=tokens * h, ops_per_element=FOUR * hc,
+            dtype=model.activation_dtype, family="mhc",
+            recipe="hc_gate_mix", shape=(tokens, h),
+            read_bytes_override=TWO * tokens * hc_dim * act_bytes,
+            write_bytes_override=tokens * h * act_bytes, **common)
+        ops = [hc_norm, hc_down_inject, hc_silu, hc_up, hc_gate_mix]
+        declare_group(
+            ops, key=c["prefix"] + ".hc_pre", role="hc_pre", family="mhc",
+            members=tuple(op.op_id for op in ops), entries=(hc_norm.op_id,),
+            anchor=hc_gate_mix.op_id, block=c.get("structure_block"),
+            scope_role="residual",
+            view={"tokens": tokens, "hidden": h, "hc": hc,
+                  "hc_lowrank": lr, "dtype": model.activation_dtype},
+            implementation={"native_kind": "Qwen4ExpGatedResidualMix"},
+            source=_qwen4_hc_source("hc_gate_mix"),
+            coverage={"kind": "complete_subgraph", "limitations": []},
+        )
+        return ops, hc_gate_mix.op_id, (ready, hc_down_inject.op_id)
+
+    def after(self, context, output, saved):
+        c = context
+        h = c["model"].hidden_size
+        hc = max(ONE, int(c["plan"].hc_mult or ONE))
+        tokens = c["tokens"]
+        hc_dim = hc * h
+        act_bytes = dtype_bytes(c["model"].activation_dtype)
+        op = vector_op(
+            op_id=c["prefix"] + ".hc_post", deps=(output, *saved),
+            stage=c["stage"], layer=c["plan"].index, requests=c["requests"],
+            elements=tokens * hc_dim, ops_per_element=FOUR,
+            dtype=c["model"].activation_dtype, family="mhc", phase=c["mode"],
+            recipe="hc_combine", shape=(tokens, hc_dim),
+            read_bytes_override=tokens * (hc_dim + h + hc) * act_bytes,
+            write_bytes_override=tokens * hc_dim * act_bytes)
+        ops = [op]
+        declare_group(
+            ops, key=c["prefix"] + ".hc_post_group", role="hc_post",
+            family="mhc", members=(op.op_id,), entries=(op.op_id,),
+            anchor=op.op_id, block=c.get("structure_block"),
+            scope_role="residual",
+            view={"tokens": tokens, "hidden": h, "hc": hc,
+                  "dtype": c["model"].activation_dtype},
+            implementation={"native_kind": "Qwen4ExpHcCombine"},
+            source=_qwen4_hc_source("hc_combine"),
+            coverage={"kind": "complete_subgraph", "limitations": []},
+        )
+        return ops, op.op_id
+
+
+def lowrank_hyper_final_mixer(*, prefix, deps, stage, requests, tokens, model, mode):
+    """Collapse the multi-stream residual to hidden before ``lm_head``."""
+    hc = max((p.hc_mult for p in model.layer_plans), default=ONE)
+    lr = max((getattr(p, "hc_lowrank", ZERO) for p in model.layer_plans),
+             default=ONE)
+    h = model.hidden_size
+    hc_dim = hc * h
+    act_bytes = dtype_bytes(model.activation_dtype)
+    ready = deps if isinstance(deps, tuple) else (deps,)
+    common = dict(stage=stage, layer=FINAL_LAYER, requests=requests, phase=mode)
+    hc_head_norm = vector_op(
+        op_id=prefix + ".hc_head_norm", deps=ready,
+        elements=tokens * hc_dim, ops_per_element=FIVE,
+        dtype=model.activation_dtype, family="rmsnorm",
+        recipe="grouped_gemma_rmsnorm", shape=(tokens, hc_dim),
+        read_bytes_override=(tokens * hc_dim + hc_dim) * act_bytes,
+        write_bytes_override=tokens * hc_dim * act_bytes, **common)
+    hc_head_down = gemm_op(
+        op_id=prefix + ".hc_head_down", deps=(hc_head_norm.op_id,),
+        m=tokens, n=lr, k=hc_dim, quant=model.quant, category="linear_param_bf16",
+        recipe="hc_lowrank_head_down", family="gemm", **common)
+    hc_head_silu = vector_op(
+        op_id=prefix + ".hc_head_silu", deps=(hc_head_down.op_id,),
+        elements=tokens * lr, ops_per_element=FOUR,
+        dtype=model.activation_dtype, family="activation", recipe="hc_silu",
+        shape=(tokens, lr), read_bytes_override=tokens * lr * act_bytes,
+        write_bytes_override=tokens * lr * act_bytes, **common)
+    hc_head_up = gemm_op(
+        op_id=prefix + ".hc_head_up", deps=(hc_head_silu.op_id,),
+        m=tokens, n=hc_dim, k=lr, quant=model.quant, category="linear_param_bf16",
+        recipe="hc_lowrank_head_up", family="gemm", **common)
+    hc_head_gate_mix = vector_op(
+        op_id=prefix + ".hc_head_gate_mix", deps=(hc_head_norm.op_id, hc_head_up.op_id),
+        elements=tokens * h, ops_per_element=FOUR * hc,
+        dtype=model.activation_dtype, family="mhc", recipe="hc_gate_mix",
+        shape=(tokens, h), read_bytes_override=TWO * tokens * hc_dim * act_bytes,
+        write_bytes_override=tokens * h * act_bytes, **common)
+    ops = [hc_head_norm, hc_head_down, hc_head_silu, hc_head_up, hc_head_gate_mix]
+    return ops, hc_head_gate_mix.op_id
+
+
 class AttentionResidual(Residual):
     def before(self, context, ready):
         c = context
@@ -211,4 +363,6 @@ class AttentionResidual(Residual):
         return ops, cast.op_id, ready
 
 
-RESIDUAL_BUILDERS = {"plain": Residual(), "hyper": HyperConnection(), "attention": AttentionResidual()}
+RESIDUAL_BUILDERS = {"plain": Residual(), "hyper": HyperConnection(),
+                     "lowrank_hyper": LowRankHyperConnection(),
+                     "attention": AttentionResidual()}

@@ -84,6 +84,7 @@ class TargetGraphSet(dict):
     """A graph mapping plus one shared effective software declaration."""
 
     def __init__(self, values, *, kernels, selection):
+        self.scope = "body"
         self.effective_kernels = deepcopy(kernels)
         self.default_selection = deepcopy(selection)
         super().__init__((rank, TargetOperators._with_declaration(
@@ -101,6 +102,7 @@ class TargetOperators(tuple):
     def _with_declaration(cls, values, kernels, selection):
         """Rank extraction shares the parent declaration without per-rank copies."""
         result = super().__new__(cls, values)
+        result.scope = "body"
         result.effective_kernels = kernels
         result.default_selection = selection
         return result
@@ -486,7 +488,7 @@ def attention_defaults(case, phase, *, tokens=ONE):
             elif (case.model.quant.kv_dtype not in floating
                   and case.model.quant.kv_dtype not in quantized_kv):
                 reason = "gqa_kv_storage_outside_fattention_domain"
-            elif any(p.window or p.noncausal_attention for p in layers):
+            elif any(p.window or p.index_topk or p.noncausal_attention for p in layers):
                 reason = "windowed_noncausal_gqa_domain"
             else:
                 tiles = _gqa_tiles(case, layers, tokens)

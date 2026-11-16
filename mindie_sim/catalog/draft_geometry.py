@@ -104,6 +104,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             ref = replace(ref, cache_kind="window_compressed", compress_ratio=explicit_ratio, owns_long_kv=True)
 
     mhc = int(draft.mhc_mult or (ref.hc_mult if ref and ref.hyper_connections else ZERO))
+    mhc_lr = int(draft.mhc_lowrank or (ref.hc_lowrank if ref and ref.hyper_connections else ZERO))
     mhc_iters = int(draft.mhc_sinkhorn_iters or (ref.hc_sinkhorn_iters if ref and ref.hyper_connections else ZERO))
     kv_elems = int(draft.kv_cache_elements or (ref.kv_cache_elements if ref else ZERO))
     qk_norm = bool(draft.qk_norm or (ref.qk_norm if ref else False))
@@ -135,7 +136,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             compress_ratio=ZERO, compressor_kind="none", compressor_width=ONE, compressor_state_rows=ZERO,
             indexer=False, indexer_type="none", owns_index_k=False, index_k_owner_layer_id=LAST,
             owns_topk=False, topk_owner_layer_id=LAST, index_query_per_layer=False,
-            hyper_connections=bool(mhc), hc_mult=mhc, hc_sinkhorn_iters=mhc_iters,
+            hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
             **plan_fields,
         )
 
@@ -159,7 +160,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
             cache_kind=standalone_ck, window=standalone_win,
             compress_ratio=standalone_comp,
             kv_owner_layer_id=index, owns_long_kv=True,
-            hyper_connections=bool(mhc), hc_mult=mhc, hc_sinkhorn_iters=mhc_iters,
+            hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
             **plan_fields,
         )
 
@@ -200,7 +201,7 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
         candidate_block_size=ref.candidate_block_size if has_indexer else ZERO,
         candidate_topk_blocks=ref.candidate_topk_blocks if has_indexer else ZERO,
         candidate_source_layer_id=LAST,
-        hyper_connections=bool(mhc), hc_mult=mhc, hc_sinkhorn_iters=mhc_iters,
+        hyper_connections=bool(mhc), hc_mult=mhc, hc_lowrank=mhc_lr, hc_sinkhorn_iters=mhc_iters,
         **plan_fields,
     )
 

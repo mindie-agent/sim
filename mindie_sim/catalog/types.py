@@ -35,6 +35,9 @@ from typing import Any, Mapping, Sequence
 
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
+ZERO = 0
+ZERO_MHC_LOWRANK = ZERO
+
 _FP32_CATEGORIES = {
     "param_fp32", "mhc", "ape", "conv_weight_f32", "a_log", "dt_bias",
     "compressor_fp32_runtime",
@@ -525,17 +528,10 @@ class VisionSpec:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "kind": self.kind, "layers": self.layers, "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size, "num_heads": self.num_heads, "head_dim": self.head_dim,
-            "query_width": self.query_width, "qkv_width": self.qkv_width, "qkv_packed_rows": self.qkv_width,
-            "patch_size": self.patch_size, "in_channels": self.in_channels, "temporal_patch": self.temporal_patch,
-            "merge_area": self.merge_area, "downsample_ratio": self.downsample_ratio,
-            "out_hidden_size": self.out_hidden_size, "aligner_hidden_size": self.aligner_hidden_size,
-            "aligner_input_width": self.aligner_input_width, "patch_input_width": self.patch_input_width,
-            "pos_embed_tokens": self.pos_embed_tokens, "deepstack": self.deepstack, "gated_mlp": self.gated_mlp,
-            "activation": self.activation, "norm_type": self.norm_type, "norm_eps": self.norm_eps,
-            "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id,
-            "source": dict(self.source),
+            "kind": self.kind, "layers": self.layers, "hidden_size": self.hidden_size, "intermediate_size": self.intermediate_size, "num_heads": self.num_heads, "head_dim": self.head_dim,
+            "query_width": self.query_width, "qkv_width": self.qkv_width, "qkv_packed_rows": self.qkv_width, "patch_size": self.patch_size, "in_channels": self.in_channels, "temporal_patch": self.temporal_patch,
+            "merge_area": self.merge_area, "downsample_ratio": self.downsample_ratio, "out_hidden_size": self.out_hidden_size, "aligner_hidden_size": self.aligner_hidden_size, "aligner_input_width": self.aligner_input_width, "patch_input_width": self.patch_input_width,
+            "pos_embed_tokens": self.pos_embed_tokens, "deepstack": self.deepstack, "gated_mlp": self.gated_mlp, "activation": self.activation, "norm_type": self.norm_type, "norm_eps": self.norm_eps, "bias": self.bias, "image_token_id": self.image_token_id, "video_token_id": self.video_token_id, "source": dict(self.source),
         }
 
 
@@ -604,6 +600,7 @@ class DraftSpec:
     vocab_size: int = 0
     mhc_mult: int = 0
     mhc_sinkhorn_iters: int = 0
+    mhc_lowrank: int = ZERO_MHC_LOWRANK
     activation_dtype: str = "bf16"
     input_projection_category: str = "dspark_input"
     source: tuple[tuple[str, str], ...] = ()
@@ -676,6 +673,8 @@ class DraftSpec:
             "markov_replicated": self.markov_replicated, "noncausal_query_block": self.noncausal_query_block,
             "pp_capability": list(self.pp_capability), "input_width": self.input_width,
             "proposal_tokens": self.proposal_tokens, "vocab_size": self.vocab_size,
+            "mhc_mult": self.mhc_mult, "mhc_sinkhorn_iters": self.mhc_sinkhorn_iters,
+            "mhc_lowrank": self.mhc_lowrank,
             "activation_dtype": self.activation_dtype, "source": dict(self.source), "notes": list(self.notes),
         }
 

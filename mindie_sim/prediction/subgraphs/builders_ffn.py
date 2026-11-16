@@ -23,6 +23,14 @@ from mindie_sim.prediction.subgraphs.registry import kind_spec as _kind_spec
 from mindie_sim.prediction.moe_comm_selection import (
     ALWAYS_MC2, MoeCommConfig,
 )
+ZERO = 0
+ONE = 1
+TWO = 2
+FOUR = 4
+FIVE = 5
+SIXTEEN = 16
+
+
 def _k3_sequence_parallel(ctx: _Ctx) -> bool:
     return kimi_sequence_parallel(ctx.features.metadata, ctx.tp)
 
@@ -855,7 +863,34 @@ def _build_r0(ctx: _Ctx) -> _Built:
     project_n = 2 * mult + mult * mult
     b_x = dtype_bytes(ctx.features.activation_dtype or "bf16")
     coeff = (mult + mult * mult) * 4
-    if variant in {"pre", "attn_pre", "ffn_pre", "hc", "hc_arch35"}:
+    lowrank = int(getattr(ctx.layer, "hc_lowrank", ZERO) or ZERO)
+    if lowrank > ZERO and variant in {"pre", "attn_pre", "ffn_pre", "hc", "hc_arch35"}:
+        specs = [("hc_norm", "elementwise", "norm"),
+                 ("hc_down_inject", "gemm", "projection"),
+                 ("hc_silu", "elementwise", "activation"),
+                 ("hc_up", "gemm", "projection"),
+                 ("hc_gate_mix", "elementwise", "hc_pre")]
+        signatures = {
+            "hc_norm": _elementwise(
+                "norm", ctx, elements=streams, ops=FIVE,
+                read_bytes=streams * b_x + hidden * b_x, write_bytes=streams * b_x,
+                extra=(("mult", mult), ("native_recipe", "grouped_gemma_rmsnorm"))),
+            "hc_down_inject": _matrix(
+                "hc_down_inject", streams, lowrank + mult, ctx, "mhc",
+                extra=(("mult", mult), ("lowrank", lowrank))),
+            "hc_silu": _elementwise(
+                "activation", ctx, elements=lowrank, ops=FOUR,
+                read_bytes=lowrank * b_x, write_bytes=lowrank * b_x,
+                extra=(("mult", mult), ("lowrank", lowrank))),
+            "hc_up": _matrix(
+                "hc_up", lowrank, streams, ctx, "mhc",
+                extra=(("mult", mult), ("lowrank", lowrank))),
+            "hc_gate_mix": _elementwise(
+                "hc_pre", ctx, elements=hidden, ops=FOUR * mult,
+                read_bytes=TWO * streams * b_x, write_bytes=hidden * b_x,
+                extra=(("mult", mult), ("lowrank", lowrank))),
+        }
+    elif variant in {"pre", "attn_pre", "ffn_pre", "hc", "hc_arch35"}:
         # Source HyperConnection.before: FP32 value cast, inverse RMS, the
         # mHC projection, then the scale/bias/gate affine. The inverse RMS
         # stays the existing norm row. The affine is not that norm.

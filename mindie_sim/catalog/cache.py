@@ -94,6 +94,8 @@ INDEX_INTERLEAVE_TOKENS = 128
 
 ZERO = 0
 ONE = 1
+TWO = 2
+FOUR = 4
 FIRST = 0
 
 
@@ -272,7 +274,7 @@ def cache_component_split(
     if component in {"mla_kv", "window", "compressed_kv"}:
         payload, scale = cache_row_split(model, component, plan.cache_row_elements)
     elif component == "gqa_kv":
-        width = 2 * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
+        width = (ONE if plan.k_eq_v else TWO) * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
         payload, scale = cache_row_split(model, "gqa_kv", width)
     elif component == "index_k":
         raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
@@ -486,29 +488,29 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
                 else rows / cp)
     if plan.attention in _LINEAR_ATTENTION_KINDS:
         if runtime is not None or query_tokens is not None:
-            return _active_state_components(
+            result = _active_state_components(
                 model, plan, parallel, runtime=runtime,
                 sequence_tokens=seq, query_tokens=query_tokens, phase=phase,
                 capacity_padded=capacity_padded)
-        result["recurrent_state"] = plan.recurrent_state_elements / tp * dtype_bytes(plan.recurrent_state_dtype)
-        result["conv_state"] = plan.conv_state_elements / tp * dtype_bytes(plan.conv_state_dtype)
+        else:
+            result["recurrent_state"] = plan.recurrent_state_elements / tp * dtype_bytes(plan.recurrent_state_dtype)
+            result["conv_state"] = plan.conv_state_elements / tp * dtype_bytes(plan.conv_state_dtype)
+        if plan.engram and seq > ZERO:
+            from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_conv_state_bytes
+            if is_qwen4_exp_ple(getattr(model, "engram", None)):
+                result["ple_conv_state"] = ple_conv_state_bytes(model, runtime)
         return result
     if plan.attention == "unmodeled" or plan.cache_kind == "none":
         return result
     if plan.attention in {"gqa", "projection_only"}:
-        if 0 <= plan.kv_owner_layer_id < plan.index:
-            return result
-        rows = min(seq, plan.window) if plan.window else seq
-        width = 2 * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
-        # One row representation owns both the total and its decomposition.
-        # An explicit ``cache_representations['gqa_kv']`` is a storage format,
-        # not a post-hoc ratio applied to a default KV element width.
-        result["gqa_kv"] = local_rows(rows) * cache_format(
-            model, "gqa_kv").row_bytes(width)
-        return result
-    if plan.attention != "mla":
+        if not ZERO <= plan.kv_owner_layer_id < plan.index:
+            rows = min(seq, plan.window) if plan.window else seq
+            width = (ONE if plan.k_eq_v else TWO) * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
+            result["gqa_kv"] = local_rows(rows) * cache_format(
+                model, "gqa_kv").row_bytes(width)
+    elif plan.attention != "mla":
         raise ModelingError(f"cache_attention_unknown:{plan.attention}")
-    if plan.cache_kind == "dense":
+    elif plan.cache_kind == "dense":
         rows = min(seq, plan.window) if plan.window else seq
         result["mla_kv"] = local_rows(rows) * cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
     else:
@@ -517,13 +519,17 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
                 model, "window").row_bytes(plan.cache_row_elements)
         if plan.owns_long_kv:
             result["compressed_kv"] = local_rows(
-                completed_rows(seq, plan.compress_ratio), max(1, interleave // max(1, plan.compress_ratio))) \
+                completed_rows(seq, plan.compress_ratio), max(ONE, interleave // max(ONE, plan.compress_ratio))) \
                 * cache_format(model, "compressed_kv").row_bytes(plan.cache_row_elements)
             if plan.compressor_state_rows and seq:
                 rows = plan.compressor_state_rows if capacity_padded else min(seq, plan.compressor_state_rows)
-                result["compressor_state"] = rows * 2 * plan.compressor_width * plan.head_dim * 4
+                result["compressor_state"] = rows * TWO * plan.compressor_width * plan.head_dim * FOUR
+    if plan.engram and seq > ZERO:
+        from mindie_sim.catalog.qwen4_exp import is_qwen4_exp_ple, ple_conv_state_bytes
+        if is_qwen4_exp_ple(getattr(model, "engram", None)):
+            result["ple_conv_state"] = ple_conv_state_bytes(model, runtime)
     if plan.owns_index_k:
-        index_ratio = max(1, plan.compress_ratio, plan.index_kpool)
+        index_ratio = max(ONE, plan.compress_ratio, plan.index_kpool)
         rows = completed_rows(seq, index_ratio)
         from .paired_sfa import execution
         if execution(model).get("dcp_indexer_sharded") and cp > ONE:
@@ -538,13 +544,15 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
             else:
                 rows = index_k_capacity_rows(rows, cp, index_ratio) if capacity_padded else rows / cp
         result["index_k"] = rows * index_row_bytes(model, plan.index_dim)
-        if plan.index_kpool > 1 and seq:
-            # Raw normalized keys and gates remain FP32 in a bounded ring;
-            # the pooled BF16 plane is independent of uncompressed token KV.
-            capacity = dict(model.metadata).get("native_keypool_caller", {}).get(
-                "tail_capacity", plan.index_kpool)
-            rows = capacity if capacity_padded else min(seq, capacity)
-            result["index_pool_tail"] = rows * 2 * plan.index_dim * 4
+        if plan.index_kpool > ONE and seq:
+            if plan.attention == "gqa":
+                ring_rows = TWO * plan.index_kpool if capacity_padded else min(seq, TWO * plan.index_kpool)
+                result["index_pool_tail"] = ring_rows * plan.index_dim * TWO
+            else:
+                capacity = dict(model.metadata).get("native_keypool_caller", {}).get(
+                    "tail_capacity", plan.index_kpool)
+                rows = capacity if capacity_padded else min(seq, capacity)
+                result["index_pool_tail"] = rows * TWO * plan.index_dim * FOUR
         if plan.index_input == "hidden" and plan.compress_ratio and seq:
             result["index_compressor_state"] = min(seq, plan.compressor_state_rows) * 2 * plan.compressor_width * plan.index_dim * 4
     return result
@@ -593,14 +601,19 @@ def request_cache_breakdown(
         for key, value in stage.items():
             totals[key] = totals.get(key, 0.0) + value
     stage_bytes = [float(sum(stage.values())) for stage in stages]
-    return {
+    from mindie_sim.catalog.qwen4_exp import qwen4_exp_pool_breakdown
+    qwen4_pool = qwen4_exp_pool_breakdown(model, parallel, sequence_tokens, runtime=runtime)
+    out = {
         "sequence_tokens": int(sequence_tokens),
         "by_component": totals,
         "stage_bytes": stage_bytes,
         "total_bytes": float(sum(stage_bytes)),
-        "max_stage_bytes": float(max(stage_bytes) if stage_bytes else 0.0),
-        "largest_stage": int(max(range(len(stage_bytes)), key=lambda i: stage_bytes[i])) if stage_bytes else 0,
+        "max_stage_bytes": float(max(stage_bytes) if stage_bytes else ZERO),
+        "largest_stage": int(max(range(len(stage_bytes)), key=lambda i: stage_bytes[i])) if stage_bytes else ZERO,
     }
+    if qwen4_pool is not None:
+        out["qwen4_exp_pool"] = qwen4_pool
+    return out
 
 
 def state_bytes_per_request_per_rank(model: Any, parallel: ParallelSpec) -> float:
