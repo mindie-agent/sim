@@ -27,7 +27,9 @@ jobs:
           - os: macos-latest
             python: '3.13'
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The Windows leg runs the full maintained suite slower than Linux/macOS;
+    # a 15-minute cap canceled a green 6063-test run before its last tests.
+    timeout-minutes: 25
     env:
       PYTHONDONTWRITEBYTECODE: '1'
     steps:
