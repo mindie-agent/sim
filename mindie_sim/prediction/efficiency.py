@@ -53,6 +53,9 @@ from mindie_sim.schema.model import RequestSpec
 from mindie_sim.schema.speculative import SpeculativeSpec
 from .body_defaults import TargetGraphSet, TargetOperators, consume_target_declaration
 from .capacity import Memory
+from .evaluation_memo import (
+    StructuralMemo, declaration_digest, geometry_key, project,
+)
 from .graph_analysis import graph_costs
 from .operator_analysis import operator_costs, target_graphs
 from .roofline_graph import (PhysicalWorkGraph, PhysicalWorkNode,
@@ -379,12 +382,46 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
     return graphs, eff_case, report
 
 
+#: Immutable structural projections of one already-composed declaration.  The
+#: frontend lowering, the Engine execution projection and the isolated operator
+#: rows are pure functions of the declaration and the probe geometry; only those
+#: immutable projections are retained, never an Event or a mutable ledger.
+_STRUCTURAL_MEMO = StructuralMemo()
+
+#: Immutable projected efficiency rows/attribution for the same declaration.
+_EFFICIENCY_MEMO = StructuralMemo()
+#: Memoized projection slots: the analysed rows and the attribution.
+PROJECTION_ROWS = 0
+PROJECTION_ATTRIBUTION = 1
+
+
+def _structural_selector(case: CaseSpec, ctx: Any, *, phase: str, tokens: int,
+                         context: int, sequences: int, scope: str,
+                         run_graph: bool) -> tuple | None:
+    """Memo selector for a case-declared evaluation, or ``None`` when ineligible."""
+    if getattr(ctx, "recipe_origin", "caller") != "case":
+        return None
+    geometry = geometry_key({
+        "phase": phase, "tokens": tokens, "context": context,
+        "sequences": sequences, "scope": scope, "run_graph": run_graph,
+        "include_submission": False, "replay_scope": None})
+    return (declaration_digest(case), geometry, ctx.bindings.resource_signature)
+
+
 def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None, evaluation_context: Any | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
     """Lower target graphs once and price both reports from one evaluation."""
     from .evaluation import EvaluationContext
     from .local_tp_groups import local_tp_spans_dp, rank_zero_graph_reuse
+    selector = None
     if precomputed_graph is None:
         ctx = evaluation_context or EvaluationContext.create(case)
+        selector = _structural_selector(
+            case, ctx, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=run_graph)
+        if selector is not None:
+            cached = _STRUCTURAL_MEMO.get(selector)
+            if cached is not None:
+                return project(cached)
         graphs, eff_case, graph_rep = _lower_and_run_graph(
             case, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
@@ -409,7 +446,11 @@ def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int,
                   "operators": r0_rows}
     else:
         op_rep = operator_costs(eff_case, r0_ops, replica=ZERO, evaluation=ctx)
-    return op_rep, graph_rep
+    payload = (op_rep, graph_rep)
+    if selector is not None:
+        _STRUCTURAL_MEMO.put(selector, payload)
+        return project(payload)
+    return payload
 
 
 
@@ -454,7 +495,7 @@ def _interval_union_ms(intervals: Sequence[tuple[float, float]]) -> tuple[float,
 
 def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any] | None:
     """Longest dependency path over per-operator service work, never over total duration shares."""
-    timeline = [dict(row) for row in graph_report.get("timeline", ()) or ()]
+    timeline = graph_report.get("timeline", ()) or ()
     if not timeline:
         return None
     service = {}
@@ -467,13 +508,17 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
         if op_id:
             service[op_id] = duration
     nodes = {str(row["id"]): row for row in timeline}
+    # Resolve the declared dependency edges once: every later stage consumes the
+    # same reduced predecessor tuple instead of re-deriving it per node.
+    predecessors: dict[str, tuple] = {}
     successors: dict[str, list[str]] = defaultdict(list)
-    waiting = {key: 0 for key in nodes}
     for key, row in nodes.items():
-        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
-        waiting[key] = len(preds)
+        preds = tuple(dict.fromkeys(
+            str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
+        predecessors[key] = preds
         for dep in preds:
             successors[dep].append(key)
+    waiting = {key: len(preds) for key, preds in predecessors.items()}
     ready = [key for key, count in waiting.items() if count == 0]
     ends: dict[str, float] = {}
     parent: dict[str, str | None] = {}
@@ -481,8 +526,8 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
     while ready:
         key = ready.pop()
         row = nodes[key]
-        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
-        best = max(preds, key=lambda dep: ends[dep], default=None)
+        preds = predecessors[key]
+        best = (max(preds, key=ends.__getitem__) if preds else None)
         parent[key] = best
         raw_isolated = row.get("isolated_ms")
         op_id = str(row.get("op_id", ""))
@@ -863,6 +908,7 @@ def analyze_network_efficiency(
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
+    evaluation = None
     if operator_report is None:
         from .evaluation import EvaluationContext
         evaluation = EvaluationContext.create(parsed)
@@ -872,9 +918,26 @@ def analyze_network_efficiency(
             precomputed_graph=_precomputed_graph, evaluation_context=evaluation)
         graph_report = auto_graph if graph_report is None else graph_report
 
+    # The analysed operator rows and the attribution are pure functions of the
+    # declaration, the frozen bindings and the probe geometry.  Reuse the
+    # immutable projection instead of re-pricing 157 rows on every probe.
+    projection = None
+    if (operator_report is not None and observed_durations_ms is None
+            and pmu_by_op is None):
+        ctx = evaluation
+        if ctx is not None and getattr(ctx, "recipe_origin", "") == "case":
+            projection = (declaration_digest(parsed), geometry_key({
+                "phase": phase, "tokens": tokens, "context": context,
+                "sequences": sequences, "scope": scope, "run_graph": run_graph,
+                "include_submission": False, "replay_scope": None}),
+                ctx.bindings.resource_signature)
+    cached_projection = (_EFFICIENCY_MEMO.get(projection)
+                         if projection is not None else None)
     raw_rows = [r for r in operator_report["operators"] if r.get("replica", 0) == 0] or list(operator_report["operators"])
     peaks_by_stage, analyzed_ops, obs_map, pmu_map = {}, [], dict(observed_durations_ms or {}), dict(pmu_by_op or {})
-    for row in raw_rows:
+    if cached_projection is not None:
+        analyzed_ops = list(cached_projection[PROJECTION_ROWS])
+    for row in (() if cached_projection is not None else raw_rows):
         op, st = row["operator"], int(row["operator"].get("stage", 0))
         if st not in peaks_by_stage:
             peaks_by_stage[st] = extract_hardware_peaks(parsed, stage=st, replica=0)
@@ -905,7 +968,12 @@ def analyze_network_efficiency(
         bound_g[x["dominant_bound"]].append(x)
         kind_g[x["operator_kind"]].append(x)
 
-    attribution = attribute_program(graph_report, analyzed_ops)
+    if cached_projection is not None:
+        attribution = dict(cached_projection[PROJECTION_ATTRIBUTION])
+    else:
+        attribution = attribute_program(graph_report, analyzed_ops)
+        if projection is not None:
+            _EFFICIENCY_MEMO.put(projection, (tuple(analyzed_ops), attribution))
     nominal = {"cube_mfu": tot_cube_id / safe_graph_ms, "vec_mfu": tot_vec_id / safe_graph_ms,
                "mbu": tot_hbm_id / safe_graph_ms, "link_util": tot_link_id / safe_graph_ms,
                "roofline_efficiency": tot_roof_id / safe_graph_ms,

@@ -69,15 +69,28 @@ VA_RECOMMENDED_PROFILES = {
 }
 
 
+#: Undeclared documented NextN proposal count.
+ZERO_MTP = 0
+
+
 def simulation_config(canonical, sku, arch):
     """Resolve only documented quant alternatives, with explicit coverage limits."""
     profile = VA_RECOMMENDED_PROFILES.get(canonical, {})
     quant = profile.get("quant", {}).get(arch)
+    # A documented profile may declare its execution controls; an undocumented
+    # model gets no fabricated capture/SP policy.  ``compose_case`` resolves the
+    # final value as ``explicit caller > documented profile > structural default``.
+    documented_capture = profile.get("graph_capture_mode")
+    if documented_capture not in {"full", "piecewise", "none"}:
+        documented_capture = None
+    documented_sp = profile.get("sp")
     return {
         "model": canonical, "sku": sku, "hardware_family": arch, "quant": quant,
-        "graph_capture_mode": "full", "sp": True,
-        "mtp_proposal_tokens": int(profile.get("mtp_proposal_tokens", 0)),
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "graph_capture_mode": documented_capture,
+        "sp": documented_sp,
+        "mtp_proposal_tokens": int(profile.get("mtp_proposal_tokens", ZERO_MTP)),
+        **({"compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"}}
+           if documented_capture == "full" else {}),
         "env": dict(profile.get("env", {})),
         "source": deepcopy(profile.get("source")),
         "coverage": "supported_simulation_subset",

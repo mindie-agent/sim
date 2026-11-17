@@ -169,51 +169,62 @@ def test_masked_peer_matrix_transposes_real_rows_and_engine_wires_once(batch):
         else:
             assert 'count_status_exchange' not in group['transport_by_rank'][name]
         work = dict(group['work_by_rank'][name])
+        # Per-pair resources count the directed transfer once, so the link
+        # work equals the TX accounting (and therefore the RX accounting).
         assert sum(value for pipe, value in work.items()
                    if 'link' in pipe) == pytest.approx(
-            group['transport_tx_bytes'] + group['transport_rx_bytes'])
+            group['transport_tx_bytes'])
     serviced = result['execution']['serviced']
-    tx = sum(value for key, value in serviced.items() if ':tx:' in key)
-    rx = sum(value for key, value in serviced.items() if ':rx:' in key)
-    # A directed frame is one coupled transfer: source TX and destination RX
-    # are the same reservation, served exactly once at every real hop.
-    assert tx == pytest.approx(total)
-    assert rx == pytest.approx(total)
-    assert sum(wire(result).values()) == pytest.approx(2 * total)
-    # Two senders into one destination reserve the same real RX port; that
-    # port's busy time is the serialized sum, not the maximum of one transfer.
+    link_work = sum(value for key, value in serviced.items()
+                    if key.startswith('link:'))
+    assert link_work == pytest.approx(total)
+    assert not any(':tx:' in key or ':rx:' in key for key in serviced)
+    assert all(':pair' in key for key in serviced if key.startswith('link:'))
+    assert sum(wire(result).values()) == pytest.approx(total)
+    # Each directed peer pair carries dispatch and combine in the same
+    # direction and is charged once.  There is no shared RX-port alias, so
+    # verify the per-pair decomposition for every source into one destination.
     incoming = [(destination_index, tuple(
         src for src in range(ep)
         if src != destination_index and matrix[src][destination_index] > 0))
         for destination_index in range(ep)]
     destination_index, senders = max(incoming, key=lambda item: len(item[1]))
     if len(senders) >= 2:
-        rx_port = next(
-            name for name in serviced
-            if f':rx:port{destination_index}' in name)
-        column_frames = sum(matrix[src][destination_index] for src in senders)
-        row_frames = sum(matrix[destination_index][src]
-                         for src in range(ep) if src != destination_index)
-        expected_rx = (column_frames * expected['dispatch'][2]
-                       + row_frames * expected['combine'][2]
-                       + (count_bytes // ep))
-        assert serviced[rx_port] == pytest.approx(expected_rx)
-        assert result['execution']['resource_busy_ms'][rx_port] > 0
+        dispatch_group = groups['s0.l1.dispatch']
+        combine_group = groups['s0.l1.unpack']
+        dispatch_work = dict(dispatch_group['work_by_rank'][next(
+            iter(dispatch_group['work_by_rank']))])
+        combine_work = dict(combine_group['work_by_rank'][next(
+            iter(combine_group['work_by_rank']))])
+        destination = destination_index
+        dispatch_packets = expected['dispatch'][2]
+        combine_packets = expected['combine'][2]
+        count_per_pair = count_bytes // (ep * (ep - 1))
+        pairs = [f"link:d2d_intra_node:0:pair{src}>{destination}"
+                 for src in range(ep) if src != destination]
+        for src, pair in zip((s for s in range(ep) if s != destination), pairs):
+            frames = matrix[src][destination]
+            expected_dispatch = frames * dispatch_packets + count_per_pair
+            # Combine is the reverse transfer on the same directional pair.
+            expected_combine = matrix[destination][src] * combine_packets
+            assert dispatch_work[pair] == pytest.approx(expected_dispatch)
+            assert combine_work.get(pair, 0.0) == pytest.approx(expected_combine)
+            assert serviced[pair] == pytest.approx(
+                expected_dispatch + expected_combine)
+            assert result['execution']['resource_busy_ms'][pair] > 0
         detail = graph_costs(
             raw, {0: protocol(ops)}, isolated=False, input_ready_ms=7,
             trace_limit=4096)
         events = {row['task']: row for row in detail['events']}
-        tx_ports = set()
         for source in senders:
+            pair = f"link:d2d_intra_node:0:pair{source}>{destination}"
             task = (f"r0:i0:s0.l1.dispatch:payload_exchange:"
-                    f"{source}->{destination_index}:hop0:service")
+                    f"{source}->{destination}:hop0:service")
             assert task in events
-            demand = events[task]['demand']
-            assert rx_port in demand
-            tx_ports.update(name for name in demand if ':tx:' in name)
-        # Two independent senders reserve the same destination RX while each
-        # owns a distinct source TX; the coupled demand is one transfer.
-        assert len(tx_ports) == len(senders)
+            assert events[task]['demand'].get(pair) == pytest.approx(
+                matrix[source][destination] * dispatch_packets)
+        # Every directional pair is distinct; no shared RX alias.
+        assert len(set(pairs)) == ep - 1
     assert result['profile']['steps_by_replica'][0]['start_ms'] == 7
     assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
     assert not any(result['execution']['live_allocated'].values())
@@ -246,13 +257,14 @@ def test_ordinary_uniform_expectation_keeps_payload_work_and_labels_expected():
         assert payload['tx_bytes'] == payload['rx_bytes'] == 430080
         assert group['link_by_phase_by_rank'][name][
             'payload_exchange']['link_hccs'] == 53760
-    # TX/RX and timing remain physical even without witnessed integer frames.
+    # Per-pair accounting remains physical even without witnessed integer
+    # frames; every directed pair is charged once.
     serviced = result['execution']['serviced']
-    assert sum(value for key, value in serviced.items()
-               if ':tx:' in key) == pytest.approx(863744)
-    assert sum(value for key, value in serviced.items()
-               if ':rx:' in key) == pytest.approx(863744)
-    assert sum(wire(result).values()) == pytest.approx(2 * 863744)
+    link_work = sum(value for key, value in serviced.items()
+                    if key.startswith('link:'))
+    assert link_work == pytest.approx(863744)
+    assert not any(':tx:' in key or ':rx:' in key for key in serviced)
+    assert sum(wire(result).values()) == pytest.approx(863744)
     assert result['profile']['steps_by_replica'][0]['start_ms'] == 7
     assert result['execution']['live_tasks'] == result['execution']['live_programs'] == 0
 

@@ -115,7 +115,9 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
     expected = float(duration_ms)
     if clocks.all_ms <= ZERO_FLOAT:
         clocks = control_clocks_local(expected)
-    elif abs(clocks.all_ms - expected) > tolerance:
+    else:
+        # The four-clock projection must span the reported device step exactly:
+        # ``join_clocks`` keeps the longest interval, not the ordered span.
         scale = expected / clocks.all_ms
         without = min(expected, clocks.without_communication_ms * scale)
         compute = min(without, clocks.compute_ms * scale)

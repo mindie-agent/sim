@@ -8,8 +8,9 @@ import pytest
 
 from mindie_sim import operator_costs, target_graphs
 from mindie_sim.prediction.mxfp4_geometry import Config, columns, owner_tiles, tile_work
+from mindie_sim.prediction.matrix import TiledMatmul
 from mindie_sim.prediction.mxfp4_grouped import UB_BYTES, recipe
-from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -106,7 +107,7 @@ def test_tail_work_is_conserved_on_real_resources(source_case, gate, rows, n, k)
 
 
 def test_caller_recipe_override_wins_over_source_family(source_case, gate):
-    explicit = ResourceEnvelope()
+    explicit = TiledMatmul()
     book = RecipeBook(families={"grouped_gemm": recipe()},
                       recipes={"balanced_grouped_gate_up": explicit})
     assert book.select(gate) is explicit
@@ -139,7 +140,8 @@ def test_small_cube_issue_does_not_invent_weight_banks(source_case, gate):
     assert b["mmad_parameter_m"] == (16,)
     assert a["l0a_issue_fractal_m"] == b["l0a_issue_fractal_m"] == (16,)
     assert one["serviced"]["mte1@r0:s0"] == sixteen["serviced"]["mte1@r0:s0"]
-    assert one["serviced"]["mte2_aiv@r0:s0"] == sixteen["serviced"]["mte2_aiv@r0:s0"]
+    assert one["serviced"]["mte2_aiv@r0:s0"] == pytest.approx(
+        sixteen["serviced"]["mte2_aiv@r0:s0"])
     # One 64-deep weight panel is 4096B, scale read256B; fixed 128 scale
     # columns publish16384B plus8192B expanded weight, without extra HBM writes.
     assert one["serviced"]["mte3@r0:s0"] == 16384 + 8192

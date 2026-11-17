@@ -1457,6 +1457,11 @@ class TransferRecipe:
         ), minimum_ms=context.minimum_ms)
 
 
+#: The generic matrix program key; a caller override of it never hijacks a
+#: family that has its own dedicated physical binding (for example grouped).
+GENERIC_MATRIX_PROGRAM = "matmul"
+
+
 class RecipeBook:
     """Explicit implementation bindings; adding recipes does not edit the loop."""
 
@@ -1482,6 +1487,7 @@ class RecipeBook:
         # ``_explicit_recipes`` also receives internally registered source
         # recipes.  Only this set is the caller's own override.
         self._caller_recipes = frozenset((recipes or {}).keys())
+        self._caller_programs = frozenset((programs or {}).keys())
         self._explicit_families = frozenset((families or {}).keys())
         self._family_kinds = {}
         self.recipes = {
@@ -1550,6 +1556,12 @@ class RecipeBook:
                            "balanced_grouped_down"}
         if recipe_name in self._caller_recipes:
             recipe = self.recipes[recipe_name]
+        elif (kind in self._caller_programs
+              and (kind == family_name or kind != GENERIC_MATRIX_PROGRAM)):
+            # A caller-declared program is authoritative over an automatic
+            # physical family default of the same name.  Physical bindings are
+            # a fallback, never an override of the caller's own declaration.
+            recipe = self.programs[kind]
         elif (family_name in self._explicit_families
               and family_name != "grouped_gemm"):
             # An explicit caller family is authoritative over any automatic

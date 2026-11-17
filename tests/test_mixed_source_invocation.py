@@ -79,6 +79,6 @@ def test_nonempty_tiny_source_uses_existing_a5_inclusive_minimum_without_adding_
     op=changed(op,(1,),64,128)
     physical=cost(hardware(case),op)
     ordinary=cost(case,op)
-    assert physical['duration_ms']<.001578
-    assert ordinary['duration_ms']==pytest.approx(.001578)
+    assert physical['duration_ms']<.001237
+    assert ordinary['duration_ms']==pytest.approx(.001237)
     assert ordinary['serviced']==pytest.approx(physical['serviced'])

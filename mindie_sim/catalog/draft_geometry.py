@@ -206,14 +206,32 @@ def _draft_layer_plan(model, draft, index: int, plan_fields: dict) -> LayerPlan:
     )
 
 
+#: Draft geometry fields a native auxiliary declaration carries per block.
+_DRAFT_PLAN_FIELDS = (
+    "num_heads", "num_kv_heads", "head_dim", "q_lora_rank", "kv_lora_rank",
+    "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "o_lora_rank",
+    "o_groups", "num_experts", "top_k", "num_shared_experts", "intermediate_size",
+)
+
+
+def native_draft_layer_plans(model, draft) -> tuple:
+    """Native explicit auxiliary plans for one declared draft spec.
+
+    Adapters call this once at model-load time so the declared ``layer_plans``
+    are the single geometry authority; execution and capacity never re-derive a
+    donor at use time.
+    """
+    plan_fields = {key: getattr(draft, key) for key in _DRAFT_PLAN_FIELDS}
+    return tuple(_draft_layer_plan(model, draft, index, plan_fields)
+                 for index in range(int(draft.layers)))
+
+
 def draft_layer_plans(model, kind="mtp"):
+    """Declared native auxiliary plans; no implicit donor synthesis."""
+    from mindie_sim.schema.common import ModelingError
     draft = optional_draft_spec(model, kind)
-    plan_fields = {
-        key: getattr(draft, key) for key in (
-            "num_heads", "num_kv_heads", "head_dim", "q_lora_rank", "kv_lora_rank",
-            "qk_nope_head_dim", "qk_rope_head_dim", "v_head_dim", "o_lora_rank",
-            "o_groups", "num_experts", "top_k", "num_shared_experts", "intermediate_size",
-        )
-    }
-    return tuple(_draft_layer_plan(model, draft, index, plan_fields) for index in range(draft.layers))
+    plans = tuple(draft.layer_plans)
+    if not plans or len(plans) != int(draft.layers):
+        raise ModelingError("draft_explicit_layer_plans_required")
+    return plans
 

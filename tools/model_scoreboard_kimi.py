@@ -173,10 +173,16 @@ def grouped_predictions(case, groups, quant, *, matrix_recipe):
             recipe="matrix_envelope" if count > 1 else "matrix_mapping",
             weight_count=count, activation_dtype="fp8_e4m3", output_dtype="bf16",
         )
+        if count > 1:
+            # Unknown group-list values are priced as one aggregate logical
+            # matrix while every declared weight bank remains charged.
+            op = replace(op, metadata=tuple({
+                **dict(op.metadata), "matrix_groups": 1,
+                "matrix_mapping_domain": "aggregate_unknown_group_list"}.items()))
         ops.append(op)
         contracts.append((count, fmt))
     book = RecipeBook.from_mapping({"recipes": {
-        "matrix_envelope": {"kind": "envelope"},
+        "matrix_envelope": {"kind": "tiled_matmul"},
         "matrix_mapping": {"kind": matrix_recipe},
     }})
     costs = {row["physical_id"]: row
@@ -198,7 +204,7 @@ def grouped_predictions(case, groups, quant, *, matrix_recipe):
             "comparison_level": "descriptor_conditioned_matrix_family_reference",
             "status": "conditional_reference",
             "limitations": ([
-                f"Group list values are absent; the aggregate envelope prices total FLOPs and all {count} weight matrices without inventing equal rows or a native grouped schedule.",
+                f"Group list values are absent; the aggregate recipe prices total FLOPs and all {count} weight matrices without inventing equal rows or a native grouped schedule.",
                 "MXFP4 uses the existing explicit BF16 dequant/accumulate resource path; native FP8xFP4 instruction mapping is not reconstructed.",
             ] if count > 1 else [
                 f"One-group native GroupedMatmul uses the explicit generic {matrix_recipe} mapping.",
@@ -641,7 +647,7 @@ def assemble(observed_path, prediction_paths, *, strict_paths=()):
             "The standalone precision declaration is descriptor-conditioned and is not equivalent to the main catalog case.",
             "Activity totals are not step spans, layer bindings, or additive critical-path contributions.",
             "Native stage and mapping uncertainty remains visible; it never calibrates rates or disables analytic prediction.",
-            "Selected matrix recipes are recorded per mode; the grouped envelope does not infer expert row histograms.",
+            "Selected matrix recipes are recorded per mode; the grouped aggregate recipe does not infer expert row histograms.",
         ],
     }
 

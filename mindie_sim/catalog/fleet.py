@@ -36,6 +36,10 @@ TWO = 2
 NEG_ONE = -1
 KV_CACHE_PLANES = 2
 NORM_WEIGHT_OFFSET = 1.0
+STEP5_NEXTN_BLOCKS = 3
+STEP5_PP_CAPABILITY = (1, 2, 4, 8, 16)
+DEFAULT_NORM_EPS = 1e-06
+_STEP5_NEXTN_BLOCKS = STEP5_NEXTN_BLOCKS
 
 FLEET_CATALOG_ENTRIES: dict[str, str] = {
     key: f"../catalog/configs/{key}.json" for key in (
@@ -210,9 +214,10 @@ def _finish(model: ModelSpec, facts: list[tuple[str, Any]]) -> ModelSpec:
 def _model(key: str, family: str, config: Mapping[str, Any], c: Mapping[str, Any],
            plans: list[LayerPlan], *, attention: str, ffn: str, heads: int,
            kv_heads: int, head_dim: int, hidden: int, intermediate: int,
-           vocab: int, experts: int = 0, top_k: int = 0, moe_i: int = 0,
-           shared: int = 0, facts: list[tuple[str, Any]] | None = None,
-           gaps: tuple[str, ...] = (), vision: Any = None) -> ModelSpec:
+           vocab: int, experts: int = ZERO, top_k: int = ZERO, moe_i: int = ZERO,
+           shared: int = ZERO, facts: list[tuple[str, Any]] | None = None,
+           gaps: tuple[str, ...] = (), vision: Any = None,
+           auxiliary: Any = None) -> ModelSpec:
     quant = _quant_bf16(c, name=f"bf16_{family}")
     metadata = native_coverage(config, list(gaps), plans=plans, quant=quant)
     model_facts = facts if facts is not None else _facts(family, config, c, plans)
@@ -223,11 +228,11 @@ def _model(key: str, family: str, config: Mapping[str, Any], c: Mapping[str, Any
         attention=attention, ffn=ffn, activation_dtype=quant.activation_format,
         weight_dtype=quant.weight_format, kv_dtype=quant.kv_dtype,
         compute_dtype=quant.native_format, quantization=quant.name,
-        norm_eps=float(c.get("rms_norm_eps", 1e-6) or 1e-6),
+        norm_eps=float(c.get("rms_norm_eps", DEFAULT_NORM_EPS) or DEFAULT_NORM_EPS),
         num_experts=experts, top_k=top_k, moe_intermediate_size=moe_i,
         num_shared_experts=shared, quant=quant, vision=vision,
         tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
-        layer_plans=tuple(plans),
+        layer_plans=tuple(plans), auxiliary=auxiliary,
         state_bytes_per_request=float(sum(p.state_bytes_total for p in plans)),
         catalog_facts=tuple(sorted(model_facts)), metadata=metadata,
     )
@@ -469,12 +474,72 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         gaps.append("csa_block_compress_ssmax_approximated_by_pooled_indexer")
     if vision_raw:
         gaps.append("vision_encoder_and_projector:language_backbone_only")
+    auxiliary = _step5_auxiliary(
+        c, plans, hidden=hidden, heads=heads, kv_heads=kv_heads,
+        head_dim=head_dim, intermediate=intermediate, vocab=vocab,
+        window=window, gate=gate)
     return _model(
         key, "step5", config, c, plans, attention="gqa", ffn="moe",
         heads=heads, kv_heads=kv_heads, head_dim=head_dim, hidden=hidden,
         intermediate=intermediate, vocab=vocab, experts=experts,
-        top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=None,
+        top_k=top_k, moe_i=moe_i, shared=ONE, gaps=tuple(gaps), facts=None,
+        auxiliary=auxiliary,
     )
+
+
+def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
+                     head_dim: int, intermediate: int, vocab: int,
+                     window: int, gate: bool):
+    """Declare the native Step-5 NextN blocks from the untruncated schedules.
+
+    Native checkpoint ids ``92..94`` are the three NextN modules.  Each owns a
+    dense FFN, a sliding window of 512, its own ``enorm``/``hnorm``/
+    ``eh_proj[H, 2H]``/``output_norm`` and its own head; one embedding is
+    shared by the three proposals.  ``cyclic_nextn`` executes proposal ``i``
+    with block ``i % 3``.
+    """
+    from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+    nextn = _int(c, "num_nextn_predict_layers")
+    if nextn <= ZERO:
+        return None
+    if nextn != _STEP5_NEXTN_BLOCKS:
+        raise ModelingError(f"model_config_step5_nextn_blocks_invalid:{nextn}")
+    native_base = int(len(plans))
+    targets = tuple(int(v) for v in (c.get("dspark_target_layer_ids") or ()) or ())
+    draft_plans = tuple(
+        LayerPlan(
+            index=index, native_layer_id=native_base + index,
+            attention="gqa", architecture="gqa", ffn="dense",
+            window=window,
+            num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            intermediate_size=intermediate,
+            q_output_gate_kind="headwise" if gate else "none",
+            q_gate_projection="separate" if gate else "packed_q",
+            ffn_activation="silu", scope="draft",
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
+            kv_owner_layer_id=index, owns_long_kv=True,
+        )
+        for index in range(nextn)
+    )
+    spec = DraftSpec(
+        kind="mtp", layers=nextn, hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+        q_width=heads * head_dim, kv_width=kv_heads * head_dim,
+        attention_kind="gqa", q_output_gate=bool(gate),
+        num_experts=ZERO, top_k=ZERO, expert_intermediate_size=ZERO,
+        target_layer_ids=targets or tuple(range(nextn)),
+        sliding_window=window, block_size=ONE,
+        target_shared_embedding=False, target_shared_lm_head=False,
+        input_mode="normalized_concat", execution_mode="cyclic_nextn",
+        embedding_owned=True, embedding_count=ONE,
+        output_head_owned=True, output_head_count=nextn,
+        vocab_size=vocab, pp_capability=STEP5_PP_CAPABILITY,
+        layer_plans=draft_plans,
+        source=(("kind", "native_step5_nextn_92_94"),),
+        notes=("native NextN ids 92..94; cyclic_nextn executes block i%%3",),
+    )
+    return AuxiliarySpec(mtp=spec)
 
 
 def build_fleet_model(key: str, config: Mapping[str, Any], family: str) -> ModelSpec:

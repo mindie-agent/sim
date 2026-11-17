@@ -48,9 +48,14 @@ def test_effective_small_matrix_weight_service_tracks_hbm_without_changing_work(
         case['machine']['device']={'hbm_bw_bytes_per_s':4e12*factor}
         result=graph_costs(case,(op,),input_ready_ms=7)
         spans.append(result['duration_ms'])
-        work.append(result['execution']['serviced'])
+        work.append(dict(result['execution']['work']))
         assert result['complete_ms']==pytest.approx(7+result['duration_ms'])
+    # The current physical model lets the effective weight service track HBM
+    # across this range; each factor's span is the response floor at that rate.
     assert spans[0]>spans[1]>spans[2]
     assert spans[0]==pytest.approx(.054272)
-    assert work[0]==pytest.approx(work[1],rel=1e-12,abs=1e-12)
-    assert work[0]==pytest.approx(work[2],rel=1e-12,abs=1e-12)
+    assert spans[1]==pytest.approx(.027136)
+    assert spans[2]==pytest.approx(.013568)
+    # Semantic issued work (FLOPs, HBM bytes) is invariant across the sweep;
+    # the resource service split may change when the binding supplier changes.
+    assert work[0]==work[1]==work[2]

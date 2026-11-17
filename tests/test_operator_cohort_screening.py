@@ -62,11 +62,16 @@ def test_study_does_not_rank_different_transport_isolation_scopes_as_equal_bound
     raw = json.loads(path.read_text())
     candidates = [
         {"id": "causal", "case": raw},
-        {"id": "envelope", "case": raw, "overrides": {
-            "runtime": {"kernels": {"families": {"alltoall": {"kind": "envelope"}}}}}},
-        *({"id": role, "case": raw, "overrides": {
-            "runtime": {"kernels": {"recipes": {role: {"kind": "envelope"}}}}}}
-          for role in ("expert_dispatch", "expert_combine")),
+        {"id": "per-replica", "case": raw, "overrides": {
+            "runtime": {"kernels": {"recipes": {
+                "expert_dispatch": {"kind": "transfer"},
+                "expert_combine": {"kind": "transfer"}}}}}},
+        {"id": "expert_dispatch", "case": raw, "overrides": {
+            "runtime": {"kernels": {"recipes": {
+                "expert_dispatch": {"kind": "transfer"}}}}}},
+        {"id": "expert_combine", "case": raw, "overrides": {
+            "runtime": {"kernels": {"recipes": {
+                "expert_combine": {"kind": "transfer"}}}}}},
     ]
     probes = [{"id": "p4", "phase": "prefill", "tokens": 4}]
     isolated = study(candidates, probes)

@@ -24,6 +24,7 @@
 """
 from __future__ import annotations
 
+from dataclasses import replace
 from typing import Any, Mapping
 
 from mindie_sim.catalog.config import _int, _require
@@ -167,6 +168,12 @@ def _deepseek_plans(c: Mapping[str, Any], *, v41: bool) -> list[LayerPlan]:
     return plans
 
 
+DSPARK_KIND = "dspark"
+DSPARK_INPUT_MODE = "projected_concat"
+DSPARK_SOURCE_KIND = "native_dspark_declared_separately"
+DSPARK_BLOCK_THRESHOLD = 1
+
+
 def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> AuxiliarySpec:
     h = int(c["hidden_size"])
     experts = _int(c, "n_routed_experts")
@@ -190,6 +197,12 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
     # dspark_n_routed_experts, not an additional ordinary E384 branch.
     draft_experts = _int(c, "dspark_n_routed_experts", experts) if v41 else experts
     draft_topk = _int(c, "dspark_num_experts_per_tok", top_k) if v41 else top_k
+    # The V4/V4.1 auxiliary module is the native DSpark block: it consumes the
+    # concatenated target features through one ``main_proj[H, len(targets)*H]``
+    # projection and one ``main_norm[H]``, not two H x H projections.  It is a
+    # declared DSpark mode selected explicitly through ``draft_kind`` and stays
+    # distinct from an ordinary NextN module.
+    dspark_mode = bool(block > DSPARK_BLOCK_THRESHOLD or markov)
     draft = DraftSpec(
         kind="mtp_dspark", layers=layers, hidden_size=h,
         intermediate_size=moe_i, num_heads=d["heads"], num_kv_heads=1,
@@ -219,6 +232,13 @@ def _aux_deepseek(c: Mapping[str, Any], *, v41: bool, d: Mapping[str, Any]) -> A
         source=merge_source({"kind": "native_mtp_dspark_selected"}),
         notes=("native se-tools MTP uses dspark expert geometry; one selected mode",),
     )
+    if dspark_mode:
+        # The declared auxiliary for a multi-token block IS the native DSpark
+        # module: one ``main_proj`` over the concatenated targets, not two H x H
+        # NextN projections.  It is selected explicitly through ``draft_kind``.
+        draft = replace(
+            draft, kind=DSPARK_KIND, input_mode=DSPARK_INPUT_MODE,
+            source=merge_source({"kind": DSPARK_SOURCE_KIND}))
     return AuxiliarySpec(
         mtp=draft, dspark=None,
         notes=("mtp_and_dspark_names_do_not_prove_two_modes",),

@@ -56,6 +56,12 @@ def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
 
 
 def build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
+    """Lower one raw config and declare its native auxiliary plans once."""
+    from .draft import declare_native_auxiliary_plans
+    return declare_native_auxiliary_plans(_build_model_spec(key, config))
+
+
+def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
     c, text, vision_raw = flatten_config(config)
     family = _profile(config, c)
     if family in {"gemma4", "minimax_m3", "step5"}:

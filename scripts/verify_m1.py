@@ -3,9 +3,11 @@
 
 [Role]
   Execute the three reproducible M1 gates and write machine-readable JSON.  The
-  catalog gate conserves logical parameters, KV payload bytes and KV allocated
-  bytes per catalog model; the spine gate measures the full Kimi-K3.1 body step
-  through the public efficiency entry point.
+  catalog gate rebuilds constructor shapes from the declared reference manifest
+  (meta-device parameters, not simulator helpers) and conserves logical
+  parameters, KV payload bytes and KV allocated bytes per catalog model; the
+  spine gate measures the full Kimi-K3.1 body step through the public efficiency
+  entry point.
 
 [Invariants]
   * No device context, weight load or network access.  Holdout directories are
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import gc
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -154,14 +157,30 @@ def hygiene(args) -> dict:
     return _pass("hygiene", **metrics)
 
 
-def _independent_parameter_total(model) -> int:
+DEFAULT_MANIFEST = SIM_ROOT / "tests" / "fixtures" / "catalog_reference_manifest.json"
+REFERENCE_BLOCK = 128
+REFERENCE_TOKENS = 4096
+REFERENCE_PARALLEL_CASES = ((1, 1, 1), (8, 1, 1), (1, 2, 1), (1, 1, 2))
+CACHE_ABS_TOLERANCE = 1e-6
+REPORT_SHAPES = 5
+
+
+def _oracle_modules():
+    tests_dir = SIM_ROOT / "tests"
+    if str(tests_dir) not in sys.path:
+        sys.path.insert(0, str(tests_dir))
+    from reference import cache_meta_oracle, catalog_meta_oracle
+    return catalog_meta_oracle, cache_meta_oracle
+
+
+def _body_entries(model) -> list[tuple]:
     from mindie_sim.catalog.weights import _body_terms
-    return int(sum(
-        int(term.rows) * int(term.cols) * int(term.count)
-        for term in _body_terms(model) if term.source_owned))
+    return [(term.name, int(term.rows), int(term.cols), int(term.count),
+             "source" if term.source_owned else "runtime")
+            for term in _body_terms(model)]
 
 
-def _independent_cache_totals(model, parallel, tokens: int) -> tuple[float, float]:
+def _cache_actuals(model, parallel, tokens: int) -> tuple[float, float, float]:
     from mindie_sim.catalog.cache import (
         layer_cache_decomposition, request_cache_breakdown,
     )
@@ -175,77 +194,195 @@ def _independent_cache_totals(model, parallel, tokens: int) -> tuple[float, floa
             if padded:
                 allocated += total
             else:
-                # Payload includes quant scales and packed-store bytes; the
-                # per-component total is the conservative payload declaration.
                 payload += total
-    if any(plan.attention in {"gdn", "kda"} for plan in model.layer_plans):
-        breakdown = request_cache_breakdown(model, parallel, tokens)
-        allocated = max(allocated, float(breakdown["total_bytes"]))
-    return payload, allocated
+    breakdown = float(request_cache_breakdown(model, parallel, tokens)["total_bytes"])
+    return payload, allocated, breakdown
 
 
-def _model_parallel(model):
+def _reference_tokens(reference) -> list[int]:
+    window = max([int(layer.window) for layer in reference.layers] + [REFERENCE_BLOCK])
+    return sorted({0, 1, REFERENCE_BLOCK - 1, REFERENCE_BLOCK,
+                   max(0, window - 1), window, REFERENCE_TOKENS})
+
+
+def _cache_matrix(reference, cache, model) -> tuple[int, float, list[dict]]:
     from mindie_sim.schema.parallel import ParallelSpec
-    return ParallelSpec(tp=1, dp=1, pp=1, ep=1)
+    tokens = _reference_tokens(reference)
+    cases = 0
+    largest = 0.0
+    failures: list[dict] = []
+    for tp, pp, cp in REFERENCE_PARALLEL_CASES:
+        parallel = ParallelSpec(tp=tp, dp=1, pp=pp, cp=cp)
+        selected = tokens if (tp, pp, cp) == (1, 1, 1) else (REFERENCE_TOKENS,)
+        for seq in selected:
+            payload, allocated, breakdown = _cache_actuals(model, parallel, seq)
+            reference_payload = float(cache.cache_totals(
+                reference.geometry, seq, padded=False, tp=tp, cp=cp))
+            reference_allocated = float(cache.cache_totals(
+                reference.geometry, seq, padded=True, tp=tp, cp=cp))
+            deltas = (payload - reference_payload,
+                      allocated - reference_allocated,
+                      allocated - breakdown)
+            cases += 1
+            largest = max(largest, *(abs(value) for value in deltas))
+            if any(abs(value) > CACHE_ABS_TOLERANCE for value in deltas):
+                failures.append({
+                    "tp": tp, "pp": pp, "cp": cp, "tokens": seq,
+                    "payload_delta": deltas[0],
+                    "allocated_delta": deltas[1],
+                    "layer_sum_vs_breakdown_delta": deltas[2],
+                })
+    return cases, largest, failures
+
+
+def _auxiliary_summary(model) -> dict:
+    aux = getattr(model, "auxiliary", None)
+    if aux is None:
+        return {}
+    for kind in ("mtp", "dspark"):
+        spec = getattr(aux, kind, None)
+        if spec is not None:
+            return {"kind": str(spec.kind), "layers": int(spec.layers),
+                    "standalone": bool(aux.standalone_draft)}
+    return {}
 
 
 def catalog_meta(args) -> dict:
     from mindie_sim.model_catalog import load_model
-    from mindie_sim.catalog.ownership import body_parameter_count
-    from mindie_sim.catalog.cache import request_cache_breakdown
+    from mindie_sim.schema.parallel import ParallelSpec
+    catalog, cache = _oracle_modules()
     required = int(args.require_models or len(CATALOG_MODELS))
     if len(CATALOG_MODELS) != required:
         return _fail("catalog-meta",
                      f"catalog_model_set_size:{len(CATALOG_MODELS)}!={required}")
+    manifest_path = Path(args.references or DEFAULT_MANIFEST).resolve()
+    if not manifest_path.is_file():
+        return _fail("catalog-meta", f"reference_manifest_missing:{manifest_path}")
+    try:
+        manifest = catalog.load_manifest(manifest_path)
+        models = catalog.manifest_models(manifest)
+    except (OSError, ValueError) as error:
+        return _fail("catalog-meta", f"reference_manifest_invalid:{error}")
+    manifest_digest = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+    missing = sorted(set(CATALOG_MODELS) - set(models))
+    extra = sorted(set(models) - set(CATALOG_MODELS))
+    if missing or extra or len(models) != required:
+        return _fail(
+            "catalog-meta", "reference_model_set_mismatch",
+            required_models=required, manifest_models=len(models),
+            missing_references=missing[:REPORT_SHAPES],
+            extra_references=extra[:REPORT_SHAPES],
+            references=str(manifest_path), references_sha256=manifest_digest)
     rows = []
     failures = []
     parameter_total = 0
+    reference_parameter_total = 0
     payload_total = 0.0
     allocated_total = 0.0
     for key in CATALOG_MODELS:
         try:
+            reference = catalog.build_reference(key, SIM_ROOT, models[key])
+        except (OSError, ValueError, KeyError) as error:
+            failures.append({"model": key, "reason": f"reference_invalid:{error}"})
+            continue
+        try:
             model = load_model(key)
-        except Exception as error:
+        except Exception as error:  # pragma: no cover - model load detail
             failures.append({"model": key, "reason": f"load_failed:{error}"})
             continue
-        parallel = _model_parallel(model)
-        parameters = int(body_parameter_count(model))
-        reference_parameters = _independent_parameter_total(model)
-        breakdown = request_cache_breakdown(model, parallel, CAPTURE_TOKENS)
-        payload = float(breakdown["total_bytes"])
-        reference_payload, reference_allocated = _independent_cache_totals(
-            model, parallel, CAPTURE_TOKENS)
-        parameter_delta = parameters - reference_parameters
+        actual_entries = _body_entries(model)
+        comparison = catalog.compare_entries(reference, actual_entries)
+        parallel = ParallelSpec(tp=1, dp=1, pp=1, cp=1)
+        payload, allocated, breakdown = _cache_actuals(model, parallel, REFERENCE_TOKENS)
+        reference_payload = float(cache.cache_totals(
+            reference.geometry, REFERENCE_TOKENS, padded=False))
+        reference_allocated = float(cache.cache_totals(
+            reference.geometry, REFERENCE_TOKENS, padded=True))
+        cases, largest, cache_failures = _cache_matrix(reference, cache, model)
         payload_delta = payload - reference_payload
-        # The catalog's allocated total is the breakdown with block/capacity
-        # padding; the independent sum is the same conservative upper bound.
-        allocated_delta = payload - max(reference_allocated, reference_payload)
-        parameter_total += parameters
-        payload_total += payload
-        allocated_total += max(reference_allocated, reference_payload)
+        allocated_delta = allocated - reference_allocated
+        auxiliary = _auxiliary_summary(model)
+        declared_auxiliary = models[key]["auxiliary_modes"]
+        auxiliary_ok = all(
+            declared_auxiliary.get(name) == auxiliary.get(name)
+            for name in ("kind", "layers", "standalone")) if auxiliary else not declared_auxiliary
+        scope_ok = (reference.scope == models[key]["parameter_scope"]
+                    and model.accounting_scope == reference.scope)
+        schedule_ok = (
+            [layer.window for layer in reference.layers]
+            == [plan.window for plan in model.layer_plans]
+            and [layer.compress_ratio for layer in reference.layers]
+            == [plan.compress_ratio for plan in model.layer_plans]
+            and [layer.owns_index_k for layer in reference.layers]
+            == [plan.owns_index_k for plan in model.layer_plans])
         row = {
             "model": key,
-            "parameters": parameters,
-            "parameter_reference": reference_parameters,
-            "parameter_delta": parameter_delta,
+            "config": reference.config_path,
+            "builder": reference.builder,
+            "parameter_scope": reference.scope,
+            "parameters": comparison["actual_parameters"],
+            "parameter_reference": comparison["reference_parameters"],
+            "parameter_delta": comparison["parameter_delta"],
+            "runtime_parameters": comparison["actual_runtime_parameters"],
+            "runtime_reference": comparison["reference_runtime_parameters"],
+            "runtime_delta": comparison["runtime_delta"],
+            "shapes_compared": len(actual_entries),
+            "missing_in_actual": len(comparison["missing_in_actual"]),
+            "missing_in_reference": len(comparison["missing_in_reference"]),
+            "shape_mismatches": len(comparison["shape_mismatches"]),
             "kv_payload_bytes": payload,
             "kv_payload_reference": reference_payload,
             "kv_payload_delta": payload_delta,
-            "kv_allocated_bytes": max(reference_allocated, reference_payload),
+            "kv_allocated_bytes": allocated,
+            "kv_allocated_reference": reference_allocated,
             "kv_allocated_delta": allocated_delta,
-            "accounting_scope": model.accounting_scope,
+            "layer_sum_vs_breakdown_delta": allocated - breakdown,
+            "cache_cases": cases,
+            "cache_max_abs_delta": largest,
+            "auxiliary_modes": auxiliary,
+            "auxiliary_declared": declared_auxiliary,
+            "auxiliary_ok": auxiliary_ok,
+            "scope_ok": scope_ok,
+            "schedule_ok": schedule_ok,
+            "complete": bool(comparison["complete"] and not cache_failures
+                             and auxiliary_ok and scope_ok and schedule_ok),
         }
         rows.append(row)
-        if any(abs(value) > 0 for value in
-               (parameter_delta, payload_delta, allocated_delta)):
-            failures.append({"model": key, **row})
+        parameter_total += comparison["actual_parameters"]
+        reference_parameter_total += comparison["reference_parameters"]
+        payload_total += payload
+        allocated_total += allocated
+        if not row["complete"] or any(abs(value) > 0 for value in (
+                comparison["parameter_delta"], comparison["runtime_delta"],
+                payload_delta, allocated_delta)):
+            failures.append({
+                "model": key,
+                **{name: row[name] for name in (
+                    "parameter_delta", "runtime_delta", "kv_payload_delta",
+                    "kv_allocated_delta", "missing_in_actual",
+                    "missing_in_reference", "shape_mismatches", "cache_cases",
+                    "cache_max_abs_delta", "auxiliary_ok", "scope_ok",
+                    "schedule_ok")},
+                "shape_detail": comparison["shape_mismatches"][:REPORT_SHAPES],
+                "missing_actual_detail": comparison["missing_in_actual"][:REPORT_SHAPES],
+                "missing_reference_detail": comparison["missing_in_reference"][:REPORT_SHAPES],
+                "cache_detail": cache_failures[:REPORT_SHAPES],
+            })
     metrics = {
         "required_models": required,
+        "manifest_models": len(models),
         "completed_models": len(rows),
         "failed_models": len(failures),
+        "references": str(manifest_path),
+        "references_sha256": manifest_digest,
         "parameter_total": parameter_total,
+        "parameter_reference_total": reference_parameter_total,
+        "parameter_delta_total": parameter_total - reference_parameter_total,
         "kv_payload_total": payload_total,
         "kv_allocated_total": allocated_total,
+        "parallel_cases": [list(case) for case in REFERENCE_PARALLEL_CASES],
+        "meta_tensor_backend": ("torch" if catalog._torch_available()
+                                else "arithmetic"),
         "failures": failures[:10],
         "models": rows,
     }
@@ -378,7 +515,7 @@ def main(argv=None) -> int:
     hygiene_parser.add_argument("--output", default=None)
 
     catalog_parser = sub.add_parser("catalog-meta")
-    catalog_parser.add_argument("--references", default=None)
+    catalog_parser.add_argument("--references", default=str(DEFAULT_MANIFEST))
     catalog_parser.add_argument("--require-models", type=int, default=37)
     catalog_parser.add_argument("--output", default=None)
 

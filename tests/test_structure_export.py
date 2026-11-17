@@ -154,7 +154,7 @@ def test_export_is_independent_of_timing_and_does_not_execute_engine(monkeypatch
                                        context=16, expand_calls=False)
     assert second == first_unexpanded
     raw["runtime"]["kernels"] = {
-        "recipes": {"qkv_projection": {"kind": "envelope"}}}
+        "recipes": {"qkv_projection": {"kind": "tiled_matmul"}}}
     implementation = export_structure(raw, phase="decode", tokens=1, context=16,
                                       expand_calls=False)
     assert implementation["graph_id"] != first_unexpanded["graph_id"]

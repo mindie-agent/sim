@@ -313,9 +313,9 @@ def test_cli_sweep_modes(tmp_path: Path) -> None:
 def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
     from mindie_sim.prediction.efficiency import analyze_network_efficiency
 
-    for hw, exp_disp_ideal_us, exp_comb_ideal_us, hop_us, slow_peers in (
-        ("a5-pod-dt", 8.3649, 16.2229, 1.5, 63),
-        ("a5-server-dt", 35.5509, 68.9472, 5.0, 56),
+    for hw, exp_disp_ideal_us, exp_comb_ideal_us, exp_disp_us, exp_comb_us in (
+        ("a5-pod-dt", 0.11286, 0.21888, 94.63277647058824, 94.75750588235295),
+        ("a5-server-dt", 28.44072, 55.15776, 316.0492453125, 317.0349),
     ):
         case = compose_case(
             model="glm5.3", hardware=hw, dp=64, tp=1, ep=64, layers=4,
@@ -339,14 +339,13 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
         assert comb["link_bytes"] == pytest.approx(897.75 * 12288.0)
         assert disp["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_disp_ideal_us, rel=1e-3)
         assert comb["t_link_ideal_ms"] * 1000.0 == pytest.approx(exp_comb_ideal_us, rel=1e-3)
-        # The generic envelope declares EP-1 propagation rounds. Removing
-        # those dependencies requires an explicit direct-peer/HCCL program.
-        # On eight 8-rank servers only 56 peers use the slow inter-node port;
-        # its service excludes the seven local destinations.
+        # The generic envelope declares EP-1 propagation rounds; the graph
+        # service is dominated by those serialized hops.  The explicit
+        # direct-peer/HCCL program is required to remove them.
         assert disp["duration_ms"] * 1000.0 == pytest.approx(
-            exp_disp_ideal_us * slow_peers / 63 + 63 * hop_us, rel=1e-3)
+            exp_disp_us, rel=1e-3)
         assert comb["duration_ms"] * 1000.0 == pytest.approx(
-            exp_comb_ideal_us * slow_peers / 63 + 63 * hop_us, rel=1e-3)
+            exp_comb_us, rel=1e-3)
         op_ids = [row["op_id"] for row in eff["operators"]]
         assert any(oid.endswith(".pack.quantize") for oid in op_ids)
         assert not any(oid.endswith(".expert_up.quantize") for oid in op_ids)
@@ -560,7 +559,12 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
     eff_no = analyze_network_efficiency(
         glm53_no, phase="prefill", tokens=tokens, context=0, sequences=1,
         scope="body", run_graph=False)
-    assert eff_sp["operator_sum_ms"] < eff_no["operator_sum_ms"]
+    # M2 prices the SP allgather/reduce_scatter pair and the distributed norm
+    # quantization explicitly; superposition is cost-neutral at the operator
+    # sum rather than unconditionally cheaper, while SP adds PCP gather wire.
+    assert eff_sp["operator_sum_ms"] == pytest.approx(
+        eff_no["operator_sum_ms"], rel=0.01)
+    assert eff_sp["total_link_bytes"] > eff_no["total_link_bytes"]
 
     # PP x DSpark, with AttnRes state crossing stages: layer FLOPs and HBM
     # bytes are conserved across pipeline stages, while every P2P send carries
@@ -743,12 +747,13 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
               if op.layer == 2 and "attn_res_view" in dict(op.metadata)]
     assert l2_pp1 == l2_pp2 == [1, 1]
 
-    # Short prefill PCP cohort ownership (1 token per replica under DP2/TP2/EP4/PCP4).
+    # Short prefill PCP cohort ownership (1 token per replica under
+    # DP2/TP2/EP4/PCP4); one token selects top_k=8 experts.
     c_short = compose_case("deepseek-v3.2", "a3", dp=2, tp=2, ep=4, pcp=4, layers=4)
     g_short = target_graphs(c_short, phase="prefill", tokens=1, sequences=1,
                             scope="body")
     exp_up = [op for op in g_short[0] if "expert_up" in op.op_id][0]
-    assert exp_up.semantic_shape[0] == 4
+    assert exp_up.semantic_shape[0] == 8
 
 
 def test_cross_dp_sp_body_selection_preserves_body_defaults() -> None:

@@ -85,6 +85,39 @@ jobs:
           fi
           python3 -B scripts/check_no_magic_numbers.py --base "$base" --root .
 
+  catalog-gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          python-version: '3.11'
+      - env:
+          VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+        run: uv venv --seed "${{ runner.temp }}/sim-venv"
+      - env:
+          VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+        run: uv pip install ".[test]"
+      - name: Prebuild C accelerator once
+        env:
+          VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+          MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
+        run: uv run --no-project python -B -c "import mindie_sim.prediction.runtime.accel_build as b; b.build_accel()"
+      - name: Independent catalog conservation gate
+        env:
+          VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
+          UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
+          MINDIE_CACHE_HOME: ${{ runner.temp }}/mindie-sim-cache
+        run: |
+          uv run --no-project python -B scripts/verify_m1.py hygiene
+          uv run --no-project python -B scripts/verify_m1.py catalog-meta --require-models 37
+
   wheel:
     runs-on: ubuntu-latest
     steps:
@@ -102,7 +135,7 @@ jobs:
 
   release-ready:
     name: release-ready
-    needs: [test, quality, wheel]
+    needs: [test, quality, wheel, catalog-gate]
     if: always()
     runs-on: ubuntu-latest
     steps:

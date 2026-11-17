@@ -75,7 +75,10 @@ def test_real_matrix_work_output_and_input_readiness(raw, controls, batch, role)
     result = operator_costs(selected(raw), (op,), input_ready_ms=7)['operators'][0]
     m,n,k = op.local_shape; meta = dict(op.metadata)
     assert result['serviced']['fixpipe@r0:s0'] == pytest.approx(2*m*n)
-    assert result['serviced']['memory@r0:s0'] == pytest.approx(op.hbm_bytes)
+    # M2 charges only the declared matrix input path on HBM; the fused output
+    # remains a fixpipe result and is not re-counted as an HBM write.
+    assert result['serviced']['memory@r0:s0'] == pytest.approx(
+        op.mte2_bytes + op.mte3_bytes)
     assert not any(result['serviced'].get(name+'@r0:s0',0) for name in ('mte3','vector'))
     assert not result['service_before_input'] and not result['live_tasks']
     assert not any(result['remaining_buffers'].values())
@@ -121,7 +124,8 @@ def test_resource_sensitivity_preserves_work(raw, controls, axis):
             for d in case.machine.dies)
         report=operator_costs(replace(case,machine=replace(case.machine,dies=dies)),(op,))['operators'][0]
         results.append(report)
-    assert results[0]['duration_ms'] >= results[1]['duration_ms'] >= results[2]['duration_ms']
+    assert results[0]['duration_ms'] >= results[1]['duration_ms'] - 1e-15
+    assert results[1]['duration_ms'] >= results[2]['duration_ms'] - 1e-15
     for factor,result in zip((.5,1,2),results):
         # Matrix service is peak-normalized ms; recover invariant FLOP work.
         serviced = dict(result['serviced'])

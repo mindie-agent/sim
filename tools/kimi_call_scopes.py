@@ -208,6 +208,12 @@ def situ_reference(case, descriptors, quant):
         family="gate_up_projection", recipe=_MATRIX_RECIPE, weight_count=g["experts"],
         weight_rows=n, weight_cols=k, activation_dtype="fp8_e4m3", output_dtype="bf16",
         metadata=declaration)
+    # Unknown group-list values are priced as one aggregate logical matrix: all
+    # declared weight banks stay charged, but no equal-row expert split is
+    # invented for the physical matrix program.
+    gate = replace(gate, metadata=tuple({
+        **dict(gate.metadata), "matrix_groups": 1,
+        "matrix_mapping_domain": "aggregate_unknown_group_list"}.items()))
     activation = gated_activation(
         plan=plan, op_id="situ.activation", deps=(gate.op_id,), rows=m, width=width,
         dtype="bf16", stage=0, requests=(), phase="prefill", recipe="situ")
@@ -234,7 +240,7 @@ def situ_reference(case, descriptors, quant):
         "boundary": "gate_up_matrix -> SiTU -> output_quantization",
         "group_list": {"values": "absent", "weight_banks": g["experts"],
                        "policy": "charge every declared weight bank; do not invent equal rows or a tiled expert distribution"},
-        "matrix_recipe": {"id": _MATRIX_RECIPE, "kind": "resource_envelope",
+        "matrix_recipe": {"id": _MATRIX_RECIPE, "kind": "tiled_matmul",
                           "reason": "unknown group_list; aggregate logical FLOPs and all weight banks"},
         "activation": {"kind": "situ", "beta": plan.activation_situ_beta,
                        "linear_beta": plan.activation_situ_linear_beta,
@@ -266,11 +272,11 @@ def situ_reference(case, descriptors, quant):
                       "omitted_op_note": "dummy down consumer requested the quantizer but is not returned work"},
         "limitations": [
             "Declared semantic reference only; not a fused native kernel, ABI or traffic identity.",
-            "Group-list values and per-expert row counts are absent; the envelope does not assert equal rows or a native grouped schedule.",
+            "Group-list values and per-expert row counts are absent; the aggregate recipe does not assert equal rows or a native grouped schedule.",
             "Input FP8 payload and E8M0 scales are already inputs; no input quantizer is added.",
             "BF16 gate/SiTU workspaces are retained analytically and are not an instruction-level schedule."],
     }
-    recipes = RecipeBook.from_mapping({"recipes": {_MATRIX_RECIPE: {"kind": "envelope"}}})
+    recipes = RecipeBook.from_mapping({"recipes": {_MATRIX_RECIPE: {"kind": "tiled_matmul"}}})
     return {"ops": ops, "recipes": recipes, "ledger": ledger}
 
 

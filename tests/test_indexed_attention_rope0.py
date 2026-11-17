@@ -76,7 +76,7 @@ def test_rope0_is_explicit_and_native_selector_keeps_its_true_geometry_domain():
     raw = case(explicit=False)
     ops = operators(raw, batch=1)
     report = execute(raw, ops)
-    assert report['timeline'][0]['program'] == 'ResourceEnvelope'
+    assert report['timeline'][0]['program'] == 'TiledFlashAndPagedAttentionRecipe'
     native = deepcopy(raw)
     native['runtime']['kernels'] = {'lowerings': {'indexed_attention': {
         'implementation': IMPLEMENTATION, 'options': {'scratch_policy': 'offchip'}}}}

@@ -463,8 +463,12 @@ def test_real_pp2_draft_store_is_not_the_stage0_id_transfer():
         "draft_accept_tokens": 1,
     }
     base = parse_case(raw)
+    from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
+    auxiliary = draft_case().model.auxiliary
+    draft = replace(auxiliary.mtp, layer_plans=native_draft_layer_plans(
+        base.model, auxiliary.mtp))
     target = replace(base, model=replace(
-        base.model, auxiliary=draft_case().model.auxiliary))
+        base.model, auxiliary=replace(auxiliary, mtp=draft)))
     view = RequestView("r", 1, 4, True, "decode",
                        draft_proposal_tokens=2, draft_accepted_tokens=1)
     work = Frontend()(IterationPlan((view,)), target.model, target.runtime,

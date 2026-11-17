@@ -270,12 +270,19 @@ def test_finding3_recipe_schedules_aiv_vector_or_aicpu_hbm(embedded, mode):
     comm_row = next(row for row in concurrent["timeline"] if row["op_id"] == "comm")
     base_vector = baseline["execution"]["serviced"]["vector@r0:s0"]
     concurrent_vector = concurrent["execution"]["serviced"]["vector@r0:s0"]
+    base_vector_busy = baseline["execution"]["resource_busy_ms"]["vector@r0:s0"]
+    concurrent_vector_busy = concurrent["execution"]["resource_busy_ms"]["vector@r0:s0"]
     if mode == "aiv":
         assert concurrent_vector > base_vector
-        assert vector_row["complete_ms"] > baseline["timeline"][0]["complete_ms"]
+        # AIV expansion adds real vector-pipe work. It cannot make the vector
+        # op faster, but a concurrent stage may finish after that op without
+        # extending it, so the shared pipe's busy time is the direct evidence.
+        assert vector_row["complete_ms"] >= baseline["timeline"][0]["complete_ms"] - 1e-12
+        assert concurrent_vector_busy > base_vector_busy
         assert comm_row["complete_ms"] > 0
     else:
         assert concurrent_vector == pytest.approx(base_vector)
+        assert concurrent_vector_busy == pytest.approx(base_vector_busy)
         assert vector_row["complete_ms"] == pytest.approx(
             baseline["timeline"][0]["complete_ms"])
         assert comm_row["complete_ms"] > 0
@@ -709,7 +716,9 @@ def test_pass2_finding5_link_curve_executes_without_named_link_resource(embedded
     row, _ = predicted(raw)
     estimate = curve.estimate(operation.link_bytes)
     assert row["duration_ms"] - estimate.duration_ms > 0
-    assert any(name.startswith("link:") for name in row["serviced"])
+    link_names = [name for name in row["serviced"] if name.startswith("link:")]
+    assert link_names
+    assert all(":pair" in name and ":tx:port" not in name for name in link_names)
     assert row["basis"]["service_models"][0]["queries"].get(
         "interpolated") == 1
 
@@ -720,8 +729,11 @@ def test_pass2_finding5_link_curve_executes_without_named_link_resource(embedded
         case_raw["machine"]["links"] = [{**link, "latency_us": latency_us}]
         return case_raw
 
-    faster_raw = with_latency(0.1)
-    slower_raw = with_latency(10.0)
+    # Bracket the declared link latency; the old 10 us "slower" point was
+    # below the current 12 us A5 d2d declaration.
+    base_latency = float(link["latency_us"])
+    faster_raw = with_latency(base_latency / 100.0)
+    slower_raw = with_latency(base_latency * 2.0)
     faster_row, _ = predicted(faster_raw)
     slower_row, _ = predicted(slower_raw)
 

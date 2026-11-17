@@ -457,9 +457,9 @@ def _binding_lower(plan, model, runtime, machine, dispatch_binding=None):
         }
         shape = (1,)
         ops.append(OpSpec(
-            f"op:{view.request_id}", "gemm", view.phase, 0, 0,
+            f"op:{view.request_id}", "vector", view.phase, 0, 0,
             (view.request_id,), shape, shape, shape, shape, flops=1e6,
-            metadata=(("state_accesses", (record,)),)))
+            vector_ops=1e6, metadata=(("state_accesses", (record,)),)))
     tokens = sum(view.q_len for view in plan.requests)
     return IterationWork(tuple(ops), plan, 1, tokens, tokens, None,
                          "body", "test_binding")
@@ -804,10 +804,10 @@ def test_release_wakeup_uses_five_ms_not_blocked_dp_or_unrelated_timer():
         tokens = sum(view.q_len for view in plan.requests)
         scale = 20.0 if any(view.request_id == "b" for view in plan.requests) else 1.0
         shape = (tokens,)
-        op = OpSpec("work", "gemm", "body", 0, 0,
+        op = OpSpec("work", "vector", "body", 0, 0,
                     tuple(view.request_id for view in plan.requests),
                     shape, shape, shape, shape, flops=tokens * 1e6 * scale,
-                    dtype="bf16")
+                    vector_ops=tokens * 1e6 * scale, dtype="bf16")
         return IterationWork((op,), plan, 1, tokens, tokens, None, "body",
                              "test_slow")
 

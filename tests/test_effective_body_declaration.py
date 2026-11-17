@@ -7,7 +7,8 @@ from mindie_sim import predict
 from mindie_sim.cohort_comparison import compare_cohorts
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.operator_analysis import operator_costs, target_graphs, target_operators
-from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.prediction.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.structure import export_structure
 from mindie_sim.study import study
@@ -111,14 +112,28 @@ def test_graph_carrier_keeps_current_hardware_and_explicit_book_or_recipe_overri
     slow["machine"]["hbm_bw_bytes_per_s"] = 1e8
     slowed = _graph(slow, graphs)
     assert slowed["duration_ms"] > automatic["duration_ms"] * 10
-    assert slowed["execution"]["serviced"] == pytest.approx(automatic["execution"]["serviced"])
-    explicit = RecipeBook(families={"attention": ResourceEnvelope()})
+    # M2 caps small-M cold weight refills at the declared mte2_aic_dram supply,
+    # so a slower external HBM rate changes the serviced byte split.  Each cold
+    # weight panel is a real byte of work; total declared work is conserved.
+    fast_service = automatic["execution"]["serviced"]
+    slow_service = slowed["execution"]["serviced"]
+    assert fast_service["mte1@r0:s0"] == pytest.approx(78880)
+    assert fast_service["mte2_aic@r0:s0"] == pytest.approx(74752)
+    assert slow_service["mte1@r0:s0"] == pytest.approx(76576)
+    assert slow_service["mte2_aic@r0:s0"] == pytest.approx(72448)
+    for key in set(fast_service) | set(slow_service):
+        if key not in {"mte1@r0:s0", "mte2_aic@r0:s0"}:
+            assert slow_service.get(key) == pytest.approx(fast_service.get(key))
+    assert slowed["execution"]["work"] == automatic["execution"]["work"]
+    explicit = RecipeBook(families={"attention": TiledFlashAndPagedAttentionRecipe()})
     override = _graph(raw, graphs, recipes=explicit)
-    assert all(row["program"] == "ResourceEnvelope" for row in attention(override))
+    assert all(row["program"] == "TiledFlashAndPagedAttentionRecipe"
+               for row in attention(override))
     changed = deepcopy(raw)
-    changed["runtime"]["kernels"] = {"recipes": {"flash_attention_decode": {"kind": "envelope"}}}
+    changed["runtime"]["kernels"] = {
+        "recipes": {"flash_attention_decode": {"kind": "staged_gqa_decode"}}}
     override = _graph(changed, graphs)
-    assert all(row["program"] == "ResourceEnvelope" for row in attention(override))
+    assert all(row["program"] == "StagedGQADecode" for row in attention(override))
 
 
 def test_explicit_book_does_not_install_structural_caller_and_model_scope_is_unchanged():
@@ -193,5 +208,5 @@ def test_body_study_and_cli_graph_share_selected_programs(tmp_path):
             "--sequences", "2", "--scope", "body", "--skip-isolated"]
     assert run(parser().parse_args(args))["duration_ms"] == body["body_forward_ms"]
     control = run(parser().parse_args([*args, "--no-body-defaults"]))
-    assert all(row["program"] == "ResourceEnvelope" for row in control["timeline"]
-               if row["family"] == "attention")
+    assert all(row["program"] == "TiledFlashAndPagedAttentionRecipe"
+               for row in control["timeline"] if row["family"] == "attention")

@@ -444,8 +444,10 @@ def test_x6_exact_service_stability_50_95_105_and_109_flip() -> None:
 
     def fixed_step_lower(plan, model, runtime, machine):
         tokens = sum(view.q_len for view in plan.requests)
-        op = OpSpec("step_work", "gemm", "body", 0, 0, tuple(v.request_id for v in plan.requests),
-                    (tokens,), (tokens,), (tokens,), (tokens,), flops=tokens * body_ms * 1e6, dtype="bf16")
+        op = OpSpec("step_work", "vector", "body", 0, 0, tuple(v.request_id for v in plan.requests),
+                    (tokens,), (tokens,), (tokens,), (tokens,),
+                    flops=tokens * body_ms * 1e6,
+                    vector_ops=tokens * body_ms * 1e6, dtype="bf16")
         return IterationWork((op,), plan, 1, tokens, tokens, None, "body", "x6_fixed")
 
     def run_rate(rate_rps: float, *, include_framework: bool, count: int = 12) -> dict:

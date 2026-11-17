@@ -150,6 +150,32 @@ def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
     return simulation_config(canonical, sku, _arch_key(sku))
 
 
+def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
+                                 tp: int, ep: int, pp: int, pcp: int) -> bool:
+    """Structural sequence-parallel applicability, never a model-name whitelist."""
+    if profile.get("sp") is False:
+        return False
+    if not (pcp >= DEFAULT_PARALLEL and pp >= DEFAULT_PARALLEL
+            and tp > DEFAULT_PARALLEL and ep >= tp
+            and ep % tp == DEFAULT_ZERO):
+        return False
+    from mindie_sim.prediction.sequence_parallel import _validate_model
+    try:
+        _validate_model(model_spec, padding="right_to_tp")
+    except ModelingError:
+        return False
+    return True
+
+
+def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolved execution policy stored by ``compose_case`` on the declaration."""
+    runtime = case.get("runtime") if isinstance(case, Mapping) else None
+    if not isinstance(runtime, Mapping):
+        return {}
+    policy = dict(runtime.get("metadata") or {}).get("execution_policy")
+    return dict(policy) if isinstance(policy, Mapping) else {}
+
+
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
 ) -> dict[str, Any]:
@@ -409,7 +435,7 @@ def compose_case(
     pp: int = DEFAULT_PARALLEL,
     pcp: int = DEFAULT_PARALLEL,
     dcp: int = DEFAULT_PARALLEL,
-    sp: bool = False,
+    sp: bool | None = None,
     num_devices: int | None = None,
     ranks_per_node: int | None = None,
     quant: str | Mapping[str, Any] | None = None,
@@ -427,7 +453,7 @@ def compose_case(
     block_size: int = DEFAULT_BLOCK_SIZE,
     enable_chunked_prefill: bool = True,
     async_scheduling: bool = False,
-    graph_capture_mode: str = "none",
+    graph_capture_mode: str | None = None,
     mtp_proposal_tokens: int = DEFAULT_MTP_TOKENS,
     mtp_acceptance_length: float = DEFAULT_MTP_ACCEPT,
     ttft_slo_ms: float = DEFAULT_TTFT_MS,
@@ -447,7 +473,7 @@ def compose_case(
     inter_pod_bw_gbps: float | None = None,
     intra_bw_4p_gbps: float | None = None,
     intra_bw_8p_gbps: float | None = None,
-    va_recommended: bool = False,
+    va_recommended: bool | None = None,
     raw_eager: bool = False,
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
@@ -483,7 +509,7 @@ def compose_case(
         raise ModelingError("invalid_workload_dimensions")
     if int(prefix_tokens) < 0 or int(prefix_tokens) > int(prompt_tokens):
         raise ModelingError("invalid_prefix_tokens")
-    if graph_capture_mode not in {"none", "full", "piecewise"}:
+    if graph_capture_mode is not None and graph_capture_mode not in {"none", "full", "piecewise"}:
         raise ModelingError(f"invalid_graph_capture_mode:{graph_capture_mode}")
     if int(mtp_proposal_tokens) < 0:
         raise ModelingError(f"invalid_mtp_proposal_tokens:{mtp_proposal_tokens}")
@@ -584,25 +610,28 @@ def compose_case(
     if preset:
         machine = {**machine, "topology_preset": preset}
 
+    # ``va_recommended=None`` is the production default on Ascend: documented
+    # vLLM-Ascend profiles are a *default*, never an override of an explicit
+    # caller choice.  ``raw_eager`` disables every optional fused lowering.
+    production = (backend == "ascend" and va_recommended is not False
+                  and not raw_eager)
     if raw_eager and va_recommended:
         raise ModelingError("raw_eager_conflicts_with_explicit_fusion")
-    if raw_eager:
-        sp = False
-        graph_capture_mode = "none"
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     va_profile: dict[str, Any] | None = None
-    if va_recommended and backend == "ascend" and not raw_eager:
+    if production:
         model_id = str(model) if isinstance(model, str) else str(model_spec.name)
         va_profile = va_recommended_config(model_id, sku)
         va_profile["quantization_action"] = (
             "explicit_quant_preserved" if quant is not None else
             "documented_alternative_applied" if va_profile["quant"] is not None else
             "no_profile_override")
+        # ``simulation_config`` no longer fabricates a full capture policy for
+        # undocumented models; only a profile that declares one is forwarded.
+        va_profile.setdefault("graph_capture_mode", None)
         if quant is None:
             quant = va_profile["quant"]
-        if graph_capture_mode == "none":
-            graph_capture_mode = str(va_profile.get("graph_capture_mode", "full"))
     model_spec = _apply_quant_override(model_spec, quant, machine)
     model_spec = _apply_structural_overrides(
         model_spec,
@@ -610,46 +639,51 @@ def compose_case(
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
     )
-    if (va_profile is not None and not sp and va_profile.get("sp", True)
-            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
-        from mindie_sim.prediction.sequence_parallel import _validate_model
-        try:
-            _validate_model(model_spec, padding="right_to_tp")
-            sp = True
-        except ModelingError:
-            pass
+    sp_source = (
+        "raw_eager" if raw_eager else
+        "explicit" if sp is not None and va_recommended is not False else
+        "production" if (production and va_profile is not None and sp is None) else
+        "explicit" if sp is not None else "default")
+    if raw_eager:
+        sp = False
+    elif sp is None:
+        sp = bool(production and va_profile is not None
+                  and _supports_sequence_parallel(model_spec, va_profile,
+                                                  tp=tp, ep=ep, pp=pp, pcp=pcp))
+    documented_capture = (va_profile or {}).get("graph_capture_mode")
+    capture_source = (
+        "raw_eager" if raw_eager else
+        "explicit" if graph_capture_mode is not None
+        else "profile" if (production and documented_capture in
+                           {"full", "piecewise", "none"})
+        else "none")
+    if raw_eager:
+        graph_capture_mode = "none"
+    elif graph_capture_mode is None:
+        documented = (va_profile or {}).get("graph_capture_mode")
+        graph_capture_mode = (str(documented)
+                              if documented in {"full", "piecewise", "none"} else "none")
+    execution_policy = {
+        "backend": backend,
+        "production": bool(production),
+        "va_recommended": va_recommended,
+        "raw_eager": bool(raw_eager),
+        "automatic_optional_fusions": bool(not raw_eager and va_recommended is not False),
+        "sp": bool(sp), "sp_source": sp_source,
+        "graph_capture_mode": str(graph_capture_mode),
+        "capture_source": capture_source,
+        "profile": (str((va_profile or {}).get("model", "")) if va_profile else ""),
+        "priority": ("raw_eager > explicit caller > documented profile > "
+                     "structural fusion defaults"),
+    }
 
-    if int(mtp_proposal_tokens) > 0:
-        has_mtp = getattr(model_spec.auxiliary, "mtp", None) is not None
-        has_dspark = getattr(model_spec.auxiliary, "dspark", None) is not None
-        if (not (has_mtp or has_dspark) and model_spec.layer_plans
-                and model_spec.layer_plans[-1].attention in {"mla", "gqa"}):
-            last = model_spec.layer_plans[-1]
-            synth_mtp = DraftSpec(
-                kind="mtp", layers=1, hidden_size=model_spec.hidden_size,
-                intermediate_size=last.intermediate_size or last.moe_intermediate_size,
-                num_heads=last.num_heads, num_kv_heads=last.num_kv_heads,
-                head_dim=last.head_dim,
-                q_width=last.num_heads * last.head_dim,
-                kv_width=last.num_kv_heads * last.head_dim,
-                attention_kind=last.attention,
-                q_lora_rank=last.q_lora_rank, kv_lora_rank=last.kv_lora_rank,
-                qk_nope_head_dim=last.qk_nope_head_dim,
-                qk_rope_head_dim=last.qk_rope_head_dim, v_head_dim=last.v_head_dim,
-                o_lora_rank=last.o_lora_rank, o_groups=last.o_groups,
-                num_experts=last.num_experts, top_k=last.top_k,
-                expert_intermediate_size=last.moe_intermediate_size,
-                num_shared_experts=last.num_shared_experts,
-                target_layer_ids=(last.index,), block_size=1,
-                target_shared_embedding=True, target_shared_lm_head=True,
-                mla_variant=last.mla_variant,
-                kv_cache_elements=last.kv_cache_elements,
-                input_mode="dual_normalized", base_logits=True,
-                pp_capability=(1, 2, 4, 8, 16),
-                vocab_size=model_spec.vocab_size,
-            )
-            model_spec = replace(model_spec, auxiliary=AuxiliarySpec(mtp=synth_mtp))
-            has_mtp = True
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
+        # Auxiliary structure is declared natively by the model adapter at load
+        # time.  No last-layer synthesis: an undeclared draft structure is an
+        # explicit, actionable error instead of a fabricated one-layer module.
+        aux = model_spec.auxiliary
+        has_mtp = getattr(aux, "mtp", None) is not None
+        has_dspark = getattr(aux, "dspark", None) is not None
         if not (has_mtp or has_dspark):
             raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
         if not (1.0 <= float(mtp_acceptance_length) <= float(1 + int(mtp_proposal_tokens))):
@@ -692,8 +726,9 @@ def compose_case(
         "sp": bool(sp),
         "moe_dispatch_quantization": "routed_expert",
         **({"raw_eager": True} if raw_eager else {}),
+        "execution_policy": dict(execution_policy),
     }
-    if int(mtp_proposal_tokens) > 0:
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
     if enable_shared_expert_dp:
@@ -772,7 +807,9 @@ def compose_case(
         runtime_meta["va_env"] = dict(va_profile["env"])
         runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
         passes: tuple[str, ...] = ()
-        if str(model_spec.quant.activation_format) != str(model_spec.activation_dtype):
+        if (model_spec.quant is not None
+                and str(model_spec.quant.activation_format)
+                != str(model_spec.activation_dtype)):
             passes = ("activation_quantization", "norm_quant")
             runtime_dict["lowering_passes"] = list(passes)
         lowerings = _resolve_va_lowerings(

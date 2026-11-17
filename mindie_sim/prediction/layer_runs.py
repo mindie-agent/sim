@@ -44,34 +44,57 @@ def _metadata(op: Any) -> Mapping[str, Any]:
     return dict(getattr(op, "metadata", ()) or ())
 
 
+#: Geometry fields that define a reusable layer template.  Occurrence index and
+#: absolute layer ids are identity, not geometry, and are handled separately.
+TEMPLATE_FIELDS = (
+    "attention", "ffn", "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
+    "qk_rope_head_dim", "v_head_dim", "num_heads", "num_kv_heads",
+    "head_dim", "window", "compress_ratio", "indexer", "indexer_type",
+    "num_experts", "top_k", "moe_intermediate_size",
+    "num_shared_experts", "shared_intermediate_size", "intermediate_size",
+    "router_input_size", "router_mode", "qk_norm", "q_output_gate_kind",
+    "q_gate_projection", "k_eq_v", "residual_block_size", "engram",
+    "hyper_connections", "hc_mult", "scope", "cache_kind",
+    "compressor_kind", "compressor_width",
+    "index_topk", "index_heads", "index_dim", "index_input",
+)
+
+#: Cross-layer owners.  Each is stored as a labelled delta, never absolute.
+OWNERSHIP_FIELDS = (
+    "kv_owner_layer_id", "index_k_owner_layer_id", "topk_owner_layer_id",
+    "candidate_source_layer_id", "index_source_layer_id",
+)
+
+ABSENT = ("absent",)
+LAYER_DELTA = "layer_delta"
+NATIVE_LAYER_DELTA = "native_layer_delta"
+
+
+def _relative(value: Any, index: int) -> tuple:
+    """Labelled layer delta, distinguishing ``absent`` from ``owner == 0``."""
+    if value is None:
+        return ABSENT
+    resolved = int(value)
+    if resolved < ZERO:
+        return ABSENT
+    return (LAYER_DELTA, resolved - int(index))
+
+
 def _plan_template(plan: Any) -> tuple:
     if plan is None:
         return ()
-    # Occurrence index and absolute layer ids are identity, not geometry.
-    fields = (
-        "attention", "ffn", "q_lora_rank", "kv_lora_rank", "qk_nope_head_dim",
-        "qk_rope_head_dim", "v_head_dim", "num_heads", "num_kv_heads",
-        "head_dim", "window", "compress_ratio", "indexer", "indexer_type",
-        "num_experts", "top_k", "moe_intermediate_size",
-        "num_shared_experts", "shared_intermediate_size", "intermediate_size",
-        "router_input_size", "router_mode", "qk_norm", "q_output_gate_kind",
-        "q_gate_projection", "k_eq_v", "residual_block_size", "engram",
-        "hyper_connections", "hc_mult", "scope", "cache_kind",
-        "compressor_kind", "compressor_width", "native_layer_id",
-        "index_topk", "index_heads", "index_dim", "index_input",
-    )
-    template = tuple(getattr(plan, field, None) for field in fields)
-    # Ownership is relative to the occurrence: a self-owner is one pattern,
-    # a cross-layer owner is a distinct one.  Absolute ids are normalized to
-    # their offset from the layer so corresponding runs compare equal.
+    template = tuple(getattr(plan, field, None) for field in TEMPLATE_FIELDS)
+    # Ownership and native ids are relative to the occurrence: a self-owner is
+    # one pattern, a cross-layer owner is a distinct one.  ``or -1`` collapsed a
+    # genuine owner of layer 0 into "no owner", so the sentinel is an explicit
+    # labelled tuple instead.
     index = int(getattr(plan, "index", ZERO))
-    ownership = []
-    for field in ("kv_owner_layer_id", "index_k_owner_layer_id",
-                  "topk_owner_layer_id", "candidate_source_layer_id",
-                  "index_source_layer_id"):
-        owner = int(getattr(plan, field, -ONE) or -ONE)
-        ownership.append(-ONE if owner < ZERO else owner - index)
-    return template + tuple(ownership)
+    ownership = tuple(_relative(getattr(plan, field, None), index)
+                      for field in OWNERSHIP_FIELDS)
+    native = getattr(plan, "native_layer_id", None)
+    native_relative = (ABSENT if native is None
+                       else (NATIVE_LAYER_DELTA, int(native) - index))
+    return template + ownership + (native_relative,)
 
 
 def _op_run_key(op: Any, plan: Any) -> tuple:
@@ -88,7 +111,7 @@ def _op_run_key(op: Any, plan: Any) -> tuple:
         tuple(sorted((str(key), repr(value)) for key, value in _metadata(op).items()
                      if key in {"group_axis", "collective", "local_tp_width",
                                 "capture_bucket", "recipe", "kernel"})),
-        str(physical_key(op)),
+        physical_key(op),
     )
 
 

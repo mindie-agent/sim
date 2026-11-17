@@ -11,7 +11,8 @@ from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.operator_analysis import operator_costs, target_operators
 from mindie_sim.prediction.operators import attention_online, cuda_norm
-from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.prediction.attention_pipeline import TiledFlashAndPagedAttentionRecipe
+from mindie_sim.prediction.program import RecipeBook
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.workload import IterationPlan, RequestView
@@ -81,7 +82,7 @@ def test_source_selection_keeps_unselected_analytic_model_usable():
     parsed = parse_case(raw)
     work = work_for(parsed)
     attention = next(op for op in work.ops if op.family == "attention")
-    assert isinstance(RecipeBook.from_mapping(parsed.runtime.kernels).select(attention), ResourceEnvelope)
+    assert isinstance(RecipeBook.from_mapping(parsed.runtime.kernels).select(attention), TiledFlashAndPagedAttentionRecipe)
     assert attention.flops == 4 * 8 * 4 * (1 + 2 + 3 + 4)
     raw["machine"]["name"] = "unseen-device-label"
     raw["model"]["name"] = "unseen-model-label"

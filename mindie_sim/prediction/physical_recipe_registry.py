@@ -43,10 +43,15 @@ class ControlSyncRecipe:
     mechanism: str = "control_sync"
 
     def lower(self, context):
-        return KernelProgram((Stage("arrive", keep_empty=True),
-                              Stage("publish", after=("arrive",),
-                                    keep_empty=True)),
-                             minimum_ms=context.minimum_ms)
+        # Declared control work (host/event service) is real work: the program
+        # must pay it exactly once.  An empty declaration keeps the pure
+        # arrival/publication ordering pair with no invented duration.
+        work = {str(name): float(value) for name, value in
+                (context.work or {}).items() if float(value) > ZERO_FLOAT}
+        stages = (Stage("arrive", keep_empty=True),
+                  Stage("publish", work=work, after=("arrive",),
+                        keep_empty=not work))
+        return KernelProgram(stages, minimum_ms=context.minimum_ms)
 
 
 ATTENTION = TiledFlashAndPagedAttentionRecipe()
@@ -67,6 +72,7 @@ INDEXER_TOPK_RECIPES = frozenset({
 LINEAR_FAMILIES = frozenset({
     "recurrent_local", "recurrent_output", "triangular_solve",
 })
+ZERO_FLOAT = 0.0
 COLLECTIVE_FAMILIES = frozenset({
     "allgather", "allreduce", "alltoall", "alltoallv", "reduce_scatter",
     "tp_allreduce", "engram_broadcast", "engram_ids",
@@ -74,12 +80,12 @@ COLLECTIVE_FAMILIES = frozenset({
 VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",
     "embedding", "engram_apply", "engram_gather", "engram_query", "fill", "geglu", "gdn_gating", "hbm_load", "histogram", "kv_cache_write", "kv_cast",
-    "layernorm", "mhc", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
+    "layernorm", "mhc", "multiply", "native_fusion", "pad", "quantize", "relu", "rmsnorm", "rmsnorm_quant", "rotary", "routing", "sigmoid", "silu", "state_gather", "state_transfer", "test",
     "situ", "softmax", "swiglu", "tensor_copy", "tensor_fill", "tensor_materialization", "tensor_select", "tensor_view", "topk", "vector", "zero_fill",
 })
 CONTROL_FAMILIES = frozenset({
     "barrier", "event", "hccl_boundary", "token_commit", "sampling", "acceptance",
-    "state_publication",
+    "state_publication", "state_publish", "state_scatter",
 })
 TRANSFER_FAMILIES = frozenset({"cache_transfer", "kv_transfer", "offload", "pp_p2p", "transfer"})
 PROJECTION_FAMILIES = frozenset({

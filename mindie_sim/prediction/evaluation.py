@@ -229,6 +229,10 @@ class EvaluationContext:
     physical_keys: BoundedCache = field(default_factory=BoundedCache)
     prepared_programs: BoundedCache = field(default_factory=BoundedCache)
     isolated_results: BoundedCache = field(default_factory=BoundedCache)
+    #: ``case`` when the recipe book is the one the case declares, ``caller``
+    #: when a caller supplied an override.  Only a case-declared book may be
+    #: reused across evaluations of the same declaration.
+    recipe_origin: str = "caller"
     construction_counts: dict[str, int] = field(
         default_factory=lambda: {"cost_models": ONE, "bindings": ONE,
                                  "contexts": ONE})
@@ -241,7 +245,8 @@ class EvaluationContext:
         book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
         bindings = ExecutionBindings.create(case, book)
         cost = CostModel(case, primitives, hardware=bindings.hardware)
-        return cls(case=case, bindings=bindings, cost=cost)
+        return cls(case=case, bindings=bindings, cost=cost,
+                   recipe_origin="case" if recipes is None else "caller")
 
     def cost_summary(self) -> dict[str, Any]:
         return self.cost.summary()

@@ -33,6 +33,15 @@ BYTES_PER_ELEMENT = {"bf16": 2, "fp16": 2, "fp32": 4, "int8": 1,
                      "fp8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1}
 
 
+#: Declared attention traffic phases.  A speculative draft step reads and
+#: writes the same cache geometry as the target phase it prepares, so it is the
+#: same traffic contract under a distinct declared phase name.
+ATTENTION_ACCESS_PHASES = frozenset({
+    "prefill", "decode", "mixed", "verify",
+    "draft", "draft_prefill",
+})
+
+
 @dataclass(frozen=True)
 class AttentionAccessSpec:
     q_lengths: tuple[int, ...]
@@ -66,7 +75,7 @@ class AttentionAccessSpec:
                 or self.value_dim < ONE or self.key_bytes < ONE
                 or self.value_bytes < ONE or self.row_bytes <= ZERO_FLOAT):
             raise ModelingError("attention_access_positive_geometry_required")
-        if self.phase not in {"prefill", "decode"}:
+        if self.phase not in ATTENTION_ACCESS_PHASES:
             raise ModelingError("attention_access_phase_invalid")
 
 
@@ -211,7 +220,7 @@ def plan_attention_traffic(access: AttentionAccessSpec,
     working_set = float(unique_rows) * row_bytes
     private_refill = logical
     effective_l2 = hierarchy.effective_l2_bytes
-    sparse_decode = (access.topk > ZERO and access.phase == "decode"
+    sparse_decode = (access.topk > ZERO and access.phase in {"decode", "draft"}
                      and not access.selected_rows_known)
     if sparse_decode:
         hbm_kv = logical

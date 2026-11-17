@@ -243,7 +243,7 @@ def test_target_efficiency_is_a_pipe_bound_not_isolated_sum_graph_scaling():
 
     expected_bound = min(evaluated["current_step_duration_ms"],
                          max(evaluated["target_pipe_totals_ms"].values()))
-    assert evaluated["target_step_basis"] == "per_pipe_work_lower_bound_not_rescheduled_graph"
+    assert evaluated["target_step_basis"] == "dag_critical_path_and_resource_conservation"
     assert evaluated["target_step_is_lower_bound"] is True
     assert evaluated["target_step_duration_ms"] == pytest.approx(expected_bound, rel=1e-12)
     isolated_sum_scaling = (evaluated["current_step_duration_ms"]

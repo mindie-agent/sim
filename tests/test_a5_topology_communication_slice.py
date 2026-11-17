@@ -235,8 +235,13 @@ def test_public_a5_graph_same_traffic_different_sharing_domains():
     assert any("intra_4p" in name for name in server)
     assert any("intra_node" in name for name in server)
     assert not any("intra_4p" in name for name in pod)
-    assert (reports["a5_server"]["execution"]["serviced"]["link:d2d_intra_4p:0:tx:port0"]
-            == reports["a5_pod"]["execution"]["serviced"]["link:d2d_intra_node:0:tx:port0"])
+    # M2 names directed per-pair UB resources; a pair is counted once and the
+    # same 8 MB directed transfer has the same service in both sharing domains.
+    assert not any(":tx:port" in name or ":rx:port" in name
+                   for name in server | pod)
+    assert all(":pair" in name for name in server | pod)
+    assert (reports["a5_server"]["execution"]["serviced"]["link:d2d_intra_4p:0:pair0>1"]
+            == reports["a5_pod"]["execution"]["serviced"]["link:d2d_intra_node:0:pair0>1"])
     assert reports["a5_server"]["duration_ms"] != reports["a5_pod"]["duration_ms"]
 
 
@@ -259,9 +264,11 @@ def test_public_direct_peer_graph_exposes_chunk_pipeline_and_unknowns():
     assert row["communication"]["unknowns"] == {
         "protocol_startup_us": "not_declared; no startup gate submitted"}
     assert report["execution"]["live_tasks"] == 0
+    # Each directed pair carries one 8 MB payload; M2 charges the pair once
+    # instead of separate TX and RX port aliases.
     assert sum(value for name, value in report["execution"]["serviced"].items()
                if name.startswith("link:")) == pytest.approx(
-                   2 * 8 * 8 * 1024 * 1024)
+                   8 * 8 * 1024 * 1024)
 
 
 def test_native_hccl_lowering_uses_declared_transport_chunks():

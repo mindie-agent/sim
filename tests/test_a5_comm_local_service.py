@@ -1081,13 +1081,18 @@ def test_public_stage_entry_binds_normalized_service_and_shares_link():
         raw, (operation,),
         recipes=RecipeBook({operation.recipe: stage.resource_service}),
     )["operators"][0]
-    assert single["duration_ms"] == pytest.approx(0.0306)
+    assert single["duration_ms"] == pytest.approx(0.10200000000000001)
     model = single["basis"]["service_models"][0]
     assert model["provenance"]["service_work_scope"] == "aggregate"
     assert model["provenance"]["normalized_fixed_us"] == pytest.approx(2.0)
     assert model["provenance"]["aggregate_cap_work_per_ms"] == pytest.approx(
         96_000)
-    assert len(single["declared_service"]) == 16
+    # M2 uses directional per-pair UB resources, not per-port TX/RX aliases.
+    # Eight ranks make eight directed pairs and each pair is charged once.
+    expected_pairs = {
+        f"link:d2d_intra_node:0:pair{rank}>{(rank + 1) % 8}"
+        for rank in range(8)}
+    assert set(single["declared_service"]) == expected_pairs
     assert set(single["declared_service"].values()) == {1536.0}
 
     shared = operator_costs(
@@ -1099,8 +1104,8 @@ def test_public_stage_entry_binds_normalized_service_and_shares_link():
     )["operators"]
     assert len(shared) == 1
     assert shared[0]["occurrences"] == 2
-    assert shared[0]["duration_ms"] == pytest.approx(0.0306)
-    assert shared[0]["total_ms"] == pytest.approx(0.0612)
+    assert shared[0]["duration_ms"] == pytest.approx(0.10200000000000001)
+    assert shared[0]["total_ms"] == pytest.approx(0.20400000000000001)
 
 
 def test_same_engine_shared_link_and_reverse_independent():

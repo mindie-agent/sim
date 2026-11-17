@@ -1,6 +1,8 @@
 """Resource identity separates repeat instances from different physical work."""
 from dataclasses import replace
 
+import pytest
+
 from mindie_sim.catalog.ops import vector_op
 from mindie_sim.structure import export_op_structure
 from mindie_sim.structure_physical import node_physical
@@ -94,7 +96,8 @@ def test_semantic_recipe_labels_share_fallback_but_explicit_invocations_do_not()
     assert node_physical(first, recipe_bindings=bindings) != node_physical(
         second, recipe_bindings=bindings)
     changed = operator_costs(declared, [first, second])["operators"]
-    assert changed[0]["duration_ms"] == changed[1]["duration_ms"] + 1
+    assert changed[0]["duration_ms"] == pytest.approx(
+        changed[1]["duration_ms"] + 1, rel=1e-12, abs=1e-12)
 
 
 def test_family_service_identity_still_distinguishes_kernel_recipe_names():
@@ -125,7 +128,7 @@ def test_catalog_matrix_roles_share_only_an_unbound_selected_program():
         metadata=tuple({**dict(first.metadata), "semantic_family": "gate_up_projection",
                         "quant_category": "shared_expert", "catalog_category": "shared_expert"}.items()))
     assert node_physical(first) == node_physical(second)
-    explicit = {"families": {"gate_up_projection": {"kind": "envelope"}}}
+    explicit = {"families": {"gate_up_projection": {"kind": "steady_matmul"}}}
     book = RecipeBook.from_mapping(explicit)
     assert type(book.select(first)) is not type(book.select(second))
     assert node_physical(first, recipe_bindings=explicit) != node_physical(

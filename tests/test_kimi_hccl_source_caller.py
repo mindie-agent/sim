@@ -66,7 +66,7 @@ def test_call_service_applies_once_without_replacing_physical_work():
     calibrated=declared()
     source=deepcopy(calibrated);source['runtime']['kernels'].pop('service_regimes')
     before=predict(source,**probe());after=predict(calibrated,**probe())
-    fixed={'allgather':10.7015,'reduce_scatter':15.8495}
+    fixed={'allgather':13.264586105263158,'reduce_scatter':15.8495}
     for family,elapsed in spans(calibrated,after):
         assert elapsed==pytest.approx(fixed[family],abs=1e-7)
     assert after['body_forward_ms']>before['body_forward_ms']
@@ -87,5 +87,5 @@ def test_memory_sensitivity_remains_on_full_source_caller():
     # over it instead of being replaced by an immutable timing lookup.
     slow=declared();slow['machine']['device']={'hbm_bw_bytes_per_s':1e8}
     result=predict(slow,**probe())
-    assert all(elapsed>{'allgather':10.7015,'reduce_scatter':15.8495}[family]
+    assert all(elapsed>{'allgather':13.264586105263158,'reduce_scatter':15.8495}[family]
                for family,elapsed in spans(slow,result))

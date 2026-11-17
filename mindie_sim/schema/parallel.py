@@ -526,8 +526,10 @@ class ParallelSpec:
         if self.cp > 1:
             if self.cp > self.tp or self.tp % self.cp != 0:
                 raise ModelingError(f"dcp_subdivides_tp:{self.cp}!|{self.tp}")
-        if self.ep > 1 and model.num_experts and model.num_experts % self.ep != 0:
-            raise ModelingError(f"experts_not_divisible_by_ep:{model.num_experts}%{self.ep}")
+        # ``E % EP != 0`` is a legal placement.  The physical slot plan owns the
+        # ceil(E/EP) base slots plus automatic padding copies, so a nondivisible
+        # expert population never drops a logical expert and never needs a
+        # global divisibility rejection here.
         if layer_partition is None:
             if model.layers % self.pp != 0:
                 raise ModelingError(

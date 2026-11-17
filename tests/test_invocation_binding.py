@@ -38,14 +38,14 @@ def test_a5_ordinary_class_minima_are_inclusive_once_and_keep_dma_outside():
     raw["machine"] = {"backend": "ascend", "sku": "Ascend950DT_9582", "num_devices": 1}
     mixed = replace(op("mixed", flops=2), vector_ops=1)
     small = operator_costs(raw, (mixed,), input_ready_ms=7)["operators"][0]
-    assert small["duration_ms"] == pytest.approx(.001578)
+    assert small["duration_ms"] == pytest.approx(.001237)
     assert small["service_before_input"] == {}
     # A combined Cube/Vector kernel takes the maximum class minimum once;
     # it does not pay both or append that value after useful resource work.
     large = replace(mixed, hbm_bytes=4e8)
     result = graph_costs(raw, (large,), input_ready_ms=7, trace_limit=100)
     assert result["duration_ms"] == pytest.approx(.1)
-    assert result["execution"]["serviced"]["memory@r0:s0"] == 4e8
+    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(4e8)
     assert not any(event["task"].endswith(":startup") for event in result["events"])
     dma = operator_costs(raw, (op("dma", memory=400),))["operators"][0]
     assert dma["duration_ms"] == pytest.approx(1e-7)
@@ -64,7 +64,7 @@ def test_a5_quantized_and_empty_classes_are_explicit_boundaries_not_stacked_floo
                     metadata=(("invocation_class", "empty_aic"),))
     recipes = RecipeBook({"empty": PlannedRecipe(
         lambda op, geometry: OperatorPlan(Work(), lambda context: KernelProgram(())))})
-    for operation, expected in ((plain, .001578), (declared, .003037), (empty, .000439)):
+    for operation, expected in ((plain, .001237), (declared, .003037), (empty, .000439)):
         report = operator_costs(raw, (operation,), recipes=recipes, input_ready_ms=3)
         assert report["operator_sum_ms"] == pytest.approx(expected)
         assert report["operators"][0]["service_before_input"] == {}

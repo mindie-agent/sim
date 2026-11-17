@@ -130,7 +130,9 @@ def test_documented_recommendations_replace_catalog_fp8_but_preserve_explicit_qu
     options = dict(hardware="a5", tp=8, layers=4)
     raw_model = compose_case("qwen3.5-397b-a17b", **options)["model"]
     raw_model["quant"] = compose_case("deepseek-v3", **options)["model"]["quant"]
-    baseline = compose_case(raw_model, **options)
+    # ``va_recommended=None`` is the production default, so an explicit
+    # no-recommendation baseline must say so.
+    baseline = compose_case(raw_model, **options, va_recommended=False)
     assert baseline["model"]["quant"]["weight_block"] == [128, 128]
     recommended = compose_case(raw_model, **options, va_recommended=True)
     quant = recommended["model"]["quant"]
@@ -147,7 +149,7 @@ def test_documented_recommendations_replace_catalog_fp8_but_preserve_explicit_qu
 @pytest.mark.parametrize("model", ["deepseek-v3", "deepseek-v4-pro", "glm-5.3", "kimi-k3"])
 def test_unconfirmed_a5_profile_keeps_catalog_quantization(model):
     options = dict(hardware="a5", tp=8, layers=4)
-    baseline = compose_case(model, **options)
+    baseline = compose_case(model, **options, va_recommended=False)
     recommended = compose_case(model, **options, va_recommended=True)
     assert recommended["model"]["quant"] == baseline["model"]["quant"]
     profile = recommended["runtime"]["metadata"]["va_profile"]

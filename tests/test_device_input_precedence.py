@@ -79,7 +79,8 @@ def test_native_compute_transfer_and_capacity_override_profile_at_the_boundary()
         "aic_count": 8, "l1_bytes": 65536,
     })
     matrix = op("compute", flops=1e9)
-    transfer = replace(op("inner"), metadata=(("resource_work", {"mte1": 4e9}),))
+    transfer = replace(op("inner"), family="transfer",
+                      metadata=(("resource_work", {"mte1": 4e9}),))
     assert operator_costs(raw, (matrix,))["operator_sum_ms"] == 1
     assert operator_costs(raw, (transfer,))["operator_sum_ms"] == 2
     machine = Hardware.from_mapping(raw["machine"])

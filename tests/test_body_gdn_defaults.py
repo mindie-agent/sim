@@ -34,7 +34,8 @@ def test_plain_body_executes_caller_copies_and_separate_source_programs(sku, que
 
 def test_explicit_program_and_unsupported_precision_keep_their_existing_execution():
     raw = case("Ascend950DT_9582")
-    raw["runtime"]["kernels"] = {"families": {"gdn_gating": {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"families": {"gdn_gating": {
+        "kind": "tiled_pointwise", "input_bytes_per_element": 2, "outputs": []}}}
     explicit = predict(raw, scope="body", tokens=4, context=128)
     assert not any(row["recipe"] == "ascend_gdn_decode_gating" for row in explicit["timeline"])
     assert explicit["default_mechanisms"]["selections"][0]["reason"] == "explicit_implementation_preserved"
@@ -63,7 +64,7 @@ def test_prefill_does_not_install_a_decode_caller_and_explicit_options_retain_pr
 
 def test_explicit_per_request_recurrence_survives_body_caller_selection():
     raw = case("Ascend950DT_9582")
-    raw["runtime"]["kernels"] = {"recipes": {"recurrent_scan0": {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"recipes": {"recurrent_scan0": {"kind": "recurrent_vector"}}}
     result = predict(raw, scope="body", tokens=4, context=128, sequences=2)
     recipes = [row["recipe"] for row in result["timeline"]]
     assert "recurrent_scan0" in recipes

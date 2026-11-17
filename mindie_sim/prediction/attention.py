@@ -335,7 +335,11 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     width = plan.head_dim
     key_fmt, value_fmt, cache_regions, shared_format = _gqa_formats(model)
     shared = 0 <= plan.kv_owner_layer_id < plan.index
-    kv_planes = 1 if plan.k_eq_v else 2
+    # ``k_eq_v`` shares the *projection weight*; it never shares the post-norm /
+    # post-RoPE cache tensor.  K and V are distinct planes for store, read and
+    # PCP gather, so capacity and execution bytes conserve.
+    projection_planes = ONE if plan.k_eq_v else TWO
+    cache_planes = TWO
     projected_kv_heads = 0 if shared else kv_heads
     configured_recipes = runtime.kernels.get("recipes", {}) if runtime else {}
     if mode in {"decode", "draft"} and "flash_attention_decode" in configured_recipes:
@@ -350,7 +354,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     q_width = plan.q_projection_width(heads, width)
     qkv = gemm_op(
         op_id=prefix + ".qkv", deps=(deps,), stage=stage, layer=plan.index,
-        requests=requests, m=padded_tokens, n=q_width + kv_planes * projected_kv_heads * width,
+        requests=requests, m=padded_tokens, n=q_width + projection_planes * projected_kv_heads * width,
         k=model.hidden_size, quant=quant, category="attn.qkv", phase=mode,
         family="qkv_projection", recipe="qkv_projection",
     )
@@ -392,7 +396,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         split_copies = [
             _qkv_output_copy(qkv, split_views[name], name, model.activation_dtype)
             for name in ("value", "gate")
-            if name in split_views and (name != "value" or (not shared and not plan.k_eq_v))
+            if name in split_views and (name != "value" or not shared)
         ]
         ops.extend(split_copies)
     rope = vector_op(
@@ -403,8 +407,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     )
     valid = sum(view.q_len for view in views)
     store_ready = rope.op_id
-    value_ready = (split_copies[0].op_id if split_copies and not shared and not plan.k_eq_v
-                   else None)
+    value_ready = (split_copies[VALUE_COPY].op_id
+                   if split_copies and not shared else None)
     pcp_prefill = not shared and parallel.pcp > 1 and any(v.phase == "prefill" for v in views)
     if pcp_prefill:
         gather = comm_op(
@@ -412,9 +416,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             deps=(rope.op_id, value_ready) if value_ready else (rope.op_id,),
             stage=stage, layer=plan.index,
             requests=requests, family="allgather", phase=mode, recipe="pcp_kv_gather",
-            link_bytes=kv_planes * kv_heads * width * dtype_bytes(quant.kv_dtype)
+            link_bytes=cache_planes * kv_heads * width * dtype_bytes(quant.kv_dtype)
                        * sum(v.global_q_len or v.q_len for v in views if v.phase == "prefill")
-                       * (parallel.pcp - 1) / parallel.pcp,
+                       * (parallel.pcp - ONE) / parallel.pcp,
             shape=(valid, kv_heads, width), metadata=(("group_axis", "pcp"),))
         ops.append(gather)
         store_ready = gather.op_id
@@ -448,7 +452,7 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     elif shared_format:
         store_ids = (_store_cache(
             ops, prefix=prefix, deps=store_deps, rows=store_rows,
-            width=(ONE if plan.k_eq_v else TWO) * kv_heads * width, region="gqa_kv",
+            width=cache_planes * kv_heads * width, region="gqa_kv",
             stage=stage, layer=plan.index, requests=requests, phase=mode,
             model=model, views=views, kv_heads=kv_heads, head_width=width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt,
@@ -459,15 +463,12 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             region="gqa_kv_key", name="cache_key", stage=stage, layer=plan.index, requests=requests,
             phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
             parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
-        if plan.k_eq_v:
-            store_ids = (key_store,)
-        else:
-            value_store = _store_cache(
-                ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
-                region="gqa_kv_value", name="cache_value", stage=stage, layer=plan.index, requests=requests,
-                phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
-                parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
-            store_ids = (key_store, value_store)
+        value_store = _store_cache(
+            ops, prefix=prefix, deps=store_deps, rows=store_rows, width=kv_heads * width,
+            region="gqa_kv_value", name="cache_value", stage=stage, layer=plan.index, requests=requests,
+            phase=mode, model=model, views=views, kv_heads=kv_heads, head_width=width,
+            parallel=parallel, quant=quant, key_fmt=key_fmt, value_fmt=value_fmt, shared_format=False)
+        store_ids = (key_store, value_store)
     plans = model.layer_plans
     idx_raw, sel_raw = int(plan.index_k_owner_layer_id), int(plan.topk_owner_layer_id)
     if plan.indexer:
@@ -573,8 +574,8 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
     attention_deps = (*store_ids, topk_id) if topk_id else store_ids
     streams = kv_heads if policy.reuse_kv_across_query_heads else heads
     kv_row_bytes = (
-        key_fmt.row_bytes((ONE if plan.k_eq_v else TWO) * streams * width)
-        if shared_format else key_fmt.row_bytes(streams * width) if plan.k_eq_v
+        key_fmt.row_bytes(cache_planes * streams * width)
+        if shared_format
         else key_fmt.row_bytes(streams * width) + value_fmt.row_bytes(streams * width)
     )
     user_pinned_attn = (
@@ -849,6 +850,9 @@ def gqa(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                            index_store_id=index_store_id, topk_id=topk_id,
                            candidate_id=candidate_id)
 
+
+#: Index of the value copy inside the emitted split-copy list.
+VALUE_COPY = 0
 
 ATTENTION_BUILDERS = {
     "gqa": gqa, "mla": mla, "gdn": linear, "kda": linear,

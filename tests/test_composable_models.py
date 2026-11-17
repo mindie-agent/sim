@@ -222,7 +222,7 @@ def test_all_architecture_presets_reach_real_frontend_and_engine(key):
     one = replace(model, layers=1, body_layers=1, layer_plans=model.layer_plans[:1], auxiliary=None)
     raw = run_case(one.to_dict(), prompt=1, output=1)
     raw["machine"]["device"]["memory_bytes"] = 10**15
-    raw["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"programs": {"matmul": {"kind": "steady_matmul"}}}
     graph = graph_costs(raw, target_graphs(raw, phase="prefill", tokens=1), isolated=False)
     assert graph["duration_ms"] > 0
     assert graph["model_coverage"] == "partial"

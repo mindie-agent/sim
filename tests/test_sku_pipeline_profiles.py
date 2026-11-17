@@ -243,8 +243,10 @@ def test_a5_hardware_uses_arch3510_units_modes_and_retains_sku_memory(sku):
 
     expected = {
         "mte1": 256 * aic * clock,
-        "mte2_aic": 80 * aic * clock,
-        "mte2_aiv": 40 * aiv * clock,
+        # DAV_3510 M2: AIC MTE2 DRAM service is 13.5168 TB/s on 9581/9582
+        # and 13.1072 TB/s on 9579.
+        "mte2_aic": (13.1072e12 if sku == "Ascend950PR_9579" else 13.5168e12),
+        "mte2_aiv": (6.5536e12 if sku == "Ascend950PR_9579" else 6.7584e12),
         "mte3": 128 * aiv * clock,
         "fixpipe": 128 * aic * clock,
         "reg_data_writes": 2 * aiv * clock,
@@ -315,8 +317,8 @@ def test_a5_capacity_and_ub_mesh_link_are_preserved():
     assert buffers == A5_BUFFERS
     links = {link.name: link for link in hardware.links}
     link = links["d2d_intra_node:0"]
-    assert link.capacity_bytes_per_ms == pytest.approx(392 * 1e6)
-    assert link.latency_us == pytest.approx(1.8)
+    assert link.capacity_bytes_per_ms == pytest.approx(47.5 * 1e6)
+    assert link.latency_us == pytest.approx(12.0)
     assert link.members == (0, 1)
 
 

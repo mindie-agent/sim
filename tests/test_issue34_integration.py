@@ -15,9 +15,10 @@ from mindie_sim.schema.operators import IterationWork, OpSpec
 def linear_work(plan, model, runtime, machine, **_):
     tokens = sum(view.q_len for view in plan.requests)
     shape = (tokens,)
-    op = OpSpec("work", "gemm", "body", 0, 0,
+    op = OpSpec("work", "vector", "body", 0, 0,
                 tuple(view.request_id for view in plan.requests),
-                shape, shape, shape, shape, flops=tokens * 1.0e6, dtype="bf16")
+                shape, shape, shape, shape, flops=tokens * 1.0e6,
+                vector_ops=tokens * 1.0e6, dtype="bf16")
     return IterationWork((op,), plan, 1, tokens, tokens, None, "body", "issue34")
 
 

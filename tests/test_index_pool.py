@@ -126,9 +126,20 @@ def test_real_q6_buckets_scan_all_pools_and_keep_2051_capacity(batch):
     scanned = batch * sum((131201 + i) // 4 for i in range(1, 7))
     scores = ops['index_pool_scores']; meta = dict(scores.metadata)
     assert meta['scanned_pools'] == scanned
-    assert scores.flops == 0
+    # M2 charges the linear weighted-query contraction as matrix work; the
+    # coarse pre-M2 score op carried vector work only.
+    assert scores.flops == 2 * scanned * 128
     assert scores.vector_ops == 2 * scanned * 128
+    assert scores.flops == scores.vector_ops
+    assert scores.matrix_flops == (('bf16', 2 * scanned * 128),)
     assert meta['score_mode'] == 'linear_weighted_query'
+    assert meta['score_pool_row_bytes'] == 256
+    assert meta['score_unique_pool_rows'] == 4
+    assert meta['score_logical_pool_read_bytes'] == scanned * 256
+    assert meta['score_l2_hit_bytes'] == scanned * 256 - 4 * 256
+    assert meta['score_materialization'] == 'fused_ub_topk_no_gm_spill'
+    assert scores.hbm_bytes == scores.mte2_bytes
+    assert scores.mte3_bytes == 0
     assert ops['index_pool_topk'].local_shape == (batch * 6, 512)
     assert ops['index_topk'].local_shape == (batch * 6, 2051)
     assert dict(ops['index_topk'].metadata)['selected_token_rows'] == batch * (6 * 2048 + 11)
