@@ -3,13 +3,17 @@
 [Role]
   Pin ``kimi-k3.1`` paired-SFA page sizing, the monotone 12-model four-level
   waterfall, single-PR What-If attribution, zero-edit JSON stack onboarding,
-  and the offline stack-PR audit helper.
+  model-support honesty, and the offline stack-PR audit helper.
 
 [Invariants]
   * ``merged`` is bitwise the documented vLLM-Ascend baseline; each subsequent
     level preserves the engine's physical work and only removes modeled traffic.
   * Waterfall ordering (``merged >= unmerged_pr >= expected_ideal >= 1.0x``)
     is asserted on real graph durations, never on stored expectations.
+  * Built-in stacks are only audited ``vllm-ascend`` and framework-neutral
+    ``raw_eager``; third-party stacks must declare real model support.
+  * ``supported_models`` gates ``merged``, ``unmerged_pr_models`` additionally
+    permits ``unmerged_pr``, and ``expected_ideal`` is never model-gated.
   * An explicit caller ``block_size`` is preserved so invalid pages still fail.
 
 [Timeouts & Locks]
@@ -36,6 +40,7 @@ from mindie_sim import (
     parse_case,
 )
 from mindie_sim.prediction.capacity import Memory
+from mindie_sim.stack_tracks import RUNTIME_STACKS
 
 FRONTIER_12 = (
     "deepseek-v3.2",
@@ -170,6 +175,73 @@ def test_custom_json_stack_manifest_onboarding_zero_python_edits(tmp_path: Path)
         item["ref"] == "jd-opensource/xllm#888"
         for item in report["waterfall"]["current_unmerged_pr"]["active_open_prs"]
     )
+
+
+def test_builtin_runtime_stacks_are_only_audited_vllm_ascend_and_raw_eager():
+    assert set(RUNTIME_STACKS) == {"vllm-ascend", "raw_eager"}
+
+
+def test_stack_manifest_model_support_honesty(tmp_path: Path):
+    manifest = {
+        "schema": "mindie-sim.stack-manifest/1",
+        "name": "custom-support-stack",
+        "repository": "jd-opensource/xllm",
+        "description": "Declares merged and open-PR model support explicitly",
+        "supported_models": ["deepseek-v3.2"],
+        "unmerged_pr_models": ["qwen3.8-flash-next"],
+        "bindings": [
+            {"mechanism_id": "aclgraph_decode_capture", "state": "merged",
+             "ref": "jd-opensource/xllm@main"},
+            {"mechanism_id": "add_rmsnorm_quant_fusion", "state": "merged",
+             "ref": "jd-opensource/xllm@main"},
+            {"mechanism_id": "gmm_swiglu_quant_fusion", "state": "unmerged_pr",
+             "ref": "jd-opensource/xllm#888"},
+        ],
+    }
+    manifest_path = tmp_path / "support_stack.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+
+    profile = load_runtime_stack_manifest(manifest_path)
+    assert profile.supported_models == ("deepseek-v3.2",)
+    assert profile.unmerged_pr_models == ("qwen3.8-flash-next",)
+    serialized = profile.to_dict()
+    assert serialized["supported_models"] == ["deepseek-v3.2"]
+    assert serialized["unmerged_pr_models"] == ["qwen3.8-flash-next"]
+    roundtrip = load_runtime_stack_manifest(serialized)
+    assert roundtrip.supported_models == profile.supported_models
+    assert roundtrip.unmerged_pr_models == profile.unmerged_pr_models
+
+    def _case(model: str, track: str) -> dict:
+        return compose_case(
+            model, hardware="a5", runtime_stack=manifest_path,
+            feature_track=track, tp=8, ep=8, num_devices=8, layers=4,
+        )
+
+    for track in ("merged", "unmerged_pr", "expected_ideal"):
+        report = _case("deepseek-v3.2", track)["runtime"]["metadata"][
+            "feature_track_report"]
+        assert report["stack"] == "custom-support-stack"
+        assert report["feature_track"] == track
+
+    with pytest.raises(ModelingError) as merged_error:
+        _case("qwen3.8-flash-next", "merged")
+    assert str(merged_error.value) == (
+        "model_not_supported_by_runtime_stack:"
+        "custom-support-stack:qwen3.8-flash-next:merged")
+    for track in ("unmerged_pr", "expected_ideal"):
+        report = _case("qwen3.8-flash-next", track)["runtime"]["metadata"][
+            "feature_track_report"]
+        assert report["feature_track"] == track
+
+    for track in ("merged", "unmerged_pr"):
+        with pytest.raises(ModelingError) as unsupported_error:
+            _case("deepseek-v4.1-flash", track)
+        assert str(unsupported_error.value) == (
+            "model_not_supported_by_runtime_stack:"
+            f"custom-support-stack:deepseek-v4.1-flash:{track}")
+    ideal_report = _case("deepseek-v4.1-flash", "expected_ideal")["runtime"][
+        "metadata"]["feature_track_report"]
+    assert ideal_report["feature_track"] == "expected_ideal"
 
 
 def test_audit_stack_prs_offline_fixture(tmp_path: Path):

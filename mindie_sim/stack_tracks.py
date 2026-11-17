@@ -1,16 +1,21 @@
 """Layer 2 pluggable RuntimeStackProfile registry and JSON manifest loader.
 
 [Role]
-  Map specific inference serving frameworks (``vllm-ascend``, ``mindie-llm``,
-  ``sglang``, ``raw_eager``, or user-supplied JSON manifests) onto universal
-  Layer-1 ``OptimizationMechanism`` IDs across three explicit states:
+  Map audited inference serving frameworks (built-in ``vllm-ascend`` and
+  ``raw_eager``, plus user-supplied JSON manifests) onto universal Layer-1
+  ``OptimizationMechanism`` IDs across three explicit states:
   ``merged`` -> ``unmerged_pr`` -> ``expected_ideal``.
 
 [Invariants]
+  * Built-in stacks are limited to audited ``vllm-ascend`` and framework-neutral
+    ``raw_eager``; third-party stacks are never shipped as placeholder profiles.
   * ``merged`` activates only mechanisms merged on the stack's main branch.
   * ``unmerged_pr`` activates ``merged`` plus open PRs registered on that stack.
   * ``expected_ideal`` is stack-neutral: it activates every structurally
-    eligible ``OptimizationMechanism`` for ``(model, hardware, parallel)``.
+    eligible ``OptimizationMechanism`` for ``(model, hardware, parallel)`` and is
+    never gated by a stack's ``supported_models`` declaration.
+  * A non-empty ``supported_models`` / ``unmerged_pr_models`` declaration is an
+    explicit model-support contract enforced for real stack tracks.
   * Explicit ``optimizations`` / ``exclude_optimizations`` overrides compose
     cleanly on top of any track for single-PR What-If A/B evaluation.
 
@@ -93,6 +98,12 @@ class RuntimeStackProfile:
     description: str = ""
     model_defaults: Mapping[str, Mapping[str, Any]] = field(default_factory=dict)
     bindings: tuple[StackMechanismBinding, ...] = ()
+    # Models supported by the stack's merged main branch. An empty tuple means
+    # unrestricted / structural-only (e.g. raw_eager or a vllm-ascend catalog
+    # fallback). A non-empty declaration is enforced as a real support contract.
+    supported_models: tuple[str, ...] = ()
+    # Models whose architecture onboarding is only in an open upstream PR.
+    unmerged_pr_models: tuple[str, ...] = ()
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -100,6 +111,8 @@ class RuntimeStackProfile:
             "name": self.name,
             "repository": self.repository,
             "description": self.description,
+            "supported_models": list(self.supported_models),
+            "unmerged_pr_models": list(self.unmerged_pr_models),
             "bindings": [b.to_dict() for b in self.bindings],
         }
 
@@ -158,6 +171,10 @@ def load_runtime_stack_manifest(source: str | Path | Mapping[str, Any]) -> Runti
         description=str(raw.get("description") or ""),
         model_defaults=dict(raw.get("model_defaults") or {}),
         bindings=bindings,
+        supported_models=tuple(
+            str(m).strip() for m in (raw.get("supported_models") or ())),
+        unmerged_pr_models=tuple(
+            str(m).strip() for m in (raw.get("unmerged_pr_models") or ())),
     )
 
 
@@ -189,6 +206,19 @@ def resolve_stack_track(
 ) -> dict[str, Any]:
     """Resolve active mechanisms, PR provenance, and unimplemented gaps."""
     canonical_track = normalize_feature_track(track)
+    if stack_profile.supported_models or stack_profile.unmerged_pr_models:
+        if canonical_track == "merged" and model_key not in stack_profile.supported_models:
+            raise ModelingError(
+                "model_not_supported_by_runtime_stack:"
+                f"{stack_profile.name}:{model_key}:merged")
+        if (canonical_track == "unmerged_pr"
+                and model_key not in stack_profile.supported_models
+                and model_key not in stack_profile.unmerged_pr_models):
+            raise ModelingError(
+                "model_not_supported_by_runtime_stack:"
+                f"{stack_profile.name}:{model_key}:unmerged_pr")
+        # ``expected_ideal`` is first-principles, stack-neutral modeling and is
+        # intentionally never blocked by an upstream stack's model support.
     include_ids = tuple(str(x).strip() for x in optimizations if str(x).strip())
     exclude_ids = frozenset(str(x).strip() for x in exclude_optimizations if str(x).strip())
     for mid in (*include_ids, *exclude_ids):
@@ -381,33 +411,6 @@ register_runtime_stack(RuntimeStackProfile(
                     "qwen3.8-flash-next", "kimi-k3.1"),
             notes="Multi-stream / MegaMoE shared-expert overlap (#22128, #21095, #21624)",
         ),
-    ),
-))
-
-register_runtime_stack(RuntimeStackProfile(
-    name="mindie-llm",
-    repository="Ascend/MindIE-LLM",
-    description="MindIE-LLM ATB graph runtime starter profile (extensible via JSON manifest)",
-    model_defaults=_VA_MODEL_DEFAULTS,
-    bindings=(
-        StackMechanismBinding("aclgraph_decode_capture", "merged", "Ascend/MindIE-LLM@master"),
-        StackMechanismBinding("sequence_parallel", "merged", "Ascend/MindIE-LLM@master"),
-        StackMechanismBinding("add_rmsnorm_quant_fusion", "merged", "Ascend/MindIE-LLM@master"),
-        StackMechanismBinding("mla_prolog_fusion", "merged", "Ascend/MindIE-LLM@master"),
-        StackMechanismBinding("activation_quant_fusion", "merged", "Ascend/MindIE-LLM@master"),
-        StackMechanismBinding("dynamic_mc2_dispatch", "merged", "Ascend/MindIE-LLM@master"),
-    ),
-))
-
-register_runtime_stack(RuntimeStackProfile(
-    name="sglang",
-    repository="sgl-project/sglang",
-    description="SGLang Ascend/NPU runtime starter profile (extensible via JSON manifest)",
-    model_defaults=_VA_MODEL_DEFAULTS,
-    bindings=(
-        StackMechanismBinding("aclgraph_decode_capture", "merged", "sgl-project/sglang@main"),
-        StackMechanismBinding("add_rmsnorm_quant_fusion", "merged", "sgl-project/sglang@main"),
-        StackMechanismBinding("recurrent_decode_native_kernels", "merged", "sgl-project/sglang@main"),
     ),
 ))
 

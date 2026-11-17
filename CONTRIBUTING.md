@@ -765,6 +765,36 @@ The simulator separates **what the hardware can do** from **what a serving stack
 
 `mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` prints the four-level waterfall (`current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`), and `--enable-opt` / `--disable-opt` isolate one mechanism for What-If A/B evaluation.
 
-1. **Pure JSON onboarding (zero Python changes)**: write a `mindie-sim.stack-manifest/1` document declaring `name`, `repository`, and `bindings` (`mechanism_id` from `list_optimization_mechanisms()`, `state: "merged" | "unmerged_pr"`, `ref: "<org>/<repo>#<PR>"`, optional `models` / `archs` / `options`), then pass `--stack-manifest my_stack.json` to `mindie-sim compose` or `mindie-sim feature-tracks` (or `runtime_stack="my_stack.json"` in Python).
+Built-in `RUNTIME_STACKS` are deliberately limited to two profiles:
+
+- `vllm-ascend` — audited against the real `vllm-project/vllm-ascend` `main` branch and open performance PRs;
+- `raw_eager` — the framework-neutral unfused PyTorch/ATen baseline with zero optional fusions.
+
+**Never register an unverified third-party stack as a built-in profile.** `mindie-llm`, `sglang`, `xllm`, and every other external framework onboard exclusively through a `mindie-sim.stack-manifest/1` JSON manifest or an explicit `register_runtime_stack(...)` in the contributor's own integration, and must declare the models they actually support:
+
+| Field | Meaning | Enforcement |
+| :--- | :--- | :--- |
+| `supported_models` | Models supported on the stack's **merged** `main` branch. Empty `()` means unrestricted / structural-only (e.g. `raw_eager`, or the `vllm-ascend` catalog fallback). | A non-empty list gates `merged` and also counts as supported on `unmerged_pr`. |
+| `unmerged_pr_models` | Models whose architecture onboarding itself is still an **open PR** on that stack. | A non-empty list additionally permits those models on `unmerged_pr`, never on `merged`. |
+
+With either field non-empty, `resolve_stack_track(...)` raises `model_not_supported_by_runtime_stack:<stack>:<model>:<track>` when a real stack track cannot serve the model. `expected_ideal` is **always** allowed: it is stack-neutral first-principles modeling and must never be blocked by an upstream framework's lack of model support.
+
+1. **Pure JSON onboarding (zero Python changes)**: write a `mindie-sim.stack-manifest/1` document declaring `name`, `repository`, optional `supported_models` / `unmerged_pr_models`, and `bindings` (`mechanism_id` from `list_optimization_mechanisms()`, `state: "merged" | "unmerged_pr"`, `ref: "<org>/<repo>#<PR>"`, optional `models` / `archs` / `options`), then pass `--stack-manifest my_stack.json` to `mindie-sim compose` or `mindie-sim feature-tracks` (or `runtime_stack="my_stack.json"` in Python). For example:
+
+   ```json
+   {
+     "schema": "mindie-sim.stack-manifest/1",
+     "name": "my-external-stack",
+     "repository": "my-org/my-stack",
+     "supported_models": ["deepseek-v3.2"],
+     "unmerged_pr_models": ["qwen3.8-flash-next"],
+     "bindings": [
+       {"mechanism_id": "aclgraph_decode_capture", "state": "merged",
+        "ref": "my-org/my-stack@main"}
+     ]
+   }
+   ```
+
+   Declare only models the stack has really implemented. An empty `supported_models` / `unmerged_pr_models` pair is reserved for unrestricted structural baselines; do not use it to claim unsupported third-party coverage.
 2. **Registering new physical mechanisms**: call `register_optimization_mechanism(OptimizationMechanism(...))` with real `OpSpec` / lowering-pass / `Software` transformations executed by the canonical engine. Never encode a latency multiplier; a mechanism must remove modeled traffic, fuse a declared boundary, or change a real `Software` field.
 3. **Syncing open vs merged PRs**: run `python3 scripts/audit_stack_prs.py --stack <name> --repo <owner/repo>` (or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.
