@@ -95,7 +95,7 @@ from .public import (
     simulate_service,
 )
 
-__version__ = "0.9.17"
+__version__ = "0.9.18"
 __all__ = [
     "observations",
     "predict", "predict_pd", "graph_costs", "operator_costs",

@@ -75,6 +75,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.11'
+          enable-cache: false
       - name: LF line endings
         run: python3 .github/scripts/check_lf_eol.py
       - name: Differential numeric literals
@@ -97,6 +98,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.11'
+          enable-cache: false
       - env:
           VIRTUAL_ENV: ${{ runner.temp }}/sim-venv
           UV_PROJECT_ENVIRONMENT: ${{ runner.temp }}/sim-venv
@@ -127,6 +129,7 @@ jobs:
       - uses: astral-sh/setup-uv@v6
         with:
           python-version: '3.11'
+          enable-cache: false
       - run: uv build
       - run: |
           uv venv /tmp/sim-wheel

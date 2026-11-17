@@ -798,3 +798,20 @@ With either field non-empty, `resolve_stack_track(...)` raises `model_not_suppor
    Declare only models the stack has really implemented. An empty `supported_models` / `unmerged_pr_models` pair is reserved for unrestricted structural baselines; do not use it to claim unsupported third-party coverage.
 2. **Registering new physical mechanisms**: call `register_optimization_mechanism(OptimizationMechanism(...))` with real `OpSpec` / lowering-pass / `Software` transformations executed by the canonical engine. Never encode a latency multiplier; a mechanism must remove modeled traffic, fuse a declared boundary, or change a real `Software` field.
 3. **Syncing open vs merged PRs**: run `python3 scripts/audit_stack_prs.py --stack <name> --repo <owner/repo>` (or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.
+
+---
+
+## 附：扁平同级 Worktree 工作流与 PR 设计原则门禁（`device-tool`）
+
+英文摘要请参阅 [CONTRIBUTING.en.md](CONTRIBUTING.en.md)。
+
+1. **扁平同级 + 独立链接 Worktree 开发流**：保持主检出目录停留在干净 `main`，在 `../.worktrees/` 下创建独立工作树开发：
+   ```bash
+   git -C ../sim fetch origin
+   git -C ../sim worktree add -b feat/<topic> ../.worktrees/sim-<topic> origin/main
+   ```
+2. **PR 设计原则门禁（`--profile device-tool`）**：所有 PR 须填写 [`.github/pull_request_template.md`](.github/pull_request_template.md) 并通过 `python3 .github/scripts/check_pr_checklist.py --profile device-tool`，逐项给出实证记录（纯文档变更可填写 `not-applicable: docs-only`）：
+   - `DEV-ZERO-CTX`：仿真、合成与目录解析路径绝不加载权重、动态导入 `torch_npu` 或初始化 NPU 上下文（`0 MiB` HBM 增量）。
+   - `DEV-READONLY-PATH`：分析与预测 CLI/API 不篡改输入产物、不泄漏宿主机 `$HOME`/内网 IP/镜像 SHA，并在捕获 `OSError` 前显式重抛 `TimeoutError`。
+   - `DEV-TOPOLOGY`：严格维护每 Die 唯一共享 `L2`（`buffer_units.l2 == 1`）、A2/A3 双 Die/A5 互联拓扑及核归属阶段工作量守恒（禁用 `ResourceEnvelope` 兜底）。
+   - `DEV-BOUNDED-MEM`：流式读取大抓包（`<= 512 MiB` 内存峰值）、核心模块 `< 800` 行且带四段式契约头、通过 `check_no_magic_numbers.py` 且全仓使用 Unix `LF`。

@@ -577,7 +577,7 @@ def test_round6_fallback_keeps_a_fake_host_sentinel(monkeypatch):
 def test_release_metadata_is_aligned_for_0_9_15():
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
     version = project["project"]["version"]
-    assert version == "0.9.17"
+    assert version == "0.9.18"
     assert mindie_sim.__version__ == version
     for name in ("sim-0.9.15.md", "sim-0.9.15.en.md",
                  f"sim-{version}.md", f"sim-{version}.en.md"):
