@@ -1,6 +1,6 @@
 # MC2 successful flag checks and token-owned slot reduction
 
-This change follows the [full-population PMU audit](kimi-mc2-pmu-source-audit.md)
+This change follows the [full-population PMU audit](../archive/operators/kimi-mc2-pmu-source-audit.md)
 without using any PMU duration as a model input. It changes the existing explicit
 `arch35_fullmesh` candidate, not the default generic collective.
 

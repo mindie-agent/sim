@@ -136,9 +136,9 @@ The separate32MiB MatMulV3 control takes11.471us while transferring useful
 weights; that duration is not an empty Cube floor. Neither the new stream
 cadence nor the roughly6–7us matrix residual sets a device startup. Such a
 residual can identify a refinement priority without identifying a parameter.
-See [the independent boundary audit](operators/a5-microbench-boundary-review.md).
+See [the independent boundary audit](archive/operators/a5-microbench-boundary-review.md).
 
-The newer [tiny Cube audit](operators/a5-tiny-cube-boundary-review.md) also
+The newer [tiny Cube audit](archive/operators/a5-tiny-cube-boundary-review.md) also
 provides `w8a8_nd_bf16`: an inclusive3.037us minimum for INT8 ND operands,
 FP32 per-token and per-channel scales, and BF16 output in one MIX_AIC kernel.
 The enclosing operator can select it through

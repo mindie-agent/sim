@@ -4,7 +4,7 @@ Development-run reports cited below are historical context and are not shipped. 
 
 The selected gate/up and grouped-down MSD programs now execute their matrix
 phase through the shared steady matrix pipeline. This fixes the zero-MTE1
-omission identified in the [GLM Decode audit](glm-decode-grouped-audit.md).
+omission identified in the [GLM Decode audit](../archive/operators/glm-decode-grouped-audit.md).
 It does not resolve the large scalar/control discrepancy in that capture.
 
 `w4a8_matrix.py` streams the source's rolling owner rectangles. Each active
