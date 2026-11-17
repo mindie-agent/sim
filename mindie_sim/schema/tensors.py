@@ -6,7 +6,7 @@
 [Timeouts & Locks] O(rank) metadata operations, no device contexts or locks.
 [Side-Effect Policy] Immutable metadata only; never allocates tensor payloads.
 """
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from math import prod
 from typing import Any
 
@@ -95,7 +95,11 @@ class TensorLayout:
         return replace(self, shape=shape, strides=tuple(strides))
 
     def to_dict(self):
-        return asdict(self)
+        # Direct projection: ``dataclasses.asdict`` recurses through every
+        # declared field (53k calls for one 92-layer model) only to copy tuple
+        # values verbatim.  The layout is two tuples and two integers.
+        return {"shape": self.shape, "strides": self.strides,
+                "offset": self.offset, "storage_shape": self.storage_shape}
 
 
 @dataclass(frozen=True)

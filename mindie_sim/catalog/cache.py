@@ -188,7 +188,8 @@ def index_k_store_rows(
 
 
 def local_kv_heads(num_kv_heads: int, tp: int) -> int:
-    return max(1, int(math.ceil(int(num_kv_heads) / max(1, int(tp)))))
+    from mindie_sim.schema.parallel import local_kv_heads as _heads
+    return _heads(num_kv_heads, tp)
 
 
 def _quant(model: Any) -> Any:
@@ -274,7 +275,7 @@ def cache_component_split(
     if component in {"mla_kv", "window", "compressed_kv"}:
         payload, scale = cache_row_split(model, component, plan.cache_row_elements)
     elif component == "gqa_kv":
-        width = (ONE if plan.k_eq_v else TWO) * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
+        width = TWO * local_kv_heads(plan.num_kv_heads, parallel.tp) * plan.head_dim
         payload, scale = cache_row_split(model, "gqa_kv", width)
     elif component == "index_k":
         raw = dict(getattr(model, "metadata", ())).get("cache_representations", {})
@@ -505,7 +506,7 @@ def layer_cache_components(model, plan, parallel, sequence_tokens, *, capacity_p
     if plan.attention in {"gqa", "projection_only"}:
         if not ZERO <= plan.kv_owner_layer_id < plan.index:
             rows = min(seq, plan.window) if plan.window else seq
-            width = (ONE if plan.k_eq_v else TWO) * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
+            width = TWO * local_kv_heads(plan.num_kv_heads, tp) * plan.head_dim
             result["gqa_kv"] = local_rows(rows) * cache_format(
                 model, "gqa_kv").row_bytes(width)
     elif plan.attention != "mla":

@@ -482,16 +482,20 @@ def test_mixed_dt_pr_does_not_leak_dt_register_or_pipe_services():
         "devices": [{"sku": DT_9581}, {"sku": PR_9579}],
     })
     dt, pr = hardware.dies
-    # DT-only register/pipe services must not appear in PR's separately
-    # materialized profile.
+    # PR declares the same register/pipe families with its own HBM supply:
+    # 1.6 TB/s / 64 AIV / 128 B = 195312500 cachelines/s/AIV, not DT's rate.
     for role in ("pipe_v_lanes", "pipe_v_issue", "pipe_s_issue",
                  "ub_read_bytes", "ub_write_bytes", "gm_hbm_cacheline_128b"):
         assert role in dict(dt.rates)
-        assert role not in dict(pr.rates)
-    assert "get_sff_value_u64_i64" not in dict(pr.service_modes)
+        assert role in dict(pr.rates)
+    assert "get_sff_value_u64_i64" in dict(pr.service_modes)
+    service = next(item for item in pr.capability.instruction_services
+                   if item.name == "gm_hbm_cacheline_128b")
+    assert service.per_owner_rate == pytest.approx(195312500.0)
+    assert dict(pr.rates)["gm_hbm_cacheline_128b"] == pytest.approx(12.5e9)
     assert dict(pr.rates) == dict(base_pr.rates)
     assert dict(pr.service_modes) == dict(base_pr.service_modes)
-    assert pr.capability.instruction_services == ()
+    assert pr.capability.instruction_services
     assert pr.launch_us == pytest.approx(7.0)
 
 
@@ -1064,7 +1068,8 @@ def test_hardware_context_exposes_one_placement_without_model_inputs():
     assert dt["memory_bytes"] != pr["memory_bytes"]
     assert "model" not in dt and "workload" not in dt and "duration_ms" not in dt
     assert "gm_hbm_cacheline_128b" in dt["rates"]
-    assert "gm_hbm_cacheline_128b" not in pr["rates"]
+    # PR declares the same line service; the aggregate rate is HBM/128B.
+    assert pr["rates"]["gm_hbm_cacheline_128b"] == pytest.approx(12.5e9)
     with pytest.raises(ModelingError, match="hardware_placement_unknown"):
         mixed.hardware_context(9)
 

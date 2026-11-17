@@ -7,7 +7,7 @@ from mindie_sim import operator_costs
 from mindie_sim.prediction.cost import CostModel
 from mindie_sim.prediction.execution import Execution
 from mindie_sim.prediction.lowering import Builder
-from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.prediction.program import RecipeBook, TransferRecipe
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.tensors import TensorLowering
 from mindie_sim.schema.operators import IterationWork
@@ -160,16 +160,6 @@ def test_same_dtype_copy_has_one_outer_vector_invocation_even_with_many_tiles(st
     assert sum(e["task"].endswith(":startup") for e in engine.trace) == 1
 
 
-def test_default_generic_gpu_copy_does_not_acquire_aiv_class():
-    parsed = parse_case(hardware_case())
-    _, ops = tensor_ops(parsed)
-    book = RecipeBook.from_mapping(parsed.runtime.kernels)
-    assert isinstance(book.select(ops[0]), ResourceEnvelope)
-    result = operator_costs(parsed, ops)["operators"][0]
-    assert result["serviced"] == {"memory@r0:s0": 768}
-    assert "program_execution" not in result["operator"]["metadata"]
-
-
 def test_selecting_tensor_copy_family_does_not_reclassify_other_dma():
     from mindie_sim.schema.invocation import InvocationTiming
     parsed = case()
@@ -178,7 +168,7 @@ def test_selecting_tensor_copy_family_does_not_reclassify_other_dma():
     die = replace(parsed.machine.dies[0], kernel_invocations=(("vector", InvocationTiming(minimum_ms=10000)),))
     parsed = replace(parsed, machine=replace(parsed.machine, dies=(die,)))
     result = operator_costs(parsed, (dma,))["operators"][0]
-    assert result["program"] == "ResourceEnvelope"
+    assert result["program"] == "TransferRecipe"
     assert "invocation_models" not in result["basis"]
     assert result["serviced"]["mte2@r0:s0"] == 384
     assert "mte2_aiv@r0:s0" not in result["serviced"]

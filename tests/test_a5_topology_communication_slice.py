@@ -28,10 +28,6 @@ from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import (
     Topology, TransportOptions, chunk_sizes,
 )
-from mindie_sim.prediction.topology_tiers import (
-    analyze_ep_mc2_communication,
-    ep_alltoall_transport,
-)
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware, Link
 from mindie_sim.schema.parallel import ParallelSpec
@@ -191,30 +187,6 @@ def test_a5_placement_changes_route_and_span_for_identical_traffic():
     assert split_report["span_ms"] > flat_report["span_ms"]
 
 
-def test_a5_ep_same_hop_shared_domain_is_not_a_group_total_rate():
-    planned = {}
-    for semantics in ("per_port", "shared"):
-        spec = ep_alltoall_transport(
-            8, 1200, preset="a5_pcie_16p", semantics=semantics, chunk_bytes=300)
-        report, _ = _run(spec["plan"])
-        planned[semantics] = (spec, report)
-    assert all(flow["hops"] <= 1 for flow in planned["shared"][1]["flows"])
-    assert all(flow["hops"] <= 1 for flow in planned["per_port"][1]["flows"])
-    # Same peer flows and one hop; only the sharing domain changes.
-    assert planned["shared"][0]["plan"].ranks == planned["per_port"][0]["plan"].ranks
-    assert (planned["shared"][1]["service_lower_bound_ms"]
-            > planned["per_port"][1]["service_lower_bound_ms"])
-    # The shared service is the aggregate work on its binding resource,
-    # not a duration copied from a rank-group total.
-    shared = planned["shared"][1]
-    bottleneck = shared["bottleneck_resources"][0]
-    rate = next(resource.rate for resource in planned["shared"][0]["plan"].resources()
-                if resource.name == bottleneck)
-    assert (shared["service_lower_bound_ms"]
-            == pytest.approx(shared["shared_resource_work_bytes"] / rate))
-    assert shared["shared_resource_work_bytes"] < (
-        planned["shared"][0]["per_source_bytes"] * 8)
-
 
 def test_receive_credit_residency_changes_completion_without_new_work():
     baseline_full = _h4_plan("shared", capacity=None)
@@ -263,8 +235,13 @@ def test_public_a5_graph_same_traffic_different_sharing_domains():
     assert any("intra_4p" in name for name in server)
     assert any("intra_node" in name for name in server)
     assert not any("intra_4p" in name for name in pod)
-    assert (reports["a5_server"]["execution"]["serviced"]["link:d2d_intra_4p:0:tx:port0"]
-            == reports["a5_pod"]["execution"]["serviced"]["link:d2d_intra_node:0:tx:port0"])
+    # M2 names directed per-pair UB resources; a pair is counted once and the
+    # same 8 MB directed transfer has the same service in both sharing domains.
+    assert not any(":tx:port" in name or ":rx:port" in name
+                   for name in server | pod)
+    assert all(":pair" in name for name in server | pod)
+    assert (reports["a5_server"]["execution"]["serviced"]["link:d2d_intra_4p:0:pair0>1"]
+            == reports["a5_pod"]["execution"]["serviced"]["link:d2d_intra_node:0:pair0>1"])
     assert reports["a5_server"]["duration_ms"] != reports["a5_pod"]["duration_ms"]
 
 
@@ -287,9 +264,11 @@ def test_public_direct_peer_graph_exposes_chunk_pipeline_and_unknowns():
     assert row["communication"]["unknowns"] == {
         "protocol_startup_us": "not_declared; no startup gate submitted"}
     assert report["execution"]["live_tasks"] == 0
+    # Each directed pair carries one 8 MB payload; M2 charges the pair once
+    # instead of separate TX and RX port aliases.
     assert sum(value for name, value in report["execution"]["serviced"].items()
                if name.startswith("link:")) == pytest.approx(
-                   2 * 8 * 8 * 1024 * 1024)
+                   8 * 8 * 1024 * 1024)
 
 
 def test_native_hccl_lowering_uses_declared_transport_chunks():
@@ -404,15 +383,6 @@ def test_mc2_native_selection_preserves_explicit_chunk_and_records_unknowns():
     assert "transfer_chunk_bytes" in baseline.transport_unknowns()
 
 
-def test_ep_group_budget_records_its_boundary_and_unknowns():
-    analysis = analyze_ep_mc2_communication(ep_values=(8,), bw_utilizations=(1.0,))
-    assert analysis["coverage"] == (
-        "group_level_analytic_budget_not_a_topology_service_span")
-    assert "protocol_startup_us" in analysis["unknowns"]
-    assert analysis["startup_parameters"]["source"] == (
-        "caller_visible_analytic_inputs_not_T06_identified")
-    assert all("wire_service_lower_bound_ms" in row for row in analysis["rows"])
-
 
 def test_pd_handoff_credits_bound_receiver_residency_before_decode_consume():
     base = Hardware.from_mapping({
@@ -464,65 +434,6 @@ def test_nonuniform_moe_peer_chunks_conserve_each_directed_cell():
         assert sum(engine.serviced.values()) == pytest.approx(sum(map(sum, matrix)))
         assert all(event.done for event in events.values())
 
-
-def test_native_group2_opt_in_is_read_from_the_real_runtime_producer():
-    """QA0 F3 interface: the fixture must mirror the real FeatureConfig producer.
-
-    This only reads the producer/curve; it does not relax the predicate or
-    replace the AG/RS curve with a total-kernel price.
-    """
-    from types import SimpleNamespace
-    from mindie_sim.observations.a5_comm_golden import (
-        A5_NATIVE_GROUP2, a5_native_group2_curve_ms,
-    )
-    from mindie_sim.prediction.subgraphs.instantiate import (
-        FeatureConfig, _native_group2_declared,
-    )
-
-    digest = "sha256:" + "5" * 64
-    declaration = {
-        "schema": "mindie-sim/a5-native-group2/1",
-        "group_size": 2, "dtype": "bf16", "execution_core": "aicpu",
-        "stack": A5_NATIVE_GROUP2["stack"],
-        "cann": A5_NATIVE_GROUP2["cann"],
-        "image_id": digest,
-        "source_path": A5_NATIVE_GROUP2["source"],
-        "deployment_image_id": digest,
-        "deployment_cann": A5_NATIVE_GROUP2["cann"],
-        "primitives": ["all_gather", "reduce_scatter"],
-    }
-    raw = compose_case(
-        "qwen3.5-35b-a3b", hardware="Ascend950DT_9581",
-        tp=2, dp=1, ep=2, layers=1, prompt_tokens=8,
-        output_tokens=1, concurrency=1, sp=True)
-    raw["runtime"]["metadata"] = {
-        "image": "repo:cann9.2.0-r35", "image_id": digest,
-        "a5_native_group2": declaration,
-    }
-    parsed = parse_case(raw)
-    features = FeatureConfig.from_runtime(
-        parsed.runtime, parsed.model, machine=parsed.machine)
-    ctx = SimpleNamespace(tp=parsed.runtime.parallel.tp, features=features)
-    assert _native_group2_declared(ctx)
-
-    missing_path = {key: value for key, value in declaration.items()
-                    if key != "source_path"}
-    assert not _native_group2_declared(SimpleNamespace(
-        tp=2, features=replace(features, metadata=tuple({
-            **dict(features.metadata), "a5_native_group2": missing_path}.items()))))
-    assert not _native_group2_declared(SimpleNamespace(
-        tp=2, features=replace(features, metadata=tuple({
-            **dict(features.metadata), "a5_native_group2": {
-                **declaration, "deployment_image_id": "sha256:" + "0" * 64},
-        }.items()))))
-
-    # Exact measured support only; no all-reduce/all-to-all or out-of-range
-    # curve, and no fallback to a total-kernel aggregate.
-    assert a5_native_group2_curve_ms("all_gather", 32768) == pytest.approx(
-        0.041113)
-    assert a5_native_group2_curve_ms("all_gather", 10240) is None
-    assert a5_native_group2_curve_ms("all_reduce", 32768) is None
-    assert a5_native_group2_curve_ms("all_to_all", 32768) is None
 
 
 

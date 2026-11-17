@@ -51,6 +51,7 @@ SINGLE_STEP = 1
 MIN_WAIT_SECONDS = 0.0
 MISSING_MTIME_NS = 0
 DIGEST_HEX_LENGTH = 64
+NS_PER_SECOND = 1_000_000_000
 _LOCK_POLL_SECONDS = 0.01
 _BUSY_ERRNOS = {errno.EACCES, errno.EAGAIN, errno.EWOULDBLOCK, errno.EDEADLK}
 
@@ -156,9 +157,19 @@ def cache_lock(cache_dir: str | Path, *, timeout: float | None = None):
 
 
 def touch_artifact(path: Path) -> None:
-    """Best-effort mtime refresh; ``TimeoutError`` is never swallowed."""
+    """Refresh mtime on the artifact clock, never moving it backwards.
+
+    ``os.utime(path, None)`` uses ``UTIME_NOW``, which some network/overlay
+    filesystems evaluate on a coarser or slightly lagging clock than
+    ``time.time()``.  Retention sorts artifact mtimes written by callers that
+    stamp with ``time.time()``; an implicit refresh could then still look like
+    the oldest entry and be pruned while mapped.  An explicit stamp keeps both
+    writers on one clock, and the max guards against a backwards file clock.
+    """
     try:
-        os.utime(path, None)
+        current = _mtime_ns(path) / NS_PER_SECOND
+        stamp = max(time.time(), current)
+        os.utime(path, (stamp, stamp))
     except TimeoutError:
         raise
     except OSError:

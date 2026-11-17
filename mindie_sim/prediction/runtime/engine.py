@@ -69,6 +69,9 @@ def _stop_window(now: float, horizon: float, releases, latency_active, tasks) ->
     return dt
 
 
+DEADLINE_POLL_MASK = 255
+
+
 class Engine(
     _EnginePrepareMixin, _EngineSubmitMixin, _EngineLifecycleMixin,
     _EnginePeriodicMixin, _EnginePairCachedMixin, _EnginePairFastMixin,
@@ -309,6 +312,10 @@ class Engine(
         _heappush = heapq.heappush
         _inf = math.inf
         while True:
+            if (steps & DEADLINE_POLL_MASK) == 0:
+                from ..evaluation import ACTIVE_DEADLINE_MONO, check_active_deadline
+                if ACTIVE_DEADLINE_MONO.get() is not None:
+                    check_active_deadline()
             accel = self._accel
             if accel is not None and accel.start_conflict(self, until_tuple):
                 accel.disable(self, "start_boundary")

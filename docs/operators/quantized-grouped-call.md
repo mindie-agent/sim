@@ -25,7 +25,7 @@ timing fit is copied.
 Producer:
 
 ```text
-/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py
+repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py
 sha256 e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a
 ```
 
@@ -113,7 +113,7 @@ The retained layout domain is checked against the INT8 layout validation in
 the local open-source GMM implementation:
 
 ```text
-/Users/maoxx241/code/vllm-ascend/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h
+repository://vllm-ascend/csrc/gmm/grouped_matmul_swiglu_quant_v2/op_host/op_api/gmm_dsq_base.h
 sha256 08e07b078ca73626df3a135bff230c9b7b61108b235e0f98f22420f4c94f9733
 ```
 
@@ -123,7 +123,7 @@ and `K % 16 == 0`. The same INT8 block extents occur in the plain grouped
 A8W8O16 reference executor:
 
 ```text
-/Users/maoxx241/code/refs/ops-transformer/gmm/grouped_matmul/tests/st/aclnnGroupedMatmulV5_A8W8O16/executor_aclnnGroupedMatmulV5_A8W8O16.py
+repository://refs/ops-transformer/gmm/grouped_matmul/tests/st/aclnnGroupedMatmulV5_A8W8O16/executor_aclnnGroupedMatmulV5_A8W8O16.py
 sha256 aabac587d789d6cce4a3284f7b6e59867357269027d3138771465fd89e321896
 ```
 
@@ -227,7 +227,7 @@ condition id, canary, samples and `unassigned` role unchanged in
 Focused command (provided interpreter, repository cwd):
 
 ```sh
-/Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python -m pytest -q \
+repository://sim-rewrite-20261027/.venv/bin/python -m pytest -q \
   tests/test_quantized_grouped_call.py tests/test_call_alignment.py \
   tests/test_capture_adapters.py tests/test_matrix_epilogue.py
 ```

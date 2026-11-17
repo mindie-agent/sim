@@ -18,7 +18,7 @@ An explicit sequence-parallel declaration is also required. The supported caller
 
 ## Source contract
 
-The source checkout is `/Users/maoxx241/code/vllm-ascend-v4-default-comm`. At that revision:
+The source checkout is `repository://vllm-ascend-v4-default-comm`. At that revision:
 
 - `ascend_forward_context.py:217–226` separates allocated/padded mask capacity from the actual valid token prefix.
 - `ops/fused_moe/prepare_finalize.py:273–284` slices the mask using TP rank and the already-sharded tensor's allocated rows.

@@ -305,7 +305,7 @@ For the same probes against the active checkout:
 
 ```sh
 .venv/bin/python tools/model_convergence.py \
-  --source-root /Users/maoxx241/code/sim-rewrite-20261027 \
+  --source-root repository://sim-rewrite-20261027 \
   --runtime-label mapped-matmul-current \
   --matmul '{"kind":"mapped_matmul"}' \
   --reference data/verification/model-convergence-20261029-baseline.json \
@@ -361,7 +361,7 @@ The paired commands are:
 
 ```sh
 .venv/bin/python tools/model_convergence.py \
-  --source-root /Users/maoxx241/code/sim-rewrite-20261027 \
+  --source-root repository://sim-rewrite-20261027 \
   --only qwen38 qwen35 qwen36 kimi-k3 glm53 v41-dp4 \
   --routing '{"policy":"balanced"}' \
   --matmul '{"kind":"mapped_matmul"}' \
@@ -373,7 +373,7 @@ The paired commands are:
   -o data/verification/model-convergence-20261029-balanced-control.json
 
 .venv/bin/python tools/model_convergence.py \
-  --source-root /Users/maoxx241/code/sim-rewrite-20261027 \
+  --source-root repository://sim-rewrite-20261027 \
   --only qwen38 qwen35 qwen36 kimi-k3 glm53 v41-dp4 \
   --routing '{"policy":"balanced"}' \
   --matmul '{"kind":"mapped_matmul"}' \

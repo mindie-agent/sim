@@ -18,10 +18,9 @@
 """
 from __future__ import annotations
 
-from .aclnn import simulate_aclnn_call
 from .api import (
-    simulate_graph, simulate_model, simulate_native_call,
-    simulate_operator, simulate_service,
+    simulate_aclnn_call, simulate_graph, simulate_model,
+    simulate_native_call, simulate_operator, simulate_service,
 )
 from .contracts import (
     CAPABILITIES, CORE_PROVIDER, ENTRY_POINT_GROUP, INTERFACE_VERSION,

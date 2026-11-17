@@ -96,18 +96,18 @@
           "provenance": {
             "assignment_sources": [
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c4-graph-hccl-ledger.json",
                 "sha256": "5ba9815b5bfc8a4d5c36628307f1542eb2c751df77423dd169a087535558692e",
                 "size_bytes": 852008
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c128-graph-hccl-ledger.json",
                 "sha256": "65894f1e578ce6529da1769a6cc1fbfe4aa4f977cd5277fe1b8000ac4b52bfde",
                 "size_bytes": 874253
               }
             ],
             "holdout_source": {
-              "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
+              "path": "repository://profiler/examples/structure/acceptance-20261030-a5-tp-hccl/qwen35-35b-a5-tp4-c64-graph-hccl-ledger.json",
               "sha256": "f99d554abe25ed212dc41e69d5d167a1b8ee1405be1ed0867f8bd043619c15cc",
               "size_bytes": 887805
             },
@@ -186,7 +186,7 @@
       },
       "frozen_scalar_store_binding": {
         "source_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
+          "path": "repository://profiler/examples/structure/cases/a5-qwen38-tp4-long-context-source.json",
           "sha256": "3a5e034267eea4239283206de91559972ba067f18e0c1251a5aeb81b59ae4db0",
           "size_bytes": 4491
         },
@@ -213,7 +213,7 @@
       },
       "frozen_hccl_transfer": {
         "parameter_source": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-hccl-service-regimes-20261030/tp4-parameters.json",
+          "path": "repository://sim-serving-host-io-20261030/data/observations/a5-hccl-service-regimes-20261030/tp4-parameters.json",
           "sha256": "119e477f4ce28a1f6ade02a5ccd6385ada7efb700622920280f911ca2d06313f",
           "size_bytes": 5350
         },

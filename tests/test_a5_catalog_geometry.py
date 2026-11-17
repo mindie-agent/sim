@@ -39,11 +39,11 @@ from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.catalog.weights import layer_weight_terms
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES, ARCHITECTURE_PRESET_CATALOG, CATALOG,
-    MODEL_ALIASES, build_model_spec, load_model, load_architecture_profile,
+    MODEL_ALIASES, build_model_spec, load_model,
     model_value_formats,
 )
 from mindie_sim.prediction.lowering import Builder
-from mindie_sim.prediction.subgraphs import FeatureConfig, instantiate_model
+from mindie_sim.prediction.frontend_features import FeatureConfig
 from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
 from mindie_sim.structure import export_structure
@@ -119,12 +119,6 @@ def test_declared_native_dtype_is_not_replaced_by_bf16_proxy():
     features = FeatureConfig.from_model(model)
     assert (features.activation_dtype, features.weight_dtype,
             features.kv_dtype) == ("fp16", "fp16", "fp16")
-    instance = instantiate_model(model, features)
-    dense = instance.find("mlp", layer=0, role="dense_ffn")
-    gate_up = next(op for op in dense.operators if op.template.name == "gate_up")
-    quant = dict(gate_up.theta.quant)
-    assert quant["weight_format"] == "fp16"
-    assert quant["act_format"] == "fp16"
 
 
 def test_redundant_operand_dtype_does_not_change_direct_output():

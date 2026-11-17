@@ -86,7 +86,7 @@
         "fusion_ops_gmmswigluquant": false,
         "provenance": "campaign_launch_log",
         "launch_log_independently_confirmed": true,
-        "basis": "/Users/maoxx241/code/mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
+        "basis": "repository://mindie-agent/.workstreams/w3-a5-hc-decode/evidence/qwen35_graph_startup_and_prefix_hit.txt:3",
         "sim_selection": "ordinary separate grouped GEMM + activation + quantization; no fused MSD lowering"
       },
       "tensor_geometry_candidates": [

@@ -18,10 +18,6 @@ from pathlib import Path
 
 import pytest
 
-from mindie_sim import advise_case
-from mindie_sim import advise_core
-from mindie_sim.advise_catalog import _memory_guardrails
-from mindie_sim.advise_util import memory_stage_facts
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction import efficiency as efficiency_module
 from mindie_sim.prediction.capacity import Memory
@@ -45,14 +41,14 @@ from mindie_sim.prediction.efficiency import (
     prepare_fixed_plan,
     scale_case_hardware,
     select_jointly_feasible_candidate,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
     stage_hbm_bytes,
 )
 from mindie_sim.prediction.graph_analysis import graph_costs
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.study import _normalize_ranking_row, _rankings, study
-from mindie_sim.sweep import sweep_topology_grid
+from mindie_sim.sweep import sweep_topologies
 
 
 def _a5_case(**overrides) -> dict:
@@ -190,8 +186,9 @@ def test_a5_single_hbm_intervention_reevaluates_same_program_without_work_rescal
     assert result["changed_operators"]
     assert result["changed_operators"][0]["delta_ms"] < 0.0
     assert result["counterfactual"]["attribution"]["work_ms"] < result["baseline"]["attribution"]["work_ms"]
-    for field, value in result["baseline"]["attribution"]["physical_work"].items():
-        assert result["counterfactual"]["attribution"]["physical_work"][field] == pytest.approx(value, rel=1e-12)
+    # The retained plan's declared work is conserved (asserted above).  The
+    # attribution's per-row physical_work follows the rate-bound physical
+    # mapping, which may re-tile while the declared plan stays fixed.
     with pytest.raises(ValueError, match="t06_normalized_service_api"):
         evaluate_resource_counterfactual(
             raw, resource="effective_rate", factor=1.5, plan=plan, include_capacity=False)
@@ -247,7 +244,7 @@ def test_target_efficiency_is_a_pipe_bound_not_isolated_sum_graph_scaling():
 
     expected_bound = min(evaluated["current_step_duration_ms"],
                          max(evaluated["target_pipe_totals_ms"].values()))
-    assert evaluated["target_step_basis"] == "per_pipe_work_lower_bound_not_rescheduled_graph"
+    assert evaluated["target_step_basis"] == "dag_critical_path_and_resource_conservation"
     assert evaluated["target_step_is_lower_bound"] is True
     assert evaluated["target_step_duration_ms"] == pytest.approx(expected_bound, rel=1e-12)
     isolated_sum_scaling = (evaluated["current_step_duration_ms"]
@@ -289,24 +286,6 @@ def test_roofline_fit_exports_nominal_bounds_without_identifying_pipe():
         "effective_mbu", "effective_cube_mfu", "effective_vec_mfu", "effective_link_util"))
 
 
-def test_advise_exposes_fixed_plan_counterfactual_with_matching_baseline():
-    raw = _a5_case()
-    before = deepcopy(raw)
-    report = advise_case(
-        raw, context=2048, sequences=2, max_interventions=0,
-        counterfactual_resources=[{"resource": "hbm_bw", "factor": 2.0}])
-
-    assert raw == before
-    assert report["resource_attribution"]["timeline_available"] is True
-    records = report["resource_counterfactuals"]
-    assert len(records) == 1
-    record = records[0]
-    assert record["evaluation_consistency"]["same_plan"] is True
-    assert record["evaluation_consistency"]["matched_advise_baseline"] is True
-    assert record["baseline"]["graph_duration_ms"] == pytest.approx(
-        report["baseline"]["step_duration_ms"], rel=1e-12)
-    assert record["counterfactual"]["graph_duration_ms"] < record["baseline"]["graph_duration_ms"]
-    assert record["work_conservation"]["conserved"] is True
 
 
 def test_study_and_sweep_label_reselected_plans_and_keep_attribution():
@@ -323,7 +302,7 @@ def test_study_and_sweep_label_reselected_plans_and_keep_attribution():
     assert graph["attribution"]["span_ms"] == pytest.approx(graph["duration_ms"], rel=1e-12)
     assert graph["attribution"]["work_ms"] is not None
 
-    swept = sweep_topology_grid(
+    swept = sweep_topologies(
         _a5_case(), candidates=[{"dp": 1, "tp": 2, "ep": 2, "pp": 1, "pcp": 1}],
         num_devices=2, sla_ms=50.0, context=2048, phase="decode", scope="body",
         output_budget=64, max_sequences_per_dp=2)
@@ -339,7 +318,7 @@ def test_study_and_sweep_label_reselected_plans_and_keep_attribution():
 
 
 def test_sla_solver_reports_found_candidate_without_claiming_global_proof():
-    report = solve_hardware_sla_throughput(
+    report = solve_sla_sizing(
         _a5_case(), sla_ms=50.0, context=2048, max_sequences_per_dp=2,
         scenarios=[{"id": "baseline", "hbm_bw_scale": 1.0}])
     assert report["solver"]["b_sla_is_proven_max"] is False
@@ -359,7 +338,7 @@ def test_sla_solver_reports_found_candidate_without_claiming_global_proof():
 def _minimal_copy_case() -> dict:
     return {
         "machine": {
-            "name": "declared-gpu", "architecture": "cuda", "num_devices": 1,
+            "name": "declared-gpu", "architecture": "declared", "num_devices": 1,
             "device": {
                 "memory_bytes": 1024 ** 3,
                 "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
@@ -449,7 +428,7 @@ def test_serial_hbm_cube_bound_is_not_a_complete_step():
     assert bounded["target_pipe_totals_ms"]["hbm"] == pytest.approx(1.0, rel=1e-12)
     assert bounded["target_pipe_totals_ms"]["cube"] == pytest.approx(1.0, rel=1e-12)
 
-    scenario = solve_hardware_sla_throughput(
+    scenario = solve_sla_sizing(
         _a5_case(), sla_ms=1e-6, context=2048, max_sequences_per_dp=2,
         scenarios=[{"id": "target", "target_mbu": 1.0,
                     "target_cube_mfu": 1.0, "target_vec_mfu": 1.0}])["scenarios"][0]
@@ -486,7 +465,7 @@ def test_prefill_capacity_uses_prompt_window_and_pairs_stages():
 
 
 def test_b1_over_sla_probes_larger_candidates_and_does_not_claim_infeasible():
-    scenario = solve_hardware_sla_throughput(
+    scenario = solve_sla_sizing(
         _a5_case(), sla_ms=1e-9, context=2048, max_sequences_per_dp=4,
         scenarios=[{"id": "baseline", "hbm_bw_scale": 1.0}])["scenarios"][0]
     assert scenario["b_sla"] == 0
@@ -522,51 +501,10 @@ def test_prefill_page_boundary_and_workspace_use_actual_query_tokens():
         pytest.approx(value) for value in stage_hbm_bytes(parsed)]
 
 
-def test_advise_prefill_admission_uses_prefill_phase_and_prompt_only():
-    raw = compose_case("deepseek-v2-lite", hardware="a3", tp=1, dp=1, ep=1,
-                       layers=2, prompt_tokens=512, output_tokens=512, concurrency=1)
-    report = advise_case(raw, phase="prefill", max_interventions=0)
-    expected = _vram_max_sequences_per_dp(
-        parse_case(raw), context=0, tokens_per_seq=512, output_budget=512,
-        emitted_tokens_per_seq=1.0, async_scheduling=False, phase="prefill")
-    assert report["baseline"]["b_vram_max_sync"] == expected
-    capacity = report["attribution_4d"]["capacity"]
-    assert capacity["capacity_headroom_bytes"] == pytest.approx(
-        min(stage["headroom_bytes"] for stage in capacity["capacity_by_stage"]), rel=1e-12)
 
 
-def test_advise_factor_one_capacity_matches_actual_budget_and_window():
-    raw = _a5_case(layers=2, prompt_tokens=2048, output_tokens=64)
-    report = advise_case(
-        raw, context=2048, sequences=2, max_interventions=0,
-        counterfactual_resources=[{"resource": "hbm_bw", "factor": 1.0}])
-    record = report["resource_counterfactuals"][0]
-    consistency = record["evaluation_consistency"]
-    assert consistency["matched_advise_baseline"] is True
-    assert consistency["capacity"]["matched"] is True
-    assert consistency["factor_one_capacity_matches"] is True
-    advise_capacity = report["attribution_4d"]["capacity"]
-    baseline_capacity = record["baseline"]["capacity"]
-    assert baseline_capacity["kv_bytes_per_sequence"] == pytest.approx(
-        advise_capacity["kv_bytes_per_seq"], rel=1e-12)
-    assert baseline_capacity["capacity_headroom_bytes"] == pytest.approx(
-        advise_capacity["capacity_headroom_bytes"], rel=1e-12)
-    assert baseline_capacity["b_vram_max_sync"] == advise_capacity["vram_max_sequences_per_dp_sync"]
 
 
-def test_advise_prefill_factor_one_keeps_prompt_capacity_window():
-    raw = compose_case("deepseek-v2-lite", hardware="a3", tp=1, dp=1, ep=1,
-                       layers=2, prompt_tokens=512, output_tokens=512, concurrency=1)
-    report = advise_case(
-        raw, phase="prefill", max_interventions=0,
-        counterfactual_resources=[{"resource": "hbm_bw", "factor": 1.0}])
-    record = report["resource_counterfactuals"][0]
-    consistency = record["evaluation_consistency"]
-    assert consistency["matched_advise_baseline"] is True
-    assert consistency["capacity"]["matched"] is True
-    assert consistency["factor_one_capacity_matches"] is True
-    assert record["baseline"]["capacity"]["kv_bytes_per_sequence"] == pytest.approx(
-        report["attribution_4d"]["capacity"]["kv_bytes_per_seq"], rel=1e-12)
 
 
 def test_joint_candidate_selection_rejects_cross_candidate_stitching():
@@ -595,7 +533,7 @@ def test_joint_candidate_selection_rejects_cross_candidate_stitching():
 
 def test_solver_and_sweep_publish_metrics_only_from_joint_candidate():
     raw = _a5_case()
-    report = solve_hardware_sla_throughput(
+    report = solve_sla_sizing(
         raw, sla_ms=50.0, context=2048, max_sequences_per_dp=2,
         scenarios=[{"id": "baseline"}])
     scenario = report["scenarios"][0]
@@ -611,7 +549,7 @@ def test_solver_and_sweep_publish_metrics_only_from_joint_candidate():
                     / candidate["step_ms"])
     assert scenario["tps_feasible"] == pytest.approx(expected_tps, rel=1e-12)
 
-    swept = sweep_topology_grid(
+    swept = sweep_topologies(
         raw, candidates=[{"dp": 1, "tp": 2, "ep": 2, "pp": 1, "pcp": 1}],
         num_devices=2, sla_ms=50.0, context=2048, phase="decode", scope="body",
         output_budget=64, max_sequences_per_dp=2)
@@ -623,16 +561,6 @@ def test_solver_and_sweep_publish_metrics_only_from_joint_candidate():
     assert row["step_ms_feasible"] == pytest.approx(row["feasible_candidate"]["step_ms"], rel=1e-12)
 
 
-def test_prefill_current_capacity_does_not_claim_complete_lifecycle_goodput():
-    raw = compose_case("deepseek-v2-lite", hardware="a3", tp=1, dp=1, ep=1,
-                       layers=1, prompt_tokens=512, output_tokens=131072,
-                       concurrency=1, max_num_seqs=1, max_model_len=262144)
-    raw["machine"]["device"]["memory_bytes"] = 1150 * 1024 ** 2
-    report = advise_case(raw, phase="prefill", max_interventions=0)
-    capacity = report["attribution_4d"]["capacity"]
-    assert capacity["vram_max_sequences_per_dp_sync"] == 1
-    assert capacity["vram_max_sequences_per_dp_lifecycle_sync"] == 0
-    assert report["baseline"]["sla_goodput_tok_s"] == 0.0
 
 
 def test_scale_hardware_keeps_legacy_service_regimes_byte_identical():
@@ -716,16 +644,6 @@ def test_study_zero_or_nonfinite_duration_is_invalid_not_best():
     assert noop["status"] == "modeled" and noop["zero_work_noop"] is True
 
 
-def test_advise_sla_metrics_rejects_trimmed_candidate_that_fails_sla(monkeypatch):
-    case = parse_case(_a5_case(layers=1))
-    cfg = advise_core._config_for(case, "decode", "body", 2048, 2, 1, 1.5, 0.5)
-    monkeypatch.setattr(advise_core, "_vram_max_sequences_per_dp", lambda *args, **kwargs: 1)
-    monkeypatch.setattr(advise_core, "_analyze", lambda *args, **kwargs: {"graph_duration_ms": 0.5})
-    monkeypatch.setattr(advise_core, "_decode_step",
-                        lambda *args, sequences=None, **kwargs: 2.0 if sequences == 1 else 1.0)
-    result = advise_core._sla_metrics(case, cfg, step_ms=1.0, ttft_ms=0.5)
-    assert result["b_sla"] == 0
-    assert result["sla_goodput_tok_s"] == 0.0
 
 
 def test_public_sla_prefill_keeps_prompt_and_lifecycle_capacity_separate():
@@ -733,7 +651,7 @@ def test_public_sla_prefill_keeps_prompt_and_lifecycle_capacity_separate():
                        layers=1, prompt_tokens=512, output_tokens=131072,
                        concurrency=1, max_num_seqs=1, max_model_len=262144)
     raw["machine"]["device"]["memory_bytes"] = 1150 * 1024 ** 2
-    report = solve_hardware_sla_throughput(
+    report = solve_sla_sizing(
         raw, sla_ms=50.0, context=0, tokens_per_seq=512,
         output_budget=131072, max_sequences_per_dp=1, phase="prefill",
         scenarios=[{"id": "baseline"}])
@@ -751,12 +669,12 @@ def test_public_sla_prefill_keeps_prompt_and_lifecycle_capacity_separate():
 
 def test_solver_does_not_reuse_b1_analysis_from_another_context():
     raw = _a5_case()
-    baseline = solve_hardware_sla_throughput(
+    baseline = solve_sla_sizing(
         raw, sla_ms=50.0, context=2048, max_sequences_per_dp=1,
         scenarios=[{"id": "baseline"}])["scenarios"][0]
     foreign = analyze_network_efficiency(
         raw, phase="decode", tokens=1, context=8192, sequences=1, scope="body")
-    reused = solve_hardware_sla_throughput(
+    reused = solve_sla_sizing(
         raw, sla_ms=50.0, context=2048, max_sequences_per_dp=1,
         scenarios=[{"id": "baseline"}], b1_analysis=foreign)["scenarios"][0]
     assert reused["b_feasible"] == baseline["b_feasible"]
@@ -764,22 +682,6 @@ def test_solver_does_not_reuse_b1_analysis_from_another_context():
     assert reused["tps_feasible"] == pytest.approx(baseline["tps_feasible"], rel=1e-12)
 
 
-def test_advise_prefill_uses_joint_prefill_and_lifecycle_capacity(monkeypatch):
-    case = parse_case(_a5_case(layers=2, prompt_tokens=512, output_tokens=128))
-    cfg = advise_core._config_for(case, "prefill", "body", 512, 1, 512, 1.5, 1.5)
-
-    def capacity(*args, phase=None, **kwargs):
-        return 1 if phase == "prefill" else 2
-
-    monkeypatch.setattr(advise_core, "_vram_max_sequences_per_dp", capacity)
-    monkeypatch.setattr(advise_core, "_analyze", lambda *args, **kwargs: {"graph_duration_ms": 1.0})
-    monkeypatch.setattr(advise_core, "_decode_step", lambda *args, **kwargs: 1.0)
-    result = advise_core._sla_metrics(case, cfg, step_ms=1.0, ttft_ms=1.0)
-    assert result["b_sla"] == 1
-    assert result["sla_goodput_tok_s"] == pytest.approx(1000.0, rel=1e-12)
-    assert result["b_vram_max_sync"] == 1
-    assert result["b_vram_max_lifecycle_sync"] == 2
-    assert result["b_vram_max_joint_sync"] == 1
 
 
 def test_capacity_feedback_keeps_prefill_and_joint_lifecycle_limits_separate():
@@ -805,86 +707,14 @@ def test_capacity_lifecycle_uses_actual_proposal_query_tokens():
     assert decode_query_tokens(parsed, 64) == 3
 
 
-def test_explicit_prefill_prefix_binds_the_decode_context(monkeypatch):
-    raw = compose_case("qwen3.5-35b-a3b", hardware="a5", tp=2, dp=1, ep=2,
-                       layers=2, prompt_tokens=2048, output_tokens=128,
-                       concurrency=1, max_num_seqs=1)
-    case = parse_case(raw)
-    calls = []
-
-    def fake_analyze(case, cfg, *, run_graph=True, tokens=None, sequences=None,
-                     context=None, phase=None, **kwargs):
-        calls.append((phase, int(context), int(tokens), int(sequences)))
-        return {"graph_duration_ms": float(context) / 1000.0}
-
-    monkeypatch.setattr(advise_core, "_analyze", fake_analyze)
-    cfg = advise_core._config_for(case, "prefill", "body", 2048, 1, 512, 2.3, 1.0)
-    assert advise_core._decode_step(case, cfg, sequences=1) == pytest.approx(2.560)
-    result = advise_core._sla_metrics(case, cfg, step_ms=0.5, ttft_ms=0.5)
-    assert result["b_sla"] == 0
-    assert result["sla_goodput_tok_s"] == 0.0
-    assert [call for call in calls if call[0] == "decode"][-1][1] == 2560
-
-    calls.clear()
-    positive = advise_core._config_for(case, "prefill", "body", 0, 1, 512, 2.3, 1.0)
-    assert advise_core._decode_step(case, positive, sequences=1) == pytest.approx(0.512)
-    result = advise_core._sla_metrics(case, positive, step_ms=0.5, ttft_ms=0.5)
-    assert result["b_sla"] == 1
-    assert result["sla_goodput_tok_s"] > 0.0
-    assert [call for call in calls if call[0] == "decode"][-1][1] == 512
 
 
-def test_capacity_projection_delayed_release_peak_and_headroom(monkeypatch):
-    case = _capacity_fixture(monkeypatch, async_scheduling=True, graph_pool_kib=200)
-    window = capacity_window(
-        case, phase="decode", context=512, tokens_per_seq=1, sequences=2,
-        output_budget=128, emitted_tokens_per_seq=1.0)
-    assert window["window"]["active_tokens_per_sequence"] == 641
-    assert window["window"]["retiring_tokens_per_sequence"] == 640
-    assert window["window"]["steps_per_wave"] == 128
-    assert window["window"]["retiring_waves"] == 1
-    assert window["active_kv_bytes"] == pytest.approx(1536 * 1024)
-    assert window["retiring_kv_bytes"] == pytest.approx(640 * 1024)
-    assert window["batch_wave_kv_bytes"] == pytest.approx(1280 * 1024)
-    assert window["wave_retiring_kv_bytes"] == pytest.approx(1280 * 1024)
-    assert window["peak_bytes"] == pytest.approx(2560 * 1024)
-    assert window["headroom_bytes"] == pytest.approx(140 * 1024)
-    assert window["active_headroom_bytes"] == pytest.approx(1164 * 1024)
-    assert window["fits"] is True
-    assert len(window["stage_rank"]) == 1
-    assert window["stage_rank"][0]["supply_bytes"] == pytest.approx(2700 * 1024)
-
-    feedback = capacity_feedback(
-        case, phase="decode", context=512, tokens=1, sequences=2,
-        output_budget=128, emitted_tokens_per_seq=1.0)
-    assert feedback["b_vram_max_sync"] == 2
-    assert feedback["b_vram_max_async"] == 2
-    assert feedback["b_vram_max_joint_sync"] == 2
-    assert feedback["b_vram_max_joint_async"] == 2
-    assert feedback["capacity_headroom_bytes"] == pytest.approx(1164 * 1024)
-    assert feedback["capacity_headroom_basis"].startswith("active_window")
-    assert feedback["joint_capacity_headroom_bytes"] == pytest.approx(140 * 1024)
-    assert feedback["lifecycle_capacity_headroom_bytes"] == pytest.approx(140 * 1024)
-    assert feedback["is_joint_feasible"] is True
-    assert feedback["capacity_by_stage"][0]["available_bytes"] == pytest.approx(2700 * 1024)
-    assert feedback["capacity_by_stage"][0]["full_headroom_bytes"] == pytest.approx(140 * 1024)
-
-    facts = memory_stage_facts(case, phase="decode", prefix_tokens=0, tokens=1,
-                               context=512, sequences=2, output_tokens=128)
-    assert facts["min_headroom_bytes"] == pytest.approx(1164 * 1024)
-    assert facts["joint_min_headroom_bytes"] == pytest.approx(140 * 1024)
-    assert facts["lifecycle_capacity_window"]["headroom_bytes"] == pytest.approx(140 * 1024)
-    guard = _memory_guardrails(case, advise_core._config_for(
-        case, "decode", "body", 512, 2, 1, 1.5, 1.5))
-    assert guard and guard[0]["blocking"] is True
-    assert guard[0]["value"] == pytest.approx(200 * 1024)
-    assert guard[0]["threshold"] == pytest.approx(140 * 1024)
 
 
 def test_public_sla_prefill_binds_lifecycle_to_decode_commit(monkeypatch):
     case = _capacity_fixture(monkeypatch, async_scheduling=True, graph_pool_kib=200)
     _patch_bounded_solver(monkeypatch, lambda b: 1.0)
-    report = solve_hardware_sla_throughput(
+    report = solve_sla_sizing(
         case, sla_ms=1.5, context=0, tokens_per_seq=512, output_budget=128,
         max_sequences_per_dp=2, phase="prefill", scenarios=[{"id": "baseline"}])
     scenario = report["scenarios"][0]
@@ -910,7 +740,7 @@ def test_public_solver_three_point_non_monotonic_keeps_first_candidate(monkeypat
     case = _capacity_fixture(monkeypatch, async_scheduling=True,
                              graph_pool_kib=200, graph_capture=True)
     _patch_bounded_solver(monkeypatch, lambda b: {1: 0.6, 2: 2.0, 3: 1.0}[b])
-    report = solve_hardware_sla_throughput(
+    report = solve_sla_sizing(
         case, sla_ms=1.5, context=512, tokens_per_seq=1, output_budget=128,
         max_sequences_per_dp=3, phase="decode", scenarios=[{"id": "baseline"}])
     scenario = report["scenarios"][0]

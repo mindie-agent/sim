@@ -16,6 +16,7 @@ import math
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
+TOLERANCE = 1e-12
 SUPPORTED_EPILOGUES = ("row_column_scale",)
 TYPED_SCALE_SLOTS = ("activation", "weight", "weight_scale", "activation_scale")
 
@@ -97,7 +98,7 @@ def _declared_epilogue(op):
     result = MatrixEpilogue(*(float(raw[key]) for key in
                               ("row_scale_bytes", "column_scale_bytes",
                                "operations_per_output")))
-    if any(not math.isfinite(value) or value < 0 for value in
+    if any(not math.isfinite(value) or value < 0.0 for value in
            (result.row_scale_bytes, result.column_scale_bytes,
             result.operations_per_output)):
         raise ModelingError("matrix_epilogue_work_must_be_finite_nonnegative")
@@ -105,8 +106,21 @@ def _declared_epilogue(op):
         raise ModelingError("row_column_scale_requires_positive_output_work")
     m, n, _ = op.local_shape[-3:]
     if not math.isclose(op.vector_ops, result.operations_per_output * m * n,
-                        rel_tol=1e-12, abs_tol=1e-12):
-        raise ModelingError("matrix_epilogue_must_account_for_declared_vector_work")
+                        rel_tol=TOLERANCE, abs_tol=TOLERANCE):
+        # Full graph capture may pad local rows to a bucket while the declared
+        # epilogue work still describes the active call.  Accept exactly the
+        # declared active/physical row counts rather than crashing; unknown
+        # rows remain an explicit error.
+        metadata = dict(op.metadata)
+        declared = {
+            int(metadata.get("graph_active_query_rows", 0) or 0),
+            int(metadata.get("graph_physical_query_rows", 0) or 0),
+        }
+        if not any(row > 0 and math.isclose(
+                op.vector_ops, result.operations_per_output * row * n,
+                rel_tol=TOLERANCE, abs_tol=TOLERANCE) for row in declared):
+            raise ModelingError(
+                "matrix_epilogue_must_account_for_declared_vector_work")
     return result
 
 

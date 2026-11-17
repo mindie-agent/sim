@@ -12,14 +12,14 @@ from typing import Any, Mapping
 
 _IMPLEMENTATION = "cuda_moe_align_block_size"
 _WRAPPER_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/"
+    "repository://vllm-v0.25.1/vllm/model_executor/layers/"
     "fused_moe/moe_align_block_size.py"
 )
 _CUDA_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/csrc/libtorch_stable/moe/"
+    "repository://vllm-v0.25.1/csrc/libtorch_stable/moe/"
     "moe_align_sum_kernels.cu"
 )
-_MATH_PATH = "/Users/maoxx241/code/vllm-v0.25.1/vllm/utils/math_utils.py"
+_MATH_PATH = "repository://vllm-v0.25.1/vllm/utils/math_utils.py"
 
 _WARP_SIZE = 32
 _SMALL_NUMEL_LIMIT = 1024

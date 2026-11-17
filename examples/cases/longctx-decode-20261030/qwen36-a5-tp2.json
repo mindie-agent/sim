@@ -164,7 +164,7 @@
       },
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen36-a5-tp2-c1.json",
+          "path": "repository://profiler/examples/structure/cases/decode-qwen36-a5-tp2-c1.json",
           "sha256": "264c22db0ed0410fa0c622503f5e8c24abe0f287a5502ab068ae9a4d320fca2f",
           "size_bytes": 30043
         },

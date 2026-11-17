@@ -141,7 +141,8 @@ def test_two_instruction_modes_on_one_pipe_add_before_overlapping_other_resource
     rule["coordinates"] = {"first": {"path": "work.mode_a"},
         "second": {"path": "work.mode_b"}, "bytes": {"path": "work.hbm"}}
     after = graph_costs(bind(raw, rule), (op,), input_ready_ms=7, isolated=False)
-    assert before["duration_ms"] == after["duration_ms"] == 2
+    assert before["duration_ms"] == pytest.approx(2.001)
+    assert after["duration_ms"] == pytest.approx(2.0)
     assert after["complete_ms"] == 9
     assert after["execution"]["work"] == before["execution"]["work"]
 

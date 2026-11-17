@@ -23,12 +23,7 @@ from mindie_sim.prediction.communication import MessageFlow
 from mindie_sim.prediction.engine import Engine
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.prediction.topology import Topology
-from mindie_sim.prediction.topology_tiers import (
-    EP_TIER_PRESETS,
-    analyze_ep_mc2_communication,
-    compute_ep_effective_bandwidth,
-    compute_speculative_accept_step,
-)
+from mindie_sim.prediction.speculation import compute_speculative_accept_step
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import Hardware, Link
 from mindie_sim.schema.parallel import ParallelSpec
@@ -178,7 +173,7 @@ def test_a5_pcie_16p_has_4p_8p_16p_and_inter_tiers():
     sixteen = _link(machine, "d2d_intra_node", range(16))
     inter = _link(machine, "d2d_inter_node")
     assert machine.ranks_per_node == 16
-    assert machine.dies_per_package == 2
+    assert machine.dies_per_package == 1
     assert four.capacity_bytes_per_ms == pytest.approx(288e6 * 0.85)
     assert four.effective_peak_capacity_bytes_per_ms == pytest.approx(288e6)
     assert eight.capacity_bytes_per_ms == pytest.approx(128e6 * 0.85)
@@ -303,80 +298,6 @@ def test_a5_ep_accept_step_matches_spreadsheet():
         compute_speculative_accept_step(0.5, -1)
 
 
-def test_a5_ep_effective_bandwidth_matches_spreadsheet():
-    pcie32 = compute_ep_effective_bandwidth(32, preset="a5_pcie_16p")
-    assert pcie32["outbound_ratio"] == pytest.approx(0.5)
-    assert pcie32["raw_effective_bw_gbps"] == pytest.approx(100.0)
-    assert pcie32["effective_bw_gbps"] == pytest.approx(100.0)
-    assert len(pcie32["tier_breakdown"]) == 4
-    assert [row["name"] for row in pcie32["tier_breakdown"]] == [
-        "intra_4p", "intra_8p", "intra_16p", "inter_node"]
-    assert [row["outbound_ratio"] for row in pcie32["tier_breakdown"]] == [
-        pytest.approx(3 / 32), pytest.approx(28 / 32),
-        pytest.approx(24 / 32), pytest.approx(16 / 32)]
-
-    assert compute_ep_effective_bandwidth(
-        8, preset="a5_pcie_16p")["raw_effective_bw_gbps"] == pytest.approx(256.0)
-    assert compute_ep_effective_bandwidth(
-        16, preset="a5_pcie_16p")["raw_effective_bw_gbps"] == pytest.approx(
-            128 / 0.75)
-    assert compute_ep_effective_bandwidth(
-        64, preset="a5_ub_pod")["effective_bw_gbps"] == pytest.approx(
-            800 * 64 / 63)
-    assert compute_ep_effective_bandwidth(
-        512, preset="a3_superpod")["raw_effective_bw_gbps"] == pytest.approx(
-            50 / 0.25)
-    throttled = compute_ep_effective_bandwidth(
-        32, preset="a5_pcie_16p", bw_utilization=0.8)
-    assert throttled["effective_bw_gbps"] == pytest.approx(80.0)
-    assert throttled["raw_effective_bw_gbps"] == pytest.approx(100.0)
-
-    custom = compute_ep_effective_bandwidth(
-        16, [{"max_ranks": 8, "bw_gbps": 100.0},
-             {"max_ranks": 64, "bw_gbps": 25.0}])
-    assert custom["raw_effective_bw_gbps"] == pytest.approx(25 / 0.5)
-
-    with pytest.raises(ModelingError):
-        compute_ep_effective_bandwidth(1, preset="a5_pcie_16p")
-    with pytest.raises(ModelingError):
-        compute_ep_effective_bandwidth(8, preset="a5_pcie_16p",
-                                       bw_utilization=1.5)
-    with pytest.raises(ModelingError):
-        compute_ep_effective_bandwidth(8, preset="not_a_preset")
-    assert set(EP_TIER_PRESETS) == {"a5_pcie_16p", "a5_ub_pod", "a3_superpod"}
-
-
-def test_ep_mc2_communication_matches_analytic_geometry():
-    analysis = analyze_ep_mc2_communication()
-    assert analysis["accept_step"] == pytest.approx(2.734375)
-    assert analysis["startup_latency_us"] == pytest.approx(11.5)
-    assert analysis["dispatch_bytes_per_layer"] == pytest.approx(
-        32 * 7168 * 8 * (33 / 32) * 1.2)
-    assert analysis["combine_bytes_per_layer"] == pytest.approx(
-        32 * 7168 * 8 * 2.0 * 1.2)
-    assert len(analysis["rows"]) == 8 * 4
-
-    row = next(item for item in analysis["rows"]
-               if item["ep"] == 64 and item["bw_utilization"] == 0.75)
-    effective = 800 * 64 / 63 * 0.75
-    dispatch_us = 11.5 + analysis["dispatch_bytes_per_layer"] / (effective * 1e9) * 1e6
-    combine_us = 11.5 + analysis["combine_bytes_per_layer"] / (effective * 1e9) * 1e6
-    total_ms = (dispatch_us + combine_us) * 61 / 1000
-    assert row["effective_bw_gbps"] == pytest.approx(effective)
-    assert row["dispatch_us"] == pytest.approx(dispatch_us)
-    assert row["combine_us"] == pytest.approx(combine_us)
-    assert row["total_comm_ms"] == pytest.approx(total_ms)
-    assert row["tpot_comm_ms"] == pytest.approx(total_ms / 2.734375)
-
-    no_draft = analyze_ep_mc2_communication(draft_tokens=0, ep_values=(2,))
-    assert no_draft["accept_step"] == 1.0
-    pcie = analyze_ep_mc2_communication(
-        ep_values=(16,), preset="a5_pcie_16p",
-        bw_utilizations=(1.0,), dispatch_dtype="fp8", combine_dtype="int8")
-    assert pcie["rows"][0]["total_comm_ms"] == pytest.approx(
-        (11.5 + (32 * 7168 * 8 * 1.0 * 1.2) / (128 / 0.75 * 1e9) * 1e6
-         + 11.5 + (32 * 7168 * 8 * 1.0 * 1.2) / (128 / 0.75 * 1e9) * 1e6)
-        * 61 / 1000)
 
 
 def test_nvidia_profile_json_is_well_formed_and_uses_declared_units():
@@ -424,14 +345,6 @@ def test_ascend_peak_capacity_override_and_nvidia_channel_merge_and_sweep():
     resized = _materialize_machine_for_devices(parse_case(nv_case), nv_case, 16)
     assert len(resized.dies) == 16
     assert any(link.channel == "d2d_inter_node" for link in resized.links)
-
-    inverted = compute_ep_effective_bandwidth(
-        16,
-        [{"name": "inner", "max_ranks": 8, "bw_gbps": 5.0},
-         {"name": "outer", "max_ranks": 64, "bw_gbps": 100.0}],
-    )
-    assert inverted["tier_breakdown"][0]["bottleneck"] is True
-    assert inverted["raw_effective_bw_gbps"] == pytest.approx(5.0 / (7 / 16))
 
     nv_bw_and_util = nvidia_materialize({
         "sku": "NVIDIA_H200", "num_devices": 16, "ranks_per_node": 8,

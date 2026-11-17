@@ -5,7 +5,7 @@
     "id": "qwen38-a5-tp4-ctx126000-c4",
     "deployment": "qwen38-a5-tp4",
     "input": {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+      "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
       "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
       "size_bytes": 6959
     },
@@ -37,7 +37,7 @@
   "runtime_seconds": 19.792845083982684,
   "runtime_commit": "e3b7a1a845ca7608829a39e9a4eb0284b0464ccb",
   "producer": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py",
+    "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py",
     "sha256": "f90403abcbd50347324c88b36b089ad83d53c68a8cfe023b6d62474062730f0b",
     "size_bytes": 16237
   },

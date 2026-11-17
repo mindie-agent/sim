@@ -4,12 +4,12 @@
     {
       "id": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-35b-a5-tp4-c4-graph.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen35-35b-a5-tp4-c4-graph.json",
         "sha256": "60a19e3738cd95098f6ef0ed8a6841ac57ed78288bcdecc978c32cb01a963ae9",
         "size_bytes": 54057
       },
@@ -43,12 +43,12 @@
     {
       "id": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen36-a5-tp2-c1.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen36-a5-tp2-c1.json",
         "sha256": "264c22db0ed0410fa0c622503f5e8c24abe0f287a5502ab068ae9a4d320fca2f",
         "size_bytes": 30043
       },
@@ -74,12 +74,12 @@
     {
       "id": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen36_highconc_c4.json",
         "sha256": "163d6f8541d710dec6b3c82637227c70d185ee20b7f953a0fd17435b4aa501fe",
         "size_bytes": 10182
       },
@@ -105,12 +105,12 @@
     {
       "id": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_qwen38_highconc_c4.json",
         "sha256": "2bace0926d283f461a3b0b126c76fd1a0081df118245f11c40fc1f697e3f45f9",
         "size_bytes": 5690
       },
@@ -136,12 +136,12 @@
     {
       "id": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_tpot5ms_c1.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_tpot5ms_c1.json",
         "sha256": "d103d230318592648fa3e0d243ac1137a4d97bbe183fc1d5a431007d186bc01b",
         "size_bytes": 62897
       },
@@ -174,12 +174,12 @@
     {
       "id": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-v4flash-a3-tp8-c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-v4flash-a3-tp8-c4.json",
         "sha256": "927c5c83f55d68b26a47dc2a08801a64f60c94a8a38fc812e641ff1ad9a88a1c",
         "size_bytes": 16577
       },
@@ -213,12 +213,12 @@
     {
       "id": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-35b-a3-tp4-c144.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen35-35b-a3-tp4-c144.json",
         "sha256": "489943fc3eca59c0da4b00f90d9fa0144108c947d5cf5c79ae547feeaffbceac",
         "size_bytes": 3145
       },
@@ -259,12 +259,12 @@
     {
       "id": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
         "sha256": "651c3e9d1c597e71a5631fba60e9693e8858a1a85e004850736b45cb128068d3",
         "size_bytes": 260331
       },
@@ -290,12 +290,12 @@
     {
       "id": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen36-a3-tp4-c64.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen36-a3-tp4-c64.json",
         "sha256": "e3d7c157f232444a3349e716169efeac16f60dcc6e2355e756ed4588a70ad780",
         "size_bytes": 2969
       },
@@ -321,12 +321,12 @@
     {
       "id": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen38-a3-tp4-c64.json",
+        "path": "repository://profiler/examples/structure/cases/decode-qwen38-a3-tp4-c64.json",
         "sha256": "d28cb614f02edaa1803741e83f0e3ec06b392e3fa9a1c27daa14d0cc1676c975",
         "size_bytes": 2969
       },
@@ -352,12 +352,12 @@
     {
       "id": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
       "source": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a3_v41_w8a8_tp4_dp4_ep16_dspark7_c4.json",
+        "path": "repository://profiler/examples/structure/cases/decode-a3_v41_w8a8_tp4_dp4_ep16_dspark7_c4.json",
         "sha256": "ec1cfe7b1e54eccc305b636d6f733b9be73671a8adedbcae188ad1304f9c67fe",
         "size_bytes": 141904
       },
@@ -389,7 +389,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c1",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -422,7 +422,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c1",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -455,7 +455,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c1",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -488,7 +488,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c2",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -521,7 +521,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c2",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -554,7 +554,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c2",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -587,7 +587,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c4",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -620,7 +620,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c4",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -653,7 +653,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c4",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -686,7 +686,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c8",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -719,7 +719,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c8",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -752,7 +752,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c8",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -785,7 +785,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c16",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -818,7 +818,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c16",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -851,7 +851,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c16",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -884,7 +884,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c32",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -917,7 +917,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c32",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -950,7 +950,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c32",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -983,7 +983,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx126000-c64",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -1016,7 +1016,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx127500-c64",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -1049,7 +1049,7 @@
       "id": "qwen35-a5-tp4-ep4-ctx128999-c64",
       "deployment": "qwen35-a5-tp4-ep4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-a5-tp4-ep4.json",
         "sha256": "b70a1bccf7eb497bfa37af01013b38168cae1cc42fe9efd6a49899e750e011c3",
         "size_bytes": 55474
       },
@@ -1082,7 +1082,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c1",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1115,7 +1115,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c1",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1148,7 +1148,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c1",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1181,7 +1181,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c2",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1214,7 +1214,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c2",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1247,7 +1247,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c2",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1280,7 +1280,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c4",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1313,7 +1313,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c4",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1346,7 +1346,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c4",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1379,7 +1379,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c8",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1412,7 +1412,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c8",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1445,7 +1445,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c8",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1478,7 +1478,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c16",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1511,7 +1511,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c16",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1544,7 +1544,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c16",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1577,7 +1577,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c32",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1610,7 +1610,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c32",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1643,7 +1643,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c32",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1676,7 +1676,7 @@
       "id": "qwen36-a5-tp2-ctx126000-c64",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1709,7 +1709,7 @@
       "id": "qwen36-a5-tp2-ctx127500-c64",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1742,7 +1742,7 @@
       "id": "qwen36-a5-tp2-ctx128999-c64",
       "deployment": "qwen36-a5-tp2",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
         "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
         "size_bytes": 31247
       },
@@ -1775,7 +1775,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c1",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1808,7 +1808,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c1",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1841,7 +1841,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c1",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1874,7 +1874,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c2",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1907,7 +1907,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c2",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1940,7 +1940,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c2",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -1973,7 +1973,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c4",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2006,7 +2006,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c4",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2039,7 +2039,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c4",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2072,7 +2072,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c8",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2105,7 +2105,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c8",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2138,7 +2138,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c8",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2171,7 +2171,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c16",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2204,7 +2204,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c16",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2237,7 +2237,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c16",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2270,7 +2270,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c32",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2303,7 +2303,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c32",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2336,7 +2336,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c32",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2369,7 +2369,7 @@
       "id": "qwen36-a5-tp8-ctx126000-c64",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2402,7 +2402,7 @@
       "id": "qwen36-a5-tp8-ctx127500-c64",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2435,7 +2435,7 @@
       "id": "qwen36-a5-tp8-ctx128999-c64",
       "deployment": "qwen36-a5-tp8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a5-tp8.json",
         "sha256": "632cb16cf26abe3ecf84777680ed82bfdb1af7dc399ae03642d865591fc75e45",
         "size_bytes": 11452
       },
@@ -2468,7 +2468,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c1",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2501,7 +2501,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c1",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2534,7 +2534,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c1",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2567,7 +2567,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c2",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2600,7 +2600,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c2",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2633,7 +2633,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c2",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2666,7 +2666,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c4",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2699,7 +2699,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c4",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2732,7 +2732,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c4",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2765,7 +2765,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c8",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2798,7 +2798,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c8",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2831,7 +2831,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c8",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2864,7 +2864,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c16",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2897,7 +2897,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c16",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2930,7 +2930,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c16",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2963,7 +2963,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c32",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -2996,7 +2996,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c32",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -3029,7 +3029,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c32",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -3062,7 +3062,7 @@
       "id": "qwen38-a5-tp4-ctx126000-c64",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -3095,7 +3095,7 @@
       "id": "qwen38-a5-tp4-ctx127500-c64",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -3128,7 +3128,7 @@
       "id": "qwen38-a5-tp4-ctx128999-c64",
       "deployment": "qwen38-a5-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a5-tp4.json",
         "sha256": "574b61a2c59d4070fd7d4413f718b17dba091bc232d9f206d80d8d0881250679",
         "size_bytes": 6959
       },
@@ -3161,7 +3161,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c1",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3208,7 +3208,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c1",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3255,7 +3255,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c1",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3302,7 +3302,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c2",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3349,7 +3349,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c2",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3396,7 +3396,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c2",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3443,7 +3443,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c4",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3490,7 +3490,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c4",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3537,7 +3537,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c4",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3584,7 +3584,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c8",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3631,7 +3631,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c8",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3678,7 +3678,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c8",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3725,7 +3725,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c16",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3772,7 +3772,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c16",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3819,7 +3819,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c16",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3866,7 +3866,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c32",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3913,7 +3913,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c32",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -3960,7 +3960,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c32",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -4007,7 +4007,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx126000-c64",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -4054,7 +4054,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx127500-c64",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -4101,7 +4101,7 @@
       "id": "v41-a5-tp1-dp8-ep8-ctx128999-c64",
       "deployment": "v41-a5-tp1-dp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a5-tp1-dp8-ep8.json",
         "sha256": "cf3a30adcbd4369424699fdd4973308dc229b502a3265ae969bd812557e5a5b4",
         "size_bytes": 64101
       },
@@ -4148,7 +4148,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c1",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4181,7 +4181,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c1",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4214,7 +4214,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c1",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4247,7 +4247,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c2",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4280,7 +4280,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c2",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4313,7 +4313,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c2",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4346,7 +4346,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c4",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4379,7 +4379,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c4",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4412,7 +4412,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c4",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4445,7 +4445,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c8",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4478,7 +4478,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c8",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4511,7 +4511,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c8",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4544,7 +4544,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c16",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4577,7 +4577,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c16",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4610,7 +4610,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c16",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4643,7 +4643,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c32",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4676,7 +4676,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c32",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4709,7 +4709,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c32",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4742,7 +4742,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx126000-c64",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4775,7 +4775,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx127500-c64",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4808,7 +4808,7 @@
       "id": "v4flash-a3-tp8-ep8-ctx128999-c64",
       "deployment": "v4flash-a3-tp8-ep8",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v4flash-a3-tp8-ep8.json",
         "sha256": "b64796f3eb6fdb64f23d6b6b4b336896e5c820cf382abc7f7630a14b0df4d17a",
         "size_bytes": 18244
       },
@@ -4841,7 +4841,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c1",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -4874,7 +4874,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c1",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -4907,7 +4907,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c1",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -4940,7 +4940,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c2",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -4973,7 +4973,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c2",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5006,7 +5006,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c2",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5039,7 +5039,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c4",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5072,7 +5072,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c4",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5105,7 +5105,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c4",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5138,7 +5138,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c8",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5171,7 +5171,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c8",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5204,7 +5204,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c8",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5237,7 +5237,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c16",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5270,7 +5270,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c16",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5303,7 +5303,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c16",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5336,7 +5336,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c32",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5369,7 +5369,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c32",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5402,7 +5402,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c32",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5435,7 +5435,7 @@
       "id": "qwen35-35b-a3-tp4-ctx126000-c64",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5468,7 +5468,7 @@
       "id": "qwen35-35b-a3-tp4-ctx127500-c64",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5501,7 +5501,7 @@
       "id": "qwen35-35b-a3-tp4-ctx128999-c64",
       "deployment": "qwen35-35b-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -5534,7 +5534,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c1",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5567,7 +5567,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c1",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5600,7 +5600,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c1",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5633,7 +5633,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c2",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5666,7 +5666,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c2",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5699,7 +5699,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c2",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5732,7 +5732,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c4",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5765,7 +5765,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c4",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5798,7 +5798,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c4",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5831,7 +5831,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c8",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5864,7 +5864,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c8",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5897,7 +5897,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c8",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5930,7 +5930,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c16",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5963,7 +5963,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c16",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -5996,7 +5996,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c16",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6029,7 +6029,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c32",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6062,7 +6062,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c32",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6095,7 +6095,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c32",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6128,7 +6128,7 @@
       "id": "qwen35-397b-a3-tp16-ctx126000-c64",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6161,7 +6161,7 @@
       "id": "qwen35-397b-a3-tp16-ctx127500-c64",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6194,7 +6194,7 @@
       "id": "qwen35-397b-a3-tp16-ctx128999-c64",
       "deployment": "qwen35-397b-a3-tp16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen35-397b-a3-tp16.json",
         "sha256": "29d4fd5ebedd690fe0c5c390788d9bf3551a78fa1a1ac41aad1743c933afd556",
         "size_bytes": 261604
       },
@@ -6227,7 +6227,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c1",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6260,7 +6260,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c1",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6293,7 +6293,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c1",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6326,7 +6326,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c2",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6359,7 +6359,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c2",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6392,7 +6392,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c2",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6425,7 +6425,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c4",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6458,7 +6458,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c4",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6491,7 +6491,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c4",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6524,7 +6524,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c8",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6557,7 +6557,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c8",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6590,7 +6590,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c8",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6623,7 +6623,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c16",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6656,7 +6656,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c16",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6689,7 +6689,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c16",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6722,7 +6722,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c32",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6755,7 +6755,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c32",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6788,7 +6788,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c32",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6821,7 +6821,7 @@
       "id": "qwen36-a3-tp4-ctx126000-c64",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6854,7 +6854,7 @@
       "id": "qwen36-a3-tp4-ctx127500-c64",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6887,7 +6887,7 @@
       "id": "qwen36-a3-tp4-ctx128999-c64",
       "deployment": "qwen36-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen36-a3-tp4.json",
         "sha256": "967b73d765432ad8b2fcf152333c23fc017f20bdb6e4fff874b9970200993f8e",
         "size_bytes": 4234
       },
@@ -6920,7 +6920,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c1",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -6953,7 +6953,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c1",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -6986,7 +6986,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c1",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7019,7 +7019,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c2",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7052,7 +7052,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c2",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7085,7 +7085,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c2",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7118,7 +7118,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c4",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7151,7 +7151,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c4",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7184,7 +7184,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c4",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7217,7 +7217,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c8",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7250,7 +7250,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c8",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7283,7 +7283,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c8",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7316,7 +7316,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c16",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7349,7 +7349,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c16",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7382,7 +7382,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c16",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7415,7 +7415,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c32",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7448,7 +7448,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c32",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7481,7 +7481,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c32",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7514,7 +7514,7 @@
       "id": "qwen38-a3-tp4-ctx126000-c64",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7547,7 +7547,7 @@
       "id": "qwen38-a3-tp4-ctx127500-c64",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7580,7 +7580,7 @@
       "id": "qwen38-a3-tp4-ctx128999-c64",
       "deployment": "qwen38-a3-tp4",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },
@@ -7613,7 +7613,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c1",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7652,7 +7652,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c1",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7691,7 +7691,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c1",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7730,7 +7730,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c2",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7769,7 +7769,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c2",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7808,7 +7808,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c2",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7847,7 +7847,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c4",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7886,7 +7886,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c4",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7925,7 +7925,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c4",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -7964,7 +7964,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c8",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8003,7 +8003,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c8",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8042,7 +8042,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c8",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8081,7 +8081,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c16",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8120,7 +8120,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c16",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8159,7 +8159,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c16",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8198,7 +8198,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c32",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8237,7 +8237,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c32",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8276,7 +8276,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c32",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8315,7 +8315,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx126000-c64",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8354,7 +8354,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx127500-c64",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8393,7 +8393,7 @@
       "id": "v41-a3-tp4-dp4-ep16-ctx128999-c64",
       "deployment": "v41-a3-tp4-dp4-ep16",
       "input": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/longctx-decode-20261030/v41-a3-tp4-dp4-ep16.json",
         "sha256": "b485a71a971eee8c8afaff3a4e96e02dd5c6108426fac10a248a8f90c04f2394",
         "size_bytes": 143131
       },
@@ -8430,7 +8430,7 @@
     }
   ],
   "producer": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py",
+    "path": "repository://sim-service-response-domain-next/data/verification/longctx-decode-20261030.producer.py",
     "sha256": "eb3bb69c58f5cf9efd1f7e938c43903cb61c8c1702d4dfd8894eb562a6ce6233",
     "size_bytes": 20247
   },

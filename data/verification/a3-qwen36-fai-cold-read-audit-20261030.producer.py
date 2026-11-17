@@ -18,7 +18,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--capture-root', type=Path, default=Path('/Volumes/data/mindie-sim-data/a3/heldout_engine_20261030/qwen36_27b_tp2_128k_20261030'))
-parser.add_argument('--source-repository', type=Path, default=Path('/Users/maoxx241/code/refs/ops-transformer'))
+parser.add_argument('--source-repository', type=Path, default=Path('repository://refs/ops-transformer'))
 parser.add_argument('--output', type=Path, required=True)
 args = parser.parse_args()
 BASE = args.capture_root

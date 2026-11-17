@@ -1,7 +1,7 @@
 {
   "schema": "operator-service-calibration/1",
   "producer": {
-    "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped_producer.py",
+    "path": "repository://sim-mc2-int8-dispatch-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped_producer.py",
     "sha256": "64a9f0daf85fb3d5f606563aae562b97936d494f74d4497098424d5734236ee4",
     "size_bytes": 6892
   },
@@ -80,7 +80,7 @@
           "declared_active_banks": 64,
           "cohort_label": 64,
           "source": {
-            "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+            "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
             "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
             "size_bytes": 49365
           }
@@ -174,7 +174,7 @@
           "declared_active_banks": 64,
           "cohort_label": 64,
           "source": {
-            "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+            "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
             "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
             "size_bytes": 49365
           }
@@ -269,7 +269,7 @@
           "declared_active_banks": 48,
           "cohort_label": 64,
           "source": {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
             "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
             "size_bytes": 214502
           }
@@ -364,7 +364,7 @@
           "declared_active_banks": 48,
           "cohort_label": 64,
           "source": {
-            "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+            "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
             "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
             "size_bytes": 214502
           }
@@ -386,14 +386,14 @@
     }
   ],
   "q35_source": {
-    "path": "/Users/maoxx241/code/sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
+    "path": "repository://sim-mc2-int8-dispatch-20261030/data/verification/qwen35-source-residual-pmu-20261030.json",
     "sha256": "81b7dc5ca025dd740950c23ac39d1b97bc8b0386c3991fc4b7b80810b16b37ff",
     "size_bytes": 49365
   },
   "v41_compact_observations": {
     "64": {
       "report": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64/body-operator-family-scoreboard.json",
         "sha256": "63d28f7b4e59de7378f135f0465fb22284ed08b1953c3e69b2d8035f40de72dc",
         "size_bytes": 214502
       },
@@ -471,7 +471,7 @@
     },
     "128": {
       "report": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_c128_p2k/body-operator-family-scoreboard.json",
+        "path": "repository://profiler/examples/structure/acceptance-20261030-v41-operators-86c1ee8f-source-symmetric/a5_v41_fp8_tp1_dp8_ep8_c128_p2k/body-operator-family-scoreboard.json",
         "sha256": "74aa5551c4aa9136037d9c3732d30b6023bfbe81c771bf529c552375d5284810",
         "size_bytes": 217165
       },

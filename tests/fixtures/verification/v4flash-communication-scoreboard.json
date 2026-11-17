@@ -620,7 +620,7 @@
             ]
           },
           "audit": {
-            "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
+            "path": "repository://sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
             "sha256": "9755b6465df9de20d57cf5bb5919d5e94e0adc81af9e947a18365bbf5665f385",
             "size_bytes": 22724
           },
@@ -752,12 +752,12 @@
           "excluded_from_graph": [],
           "worker_sources": [
             {
-              "path": "/Users/maoxx241/code/sim-rewrite-20261027/tools/model_scoreboard.py",
+              "path": "repository://sim-rewrite-20261027/tools/model_scoreboard.py",
               "sha256": "40cde56e161ec0b902e2274e0d3f91a30ab2e12177b7423112edd4e1e0e9825e",
               "size_bytes": 16109
             },
             {
-              "path": "/Users/maoxx241/code/sim-rewrite-20261027/tools/model_convergence.py",
+              "path": "repository://sim-rewrite-20261027/tools/model_convergence.py",
               "sha256": "00f65e3bfdca0b844c3c9c5bb82255be816c8bcf8c7ed31c4c15ee8a85185dc0",
               "size_bytes": 29854
             }
@@ -765,7 +765,7 @@
         },
         "identity_issues": [],
         "runtime": {
-          "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+          "import_path": "repository://sim-rewrite-20261027/mindie_sim",
           "version": "0.8.0",
           "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
           "hashed_files": 213,
@@ -774,14 +774,14 @@
         "runtime_integrity": {
           "status": "unchanged",
           "before": {
-            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "import_path": "repository://sim-rewrite-20261027/mindie_sim",
             "version": "0.8.0",
             "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
             "hashed_files": 213,
             "matrix_sha256": "8ddf2da71fd6d89632599bacc2076ec919df00ecd8b1dd3c89496e341f9d6469"
           },
           "after": {
-            "import_path": "/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim",
+            "import_path": "repository://sim-rewrite-20261027/mindie_sim",
             "version": "0.8.0",
             "package_content_sha256": "10c4eb73da5301c30817c81fc47142acd6ab5d45350eb444cdb6375964f553ee",
             "hashed_files": 213,
@@ -2875,14 +2875,14 @@
       "sources": [
         {
           "role": "structure_replay",
-          "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/subgraph-a3_v4f.json",
+          "path": "repository://profiler/examples/structure/acceptance-20261029/subgraph-a3_v4f.json",
           "size_bytes": 55551,
           "sha256": "3db36f2642a1a24da3faed92ab696fec0d04e9fb895f01ec2feb0667ff96ef2a",
           "hash_basis": "computed_from_current_small_source_2026-10-29"
         },
         {
           "role": "original_prediction_case_seed",
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/v4f-a3-w8a8-tp8.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/v4f-a3-w8a8-tp8.json",
           "size_bytes": 6587,
           "sha256": "2445cf26fce3d99f00de416dc3c79539183c33d328aecde973f1b1500dc1fce3",
           "hash_basis": "computed_from_current_small_source_2026-10-29",
@@ -2931,14 +2931,14 @@
           "hash_basis": "retained_in_structure_replay_not_rehashed_this_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-v4flash_a3-mechanisms-case.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-v4flash_a3-mechanisms-case.json",
           "sha256": "ea1b832f03bb6b1a06667ba3507524d23be6e962d66d23610ddf5b0f2e1a52e7",
           "size_bytes": 9030,
           "role": "prediction_case_executed",
           "source_revision": "239f443c25b640d8545416ef115cafd64b26d031"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261029-device-floor/v4flash_a3-0-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261029-device-floor/v4flash_a3-0-prediction.json",
           "sha256": "dee17204083d4b55cbb85c468a477d21a35aca22641f49e518326981e90c582a",
           "size_bytes": 145541,
           "role": "prediction_report_refreshed",
@@ -2946,13 +2946,13 @@
           "source_revision": "239f443c25b640d8545416ef115cafd64b26d031"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/v4flash-communication-audit-20261029.json",
           "sha256": "9755b6465df9de20d57cf5bb5919d5e94e0adc81af9e947a18365bbf5665f385",
           "size_bytes": 22724,
           "role": "communication_population_audit"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
           "sha256": "068a8f901370c662b90c74dd1aa1da4573c35e8dca2e2e1091399222f829743e",
           "size_bytes": 150833,
           "role": "current_prediction_report",
@@ -2960,7 +2960,7 @@
           "source_revision": "26f5adb48dd418584cd18c79d6a63ca8ab42afd7"
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
+          "path": "repository://sim-rewrite-20261027/data/verification/model-scoreboard-20261030-wave7/v4flash_a3-0-prediction.json",
           "sha256": "068a8f901370c662b90c74dd1aa1da4573c35e8dca2e2e1091399222f829743e",
           "size_bytes": 150833
         }

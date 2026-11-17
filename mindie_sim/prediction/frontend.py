@@ -30,6 +30,7 @@ from mindie_sim.schema.workload import selected_mode
 from .attention import ATTENTION_BUILDERS, AttentionPolicy
 from .blocks import RESIDUAL_BUILDERS, lowrank_hyper_final_mixer, norm
 from .feedforward import FFN_BUILDERS, RoutingPolicy
+from .frontend_features import FeatureConfig
 from .graph import GraphPolicy, annotate_geometry
 from .routing_realizations import RoutingRealization, select_realization
 from .structure import normalize_model, stage_map
@@ -44,10 +45,17 @@ from .implementation_selection import (
 from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
 from .recover_ssm_work import recover_ssm_enabled
 
+
 ZERO = 0
 ONE = 1
+_ENV_MODEL = 0
+_ENV_RUNTIME = 1
+_ENV_MACHINE = 2
+_ENV_REPLICA = 3
+_ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
+MIN_DBO_MICROBATCHES = 2
 
 
 def _scope(ops, block, role="body"):
@@ -243,9 +251,66 @@ class Frontend:
              features=None, source_rows_by_replica=None,
              routing_global_tokens=None, routing_views=None,
              physical_rank=None, query_position=None,
-             include_recover_commits: bool = False):
+             include_recover_commits: bool = False, machine=None,
+             dbo_partition: int | None = None, layer_limit: int | None = None):
         p = runtime.parallel
+        if layer_limit is not None:
+            limit = max(ONE, int(layer_limit))
+            model = replace(model, layer_plans=tuple(model.layer_plans[:limit]))
         features = self.features if features is None else features
+        if (runtime.enable_dbo and dbo_partition is None and len(views) > ONE):
+            from .overlap_plan import MicrobatchPolicy, build_microbatch_regions
+            from .physical_recipe_registry import COLLECTIVE_FAMILIES
+            regions = build_microbatch_regions(
+                views, policy=MicrobatchPolicy(count=MIN_DBO_MICROBATCHES))
+            if len(regions) > ONE:
+                merged, previous_partition_attention = [], None
+                for region in regions:
+                    part_ops, _ = self.body(
+                        model, runtime, region.views,
+                        prefix=f"{prefix}dbo{region.index}.",
+                        ready=ready,
+                        tokens=sum(int(view.q_len) for view in region.views),
+                        mode=mode, global_tokens=global_tokens, stages=stages,
+                        replica=replica, features=features,
+                        source_rows_by_replica=source_rows_by_replica,
+                        routing_global_tokens=routing_global_tokens,
+                        routing_views=routing_views,
+                        physical_rank=physical_rank,
+                        query_position=query_position,
+                        include_recover_commits=include_recover_commits,
+                        machine=machine, dbo_partition=region.index)
+                    first_attention = None
+                    for op in part_ops:
+                        collective = op.family in COLLECTIVE_FAMILIES
+                        stream = region.comm_stream if collective else region.stream
+                        metadata = dict(op.metadata)
+                        metadata.update({
+                            "dbo_microbatch": region.index,
+                            "dbo_microbatch_count": len(regions),
+                            "dbo_compute_stream": region.stream,
+                        })
+                        if collective:
+                            metadata["collective_rendezvous"] = (
+                                f"dbo{region.index}:{op.op_id}")
+                        if op.family == "attention" and first_attention is None:
+                            first_attention = op.op_id
+                        merged.append(replace(
+                            op, stream=stream,
+                            metadata=tuple(sorted(metadata.items()))))
+                    if previous_partition_attention and first_attention:
+                        position = next(
+                            index for index, op in enumerate(merged)
+                            if op.op_id == first_attention)
+                        merged[position] = replace(
+                            merged[position],
+                            deps=tuple(dict.fromkeys(
+                                (*merged[position].deps,
+                                 previous_partition_attention))))
+                    previous_partition_attention = (
+                        first_attention or previous_partition_attention)
+                    previous = merged[-ONE].op_id
+                return merged, previous
         requests = tuple(view.request_id for view in views)
         tokens = sum(view.q_len for view in views) if tokens is None else tokens
         stages = stages or stage_map(model, runtime)
@@ -334,7 +399,7 @@ class Frontend:
                     cache_ids=caches, topk_ids=topks, index_cache_ids=indices,
                     candidate_ids=candidates, stage_of=lambda layer: stages[layer],
                     cp_interleave_size=runtime.kv_block_size, runtime=runtime,
-                    policy=self.attention_policy,
+                    policy=self.attention_policy, machine=machine,
                 )
                 if sp:
                     attention_ops, attention_last = sequence_parallel.close_output(
@@ -669,10 +734,12 @@ class Frontend:
         if resource_fusion is None:
             resource_fusion = self.resource_fusion
         s_env = self._prev_call_env
-        if (s_env is not None and s_env[0] is model
-                and (s_env[1] is runtime or s_env[1] == runtime)
-                and s_env[2] is machine and s_env[3] == replica
-                and s_env[4] is self.features):
+        if (s_env is not None and s_env[_ENV_MODEL] is model
+                and (s_env[_ENV_RUNTIME] is runtime
+                     or s_env[_ENV_RUNTIME] == runtime)
+                and s_env[_ENV_MACHINE] is machine
+                and s_env[_ENV_REPLICA] == replica
+                and s_env[_ENV_FEATURES] is self.features):
             _, _, _, _, _, model, auto_rank, features = s_env
             if physical_rank is None:
                 physical_rank = auto_rank
@@ -686,7 +753,6 @@ class Frontend:
                     replica, 0)[0]
             except Exception:
                 auto_rank = None
-            from .subgraphs.instantiate import FeatureConfig
             features = (self.features if self.features is not None else
                         FeatureConfig.from_runtime(runtime, model, machine=machine))
             self._prev_call_env = (
@@ -727,7 +793,8 @@ class Frontend:
             from .speculation import draft_program
             before, previous = draft_program(
                 self, model, declared_runtime, plan.requests, previous,
-                global_views=global_views, replica=replica, replay_scope=scope)
+                global_views=global_views, replica=replica, replay_scope=scope,
+                machine=machine)
         media_counts = {str(request): int(count) for request, count in
                         _media_counts(runtime).items()}
         for index, view in enumerate(views):
@@ -789,6 +856,7 @@ class Frontend:
             before=before, has_after_draft=has_after_draft,
             pcp_prefill=pcp_prefill,
             dispatch_fast_step=dispatch_fast_step,
+            machine=machine,
         )
         if fast_result is not None:
             return fast_result
@@ -800,7 +868,8 @@ class Frontend:
                                    routing_views=eff_routing_views,
                                    physical_rank=physical_rank,
                                    query_position=eff_query_pos,
-                                   include_recover_commits=(assembly == "service"))
+                                   include_recover_commits=(assembly == "service"),
+                                   machine=machine)
         ops.extend(body)
         if pcp_prefill:
             if runtime.final_norm_scope == "all":
@@ -918,12 +987,12 @@ class Frontend:
         features, body_global_tokens, source_rows_by_replica,
         routing_global_tokens, routing_views, physical_rank,
         query_position, before, has_after_draft, pcp_prefill,
-        dispatch_fast_step: bool = False,
+        dispatch_fast_step: bool = False, machine=None,
     ):
         layers = model.layer_plans
         if (len(layers) <= 2 or local_tokens <= 0 or scope != "none"
                 or before or has_after_draft or pcp_prefill
-                or runtime.parallel.pp != 1):
+                or runtime.enable_dbo or runtime.parallel.pp != 1):
             return None
         fusions_cfg = runtime.kernels.get("fusions") or ()
         if "residual_norm" in fusions_cfg:
@@ -1106,13 +1175,13 @@ class Frontend:
                             width=model.hidden_size, model=model, mode=mode,
                         )
                         attn = self.attention[lyr.attention](
-                            prefix=name, plan=lyr, views=local_views, stage=0,
+                            prefix=name, plan=lyr, views=local_views, stage=ZERO,
                             deps=norm1.op_id, model=model, parallel=p, quant=model.quant,
                             mode=mode, padded_tokens=local_tokens,
                             cache_ids=caches, topk_ids=topks, index_cache_ids=indices_map,
-                            candidate_ids=candidates, stage_of=lambda _l: 0,
+                            candidate_ids=candidates, stage_of=lambda _l: ZERO,
                             cp_interleave_size=runtime.kv_block_size, runtime=runtime,
-                            policy=self.attention_policy,
+                            policy=self.attention_policy, machine=machine,
                         )
                         post_a, done_id = residual.after(
                             {**common, "prefix": name + ".attention", "structure_block": "attention"},
@@ -1294,7 +1363,7 @@ class Frontend:
                 cache_ids=caches, topk_ids=topks, index_cache_ids=indices_map,
                 candidate_ids=candidates, stage_of=lambda _l: 0,
                 cp_interleave_size=runtime.kv_block_size, runtime=runtime,
-                policy=self.attention_policy,
+                policy=self.attention_policy, machine=machine,
             )
             post_a, cur_prev = residual.after(
                 {**common, "prefix": name + ".attention", "structure_block": "attention"},
@@ -1800,5 +1869,6 @@ def _retarget_id_only(val, old_id: str, new_id: str):
 
 def _media_counts(runtime):
     import json
+
     raw = dict(runtime.metadata).get("media_tokens_by_request", "{}")
     return json.loads(raw) if isinstance(raw, str) else raw

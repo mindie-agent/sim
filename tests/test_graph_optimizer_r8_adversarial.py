@@ -62,11 +62,16 @@ def case():
 
 
 def _add(op_id, deps=(), *, family="add", metadata=(), hbm=1_000_000.0):
+    # A caller event/barrier marker is a genuinely payload-free control; only
+    # payload-carrying families get data work in these optimizer fixtures.
+    control = family in {"barrier", "event"}
     return OpSpec(
         op_id=op_id, family=family, phase="decode", stage=0, layer=0,
         requests=(), semantic_shape=(1, 4), local_shape=(1, 4),
-        padded_shape=(1, 4), launch_shape=(1, 4), hbm_bytes=hbm,
-        vector_ops=2.0, dtype="bf16", deps=tuple(deps), metadata=tuple(metadata))
+        padded_shape=(1, 4), launch_shape=(1, 4),
+        hbm_bytes=0.0 if control else hbm,
+        vector_ops=0.0 if control else 2.0, dtype="bf16",
+        deps=tuple(deps), metadata=tuple(metadata))
 
 
 # ---------------------------------------------------------------------------

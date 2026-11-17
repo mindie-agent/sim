@@ -6168,7 +6168,7 @@
       },
       "native_boundary_completion": {
         "base_case_identity": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
+          "path": "repository://profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
           "sha256": "be5465b38b7712c53b5c16ee05e1101c68914b70bbe6c0717fecb66c33dace53",
           "size_bytes": 204502
         },
@@ -6191,7 +6191,7 @@
       },
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
+          "path": "repository://profiler/examples/structure/cases/decode-qwen35-397b-a3-tp16-c48.json",
           "sha256": "651c3e9d1c597e71a5631fba60e9693e8858a1a85e004850736b45cb128068d3",
           "size_bytes": 260331
         },

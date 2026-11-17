@@ -273,19 +273,19 @@
             },
             "sources": [
               {
-                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
                 "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
                 "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
                 "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
                 "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
               }
             ],
@@ -343,19 +343,19 @@
             },
             "sources": [
               {
-                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
                 "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
                 "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
                 "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
                 "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
               }
             ],
@@ -413,19 +413,19 @@
             },
             "sources": [
               {
-                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
                 "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
                 "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
                 "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
                 "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
               }
             ],
@@ -477,19 +477,19 @@
             },
             "sources": [
               {
-                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
                 "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
                 "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
                 "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
                 "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
               }
             ],
@@ -553,19 +553,19 @@
             },
             "sources": [
               {
-                "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
+                "path": "repository://sim-rewrite-20261027/data/verification/conv-state-memory-service-audit-20261030.json",
                 "sha256": "c06ae9d3be49f331f01264eacb6ef281ddf1345665e9eafac8e7f6debf527725"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c16_p4k/body-operator-family-scoreboard.json",
                 "sha256": "cd417f0d2bdbe0237a2ecb26c71e063e72f65196c534fe87cfcf08bafcba9622"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c32_p4k/body-operator-family-scoreboard.json",
                 "sha256": "ef5c81874fc469405ae076c4db3be23467af2250b7f7b05d457e506e4a78ad6a"
               },
               {
-                "path": "/Users/maoxx241/code/profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
+                "path": "repository://profiler/examples/structure/acceptance-20261030-glm-source-complete-operators/families/a5_glm53flash_tp8_c64_p4k/body-operator-family-scoreboard.json",
                 "sha256": "08172e9ea2c8c1933c548e52513b7a079e556eba269ce9c6cd84d210546ee896"
               }
             ],
@@ -583,7 +583,7 @@
         "sha256": "d37c0832db3698a2a4d361a1bc053e4e9580e50ce49a1823297daae91023cab9"
       },
       "startup": {
-        "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
+        "path": "repository://mindie-agent/.workstreams/hp-serving/glm53-hc/raw/ws9/logs/serve-mtp.log",
         "bytes": 335341,
         "sha256": "8f9c278ee374c8983a178f515e3d37eb1e5325341e0d4a0cba14601a62517661"
       },
@@ -664,12 +664,12 @@
       "accepted_state_scenario": {
         "id": "a5_glm53flash_tp8_c32_p4k",
         "baseline": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c32_p4k--attention-plus-down.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-compatible-variants/a5_glm53flash_tp8_c32_p4k--attention-plus-down.json",
           "sha256": "9917c673b5ae07c5bc3827ff5ad73c4b2e96110c7c8bd397b07da702c4faea3b",
           "size_bytes": 7374
         },
         "prototype": {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
+          "path": "repository://sim-rewrite-20261027/examples/cases/high-concurrency-20261030/glm-kda-accepted-conditional/glm53flash-a5-b32-q4.json",
           "sha256": "cb0f498b700f72f54a2815bdbd2cfb6f1c7d48bae237b94cb688b7b769e20d40",
           "size_bytes": 9296
         },
@@ -700,7 +700,7 @@
       },
       "hccl_composed_condition": {
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c32_p4k.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-source-complete/a5_glm53flash_tp8_c32_p4k.json",
           "sha256": "72c436f30bbaf16751c56da722367abf23d6064afacc3d261fd110f2f5b66152"
         },
         "runtime_revision": "66e4c970a277f62d5d61fa8443e9879905801ad4",
@@ -740,11 +740,11 @@
         "runner": "vllm_ascend/ops/fused_moe/fused_moe.py:199-237,269-349",
         "runtime_guard": "vllm_ascend/ops/register_custom_ops.py:127-155",
         "parent": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/a5_glm53flash_tp8_c32_p4k.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/examples/cases/high-concurrency-20261030/glm-hccl-source-complete-conditional/a5_glm53flash_tp8_c32_p4k.json",
           "sha256": "b9d4eb433abc56a4f672f491b75a79e3b4a0d45a8cfae6704a593080d76d2504"
         },
         "source_audit": {
-          "path": "/Users/maoxx241/code/sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
+          "path": "repository://sim-glm-hccl-composed-20261030/data/verification/glm-native-moe-reduction-audit-20261030.json",
           "sha256": "61f3b6426f2805fdee225975cb48dfa8c189c253b0bf6ca7f8a40d8599ab7b95"
         },
         "parallel_condition": "EP=DP=CP=PCP=1; no SP/latent output transform; TP-sharded shared weights",

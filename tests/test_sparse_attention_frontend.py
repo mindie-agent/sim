@@ -30,8 +30,20 @@ def test_glm_prefill_prices_independent_query_selections_in_the_ordinary_graph()
     qk_dim, latent = 512 + 64, 512
     q_read = 4096 * 8 * qk_dim * 2
     out_write = 4096 * 8 * latent * 2
+    # M2 separates L2-resident private tile refills from cold HBM reads.  The
+    # external HBM component is the unique working set, while MTE2 pays every
+    # private refill that feeds the sparse query tiles.
+    traffic = dict(meta["attention_traffic_plan"])
+    assert traffic["logical_read_bytes"] == selected * qk_dim * 2
+    assert traffic["hbm_read_bytes"] == pytest.approx(4718592.0)
+    assert traffic["l2_hit_bytes"] == pytest.approx(
+        traffic["logical_read_bytes"] - traffic["hbm_read_bytes"])
+    assert traffic["residency_basis"] == "dense_unique_working_set_resident"
+    assert traffic["private_refill_bytes"] == pytest.approx(
+        traffic["logical_read_bytes"])
     assert op.mte2_bytes == pytest.approx(
-        selected * qk_dim * 2 + 4 * selected + q_read)
+        traffic["private_refill_bytes"] + meta["selection_index_read_bytes"]
+        + q_read)
     assert op.mte3_bytes == pytest.approx(out_write)
     assert op.flops == 2 * selected * 8 * (qk_dim + latent)
 

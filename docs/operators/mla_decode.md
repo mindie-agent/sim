@@ -16,8 +16,8 @@ and makes no capture-dispatch claim.
 
 | File | SHA256 | Lines used |
 |---|---|---|
-| `/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/backends/mla/triton_mla.py` | `5e9aa13eca7ce718ce0648f11454bb0e0e98e9f5da40ee22bd8d0b05f4ba1d03` | 35-47 auto split (not used); 82-89 supported dtypes; 95-103 page-size contract; 166-171 logit cap rejected; 199-208 wrapper q concat and `o`/`lse` zero-init; 210-216 split selection; 224-237 scratch and cache alias; 241-256 grouped call with `is_mla=True` |
-| `/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/ops/triton_decode_attention.py` | `b9823c65eba22d76abf64dad7d7d16a950f67471c86d6cb5b3e983aaf14381ac` | 59-65 page stride; 279-467 grouped stage 1 (329-355 Q/split bounds, 361-441 K/PE QK + latent PV, 443-467 partial/LSE stores); 470-572 MLA block dispatch; 575-639 stage 2 merge; 642-681 stage-2 launch; 719-753 grouped wrapper; 756-817 grouped dispatch |
+| `repository://vllm-v0.25.1/vllm/v1/attention/backends/mla/triton_mla.py` | `5e9aa13eca7ce718ce0648f11454bb0e0e98e9f5da40ee22bd8d0b05f4ba1d03` | 35-47 auto split (not used); 82-89 supported dtypes; 95-103 page-size contract; 166-171 logit cap rejected; 199-208 wrapper q concat and `o`/`lse` zero-init; 210-216 split selection; 224-237 scratch and cache alias; 241-256 grouped call with `is_mla=True` |
+| `repository://vllm-v0.25.1/vllm/v1/attention/ops/triton_decode_attention.py` | `b9823c65eba22d76abf64dad7d7d16a950f67471c86d6cb5b3e983aaf14381ac` | 59-65 page stride; 279-467 grouped stage 1 (329-355 Q/split bounds, 361-441 K/PE QK + latent PV, 443-467 partial/LSE stores); 470-572 MLA block dispatch; 575-639 stage 2 merge; 642-681 stage-2 launch; 719-753 grouped wrapper; 756-817 grouped dispatch |
 
 The two source files are the current checkout, not a historical capture image.
 Their byte counts and hashes are also recorded in the module's `SOURCE_FILES`
@@ -287,11 +287,11 @@ Commands (using the provisioned shared interpreter and this worktree on
 `PYTHONPATH`):
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest tests/operators/test_mla_decode.py -q
 # 59 passed
 
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py mindie_sim.prediction.operators.mla_decode \
   tests/fixtures/operator_cases/mla_decode.json \
   -o data/verification/operators/mla_decode.json

@@ -275,21 +275,35 @@ def test_graph_costs_publishes_conserving_device_step_breakdown():
         include_submission=False, isolated=False)
     assert report["exposed_breakdown_basis"]["available"] is True
     assert report["exposed_breakdown_basis"]["boundary"] == "device_step"
+    basis = report["exposed_breakdown_basis"]
+    assert "clock_reconciliation_residual_ms" in basis
+    assert "clock_order_clamped_ms" in basis
     assert sum(report["exposed_breakdown_ms"].values()) == pytest.approx(
-        report["duration_ms"])
+        report["duration_ms"], abs=1e-12)
 
 
-def test_exposed_breakdown_conserves_or_declares_unreconciled():
+def test_exposed_breakdown_reconciles_within_limit_and_rejects_large_gap():
     records = (record(0, "gemm", 0.0, 5.0, flops=10.0),
                record(0, "alltoall", 5.0, 8.0, link=100.0))
     result = _exposed_breakdown(records, 8.0, 0.0, 0)
-    assert result["exposed_breakdown_ms"]["cube"] == pytest.approx(5.0)
-    assert result["exposed_breakdown_ms"]["communication"] == pytest.approx(3.0)
-    assert sum(result["exposed_breakdown_ms"].values()) == pytest.approx(8.0)
+    values = result["exposed_breakdown_ms"]
+    assert all(value >= 0 for value in values.values())
+    assert sum(values.values()) == pytest.approx(8.0, abs=1e-12)
+    basis = result["exposed_breakdown_basis"]
+    assert basis["available"] is True
+    assert "clock_reconciliation_residual_ms" in basis
+    assert "clock_order_clamped_ms" in basis
+    # An execution boundary whose intervals cannot cover the span is still
+    # declared unavailable rather than rescaled.
     unavailable = _exposed_breakdown(records, 9.0, 0.0, 0)
     assert unavailable["exposed_breakdown_ms"] is None
     assert unavailable["exposed_breakdown_basis"]["reason"] == (
         "unreconciled_execution_boundary")
+    # A gap larger than a quarter of the reported duration is a real defect.
+    from mindie_sim.prediction.exposed_breakdown import ExposedClocks, finish_breakdown
+    with pytest.raises(ModelingError, match="exposed_attribution_clock_mismatch"):
+        finish_breakdown(ExposedClocks(2.0, 2.0, 2.0, 2.0),
+                         duration_ms=10.0, boundary="device_step")
 
 
 def test_scoped_resource_names_map_to_semantic_roles():

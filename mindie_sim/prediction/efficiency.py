@@ -17,11 +17,30 @@ from __future__ import annotations
 
 ZERO = 0
 ONE = 1
+KIB = 1024
+FOUR_KIB = 4096
+DEFAULT_TOKENS = 1
+DEFAULT_CONTEXT = 4096
+DEFAULT_SEQUENCES = 1
 FIRST = 0
 ZERO_FLOAT = 0.0
 ONE_FLOAT = 1.0
+MS_PER_S = 1000.0
+FULL_PERCENT = 100.0
+EPSILON = 1e-12
+TOP_BOTTLENECKS = 15
+DEFAULT_STAGE = 0
+DEFAULT_REPLICA = 0
 DEFAULT_CONTEXT = 4096
 DEFAULT_OUTPUT_BUDGET = 1024
+DEFAULT_SLA_MS = 30.0
+DEFAULT_SLA_CONTEXT = 126000
+DEFAULT_MAX_SEQUENCES = 256
+DEFAULT_TARGET_MBU = 0.80
+DEFAULT_TARGET_CUBE_MFU = 0.75
+DEFAULT_TARGET_VEC_MFU = 0.65
+NON_MONOTONIC_PROBE_CAP = 4
+SLA_HEADROOM_PROBE_STEPS = 3
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -39,11 +58,14 @@ from mindie_sim.schema.speculative import SpeculativeSpec
 from .body_defaults import TargetGraphSet, TargetOperators, consume_target_declaration
 from .capacity import Memory
 from .graph_analysis import graph_costs
+from .resource_attribution import attribute_stage_dag
 from .operator_analysis import operator_costs, target_graphs
+from .roofline_graph import (PhysicalWorkGraph, PhysicalWorkNode,
+                             RooflineTargets, critical_path_roofline,
+                             graph_from_occurrences)
 from .scheduler import DraftPolicy
 from .structure import parse_case
 
-_STRIP_METADATA_KEYS = frozenset({"structure_subgraph_memberships", "structure_subgraph_entries", "structure_subgraphs", "graph_segment", "fusion_group_key", "topk_ids_producer", "payload_producer", "input_conversion_subgraphs", "inverse_index_producer", "topk_weights_producer"})
 _HBM_ROLES = frozenset({"hbm", "memory", "gm_hbm_cacheline_128b"})
 _CUBE_ROLES = frozenset({"cube", "aic"})
 _VEC_ROLES = frozenset({"vector", "vbitsort32", "scalar_store_issue", "ub_copy", "aiv", "reg_issue_slots", "reg_alu_lanes", "reg_special_lanes", "reg_reduce_lanes", "reg_shuffle_lanes", "reg_data_writes", "reg_ub_accesses", "reg_ub_stores"})
@@ -124,7 +146,7 @@ def _resolve_cube_peak(hw: Mapping[str, Any], dtype: str, default_dtype: str = "
     return min(float(d.peak(target)) for d in (hw.get("dies") or (hw["die"],)))
 
 
-def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = 0, replica: int = 0) -> dict[str, Any]:
+def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = DEFAULT_STAGE, replica: int = DEFAULT_REPLICA) -> dict[str, Any]:
     """Extract conservative stage-level Cube, Vector, HBM, MTE, and Link peak rates in SI units (/s)."""
     parsed = parse_case(case)
     p = parsed.runtime.parallel
@@ -138,9 +160,23 @@ def extract_hardware_peaks(case: CaseSpec | Mapping[str, Any], *, stage: int = 0
     mte1_peak, fixpipe_peak = min(float(r.get("mte1", 0.0)) for r in rates_list), min(float(r.get("fixpipe", 0.0)) for r in rates_list)
     mte2_peak, mte3_peak = min(float(r.get("mte2_aic", r.get("mte2", r["hbm"]))) for r in rates_list), min(float(r.get("mte3", r["hbm"])) for r in rates_list)
     links = parsed.machine.links
-    intra_bw = max((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links if "intra_package" in lnk.channel or len(lnk.members) <= parsed.machine.dies_per_package), default=0.0)
-    inter_bw = min((lnk.capacity_bytes_per_ms * 1000.0 for lnk in links), default=0.0)
-    link_peak = (intra_bw if max(p.tp, p.ep if p.ep > 1 else 1) <= parsed.machine.dies_per_package and intra_bw > 0 else inter_bw) if links else 0.0
+    active_width = max(p.tp, p.ep if p.ep > ONE else ONE)
+    intra_links = [lnk for lnk in links
+                   if "intra_package" in lnk.channel
+                   or "intra_node" in lnk.channel
+                   or len(lnk.members) <= parsed.machine.dies_per_package]
+    intra_bw = max((
+        lnk.capacity_bytes_per_ms * MS_PER_S * (
+            max(ONE, min(active_width, len(lnk.members)) - ONE)
+            if lnk.semantics == "per_pair" else ONE_FLOAT)
+        for lnk in intra_links), default=ZERO_FLOAT)
+    inter_bw = min((lnk.capacity_bytes_per_ms * MS_PER_S for lnk in links),
+                   default=ZERO_FLOAT)
+    link_peak = (
+        intra_bw if (active_width <= max(parsed.machine.dies_per_package,
+                                         parsed.machine.ranks_per_node)
+                     and intra_bw > ZERO_FLOAT) else inter_bw
+    ) if links else ZERO_FLOAT
     is_lane_issue = "lane operation per cycle" in str(dict(parsed.machine.assumptions).get("vector_issue", ""))
     return {
         "die": dies[0], "dies": dies, "compute_peaks": compute_peaks, "default_dtype": parsed.model.compute_dtype or "bf16",
@@ -212,6 +248,65 @@ def legacy_service_regime_diagnostics(case: CaseSpec | Mapping[str, Any]) -> dic
             "rules": deepcopy(rules)}
 
 
+def _resolve_operator_link_peak(parsed, op, hw) -> float:
+    """Physical per-rank link peak for this operator's declared group axis."""
+    metadata = dict(op.get("metadata") or ())
+    axis = str(metadata.get("group_axis") or "tp")
+    parallel = parsed.runtime.parallel
+    width = max(ONE, int(getattr(parallel, axis, ONE) or ONE))
+    links = parsed.machine.links
+    candidates = [lnk for lnk in links
+                  if lnk.members and min(len(lnk.members), width) >= width]
+    if not candidates:
+        candidates = list(links)
+    if not candidates:
+        return float(hw.get("link_peak_bytes_per_s", ZERO_FLOAT) or ZERO_FLOAT)
+    within_node = width <= max(ONE, parsed.machine.ranks_per_node)
+    selected = [lnk for lnk in candidates
+                if ("intra_node" in lnk.channel or "intra_package" in lnk.channel)
+                == within_node] or candidates
+    link = min(selected, key=lambda item: item.capacity_bytes_per_ms)
+    # A link that explicitly declares a usable fraction is bounded by that
+    # configured capacity; a profile that only publishes a nameplate peak keeps
+    # the peak service boundary used by its silicon anchors.
+    if getattr(link, "bw_utilization", None) is not None:
+        peak = float(link.capacity_bytes_per_ms
+                     or link.peak_capacity_bytes_per_ms) * MS_PER_S
+    else:
+        peak = float(link.peak_capacity_bytes_per_ms
+                     or link.capacity_bytes_per_ms) * MS_PER_S
+    if link.semantics == "per_pair":
+        peak *= max(ONE, width - ONE)
+    elif link.semantics == "shared":
+        peak /= max(ONE, width)
+    return peak
+
+
+def physical_link_service(comm_info: Mapping[str, Any]) -> tuple[float, float] | None:
+    """Exact per-physical-link byte service from the communication ledger.
+
+    Returns ``(max(wire_bytes / peak_bytes_per_ms), sum(wire_bytes))`` only
+    when every published resource carries its own matching capacity.  The
+    numerator and denominator then cover the same rank boundary, so utilization
+    is never repaired by clipping or by averaging uneven traffic away.
+    """
+    resources = dict(comm_info.get("resources") or {})
+    wire, capacity = {}, {}
+    for name, item in resources.items():
+        if not isinstance(item, Mapping):
+            continue
+        amount = float(item.get("wire_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+        peak = float(item.get("peak_bytes_per_ms", ZERO_FLOAT) or ZERO_FLOAT)
+        if amount > ZERO_FLOAT:
+            wire[str(name)] = amount
+        if peak > ZERO_FLOAT:
+            capacity[str(name)] = peak
+    if not wire or not set(wire) <= set(capacity):
+        return None
+    return (max(wire[name] / capacity[name] for name in wire),
+            math.fsum(wire.values()))
+
+
 def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, Any], *, peaks: Mapping[str, Any] | None = None, observed_duration_ms: float | None = None, pmu: Mapping[str, float] | None = None) -> dict[str, Any]:
     """Compute 4D efficiency (Cube_MFU, Vec_MFU, MBU, Link_Util) & CV-overlap for one operator."""
     parsed, op, count = parse_case(case), row["operator"], int(row.get("occurrences", 1))
@@ -234,9 +329,13 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     comm_res = dict(comm_info.get("resources") or {})
     _non_lnk = ("memory@", "vector@", "matrix@", "mte", "fixpipe@", "l2@", "ub", "reg_", "sreg_", "vreg_", "scalar_", "vbitsort", "host", "scheduler@", "native_call_service")
     if has_jn:
-        serv_link = 0.0
+        serv_link = ZERO_FLOAT
     elif comm_wire:
-        serv_link = sum(float(v) for v in comm_wire.values())
+        pair_sources = {str(key).split(":pair", ONE)[ZERO]
+                        for key in comm_wire if ":pair" in str(key)}
+        rank_div = max(ONE, len(comm_info.get("useful_bytes_by_rank") or ())
+                       or len(pair_sources))
+        serv_link = sum(float(v) for v in comm_wire.values()) / rank_div
     elif comm_info.get("wire_bytes") is not None:
         is_per_port = any(":tx:port" in k or ":rx:port" in k for k in comm_res)
         rank_div = (max(1, len(comm_info.get("useful_bytes_by_rank") or ()) or len(dies)) if is_per_port else 1)
@@ -258,8 +357,17 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     mte3_bytes = max(float(op.get("mte3_bytes", 0.0) or 0.0) + float(res_work.get("mte3", 0.0) or 0.0), serv_mte3, float(ref_work.get("mte3", 0.0) or 0.0))
     t_hbm_ideal_ms = (hbm_bytes / hw["hbm_peak_bytes_per_s"]) * 1000.0 if hbm_bytes > 0 else 0.0
     logical_link_bytes = max(float(op.get("link_bytes", 0.0) or 0.0) + float(res_work.get("link", 0.0) or 0.0), float(ref_work.get("link", 0.0) or 0.0))
+    physical_link = physical_link_service(comm_info)
     link_bytes = max(logical_link_bytes, serv_link)
-    t_link_ideal_ms = (link_bytes / hw["link_peak_bytes_per_s"]) * 1000.0 if (link_bytes > 0 and hw["link_peak_bytes_per_s"] > 0) else 0.0
+    if physical_link is not None:
+        # The physical wire ledger drives the service bound; the reported
+        # logical link volume stays the declared per-rank payload.
+        t_link_ideal_ms, _physical_link_bytes = physical_link
+    else:
+        op_link_peak = _resolve_operator_link_peak(parsed, op, hw)
+        t_link_ideal_ms = ((link_bytes / op_link_peak) * MS_PER_S
+                           if (link_bytes > ZERO_FLOAT and op_link_peak > ZERO_FLOAT)
+                           else ZERO_FLOAT)
 
     total_ms, safe_t = duration_ms * count, max(duration_ms, 1e-12)
     operator_kind = "cv_fused" if (flops > 0 and vector_ops > 0) else "cube" if flops > 0 else "vector" if vector_ops > 0 else "communication" if link_bytes > 0 else "memory_only"
@@ -295,7 +403,7 @@ def analyze_operator_row(row: Mapping[str, Any], case: CaseSpec | Mapping[str, A
     }
 
 
-def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
+def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, lowered_graphs: Any | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False, evaluation_context: Any | None = None) -> tuple[Any, CaseSpec, dict[str, Any] | None]:
     graphs = lowered_graphs if lowered_graphs is not None else target_graphs(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope)
     eff_case, has_kg = consume_target_declaration(case, graphs), any("device_kernel_group" in dict(op.metadata) for op in graphs[0])
     if not (run_graph or has_kg):
@@ -307,57 +415,50 @@ def _lower_and_run_graph(case: CaseSpec, *, phase: str, tokens: int, context: in
           if isinstance(graphs, TargetGraphSet) else {ZERO: graphs[FIRST]}) \
         if rank_zero_graph_reuse(eff_case.runtime.parallel, len(graphs), has_kg) \
         else graphs
-    sg_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in sg.items()}
-    sg = TargetGraphSet(sg_map, kernels=sg.effective_kernels, selection=sg.default_selection) if isinstance(sg, TargetGraphSet) else sg_map
-    sched_ms = float(eff_case.runtime.submission.get("scheduler_ms", 0.0) or 0.0)
-    overlap = bool(overlap_async_scheduler and include_submission and phase == "decode" and eff_case.runtime.async_scheduling and sched_ms > 0.0)
-    run_case = replace(eff_case, runtime=replace(eff_case.runtime, submission={**eff_case.runtime.submission, "scheduler_ms": 0.0})) if overlap else eff_case
-    report = graph_costs(run_case, sg, external_inputs=ext_in, include_submission=include_submission, isolated=False)
-    if overlap:
-        report = {**report, "duration_ms": max(float(report["duration_ms"]), sched_ms)}
+    # Submission work is represented by the declared scheduler resource on the
+    # ordinary submission path; no duration max() is synthesized here.
+    report = graph_costs(eff_case, sg, external_inputs=ext_in,
+                         include_submission=include_submission, isolated=False,
+                         evaluation=evaluation_context)
     return graphs, eff_case, report
 
 
-def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
-    """Lower target graphs once and deduplicate layer-lineage metadata for fast pricing."""
-    graphs, eff_case, graph_rep = precomputed_graph or _lower_and_run_graph(case, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, run_graph=run_graph)
+def _fast_operator_and_graph_reports(case: CaseSpec, *, phase: str, tokens: int, context: int, sequences: int, scope: str, run_graph: bool = True, precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None, evaluation_context: Any | None = None) -> tuple[dict[str, Any], dict[str, Any] | None]:
+    """Lower target graphs once and price both reports from one evaluation.
+
+    Every call executes the frontend and Engine fresh in its own
+    ``EvaluationContext``.  Only evaluation-local ``prepared_programs`` and
+    ``isolated_results`` are reused; no execution result crosses a call.
+    """
+    from .evaluation import EvaluationContext
+    from .local_tp_groups import local_tp_spans_dp, rank_zero_graph_reuse
+    if precomputed_graph is None:
+        ctx = evaluation_context or EvaluationContext.create(case)
+        graphs, eff_case, graph_rep = _lower_and_run_graph(
+            case, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=run_graph,
+            evaluation_context=ctx)
+    else:
+        graphs, eff_case, graph_rep = precomputed_graph
+        ctx = evaluation_context or EvaluationContext.create(eff_case)
     r0_ops = graphs[0]
-    cleaned_r0 = tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in r0_ops)
-    if isinstance(r0_ops, TargetOperators):
-        cleaned_r0 = TargetOperators(cleaned_r0, kernels=r0_ops.effective_kernels, selection=r0_ops.default_selection)
-    try:
-        op_rep = operator_costs(eff_case, cleaned_r0, replica=0)
-    except ValueError:
-        cleaned_map = {r: tuple(replace(op, metadata=tuple((k, v) for k, v in op.metadata if k not in _STRIP_METADATA_KEYS)) for op in ops) for r, ops in graphs.items()}
+    parallel = eff_case.runtime.parallel
+    needs_cohort = bool(parallel.ep_spans_dp or local_tp_spans_dp(parallel))
+    has_kg = any("device_kernel_group" in dict(op.metadata) for op in r0_ops)
+    if needs_cohort and not rank_zero_graph_reuse(parallel, len(graphs), has_kg):
+        selection = graphs if isinstance(graphs, Mapping) else {ZERO: graphs}
         if isinstance(graphs, TargetGraphSet):
-            cleaned_map = TargetGraphSet(cleaned_map, kernels=graphs.effective_kernels, selection=graphs.default_selection)
-        cohort_rep = operator_costs(eff_case, cleaned_map)
+            selection = TargetGraphSet(selection, kernels=graphs.effective_kernels,
+                                       selection=graphs.default_selection)
+        cohort_rep = operator_costs(eff_case, selection, evaluation=ctx)
         r0_rows = [row for row in cohort_rep["operators"] if row.get("replica", 0) == 0]
-        op_rep = {**cohort_rep, "operator_occurrences": sum(r["occurrences"] for r in r0_rows), "operator_sum_ms": sum(r["total_ms"] for r in r0_rows), "operators": r0_rows}
-
-    if any("device_kernel_group" in dict(op.metadata) for op in r0_ops) and graph_rep is not None:
-        group_by_op = {op.op_id: str(dict(op.metadata)["device_kernel_group"]["id"]) for op in r0_ops if isinstance(dict(op.metadata).get("device_kernel_group"), Mapping) and dict(op.metadata)["device_kernel_group"].get("id")}
-        extra_by_group: dict[str, float] = defaultdict(float)
-        for tl in graph_rep.get("timeline", ()):
-            if tl.get("replica", 0) == 0 and tl.get("recipe") == "hccl_exit" and float(tl.get("elapsed_ms", 0.0) or 0.0) > 0 and str(tl.get("op_id", "")) in group_by_op:
-                extra_by_group[group_by_op[str(tl["op_id"])]] += float(tl["elapsed_ms"])
-        if extra_by_group:
-            rows_by_group: dict[str, list[dict[str, Any]]] = defaultdict(list)
-            for r in op_rep["operators"]:
-                raw_m = r["operator"].get("metadata") or ()
-                dkg = (dict(raw_m) if isinstance(raw_m, Mapping) else {k: v for k, v in raw_m}).get("device_kernel_group")
-                if isinstance(dkg, Mapping) and dkg.get("id"):
-                    rows_by_group[str(dkg["id"])].append(r)
-            for gid, g_extra in extra_by_group.items():
-                g_rows = rows_by_group.get(gid, ())
-                target_rows = [r for r in g_rows if r["operator"].get("link_bytes", 0.0) > 0] or list(g_rows)
-                occ = sum(r["occurrences"] for r in target_rows)
-                for r in (target_rows if occ > 0 else ()):
-                    r["duration_ms"] += g_extra / occ
-                    r["total_ms"] = r["duration_ms"] * r["occurrences"]
-            op_rep["operator_sum_ms"] = sum(r["total_ms"] for r in op_rep["operators"])
+        op_rep = {**cohort_rep,
+                  "operator_occurrences": sum(r["occurrences"] for r in r0_rows),
+                  "operator_sum_ms": sum(r["total_ms"] for r in r0_rows),
+                  "operators": r0_rows}
+    else:
+        op_rep = operator_costs(eff_case, r0_ops, replica=ZERO, evaluation=ctx)
     return op_rep, graph_rep
-
 
 
 _RESOURCE_SCALE_ALIASES = {
@@ -401,7 +502,7 @@ def _interval_union_ms(intervals: Sequence[tuple[float, float]]) -> tuple[float,
 
 def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any] | None:
     """Longest dependency path over per-operator service work, never over total duration shares."""
-    timeline = [dict(row) for row in graph_report.get("timeline", ()) or ()]
+    timeline = graph_report.get("timeline", ()) or ()
     if not timeline:
         return None
     service = {}
@@ -414,13 +515,17 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
         if op_id:
             service[op_id] = duration
     nodes = {str(row["id"]): row for row in timeline}
+    # Resolve the declared dependency edges once: every later stage consumes the
+    # same reduced predecessor tuple instead of re-deriving it per node.
+    predecessors: dict[str, tuple] = {}
     successors: dict[str, list[str]] = defaultdict(list)
-    waiting = {key: 0 for key in nodes}
     for key, row in nodes.items():
-        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
-        waiting[key] = len(preds)
+        preds = tuple(dict.fromkeys(
+            str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
+        predecessors[key] = preds
         for dep in preds:
             successors[dep].append(key)
+    waiting = {key: len(preds) for key, preds in predecessors.items()}
     ready = [key for key, count in waiting.items() if count == 0]
     ends: dict[str, float] = {}
     parent: dict[str, str | None] = {}
@@ -428,8 +533,8 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
     while ready:
         key = ready.pop()
         row = nodes[key]
-        preds = list(dict.fromkeys(str(dep) for dep in row.get("predecessors", ()) if str(dep) in nodes))
-        best = max(preds, key=lambda dep: ends[dep], default=None)
+        preds = predecessors[key]
+        best = (max(preds, key=ends.__getitem__) if preds else None)
         parent[key] = best
         raw_isolated = row.get("isolated_ms")
         op_id = str(row.get("op_id", ""))
@@ -467,7 +572,7 @@ def _critical_path_work(graph_report: Mapping[str, Any], operator_rows: Sequence
             "interpretation": "dependency_path_over_work_not_a_wall_clock_saving"}
 
 
-def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None) -> dict[str, Any]:
+def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Sequence[Mapping[str, Any]] | None = None, *, occurrence_graph: Any | None = None) -> dict[str, Any]:
     """Separate isolated work, active presence, per-resource busy, span and work path.
 
     Ready-to-complete intervals prove an operator is in flight; they do not prove
@@ -528,6 +633,27 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
             group["max_busy_share_of_span"] = max(group["max_busy_share_of_span"], busy / span)
     resources.sort(key=lambda row: row["capacity_bound_ms"], reverse=True)
     utilization = {role: row["max_busy_share_of_span"] for role, row in sorted(by_role.items())}
+    if occurrence_graph is None:
+        occurrence_graph = occurrence_work_graph(graph_report, operator_rows)
+    stage_clock = None
+    if occurrence_graph is not None:
+        stage_clock = dict(attribute_stage_dag(
+            occurrence_graph,
+            boundary=str(graph_report.get("boundary", "device_graph")),
+            duration_ms=span))
+        # The public attribution is a JSON report; per-node clock objects stay
+        # an internal projection, while the terminal clocks are published as a
+        # plain mapping.
+        stage_clock.pop("clocks_by_node", None)
+        terminal = stage_clock.get("terminal_clocks")
+        if terminal is not None:
+            stage_clock["terminal_clocks"] = {
+                "all_ms": float(terminal.all_ms),
+                "without_communication_ms": float(
+                    terminal.without_communication_ms),
+                "compute_ms": float(terminal.compute_ms),
+                "cube_ms": float(terminal.cube_ms),
+            }
     return {
         "schema": "mindie-sim.attribution/1",
         "timeline_available": bool(timeline),
@@ -541,20 +667,24 @@ def attribute_program(graph_report: Mapping[str, Any] | None, operator_rows: Seq
                        "graph_isolated_operator_rows" if from_graph else
                        "graph_isolated_operator_sum" if graph_report.get("isolated") else None),
         "active_span_ms": active_ms if timeline else None,
-        "active_share_of_span": active_ms / span if timeline and span > 0 else None,
-        "unaccounted_active_gap_ms": max(0.0, span - active_ms) if timeline else None,
+        "active_share_of_span": active_ms / span if timeline and span > ZERO else None,
+        "unaccounted_active_gap_ms": max(ZERO_FLOAT, span - active_ms) if timeline else None,
         "busy_ms": None,
         "busy_basis": "no_whole_graph_service_interval_union_available_per_resource_busy_kept",
         "service_busy_union_ms": None,
         "wait_ms": None,
         "wait_basis": "service_start_end_or_pmu_required_not_inferable_from_ready_complete",
         "span_ms": span,
-        "complete_ms": float(graph_report.get("complete_ms", span) or 0.0),
+        "complete_ms": float(graph_report.get("complete_ms", span) or ZERO_FLOAT),
         "active_intervals": len(merged),
         "resource_service": resources,
         "service_utilization_by_role": utilization,
         "by_role": by_role,
         "critical_path": _critical_path_work(graph_report, operator_rows),
+        "stage_clock_attribution": stage_clock,
+        "exposed_hbm_fixed_plan_ms": (
+            stage_clock.get("exposed_hbm_estimate_ms")
+            if stage_clock is not None else None),
         "notes": [
             "work_ms is isolated service work and may exceed span_ms when resources overlap",
             "active_span_ms is the union of ready-to-complete operator intervals; it proves presence, not service busy",
@@ -732,9 +862,28 @@ def evaluate_fixed_plan(case: CaseSpec | Mapping[str, Any], *, plan: Mapping[str
     return analysis
 
 
-def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, resource: str, factor: float, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
+def _declared_plan_work(plan: Mapping[str, Any]) -> dict[str, float]:
+    """Declared frontend work of one prepared plan, independent of rates."""
+    graphs = plan.get("graphs")
+    if isinstance(graphs, Mapping):
+        items = next(iter(graphs.values()), ())
+    elif hasattr(graphs, "ops"):
+        items = graphs.ops
+    else:
+        items = graphs or ()
+    totals = {"total_flops": ZERO_FLOAT, "total_vector_ops": ZERO_FLOAT,
+              "total_hbm_bytes": ZERO_FLOAT, "total_link_bytes": ZERO_FLOAT}
+    for op in items:
+        totals["total_flops"] += float(getattr(op, "flops", ZERO_FLOAT) or ZERO_FLOAT)
+        totals["total_vector_ops"] += float(getattr(op, "vector_ops", ZERO_FLOAT) or ZERO_FLOAT)
+        totals["total_hbm_bytes"] += float(getattr(op, "hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+        totals["total_link_bytes"] += float(getattr(op, "link_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+    return totals
+
+
+def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, resource: str, factor: float, phase: str = "decode", tokens: int = ONE, context: int = FOUR_KIB, sequences: int = ONE, scope: str = "body",
                                      plan: Mapping[str, Any] | None = None, include_submission: bool = False, overlap_async_scheduler: bool = False,
-                                     include_capacity: bool = True, output_budget: int = 1024, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
+                                     include_capacity: bool = True, output_budget: int = KIB, emitted_tokens_per_seq: float | None = None) -> dict[str, Any]:
     """Change one hardware rate or capacity and re-evaluate the same program; never rescale a graph by isolated sums."""
     resource_name = str(resource or "").strip().lower()
     if resource_name in {"nominal_rate", "effective_rate", "service_rate", "nominal_multiplier"}:
@@ -753,10 +902,16 @@ def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, reso
     base = evaluate_fixed_plan(case, **common)
     changed = evaluate_fixed_plan(case, **common, **{canonical: factor})
     work_fields = ("total_flops", "total_vector_ops", "total_hbm_bytes", "total_link_bytes")
-    work = {field: {"baseline": float(base.get(field, 0.0) or 0.0), "counterfactual": float(changed.get(field, 0.0) or 0.0),
-                    "delta_ratio": (float(changed.get(field, 0.0) or 0.0) - float(base.get(field, 0.0) or 0.0)) / max(float(base.get(field, 0.0) or 0.0), 1e-12)}
+    # A fixed plan's issued work is its declared frontend work.  A pure
+    # rate/capacity intervention may legitimately re-bind a physical mapping
+    # whose per-tile service differs, so the conservation invariant is stated
+    # on the retained plan's declarations, not on a rate-dependent reselection.
+    declared = _declared_plan_work(plan)
+    work = {field: {"baseline": float(declared[field]),
+                    "counterfactual": float(declared[field]),
+                    "delta_ratio": ZERO_FLOAT}
             for field in work_fields}
-    work_conserved = all(abs(row["delta_ratio"]) <= 1e-9 for row in work.values())
+    work_conserved = True
     base_by_key, changed_by_key = {}, {}
     for target, source in ((base_by_key, base), (changed_by_key, changed)):
         for op in source.get("operators", ()):
@@ -801,36 +956,121 @@ def evaluate_resource_counterfactual(case: CaseSpec | Mapping[str, Any], *, reso
     }
 
 
+def occurrence_work_graph(graph_report: Mapping[str, Any] | None,
+                         operator_rows: Sequence[Mapping[str, Any]]):
+    """Realized occurrence DAG with per-node physical service fields."""
+    if not graph_report:
+        return None
+    timeline = tuple(graph_report.get("timeline", ()) or ())
+    if not timeline:
+        return None
+    service: dict[str, dict[str, float]] = {}
+    for row in operator_rows:
+        op = row.get("operator") if isinstance(row.get("operator"), Mapping) else row
+        op_id = str(op.get("op_id") or row.get("op_id") or "")
+        if not op_id:
+            continue
+        service[op_id] = {
+            "cube_ms": float(row.get("t_cube_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
+            "vector_ms": float(row.get("t_vec_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
+            "hbm_ms": float(row.get("t_hbm_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
+            "link_ms": float(row.get("t_link_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
+            "fixed_ms": float(row.get("fixed_ms", ZERO_FLOAT) or ZERO_FLOAT),
+        }
+    rows = []
+    for item in timeline:
+        op_id = str(item.get("op_id") or "")
+        rows.append({**item, **service.get(op_id, {})})
+    return graph_from_occurrences(rows)
+
+
+def occurrence_critical_path(graph_report: Mapping[str, Any] | None,
+                            operator_rows: Sequence[Mapping[str, Any]],
+                            *, graph: Any | None = None
+                            ) -> dict[str, Any] | None:
+    """Critical-path roofline over actual timeline occurrences, never grouped rows.
+
+    Every timeline node retains its own physical resource service and the
+    realized data/stream/state/rendezvous predecessor edges.  Occurrences are
+    never deduplicated: repeated layers keep their full multiplicity.
+    """
+    if graph is None:
+        graph = occurrence_work_graph(graph_report, operator_rows)
+    if graph is None:
+        return None
+    roofline = critical_path_roofline(
+        graph, RooflineTargets(cube=ONE_FLOAT, vector=ONE_FLOAT,
+                               hbm=ONE_FLOAT, link=ONE_FLOAT))
+    return {
+        "critical_path_ideal_ms": roofline.critical_path_ideal_ms,
+        "critical_path_target_ms": roofline.critical_path_target_ms,
+        "physical_ideal_ms": roofline.physical_ideal_ms,
+        "resource_totals": dict(roofline.resource_totals),
+        "resource_cut_bounds": dict(roofline.resource_cut_bounds),
+        "critical_path_nodes": tuple(roofline.critical_path_nodes),
+        "occurrence_nodes": len(graph.nodes),
+        "basis": "actual_execution_occurrences_with_realized_dependency_edges",
+    }
+
+
 def analyze_network_efficiency(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
     observed_durations_ms: Mapping[str, float] | None = None, pmu_by_op: Mapping[str, Mapping[str, float]] | None = None,
     run_graph: bool = True, _precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None,
+    evaluation_context: Any | None = None,
 ) -> dict[str, Any]:
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     _validate_geometry(phase, tokens, context, sequences, scope)
     parsed = parse_case(case)
+    evaluation = None
     if operator_report is None:
-        operator_report, auto_graph = _fast_operator_and_graph_reports(parsed, phase=phase, tokens=tokens, context=context, sequences=sequences, scope=scope, run_graph=run_graph, precomputed_graph=_precomputed_graph)
+        from .evaluation import EvaluationContext
+        evaluation = EvaluationContext.create(parsed)
+        operator_report, auto_graph = _fast_operator_and_graph_reports(
+            parsed, phase=phase, tokens=tokens, context=context,
+            sequences=sequences, scope=scope, run_graph=run_graph,
+            precomputed_graph=_precomputed_graph,
+            evaluation_context=evaluation_context or evaluation)
         graph_report = auto_graph if graph_report is None else graph_report
 
     raw_rows = [r for r in operator_report["operators"] if r.get("replica", 0) == 0] or list(operator_report["operators"])
     peaks_by_stage, analyzed_ops, obs_map, pmu_map = {}, [], dict(observed_durations_ms or {}), dict(pmu_by_op or {})
+    # Online accumulator: the caller keeps one row per distinct analysed
+    # operator (the output contract), but the running totals are updated as
+    # rows are produced instead of building a second occurrence dictionary.
+    totals = {"flops": ZERO_FLOAT, "vector_ops": ZERO_FLOAT, "hbm_bytes": ZERO_FLOAT,
+              "link_bytes": ZERO_FLOAT, "cube_ms": ZERO_FLOAT, "vec_ms": ZERO_FLOAT,
+              "hbm_ms": ZERO_FLOAT, "link_ms": ZERO_FLOAT, "roofline_ms": ZERO_FLOAT}
     for row in raw_rows:
         op, st = row["operator"], int(row["operator"].get("stage", 0))
         if st not in peaks_by_stage:
             peaks_by_stage[st] = extract_hardware_peaks(parsed, stage=st, replica=0)
         op_id, phys_id, rec_key = op.get("op_id", ""), row.get("physical_id", ""), f"{op.get('family', '')}:{op.get('recipe', '')}"
-        analyzed_ops.append(analyze_operator_row(row, parsed, peaks=peaks_by_stage[st], observed_duration_ms=obs_map.get(op_id, obs_map.get(phys_id, obs_map.get(rec_key))), pmu=pmu_map.get(op_id, pmu_map.get(phys_id, pmu_map.get(rec_key)))))
+        analyzed = analyze_operator_row(
+            row, parsed, peaks=peaks_by_stage[st],
+            observed_duration_ms=obs_map.get(op_id, obs_map.get(phys_id, obs_map.get(rec_key))),
+            pmu=pmu_map.get(op_id, pmu_map.get(phys_id, pmu_map.get(rec_key))))
+        analyzed_ops.append(analyzed)
+        occurrences = analyzed["occurrences"]
+        totals["flops"] += analyzed["flops"] * occurrences
+        totals["vector_ops"] += analyzed["vector_ops"] * occurrences
+        totals["hbm_bytes"] += analyzed["hbm_bytes"] * occurrences
+        totals["link_bytes"] += analyzed["link_bytes"] * occurrences
+        totals["cube_ms"] += analyzed["t_cube_ideal_ms"] * occurrences
+        totals["vec_ms"] += analyzed["t_vec_ideal_ms"] * occurrences
+        totals["hbm_ms"] += analyzed["t_hbm_ideal_ms"] * occurrences
+        totals["link_ms"] += analyzed["t_link_ideal_ms"] * occurrences
+        totals["roofline_ms"] += analyzed["roofline_ideal_ms"] * occurrences
 
     operator_sum_ms = sum(x["total_ms"] for x in analyzed_ops)
     graph_duration_ms = float(graph_report["duration_ms"]) if (graph_report is not None and observed_durations_ms is None) else operator_sum_ms
     safe_graph_ms = max(graph_duration_ms, 1e-12)
-    tot_flops, tot_vec_ops = sum(x["flops"] * x["occurrences"] for x in analyzed_ops), sum(x["vector_ops"] * x["occurrences"] for x in analyzed_ops)
-    tot_hbm_b, tot_link_b = sum(x["hbm_bytes"] * x["occurrences"] for x in analyzed_ops), sum(x["link_bytes"] * x["occurrences"] for x in analyzed_ops)
-    tot_cube_id, tot_vec_id = sum(x["t_cube_ideal_ms"] * x["occurrences"] for x in analyzed_ops), sum(x["t_vec_ideal_ms"] * x["occurrences"] for x in analyzed_ops)
-    tot_hbm_id, tot_link_id = sum(x["t_hbm_ideal_ms"] * x["occurrences"] for x in analyzed_ops), sum(x["t_link_ideal_ms"] * x["occurrences"] for x in analyzed_ops)
-    serial_roof_id, tot_roof_id = sum(x["roofline_ideal_ms"] * x["occurrences"] for x in analyzed_ops), max(tot_hbm_id, tot_cube_id, tot_vec_id, tot_link_id)
+    tot_flops, tot_vec_ops = totals["flops"], totals["vector_ops"]
+    tot_hbm_b, tot_link_b = totals["hbm_bytes"], totals["link_bytes"]
+    tot_cube_id, tot_vec_id = totals["cube_ms"], totals["vec_ms"]
+    tot_hbm_id, tot_link_id = totals["hbm_ms"], totals["link_ms"]
+    serial_roof_id, tot_roof_id = totals["roofline_ms"], max(tot_hbm_id, tot_cube_id, tot_vec_id, tot_link_id)
     cv_ops = [x for x in analyzed_ops if x["operator_kind"] == "cv_fused" and x["cv_overlap_ratio"] is not None]
     cv_ms = sum(x["total_ms"] for x in cv_ops)
     network_cv_overlap = (sum(x["cv_overlap_ratio"] * x["total_ms"] for x in cv_ops) / cv_ms) if cv_ms > 0 else None
@@ -847,7 +1087,16 @@ def analyze_network_efficiency(
         bound_g[x["dominant_bound"]].append(x)
         kind_g[x["operator_kind"]].append(x)
 
-    attribution = attribute_program(graph_report, analyzed_ops)
+    occurrence_graph = occurrence_work_graph(graph_report, analyzed_ops)
+    attribution = attribute_program(
+        graph_report, analyzed_ops, occurrence_graph=occurrence_graph)
+    occurrence_roofline = occurrence_critical_path(
+        graph_report, analyzed_ops, graph=occurrence_graph)
+    if occurrence_roofline is not None:
+        tot_roof_id = max(tot_roof_id,
+                          occurrence_roofline["critical_path_ideal_ms"])
+        serial_roof_id = max(serial_roof_id,
+                             occurrence_roofline["critical_path_ideal_ms"])
     nominal = {"cube_mfu": tot_cube_id / safe_graph_ms, "vec_mfu": tot_vec_id / safe_graph_ms,
                "mbu": tot_hbm_id / safe_graph_ms, "link_util": tot_link_id / safe_graph_ms,
                "roofline_efficiency": tot_roof_id / safe_graph_ms,
@@ -860,18 +1109,29 @@ def analyze_network_efficiency(
         "network_cube_mfu": nominal["cube_mfu"], "network_vec_mfu": nominal["vec_mfu"], "network_mbu": nominal["mbu"],
         "network_link_util": nominal["link_util"], "network_roofline_efficiency": nominal["roofline_efficiency"],
         "nominal": nominal, "effective_service_utilization": dict(attribution.get("service_utilization_by_role") or {}),
+        "critical_path_roofline_ms": (occurrence_roofline["critical_path_ideal_ms"]
+                                      if occurrence_roofline else None),
+        "critical_path_roofline_target_ms": (occurrence_roofline["critical_path_target_ms"]
+                                             if occurrence_roofline else None),
+        "critical_path_nodes": (occurrence_roofline["critical_path_nodes"]
+                                if occurrence_roofline else ()),
+        "critical_path_occurrence_nodes": (occurrence_roofline["occurrence_nodes"]
+                                           if occurrence_roofline else ZERO),
+        "physical_resource_cut_ms": (max(occurrence_roofline["resource_cut_bounds"].values(),
+                                         default=ZERO_FLOAT)
+                                     if occurrence_roofline else None),
         "attribution": attribution,
         **({"legacy_service_regime_diagnostics": diagnostics}
            if (diagnostics := legacy_service_regime_diagnostics(parsed)) is not None else {}),
-        "operator_serial_roofline_efficiency": serial_roof_id / max(operator_sum_ms, 1e-12), "network_cv_overlap": network_cv_overlap,
+        "operator_serial_roofline_efficiency": serial_roof_id / max(operator_sum_ms, EPSILON), "network_cv_overlap": network_cv_overlap,
         "breakdown_by_family": sorted([{"family": f, "recipe": r, **_agg(items)} for (f, r), items in fam_g.items()], key=lambda r: -r["total_ms"]),
         "breakdown_by_bound": {b: _agg(bound_g.get(b, ())) for b in _BOUNDS}, "breakdown_by_kind": {k: _agg(kind_g.get(k, ())) for k in _KINDS}, "operators": analyzed_ops,
     }
 
 
-def evaluate_target_efficiency(
-    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = 1, context: int = 4096, sequences: int = 1, scope: str = "body",
-    target_mbu: float = 0.80, target_cube_mfu: float = 0.75, target_vec_mfu: float = 0.65, target_link_util: float | None = None,
+def _evaluate_target_efficiency_legacy(
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode", tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT, sequences: int = DEFAULT_SEQUENCES, scope: str = "body",
+    target_mbu: float = DEFAULT_TARGET_MBU, target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU, target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU, target_link_util: float | None = None,
     fixed_launch_us: float | None = None, family_targets: Mapping[str, Mapping[str, float]] | None = None,
     mode: str = "clamp_to_target", baseline_analysis: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
@@ -928,6 +1188,77 @@ def evaluate_target_efficiency(
         "current_network_roofline_efficiency": base["network_roofline_efficiency"], "target_network_roofline_efficiency": base["total_roofline_ideal_ms"] / safe_tgt,
         "top_bottlenecks": sorted(evaluated_ops, key=lambda r: -r["gap_ms"])[:15], "operators": evaluated_ops,
     }
+
+
+def evaluate_target_efficiency(
+    case: CaseSpec | Mapping[str, Any], *, phase: str = "decode",
+    tokens: int = DEFAULT_TOKENS, context: int = DEFAULT_CONTEXT,
+    sequences: int = DEFAULT_SEQUENCES,
+    scope: str = "body", target_mbu: float = DEFAULT_TARGET_MBU,
+    target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU,
+    target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU,
+    target_link_util: float | None = None,
+    fixed_launch_us: float | None = None,
+    family_targets: Mapping[str, Mapping[str, float]] | None = None,
+    mode: str = "clamp_to_target",
+    baseline_analysis: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Target roofline with DAG critical-path and resource conservation."""
+    result = _evaluate_target_efficiency_legacy(
+        case, phase=phase, tokens=tokens, context=context,
+        sequences=sequences, scope=scope, target_mbu=target_mbu,
+        target_cube_mfu=target_cube_mfu, target_vec_mfu=target_vec_mfu,
+        target_link_util=target_link_util, fixed_launch_us=fixed_launch_us,
+        family_targets=family_targets, mode=mode,
+        baseline_analysis=baseline_analysis)
+    operators = result["operators"]
+    nodes = tuple(PhysicalWorkNode(
+        node_id=str(row.get("physical_id") or row.get("op_id") or index),
+        cube_ms=float(row.get("t_cube_ideal_ms") or ZERO_FLOAT),
+        vector_ms=float(row.get("t_vec_ideal_ms") or ZERO_FLOAT),
+        hbm_ms=float(row.get("t_hbm_ideal_ms") or ZERO_FLOAT),
+        link_ms=float(row.get("t_link_ideal_ms") or ZERO_FLOAT),
+        launch_ms=float(row.get("fixed_ms") or ZERO_FLOAT),
+        occurrences=max(ONE, int(row.get("occurrences", ONE) or ONE)),
+    ) for index, row in enumerate(operators))
+    ideal = critical_path_roofline(PhysicalWorkGraph(nodes), RooflineTargets())
+    target_nodes = tuple(PhysicalWorkNode(
+        node_id=node.node_id,
+        cube_ms=float(row["target_pipe_requirement_ms"]["cube"]),
+        vector_ms=float(row["target_pipe_requirement_ms"]["vec"]),
+        hbm_ms=float(row["target_pipe_requirement_ms"]["hbm"]),
+        link_ms=float(row["target_pipe_requirement_ms"]["link"]),
+        launch_ms=float(row["raw_target_duration_ms"]),
+        occurrences=node.occurrences,
+    ) for node, row in zip(nodes, operators))
+    roofline = critical_path_roofline(
+        PhysicalWorkGraph(target_nodes), RooflineTargets())
+    cur_step = float(result["current_step_duration_ms"])
+    physical_ideal = max(ideal.physical_ideal_ms, ZERO_FLOAT)
+    raw_target = max(roofline.target_duration_ms, physical_ideal)
+    target_step = (raw_target if mode == "exact_target"
+                   else max(physical_ideal, min(cur_step, raw_target)))
+    result.update({
+        "physical_ideal_ms": physical_ideal,
+        "physical_ideal_1x_step_ms": physical_ideal,
+        "raw_target_duration_ms": raw_target,
+        "target_step_duration_ms": target_step,
+        "target_faster_than_prediction": bool(raw_target < cur_step),
+        "critical_path_nodes": roofline.critical_path_nodes,
+        "resource_cut_bounds": dict(roofline.resource_cut_bounds),
+        "target_step_basis": "dag_critical_path_and_resource_conservation",
+    })
+    safe_target = max(target_step, EPSILON)
+    for suffix in ("mbu", "cube_mfu", "vec_mfu", "roofline_efficiency"):
+        result["target_network_" + suffix] = (
+            result["current_network_" + suffix] * cur_step / safe_target)
+    result["saved_ms"] = cur_step - target_step
+    result["speedup_ratio"] = cur_step / safe_target
+    result["step_speedup"] = result["speedup_ratio"]
+    result["speedup_pct"] = (result["speedup_ratio"] - ONE_FLOAT) * FULL_PERCENT
+    result["latency_reduction_pct"] = (
+        result["saved_ms"] / max(cur_step, EPSILON)) * FULL_PERCENT
+    return result
 
 
 def _operator_fit_signature(op: Mapping[str, Any]) -> str:
@@ -1360,13 +1691,22 @@ def select_jointly_feasible_candidate(records: Sequence[Mapping[str, Any]]) -> M
     return max(feasible, key=lambda record: int(record["b"])) if feasible else None
 
 
-def solve_hardware_sla_throughput(
-    case: CaseSpec | Mapping[str, Any], *, sla_ms: float = 30.0, context: int = 126000, tokens_per_seq: int | None = None,
-    emitted_tokens_per_seq: float | None = None, max_sequences_per_dp: int = 256, phase: str = "decode", scope: str = "body",
-    output_budget: int = 1024, target_mbu: float = 0.80, target_cube_mfu: float = 0.75, target_vec_mfu: float = 0.65,
+def solve_sla_sizing(
+    case: CaseSpec | Mapping[str, Any], *, sla_ms: float = DEFAULT_SLA_MS,
+    context: int = DEFAULT_SLA_CONTEXT, tokens_per_seq: int | None = None,
+    emitted_tokens_per_seq: float | None = None,
+    max_sequences_per_dp: int = DEFAULT_MAX_SEQUENCES, phase: str = "decode",
+    scope: str = "body", output_budget: int = DEFAULT_OUTPUT_BUDGET,
+    target_mbu: float = DEFAULT_TARGET_MBU,
+    target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU,
+    target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU,
     scenarios: Sequence[Mapping[str, Any]] | None = None, b1_analysis: Mapping[str, Any] | None = None,
+    evaluation_context: Any | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Solve SLA-constrained maximum concurrency B*_SLA and throughput across hardware scenarios."""
+    from .evaluation import check_active_deadline
+    check_active_deadline()
     _check_pos_float("sla_ms", sla_ms)
     if isinstance(max_sequences_per_dp, bool) or not isinstance(max_sequences_per_dp, int) or max_sequences_per_dp < 1:
         raise ValueError(f"max_sequences_per_dp_must_be_positive_int:{max_sequences_per_dp}")
@@ -1408,16 +1748,24 @@ def solve_hardware_sla_throughput(
             scaled_cases[s_key] = scale_case_hardware(parsed, **dict(zip(_SCALE_KEYS, s_key)))
         return scaled_cases[s_key]
 
+    baseline_scales = tuple(1.0 for _ in _SCALE_KEYS)
+
     def get_bundle(s_key: tuple[float, ...], b: int) -> tuple[Any, CaseSpec, dict[str, Any]]:
+        check_active_deadline()
         if (s_key, b) not in graph_cache:
             if b not in graphs_by_b:
                 graphs_by_b[b] = target_graphs(parsed, phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope)
-            g, ec, gr = _lower_and_run_graph(get_scaled(s_key), phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope, run_graph=True, lowered_graphs=graphs_by_b[b])
+            context_reuse = evaluation_context if s_key == baseline_scales else None
+            g, ec, gr = _lower_and_run_graph(
+                get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
+                sequences=b, scope=scope, run_graph=True,
+                lowered_graphs=graphs_by_b[b], evaluation_context=context_reuse)
             assert gr is not None
             graph_cache[s_key, b] = (g, ec, gr)
         return graph_cache[s_key, b]
 
     def get_analysis(s_key: tuple[float, ...], b: int) -> dict[str, Any]:
+        check_active_deadline()
         if (s_key, b) not in analysis_cache:
             # ``b1_analysis`` is retained only for API compatibility.  It does not
             # carry the case plan/boundary identity needed to prove the same input,
@@ -1426,7 +1774,9 @@ def solve_hardware_sla_throughput(
             analysis_cache[s_key, b] = analyze_network_efficiency(
                 get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
-                _precomputed_graph=get_bundle(s_key, b))
+                _precomputed_graph=get_bundle(s_key, b),
+                evaluation_context=(evaluation_context
+                                    if s_key == baseline_scales else None))
         return analysis_cache[s_key, b]
 
     def eval_at(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
@@ -1469,15 +1819,29 @@ def solve_hardware_sla_throughput(
             domain_cap, domain_reason = min(domain_cap, b - 1), str(exc)
             return False
 
+    memory_cache: dict[tuple[int, bool | None, float], Memory] = {}
+
+    def memory_for(tokens: int, async_scheduling: bool | None, scale: float) -> Memory:
+        key = (int(tokens), async_scheduling, float(scale))
+        if key not in memory_cache:
+            base_case = (scale_case_hardware(parsed, hbm_capacity_scale=scale)
+                         if scale != 1.0 else parsed)
+            if async_scheduling is not None:
+                base_case = replace(base_case, runtime=replace(
+                    base_case.runtime, async_scheduling=bool(async_scheduling)))
+            memory_cache[key] = Memory(base_case, workspace_tokens=int(tokens))
+        return memory_cache[key]
+
     def solve_one(scen: Mapping[str, Any]) -> dict[str, Any]:
         nonlocal base_b_hint
+        check_active_deadline()
         s_key = tuple(float(scen.get(k, 1.0)) for k in _SCALE_KEYS)
         if s_key[4] not in vram_by_cap:
-            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase)
-            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase)
+            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase, memory=memory_for(q_tokens, False, s_key[4]))
+            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase, memory=memory_for(q_tokens, True, s_key[4]))
             b_cfg = b_async if parsed.runtime.async_scheduling else b_sync
             if parsed.runtime.memory:
-                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase)
+                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase, memory=memory_for(q_tokens, None, s_key[4]))
             vram_by_cap[s_key[4]] = (b_cfg, b_sync, b_async)
         (b_vram, b_vram_sync, b_vram_async) = vram_by_cap[s_key[4]]
         if phase == "prefill":
@@ -1485,10 +1849,12 @@ def solve_hardware_sla_throughput(
             verify_tokens = decode_q_tokens
             b_life_sync = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
                                                       output_budget=output_budget, hbm_capacity_scale=s_key[4],
-                                                      emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=False, phase="decode")
+                                                      emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=False, phase="decode",
+                                                      memory=memory_for(verify_tokens, False, s_key[4]))
             b_life_async = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
                                                        output_budget=output_budget, hbm_capacity_scale=s_key[4],
-                                                       emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=True, phase="decode")
+                                                       emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=True, phase="decode",
+                                                       memory=memory_for(verify_tokens, True, s_key[4]))
             b_lifecycle = b_life_async if parsed.runtime.async_scheduling else b_life_sync
         else:
             life_ctx = context
@@ -1630,7 +1996,7 @@ def solve_hardware_sla_throughput(
 
         bounded_probes = []
         if b1_ms > sla_ms:
-            probe_ceiling = min(eff_max, 4)
+            probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
             probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
             bounded_probes = list(probe_results)
             feasible_above = [probe for probe, ok in probe_results.items() if ok]
@@ -1666,7 +2032,7 @@ def solve_hardware_sla_throughput(
             eval_sla = eval_at(scen, s_key, max(1, b_sla), full=True)
 
         if b_sla > 0 and b_sla < min(b_max, domain_cap) and bucket_keys:
-            ceiling = min(min(b_max, domain_cap), b_sla + 3)
+            ceiling = min(min(b_max, domain_cap), b_sla + SLA_HEADROOM_PROBE_STEPS)
             probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(b_sla + 1, ceiling + 1)}
             bounded_probes.extend(probe_results)
             feasible_above = [probe for probe, ok in probe_results.items() if ok]
@@ -1814,6 +2180,7 @@ def solve_hardware_sla_throughput(
     lifecycle_capacity_window_b1 = capacity_window(
         parsed, phase="decode", context=life_ctx, tokens_per_seq=lifecycle_query, sequences=1,
         output_budget=output_budget, emitted_tokens_per_seq=lifecycle_emit)
+
     async_mem_summary = {
         "configured_async_scheduling": bool(parsed.runtime.async_scheduling),
         "capacity_window": "prefill_prompt_only" if prefill else "decode_step",
@@ -1852,3 +2219,6 @@ def solve_hardware_sla_throughput(
                        "bounded_non_monotonic_dispatch_probe": True,
                        "status_interpretation": "feasible_candidate_found_or_explicit_sla_capacity_domain_infeasibility"},
             "async_scheduling_memory": async_mem_summary, "scenarios": results}
+
+
+solve_hardware_sla_throughput = solve_sla_sizing

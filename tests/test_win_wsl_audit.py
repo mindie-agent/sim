@@ -64,5 +64,9 @@ def test_timeout_error_not_swallowed_in_catalog_and_custom_hardware(
         custom_hardware.list_custom_hardware_skus()
 
     monkeypatch.setattr(Path, "read_text", raise_timeout)
+    # This test runs on xdist workers where another test may already have
+    # populated the built-in model cache. Clear it so the patched read path is
+    # genuinely exercised instead of returning a cached ModelSpec.
+    model_catalog._load_builtin_model.cache_clear()
     with pytest.raises(TimeoutError):
-        model_catalog.load_architecture_profile(next(iter(model_catalog.ARCHITECTURE_PRESET_CATALOG)))
+        model_catalog.load_model(next(iter(model_catalog.ARCHITECTURE_PRESET_CATALOG)))

@@ -46,7 +46,7 @@ The op recipe is `grouped_expert_gemm`; callers bind
 ## 2. Source identity and evidence scope
 
 All five supplied files are the **current checkout** at
-`/Users/maoxx241/code/vllm-ascend`, not a historical capture image. Their
+`repository://vllm-ascend`, not a historical capture image. Their
 SHA256 values match both the retained `tests/fixtures/operator_sources/grouped_gemm.json`
 and the wave4 campaign manifest at
 `tests/fixtures/operator_sources/grouped_gemm.json`
@@ -67,7 +67,7 @@ compared here is the supplied source and the coordinator's synthetic control
 hardware.
 
 Review input for this repair: the `grouped_gemm` task section of
-`/Users/maoxx241/code/sim-rewrite-20261027/data/verification/operators-wave2-review.json`
+`repository://sim-rewrite-20261027/data/verification/operators-wave2-review.json`
 (finding `GMM-HISTOGRAM-BOUNDARY`). The review finding cites additional
 `op_host/op_api/*.cpp` files. Those files are outside the five-file source set
 and hash receipt above; this report does not claim to have read or modeled them.
@@ -511,7 +511,7 @@ The supplied files do not state that value, so no workspace bytes are declared.
 Focused command:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest tests/operators/test_grouped_gemm.py -q
 ```
 
@@ -682,7 +682,7 @@ auto-discovered.
 For the campaign, the exact runner command is:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   tools/run_operator_cases.py \
   mindie_sim.prediction.operators.grouped_gemm \
   tests/fixtures/operator_cases/grouped_gemm.json \

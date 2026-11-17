@@ -2,7 +2,7 @@
   "scope": "source_geometry_homology_for_frozen_helper_responses",
   "sources": {
     "caller": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+      "path": "repository://sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
       "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
       "size_bytes": 33354,
       "lines": [
@@ -21,7 +21,7 @@
       ]
     },
     "gating": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/fused_gdn_gating.py.txt",
+      "path": "repository://sim-serving-host-io-20261030/data/observations/sources/gdn-image-c3d00a196905/fused_gdn_gating.py.txt",
       "sha256": "5587bf3440e64eda125899f5de2d1ab609061e2b5336f847af101ada51d81058",
       "size_bytes": 3011,
       "lines": [

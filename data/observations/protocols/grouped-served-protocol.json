@@ -2,7 +2,7 @@
   "schema": "mindie-sim.capture-protocol/1",
   "adapter": "served_grouped_kernels",
   "producer": {
-    "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/analyze_grouped.py",
+    "path": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/analyze_grouped.py",
     "sha256": "4422de3370d03fba25f22bbd9464fd8dbc1c62ecc4b53e4602686fb2b3b6bc89"
   },
   "supporting_sources": [
@@ -11,7 +11,7 @@
       "sha256": "ac63a7078310a4599b0d178ac159d37901b9732046788cf3beddec4ef6187f89"
     },
     {
-      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/serve_qwen35_grouped.sh",
+      "path": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/serve_qwen35_grouped.sh",
       "sha256": "aeb753fb4856b848694c3cf5bae603d5ad665b1d10b53226f512221b5742c2e5"
     }
   ],

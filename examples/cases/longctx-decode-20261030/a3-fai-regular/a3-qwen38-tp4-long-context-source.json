@@ -118,7 +118,7 @@
     ],
     "metadata": {
       "source_template_identity": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen38-a3-tp4.json",
         "sha256": "9567c873f7fd1d382082b05ea5d58fc8985b65a2281d99d886630ed5e65c624d",
         "size_bytes": 4234
       },

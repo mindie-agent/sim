@@ -1,34 +1,34 @@
 {
   "scope": "same_case_full_45_layer_q6_short_and_long_context_Body_matrix",
   "case": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool-gmm-service.json",
+    "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/glm53flash-a3-native-keypool-gmm-service.json",
     "sha256": "96884fb14a384fb0ba5ec01a1e4da48396845e78e298755d863dde9cb30a313d",
     "size_bytes": 29469
   },
   "gmm_parameters": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/gmm-parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/gmm-parameters.json",
     "sha256": "0ce5d716d23d810c6c79c007a52417bfa2198f166e4196b0cab740f8df9d5660",
     "size_bytes": 14617
   },
   "keypool_parameters": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a3-native-keypool-20261030/parameters.json",
     "sha256": "5e100ba5782d2a517adf3c7ce0b83a0b1de84573de5749183da85caa8b8c5a31",
     "size_bytes": 19546
   },
   "revision": "753e9003a0b8e125824efa27208c8faa38c30808",
   "runtime_sources": {
     "feedforward.py": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/feedforward.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/feedforward.py",
       "sha256": "96724583590539761665a6e0ce1fe416aca81c1fdcbd4becd2b2b981f4faccb6",
       "size_bytes": 41931
     },
     "moe_group_list.py": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/moe_group_list.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/moe_group_list.py",
       "sha256": "b3a332dd2dae29e1eee4f4427410a9fb5483c0c8f2372183ee349d960324b8f5",
       "size_bytes": 4940
     },
     "index_pool_native.py": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/index_pool_native.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/index_pool_native.py",
       "sha256": "9fd3980fb102bfc2c61d84607a3b3d97640e6ac0bd3750ce2ad5497ea761150c",
       "size_bytes": 14908
     }

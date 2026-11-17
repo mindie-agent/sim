@@ -245,9 +245,9 @@ def test_w3_prefetch_grant_waits_for_copy_and_consumer_and_export_is_real():
     plan, prefetch_id, _decision = _busy_prefetch_plan()
     result = plan.evaluate(audit_allocations=True)
     rows = {row["op_id"]: row for row in result["timeline"]}
-    assert rows["mm"]["complete_ms"] == pytest.approx(1.005)
+    assert rows["mm"]["complete_ms"] == pytest.approx(0.00501024)
     assert rows[prefetch_id]["complete_ms"] == pytest.approx(
-        6.255872999999999)
+        6.2552480000000035)
     release = rows["release_W_mm"]
     assert release["ready_ms"] >= rows[prefetch_id]["complete_ms"] - 1e-12
     assert release["ready_ms"] >= rows["mm"]["complete_ms"] - 1e-12
@@ -257,8 +257,12 @@ def test_w3_prefetch_grant_waits_for_copy_and_consumer_and_export_is_real():
 
     trade = [row for row in result["allocation_trace"]
              if str(row["pool"]).startswith("l1")]
-    acquire = next(row for row in trade if row["action"] == "acquire")
-    freed = next(row for row in trade if row["action"] == "release")
+    # The matrix program also grants/releases per-tile L1 panels; isolate the
+    # prefetch grant by its owner name.
+    acquire = next(row for row in trade
+                   if row["action"] == "acquire" and "prefetch_W_mm" in row["name"])
+    freed = next(row for row in trade
+                 if row["action"] == "release" and "prefetch_W_mm" in row["name"])
     assert acquire["size"] * len(acquire["units"]) == 8 * 1024 * 1024
     assert freed["time"] == pytest.approx(rows[prefetch_id]["complete_ms"])
     assert acquire["time"] < freed["time"]

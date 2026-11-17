@@ -23,6 +23,9 @@ from .ownership import read_role
 from .program import (KernelProgram, ParallelProgram, PipelineProgram,
                       PipelineTemplateProgram, Stage)
 
+DEFAULT_SPLIT_K = 1
+MS_PER_SECOND = 1000
+
 
 @lru_cache(maxsize=1024)
 def _cycle(load, steps, count, slots, compute_slots, tail_load, tail_steps):
@@ -30,10 +33,21 @@ def _cycle(load, steps, count, slots, compute_slots, tail_load, tail_steps):
                         tail_load_ms=tail_load, tail_micro_steps=tail_steps)
 
 
+def _tightened_caps(caps, extra):
+    """Add declared ceilings without ever loosening an existing pipeline cap."""
+    if not extra:
+        return dict(caps)
+    combined = dict(caps)
+    for key, value in extra.items():
+        combined[key] = min(combined[key], value) if key in combined else value
+    return combined
+
+
 @dataclass(frozen=True)
 class SteadyMatmul(MappedMatmul):
     """Keep exact nominal K-loop dependencies and a compact contended body."""
 
+    traffic_rewrite_capable: bool = True
     compact_output_tiles: bool = True
     #: Eligible one-tile owners reuse the finite template path.  Multi-tile
     #: owner_run stays its existing real KernelProgram branch.
@@ -44,7 +58,7 @@ class SteadyMatmul(MappedMatmul):
     #: demand, completion time and allocation accounting are the per-owner
     #: values; only task count falls.  ``False`` keeps the detailed per-owner
     #: programs, including asymmetric external contention between owners.
-    owner_cohorts: bool = False
+    owner_cohorts: bool = True
 
     def lower(self, context, *, mapping=None, owner_tiles=None, group_rows=None,
               output=None, directional_mte1=False):
@@ -52,13 +66,16 @@ class SteadyMatmul(MappedMatmul):
                                      owner_records)
         owner_tiles = (freeze_owner_tiles(owner_tiles)
                        if owner_tiles is not None else None)
+        include_record = context.record_mapping is not None
         if mapping is None:
-            recipe, record = self.select(context)
+            recipe, record = self.select(context,
+                                         include_record=include_record)
         else:
-            recipe, record = mapping, {
+            recipe = mapping
+            record = ({
                 "basis": "declared_source_owner_mapping", "selected": asdict(mapping),
                 "shape": list(context.op.local_shape[-3:]),
-            }
+            } if include_record else None)
         if owner_tiles is not None:
             sources = [tuple(tiles) for _, tiles in owner_tiles]
             explicit = owner_records(owner_tiles)
@@ -73,16 +90,31 @@ class SteadyMatmul(MappedMatmul):
             explicit = None
         geometry = matrix_geometry(
             context, recipe, owners=explicit, group_rows=group_rows)
-        record.update({
-            "execution_abstraction": "closed_form_k_pipeline",
-            "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
-            "contention": "dominant_resource_fair_coupled_fluid_progress",
-            "buffer_model": "finite_selected_tile_reservation",
-            "output_tile_execution": ("coupled_owner_run" if self.compact_output_tiles
-                                      else "individual_serial_tiles"),
-            "geometry": geometry.to_dict(),
-        })
-        if context.record_mapping is not None:
+        if include_record:
+            record.update({
+                "execution_abstraction": "closed_form_k_pipeline",
+                "overlap": "finite_K_micro_recurrence; inter_output_tiles_serial_per_owner",
+                "contention": "dominant_resource_fair_coupled_fluid_progress",
+                "buffer_model": "finite_selected_tile_reservation",
+                "output_tile_execution": ("coupled_owner_run" if self.compact_output_tiles
+                                          else "individual_serial_tiles"),
+                "geometry": geometry.to_dict(),
+            })
+        if (getattr(recipe, "k_splits", DEFAULT_SPLIT_K) > DEFAULT_SPLIT_K
+                and "mte2_aic_dram" in context.service_modes):
+            if include_record:
+                record.update({
+                    "execution_abstraction": "finite_split_k",
+                    "split_k": recipe.k_splits,
+                    "partial_policy": "explicit_gm_fp32_partials_then_vector_merge",
+                })
+            from .matrix_splitk import splitk_program
+            program = splitk_program(context, recipe.k_splits, recipe=recipe,
+                                     geometry=geometry, record=record)
+            if include_record:
+                context.record_mapping(record)
+            return program
+        if include_record:
             context.record_mapping(record)
         op, names = context.op, context.resource_names
         total_m, n, k = geometry.local_shape
@@ -95,6 +127,11 @@ class SteadyMatmul(MappedMatmul):
         count, tail = divmod(k, recipe.tile_k)
         epilogue = MatrixEpilogue.from_op(op)
         inputs, weights = epilogue.operands(op)
+        dram_mode = dict(context.service_modes).get("mte2_aic_dram")
+        single_m_hbm_cap = (
+            {names["hbm"]: float(dram_mode[1])
+             / (MS_PER_SECOND * max(1, int(context.core_count)))}
+            if (nm == 1 and dram_mode and "hbm" in names) else {})
         operand_read = read_role(names)
         scale_read = read_role(names, aiv=0)
         width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))
@@ -183,7 +220,9 @@ class SteadyMatmul(MappedMatmul):
             stages = [
                 Stage("load", load0.work, acquire=buffers, placement=load0.placement),
                 Stage("steady", work, after=("load",), placement=placement, coupled=True,
-                      caps={key: amount / span for key, amount in work.items()} if span else {}),
+                      caps=_tightened_caps(
+                          {key: amount / span for key, amount in work.items()}
+                          if span else {}, single_m_hbm_cap)),
                 Stage("matrix", final.work, after=("steady",), placement=final.placement),
             ]
             predecessor = "matrix"
@@ -251,7 +290,9 @@ class SteadyMatmul(MappedMatmul):
             work = {key: value for key, value in work.items() if value > 0}
             # Per-owner outputs remain nominally serial. External contention
             # shares their coupled fluid body, just like the inner K pipeline.
-            caps = {key: value / total_span for key, value in work.items()}
+            caps = _tightened_caps(
+                {key: value / total_span for key, value in work.items()},
+                single_m_hbm_cap)
             return KernelProgram((
                 Stage("load", load.work, acquire=load.acquire, placement=load.placement),
                 Stage("owner_run", work, after=("load",), placement=placement,

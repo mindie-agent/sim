@@ -18,7 +18,7 @@ from mindie_sim.prediction.api import predict
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
     _vram_max_sequences_per_dp,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
 from mindie_sim.prediction.structure import parse_case
 from test_prediction_system import case, linear_work
@@ -240,7 +240,7 @@ def test_sla_solver_quantifies_concurrency_gain_from_disabling_async_scheduling(
     assert b_sync == 8
     assert b_async < b_sync
 
-    sla_async = solve_hardware_sla_throughput(
+    sla_async = solve_sla_sizing(
         raw,
         sla_ms=50.0,
         context=64,
@@ -256,7 +256,7 @@ def test_sla_solver_quantifies_concurrency_gain_from_disabling_async_scheduling(
     assert summary["disabling_async_unlocks_concurrency"] is True
 
     raw_sync = {**raw, "runtime": {**raw["runtime"], "async_scheduling": False}}
-    sla_sync = solve_hardware_sla_throughput(
+    sla_sync = solve_sla_sizing(
         raw_sync,
         sla_ms=50.0,
         context=64,

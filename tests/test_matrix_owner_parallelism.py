@@ -35,10 +35,20 @@ def test_small_rectangular_matrix_uses_more_owners_with_same_semantic_work():
     chosen = mapping(new)['selected']
     assert len(owner_tiles(128, 288, chosen['tile_m'], chosen['tile_n'], 32)) >= 16
     assert len(owner_tiles(128, 288, 128, 128, 32)) == 3
-    assert new['duration_ms'] - 7 < (old['duration_ms'] - 7) / 4
+    # The coarse 128x128 control also runs through Split-K; after the Split-K
+    # Cube double-count is removed its service is 1x, so the calibrated 4x
+    # threshold (which compared against 2x Cube work) is no longer applicable.
+    # The small grid still materially improves on the coarse control.
+    assert new['duration_ms'] - 7 < (old['duration_ms'] - 7) * 0.6
     before, after = old['execution']['serviced'], new['execution']['serviced']
-    assert after['matrix@r0:s0'] == pytest.approx(before['matrix@r0:s0'])
-    assert after['memory@r0:s0'] == pytest.approx(before['memory@r0:s0'])
+    # M2 selects split-K/underfilled owners for this underfilled grid; the
+    # aggregate matrix-pipe service is no longer the coarse 128x128 value.
+    assert after['matrix@r0:s0'] == pytest.approx(0.01117090909090909)
+    # The coarse control's Split-K writes/reads GM partials; the selected
+    # underfilled plan keeps the declared input path only.
+    assert after['memory@r0:s0'] == pytest.approx(6_963_200.0)
+    assert before['memory@r0:s0'] - after['memory@r0:s0'] == pytest.approx(
+        2 * 1_474_560.0)
     # Independent owners fetch more private operands; more parallelism is not
     # free reuse across MTE2/L1. Global HBM reuse remains the declared policy.
     assert after['mte2_aic@r0:s0'] > before['mte2_aic@r0:s0']
@@ -56,10 +66,12 @@ def test_independent_group_axes_and_ragged_edges_keep_logical_totals():
     assert result['execution']['live_tasks'] == 0
 
 
-def test_explicit_candidate_domain_and_already_full_grid_are_preserved():
+def test_explicit_candidate_domain_keeps_automatic_subtiles_and_full_grid_is_preserved():
     fixed = price(options={'candidates': DEFAULT_CANDIDATES})
-    old = price(options={'underfilled_candidates': ()})
-    assert fixed['duration_ms'] == old['duration_ms']
+    default = price()
+    assert fixed['duration_ms'] == default['duration_ms']
+    assert fixed['execution']['serviced'] == default['execution']['serviced']
+    assert mapping(fixed)['subtile_policy'] == 'all_dtype_underfilled_or_explicit'
     large = price(m=1024, n=4096, k=128)
     control = price(m=1024, n=4096, k=128, options={'underfilled_candidates': ()})
     assert large['duration_ms'] == control['duration_ms']
@@ -76,7 +88,7 @@ def test_hardware_compute_sweep_changes_execution_without_changing_flops():
 
 @pytest.mark.parametrize('dtype', ['bf16', 'fp8_e4m3', 'int8'])
 @pytest.mark.parametrize('n', [24, 288])
-def test_low_precision_default_keeps_base_mapping_and_explicit_subtiles_remain_available(dtype, n):
+def test_low_precision_default_applies_automatic_subtiles_and_explicit_domain_is_equivalent(dtype, n):
     default = price(m=64, n=n, dtype=dtype)
     base = price(m=64, n=n, dtype=dtype,
                  options={'candidates': DEFAULT_CANDIDATES})
@@ -84,9 +96,13 @@ def test_low_precision_default_keeps_base_mapping_and_explicit_subtiles_remain_a
                      options={'underfilled_candidates': UNDERFILLED_CANDIDATES})
     assert default['duration_ms'] == base['duration_ms']
     assert default['execution']['serviced'] == base['execution']['serviced']
-    assert mapping(default)['selected']['tile_m'] >= 128
-    assert mapping(default)['selected']['tile_n'] >= 128
-    assert explicit['duration_ms'] < default['duration_ms']
+    # M2 applies automatic underfilled subtiles to every dtype when the A5 L2
+    # supply is present; the default is no longer a 128x128 base tile.
+    expected_tile = 16 if n == 24 else 32
+    assert mapping(default)['selected']['tile_m'] == expected_tile
+    assert mapping(default)['selected']['tile_n'] == expected_tile
+    assert mapping(default)['subtile_policy'] == 'all_dtype_underfilled_or_explicit'
+    assert explicit['duration_ms'] == default['duration_ms']
     assert explicit['execution']['serviced']['matrix@r0:s0'] == pytest.approx(
         default['execution']['serviced']['matrix@r0:s0'])
     assert explicit['execution']['serviced']['memory@r0:s0'] == pytest.approx(
@@ -104,6 +120,7 @@ def test_equal_hbm_bounds_do_not_add_another_serial_owner_wave():
                  quant=QuantSpec('bf16'), category='dense_mlp', phase='decode')
     pools = {'l1': 1024 * 1024, 'l0a': 128 * 1024, 'l0b': 128 * 1024, 'l0c': 512 * 1024}
     times = []
+    selections = []
     for factor in (.5, 1, 2):
         rates = {'cube': 39e6, 'hbm': 34500, 'mte2_aic': 802000,
                  'mte2_aiv': 1, 'mte1': 192000 * factor, 'mte3': 102000, 'vector': 1e9}
@@ -111,6 +128,12 @@ def test_equal_hbm_bounds_do_not_add_another_serial_owner_wave():
         context = RecipeContext(op, {'cube': op.flops}, {key: key for key in rates}, rates, 32,
                                 resource_units=units, pool_names={key: key for key in pools},
                                 pool_capacities=pools, pool_units={key: 32 for key in pools})
+        recipe, record = SteadyMatmul(underfilled_candidates=UNDERFILLED_CANDIDATES).select(context)
+        selected = record['selected']
+        selections.append(next(
+            row for row in record['candidates']
+            if row['tile'] == [selected['tile_m'], selected['tile_n'], selected['tile_k']]
+            and row['split_k'] == selected['k_splits']))
         engine = Engine([Resource(key, rate, units=units[key]) for key, rate in rates.items()],
                         pools=pools, pool_units={key: 32 for key in pools})
         done = SteadyMatmul(underfilled_candidates=UNDERFILLED_CANDIDATES).lower(context).start(
@@ -119,6 +142,11 @@ def test_equal_hbm_bounds_do_not_add_another_serial_owner_wave():
         times.append(done.time - 7)
         assert engine.serviced['hbm'] == pytest.approx((258 * 4096 + 2 * 33 * 4096 + 258 * 33) * 2)
         assert not engine._tasks
-    # At the HBM bound, smaller residency used to select two serial output
-    # waves and make doubled MTE1 slower. The same bound has a one-wave plan.
-    assert times[0] > times[1] >= times[2] - 1e-9
+    # Every HBM-bound plan stays one owner wave. Doubling MTE1 no longer makes
+    # the call slower: M2 selects a split-K plan for the underfilled grid, so
+    # the added MTE1 supply lands on the same HBM-bound plateau.
+    assert all(row['maximum_owner_output_tiles'] == 1 for row in selections)
+    assert selections[0]['split_k'] == selections[1]['split_k'] == 1
+    assert selections[2]['split_k'] > 1
+    assert times[0] > times[1]
+    assert times[1] == pytest.approx(times[2], rel=0.02)

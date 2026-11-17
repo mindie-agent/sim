@@ -142,3 +142,40 @@ def page_groups(case, layer_stage, query_tokens):
             "recycling_pages": state_groups * slots,
         })
     return tuple(result)
+
+
+BLOCK_ALIGNMENT = 16
+
+
+def minimum_block_size(model, *, tp: int = 1, proposals: int = 0, extra: int = 0) -> int:
+    """Minimum ``kv_block_size`` (aligned to 16) so every KDA state fits one main page."""
+    if dict(model.metadata).get("cache_allocator") != "paired_sfa":
+        return 0
+    if not any(plan.indexer for plan in model.layer_plans):
+        # A truncated plan set without the sparse owner cannot declare the
+        # paired regions; no recurrent-page lower bound is claimed.
+        return 0
+    normalized = normalize_formats(model)
+    main = [plan for plan in normalized.layer_plans if plan.attention == "mla"]
+    recurrent = [plan for plan in normalized.layer_plans if plan.attention == "kda"]
+    if not main or not recurrent:
+        return 0
+    row_bytes = min(
+        cache_format(normalized, "mla_kv").row_bytes(plan.cache_row_elements)
+        for plan in main
+    )
+    if row_bytes <= 0:
+        return 0
+    tp_degree = max(1, int(tp))
+    spec_slots = max(0, int(proposals)) + max(0, int(extra))
+    required = 0
+    for plan in recurrent:
+        state_page = (
+            plan.recurrent_state_elements * dtype_bytes(plan.recurrent_state_dtype)
+            + plan.conv_width * (plan.conv_kernel - 1 + spec_slots)
+            * dtype_bytes(plan.conv_state_dtype)
+        ) / tp_degree
+        tokens = math.ceil(state_page / row_bytes)
+        if tokens > required:
+            required = tokens
+    return ((required + BLOCK_ALIGNMENT - 1) // BLOCK_ALIGNMENT) * BLOCK_ALIGNMENT

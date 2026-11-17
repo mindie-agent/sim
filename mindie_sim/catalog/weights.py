@@ -143,6 +143,8 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             terms.append(_t("k_norm", plan.head_dim, 1, "norm"))
     elif plan.attention == "gdn":
         terms.append(_t("gdn_norm", plan.linear_head_dim, 1, "norm"))
+    if plan.architecture == "gemma4":
+        terms.extend(_gemma4_norm_terms(plan, model))
     if plan.residual_block_size:
         terms.extend([
             _t("attn_res_norm", h, 1, "norm"),
@@ -151,6 +153,45 @@ def _norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
             _t("mlp_res_proj", 1, h, "norm"),
         ])
     return terms
+
+
+def _gemma4_norm_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
+    """Gemma-4 declares four dense norms and seven MoE norms plus scales."""
+    h = model.hidden_size
+    terms = [_t("pre_ffn_norm", h, ONE, "norm"),
+             _t("post_ffn_norm", h, ONE, "norm")]
+    if plan.ffn == "moe":
+        terms.extend([_t("pre_experts_norm", h, ONE, "norm"),
+                      _t("post_experts_norm", h, ONE, "norm"),
+                      _t("router_norm", h, ONE, "norm"),
+                      _t("router_scale", h, ONE, "param_fp32"),
+                      _t("expert_scale", int(plan.num_experts), ONE, "param_fp32")])
+    return terms
+
+
+def gemma4_ple_terms(model: ModelSpec) -> list[WeightTerm]:
+    """Nonzero per-layer-embedding tables and their projection/norm."""
+    facts = dict(model.catalog_facts)
+    width = int(facts.get("gemma4_ple_width", ZERO) or ZERO)
+    if not facts.get("gemma4_ple") or width <= ZERO:
+        return []
+    layers = max(ONE, int(model.layers))
+    vocab = int(facts.get("gemma4_ple_vocab", model.vocab_size) or model.vocab_size)
+    h = model.hidden_size
+    return [_t("ple_embedding", vocab, layers * width, "ple_table", "embedding"),
+            _t("ple_model_projection", layers * width, h, "ple_projection"),
+            _t("ple_projection_norm", width, ONE, "norm")]
+
+
+def gemma4_ple_layer_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
+    facts = dict(model.catalog_facts)
+    width = int(facts.get("gemma4_ple_width", ZERO) or ZERO)
+    if not facts.get("gemma4_ple") or width <= ZERO:
+        return []
+    h = model.hidden_size
+    return [_t("ple_gate", width, h, "ple_gate"),
+            _t("ple_projection", h, width, "ple_gate"),
+            _t("ple_norm", h, ONE, "norm")]
 
 
 def _mhc_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
@@ -314,7 +355,8 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
     if plan.attention == "unmodeled":
         return []
     if plan.attention in {"gqa", "projection_only"}:
-        q_width = (2 if plan.q_output_gate else 1) * heads * plan.head_dim
+        gate_separate = plan.q_gate_separate
+        q_width = plan.q_projection_width(heads, plan.head_dim)
         kv_width = plan.num_kv_heads * plan.head_dim
         terms.extend([
             _t("q_proj", q_width, h, "attn.qkv", "out_tp"),
@@ -324,6 +366,8 @@ def _attention_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
         if not plan.k_eq_v:
             terms.append(_t("v_proj", kv_width, h, "attn.qkv", "kv_out",
                             units=plan.num_kv_heads, unit_width=plan.head_dim))
+        if gate_separate:
+            terms.append(_t("g_proj", heads, h, "attn.gate", "out_tp"))
         terms.append(_t("o_proj", h, heads * plan.head_dim, "attn.o", "in_tp"))
         if 0 <= plan.kv_owner_layer_id < plan.index:
             terms = [term for term in terms if term.name not in {"k_proj", "v_proj"}]
@@ -454,6 +498,7 @@ def layer_weight_terms(plan: LayerPlan, model: ModelSpec) -> list[WeightTerm]:
                      if term.name in prepared else term for term in attention]
     return _tag_projection_roles(
         _norm_terms(plan, model)
+        + gemma4_ple_layer_terms(plan, model)
         + attention
         + _mhc_terms(plan, model)
         + [replace(term, quant=quant) for term in _indexer_terms(plan, model)]
@@ -593,6 +638,7 @@ def _body_terms(model: ModelSpec, *, include_engram: bool = True) -> list[Weight
     for _, layer_terms in _iter_model_layer_terms(model):
         terms.extend(layer_terms)
     terms.extend(body_head_terms(model))
+    terms.extend(gemma4_ple_terms(model))
     terms.extend(vision_weight_terms(model))
     if include_engram:
         terms.extend(engram_weight_terms(model))

@@ -152,7 +152,7 @@ This is execution validation, not a new Body accuracy claim.
 Reproduce from the retained profiler summary (no raw scan or NPU required):
 
 ```sh
-python3 tools/fit_copy_joint_service.py /Users/maoxx241/code/profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json data/observations/a5-copy-joint-service-20261030/parameters.json
+python3 tools/fit_copy_joint_service.py repository://profiler/data/observations/sources/arch3510-physical-services/scalar-dma-physical-constraints.json data/observations/a5-copy-joint-service-20261030/parameters.json
 python3 tools/verify_copy_joint_service.py --rss-byte-factor 1 --output data/verification/copy-joint-service-20261030.json
 ```
 

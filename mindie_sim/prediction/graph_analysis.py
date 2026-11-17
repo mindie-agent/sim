@@ -26,7 +26,11 @@ from .operator_analysis import cohort_operator_costs, operator_costs, physical_i
 from .native_binding import bind_native_call
 from .program import RecipeBook
 from .structure import parse_case
-from .exposed_breakdown import ExposedClocks, finish_breakdown, unavailable_breakdown
+from .exposed_breakdown import (
+    CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
+    communication_clocks, control_clocks, cube_clocks, finish_breakdown,
+    memory_clocks, unavailable_breakdown, vector_clocks)
+from .resource_attribution import realized_clock_dag
 
 ZERO = 0
 ONE = 1
@@ -58,12 +62,17 @@ def _dominant_role(op) -> str:
     return ROLE_MEMORY if memory > ZERO else ROLE_CONTROL
 
 
-def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
-    """Reduce executed occurrence intervals onto the device-step boundary.
+def _exposed_breakdown(records, duration_ms, input_ready_ms, replica,
+                       service_clocks_by_id=None):
+    """Reduce executed occurrence service clocks onto the device-step boundary.
 
     Intervals are the actual ``[ready, complete]`` spans of one replica's
-    executed operators. A missing periodic cross-stage wait cannot be scaled
-    into agreement: the report is explicitly unavailable instead.
+    executed operators.  Each occurrence contributes its executed service
+    interval to its declared dominant physical stage; no byte/FLOP proportion
+    is fabricated and no clock is rescaled to the graph span.  The clocks are
+    propagated through the realized causal DAG (data, stream, state and
+    collective-rendezvous predecessors).  A missing periodic cross-stage wait
+    or an unreconciled boundary makes the report explicitly unavailable.
     """
     intervals = []
     for record in records:
@@ -72,36 +81,91 @@ def _exposed_breakdown(records, duration_ms, input_ready_ms, replica):
         ready = record.get("collective_ready_ms", record["ready"].time)
         start = max(ZERO_FLOAT, float(ready) - float(input_ready_ms))
         end = max(start, float(record["complete"].time) - float(input_ready_ms))
-        intervals.append((start, end, _dominant_role(record["op"])))
+        intervals.append((start, end, record))
     if not intervals:
         return unavailable_breakdown(
             "exposed_operator_intervals_missing", boundary="device_step")
-    first_start = min(start for start, _end, _role in intervals)
-    if first_start > ZERO_FLOAT:
-        intervals.append((ZERO_FLOAT, first_start, ROLE_CONTROL))
-    span_end = max(end for _start, end, _role in intervals)
+    first_start = min(start for start, _end, _record in intervals)
+    span_end = max(end for _start, end, _record in intervals)
     tolerance = RECONCILE_FRACTION * max(RECONCILE_MIN_MS, float(duration_ms))
     if abs(span_end - float(duration_ms)) > tolerance:
         return unavailable_breakdown(
             "unreconciled_execution_boundary", boundary="device_step")
 
-    def union_end(roles):
-        ends = [end for _start, end, role in intervals if role in roles]
-        return max(ends, default=ZERO_FLOAT)
+    def service_clocks(op, elapsed):
+        role = _dominant_role(op)
+        if role == ROLE_COMMUNICATION:
+            return communication_clocks(elapsed)
+        if role == ROLE_CUBE:
+            return cube_clocks(elapsed)
+        if role == ROLE_VECTOR:
+            return vector_clocks(elapsed)
+        if role == ROLE_MEMORY:
+            return memory_clocks(elapsed)
+        return control_clocks(elapsed)
 
-    clocks = ExposedClocks(
-        float(duration_ms),
-        union_end(NON_COMMUNICATION_ROLES),
-        union_end({ROLE_CUBE, ROLE_VECTOR, ROLE_CONTROL}),
-        union_end({ROLE_CUBE}),
-    )
+    def record_id(record, ordinal):
+        return str(record.get("id") or f"record{ordinal}")
+
+    identifiers = [record_id(record, ordinal)
+                   for ordinal, (_start, _end, record) in enumerate(intervals)]
+    if len(set(identifiers)) != len(identifiers):
+        return unavailable_breakdown(
+            "exposed_occurrence_identity_duplicate", boundary="device_step")
+    local = {}
+    dependencies = {}
+    has_dependency_identity = all(
+        "predecessors" in record for _start, _end, record in intervals)
+    for ordinal, (start, end, record) in enumerate(intervals):
+        elapsed = max(ZERO_FLOAT, end - start)
+        supplied = (service_clocks_by_id or {}).get(identifiers[ordinal])
+        local[identifiers[ordinal]] = (
+            supplied if isinstance(supplied, ExposedClocks)
+            else service_clocks(record["op"], elapsed))
+        if has_dependency_identity:
+            dependencies[identifiers[ordinal]] = tuple(record["predecessors"])
+    if not has_dependency_identity:
+        # No declared edges: keep the observed intervals serial in execution
+        # order.  Parallel overlap is not invented.
+        def interval_order(pair):
+            interval, _identifier = pair
+            start, end, _record = interval
+            return start, end
+
+        ordered = [
+            identifier for _interval, identifier in sorted(
+                zip(intervals, identifiers), key=interval_order)]
+        dependencies = {}
+        previous = None
+        for node_id in ordered:
+            dependencies[node_id] = (
+                () if previous is None else (previous,))
+            previous = node_id
+    _clocks, terminal = realized_clock_dag(
+        local, dependencies, allow_external_predecessors=True)
+    expected = float(duration_ms)
+    if terminal.all_ms <= ZERO_FLOAT:
+        if expected > ZERO_FLOAT:
+            return unavailable_breakdown(
+                "service_clocks_missing", boundary="device_step")
+    gap_limit = max(expected * CLOCK_GAP_LIMIT_FRACTION,
+                    CLOCK_GAP_ABS_FLOOR_MS)
+    if abs(expected - terminal.all_ms) > gap_limit:
+        return unavailable_breakdown(
+            "unreconciled_service_clock_boundary", boundary="device_step")
     result = finish_breakdown(
-        clocks, duration_ms=float(duration_ms), boundary="device_step",
+        terminal, duration_ms=expected, boundary="device_step",
         control_ms=first_start)
     basis = result["exposed_breakdown_basis"]
     basis["replica"] = int(replica)
     basis["operator_intervals"] = len(intervals)
     basis["host_launch_ms"] = float(first_start)
+    basis["method"] = "four_clock_service_attribution_v2"
+    basis["service_basis"] = (
+        "executed_interval_assigned_to_declared_dominant_physical_class")
+    basis["declared_edges"] = bool(has_dependency_identity)
+    basis["realized_edges"] = sum(
+        len(predecessors) for predecessors in dependencies.values())
     return result
 
 
@@ -196,7 +260,7 @@ def _matrix_wrapper_projection(metadata):
 def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=None,
                 input_ready_ms=ZERO, include_submission=False, replay_scope=None,
                 isolated=True, trace_limit=ZERO, compact=False,
-                audit_allocations=False):
+                audit_allocations=False, evaluation=None):
     """Run a declared DAG or replica->DAG mapping without a request scheduler.
 
     External input keys are operator dependency names and values are absolute
@@ -218,17 +282,16 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
     case = consume_target_declaration(parse_case(case), ops)
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
         raise ValueError("graph_input_ready_time_must_be_finite_and_nonnegative")
-    if external_inputs is not None:
-        external = dict(external_inputs)
-    elif getattr(ops, "scope", None) == "body":
-        sample = next(iter(ops.values()), ()) if isinstance(ops, Mapping) else ops
-        external = ({"analysis_input": ZERO}
-                    if any("analysis_input" in getattr(op, "deps", ()) for op in sample)
-                    else {})
-    else:
-        external = {}
+    # A cut dependency is a declared input, never an implicit body default.
+    # Callers that intentionally cut a body graph provide the boundary
+    # explicitly (efficiency/body entry points pass ``{"analysis_input": 0}``);
+    # an undeclared cut raises ``graph_dependency_unavailable`` below.
+    external = {} if external_inputs is None else dict(external_inputs)
     if any(value < 0 or not math.isfinite(value) for value in external.values()):
         raise ValueError("graph_external_input_time_must_be_finite_and_nonnegative")
+    from .evaluation import EvaluationContext, context_for
+    ctx = (context_for(case, evaluation, recipes) if evaluation is not None
+           else EvaluationContext.create(case, recipes, primitives))
     book = recipes or RecipeBook.from_mapping(case.runtime.kernels)
     graphs = {r: tuple(book.expand(items)) for r, items in
               (ops.items() if isinstance(ops, Mapping) else ((0, ops),))}
@@ -275,8 +338,10 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
             "collective_algorithm": getattr(book.select(op), "algorithm", None),
         })
 
-    cost = CostModel(case, primitives)
-    execution = Execution(case, cost, recipes=book, include_submission=include_submission,
+    from .cost import CostLedger
+    cost = ctx.cost
+    execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
+                          ledger=CostLedger(), include_submission=include_submission,
                           on_operator=observe, trace_limit=trace_limit)
     engine = execution.engine
     engine.now = input_ready_ms
@@ -558,7 +623,8 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
         "operator_occurrences": sum(
             record["op"].family != "barrier" for record in records),
     }
-    execution_summary, parameter_summary = execution.summary(), cost.summary()
+    execution_summary = execution.summary()
+    parameter_summary = execution.cost.summary()
     if compact:
         result = {
             **head, "resources": resources,

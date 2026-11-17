@@ -15,6 +15,7 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 ZERO = 0
 ONE = 1
+#: ``WeightTerm.groups``/``units``/``unit_width`` for a term with no grouping.
 
 def _local_draft_experts(num_experts: int, ep: int) -> int:
     """Experts held on one EP rank.
@@ -29,10 +30,7 @@ def _local_draft_experts(num_experts: int, ep: int) -> int:
     width = max(1, int(ep))
     if experts <= 0:
         return 0
-    if experts % width != 0 and width % experts != 0:
-        raise ModelingError(
-            f"draft_experts_not_divisible_by_ep:{experts}%{width}")
-    return max(1, experts // width)
+    return max(ONE, (experts + width - ONE) // width)
 
 
 def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTerm]:
@@ -93,6 +91,9 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
             else:
                 terms.append(_t("draft_o", h, draft.num_heads * draft.head_dim, "mla", "in_tp"))
     else:
+        if draft.q_output_gate:
+            terms.append(_t("draft_q_gate", draft.num_heads, h,
+                            "attn.gate", "out_tp"))
         terms.extend([
             _t("draft_q", draft.q_width, h, "attn.qkv", "out_tp"),
             _t("draft_k", draft.kv_width, h, "attn.qkv", "kv_out",
@@ -104,6 +105,14 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
         if draft.qk_norm:
             terms.extend([_t("draft_q_norm", draft.head_dim, ONE, "norm"),
                           _t("draft_k_norm", draft.head_dim, ONE, "norm")])
+    if draft.input_mode == "normalized_concat":
+        # Each native NextN block owns its decoder/target normalisations and one
+        # ``eh_proj[H, 2H]`` on the concatenated normalised pair.
+        terms.extend([
+            _t("draft_enorm", h, ONE, "linear_param_bf16"),
+            _t("draft_hnorm", h, ONE, "linear_param_bf16"),
+            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "replicated"),
+        ])
     if draft.mhc_lowrank <= ZERO:
         terms.extend([_t("draft_input_norm", h, ONE, "norm"),
                       _t("draft_post_norm", h, ONE, "norm"),
@@ -183,7 +192,15 @@ def draft_terms(
                 False,
             ))
     if not standalone_heads_only:
-        if draft.input_mode == "dual_normalized":
+        if draft.input_mode == "projected_concat":
+            # Native DSpark input: one ``main_proj[H, len(targets) * H]`` and one
+            # ``main_norm[H]``.  The 3H-wide projection is a different operator
+            # from two independent H x H projections, so it must not be modelled
+            # as ``dual_normalized``.
+            terms.append(_t("draft_main_proj", h, draft.input_width,
+                            draft.input_projection_category, "out_tp"))
+            terms.append(_t("draft_main_norm", h, ONE, "norm"))
+        elif draft.input_mode == "dual_normalized":
             # Deployed V4 MTP input: enorm(decoder h) + hnorm(target h), then two
             # replicated BF16 HxH projections, then add.  Not a DSpark
             # concatenated fp8 input projection.
@@ -194,9 +211,20 @@ def draft_terms(
         else:
             terms.append(_t("draft_input_proj", h, draft.input_width,
                             draft.input_projection_category, "out_tp"))
+        if draft.embedding_owned and int(draft.embedding_count) > ZERO:
+            terms.append(WeightTerm(
+                "draft_embedding", draft.vocab_size, h, "embedding",
+                "embedding", int(draft.embedding_count), 0, 0, 0,
+                False, True))
         for _ in range(max(ZERO, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
             terms.extend(_draft_ffn_terms(draft, model, ep=ep))
+            if draft.output_head_owned:
+                terms.append(_t("draft_output_norm", h, ONE, "norm"))
+                if int(draft.output_head_count) > ZERO:
+                    terms.append(WeightTerm(
+                        "draft_output_head", draft.vocab_size, h, "lm_head",
+                        "replicated", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
             from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))

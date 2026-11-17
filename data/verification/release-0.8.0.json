@@ -4,7 +4,7 @@
   "runtime_revision": "439779a7e2ead9fd149d9202e45f9c2ccda73c49",
   "scope": "Local acceptance of the cleaned runtime; exact release-tag CI is published with the GitHub Release.",
   "maintained_tests": {
-    "command": "PYTHONPATH=.:/Users/maoxx241/code/profiler .venv/bin/python -m pytest -q -m 'not live_npu'",
+    "command": "PYTHONPATH=.:repository://profiler .venv/bin/python -m pytest -q -m 'not live_npu'",
     "passed": 3301,
     "failed": 0,
     "seconds": 366.92,
@@ -81,7 +81,7 @@
         "duration_ms": 13.748800118792664,
         "elapsed_pass": true,
         "input": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c16_p2k.json",
+          "path": "repository://profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c16_p2k.json",
           "sha256": "e54cc728c4373ee976db2260af6fa6172261fc7f0a176f64a930eba9d717bffb"
         },
         "live_programs": 0,
@@ -125,7 +125,7 @@
         "duration_ms": 24.81157756185846,
         "elapsed_pass": true,
         "input": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64.json",
+          "path": "repository://profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_tpot30ms_c64.json",
           "sha256": "486eb5a50ec7d99b6cc079409d44246f22e3ccbb3d54a32ee6d5454a4c546379"
         },
         "live_programs": 0,
@@ -161,7 +161,7 @@
         "duration_ms": 25.539779191201085,
         "elapsed_pass": true,
         "input": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c128_p2k.json",
+          "path": "repository://profiler/examples/structure/cases/decode-a5_v41_fp8_tp1_dp8_ep8_c128_p2k.json",
           "sha256": "3eafc97dc5f21e0a1b3b03a71ae30f0041d0a5b00abeb434741a19e4e6118e96"
         },
         "live_programs": 0,

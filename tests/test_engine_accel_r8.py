@@ -274,10 +274,13 @@ def test_r8_3_maintained_sources_obey_strict_745_line_and_header_caps():
 
 
 def test_r8_3_workspace_has_zero_build_or_cache_artifacts():
-    """The release gate rejects every compiled binary, cache and egg metadata."""
+    """The release gate rejects compiled build outputs, not local tool caches."""
+    cache_dirs = {"__pycache__", ".pytest_cache", ".ruff_cache"}
     offenders = []
     for path in ROOT.rglob("*"):
         relative = path.relative_to(ROOT).as_posix()
+        if any(part in cache_dirs for part in path.relative_to(ROOT).parts):
+            continue
         if path.is_dir():
             if path.name in ARTIFACT_DIRS or path.name.endswith(".egg-info"):
                 offenders.append(relative)

@@ -241,7 +241,7 @@
         "after": []
       },
       "fetch_evidence": {
-        "dir": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-rack08-r8-c2",
+        "dir": "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-rack08-r8-c2",
         "files": [
           "a5-comm-rack08-r8-c2.parent.json",
           "a5-comm-rack08-r8-c2.rank0.json",
@@ -385,7 +385,7 @@
         "after": []
       },
       "fetch_evidence": {
-        "dir": "/Users/maoxx241/code/mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-smoke",
+        "dir": "repository://mindie-agent/.workstreams/a5-comm/raw/a5-comm-r2-smoke",
         "files": [
           "a5-comm-r2-smoke.parent.json",
           "a5-comm-r2-smoke.rank0.json",

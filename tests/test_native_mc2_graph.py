@@ -150,7 +150,7 @@ def test_ordinary_selector_uses_common_moe_comm_config_without_kernel_entry():
         ALLGATHER, MC2, MoeCommConfig,
     )
     from mindie_sim.prediction.structure import parse_case
-    from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig
+    from mindie_sim.prediction.frontend_features import FeatureConfig
 
     raw = case()
     raw['runtime']['kernels'].pop('native_moe_protocol')

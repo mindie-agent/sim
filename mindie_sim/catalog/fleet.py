@@ -31,6 +31,12 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError
 
 ZERO = 0
+KV_CACHE_PLANES = 2
+NORM_WEIGHT_OFFSET = 1.0
+STEP5_NEXTN_BLOCKS = 3
+STEP5_PP_CAPABILITY = (1, 2, 4, 8, 16)
+DEFAULT_NORM_EPS = 1e-06
+_STEP5_NEXTN_BLOCKS = STEP5_NEXTN_BLOCKS
 
 FLEET_CATALOG_ENTRIES: dict[str, str] = {
     key: f"../catalog/configs/{key}.json" for key in (
@@ -205,9 +211,10 @@ def _finish(model: ModelSpec, facts: list[tuple[str, Any]]) -> ModelSpec:
 def _model(key: str, family: str, config: Mapping[str, Any], c: Mapping[str, Any],
            plans: list[LayerPlan], *, attention: str, ffn: str, heads: int,
            kv_heads: int, head_dim: int, hidden: int, intermediate: int,
-           vocab: int, experts: int = 0, top_k: int = 0, moe_i: int = 0,
-           shared: int = 0, facts: list[tuple[str, Any]] | None = None,
-           gaps: tuple[str, ...] = (), vision: Any = None) -> ModelSpec:
+           vocab: int, experts: int = ZERO, top_k: int = ZERO, moe_i: int = ZERO,
+           shared: int = ZERO, facts: list[tuple[str, Any]] | None = None,
+           gaps: tuple[str, ...] = (), vision: Any = None,
+           auxiliary: Any = None) -> ModelSpec:
     quant = _quant_bf16(c, name=f"bf16_{family}")
     metadata = native_coverage(config, list(gaps), plans=plans, quant=quant)
     model_facts = facts if facts is not None else _facts(family, config, c, plans)
@@ -218,11 +225,11 @@ def _model(key: str, family: str, config: Mapping[str, Any], c: Mapping[str, Any
         attention=attention, ffn=ffn, activation_dtype=quant.activation_format,
         weight_dtype=quant.weight_format, kv_dtype=quant.kv_dtype,
         compute_dtype=quant.native_format, quantization=quant.name,
-        norm_eps=float(c.get("rms_norm_eps", 1e-6) or 1e-6),
+        norm_eps=float(c.get("rms_norm_eps", DEFAULT_NORM_EPS) or DEFAULT_NORM_EPS),
         num_experts=experts, top_k=top_k, moe_intermediate_size=moe_i,
         num_shared_experts=shared, quant=quant, vision=vision,
         tie_word_embeddings=bool(c.get("tie_word_embeddings", False)),
-        layer_plans=tuple(plans),
+        layer_plans=tuple(plans), auxiliary=auxiliary,
         state_bytes_per_request=float(sum(p.state_bytes_total for p in plans)),
         catalog_facts=tuple(sorted(model_facts)), metadata=metadata,
     )
@@ -264,14 +271,19 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
         full = kind == "full_attention"
         layer_kv = global_kv_heads if full else kv_heads
         layer_hd = global_head_dim if full else head_dim
-        factor = 1 if (full and k_eq_v) else 2
+        # Two cache planes are retained even when the projection is shared.
+        factor = KV_CACHE_PLANES
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gemma4",
-            ffn="moe" if moe else "dense", window=0 if full else window,
+            ffn="moe" if moe else "dense",
+            window=ZERO if full else window,
             num_heads=heads, num_kv_heads=layer_kv, head_dim=layer_hd,
-            intermediate_size=0 if moe else intermediate, num_experts=experts,
-            top_k=top_k, moe_intermediate_size=moe_i, num_shared_experts=shared,
-            shared_intermediate_size=shared_i, qk_norm=True, ffn_activation="gelu",
+            intermediate_size=ZERO if moe else intermediate,
+            num_experts=experts,
+            top_k=top_k, moe_intermediate_size=moe_i,
+            num_shared_experts=shared,
+            shared_intermediate_size=shared_i, qk_norm=True,
+            ffn_activation="gelu",
             kv_cache_elements=factor * layer_kv * layer_hd,
             kv_owner_layer_id=index, owns_long_kv=True, k_eq_v=bool(full and k_eq_v),
             native_layer_id=index, scope="body",
@@ -279,8 +291,11 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
     gemma_facts = {
         "gemma4": 1, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
         "gemma4_ple_width": ple_width, "gemma4_ple_tables": 1,
-        "gemma4_ple_gated": True, "gemma4_k_eq_v_all": 0,
-        "gemma4_k_eq_v_layers": k_layers, "norm_weight_offset": 1.0,
+        "gemma4_ple_gated": True,
+        "gemma4_ple_vocab": _int(c, "vocab_size_per_layer_input") or vocab,
+        "gemma4_k_eq_v_all": ZERO,
+        "gemma4_k_eq_v_layers": k_layers,
+        "norm_weight_offset": NORM_WEIGHT_OFFSET,
         "attention_schedule": schedule,
     }
     gaps = ("vision_encoder_and_projector:language_backbone_only",) if vision_raw else ()
@@ -334,22 +349,27 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             index=index, attention="gqa", architecture="gqa",
             ffn="moe" if moe else "dense", num_heads=heads,
             num_kv_heads=kv_heads, head_dim=head_dim,
-            intermediate_size=0 if moe else dense_i,
-            num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-            moe_intermediate_size=moe_i if moe else 0,
-            num_shared_experts=shared if moe else 0,
-            shared_intermediate_size=shared_i if moe else 0,
-            router_input_size=hidden if moe else 0,
+            intermediate_size=ZERO if moe else dense_i,
+            num_experts=experts if moe else ZERO,
+            top_k=top_k if moe else ZERO,
+            moe_intermediate_size=moe_i if moe else ZERO,
+            num_shared_experts=shared if moe else ZERO,
+            shared_intermediate_size=shared_i if moe else ZERO,
+            router_input_size=hidden if moe else ZERO,
             router_mode=str(c.get("scoring_func", "softmax")),
             qk_norm=qk_norm, q_output_gate=gate, ffn_activation="silu",
             indexer=active, indexer_type="full" if active else "none",
-            owns_index_k=active, index_k_owner_layer_id=index if active else -1,
-            owns_topk=active, topk_owner_layer_id=index if active else -1,
-            index_heads=index_heads if active else 0, index_dim=index_dim if active else 0,
-            index_topk=(topk_blocks + local_blocks) * block if active else 0,
+            owns_index_k=active,
+            index_k_owner_layer_id=index if active else (-1),
+            owns_topk=active,
+            topk_owner_layer_id=index if active else (-1),
+            index_heads=index_heads if active else ZERO,
+            index_dim=index_dim if active else ZERO,
+            index_topk=(topk_blocks + local_blocks) * block if active else ZERO,
             candidate_block_size=block if active else 1,
-            candidate_topk_blocks=topk_blocks + local_blocks if active else 0,
-            kv_cache_elements=2 * kv_heads * head_dim,
+            candidate_topk_blocks=(topk_blocks + local_blocks if active
+                                   else ZERO),
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
@@ -415,26 +435,34 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         sparse_layer = bool(sparse_on and kind in apply_types)
         plans.append(LayerPlan(
             index=index, attention="gqa", architecture="gqa",
-            ffn="moe" if moe else "dense", window=0 if full else window,
+            ffn="moe" if moe else "dense",
+            window=ZERO if full else window,
             num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
-            intermediate_size=0 if moe else intermediate,
-            num_experts=experts if moe else 0, top_k=top_k if moe else 0,
-            moe_intermediate_size=moe_i if moe else 0,
-            num_shared_experts=1 if moe else 0,
-            shared_intermediate_size=shared_i if moe else 0,
-            router_input_size=hidden if moe else 0, router_mode="softmax",
-            q_output_gate=gate, ffn_activation="silu",
-            indexer=sparse_layer, indexer_type="full" if sparse_layer else "none",
-            owns_index_k=sparse_layer, index_k_owner_layer_id=index if sparse_layer else -1,
-            owns_topk=sparse_layer, topk_owner_layer_id=index if sparse_layer else -1,
-            index_heads=idx_heads if sparse_layer else 0,
-            index_dim=idx_dim if sparse_layer else 0,
-            index_topk=topk_regions * block if sparse_layer else 0,
+            intermediate_size=ZERO if moe else intermediate,
+            num_experts=experts if moe else ZERO,
+            top_k=top_k if moe else ZERO,
+            moe_intermediate_size=moe_i if moe else ZERO,
+            num_shared_experts=1 if moe else ZERO,
+            shared_intermediate_size=shared_i if moe else ZERO,
+            router_input_size=hidden if moe else ZERO,
+            router_mode="softmax",
+            q_output_gate_kind="headwise" if gate else "none",
+            q_gate_projection="separate" if gate else "packed_q",
+            ffn_activation="silu",
+            indexer=sparse_layer,
+            indexer_type="full" if sparse_layer else "none",
+            owns_index_k=sparse_layer,
+            index_k_owner_layer_id=index if sparse_layer else (-1),
+            owns_topk=sparse_layer,
+            topk_owner_layer_id=index if sparse_layer else (-1),
+            index_heads=idx_heads if sparse_layer else ZERO,
+            index_dim=idx_dim if sparse_layer else ZERO,
+            index_topk=topk_regions * block if sparse_layer else ZERO,
             index_kpool=block if sparse_layer else 1,
             index_kpool_compress=bool(sparse_layer and block > 1),
             candidate_block_size=block if sparse_layer else 1,
-            candidate_topk_blocks=topk_regions if sparse_layer else 0,
-            kv_cache_elements=2 * kv_heads * head_dim,
+            candidate_topk_blocks=topk_regions if sparse_layer else ZERO,
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
             native_layer_id=index, scope="body",
         ))
@@ -443,12 +471,72 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         gaps.append("csa_block_compress_ssmax_approximated_by_pooled_indexer")
     if vision_raw:
         gaps.append("vision_encoder_and_projector:language_backbone_only")
+    auxiliary = _step5_auxiliary(
+        c, plans, hidden=hidden, heads=heads, kv_heads=kv_heads,
+        head_dim=head_dim, intermediate=intermediate, vocab=vocab,
+        window=window, gate=gate)
     return _model(
         key, "step5", config, c, plans, attention="gqa", ffn="moe",
         heads=heads, kv_heads=kv_heads, head_dim=head_dim, hidden=hidden,
         intermediate=intermediate, vocab=vocab, experts=experts,
         top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=None,
+        auxiliary=auxiliary,
     )
+
+
+def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
+                     head_dim: int, intermediate: int, vocab: int,
+                     window: int, gate: bool):
+    """Declare the native Step-5 NextN blocks from the untruncated schedules.
+
+    Native checkpoint ids ``92..94`` are the three NextN modules.  Each owns a
+    dense FFN, a sliding window of 512, its own ``enorm``/``hnorm``/
+    ``eh_proj[H, 2H]``/``output_norm`` and its own head; one embedding is
+    shared by the three proposals.  ``cyclic_nextn`` executes proposal ``i``
+    with block ``i % 3``.
+    """
+    from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+    nextn = _int(c, "num_nextn_predict_layers")
+    if nextn <= ZERO:
+        return None
+    if nextn != _STEP5_NEXTN_BLOCKS:
+        raise ModelingError(f"model_config_step5_nextn_blocks_invalid:{nextn}")
+    native_base = int(len(plans))
+    targets = tuple(int(v) for v in (c.get("dspark_target_layer_ids") or ()) or ())
+    draft_plans = tuple(
+        LayerPlan(
+            index=index, native_layer_id=native_base + index,
+            attention="gqa", architecture="gqa", ffn="dense",
+            window=window,
+            num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+            intermediate_size=intermediate,
+            q_output_gate_kind="headwise" if gate else "none",
+            q_gate_projection="separate" if gate else "packed_q",
+            ffn_activation="silu", scope="draft",
+            kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
+            kv_owner_layer_id=index, owns_long_kv=True,
+        )
+        for index in range(nextn)
+    )
+    spec = DraftSpec(
+        kind="mtp", layers=nextn, hidden_size=hidden,
+        intermediate_size=intermediate,
+        num_heads=heads, num_kv_heads=kv_heads, head_dim=head_dim,
+        q_width=heads * head_dim, kv_width=kv_heads * head_dim,
+        attention_kind="gqa", q_output_gate=bool(gate),
+        num_experts=ZERO, top_k=ZERO, expert_intermediate_size=ZERO,
+        target_layer_ids=targets or tuple(range(nextn)),
+        sliding_window=window, block_size=1,
+        target_shared_embedding=False, target_shared_lm_head=False,
+        input_mode="normalized_concat", execution_mode="cyclic_nextn",
+        embedding_owned=True, embedding_count=1,
+        output_head_owned=True, output_head_count=nextn,
+        vocab_size=vocab, pp_capability=STEP5_PP_CAPABILITY,
+        layer_plans=draft_plans,
+        source=(("kind", "native_step5_nextn_92_94"),),
+        notes=("native NextN ids 92..94; cyclic_nextn executes block i%%3",),
+    )
+    return AuxiliarySpec(mtp=spec)
 
 
 def build_fleet_model(key: str, config: Mapping[str, Any], family: str) -> ModelSpec:

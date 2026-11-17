@@ -54,8 +54,11 @@ book = RecipeBook(recipes={"my_kernel": SerialLoadCompute()})
 
 This example demonstrates ordering only. A real implementation must preserve all
 memory/compute/copy work and account for its own output stage and buffer lifetimes.
-`ResourceEnvelope`, `TiledMatmul`, `TransferRecipe`, `RecurrentScan` and `RecurrentVector` provide
-existing program patterns. JSON bindings can select built-in recipes by exact
+`TiledFlashAndPagedAttentionRecipe`, `TiledSparseIndexerRecipe`,
+`ChunkedLinearAttentionRecipe`, `AIVTiledVectorAndGatherRecipe`,
+`TopologyCollectiveRecipe`, `TiledMatmul`, `TransferRecipe`, `RecurrentScan` and
+`RecurrentVector` provide existing program patterns. There is no implicit
+aggregate fallback: an unbound mechanism raises `unmodeled_operator_mechanism`. JSON bindings can select built-in recipes by exact
 recipe, family or program kind. Python bindings can supply new recipe objects
 without changing the engine loop.
 

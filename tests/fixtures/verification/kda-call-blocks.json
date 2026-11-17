@@ -1715,7 +1715,7 @@
     "stage_attribute_observed": false,
     "sources": [
       {
-        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/vllm_ascend/ops/kimi_kda.py",
+        "path": "repository://vllm-ascend-v41-private/vllm_ascend/ops/kimi_kda.py",
         "sha256": "35365b3b353fc492b4dc5d75b88916431f6802c21bf51b61b4893d39d54f11f3",
         "size_bytes": 30609,
         "lines": [
@@ -1734,7 +1734,7 @@
         ]
       },
       {
-        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp",
+        "path": "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp",
         "sha256": "4db63cf9151d52d8b6d101abc05f3af1f42eaa88435483662dc9cb5d72370fa2",
         "size_bytes": 37852,
         "lines": [
@@ -1749,7 +1749,7 @@
         ]
       },
       {
-        "path": "/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp",
+        "path": "repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/chunk_kda_fwd.cpp",
         "sha256": "0ea787730736f4ed92a35e3bafa6e54417c84716fc6aed381a339259abfa74d0",
         "size_bytes": 10682,
         "lines": [

@@ -129,15 +129,17 @@ output chunks. This preserves source AIC/AIV dependencies without inferring
 the historical kernel's dispatch or scalar latency from an event residual.
 See `operators/grouped-source-execution.md`.
 
-`ResourceEnvelope` is the default for operations without a specialized stage
-recipe. Its time is the maximum independent resource service, plus declared setup.
-A source-derived `OpSpec` declares `source_boundary="kernel"` or `"call"`. Its exact recipe id must bind
-a `PlannedRecipe` before isolated analysis or iteration execution; family/program
-defaults and an explicit envelope cannot substitute for its work and dependencies.
+Every operator without a specialized source planner binds one of the five
+declared physical mechanism classes (tiled attention, sparse indexer, chunked
+linear attention, AIV vector/gather or topology collective). There is no
+implicit aggregate `ResourceEnvelope` default. A source-derived `OpSpec`
+declares `source_boundary="kernel"` or `"call"`. Its exact recipe id must bind a
+`PlannedRecipe` before isolated analysis or iteration execution; family/program
+defaults cannot substitute for its work and dependencies.
 Calls require a kernel expander; an unexpanded call cannot be priced as one
 kernel. Already expanded kernels retain their boundary through repeated passes.
 Generic conversion/fusion passes preserve these implementation boundaries.
-A bound source planner may use a compact envelope or phase model when that is
+A bound source planner may use a compact physical phase model when that is
 sufficient for its declared work and constraints. The binding requirement
 establishes selection, not a minimum instruction-level modeling depth.
 A custom recipe can introduce serial stages, transaction limits, conversion work,

@@ -22,7 +22,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[3]
 HERE = Path(__file__).resolve().parent
-PROFILER = Path('/Users/maoxx241/code/profiler')
+PROFILER = Path('repository://profiler')
 sys.path.insert(0, str(PROFILER))
 from mindie_profiler.normalized import kernel_rows
 from mindie_profiler.decode_segmentation import is_aicpu_controller
@@ -82,14 +82,14 @@ def freeze():
             'original_assignment': 'unassigned', 'evaluation_relation': 'retrospective',
         })
     assert Counter(s['assignment'] for s in sources) == {'train': 6, 'validation': 40}
-    ascend = '/Users/maoxx241/code/vllm-ascend'
+    ascend = 'repository://vllm-ascend'
     rev = '8c30e4f491f73cba737a1dacc522894e437cdf3d'
     source = [source_blob(ascend, rev, 'vllm_ascend/models/kimi_k3.py', [
         'AscendKimiLinearModel.__init__/forward', 'AscendKimiDecoderLayer.forward_attn_residual',
         'AscendKimiMLP.forward']), source_blob(ascend, rev,
         'vllm_ascend/ops/fused_moe/shared_experts.py',
         ['SharedExperts._gather_sp_input', 'SharedExperts._pad_and_reduce_scatter']),
-        source_blob('/Users/maoxx241/code/vllm-v0.27.1-k3-ops-validation',
+        source_blob('repository://vllm-v0.27.1-k3-ops-validation',
         '6e448d0ea9bf3d88d898b65449ca6dc2aec170ac',
         'vllm/models/common/ops/sequence_parallel.py',
         ['sp_shard', 'sp_all_gather', 'sp_reduce_scatter'])]

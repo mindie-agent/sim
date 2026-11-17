@@ -192,29 +192,6 @@ def multi_node_deepep_case():
     return raw
 
 
-def test_deepep_two_stage_analysis_reduces_time_all_to_all():
-    raw = multi_node_deepep_case()
-    report = deepep.analyze_deepep_collectives(
-        raw, phase="prefill", tokens=8, sequences=1)
-    assert report["ep"] == 64
-    assert report["ranks_per_node"] == 8
-    assert report["nodes"] == 8
-    assert report["moe_layers"] == 1
-    assert len(report["per_layer"]) == 1
-    row = report["per_layer"][0]
-    assert row["deepep_dispatch_group_bytes"] < row["standard_dispatch_bytes"]
-    assert row["deepep_dispatch_intra_bytes"] > 0
-    assert report["standard_total_comm_ms"] > 0
-    assert report["deepep_total_comm_ms"] < report["standard_total_comm_ms"]
-    assert report["comm_saving_ratio"] > 0
-    # Overlap removes communication time without changing physical work.
-    half = deepep.analyze_deepep_collectives(
-        raw, phase="prefill", tokens=8, sequences=1,
-        deepep_overlap_ratio=0.5)
-    assert half["deepep_total_comm_ms"] == pytest.approx(
-        half["deepep_unoverlapped_comm_ms"] * 0.5)
-    assert half["comm_saving_ratio"] > report["comm_saving_ratio"]
-
 
 def test_deepep_dag_lowering_scales_payloads_and_lowers_step_time():
     raw = _moE_case(prompt=8, top_k=1)

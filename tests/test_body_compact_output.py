@@ -232,6 +232,8 @@ def test_compact_publishes_selected_matrix_wrapper_kind_without_second_op():
     }
     selected = replace(
         op("latent", flops=4e6), family="projection", recipe="latent_projection",
+        semantic_shape=(1, 1, 1), local_shape=(1, 1, 1),
+        padded_shape=(1, 1, 1), launch_shape=(1, 1, 1),
         metadata=(("matrix_wrapper", wrapper),))
     compact = graph_costs(raw, {0: [selected]}, compact=True,
                           isolated=False, trace_limit=0)

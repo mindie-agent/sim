@@ -35,6 +35,7 @@ from mindie_sim.catalog.cache import layer_cache_components
 from mindie_sim.catalog.cache_ownership import (
     batch_cache_footprint, draft_cache_components,
 )
+from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.paired_sfa import page_groups
 from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.prediction.batch_prefix_attention import BatchPrefixAttention
@@ -192,8 +193,9 @@ def test_capacity_query_width_and_windowed_mtp_draft_geometry():
         attention_kind="gqa", target_layer_ids=(0,))
     base = dense_case(layers=1)
     plans = (replace(dense_layer(0), window=64),)
-    model = replace(dense_model(layers=1), layer_plans=plans,
-                    auxiliary=AuxiliarySpec(mtp=mtp))
+    target = replace(dense_model(layers=1), layer_plans=plans)
+    mtp = replace(mtp, layer_plans=native_draft_layer_plans(target, mtp))
+    model = replace(target, auxiliary=AuxiliarySpec(mtp=mtp))
     drafted = replace(
         base, model=model, runtime=replace(
             base.runtime,

@@ -29,7 +29,7 @@ def combined_case(*, layers=None, bounded=False):
         kernels = raw["runtime"]["kernels"]
         kernels.setdefault("programs", {})["matmul"] = {"kind": "steady_matmul"}
         kernels.setdefault("families", {}).update({
-            "grouped_gemm": {"kind": "envelope"},
+            "grouped_gemm": {"kind": "steady_matmul"},
             "alltoall": {"kind": "pairwise_collective"},
             "allgather": {"kind": "ring_collective"},
             "reduce_scatter": {"kind": "ring_collective"},

@@ -117,12 +117,39 @@ class TargetOperators(tuple):
                                "selection": self.default_selection}
 
 
-def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=True):
+def execution_policy(case) -> dict:
+    """Resolved execution policy stored by ``compose_case`` on the declaration."""
+    runtime = getattr(case, "runtime", None)
+    metadata = dict(getattr(runtime, "metadata", {}) or {})
+    policy = metadata.get("execution_policy")
+    return dict(policy) if isinstance(policy, Mapping) else {}
+
+
+def _strip_automatic_lowerings(case, declared):
+    """Remove lowerings that a body default installed beyond the caller's set."""
+    kernels = dict(case.runtime.kernels)
+    lowerings = kernels.get("lowerings")
+    if isinstance(lowerings, Mapping):
+        kernels["lowerings"] = {key: value for key, value in lowerings.items()
+                                if key in declared}
+    return replace(case, runtime=replace(case.runtime, kernels=kernels))
+
+
+def effective_body_declaration(case, phase, *, tokens=ONE, scope="body", enabled=True):
     """Resolve one body declaration before either structure or timing lowers it."""
     if scope != "body" or not enabled:
         return case, {"profile": "explicit_declaration_preserved",
                       "reason": "model_scope" if scope != "body" else "body_defaults_disabled"}
+    policy = execution_policy(case)
+    declared_lowerings = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
     case, selection = attention_defaults(case, phase, tokens=tokens)
+    if not bool(policy.get("automatic_optional_fusions", True)):
+        # ``raw_eager`` (and a caller that disabled recommendations) must never
+        # re-acquire an optional fused lowering from the structural defaults.
+        case = _strip_automatic_lowerings(case, declared_lowerings)
+        selection = {**selection,
+                     "automatic_optional_fusions": "disabled_by_execution_policy",
+                     "declared_lowerings": sorted(declared_lowerings)}
     programs = case.runtime.kernels.setdefault("programs", {})
     explicit = "matmul" in programs
     if not explicit:
@@ -132,7 +159,8 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
         # Compression must not enable the opt-in mapping search. Keep the
         # original 128x128 output-owner grid. K64 is a capacity alternative
         # when two FP32 K128 operand buffers do not fit a declared L0 pool.
-        programs["matmul"] = _steady_matmul_default(candidates=True)
+        programs["matmul"] = _steady_matmul_default(
+            candidates=True, a5=case.machine.sku.startswith("Ascend950"))
         # Grouped matrices already had a mapped Steady fallback before the
         # body default. Do not narrow their independent expert-bank domain.
         families = case.runtime.kernels.setdefault("families", {})
@@ -158,15 +186,35 @@ def effective_body_declaration(case, phase, *, tokens=1, scope="body", enabled=T
     return case, selection
 
 
-def _steady_matmul_default(*, candidates=False):
+DEFAULT_MATMUL_CANDIDATES = (
+    (256, 256, 64),
+    (128, 256, 128),
+    (256, 128, 128),
+    (128, 256, 64),
+    (128, 128, 128),
+    (128, 128, 64),
+    (64, 256, 128),
+    (64, 128, 128),
+    (32, 128, 256),
+    (32, 128, 128),
+    (32, 64, 256),
+    (32, 32, 256),
+    (16, 128, 256),
+    (16, 64, 256),
+)
+LEGACY_MATMUL_CANDIDATES = ((128, 128, 128), (128, 128, 64))
+
+
+def _steady_matmul_default(*, candidates=False, a5=False):
     """The compact finite-K matrix program, including symmetric owner cohorts.
 
-    The grouped-matrix family keeps its own unconstrained candidate domain; only
-    the dense ``matmul`` program declares the two 128-output-grid candidates.
+    Candidate tiles are declared architecture policy, not a dense-only
+    128-output narrowing. The mapping still screens L1/L0A/L0B/L0C capacity.
     """
     program = {"kind": "steady_matmul", "owner_cohorts": True}
     if candidates:
-        program["candidates"] = [[128, 128, 128], [128, 128, 64]]
+        tiles = DEFAULT_MATMUL_CANDIDATES if a5 else LEGACY_MATMUL_CANDIDATES
+        program["candidates"] = [list(item) for item in tiles]
     return program
 
 
@@ -186,7 +234,8 @@ def service_program_defaults(case):
     if "matmul" in (kernels.get("programs") or {}):
         return case
     programs = {**kernels.get("programs", {}),
-                "matmul": _steady_matmul_default(candidates=True)}
+                "matmul": _steady_matmul_default(
+        candidates=True, a5=case.machine.sku.startswith("Ascend950"))}
     families = dict(kernels.get("families", {}))
     families.setdefault("grouped_gemm", _steady_matmul_default())
     return replace(case, runtime=replace(
@@ -213,13 +262,23 @@ def consume_target_declaration(case, target):
             carried = supplied[0]
     if carried is None:
         return case
+    policy = execution_policy(case)
+    automatic = bool(policy.get("automatic_optional_fusions", True))
+    declared = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
     kernels = deepcopy(carried)
     for key, value in case.runtime.kernels.items():
         if key in {"recipes", "programs", "families", "lowerings"}:
             entries = deepcopy(value)
-            if key == "lowerings" and "gdn_decode" in entries:
-                entries["gdn_decode"] = _inherit_gdn_store(
-                    entries["gdn_decode"], carried=kernels.get(key, {}).get("gdn_decode"))
+            if key == "lowerings":
+                if not automatic:
+                    # A raw-eager declaration never re-acquires an optional fused
+                    # lowering from a carried target declaration.
+                    kernels[key] = {name: item for name, item in
+                                    kernels.get(key, {}).items()
+                                    if name in declared}
+                if "gdn_decode" in entries:
+                    entries["gdn_decode"] = _inherit_gdn_store(
+                        entries["gdn_decode"], carried=kernels.get(key, {}).get("gdn_decode"))
             kernels[key] = {**kernels.get(key, {}), **entries}
         else:
             kernels[key] = deepcopy(value)

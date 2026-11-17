@@ -314,19 +314,33 @@ def _routed_expert_bytes_by_stage(
         payload[stage] += routed_payload
         num_exp = int(plan.num_experts)
         k = min(num_exp, max(1, int(plan.top_k)))
-        active_total = float(num_exp) if k >= num_exp else float(num_exp) * (
-            ONE_FLOAT - ((ONE_FLOAT - float(k) / float(num_exp)) ** float(tokens))
-        )
-        local_exp = max(ONE, (num_exp + ep - ONE) // ep)
         if slots is not None:
+            # ``routed`` is already this rank's physical slot bank, so the active
+            # staging of this rank is
+            #   sum_{slot in rank} W[logical(slot)] * p[logical(slot)]
+            # with NO further EP division: ``active_total`` is already local.
+            copies = slots.copies_per_expert()
             local_slots = max(ONE, base_count + extra_count)
-            p_slot = (float(k) / float(num_exp)) * (
-                float(base_count) / float(local_slots))
-            active_total = float(local_slots) * (
-                -math.expm1(float(tokens) * math.log1p(-p_slot))
-                if ZERO_FLOAT < p_slot < ONE_FLOAT else float(p_slot > ZERO_FLOAT))
-            local_exp = local_slots
-        active_layer_bytes = (active_total / float(ep)) * (routed / float(local_exp))
+            per_slot = routed / float(local_slots)
+            row_share = float(k) / float(num_exp)
+            best_active = ZERO_FLOAT
+            for ids in slots.expert_ids_by_rank:
+                active = ZERO_FLOAT
+                for expert in ids:
+                    share = row_share / float(copies.get(int(expert), ZERO) or ONE)
+                    if ZERO_FLOAT < share < ONE_FLOAT:
+                        active += -math.expm1(float(tokens) * math.log1p(-share))
+                    else:
+                        active += float(share >= ONE_FLOAT)
+                best_active = max(best_active, active)
+            active_layer_bytes = min(routed, per_slot * best_active)
+        else:
+            active_total = float(num_exp) if k >= num_exp else float(num_exp) * (
+                ONE_FLOAT - ((ONE_FLOAT - float(k) / float(num_exp)) ** float(tokens))
+            )
+            local_exp = max(ONE, (num_exp + ep - ONE) // ep)
+            active_layer_bytes = (active_total / float(ep)) * (
+                routed / float(local_exp))
         staging[stage] = max(staging[stage], min(routed, active_layer_bytes))
     return result, payload, staging
 
@@ -413,7 +427,10 @@ class Memory:
         shared_expert_dp = bool(dict(case.runtime.metadata).get(
             "enable_shared_expert_dp", False))
         self.slot_plans = None
-        if int(getattr(p, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO:
+        if (int(getattr(p, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
+                or any(plan.ffn == "moe" and int(plan.num_experts) > ZERO
+                       and int(plan.num_experts) % max(ONE, int(p.ep)) != ZERO
+                       for plan in case.model.layer_plans)):
             from mindie_sim.catalog.expert_slots import expert_slot_plan
             from mindie_sim.schema.runtime_features import split_routing_features
             _logical, slot_routing = split_routing_features(

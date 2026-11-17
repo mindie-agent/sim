@@ -36,11 +36,11 @@ NUM_STAGES = 2
 # Declared per-owner in-flight CTA window.  It is a dependency-window model
 # parameter, deliberately not Triton's num_stages=2 and not an occupancy claim.
 OWNER_CTA_WINDOW = 2
-SOURCE_PATH = "/Users/maoxx241/code/vllm-v0.25.1/vllm/model_executor/layers/mamba/ops/causal_conv1d.py"
+SOURCE_PATH = "repository://vllm-v0.25.1/vllm/model_executor/layers/mamba/ops/causal_conv1d.py"
 SOURCE_SHA256 = "5f3d16d730fd6dc427cf6981a3de58b1e1e625e624ae8fa0fe77891f58b8bd5c"
 SOURCE_BYTES = 49533
 SOURCE_LINES = "16-465 (kernel); 468-745 (wrapper)"
-NULL_BLOCK_SOURCE_PATH = "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/backends/utils.py"
+NULL_BLOCK_SOURCE_PATH = "repository://vllm-v0.25.1/vllm/v1/attention/backends/utils.py"
 NULL_BLOCK_SOURCE_SHA256 = "192e6b5df24ff52ae57a6a23d6cf58d1b4dd34f14c9283ce268e5f88b1123b96"
 NULL_BLOCK_SOURCE_LINE = 46
 PAD_SLOT_SOURCE_LINE = 45

@@ -50,7 +50,7 @@ def projection_only(*, prefix, deps, stage, plan, views, mode, model, parallel,
     heads = plan.num_heads // parallel.tp
     kv = local_kv_heads(plan.num_kv_heads, parallel.tp)
     shared = 0 <= plan.kv_owner_layer_id < plan.index
-    q = heads * plan.head_dim * (2 if plan.q_output_gate else 1)
+    q = plan.q_projection_width(heads, plan.head_dim)
     projected = gemm_op(
         op_id=prefix + ".known_qkv", deps=(deps,), stage=stage, layer=plan.index,
         requests=requests, m=padded_tokens, n=q + (0 if shared else 2 * kv * plan.head_dim),

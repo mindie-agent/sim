@@ -57,7 +57,7 @@
  },
  "provenance": {
   "campaign": "a5-comm-w16",
-  "source_artifact": "/Users/maoxx241/code/mindie-agent/.workstreams/model-physical/a5-comm-w16-calibration.json",
+  "source_artifact": "repository://mindie-agent/.workstreams/model-physical/a5-comm-w16-calibration.json",
   "source_sha256": "99513a269266170b1cb8ede4cd4efe123884393c349aa21674a97349a3d5141f",
   "source_label": "a5-comm-w16-rack06-os5os6",
   "conversion": "conditions[collective=all_reduce, single=false] -> comm_conditions; placement a5-ub-mesh-2node-r16 -> ub; payload_bytes -> size_bytes; per_op_ms.median -> median_ms; per_op_ms.n -> samples; ranks fixed at 16",

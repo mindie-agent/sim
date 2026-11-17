@@ -115,10 +115,14 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
         moe_transport.validate_contract(model, plan, transport)
     overlap_shared = bool(
         overlap_shared or getattr(plan, "overlap_shared", False)
+        or getattr(runtime, "multistream_overlap_shared_expert", False)
         or dict(getattr(runtime, "metadata", ()) or ()).get(
-            "overlap_shared_expert", False))
+            "overlap_shared_expert", False)
+        or dict(getattr(runtime, "metadata", ()) or ()).get(
+            "enable_shared_expert_overlap", False))
     group_tokens = global_tokens if global_tokens is not None else pre_sp_tokens
-    local_experts = max(1, plan.num_experts // parallel.ep)
+    local_experts = max(ONE, (int(plan.num_experts) + int(parallel.ep) - ONE)
+                        // int(parallel.ep))
     partitions = (sequence_plan.source_partitions if sequence_plan else
                   getattr(routing_realization, "source_partitions",
                           min(parallel.tp, parallel.ep)))
@@ -157,7 +161,9 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     runtime_routing = dict(getattr(runtime, "routing", {}) or {})
     has_slots = (
         int(getattr(parallel, "redundant_experts_per_rank", ZERO) or ZERO) > ZERO
-        or "expert_slot_map" in runtime_routing)
+        or "expert_slot_map" in runtime_routing
+        or (int(plan.num_experts) > ZERO and int(parallel.ep) > ZERO
+            and int(plan.num_experts) % int(parallel.ep) != ZERO))
     balanced = (routing_realization is not None
                 and routing_realization.basis in {"forced_balanced_integer_counts",
                                                   "source_force_eplb_masked_integer_counts"})
@@ -911,6 +917,15 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
             gate_bound.get(op.op_id, down_bound.get(op.op_id, op))
             for op in ops
         ]
+    if overlap_shared:
+        shared_ops = [op for op in ops if op.stream == "shared_stream"]
+        if shared_ops:
+            routed = [op for op in ops if op.stream != "shared_stream"]
+            dispatch_index = next(
+                (index for index, op in enumerate(routed)
+                 if op.recipe == "expert_dispatch" or op.family == "alltoall"),
+                len(routed))
+            ops = routed[:dispatch_index] + shared_ops + routed[dispatch_index:]
     from .mc2_graph import lower as lower_native_mc2
     destination_rows = (
         tuple(int(value) for value in routing_realization.rank_assignment_rows)
@@ -928,7 +943,10 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     return ops, last
 
 
-def mc2(*, prefix, tokens, global_tokens=None, chunks=4, **kwargs):
+DEFAULT_MC2_CHUNKS = 4
+
+
+def mc2(*, prefix, tokens, global_tokens=None, chunks=DEFAULT_MC2_CHUNKS, **kwargs):
     """Finite dispatch/compute/combine chunks with separate ordered streams."""
     group = tokens if global_tokens is None else global_tokens
     count = min(chunks, max(1, group))
@@ -953,7 +971,9 @@ def mc2(*, prefix, tokens, global_tokens=None, chunks=4, **kwargs):
                 phase = "combine"
             elif op.recipe == "route_unpack":
                 phase = "finish"
-            ops.append(replace(op, stream=f"mc2:{phase}"))
+            target_stream = (op.stream if op.stream == "shared_stream"
+                             else f"mc2:{phase}")
+            ops.append(replace(op, stream=target_stream))
         completions.append(last)
     joined = barrier_op(
         op_id=prefix + ".chunks_complete", deps=tuple(completions), stage=kwargs["stage"],

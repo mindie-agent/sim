@@ -28,10 +28,8 @@ from .contracts import load_extensions
 from .environment import ExecutionEnvironment
 from .errors import ExtensionError
 from .profiles import load_user_profile
-from .api import simulate_aclnn_call
 
-PUBLIC_COMMANDS = frozenset({"extensions", "extension", "ext", "profile",
-                             "aclnn"})
+PUBLIC_COMMANDS = frozenset({"extensions", "extension", "ext", "profile"})
 
 
 def _emit(payload: dict[str, Any], output: str | None) -> int:
@@ -114,42 +112,6 @@ def profile_main(argv: Sequence[str] | None = None, *,
         return 2
 
 
-def aclnn_main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(
-        prog="mindie-sim aclnn",
-        description="Execute one independent T12 ACLNN ABI call on a declared hardware environment.",
-        allow_abbrev=False)
-    parser.add_argument("invocation", help="T12 invocation JSON file")
-    parser.add_argument("--hardware", help="A5 SKU for T12 prediction")
-    parser.add_argument("--hardware-json", help="machine/hardware mapping for actual execution")
-    parser.add_argument("--wait", action="store_true", default=True)
-    parser.add_argument("--output", "-o")
-    args = parser.parse_args(argv)
-    try:
-        invocation = json.loads(Path(args.invocation).read_text(encoding="utf-8"))
-        execution = None
-        hardware = args.hardware
-        if args.hardware_json:
-            raw = json.loads(Path(args.hardware_json).read_text(encoding="utf-8"))
-            environment = ExecutionEnvironment.from_hardware(raw)
-            execution = environment.execution()
-            hardware = (args.hardware or raw.get("sku") or raw.get("name")
-                        or "Ascend950DT_9582")
-        result = simulate_aclnn_call(
-            invocation, hardware=hardware, execution=execution,
-            wait=args.wait)
-        actual = result.get("actual_execution")
-        if isinstance(actual, dict):
-            actual = dict(actual)
-            actual.pop("handle", None)
-            actual.pop("execution", None)
-            result = {**result, "actual_execution": actual}
-        return _emit(result, args.output)
-    except (ExtensionError, OSError, ValueError, KeyError) as exc:
-        print(json.dumps({"status": "failed", "error": str(exc)}), file=sys.stderr)
-        return 2
-
-
 def public_main(argv: Sequence[str] | None = None, *,
                 prog: str = "mindie-sim") -> int:
     args = list(sys.argv[1:] if argv is None else argv)
@@ -162,6 +124,4 @@ def public_main(argv: Sequence[str] | None = None, *,
     command, rest = args[0], args[1:]
     if command == "profile":
         return profile_main(rest, prog=prog + " profile")
-    if command == "aclnn":
-        return aclnn_main(rest)
     return extensions_main(rest, prog=prog + " extensions")

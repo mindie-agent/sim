@@ -4617,7 +4617,7 @@
     ],
     "metadata": {
       "source_template_identity": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
+        "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen35-35b-a3-tp4.json",
         "sha256": "9b4db9e09e3e00b0df50b1e9e7d10a86e04e46438dd6634840980c1b40661de3",
         "size_bytes": 5852
       },
@@ -4968,12 +4968,12 @@
         "base_case_path": "examples/cases/longctx-decode-20261030/a3-fai-regular/a3-qwen35-tp4-long-context-source.json",
         "base_case_sha256": "1fa00563314b0897a52818969392641d5f947119beb9fba4357fd4b808987160",
         "parameter_identity": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
+          "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
           "sha256": "9bdb420ab66a42f42257fac8fdbf6364530e5e870af83c54b3fa00a2932f41e9",
           "size_bytes": 104353
         },
         "operator_evidence_identity": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/operator-evidence.json",
+          "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/operator-evidence.json",
           "sha256": "2294818d7befce67a2d443c604661718c0ea1674080e701209d8639cb49d15f8",
           "size_bytes": 652045
         },
@@ -4987,7 +4987,7 @@
         ],
         "three_rule_baseline_revision": "c4e91818",
         "helper_source_contract": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/helper-source-contract.json",
+          "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/helper-source-contract.json",
           "sha256": "0793a5a7ea6d684b5f9f5069f1fcf74cb1923cf8add4a6d876d781ce771ab1e4",
           "size_bytes": 20597
         },

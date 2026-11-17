@@ -33,16 +33,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
 
 
-ZERO = 0
-ONE = 1
-TWO = 2
-THREE = 3
-FOUR = 4
-FIVE = 5
-FIRST = 0
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
-HALF = 0.5
 TILE_SLOTS = 2
 KEY_TILE_BYTES = 262144.0
 MAX_KEY_TILES = 32
@@ -57,7 +47,7 @@ def _matches_role(key: str, roles: tuple[str, ...], mapped: set[str]) -> bool:
 
 
 def _scale_work(work: dict[str, float], factor: float) -> dict[str, float]:
-    return {k: v * factor for k, v in work.items() if v * factor > ZERO_FLOAT}
+    return {k: v * factor for k, v in work.items() if v * factor > 0.0}
 
 
 @dataclass(frozen=True)
@@ -92,30 +82,44 @@ class BatchPrefixAttention:
                 store_work[name] = fval
             else:
                 fill_work[name] = fval
-        q_out_b = max(ZERO_FLOAT, float(getattr(context.op, "mte3_bytes", ZERO_FLOAT) or ZERO_FLOAT))
+        out_b = max(0.0, float(getattr(context.op, "mte3_bytes", 0.0) or 0.0))
+        hbm_total = max(0.0, float(getattr(context.op, "hbm_bytes", 0.0) or 0.0))
+        kv_hbm_b = float(metadata.get("prefix_read_hbm_bytes", 0.0) or 0.0)
+        q_in_b = (
+            max(0.0, hbm_total - kv_hbm_b - out_b)
+            if kv_hbm_b > 0.0 and hbm_total >= kv_hbm_b + out_b
+            else out_b
+        )
+        hbm_set = {names.get("hbm", "hbm")}
         q_load_work: dict[str, float] = {}
         out_store_work = dict(store_work)
         key_fill_work: dict[str, float] = {}
         for name, val in fill_work.items():
-            if val > TWO * q_out_b and q_out_b > ZERO_FLOAT:
-                q_load_work[name] = q_out_b
-                out_store_work[name] = out_store_work.get(name, ZERO_FLOAT) + q_out_b
-                key_fill_work[name] = val - TWO * q_out_b
+            is_hbm = name in hbm_set or name == "hbm" or name.startswith("memory@")
+            if is_hbm and val > (q_in_b + out_b) and (q_in_b + out_b) > 0.0:
+                if q_in_b > 0.0:
+                    q_load_work[name] = q_in_b
+                if out_b > 0.0:
+                    out_store_work[name] = out_store_work.get(name, 0.0) + out_b
+                key_fill_work[name] = val - q_in_b - out_b
+            elif not is_hbm and val > q_in_b and q_in_b > 0.0:
+                q_load_work[name] = q_in_b
+                key_fill_work[name] = val - q_in_b
             else:
                 key_fill_work[name] = val
         shape = tuple(getattr(context.op, "semantic_shape", ()) or ())
         qk_share = (
-            float(shape[THREE]) / max(ONE_FLOAT, float(shape[THREE] + shape[FOUR]))
-            if len(shape) >= FIVE else HALF
+            float(shape[3]) / max(1.0, float(shape[3] + shape[4]))
+            if len(shape) >= 5 else 0.5
         )
         qk_work = _scale_work(matrix_work, qk_share)
-        pv_work = {k: v - qk_work.get(k, ZERO_FLOAT) for k, v in matrix_work.items()
-                   if v - qk_work.get(k, ZERO_FLOAT) > ZERO_FLOAT}
-        hbm_plan_b = float(metadata.get("prefix_read_hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+        pv_work = {k: v - qk_work.get(k, 0.0) for k, v in matrix_work.items()
+                   if v - qk_work.get(k, 0.0) > 0.0}
+        hbm_plan_b = float(metadata.get("prefix_read_hbm_bytes", 0.0) or 0.0)
         tiles = (
-            max(ONE, int(self.key_tiles)) if self.key_tiles is not None
-            else min(MAX_KEY_TILES, max(ONE, math.ceil(hbm_plan_b / KEY_TILE_BYTES)))
-            if hbm_plan_b > KEY_TILE_BYTES else ONE
+            max(1, int(self.key_tiles)) if self.key_tiles is not None
+            else min(MAX_KEY_TILES, max(1, math.ceil(hbm_plan_b / KEY_TILE_BYTES)))
+            if hbm_plan_b > KEY_TILE_BYTES else 1
         )
         prefix_stages = (Stage("setup", latency=context.setup_ms),) if context.setup_ms else ()
         q_after = ("setup",) if context.setup_ms else ()
@@ -124,7 +128,7 @@ class BatchPrefixAttention:
             (Stage("query_load", q_load_work, after=q_after),) if has_q else ()
         )
         tile_dep = ("query_load",) if has_q else q_after
-        if tiles <= ONE:
+        if tiles <= 1:
             body = (
                 Stage("key_tile_fill", key_fill_work, after=tile_dep),
                 Stage("qk", qk_work, after=("key_tile_fill",)),
@@ -133,7 +137,7 @@ class BatchPrefixAttention:
                 Stage("output_store", out_store_work, after=("pv",)),
             )
             return KernelProgram(lead_stages + body, minimum_ms=context.minimum_ms)
-        inv = ONE / float(tiles)
+        inv = 1 / float(tiles)
         t_fill = _scale_work(key_fill_work, inv)
         t_qk = _scale_work(qk_work, inv)
         t_soft = _scale_work(vector_work, inv)
@@ -172,33 +176,63 @@ def select(op: Any, runtime: Any) -> str | None:
     return RECIPE_NAME
 
 
+def _view_query_tokens(view: Any) -> int:
+    ranges = getattr(view, "query_ranges", None)
+    if ranges:
+        return max(1, sum(
+            int(end) - int(start) for start, end in ranges if int(end) > int(start)))
+    return max(1, int(getattr(view, "q_len", 1) or 1))
+
+
 def apply_attention_prefix_reads(
     op: Any, *, views: Sequence[Any], sweeps_by_view: Sequence[int],
     shared_sweeps_by_view: Sequence[int], row_bytes: float, layer_index: int,
     runtime: Any, kernel_reuse: str = "tile", allow_recipe_rebind: bool = True,
+    kv_hbm_bytes: float | None = None,
+    kv_mte2_bytes: float | None = None,
+    unique_prefix_rows_by_view: Sequence[int] | None = None,
 ) -> Any:
-    """Apply physical prefix KV read deduplication and bind the batch recipe."""
+    """Replace the precharged KV components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
         return op
-    accesses = [
-        CacheAccess(
+    prefix_caps = (
+        tuple(int(value) for value in unique_prefix_rows_by_view)
+        if unique_prefix_rows_by_view is not None else None
+    )
+    accesses = []
+    for idx, (view, sweeps, shared) in enumerate(
+        zip(views, sweeps_by_view, shared_sweeps_by_view)
+    ):
+        if int(sweeps) <= 0:
+            continue
+        q_tokens = _view_query_tokens(view)
+        raw_context = getattr(view, "context", None)
+        context_tokens = (
+            max(0, int(raw_context))
+            if raw_context is not None
+            else max(0, int(sweeps) - q_tokens)
+        )
+        physical_prefix = min(int(shared), int(sweeps))
+        if prefix_caps is not None:
+            physical_prefix = min(physical_prefix, max(0, prefix_caps[idx]))
+        elif getattr(view, "prefix_tokens", None) is not None:
+            physical_prefix = min(physical_prefix, max(0, int(view.prefix_tokens)))
+        accesses.append(CacheAccess(
             request_id=str(view.request_id),
-            context_tokens=max(ZERO, int(sweeps) - ONE),
-            q_len=ONE,
-            prefix_tokens=max(ZERO, min(int(shared), int(sweeps))),
+            context_tokens=context_tokens,
+            q_len=q_tokens,
+            prefix_tokens=max(0, physical_prefix),
             prefix_key=canonical_prefix_cache_key(
                 "shared", getattr(view, "prefix_cache_key", "")),
             row_bytes=float(row_bytes),
             layer=int(layer_index),
             component="kv",
             logical_rows=int(sweeps),
-        )
-        for view, sweeps, shared in zip(views, sweeps_by_view, shared_sweeps_by_view)
-        if int(sweeps) > ZERO
-    ]
+        ))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
-    updated = apply_prefix_read_plan(op, plan)
+    updated = apply_prefix_read_plan(
+        op, plan, hbm_component=kv_hbm_bytes, mte2_component=kv_mte2_bytes)
     if allow_recipe_rebind and select(updated, runtime) == RECIPE_NAME:
         updated = replace(updated, recipe=RECIPE_NAME)
     return updated
@@ -215,4 +249,4 @@ def annotate_sparse_prefix_unknown(op: Any, runtime: Any) -> Any:
         "prefix_read_reason": "sparse_selected_rows_unknown",
     })
     return replace(
-        op, metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[FIRST])))
+        op, metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[0])))

@@ -44,7 +44,7 @@ __all__ = [
 
 IMPLEMENTATION_ID = "arch35_gqmm_mix_nz"
 SOURCE_REVISION = "a3925fd49cd256ad478d2faf983bf2961b8ae2c8"
-SOURCE_ROOT = "/Users/maoxx241/code/refs/ops-transformer"
+SOURCE_ROOT = "repository://refs/ops-transformer"
 
 # sha256 and byte length of the exact pinned files read for this adapter.
 _SOURCE_FILES = (

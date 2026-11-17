@@ -95,7 +95,7 @@ def _native_plan(raw, geometry):
                 for peer in range(len(matrix)) if peer != rank)
                 * plan.layout.packet_bytes)
     else:
-        from .piecewise.families_moe_mc2 import _link_work
+        from .mc2_program import _link_work
         for phase in _link_work(plan, max(1, int(raw["ep"])), 0):
             link += sum(float(amount) for pipe, amount in phase.work
                         if pipe in {"link", "link_hccs", "link_roce"})
@@ -104,7 +104,7 @@ def _native_plan(raw, geometry):
     kind = str(raw["kind"])
 
     def program(context):
-        from .piecewise.families_moe_mc2 import native_program_from_contract
+        from .mc2_program import native_program_from_contract
         return native_program_from_contract(raw, context)
 
     return OperatorPlan(

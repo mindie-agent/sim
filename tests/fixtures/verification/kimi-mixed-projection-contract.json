@@ -1,7 +1,7 @@
 {
   "schema": "mindie-kda-mixed-projection-source-contract/1",
   "source_code": {
-    "path": "/Users/maoxx241/code/vllm-ascend-v4-default-comm/vllm_ascend/ops/kimi_kda.py",
+    "path": "repository://vllm-ascend-v4-default-comm/vllm_ascend/ops/kimi_kda.py",
     "sha256": "b36208b3a9a6fffb05c9437fdecaf62bb2af0e0a5be9edf0bab4f1bd5ab10617",
     "size_bytes": 27734
   },

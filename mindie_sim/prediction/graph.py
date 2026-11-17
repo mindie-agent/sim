@@ -9,13 +9,46 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import math
+
+TOLERANCE = 1e-12
+SHAPE_TRAILING_DIMS = 3
+ROWS_DIM = -3
+COLS_DIM = -2
 
 
 def annotate_geometry(ops, *, active_rows, physical_rows):
-    """Capture dimensions describe the call, independently of kernel slicing."""
-    return tuple(replace(op, metadata=tuple({**dict(op.metadata),
-        "graph_active_query_rows": active_rows,
-        "graph_physical_query_rows": physical_rows}.items())) for op in ops)
+    """Capture dimensions describe the call, independently of kernel slicing.
+
+    Full capture may pad the call's local rows to a bucket.  A declared matrix
+    epilogue whose vector work still describes the active rows is scaled to the
+    physical padded rows here, so the typed epilogue identity and its declared
+    work stay consistent.  Integer work for the active call is unchanged.
+    """
+    annotated = []
+    for op in ops:
+        metadata = {**dict(op.metadata),
+                    "graph_active_query_rows": active_rows,
+                    "graph_physical_query_rows": physical_rows}
+        epilogue = metadata.get("matrix_epilogue")
+        shape = tuple(op.local_shape)
+        if (isinstance(epilogue, dict) and len(shape) >= SHAPE_TRAILING_DIMS
+                and active_rows and physical_rows
+                and int(active_rows) != int(physical_rows)):
+            operations = float(epilogue.get("operations_per_output", 0.0)
+                               or 0.0)
+            rows, cols = int(shape[ROWS_DIM]), int(shape[COLS_DIM])
+            if operations > 0 and cols > 0:
+                active_work = operations * int(active_rows) * cols
+                physical_work = operations * int(physical_rows) * cols
+                if (math.isclose(float(op.vector_ops), active_work,
+                                 rel_tol=TOLERANCE, abs_tol=TOLERANCE)
+                        and not math.isclose(float(op.vector_ops), physical_work,
+                                             rel_tol=TOLERANCE,
+                                             abs_tol=TOLERANCE)):
+                    op = replace(op, vector_ops=physical_work)
+        annotated.append(replace(op, metadata=tuple(metadata.items())))
+    return tuple(annotated)
 
 
 class GraphPolicy:

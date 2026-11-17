@@ -24,7 +24,7 @@ IMPLEMENTATION_ID = "vllm_triton_unified_attention_2d_pointer"
 RECIPE_ID = "triton_unified_attention_2d"
 SELECTED_PATH = "2D pointer; no KV quantization, sinks, bias, window or prefix"
 SOURCE_PATH = (
-    "/Users/maoxx241/code/vllm-v0.25.1/vllm/v1/attention/ops/"
+    "repository://vllm-v0.25.1/vllm/v1/attention/ops/"
     "triton_unified_attention.py"
 )
 HELPERS_PATH = SOURCE_PATH.replace("triton_unified_attention", "triton_attention_helpers")

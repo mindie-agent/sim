@@ -1427,45 +1427,37 @@ def capture_image_identity(capture_path):
             "checks": checks, "reason": "capture_image_identity_not_declared"}
 
 
+_CAPTURE_ZERO = 0
+_CAPTURE_ONE = 1
+_CAPTURE_MATMUL_ARITY = 2
+_CAPTURE_QBMM_ARITY = 4
+_CAPTURE_NATIVE_ARITY = {
+    "MatMulV3": _CAPTURE_MATMUL_ARITY,
+    "QuantBatchMatmulV3": _CAPTURE_QBMM_ARITY,
+}
+
+
 def _capture_binary_contract(image_id, native_type):
+    """Record caller-supplied image provenance without prefix dispatch.
+
+    A short image prefix is not a program identity: the observation contract
+    keeps the declared digest and reports binary equivalence as undeclared
+    unless the caller supplies an exact identity.  No image-to-adapter table
+    or prefix expansion exists here.
+    """
     from mindie_sim.observations.resource_services import identity_digest
     digest = identity_digest(image_id or "")
-    if native_type == "MatMulV3":
-        established = digest.startswith("9e869e814846")
-        return {
-            "native_type": native_type,
-            "t12_adapter": "native_r31_matmul_bf16",
-            "declared_image_prefix": "9e869e814846",
-            "observed_image_id": digest or None,
-            "binary_match": established,
-            "status": ("same_image_r31_matmul"
-                       if established else "binary_source_not_matched"),
-        }
-    if native_type == "QuantBatchMatmulV3":
-        prefix = ("8d422528ac20" if digest.startswith("8d422528ac20")
-                  else "5461a1a8" if digest.startswith("5461a1a8") else None)
-        return {
-            "native_type": native_type,
-            "t12_adapter": "native_qbmm",
-            "declared_image_prefixes": ["8d422528ac20", "5461a1a8"],
-            "observed_image_id": digest or None,
-            "binary_match": prefix is not None,
-            "status": ("same_image_qbmm" if prefix is not None
-                       else "captured_r31_qbmm_has_no_t12_r31_adapter"
-                       if digest.startswith("9e869e814846")
-                       else "binary_source_not_matched"),
-        }
     return {
         "native_type": native_type,
-        "t12_adapter": None,
         "observed_image_id": digest or None,
         "binary_match": False,
-        "status": "no_t12_native_adapter_for_capture_family",
+        "status": ("caller_supplied_image_identity" if digest
+                   else "image_identity_not_declared"),
     }
 
 
 def parse_capture_abi(row):
-    """Parse raw shapes/dtypes/formats into the T03 ABI-signature order."""
+    """Parse raw shapes/dtypes/formats into the ABI-signature order."""
     def clean(value):
         return str(value or "").strip().strip("\"").strip("'").strip()
 
@@ -1500,6 +1492,166 @@ def parse_capture_abi(row):
         "output_formats": output_formats,
         "abi_signature": signature,
     }
+
+
+def _capture_geometry(native_type, inputs, outputs):
+    """Derive M/K/N from the captured ABI shapes, not from an image table."""
+    first, second = list(inputs[_CAPTURE_ZERO]), list(inputs[_CAPTURE_ONE])
+    if len(first) < _CAPTURE_MATMUL_ARITY or len(second) < _CAPTURE_MATMUL_ARITY:
+        raise ValueError("capture_abi_requires_rank_two_matmul_operands")
+    rows = _CAPTURE_ONE
+    for dim in first[:-_CAPTURE_ONE]:
+        rows *= int(dim)
+    inner = int(first[-_CAPTURE_ONE])
+    if native_type == "MatMulV3":
+        columns = int(second[-_CAPTURE_ONE])
+        declared_inner = int(second[_CAPTURE_ZERO])
+        if declared_inner != inner and columns == inner:
+            columns, inner = declared_inner, int(second[-_CAPTURE_ONE])
+    else:
+        declared_inner = int(second[_CAPTURE_ZERO])
+        columns = (int(second[-_CAPTURE_ONE]) if declared_inner == inner
+                   else declared_inner)
+    return {
+        "m": int(rows), "k": int(inner), "n": int(columns),
+        "macs": int(rows) * int(inner) * int(columns),
+    }
+
+
+def _capture_tensor(name, shape, dtype, layout=None):
+    return {
+        "name": name,
+        "shape": [int(item) for item in shape],
+        "dtype": _CAPTURE_DTYPE_ALIASES.get(dtype, str(dtype).lower()),
+        **({"layout": layout} if layout else {}),
+    }
+
+
+def _capture_bytes(shapes, dtypes):
+    total = _CAPTURE_ZERO
+    for shape, dtype in zip(shapes, dtypes):
+        width = _CAPTURE_DTYPE_BYTES.get(dtype)
+        if width is None or not shape:
+            continue
+        elements = _CAPTURE_ONE
+        for dim in shape:
+            elements *= int(dim)
+        total += elements * width
+    return total
+
+
+def bind_capture_native_plan(row, *, image_id=None):
+    """Bind one captured ABI row to the canonical declared call geometry.
+
+    Shapes and dtype widths come only from the captured row; the returned
+    declaration carries no measured duration, no image-prefix program dispatch
+    and no ``predict_abi`` pricing.  Missing or malformed geometry stays an
+    explicit unsupported result.
+    """
+    native_type = str(row.get("Type") or "")
+    abi = parse_capture_abi(row)
+    inputs = abi["input_shapes"]
+    outputs = abi["output_shapes"]
+    version = ({"image_id": str(image_id)} if image_id
+               else {"source": "captured_abi"})
+    binary = _capture_binary_contract(image_id, native_type)
+    result = {
+        "native_type": native_type,
+        "entry_adapter": None,
+        "binary": binary,
+        "version": version,
+        "status": "not_attempted",
+        "reasons": [],
+        "source_role_status": "not_identified_from_capture",
+        "dispatch_status": "not_established_from_capture",
+    }
+    arity = _CAPTURE_NATIVE_ARITY.get(native_type)
+    parsed = list(inputs[:arity]) if arity else []
+    if (arity is None or len(inputs) < arity or not outputs
+            or any(shape is None for shape in parsed + list(outputs[:_CAPTURE_ONE]))):
+        result["status"] = "unsupported"
+        result["reasons"] = ["no_canonical_geometry_for_capture_family"]
+        return result
+    try:
+        geometry = _capture_geometry(native_type, inputs, outputs)
+    except (TypeError, ValueError, IndexError) as error:
+        result["status"] = "adapter_error"
+        result["reasons"] = [type(error).__name__ + ":" + str(error)]
+        return result
+    input_bytes = _capture_bytes(inputs, abi["input_dtypes"])
+    output_bytes = _capture_bytes(outputs, abi["output_dtypes"])
+    issued = {
+        "macs": geometry["macs"],
+        "mte2_bytes": input_bytes,
+        "mte3_bytes": output_bytes,
+    }
+    tensors = [
+        _capture_tensor(f"input{index}", shape, abi["input_dtypes"][index]
+                        if index < len(abi["input_dtypes"]) else "")
+        for index, shape in enumerate(inputs)]
+    tensors.extend(
+        _capture_tensor(f"output{index}", shape,
+                        abi["output_dtypes"][index]
+                        if index < len(abi["output_dtypes"]) else "")
+        for index, shape in enumerate(outputs))
+    selected_call = {
+        "api": native_type,
+        "arity": arity,
+        "shapes": {"inputs": inputs, "outputs": outputs},
+        "dtypes": {"inputs": abi["input_dtypes"],
+                   "outputs": abi["output_dtypes"]},
+        "tensors": tensors,
+    }
+    owner_phases = {
+        "cube": {
+            "owner": "cube", "phase": "matmul", "resource": "cube",
+            "declared_logical_macs": geometry["macs"],
+            "declared_padded_macs": None,
+            "declared_bytes": None, "issued_macs": None, "issued_bytes": None,
+            "work_basis": "declared_ABI_geometry_not_measured_dispatch",
+        },
+        "mte2": {
+            "owner": "mte2", "phase": "load", "resource": "mte2",
+            "declared_logical_macs": None, "declared_padded_macs": None,
+            "declared_bytes": input_bytes, "issued_macs": None,
+            "issued_bytes": None,
+            "work_basis": "declared_ABI_geometry_not_measured_dispatch",
+        },
+        "mte3": {
+            "owner": "mte3", "phase": "store", "resource": "mte3",
+            "declared_logical_macs": None, "declared_padded_macs": None,
+            "declared_bytes": output_bytes, "issued_macs": None,
+            "issued_bytes": None,
+            "work_basis": "declared_ABI_geometry_not_measured_dispatch",
+        },
+    }
+    descriptor = {
+        "selected_call": selected_call,
+        "geometry": geometry,
+        "issued": issued,
+        "kernels": list(owner_phases.values()),
+    }
+    result.update({
+        "status": "predicted",
+        "record_status": "predicted",
+        "geometry": geometry,
+        "work": {
+            "work_unit": "macs",
+            "logical_work": geometry["macs"],
+            "logical_bytes": input_bytes + output_bytes,
+            "issued_work": None,
+            "issued_work_status": "requires_selected_dispatch_and_tiling",
+        },
+        "selected_call": selected_call,
+        "operator_plan": descriptor,
+        "issued": issued,
+        "kernels": list(owner_phases.values()),
+        "owner_phases": owner_phases,
+        "plan_basis": "declared_ABI_geometry_not_measured_dispatch",
+        "tail_status": "not_exposed_at_descriptor_boundary",
+    })
+    result["source_established"] = bool(binary.get("binary_match"))
+    return result
 
 
 def capture_measurement(row):
@@ -1728,148 +1880,6 @@ def logical_capture_work(row):
         "reason": "logical_work_not_derivable_from_capture_family",
         "issued_work": None,
     }
-
-
-_CAPTURE_IMAGE_PREFIXES = ("9e869e814846", "8d422528ac20", "5461a1a8")
-
-
-def capture_full_image_digest(image_id):
-    """Expand a retained short image prefix through the T12 declared identity."""
-    from mindie_sim.observations.resource_services import identity_digest
-    digest = identity_digest(image_id or "")
-    if digest.startswith("9e869e814846"):
-        from mindie_sim.prediction.piecewise.native_r31_matmul_bf16 import (
-            R31_IMAGE_SHA,
-        )
-        return R31_IMAGE_SHA
-    if digest.startswith("8d422528ac20"):
-        from mindie_sim.prediction.piecewise.native_qbmm import QBMM_SOURCES
-        return str(QBMM_SOURCES["r64"]["image_sha"])
-    if digest.startswith("5461a1a8"):
-        from mindie_sim.prediction.piecewise.native_qbmm import R35_IMAGE_SHA
-        return str(R35_IMAGE_SHA)
-    return digest
-
-
-def _capture_tensor(name, shape, dtype, layout=None):
-    return {
-        "name": name,
-        "shape": [int(item) for item in shape],
-        "dtype": _CAPTURE_DTYPE_ALIASES.get(dtype, str(dtype).lower()),
-        **({"layout": layout} if layout else {}),
-    }
-
-
-def bind_capture_native_plan(row, *, image_id=None):
-    """Bind one captured ABI row to the existing T12 native ABI program.
-
-    This is a metadata-only call into the T12 independent-ABI mapper.  It does
-    not initialize a device, allocate a tensor or read a target duration.  A
-    binary/source match is kept separate from the geometry contract and from
-    the dispatch/tiling evidence.
-    """
-    native_type = str(row.get("Type") or "")
-    abi = parse_capture_abi(row)
-    inputs = abi["input_shapes"]
-    outputs = abi["output_shapes"]
-    version = ({"image_id": capture_full_image_digest(image_id)}
-               if image_id else {"api": "cann-9.2.0"})
-    binary = _capture_binary_contract(image_id, native_type)
-    result = {
-        "native_type": native_type,
-        "entry_adapter": binary.get("t12_adapter"),
-        "binary": binary,
-        "version": version,
-        "status": "not_attempted",
-        "reasons": [],
-        "source_role_status": "not_identified_from_capture",
-        "dispatch_status": "not_established_from_capture",
-    }
-    try:
-        if native_type == "MatMulV3" and len(inputs) >= 2 and outputs:
-            from mindie_sim.prediction.piecewise import native_r31_matmul_bf16 as leaf
-            tensors = {
-                "x1": _capture_tensor("x1", inputs[0], abi["input_dtypes"][0]),
-                "x2": _capture_tensor("x2", inputs[1], abi["input_dtypes"][1]),
-                "output": _capture_tensor("output", outputs[0],
-                                          abi["output_dtypes"][0]),
-            }
-            record = leaf.predict_abi(tensors, version=version)
-        elif native_type == "QuantBatchMatmulV3" and len(inputs) >= 4 and outputs:
-            from mindie_sim.prediction.piecewise import native_qbmm as leaf
-            tensors = {
-                "x": _capture_tensor("x", inputs[0], abi["input_dtypes"][0]),
-                "weight": _capture_tensor("weight", inputs[1],
-                                          abi["input_dtypes"][1]),
-                "weight_scale": _capture_tensor(
-                    "weight_scale", inputs[2], abi["input_dtypes"][2]),
-                "pertoken_scale": _capture_tensor(
-                    "pertoken_scale", inputs[3], abi["input_dtypes"][3]),
-                "output": _capture_tensor("output", outputs[0],
-                                          abi["output_dtypes"][0]),
-            }
-            record = leaf.predict_abi(tensors, version=version)
-        else:
-            result["status"] = "unsupported"
-            result["reasons"] = ["no_t12_native_adapter_for_capture_family"]
-            return result
-    except Exception as error:  # adapter rejection is an evidence gap
-        result["status"] = "adapter_error"
-        result["reasons"] = [type(error).__name__ + ":" + str(error)]
-        return result
-    result["status"] = str(record.get("status") or "unknown")
-    result["reasons"] = list(record.get("reasons") or ())
-    result["record"] = record
-    result["source_established"] = (
-        bool(binary.get("binary_match"))
-        and result["status"] == "predicted")
-    if result["status"] != "predicted":
-        return result
-    try:
-        plan = leaf.operator_plan(record)
-        descriptor = (plan.metadata or {}).get("operator_plan") or {}
-        descriptor = json.loads(json.dumps(descriptor, default=str,
-                                           allow_nan=False))
-    except Exception as error:
-        result["status"] = "plan_unavailable"
-        result["reasons"] = [type(error).__name__ + ":" + str(error)]
-        return result
-    issued = dict(descriptor.get("issued") or {})
-    kernels = list(descriptor.get("kernels") or ())
-    owner_phases = {}
-    for item in kernels:
-        owner = str(item.get("owner") or "")
-        stage = str(item.get("stage") or "")
-        if owner and stage:
-            owner_phases[owner] = {
-                "owner": owner, "phase": stage,
-                "resource": ("cube" if owner == "cube" else owner),
-                "declared_logical_macs": (
-                    issued.get("macs") if owner == "cube" else None),
-                "declared_padded_macs": (
-                    issued.get("declared_padded_macs")
-                    if owner == "cube" else None),
-                "declared_bytes": (issued.get("mte2_bytes") if owner == "mte2"
-                                   else issued.get("mte3_bytes")
-                                   if owner == "mte3" else None),
-                "issued_macs": None,
-                "issued_bytes": None,
-                "work_basis": "T12_operator_plan_declaration_not_measured",
-            }
-    result.update({
-        "status": "predicted",
-        "record_status": "predicted",
-        "geometry": dict(record.get("geometry") or {}),
-        "work": dict(record.get("work") or {}),
-        "selected_call": dict(record.get("selected_call") or {}),
-        "operator_plan": descriptor,
-        "issued": issued,
-        "kernels": kernels,
-        "owner_phases": owner_phases,
-        "plan_basis": "T12_operator_plan_declaration_not_measured_dispatch",
-        "tail_status": "not_exposed_at_descriptor_boundary",
-    })
-    return result
 
 
 def join_capture_measurement_and_plan(measurement, plan):

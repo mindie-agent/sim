@@ -9,12 +9,12 @@
   ],
   "source_files": [
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
       "sha256": "f033f1d19ee5176116a83991c645902d4acd806cc6ab848156c087cbf190482a",
       "bytes": 17963
     },
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
       "sha256": "44218db471f47c870d8920fa0d81a941ea9eac56e6dcf233125d3156e67a62e7",
       "bytes": 21997
     }
@@ -80,7 +80,7 @@
         "sequences": 48
       },
       "input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
         "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408"
       },
       "source_git_revision_at_start": "9f2f3359aba71a6f28709258a26c67813511a86c",
@@ -133,7 +133,7 @@
         "sequences": 64
       },
       "input": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a3-qwen35-tp4-long-context-source.json",
         "sha256": "5ee9882d903122c1c111b533a3d5044e6aae426ead416fba4584a676cb196408"
       },
       "source_git_revision_at_start": "a72e432ad43833e791b8cac69dac6f398fc6d622",

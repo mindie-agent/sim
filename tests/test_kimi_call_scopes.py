@@ -93,7 +93,7 @@ def test_situ_graph_has_three_ops_no_down_and_no_input_quantizer():
     result = situ_reference(situ_case(), situ_descriptors(2875), QUANT)
     gate, activation, quantize = result["ops"]
     assert gate.recipe == "matrix_envelope"
-    assert type(result["recipes"].select(gate)).__name__ == "ResourceEnvelope"
+    assert type(result["recipes"].select(gate)).__name__ == "TiledMatmul"
     assert [op.op_id for op in result["ops"]] == ["situ.gate_up", "situ.activation", SITU_QUANT]
     assert SITU_DOWN not in [op.op_id for op in result["ops"]]
     assert not any(op.family == "down_projection" for op in result["ops"])

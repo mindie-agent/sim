@@ -117,7 +117,7 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
         "inter_pod_latency_us": 10.0,
     },
     "a5_pod": {
-        "ranks_per_node": 64, "dies_per_package": 2, "superpod_size": 8192,
+        "ranks_per_node": 64, "dies_per_package": 1, "superpod_size": 8192,
         "intra_node_bw_gbps": 800.0, "intra_node_bw_util": 0.85,
         "superpod_bw_gbps": 800.0, "inter_pod_bw_gbps": 100.0,
         "inter_node_bw_util": 0.80,
@@ -125,14 +125,14 @@ ASCEND_TOPOLOGY_PRESETS: dict[str, dict[str, object]] = {
         "inter_pod_latency_us": 10.0,
     },
     "a5_server": {
-        "ranks_per_node": 8, "dies_per_package": 2,
+        "ranks_per_node": 8, "dies_per_package": 1,
         "intra_bw_4p_gbps": 560.0, "intra_bw_8p_gbps": 640.0,
         "intra_node_bw_gbps": 640.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_gbps": 200.0, "inter_node_bw_util": 0.80,
         "intra_node_latency_us": 1.5, "inter_node_latency_us": 5.0,
     },
     "a5_pcie_16p": {
-        "ranks_per_node": 16, "dies_per_package": 2,
+        "ranks_per_node": 16, "dies_per_package": 1,
         "intra_bw_4p_gbps": 288.0, "intra_bw_8p_gbps": 128.0,
         "intra_node_bw_gbps": 116.0, "intra_node_bw_util": 0.85,
         "inter_node_bw_gbps": 50.0, "inter_node_bw_util": 0.80,
@@ -216,11 +216,16 @@ def _merge_channels(raw, profile):
         if unknown:
             field = sorted(unknown)[0]
             raise ModelingError(f"transfer_channel_field_unknown:{name}:{field}")
-        if "links" not in raw:
-            for field in ("channel_semantics", "semantics"):
-                if field in patch and patch[field] not in _LINK_SEMANTICS:
-                    raise ModelingError(
-                        f"transfer_channel_semantics_unsupported:{name}:{patch[field]}")
+        # A resized/materialized profile may carry a placeholder provenance
+        # value beside an explicitly resolved semantic.  Drop only the
+        # placeholder; a genuinely invalid standalone user value still fails
+        # the validation below.
+        for field in ("channel_semantics", "semantics"):
+            if patch.get(field) in {"unknown", "none"}:
+                patch.pop(field)
+            elif field in patch and patch[field] not in _LINK_SEMANTICS:
+                raise ModelingError(
+                    f"transfer_channel_semantics_unsupported:{name}:{patch[field]}")
         if set(patch) & set(_BW_FIELDS):
             explicit.add(name)
         declared[name] = set(patch)
@@ -230,7 +235,10 @@ def _merge_channels(raw, profile):
     # Per-port service includes independent full-duplex transmit and receive
     # ports. Optional switch-plane supply is a separate shared constraint.
     for declaration in channels.values():
-        declaration["semantics"] = "per_port"
+        profile_sem = (declaration.get("semantics")
+                       or declaration.get("channel_semantics"))
+        declaration["semantics"] = ("per_pair" if profile_sem == "per_pair"
+                                    else "per_port")
     for name, patch in patches:
         channels[name] = _merge_mapping(channels[name], patch)
         if "semantics" in patch or "channel_semantics" in patch:

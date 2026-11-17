@@ -8,7 +8,7 @@
 The activation producer is preserved at:
 
 ```text
-/Users/maoxx241/code/mindie-agent/.workstreams/composability/scripts/bench_activation.py
+repository://mindie-agent/.workstreams/composability/scripts/bench_activation.py
 SHA-256 ea76c64cd935e2d35c849f957f2179701d81d72c951a738a430260de4b251136
 ```
 

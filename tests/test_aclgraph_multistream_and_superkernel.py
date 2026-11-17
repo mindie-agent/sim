@@ -14,6 +14,8 @@ Read-only; no files or graph captures are created.
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
 pytest.importorskip("mindie_profiler")
@@ -34,7 +36,16 @@ from mindie_profiler.aclgraph_multistream import (
     diagnose_region,
     effective_launch_floor_us,
 )
-from mindie_sim.opflow.token_budget import envelope_size
+
+
+def _envelope_size(payload):
+    """Strict UTF-8/BPE upper bound for one serialized MCP payload."""
+    default = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    compact = json.dumps(payload, ensure_ascii=False, sort_keys=True,
+                         separators=(",", ":"))
+    bound = max(len(default.encode("utf-8")), len(compact.encode("utf-8")))
+    return {"utf8_bytes": bound, "token_estimate": bound}
+
 
 
 def _interval(
@@ -189,7 +200,7 @@ def test_mcp_envelopes_bounded_and_hostile() -> None:
     ]
     for name, arguments in calls:
         result = call_tool(name, arguments)
-        size = envelope_size(result)
+        size = _envelope_size(result)
         assert size["utf8_bytes"] <= 250
         assert size["token_estimate"] <= 250
         assert isinstance(result, dict)

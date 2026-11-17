@@ -43,7 +43,7 @@ from mindie_sim.backends.nvidia import (
     profiles as nvidia_profiles,
 )
 from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES,
     ARCHITECTURE_PRESET_CATALOG,
@@ -60,12 +60,22 @@ from mindie_sim.schema.serialization import apply_model_overrides
 from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES, simulation_config
 
 
+MX_GROUP_SIZE = 32
+MX_SCALE_PACK = 2
+NOMINAL_HOST_MEM_BPS = 64_000_000_000.0
+NOMINAL_HOST_VEC_OPS = 50_000_000_000.0
+NOMINAL_H2D_BPS = 32_000_000_000.0
+BYTES_PER_GB = 1_000_000_000.0
+NEXTN_DEFAULT_HEAD_DIM = 192
+PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
+
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
     "910b1": "Ascend910B1", "910b2": "Ascend910B2", "910b3": "Ascend910B3",
     "a3": "Ascend910_9392", "910c": "Ascend910_9392", "910_9392": "Ascend910_9392",
     "910_9382": "Ascend910_9382",
-    "a5": "Ascend910_9599", "950": "Ascend910_9599", "910_9599": "Ascend910_9599",
+    "a5": "Ascend950DT_9582", "950": "Ascend950DT_9582",
+    "a5-pod": "Ascend950DT_9581", "atlas-950-superpod": "Ascend950DT_9581",
     "h20": "NVIDIA_H20", "h800": "NVIDIA_H800", "h200": "NVIDIA_H200",
     "b300": "NVIDIA_B300",
     "800i-a2": "Ascend910B4", "800i-a3": "Ascend910_9392",
@@ -82,6 +92,8 @@ HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a3-8p": ("Ascend910_9392", "a3_8p"),
     "800i-a3-16p": ("Ascend910_9392", "a3_16p"),
     "a3-pod": ("Ascend910_9392", "a3_superpod"),
+    "a5-pod": ("Ascend950DT_9581", "a5_pod"),
+    "atlas-950-superpod": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-dt": ("Ascend950DT_9581", "a5_pod"),
     "a5-pod-pr": ("Ascend950PR_9579", "a5_pod"),
     "a5-server-dt": ("Ascend950DT_9581", "a5_server"),
@@ -114,6 +126,25 @@ DEFAULT_LOCAL_WIDTH = 1
 DEFAULT_REDUNDANT_EXPERTS = 0
 
 
+CAPTURE_BASE_KEYS = (1, 2, 4, 8, 16, 32, 64, 128, 256)
+CAPTURE_MIN_SEQUENCES = 1
+CAPTURE_MIN_STRIDE = 1
+CAPTURE_DEFAULT_MTP = 0
+
+
+def capture_keys(max_num_seqs: int,
+                 mtp_proposal_tokens: int = CAPTURE_DEFAULT_MTP) -> list[int]:
+    """Capture buckets up to ``max_num_seqs * (1 + mtp)`` including strides."""
+    sequences = max(CAPTURE_MIN_SEQUENCES, int(max_num_seqs))
+    stride = max(CAPTURE_MIN_STRIDE,
+                 CAPTURE_MIN_STRIDE + int(mtp_proposal_tokens))
+    keys = set(CAPTURE_BASE_KEYS)
+    keys.update(stride * step for step in range(CAPTURE_MIN_SEQUENCES,
+                                                sequences + CAPTURE_MIN_SEQUENCES))
+    keys.add(sequences * stride)
+    return sorted(keys)
+
+
 def _arch_key(sku: str) -> str:
     if sku.startswith(("Ascend950", "Ascend910_95")):
         return "a5"
@@ -128,6 +159,32 @@ def va_recommended_config(model: str, hardware: str = "a3") -> dict[str, Any]:
     return simulation_config(canonical, sku, _arch_key(sku))
 
 
+def _supports_sequence_parallel(model_spec, profile: Mapping[str, Any], *,
+                                 tp: int, ep: int, pp: int, pcp: int) -> bool:
+    """Structural sequence-parallel applicability, never a model-name whitelist."""
+    if profile.get("sp") is False:
+        return False
+    if not (pcp >= DEFAULT_PARALLEL and pp >= DEFAULT_PARALLEL
+            and tp > DEFAULT_PARALLEL and ep >= tp
+            and ep % tp == DEFAULT_ZERO):
+        return False
+    from mindie_sim.prediction.sequence_parallel import _validate_model
+    try:
+        _validate_model(model_spec, padding="right_to_tp")
+    except ModelingError:
+        return False
+    return True
+
+
+def _execution_policy(case: Mapping[str, Any]) -> dict[str, Any]:
+    """Resolved execution policy stored by ``compose_case`` on the declaration."""
+    runtime = case.get("runtime") if isinstance(case, Mapping) else None
+    if not isinstance(runtime, Mapping):
+        return {}
+    policy = dict(runtime.get("metadata") or {}).get("execution_policy")
+    return dict(policy) if isinstance(policy, Mapping) else {}
+
+
 def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
 ) -> dict[str, Any]:
@@ -139,7 +196,8 @@ def _resolve_va_lowerings(
         cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
     )
     lowerings: dict[str, Any] = {}
-    if any(p.attention == "kda" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
+    if (any(p.attention == "kda" for p in model_spec.layer_plans)
+            and p_cfg.pcp >= 1 and p_cfg.cp == 1):
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
         lowerings["kda"] = {
@@ -183,8 +241,19 @@ def _resolve_va_lowerings(
             and not normalization.get("norm_weight_offset", 0.0)
             and not any(p.qk_norm for p in model_spec.layer_plans)):
         lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
-        if "activation_quantization" in lowering_passes and model_spec.quant.activation_format == "int8":
-            lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+        if "activation_quantization" in lowering_passes and model_spec.quant is not None:
+            q = model_spec.quant
+            is_mx_fp8 = (
+                q.activation_format == "fp8_e4m3"
+                and q.activation_group_size == MX_GROUP_SIZE
+                and q.activation_scale_format == "fp8_e8m0"
+                and q.activation_scale_pack == MX_SCALE_PACK
+            )
+            if q.activation_format == "int8":
+                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+            elif is_mx_fp8:
+                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+                lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
     return lowerings
 
 
@@ -199,10 +268,7 @@ def _to_jsonable(value: Any) -> Any:
 
 
 def _ensure_registered_profiles() -> dict[str, Any]:
-    reg = ascend_profiles()
-    if "Ascend910_9599" not in reg and "Ascend950DT_9582" in reg:
-        reg["Ascend910_9599"] = deepcopy(reg["Ascend950DT_9582"])
-    return reg
+    return ascend_profiles()
 
 
 def resolve_hardware_sku(hardware: str) -> str:
@@ -390,7 +456,7 @@ def compose_case(
     pp: int = DEFAULT_PARALLEL,
     pcp: int = DEFAULT_PARALLEL,
     dcp: int = DEFAULT_PARALLEL,
-    sp: bool = False,
+    sp: bool | None = None,
     num_devices: int | None = None,
     ranks_per_node: int | None = None,
     quant: str | Mapping[str, Any] | None = None,
@@ -405,10 +471,10 @@ def compose_case(
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
     max_model_len: int | None = None,
-    block_size: int = DEFAULT_BLOCK_SIZE,
+    block_size: int | None = None,
     enable_chunked_prefill: bool = True,
     async_scheduling: bool = False,
-    graph_capture_mode: str = "none",
+    graph_capture_mode: str | None = None,
     mtp_proposal_tokens: int = DEFAULT_MTP_TOKENS,
     mtp_acceptance_length: float = DEFAULT_MTP_ACCEPT,
     ttft_slo_ms: float = DEFAULT_TTFT_MS,
@@ -428,10 +494,15 @@ def compose_case(
     inter_pod_bw_gbps: float | None = None,
     intra_bw_4p_gbps: float | None = None,
     intra_bw_8p_gbps: float | None = None,
-    va_recommended: bool = False,
+    va_recommended: bool | None = None,
+    raw_eager: bool = False,
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
     *,
+    multistream_overlap_shared_expert: bool | None = None,
+    engram_cpu_offload: bool | None = None,
+    enable_dbo: bool = False,
+    moe_comm_mode: str | None = None,
     o_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
@@ -451,6 +522,10 @@ def compose_case(
     hbm_efficiency: Any = None,
     mte2_ceiling_bytes_per_s: float | None = None,
     mte2_efficiency: Any = None,
+    runtime_stack: str | Path | Mapping[str, Any] = "vllm-ascend",
+    feature_track: str = "merged",
+    optimizations: Sequence[str] = (),
+    exclude_optimizations: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -463,7 +538,7 @@ def compose_case(
         raise ModelingError("invalid_workload_dimensions")
     if int(prefix_tokens) < 0 or int(prefix_tokens) > int(prompt_tokens):
         raise ModelingError("invalid_prefix_tokens")
-    if graph_capture_mode not in {"none", "full", "piecewise"}:
+    if graph_capture_mode is not None and graph_capture_mode not in {"none", "full", "piecewise"}:
         raise ModelingError(f"invalid_graph_capture_mode:{graph_capture_mode}")
     if int(mtp_proposal_tokens) < 0:
         raise ModelingError(f"invalid_mtp_proposal_tokens:{mtp_proposal_tokens}")
@@ -564,20 +639,31 @@ def compose_case(
     if preset:
         machine = {**machine, "topology_preset": preset}
 
+    # ``va_recommended=None`` is the production default on Ascend: documented
+    # vLLM-Ascend profiles are a *default*, never an override of an explicit
+    # caller choice.  ``raw_eager`` disables every optional fused lowering.
+    production = (backend == "ascend" and va_recommended is not False
+                  and not raw_eager)
+    if raw_eager and va_recommended:
+        raise ModelingError("raw_eager_conflicts_with_explicit_fusion")
+    ascend_backend = backend == "ascend"
+    explicit_graph_capture = graph_capture_mode is not None
+    explicit_sp = sp is not None
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     va_profile: dict[str, Any] | None = None
-    if va_recommended and backend == "ascend":
+    if production:
         model_id = str(model) if isinstance(model, str) else str(model_spec.name)
         va_profile = va_recommended_config(model_id, sku)
         va_profile["quantization_action"] = (
             "explicit_quant_preserved" if quant is not None else
             "documented_alternative_applied" if va_profile["quant"] is not None else
             "no_profile_override")
+        # ``simulation_config`` no longer fabricates a full capture policy for
+        # undocumented models; only a profile that declares one is forwarded.
+        va_profile.setdefault("graph_capture_mode", None)
         if quant is None:
             quant = va_profile["quant"]
-        if graph_capture_mode == "none":
-            graph_capture_mode = str(va_profile.get("graph_capture_mode", "full"))
     model_spec = _apply_quant_override(model_spec, quant, machine)
     model_spec = _apply_structural_overrides(
         model_spec,
@@ -585,46 +671,103 @@ def compose_case(
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
     )
-    if (va_profile is not None and not sp and va_profile.get("sp", True)
-            and pcp >= 1 and pp >= 1 and tp > 1 and ep >= tp and (ep % tp == 0)):
-        from mindie_sim.prediction.sequence_parallel import _validate_model
-        try:
-            _validate_model(model_spec, padding="right_to_tp")
-            sp = True
-        except ModelingError:
-            pass
+    # ``block_size=None`` resolves the documented page size and, for
+    # ``paired_sfa`` caches, the recurrent-state minimum; an explicit caller
+    # value is preserved verbatim so an invalid page still fails honestly.
+    if block_size is not None:
+        resolved_block_size = int(block_size)
+    else:
+        resolved_block_size = int(
+            (va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
+        if dict(model_spec.metadata).get("cache_allocator") == "paired_sfa":
+            from mindie_sim.catalog.paired_sfa import minimum_block_size
+            resolved_block_size = max(
+                resolved_block_size,
+                minimum_block_size(model_spec, tp=tp,
+                                  proposals=int(mtp_proposal_tokens)))
+    # These are caller opt-ins: the profile exposes the documented capability
+    # as provenance, but enabling an overlap/offload path changes the pinned
+    # physical decomposition and must be an explicit composition choice.
+    resolved_mso = bool(multistream_overlap_shared_expert)
+    resolved_engram_offload = bool(engram_cpu_offload)
+    sp_source = (
+        "raw_eager" if raw_eager else
+        "explicit" if sp is not None and va_recommended is not False else
+        "production" if (production and va_profile is not None and sp is None) else
+        "explicit" if sp is not None else "default")
+    if raw_eager:
+        sp = False
+    elif sp is None:
+        sp = bool(production and va_profile is not None
+                  and _supports_sequence_parallel(model_spec, va_profile,
+                                                  tp=tp, ep=ep, pp=pp, pcp=pcp))
+    documented_capture = (va_profile or {}).get("graph_capture_mode")
+    capture_source = (
+        "raw_eager" if raw_eager else
+        "explicit" if graph_capture_mode is not None
+        else "profile" if (production and documented_capture in
+                           {"full", "piecewise", "none"})
+        else "none")
+    if raw_eager:
+        graph_capture_mode = "none"
+    elif graph_capture_mode is None:
+        documented = (va_profile or {}).get("graph_capture_mode")
+        graph_capture_mode = (str(documented)
+                              if documented in {"full", "piecewise", "none"} else "none")
+    execution_policy = {
+        "backend": backend,
+        "production": bool(production),
+        "va_recommended": va_recommended,
+        "raw_eager": bool(raw_eager),
+        "automatic_optional_fusions": bool(not raw_eager and va_recommended is not False),
+        "sp": bool(sp), "sp_source": sp_source,
+        "graph_capture_mode": str(graph_capture_mode),
+        "capture_source": capture_source,
+        "profile": (str((va_profile or {}).get("model", "")) if va_profile else ""),
+        "priority": ("raw_eager > explicit caller > documented profile > "
+                     "structural fusion defaults"),
+    }
 
-    if int(mtp_proposal_tokens) > 0:
-        has_mtp = getattr(model_spec.auxiliary, "mtp", None) is not None
-        has_dspark = getattr(model_spec.auxiliary, "dspark", None) is not None
-        if (not (has_mtp or has_dspark) and model_spec.layer_plans
-                and model_spec.layer_plans[-1].attention in {"mla", "gqa"}):
-            last = model_spec.layer_plans[-1]
-            synth_mtp = DraftSpec(
-                kind="mtp", layers=1, hidden_size=model_spec.hidden_size,
-                intermediate_size=last.intermediate_size or last.moe_intermediate_size,
-                num_heads=last.num_heads, num_kv_heads=last.num_kv_heads,
-                head_dim=last.head_dim,
-                q_width=last.num_heads * last.head_dim,
-                kv_width=last.num_kv_heads * last.head_dim,
-                attention_kind=last.attention,
-                q_lora_rank=last.q_lora_rank, kv_lora_rank=last.kv_lora_rank,
-                qk_nope_head_dim=last.qk_nope_head_dim,
-                qk_rope_head_dim=last.qk_rope_head_dim, v_head_dim=last.v_head_dim,
-                o_lora_rank=last.o_lora_rank, o_groups=last.o_groups,
-                num_experts=last.num_experts, top_k=last.top_k,
-                expert_intermediate_size=last.moe_intermediate_size,
-                num_shared_experts=last.num_shared_experts,
-                target_layer_ids=(last.index,), block_size=1,
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO and model_spec.auxiliary is None:
+        from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+        facts = dict(model_spec.catalog_facts)
+        nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
+        moe_ref = next((p for p in model_spec.layer_plans if p.ffn == "moe"), None)
+        if (nextn <= 0 and moe_ref is not None and moe_ref.attention == "mla"
+                and moe_ref.q_lora_rank > 0):
+            nextn = 1
+        if nextn > 0 and moe_ref is not None and moe_ref.attention == "mla":
+            qk_dim = moe_ref.qk_nope_head_dim + moe_ref.qk_rope_head_dim
+            draft = DraftSpec(
+                kind="mtp", layers=nextn, hidden_size=model_spec.hidden_size,
+                intermediate_size=moe_ref.moe_intermediate_size,
+                num_heads=moe_ref.num_heads, num_kv_heads=DEFAULT_PARALLEL,
+                head_dim=qk_dim or NEXTN_DEFAULT_HEAD_DIM,
+                q_width=moe_ref.num_heads * qk_dim, kv_width=qk_dim,
+                attention_kind="mla", kv_cache_elements=moe_ref.kv_cache_elements,
+                weight_category="mtp", q_lora_rank=moe_ref.q_lora_rank,
+                kv_lora_rank=moe_ref.kv_lora_rank,
+                qk_nope_head_dim=moe_ref.qk_nope_head_dim,
+                qk_rope_head_dim=moe_ref.qk_rope_head_dim,
+                v_head_dim=moe_ref.v_head_dim, num_experts=moe_ref.num_experts,
+                top_k=moe_ref.top_k,
+                expert_intermediate_size=moe_ref.moe_intermediate_size,
+                num_shared_experts=moe_ref.num_shared_experts,
                 target_shared_embedding=True, target_shared_lm_head=True,
-                mla_variant=last.mla_variant,
-                kv_cache_elements=last.kv_cache_elements,
-                input_mode="dual_normalized", base_logits=True,
-                pp_capability=(1, 2, 4, 8, 16),
+                base_logits=True, pp_capability=PP_CAP_DEFAULT,
                 vocab_size=model_spec.vocab_size,
+                source=merge_source({"kind": "standard_deepseek_nextn_mtp"}),
             )
-            model_spec = replace(model_spec, auxiliary=AuxiliarySpec(mtp=synth_mtp))
-            has_mtp = True
+            model_spec = declare_native_auxiliary_plans(
+                replace(model_spec, auxiliary=AuxiliarySpec(mtp=draft)))
+
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
+        # Auxiliary structure is declared natively by the model adapter at load
+        # time.  No last-layer synthesis: an undeclared draft structure is an
+        # explicit, actionable error instead of a fabricated one-layer module.
+        aux = model_spec.auxiliary
+        has_mtp = getattr(aux, "mtp", None) is not None
+        has_dspark = getattr(aux, "dspark", None) is not None
         if not (has_mtp or has_dspark):
             raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
         if not (1.0 <= float(mtp_acceptance_length) <= float(1 + int(mtp_proposal_tokens))):
@@ -666,8 +809,25 @@ def compose_case(
     runtime_meta: dict[str, Any] = {
         "sp": bool(sp),
         "moe_dispatch_quantization": "routed_expert",
+        **({"raw_eager": True} if raw_eager else {}),
+        "execution_policy": dict(execution_policy),
     }
-    if int(mtp_proposal_tokens) > 0:
+    if resolved_engram_offload:
+        h2d_ch = dict((machine.get("transfer_channels") or {}).get("h2d") or {})
+        h2d_bps = (float(h2d_ch.get("effective_uni_bw_gbps") or 0.0)
+                   * BYTES_PER_GB)
+        dev = dict(machine.get("device") or {})
+        rates = dict(dev.get("rates") or {})
+        rates.setdefault("host_memory", NOMINAL_HOST_MEM_BPS)
+        rates.setdefault("host_vector", NOMINAL_HOST_VEC_OPS)
+        rates.setdefault("h2d", h2d_bps if h2d_bps > 0.0 else NOMINAL_H2D_BPS)
+        dev["rates"] = rates
+        machine = {**machine, "device": dev}
+    if resolved_mso:
+        runtime_meta["multistream_overlap_shared_expert"] = True
+    if moe_comm_mode is not None:
+        runtime_meta["moe_comm_mode"] = str(moe_comm_mode)
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
     if enable_shared_expert_dp:
@@ -694,7 +854,7 @@ def compose_case(
         "max_num_seqs": resolved_max_seqs,
         "max_num_batched_tokens": resolved_max_batched,
         "max_model_len": resolved_max_model_len,
-        "kv_block_size": int(block_size),
+        "kv_block_size": int(resolved_block_size),
         "enable_chunked_prefill": bool(enable_chunked_prefill),
         "async_scheduling": bool(async_scheduling),
         "graph_mode": str(graph_capture_mode),
@@ -702,9 +862,15 @@ def compose_case(
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "metadata": runtime_meta,
     }
+    if resolved_mso:
+        runtime_dict["multistream_overlap_shared_expert"] = True
+    if resolved_engram_offload:
+        runtime_dict["engram_cpu_offload"] = True
+    if enable_dbo:
+        runtime_dict["enable_dbo"] = True
     if graph_capture_mode == "full":
-        max_cap = max(1, resolved_max_seqs * max(1, 1 + int(mtp_proposal_tokens)))
-        runtime_dict["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max_cap})
+        runtime_dict["graph_capture_keys"] = capture_keys(
+            resolved_max_seqs, mtp_proposal_tokens)
     elif graph_capture_mode == "piecewise":
         runtime_dict["piecewise_capture_keys"] = sorted(
             {1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, resolved_max_batched}
@@ -746,17 +912,61 @@ def compose_case(
         runtime_meta["va_env"] = dict(va_profile["env"])
         runtime_meta["va_recommended_mtp_proposal_tokens"] = int(va_profile["mtp_proposal_tokens"])
         passes: tuple[str, ...] = ()
-        if str(model_spec.quant.activation_format) != str(model_spec.activation_dtype):
+        if (model_spec.quant is not None
+                and str(model_spec.quant.activation_format)
+                != str(model_spec.activation_dtype)):
             passes = ("activation_quantization", "norm_quant")
             runtime_dict["lowering_passes"] = list(passes)
         lowerings = _resolve_va_lowerings(
             model_spec, runtime_dict["parallel"], sku, passes,
         )
+        if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
+            passes = (*passes, "residual_norm")
+            runtime_dict["lowering_passes"] = list(passes)
         if lowerings:
             kernels_dict = dict(runtime_dict.get("kernels", {}))
             existing_low = dict(kernels_dict.get("lowerings", {}))
             kernels_dict["lowerings"] = {**lowerings, **existing_low}
             runtime_dict["kernels"] = kernels_dict
+
+    # Two-layer feature tracks: resolve the selected runtime stack's merged /
+    # unmerged-PR / architectural-ideal mechanism set on top of the documented
+    # profile base.  ``va_recommended=False`` with the default ``merged`` track
+    # keeps zero automatic stack fusions, preserving the caller's bare case.
+    if ascend_backend and not raw_eager:
+        from mindie_sim.feature_mechanisms import MechanismContext
+        from mindie_sim.stack_tracks import (
+            apply_resolved_mechanisms, normalize_feature_track,
+            resolve_runtime_stack, resolve_stack_track,
+        )
+
+        canonical_track = normalize_feature_track(feature_track)
+        if (va_recommended is not False or bool(optimizations)
+                or bool(exclude_optimizations) or canonical_track != "merged"):
+            stack_profile = resolve_runtime_stack(runtime_stack)
+            stack_model_key = str(
+                (va_profile or {}).get("canonical_model") or model_spec.name)
+            caller_explicit = frozenset(
+                name for name, explicit in (
+                    ("graph_capture_mode", explicit_graph_capture),
+                    ("sp", explicit_sp),
+                    ("multistream_overlap_shared_expert",
+                     multistream_overlap_shared_expert is not None),
+                    ("moe_comm_mode", moe_comm_mode is not None),
+                    ("recover_ssm", recover_ssm is True),
+                ) if explicit)
+            mechanism_ctx = MechanismContext(
+                model=model_spec, sku=sku, arch=_arch_key(sku),
+                parallel=dict(runtime_dict["parallel"]),
+                caller_explicit=caller_explicit, options={})
+            resolved_track = resolve_stack_track(
+                stack_profile, track=canonical_track, model_key=stack_model_key,
+                ctx=mechanism_ctx, optimizations=optimizations,
+                exclude_optimizations=exclude_optimizations)
+            apply_resolved_mechanisms(runtime_dict, resolved_track, mechanism_ctx)
+            runtime_meta = dict(runtime_dict.get("metadata") or {})
+            runtime_meta["feature_track_report"] = resolved_track
+            runtime_dict["metadata"] = runtime_meta
 
     case_dict: dict[str, Any] = {
         "model": model_dict,
@@ -781,9 +991,9 @@ def compose_case(
             raise ModelingError(f"hardware_derivation_conflict:{key}")
         derivation[key] = value
     if derivation:
-        from mindie_sim.issue34_cli import _derived_machine
+        from mindie_sim.hardware_derivation import derived_machine
         parsed = parse_case(case_dict)
-        derived = _derived_machine(parsed.machine, derivation)
+        derived = derived_machine(parsed.machine, derivation)
         case_dict["machine"] = _to_jsonable(derived)
         parse_case(case_dict)
     return case_dict
@@ -1348,7 +1558,8 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         rt["graph_mode"] = "full"
         rt["graph_capture_mode"] = "full"
         max_seqs = int(rt.get("max_num_seqs", 16))
-        rt["graph_capture_keys"] = sorted({1, 2, 4, 8, 16, 32, 64, 128, 256, max(1, max_seqs)})
+        rt["graph_capture_keys"] = capture_keys(
+            max_seqs, int(rt.get("mtp_proposal_tokens", DEFAULT_ZERO) or DEFAULT_ZERO))
     meta = dict(rt.get("metadata", {}))
     meta["va_recommended"] = True
     meta["va_profile"] = deepcopy(va_profile)
@@ -1370,6 +1581,9 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         passes = ("activation_quantization", "norm_quant")
         rt["lowering_passes"] = list(passes)
     lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes)
+    if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
+        passes = (*passes, "residual_norm")
+        rt["lowering_passes"] = list(passes)
     if lowerings:
         existing_low = dict(kernels.get("lowerings", {}))
         kernels["lowerings"] = {**lowerings, **existing_low}

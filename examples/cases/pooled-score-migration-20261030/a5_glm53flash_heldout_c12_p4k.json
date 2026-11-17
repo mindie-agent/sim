@@ -1924,7 +1924,7 @@
       "caller_regime": "captured_full_decode",
       "pooled_score_coordinate_migration": {
         "original_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c12_p4k.json",
+          "path": "repository://profiler/examples/structure/cases/decode-a5_glm53flash_heldout_c12_p4k.json",
           "sha256": "e67ed9ecf0239bcef319b3eb6c3e5c3b00e8ff7985fc10249ff3a7ed803813d2",
           "size_bytes": 71970
         },

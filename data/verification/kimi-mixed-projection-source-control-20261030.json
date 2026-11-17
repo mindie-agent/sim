@@ -4,29 +4,29 @@
   "timing_acceptance": "not_established; no captured duration is fitted or scored",
   "source_binary_identity": "unverified; retained source revision and ABI are explicit",
   "producer": {
-    "path": "/Users/maoxx241/code/sim-service-response-domain-next/data/verification/kimi-mixed-projection-source-control-20261030.producer.py",
+    "path": "repository://sim-service-response-domain-next/data/verification/kimi-mixed-projection-source-control-20261030.producer.py",
     "sha256": "7f18317c3adfbe0c7d9eb6129c261c55224dd7a15e809918e1cb630e181e422d",
     "size_bytes": 8850
   },
   "runtime_git_head": "260927bed300cc32747391762c50ec06b3371cc9",
   "runtime_modules": [
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/family_kda_projection.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/family_kda_projection.py",
       "sha256": "7e79796a1ff463ac24af4009950a488cf36df523f62b60b07b7baf6c162ef0aa",
       "size_bytes": 7500
     },
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/recurrent.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/recurrent.py",
       "sha256": "ab3d17bba80103363f86582df33aa34da64aef7758daefd39bbc4ae91b592b1f",
       "size_bytes": 27144
     },
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/prediction/transforms.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/prediction/transforms.py",
       "sha256": "cc16248b3dc18510100452afd9d6bffc29f4149f31efc09300ee55aceadc108f",
       "size_bytes": 12549
     },
     {
-      "path": "/Users/maoxx241/code/sim-service-response-domain-next/mindie_sim/catalog/weights.py",
+      "path": "repository://sim-service-response-domain-next/mindie_sim/catalog/weights.py",
       "sha256": "ecc791287ede7a933eda42c77477ff0fb9e73826395ceb7fbef8db86081b73f0",
       "size_bytes": 31243
     }
@@ -3213,7 +3213,7 @@
       "tp": 8,
       "batch_slots": 2,
       "case": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp8.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp8.json",
         "sha256": "5308f086749470d2f27c95ebad1a0df5bc9930cfbe1134e144e51a94e5876d84",
         "size_bytes": 14501
       },
@@ -3997,7 +3997,7 @@
       "tp": 16,
       "batch_slots": 1,
       "case": {
-        "path": "/Users/maoxx241/code/sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp16.json",
+        "path": "repository://sim-service-response-domain-next/examples/cases/kimi-mixed-projection-20261030/a3-kimi4-tp16.json",
         "sha256": "dd080041df77108b993df61b08c4cd3c47e2f93071b2db60ca2be6125c56b3e8",
         "size_bytes": 11818
       },

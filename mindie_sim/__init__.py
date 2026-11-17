@@ -5,6 +5,7 @@
 [Timeouts & Locks] Imports perform no hardware access or file writes.
 [Side-Effect Policy] Pure declarations.
 """
+from . import observations
 from .schema.case import Case, Software
 from .schema.hardware import Hardware, Device, Link
 from .schema.model import ModelSpec, LayerPlan, RequestSpec, WorkloadSpec, SloSpec
@@ -14,10 +15,23 @@ from .prediction.api import predict
 from .prediction.disaggregated import predict_pd
 from .prediction.graph_analysis import graph_costs
 from .prediction.operator_analysis import operator_costs, target_graphs, target_operators
+from .prediction.structure import parse_case
 from .study import study
 from .prediction.call import call_costs
 from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
+from .feature_mechanisms import (
+    OptimizationMechanism,
+    list_optimization_mechanisms,
+    register_optimization_mechanism,
+)
+from .feature_waterfall import compare_feature_tracks
+from .stack_tracks import (
+    RuntimeStackProfile,
+    StackMechanismBinding,
+    load_runtime_stack_manifest,
+    register_runtime_stack,
+)
 from .hardware_derivation import derive_hardware_sku
 from .hardware_efficiency import EfficiencyCurve
 from .custom_hardware import (
@@ -32,13 +46,8 @@ from .custom_hardware import (
     resolve_custom_hardware_sku,
     unregister_custom_hardware_sku,
 )
-from .advise import advise_case, load_case_from_profile
-from .launch_bindings import parse_launch
-from .feature_analysis import compare_launch
 from .model_catalog import customize_model_spec
-from .prediction.afd import effective_pool_link, predict_afd, solve_afd_pareto
 from .prediction.deepep import (
-    analyze_deepep_collectives,
     analyze_shared_expert_overlap,
     deepep_group_volume,
     deepep_intra_volume,
@@ -50,30 +59,20 @@ from .prediction.efficiency import (
     evaluate_target_efficiency,
     fit_efficiency_targets,
     scale_case_hardware,
-    solve_hardware_sla_throughput,
+    solve_sla_sizing,
 )
-from .prediction.offload import (
-    OffloadPolicy,
-    analyze_kv_cache_offload,
-    prepare_expert_offload,
-)
-from .prediction.skew_analysis import (
-    analyze_chunked_prefill_decode_interference,
-    analyze_moe_routing_imbalance,
-    analyze_multi_dp_barrier_skew,
-)
-from .diff_trace import attribute_diff, effective_operator_rows
-from .prediction.topology_tiers import (
-    EP_TIER_PRESETS,
-    analyze_ep_mc2_communication,
-    compute_ep_effective_bandwidth,
-    compute_speculative_accept_step,
-)
+from .prediction.offload import OffloadPolicy
+from .prediction.speculation import compute_speculative_accept_step
 from .sweep import (
     compute_pareto_frontier,
     enumerate_parallel_candidates,
+    reconstruct_sweep_summary,
+    solve_hardware_sla_throughput,
     sweep_pd_disaggregation_ratios,
+    sweep_topologies,
+    sweep_topologies_iter,
     sweep_topology_grid,
+    sweep_topology_grid_iter,
 )
 from .public import (
     CORE_PROVIDER,
@@ -97,43 +96,41 @@ from .public import (
 )
 
 __version__ = "0.9.17"
-__all__ = ["predict", "predict_pd", "attribute_diff", "effective_operator_rows", "graph_costs", "operator_costs", "target_graphs", "target_operators", "study",
-           "call_costs", "build_call",
-           "compose_case", "resolve_hardware_sku", "derive_hardware_sku",
-           "EfficiencyCurve", "customize_model_spec",
-           "HARDWARE_ARCHETYPE_TEMPLATES", "export_hardware_sku_template",
-           "build_custom_hardware_machine", "register_custom_hardware_sku",
-           "unregister_custom_hardware_sku", "clear_custom_hardware_skus",
-           "list_custom_hardware_skus", "load_custom_hardware_skus_from_file",
-           "resolve_custom_hardware_sku", "compose_custom_case",
-           "derive_hardware_sku",
-           "advise_case", "load_case_from_profile",
-           "analyze_network_efficiency", "analyze_operator_row", "evaluate_target_efficiency",
-           "fit_efficiency_targets", "scale_case_hardware", "solve_hardware_sla_throughput",
-           "analyze_multi_dp_barrier_skew", "analyze_moe_routing_imbalance",
-           "analyze_chunked_prefill_decode_interference",
-           "EP_TIER_PRESETS", "compute_speculative_accept_step",
-           "compute_ep_effective_bandwidth", "analyze_ep_mc2_communication",
-           "deepep_group_volume", "deepep_intra_volume", "standard_alltoall_volume",
-           "analyze_deepep_collectives", "analyze_shared_expert_overlap",
-           "effective_pool_link", "predict_afd", "solve_afd_pareto",
-           "OffloadPolicy", "prepare_expert_offload", "analyze_kv_cache_offload",
-           "enumerate_parallel_candidates", "sweep_topology_grid", "sweep_pd_disaggregation_ratios",
-           "compute_pareto_frontier",
-           "CORE_PROVIDER", "ENTRY_POINT_GROUP", "INTERFACE_VERSION",
-           "ExecutionEnvironment", "USER_PROFILE_SCHEMA",
-           "Extension", "ExtensionContext", "ExtensionError", "Provider", "UserProfile",
-           "load_extensions", "load_user_profile",
-           "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
-           "simulate_graph", "simulate_model", "simulate_service",
-           "Case", "Software", "Hardware", "Device", "Link",
-           "ModelSpec", "LayerPlan", "RequestSpec", "WorkloadSpec", "SloSpec",
-           "ParallelSpec", "ModelingError", "parse_launch", "compare_launch", "opflow"]
-
-
-def __getattr__(name: str):
-    if name == "opflow":
-        import importlib
-
-        return importlib.import_module(".opflow", __name__)
-    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+__all__ = [
+    "observations",
+    "predict", "predict_pd", "graph_costs", "operator_costs",
+    "target_graphs", "target_operators", "parse_case", "study",
+    "call_costs", "build_call",
+    "compose_case", "resolve_hardware_sku", "derive_hardware_sku",
+    "EfficiencyCurve", "customize_model_spec",
+    "HARDWARE_ARCHETYPE_TEMPLATES", "export_hardware_sku_template",
+    "build_custom_hardware_machine", "register_custom_hardware_sku",
+    "unregister_custom_hardware_sku", "clear_custom_hardware_skus",
+    "list_custom_hardware_skus", "load_custom_hardware_skus_from_file",
+    "resolve_custom_hardware_sku", "compose_custom_case",
+    "analyze_network_efficiency", "analyze_operator_row",
+    "evaluate_target_efficiency", "fit_efficiency_targets",
+    "scale_case_hardware", "solve_sla_sizing",
+    "deepep_group_volume", "deepep_intra_volume", "standard_alltoall_volume",
+    "analyze_shared_expert_overlap", "OffloadPolicy",
+    "compute_speculative_accept_step",
+    "enumerate_parallel_candidates", "sweep_topologies",
+    "sweep_topology_grid", "sweep_topologies_iter",
+    "sweep_topology_grid_iter", "reconstruct_sweep_summary",
+    "solve_hardware_sla_throughput",
+    "sweep_pd_disaggregation_ratios", "compute_pareto_frontier",
+    "CORE_PROVIDER", "ENTRY_POINT_GROUP", "INTERFACE_VERSION",
+    "ExecutionEnvironment", "USER_PROFILE_SCHEMA",
+    "Extension", "ExtensionContext", "ExtensionError", "Provider", "UserProfile",
+    "load_extensions", "load_user_profile",
+    "simulate_operator", "simulate_native_call", "simulate_aclnn_call",
+    "simulate_graph", "simulate_model", "simulate_service",
+    "Case", "Software", "Hardware", "Device", "Link",
+    "ModelSpec", "LayerPlan", "RequestSpec", "WorkloadSpec", "SloSpec",
+    "ParallelSpec", "ModelingError",
+    "OptimizationMechanism", "register_optimization_mechanism",
+    "list_optimization_mechanisms",
+    "RuntimeStackProfile", "StackMechanismBinding",
+    "register_runtime_stack", "load_runtime_stack_manifest",
+    "compare_feature_tracks",
+]

@@ -141,7 +141,7 @@ declared capability/weight dtype, and public `graph_costs`/`predict` execution.
 `examples/source-families/moe-routing-control.json` is a synthetic CPU control.
 
 ```sh
-/Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python -m pytest \
+repository://sim-rewrite-20261027/.venv/bin/python -m pytest \
   tests/test_moe_family_selection.py tests/operators/test_moe_align.py \
   tests/operators/test_moe_combine.py tests/test_grouped_family_selection.py -q
 ```

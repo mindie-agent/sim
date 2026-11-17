@@ -15,6 +15,30 @@ from mindie_sim.schema.runtime_features import (
 )
 from typing import Any, Mapping
 
+def local_query_heads(num_heads: int, tp: int) -> int:
+    """Per-rank query heads; H must be divisible by TP (no padding)."""
+    heads, width = int(num_heads), max(1, int(tp))
+    if heads <= 0 or heads % width != 0:
+        raise ModelingError(f"attention_query_heads_not_divisible:{heads}%{width}")
+    return heads // width
+
+
+def local_kv_heads(num_kv_heads: int, tp: int) -> int:
+    """Per-rank KV heads with explicit replication when K < TP."""
+    heads, width = int(num_kv_heads), max(1, int(tp))
+    if heads <= 0:
+        raise ModelingError(f"attention_kv_heads_invalid:{heads}")
+    if heads >= width:
+        if heads % width != 0:
+            raise ModelingError(f"attention_kv_heads_not_divisible:{heads}%{width}")
+        return heads // width
+    if width % heads != 0:
+        raise ModelingError(
+            f"attention_kv_head_replication_indivisible:{width}%{heads}")
+    return 1
+
+
+
 _CP_PLAN_ALIASES = {
     "auto": "auto",
     "": "auto",
@@ -500,8 +524,10 @@ class ParallelSpec:
         if self.cp > 1:
             if self.cp > self.tp or self.tp % self.cp != 0:
                 raise ModelingError(f"dcp_subdivides_tp:{self.cp}!|{self.tp}")
-        if self.ep > 1 and model.num_experts and model.num_experts % self.ep != 0:
-            raise ModelingError(f"experts_not_divisible_by_ep:{model.num_experts}%{self.ep}")
+        # ``E % EP != 0`` is a legal placement.  The physical slot plan owns the
+        # ceil(E/EP) base slots plus automatic padding copies, so a nondivisible
+        # expert population never drops a logical expert and never needs a
+        # global divisibility rejection here.
         if layer_partition is None:
             if model.layers % self.pp != 0:
                 raise ModelingError(

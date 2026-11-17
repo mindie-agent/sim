@@ -10,8 +10,9 @@ import json
 from pathlib import Path
 
 from mindie_sim import Case, predict
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
+from mindie_sim.catalog.draft_geometry import native_draft_layer_plans
 from mindie_sim.catalog.draft_weights import draft_terms
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec
 from mindie_sim.catalog.weight_terms import term_bytes
 from mindie_sim.prediction.frontend import Frontend
 from mindie_sim.prediction.scheduler import DraftPolicy, Progress
@@ -26,6 +27,7 @@ def draft_case():
     draft = DraftSpec(kind="mtp", layers=1, hidden_size=32, intermediate_size=64,
                       num_heads=4, num_kv_heads=2, head_dim=8, q_width=32, kv_width=16,
                       vocab_size=128, target_shared_embedding=True, target_shared_lm_head=True)
+    draft = replace(draft, layer_plans=native_draft_layer_plans(parsed.model, draft))
     return replace(parsed, model=replace(parsed.model, auxiliary=AuxiliarySpec(mtp=draft)),
                    runtime=replace(parsed.runtime, metadata=(
                        ("draft_mode", "mtp"), ("draft_proposal_tokens", 2), ("draft_accept_tokens", 1))))
@@ -124,7 +126,6 @@ def test_one_token_response_does_not_prepare_an_unused_draft():
 def test_kimi_k3_dspark_kv_cache_footprint_and_block_draft_subgraph():
     from mindie_sim.catalog.cache import cache_bytes_per_token_estimate, request_cache_breakdown
     from mindie_sim.prediction.capacity import Memory
-    from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, instantiate_model
     from mindie_sim.schema.parallel import ParallelSpec
 
     path = Path(__file__).parents[1] / "examples/cases/kimi-k3.json"
@@ -162,16 +163,6 @@ def test_kimi_k3_dspark_kv_cache_footprint_and_block_draft_subgraph():
     assert mem_dspark.workspace[0] > mem_base.workspace[0]
     assert mem_dspark.cache_bytes(4096)[0] - mem_base.cache_bytes(4096)[0] == 4096 * 2560.0
 
-    # Subgraph D0 instantiation for Kimi-K3 DSpark
-    inst = instantiate_model(model, FeatureConfig.from_model(model, tp=8, ep=32, dp=4))
-    d0 = next(g for g in inst.globals if g.kind == "spec_decode")
-    assert d0.template.variant == "dspark"
-    proj = d0.operator("draft_projection")
-    assert proj.theta.find("K") == 5 * model.hidden_size
-    heads = d0.operator("draft_heads")
-    assert heads.theta.find("noncausal_block") == 1
-    assert heads.theta.find("markov_rank") == 256
-    assert heads.theta.find("draft_len") == 7
 
 
 def _draft_kv_delta(model, tp: int, tokens: int = 4096) -> float:
@@ -183,55 +174,6 @@ def _draft_kv_delta(model, tp: int, tokens: int = 4096) -> float:
     drafted, _ = cache_bytes_per_token_estimate(
         model, parallel, tokens, draft_kind="dspark")
     return drafted - base
-
-
-def _assert_mla_d0(model, *, hidden: int) -> None:
-    from mindie_sim.catalog.draft_weights import draft_terms
-    from mindie_sim.prediction.subgraphs.instantiate import FeatureConfig, instantiate_model
-
-    draft = model.auxiliary.dspark
-    assert draft is not None
-    assert draft.attention_kind == "mla"
-    assert draft.mla_variant == "latent_mla"
-    assert draft.layers == 5
-    assert draft.kv_cache_elements == 576
-    assert draft.head_dim == 192
-    assert draft.q_lora_rank == 1536
-    assert draft.kv_lora_rank == 512
-    assert draft.qk_nope_head_dim == 128
-    assert draft.qk_rope_head_dim == 64
-    assert draft.v_head_dim == 128
-    assert draft.q_width == 64 * 192
-    assert draft.kv_width == 576
-    assert draft.num_kv_heads == 1
-    assert draft.target_layer_ids == (2, 23, 47, 71, 89)
-    wkv = next(term for term in draft_terms(
-        draft, model, standalone_heads_only=False) if term.name == "draft_wkv")
-    out = next(term for term in draft_terms(
-        draft, model, standalone_heads_only=False) if term.name == "draft_o")
-    assert wkv.rows == 512 + 64
-    assert out.cols == 64 * 128
-    inst = instantiate_model(model, FeatureConfig.from_model(model, tp=1, ep=1, dp=1))
-    d0 = next(graph for graph in inst.globals if graph.kind == "spec_decode")
-    for name in (
-        "draft_layer0_attn_norm", "draft_layer0_q_a", "draft_layer0_q_norm",
-        "draft_layer0_q_b", "draft_layer0_kv_a", "draft_layer0_kv_norm",
-        "draft_layer0_kv_store", "draft_layer0_attention",
-        "draft_layer0_o_projection", "draft_layer0_attn_residual",
-        "draft_layer0_ffn_norm", "draft_layer0_gate_up", "draft_layer0_activation",
-        "draft_layer0_down", "draft_layer0_ffn_residual",
-    ):
-        assert d0.operator(name).name == name
-    assert "draft_layer0_qkv" not in d0.template.operator_names
-    assert d0.operator("draft_layer0_q_a").theta.find("K") == hidden
-    assert d0.operator("draft_layer0_q_a").theta.find("N") == 1536
-    assert d0.operator("draft_layer0_q_b").theta.find("K") == 1536
-    assert d0.operator("draft_layer0_q_b").theta.find("N") == 64 * 192
-    assert d0.operator("draft_layer0_kv_a").theta.find("K") == hidden
-    assert d0.operator("draft_layer0_kv_a").theta.find("N") == 576
-    assert d0.operator("draft_layer0_o_projection").theta.find("K") == 64 * 128
-    assert d0.operator("draft_layer0_o_projection").theta.find("N") == hidden
-    assert d0.operator("draft_layer4_q_a").theta.find("N") == 1536
 
 
 def test_kimi_k3_dspark_block5_mla_catalog_and_draft_subgraph():
@@ -249,7 +191,6 @@ def test_kimi_k3_dspark_block5_mla_catalog_and_draft_subgraph():
     assert model.auxiliary.dspark.block_size == 5
     for tp in (1, 2, 4, 8):
         assert _draft_kv_delta(model, tp) == 5760.0
-    _assert_mla_d0(model, hidden=model.hidden_size)
 
 
 def test_kimi_k3_dspark_block_size_five_selects_mla_draft():
@@ -263,4 +204,3 @@ def test_kimi_k3_dspark_block_size_five_selects_mla_draft():
     assert model.auxiliary.dspark.block_size == 5
     for tp in (1, 2, 4, 8):
         assert _draft_kv_delta(model, tp) == 5760.0
-    _assert_mla_d0(model, hidden=model.hidden_size)

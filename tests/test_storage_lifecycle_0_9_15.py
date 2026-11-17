@@ -292,18 +292,6 @@ def test_round4_probe_removes_its_workspace(tmp_path, monkeypatch):
     assert list(scratch.iterdir()) == []
 
 
-def test_issue34_budget_removes_internal_artifacts(tmp_path, monkeypatch):
-    module = _script("check_issue34_test_budget")
-    scratch = tmp_path / "tmp"
-    scratch.mkdir()
-    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
-    code = module.main([
-        "--skip-tests", "--root", str(ROOT),
-        "--pattern", "tests/no-such-issue34-file-*.py",
-    ])
-    assert code == 0
-    assert list(scratch.iterdir()) == []
-
 
 def test_cache_hit_refresh_and_locked_loader_survive_seventeenth_artifact(
         monkeypatch, tmp_path):

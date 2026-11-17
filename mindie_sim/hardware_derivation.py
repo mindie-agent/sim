@@ -64,6 +64,11 @@ A5_FAMILY = "A5"
 MXFP4_ALIAS = "mxfp4"
 FP8_E4M3 = "fp8_e4m3"
 FP8_GENERIC = "fp8"
+DEFAULT_SKU = "derived-sku"
+HARDWARE_KEYS = (
+    "aic_count", "aiv_count", "memory_bytes", "hbm_peak_bytes_per_s",
+    "hbm_efficiency", "mte2_ceiling_bytes_per_s", "mte2_efficiency",
+)
 
 
 def _load_base(base: Hardware | Mapping[str, Any] | str) -> Hardware:
@@ -313,3 +318,17 @@ def derive_hardware_sku(
     if collective_protocols is not None:
         data["collective_protocols"] = dict(collective_protocols)
     return Hardware.from_mapping(data)
+
+
+def derived_machine(machine: Any, overrides: Mapping[str, Any]) -> Any:
+    """Apply only explicitly declared hardware overrides to a base machine.
+
+    An omitted field keeps the parsed machine declaration.  A nonempty scalar
+    override set derives one new immutable ``Hardware``; it never installs a
+    registry entry or mutates the caller's machine.
+    """
+    kwargs = {key: overrides[key] for key in HARDWARE_KEYS if key in overrides}
+    if not kwargs:
+        return machine
+    sku = str(overrides.get("sku") or getattr(machine, "sku", "") or DEFAULT_SKU)
+    return derive_hardware_sku(machine, sku=sku, **kwargs)

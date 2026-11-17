@@ -13,9 +13,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from fractions import Fraction
 import json
 from types import MappingProxyType
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
@@ -297,6 +298,50 @@ def stage_from_fragment(fragment: ProgramFragment, *, name: str = "",
 
 class Program(Protocol):
     def start(self, engine: Engine, name: str, ready: Event, *, owner: str = "") -> Event: ...
+
+
+@dataclass(frozen=True)
+class NativeProgram:
+    """Canonical executable native program plus its exact source ledger.
+
+    The contract preserves the native owner's own ``start`` /
+    ``start_with_handles`` readiness, peer sends, send placeholders, launch
+    handles and transport bindings.  It stores no duration: a caller binds
+    and measures the actual completion Event on the shared Engine instead of
+    reusing a precomputed time.
+    """
+
+    program: Any
+    work: tuple[tuple[str, Fraction], ...]
+    fidelity: str = "native_program"
+
+    def start(self, engine: Any, name: str, ready: Any, *,
+              peer_ready: Any = None, peer_send: Any = None,
+              launch: Any = None, source_send: Any = None,
+              send_placeholders: Any = None, transport: Any = None) -> Any:
+        if (peer_ready is None and peer_send is None and launch is None
+                and source_send is None and send_placeholders is None
+                and transport is None):
+            return self.program.start(engine, name, ready)
+        arguments = dict(
+            peer_ready=peer_ready, peer_send=peer_send, launch=launch,
+            source_send=source_send, send_placeholders=send_placeholders)
+        if transport is not None:
+            arguments["transport"] = transport
+        return self.program.start(engine, name, ready, **arguments)
+
+    def start_with_handles(self, engine: Any, name: str, ready: Any, *,
+                           peer_ready: Any = None, peer_send: Any = None,
+                           launch: Any = None, source_send: Any = None,
+                           send_placeholders: Any = None,
+                           transport: Any = None):
+        arguments = dict(
+            peer_ready=peer_ready, peer_send=peer_send, launch=launch,
+            source_send=source_send, send_placeholders=send_placeholders)
+        if transport is not None:
+            arguments["transport"] = transport
+        return self.program.start_with_handles(
+            engine, name, ready, **arguments)
 
 
 @dataclass(frozen=True)
@@ -1269,6 +1314,8 @@ class RecipeContext:
     #: Stable serializable projection of transport_options (separate from the
     #: service identity used for curve matching).
     transport_identity: Mapping | None = None
+    #: Immutable typed physical declaration selected for this device cohort.
+    physical_mechanisms: object = None
 
     def __post_init__(self):
         # T04 historically folded the typed option into service_identity.  Keep
@@ -1337,6 +1384,30 @@ class RecipeContext:
             cache[key] = hit
         return dict(hit)
 
+    def read_pipe(self, *, aiv: bool | None = None) -> str:
+        """Declared operand-read pipe for this op's consumer owner.
+
+        A split MTE2 topology exposes one AIC-owned and one AIV-owned read path.
+        The consumer decides which pipe services an operand fetch: an op with
+        Cube work reads through AIC, a vector-only op through AIV.  An explicit
+        ``read_pipe`` metadata declaration wins so a mixed owner can name the
+        exact physical consumer instead of inferring it from totals.
+        """
+        from .ownership import read_role
+        names = self.resource_names
+        split = {"mte2_aic", "mte2_aiv"}.intersection(names)
+        if not split:
+            return "mte2"
+        declared = str(dict(self.op.metadata or {}).get("read_pipe", "") or "")
+        if declared in {"aic", "aiv"}:
+            return read_role(names, aiv=0 if declared == "aiv" else None)
+        if aiv is None:
+            matrix = tuple(getattr(self.op, "matrix_flops", ()) or ())
+            flops = float(getattr(self.op, "flops", 0.0) or 0.0)
+            vector = float(getattr(self.op, "vector_ops", 0.0) or 0.0)
+            aiv = not matrix and flops <= 0.0 and vector > 0.0
+        return read_role(names, aiv=0 if aiv else None)
+
     def bind(self, work) -> dict[str, float]:
         """Resolve typed stage work onto shared physical resources, in ms units."""
         demand = {}
@@ -1347,6 +1418,8 @@ class RecipeContext:
                 raise ModelingError(f"compute_precision_rate_required:{dtype}")
             name = self.resource_names["cube"]
             demand[name] = demand.get(name, 0) + 1000 * flops / self.compute_peaks[dtype]
+        matrix_consumer = any(float(value) > 0.0
+                              for value in work.matrix.values())
         for role, amount in work.resources.items():
             if not amount:
                 continue
@@ -1358,10 +1431,23 @@ class RecipeContext:
                 # in the base pipe's units so its different instructions contend.
                 amount *= self.rates[name] * 1000 / rate
                 role = resource
-            if role in {"mte2", "mte3"} and role not in self.resource_names:
+            if role == "mte2" and role not in self.resource_names:
+                # The hardware declares separate AIC/AIV read pipes. Route the
+                # typed fetch to its consumer instead of dropping the service.
+                split = {"mte2_aic", "mte2_aiv"}.intersection(self.resource_names)
+                if not split:
+                    # A non-Ascend backend has one global memory path and no
+                    # separate operand-fetch pipe; the HBM component already
+                    # carries those bytes.  Never invent a second charge.
+                    continue
+                role = self.read_pipe(aiv=False if matrix_consumer else None)
+            if role == "mte3" and role not in self.resource_names:
                 continue
             if role not in self.resource_names:
-                raise ModelingError(f"physical_resource_rate_missing:{role}")
+                raise ModelingError(
+                    f"physical_resource_rate_missing:{role}:"
+                    f"{getattr(self.op, 'family', '')}:"
+                    f"{getattr(self.op, 'recipe', '')}")
             name = self.resource_names[role]
             demand[name] = demand.get(name, 0) + amount
         return demand
@@ -1372,16 +1458,10 @@ class Recipe(Protocol):
 
 
 class ResourceEnvelope:
-    """Aggregate independent work where no instruction-stage recipe is declared."""
+    """Removed production fallback; retained only to reject legacy bindings."""
 
     def lower(self, context: RecipeContext) -> KernelProgram:
-        stages = (
-            (Stage("setup", latency=context.setup_ms),
-             Stage("service", context.work, after=("setup",)))
-            if context.setup_ms
-            else (Stage("service", context.work),)
-        )
-        return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        raise ModelingError("resource_envelope_banned")
 
 
 @dataclass(frozen=True)
@@ -1416,6 +1496,11 @@ class TransferRecipe:
         ), minimum_ms=context.minimum_ms)
 
 
+#: The generic matrix program key; a caller override of it never hijacks a
+#: family that has its own dedicated physical binding (for example grouped).
+GENERIC_MATRIX_PROGRAM = "matmul"
+
+
 class RecipeBook:
     """Explicit implementation bindings; adding recipes does not edit the loop."""
 
@@ -1433,29 +1518,36 @@ class RecipeBook:
         from .mechanism import PlannedRecipe as _PlannedRecipe
         from .batch_prefix_attention import RECIPE as _batch_prefix_attn
         from .batch_prefix_indexer import RECIPE as _batch_prefix_idx
+        from .physical_recipe_registry import (physical_family_bindings,
+                                               physical_recipe_bindings)
         self._explicit_recipes = frozenset((recipes or {}).keys()) | {
             "batch_prefix_attention", "batch_prefix_indexer",
         }
         # ``_explicit_recipes`` also receives internally registered source
         # recipes.  Only this set is the caller's own override.
         self._caller_recipes = frozenset((recipes or {}).keys())
+        self._caller_programs = frozenset((programs or {}).keys())
         self._explicit_families = frozenset((families or {}).keys())
         self._family_kinds = {}
         self.recipes = {
+            **physical_recipe_bindings(),
             "balanced_grouped_gate_up": balanced_matrix,
             "balanced_grouped_down": balanced_matrix,
             "batch_prefix_attention": _batch_prefix_attn,
             "batch_prefix_indexer": _batch_prefix_idx,
             **(recipes or {}),
         }
-        self.families = {"recurrent_scan": RecurrentScan(), "recurrent_vector": RecurrentVector(),
-                         "engram_rh2d": HostStaging(),
-                         "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
-                         **(families or {})}
+        self.families = {
+            **physical_family_bindings(),
+            "recurrent_scan": RecurrentScan(), "recurrent_vector": RecurrentVector(),
+            "engram_rh2d": HostStaging(),
+            "grouped_gemm": (programs or {}).get("matmul", SteadyMatmul()),
+            **(families or {}),
+        }
         self.programs = {"matmul": TiledMatmul(128, 128),
                          "dense_latent_attention": _PlannedRecipe(_generic_latent_build),
                          **(programs or {})}
-        self.default = default or ResourceEnvelope()
+        self.default = default
         self._select_id_cache: dict[int, tuple[object, Recipe]] = {}
         self._expand_id_cache: dict[int, tuple[object, tuple]] = {}
         self._prev_expand: tuple | None = None
@@ -1503,6 +1595,12 @@ class RecipeBook:
                            "balanced_grouped_down"}
         if recipe_name in self._caller_recipes:
             recipe = self.recipes[recipe_name]
+        elif (kind in self._caller_programs
+              and (kind == family_name or kind != GENERIC_MATRIX_PROGRAM)):
+            # A caller-declared program is authoritative over an automatic
+            # physical family default of the same name.  Physical bindings are
+            # a fallback, never an override of the caller's own declaration.
+            recipe = self.programs[kind]
         elif (family_name in self._explicit_families
               and family_name != "grouped_gemm"):
             # An explicit caller family is authoritative over any automatic
@@ -1519,7 +1617,7 @@ class RecipeBook:
                 recipe = _shared_recipe()
             else:
                 recipe = self.recipes.get(recipe_name, self.families.get(
-                    op.family, self.programs.get(kind, self.default)))
+                    op.family, self.programs.get(kind)))
         elif (family_name == "grouped_gemm"
               and "grouped_gemm" in self._explicit_families
               and recipe_name in generic_grouped):
@@ -1542,7 +1640,16 @@ class RecipeBook:
                     _mxfp4_config(op)
         else:
             recipe = self.recipes.get(recipe_name, self.families.get(
-                op.family, self.programs.get(kind, self.default)))
+                op.family, self.programs.get(kind)))
+        if recipe is None:
+            from .physical_recipe_registry import PROJECTION_FAMILIES
+            if family_name in PROJECTION_FAMILIES:
+                recipe = self.programs.get("matmul")
+            elif self.default is not None:
+                recipe = self.default
+            else:
+                from .physical_recipe_registry import resolve_physical_recipe
+                recipe = resolve_physical_recipe(op)
         if "matrix_group_rows" in meta:
             from .grouped_rows import adapt
             recipe = adapt(recipe, op)
@@ -1794,7 +1901,7 @@ class RecipeBook:
 
         from .batch_prefix_attention import BatchPrefixAttention
         from .batch_prefix_indexer import BatchPrefixIndexer
-        factories = {"envelope": ResourceEnvelope, "tiled_matmul": TiledMatmul,
+        factories = {"tiled_matmul": TiledMatmul,
                      "hierarchical_matmul": HierarchicalMatmul, "mapped_matmul": MappedMatmul,
                      "phase_matmul": PhaseMatmul,
                      "steady_matmul": SteadyMatmul,
@@ -2790,4 +2897,5 @@ def split_cohort_kernel(programs):
                             for dep in refs(name, owner)),
                 previous=tuple(dep for name in stage.previous
                                for dep in refs(name, owner))))
+
     return KernelProgram(tuple(rebuilt), first.minimum_ms)

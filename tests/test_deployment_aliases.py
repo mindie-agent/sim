@@ -5,7 +5,7 @@ import pytest
 
 from mindie_sim import predict, target_graphs
 from mindie_sim.catalog.quant import quant_preset
-from mindie_sim.model_catalog import load_architecture_profile, load_model
+from mindie_sim.model_catalog import load_model
 from mindie_sim.prediction.structure import parse_case
 from mindie_sim.schema.common import ModelingError
 
@@ -42,7 +42,6 @@ def test_model_short_label_preserves_exact_geometry_quantization_and_weights(sho
     model = load_model(canonical)
     assert load_model(short) == model
     assert load_model(short.upper()) == model
-    assert load_architecture_profile(short) == load_architecture_profile(canonical)
 
 
 def test_quant_aliases_preserve_real_packed_bytes_and_checkpoint_exclusions():

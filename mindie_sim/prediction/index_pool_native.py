@@ -15,7 +15,7 @@ from mindie_sim.catalog.ops import compute_dtype_for
 from mindie_sim.schema.common import ModelingError
 from .mla_native import index_layer_norm
 from .mechanism import OperatorPlan, PlannedRecipe, Work
-from .program import ResourceEnvelope
+from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
 from .structure_groups import declare_group
 
 IMPLEMENTATION = "vllm_ascend_cann_keypool_caller"
@@ -41,8 +41,8 @@ def build(op, geometry):
     work = Work(matrix={op.dtype: op.flops} if op.flops else {}, resources={
         "hbm": op.hbm_bytes, "mte2": op.mte2_bytes,
         "mte3": op.mte3_bytes, "vector": op.vector_ops})
-    return OperatorPlan(work, ResourceEnvelope().lower, metadata={
-        "schedule": "analytical_resource_envelope; native_core_schedule_unbound",
+    return OperatorPlan(work, TiledSparseIndexerRecipe().lower, metadata={
+        "schedule": "class_b_sparse_score_topk_phases",
         "traffic": "logical_external_tensors; no_inferred_internal_spill_or_cache_reuse"})
 
 

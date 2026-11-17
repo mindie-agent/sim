@@ -11,6 +11,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+from hashlib import sha256
+import json
 import math
 from collections.abc import Mapping as _AbcMapping
 from typing import Callable, Mapping, Any
@@ -32,6 +34,14 @@ from mindie_sim.coverage import model_coverage
 
 ZERO = 0
 DEFAULT_TRACE_LIMIT = 2
+DEFAULT_EVENT_LIMIT = 256
+
+
+def _runtime_identity(case: CaseSpec) -> str:
+    """Stable public runtime label derived from the parsed declaration."""
+    payload = json.dumps(case.to_dict(), sort_keys=True,
+                         separators=(",", ":"), allow_nan=False)
+    return sha256(payload.encode("utf-8")).hexdigest()
 
 
 def _event_pending(event) -> bool:
@@ -461,13 +471,15 @@ def predict(
     case: CaseSpec | Mapping[str, Any], *, primitives: PrimitiveStore | None = None,
     recipes: RecipeBook | None = None, submission: SubmissionPolicy | None = None,
     memory_policy: MemoryPolicy | None = None, lower: Callable | None = None,
-    scheduler_factory: Callable = Scheduler, trace_limit: int = 2,
-    event_limit: int = 256, scope: str = "serving", phase: str | None = None,
+    scheduler_factory: Callable = Scheduler,
+    trace_limit: int = DEFAULT_TRACE_LIMIT,
+    event_limit: int = DEFAULT_EVENT_LIMIT, scope: str = "serving",
+    phase: str | None = None,
     tokens: int | None = None, context: int | None = None, sequences: int | None = None,
     max_model_steps: int | None = None, window=None, observer=None,
     include_submission: bool = True, resource_fusion: bool = True,
     memory: Memory | None = None, selected_allocations=None,
-    memory_replica: int = 0, memory_stage: int = 0,
+    memory_replica: int = ZERO, memory_stage: int = ZERO,
     token_quotas: Mapping[str, int] | None = None,
 ) -> dict[str, Any]:
     if scope == "body":
@@ -532,7 +544,7 @@ def predict(
                                            float(values["release_ms"]))
     cost = CostModel(case, primitives)
     execution = Execution(
-        case, cost, recipes=recipes, submission=submission,
+        case, cost, ledger=cost.ledger, recipes=recipes, submission=submission,
         trace_limit=event_limit, include_serving_io=True,
         include_submission=include_submission, memory_policy=memory.policy,
         memory=memory,
@@ -584,7 +596,7 @@ def predict(
         "metric_boundaries": boundaries,
         "throughput_window_boundary": "legacy_scheduler_completion",
         "execution": {**execution.summary(),
-                      "runtime_uid": execution.engine.uid,
+                      "runtime_uid": _runtime_identity(case),
                       "iterations": iterations,
                       "iteration_modes": modes, "graph_scopes": scopes,
                       "assembly": assembly, "cohort_stop": run["stop_reason"],

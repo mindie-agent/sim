@@ -1,6 +1,6 @@
 {
   "frozen_parameter_manifest": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a5-grouped-service-regimes-20261030/grouped-parameters.json",
     "sha256": "f9863f1b4f5d7f1eac3422f59a1dfec2d09b1d87687cef79fcc1b6070bbc740a"
   },
   "native_target": {
@@ -172,11 +172,11 @@
       "sha256": "b89924f519db9739f24595b7203f22ec230907a018d546f74076505376414fe9"
     },
     "protocol": {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/protocols/grouped-call-protocol.json",
+      "path": "repository://sim-serving-host-io-20261030/data/observations/protocols/grouped-call-protocol.json",
       "sha256": "9ce423f285dca84c17a123214574467fef580e5e13af64e7629cc3711a95ca31"
     },
     "producer": {
-      "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
+      "path": "repository://mindie-agent/.workstreams/hp-serving/qwen35-grouped/scripts/probe_grouped_graph.py",
       "sha256": "e04e38ccf8a6f27be886ad7db9856fa97491c1cf9d41bd11cf3efa170edb8e5a"
     },
     "column_scale": "producer declares FP32 [E,N]; retained target native column scale BF16 [256,N]",

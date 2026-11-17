@@ -27,7 +27,7 @@ representation, not source selection or native precision.
 
 ## Source branch
 
-Pinned `/Users/maoxx241/code/vllm-ascend-v41-private` at
+Pinned `repository://vllm-ascend-v41-private` at
 `ae923905948f360f4b7ab06df52d0789a0c9316e`.
 
 - `chunk_kda_fwd.cpp` lines 15-19 and 35-46 dispatch stage 0

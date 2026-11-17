@@ -18,7 +18,7 @@ def case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None):
     ranks = dp * tp * pp
     return {
         "machine": {
-            "name": "declared-gpu", "architecture": "cuda", "num_devices": ranks,
+            "name": "declared-gpu", "architecture": "declared", "num_devices": ranks,
             "device": {"memory_bytes": 1024 ** 3, "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
                        "rates": {"memory": 1e9, "vector": 1e9}, "compute_units": 4},
             "links": [{"name": "fabric", "capacity_bytes_per_ms": 1000,
@@ -37,8 +37,9 @@ def case(*, dp=1, tp=1, pp=1, ep=1, prompt=4, output=3, requests=None):
 def linear_work(plan, model, runtime, machine):
     tokens = sum(view.q_len + view.draft_proposal_tokens for view in plan.requests)
     shape = (tokens,)
-    op = OpSpec("work", "gemm", "body", 0, 0, tuple(v.request_id for v in plan.requests),
-                shape, shape, shape, shape, flops=tokens * 1e6, dtype="bf16")
+    op = OpSpec("work", "vector", "body", 0, 0, tuple(v.request_id for v in plan.requests),
+                shape, shape, shape, shape, flops=tokens * 1e6,
+                vector_ops=tokens * 1e6, dtype="bf16")
     return IterationWork((op,), plan, 1, tokens, tokens, None, "body", "test_linear")
 
 
@@ -178,8 +179,9 @@ def test_pipeline_microbatches_produce_finite_fill_and_drain():
         tokens = plan.valid_tokens
         shape = (tokens,)
         ops = tuple(OpSpec(
-            f"stage{stage}", "gemm", "prefill", stage, stage, tuple(v.request_id for v in plan.requests),
+            f"stage{stage}", "vector", "prefill", stage, stage, tuple(v.request_id for v in plan.requests),
             shape, shape, shape, shape, flops=tokens * 1e6,
+            vector_ops=tokens * 1e6,
             deps=("stage0",) if stage else (), dtype="bf16",
         ) for stage in range(2))
         return IterationWork(ops, plan, 2, tokens, tokens, None, "prefill", "two_stage")

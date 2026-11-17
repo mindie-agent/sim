@@ -11,17 +11,17 @@
   "baseline_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",
   "source_files": [
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/engine.py",
       "sha256": "2d85c47a1dd1b7d47e79af542365187dcf05db2d5e349c0d1fb78aee9270db63",
       "bytes": 18830
     },
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/program.py",
       "sha256": "22ea2c6ba735da2266a5b7d15c1d41b5e8c1046a413bf3c7b8cc7ce77bafc097",
       "bytes": 22088
     },
     {
-      "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
+      "path": "repository://sim-serving-host-io-20261030/mindie_sim/prediction/attention_decode.py",
       "sha256": "1907e39c3911b34fc897d4a5c3ac495b2216044d10bb9c2a41c5336c2b7c889f",
       "bytes": 32018
     }
@@ -61,7 +61,7 @@
     "execution_wall_seconds": 0.063502083,
     "exit_code": 0,
     "script_note": "Saved verbatim after the one successful in-memory invocation; not rerun. Old modules loaded with git show HEAD at review time; new modules from current working tree.",
-    "workspace": "/Users/maoxx241/code/sim-serving-host-io-20261030",
+    "workspace": "repository://sim-serving-host-io-20261030",
     "record": {
       "path": "/tmp/prepared-pipeline-independent-review-20261030.json",
       "sha256": "ddd95b571db9a4bdce3230dd2a08833b68a23e851f0bfd4c46fdc116e11e8f07",
@@ -79,7 +79,7 @@
         "sequences": 12
       },
       "case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
         "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
       },
       "runtime_revision": "2ec98bc3d20230f4c4477048d12c23db84e7141a",
@@ -171,7 +171,7 @@
         "sequences": 12
       },
       "case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
         "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
       },
       "runtime_revision": "2ec98bc3d20230f4c4477048d12c23db84e7141a",
@@ -220,7 +220,7 @@
         "sequences": 16
       },
       "case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
         "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
       },
       "runtime_revision": "b586b183749803f755f46f4adf1446d815917d19",
@@ -269,7 +269,7 @@
         "sequences": 24
       },
       "case": {
-        "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+        "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
         "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
       },
       "runtime_revision": "537cc9ade2d9f41b366f73d05b88e3ec0cf67718",
@@ -319,7 +319,7 @@
       "sequences": 24
     },
     "case": {
-      "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+      "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
       "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67"
     },
     "runtime_revision": "479f5aa2ebd2dcd687eccbf96f70859c668f928a",

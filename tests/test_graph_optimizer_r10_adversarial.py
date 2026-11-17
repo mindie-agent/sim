@@ -38,7 +38,7 @@ from mindie_sim.prediction.fusion_ports import full_operand_ports, input_port_en
 from mindie_sim.prediction.fusion_recipe import (
     RejectedFusion, synthesize_vector,
 )
-from mindie_sim.prediction.program import RecipeBook, ResourceEnvelope
+from mindie_sim.prediction.program import KernelProgram, RecipeBook, Stage
 from mindie_sim.prediction.runtime.engine import Engine, Resource
 from mindie_sim.prediction.weight_prefetch import PrefetchDecision
 from mindie_sim.schema.operators import OpSpec
@@ -256,14 +256,18 @@ def test_r16_nonroot_explicit_data_has_exact_causal_timeline(deps, phase):
 def test_r16_root_data_waits_across_priority_external_ready_and_pipes(hazard, deps, phase):
     p = _add("p", ("late_input",) if hazard == "external" else ("analysis_input",))
     if hazard == "cube":
-        p = replace(p, family="gemm", flops=1e8, vector_ops=0.0, hbm_bytes=0.0)
+        p = replace(p, family="gemm", flops=1e8, vector_ops=0.0, hbm_bytes=0.0,
+                    semantic_shape=(1, 1, 4), local_shape=(1, 1, 4),
+                    padded_shape=(1, 1, 4), launch_shape=(1, 1, 4))
     c = _add("c", deps, metadata=(("control_deps", ("a", "p")),
                                  ("fusion_input_ports", _R16_PORTS)))
     priorities = {}
 
-    class PriorityRecipe(ResourceEnvelope):
+    class PriorityRecipe:
         def lower(self, context):
-            program = super().lower(context)
+            program = KernelProgram(
+                (Stage("service", context.work),),
+                minimum_ms=context.minimum_ms)
             priority = getattr(context.op, "priority", 0)
             priorities[context.op.op_id] = priority
             return replace(program, stages=tuple(replace(stage, priority=priority)
@@ -278,7 +282,9 @@ def test_r16_root_data_waits_across_priority_external_ready_and_pipes(hazard, de
             "external_inputs": ("analysis_input", "late_input"),
             "external_ready_ms": {"late_input": 0.1}})
     if hazard == "priority":
-        plan = replace(plan, book=RecipeBook(default=PriorityRecipe()))
+        # The synthetic members are the declared `add` family; the physical
+        # registry already binds that family, so override it explicitly.
+        plan = replace(plan, book=RecipeBook(families={"add": PriorityRecipe()}))
     current = plan.rewrite(_r16_phase(plan.ops, phase))
     _, rows = _r16_ordered(current)
     if hazard == "priority":

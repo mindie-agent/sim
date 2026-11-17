@@ -241,7 +241,8 @@ def test_actual_engine_obeys_input_ready_and_services_native_bytes_without_cube(
         assert row["declared_service"] == pytest.approx(row["serviced"], rel=1e-12, abs=1e-8)
         assert row["serviced"]["memory@r0:s0"] == prepared.hbm_bytes
         role = dict(prepared.metadata)["attn_res_read_role"]
-        assert row["serviced"][role + "@r0:s0"] == _read_bytes(prepared)
+        assert row["serviced"][role + "@r0:s0"] == pytest.approx(
+            _read_bytes(prepared), rel=1e-12, abs=1e-8)
         assert row["serviced"]["mte3@r0:s0"] == pytest.approx(prepared.mte3_bytes, rel=1e-12, abs=1e-8)
         assert "cube" not in row["serviced"]
         assert row["duration_ms"] > 0

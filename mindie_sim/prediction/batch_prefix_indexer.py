@@ -29,9 +29,6 @@ from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
 
 
-ZERO = 0
-ONE = 1
-FIRST = 0
 RECIPE_NAME = "batch_prefix_indexer"
 SUPPORTED_AXES = frozenset({"index_k", "key", "kv"})
 
@@ -43,23 +40,18 @@ class BatchPrefixIndexer:
     algorithm = RECIPE_NAME
 
     def lower(self, context):
-        from .program import KernelProgram, Stage
+        from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
 
-        metadata = dict(getattr(context.op, "metadata", ()) or {})
+        metadata = dict(getattr(context.op, "metadata", ()) or ())
         if metadata.get("prefix_read_reuse_applied") is not True:
             raise ModelingError("batch_prefix_indexer_requires_applied_read_plan")
         component = str(metadata.get("component", "index_k"))
         if component not in SUPPORTED_AXES:
             raise ModelingError(f"batch_prefix_indexer_axis_unsupported:{component}")
         if context.collective_plan is None and "link" in context.native_work:
-            # A transport-only op is not an indexer scan.
             raise ModelingError("batch_prefix_indexer_requires_index_work")
-        stages = (
-            (Stage("setup", latency=context.setup_ms),
-             Stage("key_tiles", context.work, after=("setup",)))
-            if context.setup_ms else (Stage("key_tiles", context.work),)
-        )
-        return KernelProgram(stages, minimum_ms=context.minimum_ms)
+        return TiledSparseIndexerRecipe().lower(context)
+
 
 
 RECIPE = BatchPrefixIndexer()
@@ -81,33 +73,52 @@ def apply_indexer_prefix_reads(
     op: Any, *, views: Sequence[Any], rows_by_view: Sequence[int],
     shared_rows_by_view: Sequence[int], row_bytes: float, layer_index: int,
     runtime: Any, kernel_reuse: str = "tile", allow_recipe_rebind: bool = True,
+    hbm_component: float | None = None,
+    mte2_component: float | None = None,
 ) -> Any:
-    """Apply physical prefix index-K read deduplication and bind the batch recipe."""
+    """Replace the precharged index-K components with their physical union."""
     if runtime is None or getattr(runtime, "prefix_cache_mode", "private") != "shared":
         return op
-    accesses = [
-        CacheAccess(
+    accesses = []
+    for view, rows, shared in zip(views, rows_by_view, shared_rows_by_view):
+        if int(rows) <= 0:
+            continue
+        ranges = getattr(view, "query_ranges", None)
+        q_tokens = (
+            max(1, sum(int(end) - int(start) for start, end in ranges
+                       if int(end) > int(start)))
+            if ranges else max(1, int(getattr(view, "q_len", 1) or 1))
+        )
+        raw_context = getattr(view, "context", None)
+        context_tokens = (
+            max(0, int(raw_context))
+            if raw_context is not None
+            else max(0, int(rows) - q_tokens)
+        )
+        physical_prefix = min(int(shared), int(rows))
+        if getattr(view, "prefix_tokens", None) is not None:
+            physical_prefix = min(physical_prefix, max(0, int(view.prefix_tokens)))
+        accesses.append(CacheAccess(
             request_id=str(view.request_id),
-            context_tokens=max(ZERO, int(rows) - ONE),
-            q_len=ONE,
-            prefix_tokens=max(ZERO, min(int(shared), int(rows))),
+            context_tokens=context_tokens,
+            q_len=q_tokens,
+            prefix_tokens=max(0, physical_prefix),
             prefix_key=canonical_prefix_cache_key(
                 "shared", getattr(view, "prefix_cache_key", "")),
             row_bytes=float(row_bytes),
             layer=int(layer_index),
             component="index_k",
             logical_rows=int(rows),
-        )
-        for view, rows, shared in zip(views, rows_by_view, shared_rows_by_view)
-        if int(rows) > ZERO
-    ]
+        ))
     meta = dict(getattr(op, "metadata", ()) or ())
     meta.setdefault("component", "index_k")
     tagged = replace(
-        op, metadata=tuple(sorted(meta.items(), key=lambda pair: pair[FIRST])))
+        op, metadata=tuple(sorted(meta.items(), key=lambda pair: pair[0])))
     read_mode = str(getattr(runtime, "prefix_read_mode", "auto") or "auto")
     plan = plan_prefix_reads(accesses, mode=read_mode, kernel_reuse=kernel_reuse)
-    updated = apply_prefix_read_plan(tagged, plan)
+    updated = apply_prefix_read_plan(
+        tagged, plan, hbm_component=hbm_component,
+        mte2_component=mte2_component)
     if allow_recipe_rebind and select(updated, runtime) == RECIPE_NAME:
         updated = replace(updated, recipe=RECIPE_NAME)
     return updated

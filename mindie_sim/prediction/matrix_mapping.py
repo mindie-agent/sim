@@ -23,6 +23,12 @@ from .matrix_epilogue import MatrixEpilogue
 from .ownership import read_role
 
 
+REFILL_M = 128
+MIN_NARROW_N = 32
+MAX_SPLIT_K = 32
+A5_L2_MTE2_RATE = 1e13
+A5_BF16_PEAK_FLOOR = 4e14
+
 DEFAULT_CANDIDATES = ((128, 128, 64), (128, 128, 128), (128, 256, 64), (128, 256, 128),
                       (256, 128, 64), (256, 128, 128), (256, 256, 64), (256, 256, 128))
 NARROW_CANDIDATES = ((16, 16, 64), (32, 16, 64), (64, 16, 64),
@@ -592,7 +598,13 @@ class MappedMatmul:
     narrow_candidates: tuple | None = None
     underfilled_candidates: tuple | None = None
 
-    def select(self, context):
+    def select(self, context, *, include_record: bool = True):
+        """Select the declared tile mapping and its explanatory record.
+
+        ``include_record=False`` skips the defensive record copy on the hot
+        steady path (a caller that has no mapping observer).  Selection itself
+        is identical: the same cached recipe object is returned either way.
+        """
         cache_key = (
             _matmul_recipe_key(self), _op_matrix_key(context.op), context.core_count,
             tuple(sorted(context.resource_names.items())),
@@ -600,25 +612,38 @@ class MappedMatmul:
             tuple(sorted(context.work.items())),
             tuple(sorted(context.resource_units.items())),
             tuple(sorted(context.pool_capacities.items())),
+            getattr(context.physical_mechanisms, "signature", None),
         )
         if cache_key in _SELECT_CACHE:
             recipe, record = _SELECT_CACHE[cache_key]
-            return recipe, deepcopy(record)
+            return recipe, (deepcopy(record) if include_record else None)
         records = []
         selected = None
         selected_geometry = None
         meta = dict(context.op.metadata)
         groups = int(meta.get("matrix_groups", 1))
-        if groups < 1 or context.op.local_shape[-3] % groups:
+        if groups < 1 or context.op.local_shape[(-3)] % groups:
             raise ModelingError("matrix_groups_require_equal_integer_rows")
         compute_format = meta.get("compute_format", context.op.dtype or "bf16")
-        automatic_subtiles = self.candidates is None and compute_format == "fp32"
+        m = context.op.local_shape[(-3)] // groups
+        n = context.op.local_shape[(-2)]
+        default_grid = math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
+        a5_l2_supply = (
+            float(context.rates.get("mte2_aic", 0)) >= A5_L2_MTE2_RATE
+            or float(context.compute_peaks.get("bf16", 0)) >= A5_BF16_PEAK_FLOOR)
+        # FP32 has no packed L2 supply path: a single 128x128 tile would leave
+        # 23 of 24 AIC owners idle on a tall projection (e.g. hc_projection
+        # [M, 32, 7168]), so fp32 always screens the declared sub-tiles even
+        # when the A5 L2/bf16 supply heuristic does not fire.
+        fp32_subtiles = self.candidates is None and compute_format == "fp32"
+        automatic_subtiles = fp32_subtiles or (
+            a5_l2_supply and (
+                self.candidates is None
+                or m < context.core_count * REFILL_M
+                or default_grid < context.core_count))
         narrow = (NARROW_CANDIDATES if automatic_subtiles else ()
                   ) if self.narrow_candidates is None else self.narrow_candidates
-        narrow = narrow if context.op.local_shape[-2] <= 32 else ()
-        m = context.op.local_shape[-3] // groups
-        n = context.op.local_shape[-2]
-        default_grid = math.ceil(m / 128) * math.ceil(n / 128) * groups
+        narrow = narrow if n <= MIN_NARROW_N else ()
         underfilled = (UNDERFILLED_CANDIDATES if automatic_subtiles else ()
                        ) if self.underfilled_candidates is None else self.underfilled_candidates
         underfilled = underfilled if default_grid < context.core_count else ()
@@ -627,11 +652,22 @@ class MappedMatmul:
         candidates.extend((tile, True) for tile in narrow)
         candidates.extend((tile, True) for tile in underfilled if tile not in narrow)
         for (tm, tn, tk), is_narrow in candidates:
-            cm = min(self.compute_m, tm) if is_narrow else self.compute_m
-            cn = min(self.compute_n, tn) if is_narrow else self.compute_n
+            del is_narrow
+            cm = min(self.compute_m, tm)
+            cn = min(self.compute_n, tn)
+            k = context.op.local_shape[(-1)]
+            output_tiles = (math.ceil(m / tm) * math.ceil(n / tn) * groups)
+            split_k = 1
+            if output_tiles < context.core_count and k > tk:
+                split_k = min(
+                    k // tk,
+                    max(1, context.core_count // max(1, output_tiles)),
+                    MAX_SPLIT_K,
+                )
             recipe = HierarchicalMatmul(
                 tm, tn, tk, cm, cn,
-                self.slots, self.compute_slots, self.reuse_inputs, self.reuse_weights)
+                self.slots, self.compute_slots, self.reuse_inputs,
+                self.reuse_weights, split_k)
             if min(tm, tn, tk, self.compute_m, self.compute_n,
                    self.slots, self.compute_slots) < 1:
                 raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
@@ -643,7 +679,8 @@ class MappedMatmul:
                         if pool in context.pool_capacities and size > context.pool_capacities[pool]}
             bound = None if exceeded else mapping_bound(context, recipe, geometry=geometry)
             waves = math.ceil(math.ceil(m / tm) * math.ceil(n / tn) * groups / context.core_count)
-            records.append({"tile": [tm, tn, tk], "footprint_bytes_per_owner": buffers,
+            records.append({"tile": [tm, tn, tk], "split_k": split_k,
+                            "footprint_bytes_per_owner": buffers,
                             "exceeded_pools": exceeded, "resource_bound_ms": bound,
                             "maximum_owner_output_tiles": waves,
                             "logical_shape": list(geometry.logical_shape),
@@ -658,7 +695,7 @@ class MappedMatmul:
                 # Equal resource bounds can hide another serial output-tile
                 # drain/prologue on an owner. Avoid those extra waves before
                 # minimizing residency; smaller buffers alone are not faster.
-                score = (bound, waves, -tk, sum(buffers.values()), tm, tn)
+                score = (bound, waves, -split_k, -tk, sum(buffers.values()), tm, tn)
                 if selected is None or score < selected[0]:
                     selected = (score, recipe)
                     selected_geometry = geometry
@@ -667,12 +704,12 @@ class MappedMatmul:
                                 f"shape={context.op.local_shape}:groups={groups}:dtype={context.op.dtype}")
         res = selected[1], {
             "basis": "declared_candidates_resource_lower_bound",
-            "shape": list(context.op.local_shape[-3:]),
+            "shape": list(context.op.local_shape[(-3):]),
             "groups": groups,
             "default_128_grid_tiles": default_grid,
             "physical_compute_owners": context.core_count,
-            "subtile_policy": ("fp32_default_or_explicit" if automatic_subtiles
-                               else "explicit_only"),
+            "subtile_policy": ("all_dtype_underfilled_or_explicit"
+                               if automatic_subtiles else "explicit_only"),
             "underfilled_grid_candidates": bool(underfilled),
             "geometry": selected_geometry.to_dict(),
             "selected": asdict(selected[1]), "candidates": records,
@@ -693,7 +730,7 @@ class MappedMatmul:
         if len(_SELECT_CACHE) >= 1024:
             _SELECT_CACHE.pop(next(iter(_SELECT_CACHE)))
         _SELECT_CACHE[cache_key] = res
-        return res[0], deepcopy(res[1])
+        return res[0], (deepcopy(res[1]) if include_record else None)
 
     def lower(self, context):
         recipe, record = self.select(context)

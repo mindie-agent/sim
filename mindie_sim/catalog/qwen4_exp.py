@@ -203,14 +203,20 @@ def lower_ple(
         gathered = query.op_id
         has_host = bool(getattr(runtime, "engram_cpu_offload", False))
         if has_host:
+            uva_bytes = float(lookups * engram.row_bytes / max(1, parallel.tp))
             lookup = vector_op(
                 op_id=f"{prefix}.ple_host_uva_t{table.table_id}", deps=(query.op_id,),
                 stage=stage, layer=plan.index, requests=requests,
                 elements=lookups, ops_per_element=PLE_LOOKUP_OPS_PER_ELEM,
                 dtype="bf16", family="engram_rh2d", phase=mode,
                 recipe="ple_host_uva_lookup", shape=(padded_tokens, embed),
-                read_bytes_override=float(lookups * engram.row_bytes / max(ONE, parallel.tp)),
-                write_bytes_override=float(padded_tokens * embed * BF16_BYTES))
+                read_bytes_override=0.0,
+                write_bytes_override=float(padded_tokens * embed * BF16_BYTES),
+                metadata=(("resource_work", {
+                    "host_memory": uva_bytes,
+                    "host_vector": float(lookups * PLE_LOOKUP_OPS_PER_ELEM),
+                    "h2d": uva_bytes,
+                }),))
         else:
             lookup = vector_op(
                 op_id=f"{prefix}.ple_device_lookup_t{table.table_id}", deps=(query.op_id,),
@@ -260,6 +266,20 @@ def lower_ple(
             write_bytes_override=gated_output + state_bytes)
         ops.extend([kv, gate, conv])
         last = conv.op_id
+        if parallel.pcp > 1 and conv_k > 1 and any(v.phase == "prefill" for v in views):
+            prefill_reqs = sum(1 for v in views if v.phase == "prefill")
+            pcp_conv_bytes = float(
+                prefill_reqs * (conv_k - 1) * hc_mult * h * act_bytes
+                * (2 * parallel.pcp - 1) / parallel.pcp)
+            pcp_conv = comm_op(
+                op_id=f"{prefix}.pcp_ple_conv_state_t{table.table_id}",
+                deps=(last,), stage=stage, layer=plan.index, requests=requests,
+                family="allgather", phase=mode, recipe="pcp_ple_conv_state_step",
+                link_bytes=pcp_conv_bytes,
+                shape=(prefill_reqs * (conv_k - 1), hc_mult * h),
+                metadata=(("group_axis", "pcp"),))
+            ops.append(pcp_conv)
+            last = pcp_conv.op_id
     if not last:
         raise ModelingError(f"catalog_engram_table_not_at_layer:{plan.index}")
     return ops, last

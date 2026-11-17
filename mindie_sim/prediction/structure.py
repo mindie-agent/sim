@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import fields, replace
 from typing import Mapping
 import json
+from collections import OrderedDict
 
 from mindie_sim.catalog.types import QuantSpec
 from mindie_sim.schema.model import LayerPlan, ModelSpec, SloSpec, WorkloadSpec
@@ -63,7 +64,34 @@ def normalize_model(model: ModelSpec) -> ModelSpec:
     return replace(model, quant=quant, layer_plans=plans)
 
 
-def parse_case(value: Case | Mapping) -> Case:
+#: Bounded identity memo of already-parsed declarations.  ``Case`` is frozen and
+#: parsing is a pure function of the declaration, so an unchanged declaration
+#: object always yields the same parsed case.  The memo holds a strong reference
+#: to the producing input, so a recycled ``id`` misses instead of mis-hitting.
+_PARSE_MEMO: "OrderedDict[int, tuple]" = OrderedDict()
+_PARSE_MEMO_LIMIT = 8
+MEMO_INPUT = 0
+MEMO_PARSED = 1
+
+def _memoized_parse(value: Case) -> Case:
+    key = id(value)
+    entry = _PARSE_MEMO.get(key)
+    if entry is not None and entry[MEMO_INPUT] is value:
+        _PARSE_MEMO.move_to_end(key)
+        return entry[MEMO_PARSED]
+    parsed = _parse_case_uncached(value)
+    _PARSE_MEMO[key] = (value, parsed)
+    # A caller that re-parses the already-parsed value gets it back in O(1):
+    # normalisation is idempotent, so this is the same declaration.
+    if parsed is not value:
+        _PARSE_MEMO[id(parsed)] = (parsed, parsed)
+    _PARSE_MEMO.move_to_end(key)
+    while len(_PARSE_MEMO) > _PARSE_MEMO_LIMIT:
+        _PARSE_MEMO.popitem(last=False)
+    return parsed
+
+
+def _parse_case_uncached(value: Case | Mapping) -> Case:
     if not isinstance(value, Mapping):
         case = value
         if not isinstance(case.machine, Hardware):
@@ -87,6 +115,21 @@ def parse_case(value: Case | Mapping) -> Case:
             slo=SloSpec.from_mapping(value.get("slo")),
         )
     return _normalize_parsed_case(case)
+
+
+def parse_case(value: Case | Mapping) -> Case:
+    """Parse a declaration into the frozen internal Case.
+
+    A ``Case`` object is frozen and parsing is a pure function of it, so a
+    repeated parse of the same declaration object reuses the identical parsed
+    value.  A ``Mapping`` declaration may be mutated by its owner and is never
+    memoized.
+    """
+    if isinstance(value, Mapping):
+        # A raw mapping is mutable and must never be retained: parsing it is a
+        # pure function whose result belongs to the caller's active work only.
+        return _parse_case_uncached(value)
+    return _memoized_parse(value)
 
 
 def parse_model(value: Case | Mapping) -> Case:
@@ -125,6 +168,12 @@ def parse_model(value: Case | Mapping) -> Case:
 
 def _normalize_parsed_case(case: Case) -> Case:
     model = normalize_model(case.model)
+    # Every declared model acquires its explicit native auxiliary plans here,
+    # once, before geometry, residency or execution can consume them.  Adapters
+    # that already declared plans keep them; an undeclared auxiliary still
+    # raises ``draft_explicit_layer_plans_required`` at the geometry entry.
+    from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+    model = declare_native_auxiliary_plans(model)
     from .implementations import select
     from .implementation_selection import prepared_selection
 
@@ -205,7 +254,7 @@ def _normalize_parsed_case(case: Case) -> Case:
     # Carry the unaltered case machine/model identity with the parsed runtime so
     # every ordinary FeatureConfig/compiled feature record receives it.  This is
     # the deployment identity, not a measured supply or model-label branch.
-    from .subgraphs.instantiate import _identity_metadata
+    from .frontend_features import _identity_metadata
     metadata.update(_identity_metadata(case.machine, model))
     media = {request.request_id: request.media_tokens for request in case.workload.requests if request.media_tokens}
     if media:

@@ -1,25 +1,46 @@
 """Source-scoped vLLM-Ascend simulation presets.
 
-[Role] Keep model-document references separate from supported simulation choices.
+[Role] Keep structural model capability references separate from supported
+  simulation choices, without binding to repository or container revisions.
 [Invariants] A hardware family without a cited quantized checkpoint keeps its
-  caller's quantization. These subsets are not complete production launch files.
+  caller's quantization. Framework merge status is informational provenance,
+  never a gate on a mathematically valid parallel composition. These subsets
+  are not complete production launch files.
 [Timeouts & Locks] Bounded in-memory lookups; no I/O, network, devices or locks.
 [Side-Effect Policy] Returns new dictionaries; never launches or configures vLLM.
 """
 from copy import deepcopy
 
 
-_MAIN_REV = "1223fea314cb6172900bd615c9940fcd2c658925"
-_MODEL_REV = "8c30e4f491f73cba737a1dacc522894e437cdf3d"
+_REPO = "vllm-project/vllm-ascend"
 _DOC_ROOT = "docs/source/tutorials/models/"
+_ENV = {"HCCL_OP_EXPANSION_MODE": "AIV", "OMP_PROC_BIND": "false"}
+_MLAPO_ENV = {**_ENV, "VLLM_ASCEND_ENABLE_MLAPO": "1"}
+
+MTP_STANDARD_PROPOSAL_TOKENS = 3
+MTP_DSPARK_PROPOSAL_TOKENS = 5
+MTP_KIMI_K3_PROPOSAL_TOKENS = 7
+PAIRED_SFA_DOC_BLOCK_SIZE = 544
 
 
-def _profile(document, quant, *, revision=_MAIN_REV, lines, mtp=0, env=None):
+def _p(quant_by_arch, mtp, doc, *, mlapo=False, sp=True, mso=False,
+       engram_offload=False, support="vllm_ascend_main", kv_block_size=None):
     return {
-        "quant": quant, "graph_capture_mode": "full", "sp": True,
-        "mtp_proposal_tokens": mtp, "env": env or {},
-        "source": {"repository": "vllm-project/vllm-ascend", "revision": revision,
-                   "path": _DOC_ROOT + document, "lines": lines},
+        "quant": quant_by_arch,
+        "graph_capture_mode": "full",
+        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        "sp": sp,
+        "mtp_proposal_tokens": mtp,
+        "multistream_overlap_shared_expert": mso,
+        "engram_cpu_offload": engram_offload,
+        "framework_support": support,
+        "kv_block_size": kv_block_size,
+        "env": _MLAPO_ENV if mlapo else _ENV,
+        "source": {
+            "repository": _REPO,
+            "doc": _DOC_ROOT + doc,
+            "basis": "structural_runtime_capability",
+        },
     }
 
 
@@ -27,57 +48,103 @@ def _profile(document, quant, *, revision=_MAIN_REV, lines, mtp=0, env=None):
 # hardware families intentionally have no override; support on A2/A3 does not
 # establish an A5 checkpoint format. MTP and topology remain caller decisions.
 VA_RECOMMENDED_PROFILES = {
-    "deepseek-r1": _profile("DeepSeek-R1.md", {"a2": "w8a8", "a3": "w8a8"},
-                            lines="20-22,160", mtp=3),
-    "deepseek-v3.2": _profile("DeepSeek-V3.2.md", {"a2": "w8a8", "a3": "w8a8"},
-                              lines="18-20,134-153", mtp=3,
-                              env={"VLLM_ASCEND_ENABLE_MLAPO": "1"}),
-    "deepseek-v4-flash-0731": _profile(
-        "DeepSeek-V4-Flash.md", {"a2": "w8a8", "a3": "w8a8"},
-        revision=_MODEL_REV, lines="147-180,227-261", mtp=1),
-    "deepseek-v4-pro-0813": _profile(
-        "DeepSeek-V4-Pro.md", {"a2": "w4a8", "a3": "w4a8"},
-        revision=_MODEL_REV, lines="26-29,562-568"),
-    "glm-5.1": _profile("GLM5.md", {"a2": "w8a8", "a3": "w8a8"},
-                       lines="22-27,171,185,261", mtp=3,
-                       env={"VLLM_ASCEND_ENABLE_MLAPO": "1"}),
-    "glm-5.2": _profile("GLM5.2.md", {"a2": "w8a8", "a3": "w8a8"},
-                       lines="17-21,165-179", mtp=3),
-    "glm-5.3": _profile("GLM5.3.md", {"a2": "w8a8", "a3": "w8a8"},
-                       revision=_MODEL_REV, lines="27-29,175-207", mtp=3,
-                       env={"VLLM_ASCEND_ENABLE_MLAPO": "1"}),
-    "glm-5.3-flash": _profile(
-        "GLM5.3-Flash.md", {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
-        revision=_MODEL_REV, lines="19-21,158-220", mtp=3),
-    "qwen3.5-397b-a17b": _profile(
-        "Qwen3.5-397B-A17B.md", {"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
-        lines="25-29,176-217,220-280", mtp=3),
-    "qwen3.5-35b-a3b": _profile(
-        "Qwen3.6-35B-A3B.md", {"a2": "w8a8", "a3": "w8a8"},
-        lines="163-217,250", mtp=1),
-    "qwen3-next-80b-a3b": _profile("Qwen3-Next.md", {}, lines="19-23"),
-    "qwen3-235b-a22b": _profile("Qwen3-235B-A22B.md", {"a2": "w8a8", "a3": "w8a8"},
-                              lines="25-33"),
-    "qwen3-30b-a3b": _profile("Qwen3-30B-A3B.md", {"a2": "w8a8", "a3": "w8a8"},
-                             lines="19-26"),
-    "kimi-k2.5": _profile("Kimi-K2.5.md", {"a2": "w4a8", "a3": "w4a8"},
-                         lines="21,144-165", env={"VLLM_ASCEND_ENABLE_MLAPO": "1"}),
-    "kimi-k2.6": _profile("Kimi-K2.6.md", {"a2": "w4a8", "a3": "w4a8"},
-                         lines="21"),
-    "kimi-k3": _profile("Kimi-K3.md", {"a3": "w4a8"},
-                       revision=_MODEL_REV, lines="29,131-193,391-403"),
+    "deepseek-r1": _p({"a2": "w8a8", "a3": "w8a8"},
+                      MTP_STANDARD_PROPOSAL_TOKENS, "DeepSeek-V3.2.md", mlapo=True),
+    "deepseek-v3": _p({"a2": "w8a8", "a3": "w8a8"},
+                      MTP_STANDARD_PROPOSAL_TOKENS, "DeepSeek-V3.2.md", mlapo=True),
+    "deepseek-v3.2": _p({"a2": "w8a8", "a3": "w8a8"},
+                        MTP_STANDARD_PROPOSAL_TOKENS, "DeepSeek-V3.2.md", mlapo=True),
+    "deepseek-v4-pro-0813": _p({"a2": "w4a8", "a3": "w4a8"}, 0,
+                               "DeepSeek-V4-Pro.md", mso=True),
+    "deepseek-v4-10t": _p({"a2": "w4a8", "a3": "w4a8"},
+                          MTP_DSPARK_PROPOSAL_TOKENS, "DeepSeek-V4-Pro.md", mso=True),
+    "deepseek-v4-flash-0731": _p({"a2": "w8a8", "a3": "w8a8"}, 1,
+                                 "DeepSeek-V4-Flash.md", mso=True),
+    "deepseek-v4.1-flash": _p({"a2": "w4a8", "a3": "w4a8"},
+                              MTP_DSPARK_PROPOSAL_TOKENS,
+                              "DeepSeek-V4.1-Flash.md", mso=True,
+                              engram_offload=True),
+    "glm-5": _p({"a2": "w8a8", "a3": "w8a8"},
+                MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.md", mlapo=True, mso=True),
+    "glm-5.1": _p({"a2": "w8a8", "a3": "w8a8"},
+                  MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.md", mlapo=True, mso=True),
+    "glm-5.2": _p({"a2": "w8a8", "a3": "w8a8"},
+                  MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.2.md", mlapo=True, mso=True),
+    "glm-5.3": _p({"a2": "w8a8", "a3": "w8a8"},
+                  MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.2.md", mlapo=True, mso=True),
+    "glm-5.3-flash": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
+                        MTP_STANDARD_PROPOSAL_TOKENS, "GLM5.3-Flash.md", mso=True),
+    "kimi-k2": _p({"a2": "w8a8", "a3": "w8a8"}, 0, "Kimi-K2.md"),
+    "kimi-k2.5": _p({"a2": "w8a8", "a3": "w8a8"},
+                    MTP_STANDARD_PROPOSAL_TOKENS, "Kimi-K2.5.md"),
+    "kimi-k2.6": _p({"a2": "w4a8", "a3": "w4a8"}, 0, "Kimi-K2.6.md"),
+    "kimi-k3": _p({"a2": "w4a8", "a3": "w4a8"},
+                  MTP_KIMI_K3_PROPOSAL_TOKENS, "Kimi-K3.md", mlapo=True),
+    "kimi-k3.1": _p({"a3": "w4a8"}, MTP_STANDARD_PROPOSAL_TOKENS,
+                    "Kimi-K3.1-Pro.md", mlapo=True, mso=True,
+                    kv_block_size=PAIRED_SFA_DOC_BLOCK_SIZE),
+    "qwen3-235b-a22b": _p({"a2": "w8a8", "a3": "w8a8"}, 0, "Qwen3-MoE.md"),
+    "qwen3-30b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, 0, "Qwen3-MoE.md"),
+    "qwen3-next-80b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, 1, "Qwen3-Next.md"),
+    "qwen3.5-27b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, 1,
+                      "Qwen3.5-27B-Qwen3.6-27B.md", sp=False),
+    "qwen3.6-27b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, 1,
+                      "Qwen3.5-27B-Qwen3.6-27B.md", sp=False),
+    "qwen3.8-27b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
+                      MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.8-27B.md", sp=False),
+    "qwen3.5-35b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, 1,
+                          "Qwen3.6-35B-A3B.md", mso=True),
+    "qwen3.6-35b-a3b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
+                          MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.6-35B-A3B.md", mso=True),
+    "qwen3.5-397b-a17b": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"},
+                            MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.5-397B-A17B.md",
+                            mso=True),
+    "qwen3.8-flash-next": _p({"a2": "w4a8", "a3": "w4a8", "a5": "mxfp4"},
+                             MTP_STANDARD_PROPOSAL_TOKENS, "Qwen3.8-Flash-Next.md",
+                             mso=True, engram_offload=True),
+    "minimax-m3": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, 0,
+                     "MiniMax-M3.1-Flash.md", mso=True),
+    "minimax-m3.1-flash": _p({"a2": "w8a8", "a3": "w8a8", "a5": "mxfp8"}, 0,
+                             "MiniMax-M3.1-Flash.md", mso=True),
+    "step-5-preview": _p({"a5": "mxfp8"}, MTP_STANDARD_PROPOSAL_TOKENS,
+                         "Step-5-Preview.md", mso=True),
+    "gemma-4-31b": _p({}, 0, "Gemma4.md", sp=False),
+    "gemma-4-26b-a4b": _p({}, 0, "Gemma4.md", sp=True),
+}
+
+_MODEL_ALIASES = {
+    "deepseek-v3.2-prune-3l": "deepseek-v3.2",
+    "deepseek-v4-pro": "deepseek-v4-pro-0813",
+    "deepseek-v4-flash": "deepseek-v4-flash-0731",
 }
 
 
 def simulation_config(canonical, sku, arch):
     """Resolve only documented quant alternatives, with explicit coverage limits."""
-    profile = VA_RECOMMENDED_PROFILES.get(canonical, {})
+    resolved = _MODEL_ALIASES.get(canonical, canonical)
+    profile = VA_RECOMMENDED_PROFILES.get(resolved, {})
     quant = profile.get("quant", {}).get(arch)
+    # A documented profile may declare its execution controls; an undocumented
+    # model gets no fabricated capture/SP policy.  ``compose_case`` resolves the
+    # final value as ``explicit caller > documented profile > structural default``.
+    documented_capture = profile.get("graph_capture_mode")
+    if documented_capture not in {"full", "piecewise", "none"}:
+        documented_capture = None
+    documented_sp = profile.get("sp")
     return {
-        "model": canonical, "sku": sku, "hardware_family": arch, "quant": quant,
-        "graph_capture_mode": "full", "sp": True,
+        "model": canonical, "sku": sku, "hardware_family": arch,
+        "canonical_model": resolved, "hardware_arch": arch, "quant": quant,
+        "graph_capture_mode": documented_capture,
+        "compilation_config": (dict(profile["compilation_config"])
+                               if "compilation_config" in profile else None),
+        "sp": documented_sp,
         "mtp_proposal_tokens": int(profile.get("mtp_proposal_tokens", 0)),
-        "compilation_config": {"cudagraph_mode": "FULL_DECODE_ONLY"},
+        **({"kv_block_size": profile["kv_block_size"]}
+           if profile.get("kv_block_size") else {}),
+        "multistream_overlap_shared_expert": bool(
+            profile.get("multistream_overlap_shared_expert", False)),
+        "engram_cpu_offload": bool(profile.get("engram_cpu_offload", False)),
+        "framework_support": str(profile.get("framework_support", "analytical_projection")),
         "env": dict(profile.get("env", {})),
         "source": deepcopy(profile.get("source")),
         "coverage": "supported_simulation_subset",

@@ -1313,7 +1313,7 @@
     "bounded_lookup": {
       "exact_image_tbe_python_files_scanned": 1752,
       "matching_consumer_result": "Only op_util_conv2d.py:1169-1170 forwards DDR/L2 field names into the platform dictionary; no instruction-rate arithmetic found.",
-      "raw_log": "/Users/maoxx241/.local/share/mindie-remote-dev/runtime/01a1802e-afce-7092-8b08-cc98f9ca58bb/endpoints/8016de4fba91fbc1/jobs/1793157486735394000.stdout.log"
+      "raw_log": "home://.local/share/mindie-remote-dev/runtime/01a1802e-afce-7092-8b08-cc98f9ca58bb/endpoints/8016de4fba91fbc1/jobs/1793157486735394000.stdout.log"
     }
   }
 }

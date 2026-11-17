@@ -65,6 +65,7 @@ class Geometry:
     resource_units: Mapping[str, int] = field(default_factory=dict)
     buffers: Mapping[str, int] = field(default_factory=dict)
     buffer_units: Mapping[str, int] = field(default_factory=dict)
+    physical_mechanisms: object = None
 
     @classmethod
     def from_devices(cls, devices):
@@ -79,6 +80,7 @@ class Geometry:
              **{name: first.units(role) for name, (role, _) in modes.items()}},
             {pool: min(dict(device.buffers)[pool] for device in devices) for pool in pools},
             {pool: first.pool_units(pool) for pool in pools},
+            first.physical_mechanisms,
         )
 
 
@@ -94,11 +96,10 @@ class OperatorPlan:
 
     def lower(self, context: RecipeContext) -> Program:
         if self.native:
-            from fractions import Fraction
-            from .piecewise.compiler import NativeProgram
+            from .program import NativeProgram
             inner = self.program(replace(context, setup_ms=0, minimum_ms=0))
             return NativeProgram(
-                inner, tuple(getattr(inner, "work", ()) or ()), Fraction(0))
+                inner, tuple(getattr(inner, "work", ()) or ()))
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
             Stage("body", after=("setup",),

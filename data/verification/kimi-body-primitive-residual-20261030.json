@@ -13553,7 +13553,7 @@
     }
   ],
   "existing_short_context_parameters": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
     "sha256": "9bdb420ab66a42f42257fac8fdbf6364530e5e870af83c54b3fa00a2932f41e9",
     "training_context": 4096,
     "validation_context": 16384,

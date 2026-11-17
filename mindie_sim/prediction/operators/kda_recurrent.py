@@ -16,7 +16,7 @@ from dataclasses import dataclass, replace
 import math
 
 from mindie_sim.prediction.engine import Allocation
-from mindie_sim.prediction.mechanism import OperatorPlan, Work
+from mindie_sim.prediction.mechanism import Geometry, OperatorPlan, Work
 from mindie_sim.prediction.ownership import read_role, unit_group
 from mindie_sim.prediction.program import KernelProgram, ParallelProgram, PipelineProgram, Stage
 from mindie_sim.prediction.recover_ssm_work import record_head_bytes, record_slice_bytes
@@ -45,6 +45,25 @@ SOURCE = {
     "scope": "selected_source_kernel_not_capture_binary_identity",
 }
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
+ZERO_WORK = 0.0
+A5_AIC_UNITS = 32
+A5_AIV_UNITS = 64
+A5_UB_BYTES = 253952
+
+
+def frontend_geometry():
+    """Declared A5 ownership used before a device cohort is attached.
+
+    The source plan still recomputes the same work against its actual geometry;
+    this default only lets the frontend publish nonempty physical state IO.
+    """
+    return Geometry(
+        A5_AIC_UNITS,
+        {"vector": A5_AIV_UNITS, "mte2_aiv": A5_AIV_UNITS,
+         "mte3": A5_AIV_UNITS, "mte2_aic": A5_AIC_UNITS},
+        {"ub": A5_UB_BYTES},
+        {"ub": A5_AIV_UNITS},
+    )
 
 
 @dataclass(frozen=True)
@@ -329,6 +348,27 @@ def _head_stages(p, q, repeat, profile, context, placement, read,
     return tuple(stages)
 
 
+def summarize_work(params, geometry, *, execution=SourceExecution()):
+    """Canonical frontend/source-plan work for one complete KDA launch."""
+    p = params if isinstance(params, Params) else Params.parse(params)
+    units = geometry.resource_units.get("vector", geometry.compute_units)
+    blocks = min(units, len(p.lengths)*p.heads)
+    if "ub" not in geometry.buffers:
+        raise ModelingError("recurrent_kda_requires_declared_ub_capacity")
+    profile = buffer_profile(p, geometry.buffers["ub"])
+    read = read_role(geometry.resource_units, aiv=0)
+    work = Work()
+    for owner in range(blocks):
+        for q, heads, beta_count in scheduled_runs(
+                p.lengths, p.heads, blocks, owner,
+                beta_per_head=execution.beta_per_head):
+            work += head_work(
+                p, q, profile["parts"], read, include_beta=False,
+                delta_broadcast=execution.delta_broadcast).scaled(heads)
+            work += beta_work(p, q, read).scaled(beta_count)
+    return work
+
+
 def build(op, geometry, *, compact=True, execution=SourceExecution()):
     p = Params.parse(dict(op.metadata)["kda_recurrent_params"])
     units = geometry.resource_units.get("vector", geometry.compute_units)
@@ -340,14 +380,10 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     def runs(owner):
         return scheduled_runs(p.lengths, p.heads, blocks, owner, compact=compact,
                               beta_per_head=execution.beta_per_head)
-    work, cycles = Work(), []
+    work = summarize_work(p, geometry, execution=execution)
+    cycles = []
     for owner in range(blocks):
-        count = 0
-        for q, heads, beta_count in runs(owner):
-            work += head_work(p, q, profile["parts"], read, include_beta=False,
-                              delta_broadcast=execution.delta_broadcast).scaled(heads)
-            work += beta_work(p, q, read).scaled(beta_count)
-            count += 1
+        count = sum(1 for _ in runs(owner))
         cycles.append(count)
     cycles = tuple(cycles)
     fragments = state_fragments(op)
@@ -785,5 +821,12 @@ def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
                 shape, shape, shape, shape, deps=tuple(deps), dtype="bf16", layout="TND",
                 recipe=RECIPE, source_boundary="kernel", coverage="source_selected_recurrent_kernel",
                 metadata=tuple(sorted(metadata.items())), stream=stream, notes=tuple(notes))
+    summary = summarize_work(p, frontend_geometry())
+    op = summary.apply(op)
+    physical_read = float(sum(
+        amount for role, amount in summary.resources.items()
+        if role in {"mte2", "mte2_aiv"}))
+    if physical_read:
+        op = replace(op, mte2_bytes=max(float(op.mte2_bytes), physical_read))
     return replace(op, metadata=op.metadata + (
         ("state_accesses", state_accesses(op)),))

@@ -143,8 +143,11 @@ def test_capped_service_releases_unused_bandwidth_to_another_ready_operator():
     step, execution = execute((slow, fast), ResourceService(model))
     # Slow producer supplies250 B/ms; the remaining750 serves the3000-byte op.
     assert step.completion.time == 4
-    ends = {event["task"].split(":")[2]: event["end_ms"]
-            for event in execution.engine.trace if event["task"].endswith(":service")}
+    ends = {}
+    for event in execution.engine.trace:
+        if event["demand"]:
+            name = event["task"].split(":")[2]
+            ends[name] = max(ends.get(name, 0.0), event["end_ms"])
     assert ends == {"copy": 4, "fast": 4}
     assert execution.engine.serviced["memory@r0:s0"] == 4000
 

@@ -165,12 +165,12 @@ Storage is retained separately:
 The ledger embeds pinned paths, SHA-256 hashes and line ranges from the local
 audit. Key paths:
 
-- `/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp`
-- `/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_prepare.h`
-- `/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_post_wu.h`
-- `/Users/maoxx241/code/vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_finalize.h`
-- `/Users/maoxx241/code/sim-rewrite-20261027/mindie_sim/prediction/recurrent.py`
-- `/Users/maoxx241/code/profiler/tests/fixtures/fusion_contracts/a5_kimi_k3.csv`
+- `repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_host/op_api/aclnn_chunk_kda_fwd.cpp`
+- `repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_prepare.h`
+- `repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_post_wu.h`
+- `repository://vllm-ascend-v41-private/csrc/attention/chunk_kda_fwd/op_kernel/arch35/chunk_kda_fwd_finalize.h`
+- `repository://sim-rewrite-20261027/mindie_sim/prediction/recurrent.py`
+- `repository://profiler/tests/fixtures/fusion_contracts/a5_kimi_k3.csv`
 
 The fixture rows are provenance examples. The ledger identifies the pinned
 source condition, not an installed capture binary.

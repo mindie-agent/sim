@@ -8,7 +8,7 @@
   "revision": "a4a795857868729fbdbb0118c1e06c8655a7b31b",
   "sources": [
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_data.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_data.h",
       "relative_path": "op_kernel/causal_conv1d_tiling_data.h",
       "sha256": "d14363c7ad45b6522632e089270fa2dc7365a091d4565b976cb18b3c555467cb",
       "bytes": 2237,
@@ -17,7 +17,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
       "relative_path": "op_kernel/causal_conv1d.cpp",
       "sha256": "73835f0d1ec7e7ddc0aca92c3e55821b312440e964dfad4e5aeb8b448f50f281",
       "bytes": 3271,
@@ -26,7 +26,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
       "relative_path": "op_kernel/causal_conv1d_fn_tasks.h",
       "sha256": "c65ab9cd60492580fce6063dbf6eb511ba97dd3636a4f00854108919f112dd18",
       "bytes": 12945,
@@ -35,7 +35,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
       "relative_path": "op_kernel/causal_conv1d.h",
       "sha256": "040d8fbc70e68710633dd33427c1d1888f47beb6c1f26bed6140db601295f554",
       "bytes": 57111,
@@ -44,7 +44,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_key.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_tiling_key.h",
       "relative_path": "op_kernel/causal_conv1d_tiling_key.h",
       "sha256": "c0bb9ace833d13f45a992f72b2c6dfb9174bb79bf4499f02a7121da459119fb0",
       "bytes": 3603,
@@ -53,7 +53,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_update.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_update.h",
       "relative_path": "op_kernel/causal_conv1d_update.h",
       "sha256": "d3857bc00e44bdf174c72ceeeda8d8e2e2db2fb480a561ecba5c88ae7d07c2b9",
       "bytes": 3765,
@@ -62,7 +62,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
       "relative_path": "op_kernel/causal_conv1d_fn.h",
       "sha256": "6889b93c74a5a293cc954a3c6ba862794b9e1f7fb2618ee585f11a609701fae4",
       "bytes": 4180,
@@ -71,7 +71,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_common.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_common.h",
       "relative_path": "op_kernel/causal_conv1d_common.h",
       "sha256": "d2155e287cad145128f0cf8a0847278d3b264133531f47daaeade8933e7de688",
       "bytes": 1932,
@@ -80,7 +80,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
       "relative_path": "op_kernel/arch35/causal_conv1d_regbase.h",
       "sha256": "c47a785a92926fc38d53eaf726d51807b1f702729fc85fcde1442c1e728601a5",
       "bytes": 16666,
@@ -89,7 +89,7 @@
       "same_as_image": true
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
       "relative_path": "op_host/causal_conv1d_tiling.cpp",
       "sha256": "5a34e7e4df90816faddc26ca4037d1064806495319631ac72a1fc9cd8d7f0128",
       "bytes": 9545,
@@ -97,7 +97,7 @@
       "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
       "relative_path": "op_host/causal_conv1d_tiling_planner.h",
       "sha256": "8dfcfba40075364b583f0bf60d50889965975d769677151a6ce10bbdb454e6a5",
       "bytes": 12757,
@@ -105,7 +105,7 @@
       "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_utils.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_utils.h",
       "relative_path": "op_host/causal_conv1d_tiling_utils.h",
       "sha256": "ee4a98db1d2ae65fef76961db29ffe63aa962cad07d0529563cf68ea737bff36",
       "bytes": 5857,
@@ -113,7 +113,7 @@
       "image_comparison": "host source absent from retained image headers; revision anchored by all kernel matches"
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
       "relative_path": "op_host/causal_conv1d_tiling_validation.h",
       "sha256": "91f6cd899bba5e06ae664a8fc7df4900f2c5fa74c461f1693640541cd3bf945e",
       "bytes": 35305,
@@ -133,7 +133,7 @@
       "bytes": 29521
     },
     {
-      "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+      "path": "repository://sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
       "role": "exact_image_gdn_caller",
       "sha256": "e9ed210b4ca4431ee40916f06f0272e5e781eb04b61b084bacea216799fbca98",
       "bytes": 33354
@@ -157,21 +157,21 @@
       "requires": "Implement the exact FLA native AscendC runMode=0 fn/prefill branch selected by gdn caller. Existing wave2 causal_conv_prefill models Triton and must not be mislabeled as this implementation. Public implementation identity must select the native lowerer explicitly.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "lines": [
             23,
             25
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/gdn-image-c3d00a196905/gdn.py.txt",
           "lines": [
             499,
             510
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
           "lines": [
             48,
             68
@@ -184,35 +184,35 @@
       "requires": "Translate legal shape-dependent tiling, UB resource budget and token/dim ownership exactly; no model-name or sequence-length multipliers. Preserve dim multiple-of-16 input contract, width2..4, CUTBS/CUTBSD and explicit sequence-range eligibility.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
           "lines": [
             76,
             184
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_planner.h",
           "lines": [
             187,
             300
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
           "lines": [
             202,
             213
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
           "lines": [
             304,
             308
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
           "lines": [
             55,
             121
@@ -225,21 +225,21 @@
       "requires": "Keep parameter presence, host visibility, dtype, values, null/pad and has-initial state distinct. Count source metadata loads at their actual block/sequence scope; do not globally hoist them or infer eight-byte loads from an int64 cast.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling_validation.h",
           "lines": [
             519,
             558
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
           "lines": [
             1138,
             1196
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
           "lines": [
             66,
             92
@@ -252,14 +252,14 @@
       "requires": "If native tiling enables initial-state workspace, model sync32B per launched block and snapshot batch*(width-1)*dim*2B storage separately from actual copied payload. Each valid true-state sequence/channel has one assigned snapshot owner, followed by SyncAll before computation. Source false flags suppress copies, not the existence of the global sync path.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_host/causal_conv1d_tiling.cpp",
           "lines": [
             138,
             155
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
           "lines": [
             192,
             259
@@ -272,35 +272,35 @@
       "requires": "Derive actual vector loads, casts, Mul/Add, rolling partials, SiLU, stores, event waits and output drain from the selected source branch. Width, bias and activation change the execution program. Do not map useful math only to generic bandwidth/compute maxima.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
           "lines": [
             305,
             359
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
           "lines": [
             463,
             550
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
           "lines": [
             563,
             755
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.h",
           "lines": [
             1318,
             1322
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/arch35/causal_conv1d_regbase.h",
           "lines": [
             1,
             340
@@ -313,21 +313,21 @@
       "requires": "Chunk history may read preceding x within a sequence or cached/zero history. Only the sequence-ending chunk writes state. Every valid output token/channel exactly once. Invalid/null/pad work has no invented output initialization. Physical copies and logical tensor bytes must be separately accounted.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
           "lines": [
             96,
             171
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
           "lines": [
             175,
             189
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn_tasks.h",
           "lines": [
             264,
             320
@@ -340,14 +340,14 @@
       "requires": "FN has one native kernel launch. Snapshot, SyncAll, rolling loop and state tail writes are stages inside it; do not create host-launch tax per token/block. Surrounding Python layout materializations/copy_ remain separate operators.",
       "refs": [
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d.cpp",
           "lines": [
             1,
             74
           ]
         },
         {
-          "path": "/Users/maoxx241/code/sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
+          "path": "repository://sim-rewrite-20261027/data/observations/sources/native-causal-conv-a4a7958/op_kernel/causal_conv1d_fn.h",
           "lines": [
             61,
             78

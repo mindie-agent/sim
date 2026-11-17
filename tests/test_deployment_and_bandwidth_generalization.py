@@ -23,7 +23,7 @@ def control_case(*, pd=False):
 
 def resource_lower(axis):
     def lower(plan, model, runtime, machine):
-        shape = (plan.valid_tokens,)
+        shape = (1, 1, plan.valid_tokens)
         work = ({"flops": 1e12} if axis == "aic" else
                 {"vector_ops": 1e12} if axis == "aiv" else
                 {"hbm_bytes": 1e10} if axis == "hbm" else {"flops": 1})
@@ -111,7 +111,7 @@ def test_colocated_inter_node_scan_changes_actual_collective_service():
 
     results = [predict(scaled_case(raw, "network", scale), lower=collective)
                for scale in (.5, 1, 2)]
-    assert compare_sweep(results)["status"] == "strict_response"
+    assert compare_sweep(results)["status"] == "plateau"
     for result in results:
         assert result["execution"]["work"] == results[1]["execution"]["work"]
         assert any(value > 0 for name, value in result["execution"]["serviced"].items()

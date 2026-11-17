@@ -114,7 +114,7 @@
       },
       "launch_declaration": {
         "source": {
-          "path": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+          "path": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
           "sha256": "3642c774841205a58d18951e41c5338989858a35ece0c9c5c3c33c71a404373d",
           "size_bytes": 2199
         },
@@ -148,7 +148,7 @@
           0.32768
         ],
         "acceptance_mode": "marginal",
-        "source": "/Users/maoxx241/code/mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
+        "source": "repository://mindie-agent/.workstreams/hp-serving/a3-highconc-decode/scripts/cases/serve_glm53f_w4a8.sh",
         "label": "configured synthetic acceptance; not observed acceptance"
       },
       "profiled_client": {

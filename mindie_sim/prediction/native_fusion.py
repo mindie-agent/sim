@@ -17,7 +17,7 @@ from mindie_sim.schema.operators import OpSpec
 
 from .mechanism import OperatorPlan, PlannedRecipe, Work
 from .native_fusion_traffic import apply_traffic_profile
-from .program import KernelProgram, RecipeBook, ResourceEnvelope, Stage, TransferRecipe
+from .program import KernelProgram, RecipeBook, Stage, TransferRecipe
 
 
 RECIPE = "declared_native_fusion"
@@ -670,8 +670,10 @@ def lower_native_fusions(ops, runtime, *, local_tokens=None, public_outputs=()):
             members, declaration, profile,
             external_outputs=external["references"])
         for before, after in zip(members, adjusted):
+            selected = book.select(after)
             if (before.hbm_bytes != after.hbm_bytes
-                    and not isinstance(book.select(after), (ResourceEnvelope, TransferRecipe))):
+                    and not isinstance(selected, TransferRecipe)
+                    and not getattr(selected, "traffic_rewrite_capable", False)):
                 # Shape-generated memory programs can reconstruct transfers
                 # independently of OpSpec bytes; subtracting only the envelope
                 # would claim a saving that their executed program does not make.

@@ -35,7 +35,7 @@ def _nodes(report):
 
 
 def _tiny_case():
-    return {"machine": {"name": "declared", "architecture": "cuda", "num_devices": 1,
+    return {"machine": {"name": "declared", "architecture": "declared", "num_devices": 1,
                         "device": {"memory_bytes": 1024 ** 3,
                                    "compute_peaks": {"bf16": 1e9, "fp32": 1e9},
                                    "rates": {"memory": 1e9, "vector": 1e9},

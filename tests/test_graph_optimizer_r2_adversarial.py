@@ -302,8 +302,13 @@ def test_r03_existing_l1_holders_reject_an_overlapping_prefetch():
             "id": "r2_l1_holder", "kernel": "L1Holder", "entry": True,
             "exit": True, "buffers": ({"id": "w", "pool": "l1",
                                        "bytes": 524288,
-                                       "units": tuple(range(24))},)}),
-        ))
+                                       "units": tuple(range(1, 24))},)}),
+                  # M2 lowers the GEMM body through a physical matrix recipe
+                  # whose first owner needs L1 unit 0.  Reserve that unit as a
+                  # declared optimizer hold so the holder remains executable
+                  # while the planner still sees all 24 units held.
+                  ("optimizer_l1_hold", {"bytes": 524288, "units": (0,)})),
+    )
     plan = canonical_plan(case(), (holder,))
     assert declared_l1_holders(plan) == 12 * 1024 * 1024
     decision = plan_prefetch(
@@ -345,9 +350,13 @@ def test_r03_canonical_prefetch_acquires_at_start_and_frees_at_consumer():
     result = trial.evaluate(audit_allocations=True)
     trace = [row for row in result.get("allocation_trace", ())
              if str(row.get("pool", "")).startswith("l1")]
-    acquires = [row for row in trace if row["action"] == "acquire"]
-    releases = [row for row in trace if row["action"] == "release"]
-    assert acquires and releases
+    # The matrix program also grants/releases per-tile L1 panels; isolate the
+    # prefetch grant so the grant-lifetime assertion is not the first tile.
+    acquires = [row for row in trace if row["action"] == "acquire"
+                and prefetch_id in row["name"]]
+    releases = [row for row in trace if row["action"] == "release"
+                and prefetch_id in row["name"]]
+    assert len(acquires) == len(releases) == 1
     rows = timeline_by_op(result)
     assert acquires[0]["time"] == pytest.approx(rows[prefetch_id]["ready_ms"])
     # The grant is held until both the consumer kernel and the producer copy

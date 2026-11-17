@@ -205,7 +205,7 @@
       },
       "frozen_scalar_store_binding": {
         "source_case": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
+          "path": "repository://profiler/examples/structure/cases/a5-qwen36-tp2-long-context-source.json",
           "sha256": "40d2a8b85bb81c154afcd25e4c3942b666e679f760f117fc3a49ab996bfcdd67",
           "size_bytes": 5829
         },
@@ -232,7 +232,7 @@
       },
       "frozen_hccl_transfer": {
         "parameter_source": {
-          "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
+          "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/qwen36-a5-tp2.json",
           "sha256": "b6fd9184b486a3e78049023c5bc94505cea1e19f62de35a120ff2c1a94f782e1",
           "size_bytes": 31247
         },

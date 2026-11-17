@@ -12,7 +12,9 @@
   Chunk pipeline, receive credits/residency and one declared per-hop startup
   are actual tasks; missing parameters stay explicit unknowns. Joint plans
   cover complete physical groups, account each rank once and never merge
-  unrelated groups.
+  unrelated groups. A direct mesh is selected only when every directed peer of
+  a single-node K_8 group owns one declared per_pair hop; its AllReduce keeps
+  dependent ReduceScatter then AllGather phases.
 [Timeouts & Locks] Finite rank graph, bounded route cache and bounded chunk
   count; no network I/O.
 [Side-Effect Policy] Only caches paths and submits caller-owned Engine tasks.
@@ -28,6 +30,9 @@ from mindie_sim.schema.common import ModelingError
 from .communication import CommunicationWork, MessageFlow, RoutedHop, RoutedMessage
 from .engine import Resource
 from .peer_traffic import PeerTraffic
+
+MS_PER_S = 1000.0
+EIGHT_KIB = 8192
 
 
 _PORT_SEMANTICS = {"per_port", "fully_connected", "mesh"}
@@ -852,6 +857,36 @@ STARTUP_ONE = 1
 STARTUP_ZERO_FLOAT = 0.0
 DEFAULT_MAX_PHYSICAL_CHUNKS = 4096
 STARTUP_ZERO = 0
+#: Collectives with a publishable all-to-all mesh algorithm.
+DIRECT_MESH_FAMILIES = frozenset({"allreduce", "reduce_scatter", "allgather"})
+#: Physical phase order; AllReduce keeps dependent ReduceScatter then AllGather.
+DIRECT_MESH_PHASES = {
+    "allreduce": ("reduce_scatter", "all_gather"),
+    "reduce_scatter": ("reduce_scatter",),
+    "allgather": ("all_gather",),
+}
+#: A single-node K_8 UB mesh is the largest declared direct-peer domain.
+DIRECT_MESH_MAX_PEERS = 8
+
+
+@dataclass(frozen=True)
+class TopologyCommunicationWork(CommunicationWork):
+    """Communication ledger that also publishes each resource's capacity.
+
+    ``wire_bytes`` is the physical wire work.  ``peak_bytes_per_ms`` is the
+    matching Engine resource rate, so an independent Link_Util consumer never
+    has to re-derive the capacity from a different declaration.
+    """
+
+    capacity_by_resource: Mapping[str, float] = field(default_factory=dict)
+
+    def to_dict(self):
+        result = super().to_dict()
+        for name, row in result["resources"].items():
+            capacity = self.capacity_by_resource.get(name)
+            if capacity is not None:
+                row["peak_bytes_per_ms"] = float(capacity)
+        return result
 
 
 class Topology:
@@ -889,6 +924,27 @@ class Topology:
         # second IR or a metadata re-parse.  Explicit transport arguments take
         # precedence; T04/SIM-STRUCTURE can also pass the object directly.
         self._transport_bindings = {}
+        # One selected direct-mesh plan per (op_id, replica).  The public
+        # ledger returns that plan's physical wire instead of re-deriving ring
+        # demand for the same invocation.
+        self._mesh_plans = {}
+        # Declared protocol startup (channel ``alpha_us``) of a physical phase.
+        # Absent means unknown; it is never synthesized from a SKU name.
+        self._channel_startup_ms = {}
+        channels = getattr(machine, "transfer_channels", ()) or ()
+        entries = channels.items() if isinstance(channels, Mapping) else channels
+        for name, items in entries:
+            value = dict(items).get("alpha_us")
+            if value is None:
+                continue
+            try:
+                amount = float(value)
+            except (TypeError, ValueError):
+                raise ModelingError(
+                    f"transport_channel_alpha_invalid:{name}") from None
+            if not math.isfinite(amount) or amount < 0:
+                raise ModelingError(f"transport_channel_alpha_invalid:{name}")
+            self._channel_startup_ms[str(name)] = amount / MS_PER_S
 
     def startup_descriptor(self, op, group_size):
         """Resolve this collective's declared startup model once."""
@@ -900,6 +956,97 @@ class Topology:
             family=family, group_size=int(group_size), metadata=metadata,
             runtime_mode=self.collective_startup_mode,
             topology_protocols=self.collective_protocols)
+
+    def direct_mesh_groups(self, op, replica):
+        """Declared single-node full all-to-all pair mesh for this invocation.
+
+        Selection is a physical declaration, not a family or SKU shortcut:
+        every directed peer of the group must own exactly one ``per_pair``
+        hop, all ranks must share one node, and the group must fit the declared
+        K_8 direct domain.  An explicit custom ``steps`` that is not the
+        collective's ordinary round declaration opts out, so a caller can keep
+        a ring envelope on the same hardware.
+        """
+        metadata = dict(op.metadata)
+        family = str(metadata.get("collective", op.family)).strip().lower()
+        if family not in DIRECT_MESH_FAMILIES or "peer_traffic" in metadata:
+            return family, ()
+        axis = metadata.get("group_axis", "tp")
+        try:
+            stage = int(metadata.get("source_stage", op.stage))
+        except (TypeError, ValueError):
+            return family, ()
+        if not 0 <= stage < self.parallel.pp:
+            return family, ()
+        phases = DIRECT_MESH_PHASES[family]
+        local = set(self.ranks(replica, stage))
+        groups = tuple(self.groups(axis, replica, stage, metadata=metadata))
+        if not groups:
+            return family, ()
+        for ranks in groups:
+            # This per-replica program owns only its own ranks; a cross-replica
+            # cohort stays on its declared joint path.
+            if not set(ranks) <= local:
+                return family, ()
+            if not 2 <= len(ranks) <= DIRECT_MESH_MAX_PEERS:
+                return family, ()
+            nodes = {self._rank_node.get(rank, int(rank) // self._ranks_per_node)
+                     for rank in ranks}
+            if len(nodes) != 1:
+                return family, ()
+            rounds = len(phases) * (len(ranks) - 1)
+            if metadata.get("steps", rounds) != rounds:
+                return family, ()
+            for source in ranks:
+                for destination in ranks:
+                    if source == destination:
+                        continue
+                    try:
+                        path = self.route(source, destination)
+                    except ValueError:
+                        # An undeclared route is not a declared full mesh; the
+                        # ordinary ledger still owns that routing failure.
+                        return family, ()
+                    if len(path) != 1:
+                        return family, ()
+                    if self.links[path[0][0]].semantics != "per_pair":
+                        return family, ()
+        return family, groups
+
+    def declares_direct_mesh(self, op, replica) -> bool:
+        """True when this invocation declares the direct K_8 pair mesh."""
+        return bool(self.direct_mesh_groups(op, replica)[1])
+
+    def bind_direct_mesh(self, op, replica, plan) -> None:
+        """Publish the one mesh plan selected for an invocation."""
+        if len(self._mesh_plans) >= EIGHT_KIB:
+            self._mesh_plans.clear()
+        self._mesh_plans[(str(getattr(op, "op_id", "")), int(replica))] = plan
+
+    def bound_mesh_plan(self, op, replica):
+        if not self._mesh_plans:
+            return None
+        return self._mesh_plans.get(
+            (str(getattr(op, "op_id", "")), int(replica)))
+
+    def mesh_phase_startup_ms(self, links) -> float:
+        """Declared per-phase protocol startup; unknown stays zero."""
+        return max((self._channel_startup_ms.get(str(link.channel), 0.0)
+                    for link in links), default=0.0)
+
+    def _work_with_capacity(self, work) -> TopologyCommunicationWork:
+        rates = self._resource_rates
+        if rates is None:
+            self.resources()
+            rates = self._resource_rates
+        return TopologyCommunicationWork(
+            work.useful_by_rank, work.useful_by_resource, work.wire_by_resource,
+            work.transactions_by_resource, work.transaction_frames, work.messages,
+            work.setup_ms, work.routed_useful_bytes, work.physical_wire_bytes,
+            work.path_latency_ms,
+            capacity_by_resource={
+                name: rates[name] for name in work.wire_by_resource
+                if name in rates})
 
     def location(self, rank: int) -> dict:
         """Return the declared die/package/node placement of one rank."""
@@ -932,22 +1079,27 @@ class Topology:
     def _has_endpoint_rate(self, link, rank: int) -> bool:
         return link.endpoint_capacity_bytes_per_ms(int(rank)) is not None
 
-    def resources(self):
-        if self._resource_cache is not None:
-            return self._resource_cache
+    def _build_resources(self, active: frozenset[int] | None = None):
         result = []
         for link in self.links.values():
             endpoint_ranks = sorted({int(rank) for rank, _ in link.endpoint_rates})
+            if active is not None and not (set(link.members) & active):
+                continue
             if link.semantics == "per_pair":
                 result.extend(Resource(
                     f"{self.namespace}link:{link.name}:pair{source}>{destination}",
                     link.capacity_bytes_per_ms, "bytes",
-                ) for source in link.members for destination in link.members if source != destination)
+                ) for source in link.members for destination in link.members
+                    if source != destination
+                    and (active is None or source in active or destination in active))
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in endpoint_ranks
+                              if active is None or rank in active
                               for direction in ("tx", "rx"))
             elif link.semantics in _PORT_SEMANTICS:
-                # Per-port semantics already expose every placement's tx/rx;
+                # Per-port semantics expose every placement's tx/rx.  A source
+                # on one isolated replica still needs its peers' destination
+                # port resources, so a touching link retains all its ports.
                 # endpoint_rates changes those resources, never a second copy.
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in link.members
@@ -962,10 +1114,26 @@ class Topology:
             if link.switch_capacity_bytes_per_ms is not None:
                 result.append(Resource(f"{self.namespace}link:{link.name}:switch_plane",
                                        link.switch_capacity_bytes_per_ms, "bytes"))
-        self._resource_cache = tuple(result)
+        return tuple(result)
+
+    def resources(self):
+        if self._resource_cache is not None:
+            return self._resource_cache
+        self._resource_cache = self._build_resources()
         self._resource_rates = {resource.name: resource.rate
                                 for resource in self._resource_cache}
         return self._resource_cache
+
+    def resources_for_ranks(self, ranks):
+        """Link resources touching one replica, not the whole declared cluster."""
+        active = frozenset(int(rank) for rank in ranks)
+        cache = getattr(self, "_rank_resource_cache", None)
+        if cache is None:
+            cache = {}
+            self._rank_resource_cache = cache
+        if active not in cache:
+            cache[active] = self._build_resources(active)
+        return cache[active]
 
     def route(self, source, destination):
         key = source, destination
@@ -1405,7 +1573,8 @@ class Topology:
             self._transport_bindings.clear()
         self._transport_bindings[id(op)] = resolved
         self._transport_bindings[getattr(op, "op_id", id(op))] = resolved
-        if algorithm not in {"ring", "pairwise", "direct_peer", "startup_waves"}:
+        if algorithm not in {"ring", "pairwise", "direct_peer", "direct_mesh",
+                             "startup_waves"}:
             raise ModelingError(f"joint_collective_algorithm_unsupported:{algorithm}")
         if (algorithm not in {"direct_peer", "startup_waves"}
                 and (chunk_bytes is not None or hop_startup_us
@@ -1419,6 +1588,54 @@ class Topology:
         if alltoall and unique_groups:
             startup = self.startup_descriptor(
                 op, len(next(iter(unique_groups))))
+        if algorithm == "direct_mesh":
+            from .direct_peer import DirectMeshGroup, DirectMeshPhase, DirectMeshPlan
+
+            if family not in DIRECT_MESH_FAMILIES:
+                raise ModelingError(
+                    f"direct_mesh_collective_family_unsupported:{family}")
+            names = DIRECT_MESH_PHASES[family]
+            groups = []
+            for ranks in unique_groups:
+                if len(ranks) <= 1:
+                    continue
+                if len(ranks) > DIRECT_MESH_MAX_PEERS:
+                    raise ModelingError(
+                        f"direct_mesh_collective_exceeds_declared_peers:{len(ranks)}")
+                volumes = {rank: volume_by_rank[rank] for rank in ranks}
+                if len(set(volumes.values())) > 1:
+                    raise ModelingError(
+                        "direct_mesh_collective_requires_equal_per_rank_volume")
+                if len({self._rank_node[rank] for rank in ranks}) != 1:
+                    raise ModelingError(
+                        "direct_mesh_collective_requires_single_node_group")
+                rounds = len(names) * (len(ranks) - 1)
+                if metadata.get("steps", rounds) != rounds:
+                    raise ModelingError(
+                        "direct_mesh_collective_round_count_conflicts_with_declaration")
+                links = []
+                for source in ranks:
+                    for destination in ranks:
+                        if source == destination:
+                            continue
+                        path = self.route(source, destination)
+                        if len(path) != 1:
+                            raise ModelingError(
+                                "direct_mesh_collective_requires_one_hop_peer")
+                        link = self.links[path[0][0]]
+                        if link.semantics != "per_pair":
+                            raise ModelingError(
+                                "direct_mesh_collective_requires_per_pair_links")
+                        links.append(link)
+                volume = next(iter(volumes.values()), STARTUP_ZERO_FLOAT)
+                payload = volume / rounds if rounds else STARTUP_ZERO_FLOAT
+                startup_ms = self.mesh_phase_startup_ms(links)
+                groups.append(DirectMeshGroup(
+                    ranks, tuple((rank, volumes[rank]) for rank in ranks),
+                    tuple(DirectMeshPhase(
+                        ranks, payload, self, phase=name, startup_ms=startup_ms)
+                        for name in names), self))
+            return DirectMeshPlan(family, tuple(groups))
         if algorithm == "ring":
             if "peer_traffic" in metadata:
                 raise ModelingError(
@@ -1565,6 +1782,11 @@ class Topology:
         resolved through the same function.  Metadata is only the fallback for
         a native network op that carries its own explicit transport declaration.
         """
+        mesh = self.bound_mesh_plan(op, replica)
+        if mesh is not None:
+            # The selected mesh plan owns this invocation's physical wire; do
+            # not re-derive ring demand from the same operator ledger.
+            return self._work_with_capacity(mesh.accounting())
         if transport is None and recipe is not None:
             from .direct_peer import resolve_transport_options
             transport = resolve_transport_options(recipe, op)
@@ -1617,12 +1839,12 @@ class Topology:
                     path_latency += hop.latency_ms
                 max_path_latency = max(max_path_latency, path_latency)
                 latency = max(latency, path_latency * rounds)
-        return CommunicationWork(
+        return self._work_with_capacity(CommunicationWork(
             useful_by_rank, useful, wire, transactions, transaction_frames, count, latency,
             routed_useful, physical_wire, max_path_latency,
-        )
+        ))
 
     def demand(self, op, replica, *, volume=None, transport=None, recipe=None):
         work = self.accounting(
             op, replica, volume=volume, transport=transport, recipe=recipe)
-        return dict(work.wire_by_resource), work.setup_ms
+        return work.wire_by_resource, work.setup_ms

@@ -66,19 +66,18 @@ def _base_layout(parallel: Any, experts: int) -> tuple[int, ...]:
     ep = max(ONE, int(parallel.ep))
     if experts <= ZERO:
         raise ModelingError("expert_slot_plan_requires_routed_experts")
-    if experts % ep == ZERO:
-        base = experts // ep
-        return tuple(base for _ in range(ep))
-    if ep % experts == ZERO:
-        return tuple(ONE for _ in range(ep))
-    raise ModelingError(f"experts_not_divisible_by_ep:{experts}%{ep}")
+    # Native EPLB convention: each rank owns ceil(E/EP) base slots.  The last
+    # ``EP*base - E`` slots are automatic padding copies cycling through the
+    # logical ids, so a nondivisible E never drops a logical expert.
+    base = (experts + ep - ONE) // ep
+    return tuple(base for _ in range(ep))
 
 
 def _uniform_ids(rank: int, base: int, experts: int, ep: int) -> list[int]:
-    if experts % ep == ZERO:
-        start = rank * base
-        return list(range(start, start + base))
-    return [rank % experts]
+    """Logical ids for one rank's contiguous base slot range."""
+    del ep
+    start = int(rank) * int(base)
+    return [int((start + offset) % experts) for offset in range(int(base))]
 
 
 def expert_slot_plan(

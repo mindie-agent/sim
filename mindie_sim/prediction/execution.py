@@ -80,6 +80,7 @@ _LAYER_INDEX_RE = re.compile(r'"layer":\s*\d+')
 #: duration, a schedule or a served amount - only the declaration text.
 _META_TEXT_CACHE: dict = {}
 _META_ID_CACHE: dict = {}
+_META_KEY_CACHE: dict = {}
 _META_DICT_CACHE: dict = {}
 _META_SCAN_CACHE: dict = {}
 _NO_REV_OPS_CACHE: dict = {}
@@ -98,8 +99,8 @@ def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
     if not metadata:
         return False, False, False
     hit = _META_SCAN_CACHE.get(id(metadata))
-    if hit is not None and hit[0] is metadata:
-        return hit[1], hit[2], hit[3]
+    if hit is not None and hit[FIRST] is metadata:
+        return hit[SECOND], hit[2], hit[3]
     if isinstance(metadata, _AbcMapping):
         has_reb = any(k in _SCAN_REBIND_KEYS for k in metadata)
         has_rev = bool(metadata.get("reverse_of_collective"))
@@ -189,6 +190,19 @@ def _project_meta_pair(pair):
 
 
 def op_meta_key_from_metadata(metadata) -> Any:
+    """Layer-zero canonical projection of one immutable metadata declaration."""
+    from .physical_key import operator_metadata_key
+    hit = _META_KEY_CACHE.get(id(metadata))
+    if hit is not None and hit[FIRST] is metadata:
+        return hit[SECOND]
+    key = operator_metadata_key(metadata, ZERO, ZERO)
+    if len(_META_KEY_CACHE) >= _META_CACHE_LIMIT:
+        _META_KEY_CACHE.clear()
+    _META_KEY_CACHE[id(metadata)] = (metadata, key)
+    return key
+
+
+def _legacy_op_meta_key_from_metadata(metadata) -> Any:
     id_hit = _META_ID_CACHE.get(id(metadata))
     if id_hit is not None and id_hit[0] is metadata:
         return id_hit[1]
@@ -231,8 +245,9 @@ def op_meta_key_from_metadata(metadata) -> Any:
 
 
 def _op_meta_key(op) -> Any:
-    """Deterministic, layer-independent projection of one operator's metadata."""
-    return op_meta_key_from_metadata(op.metadata)
+    """Canonical occurrence-relative projection of one operator's metadata."""
+    from .physical_key import operator_metadata_key
+    return operator_metadata_key(op.metadata, op.stage, op.layer)
 
 
 def _op_meta_key_slow_meta(metadata) -> Any:
@@ -400,6 +415,109 @@ def _execution_geometry(device):
 
 
 @dataclass(frozen=True)
+class StageProfile:
+    """Immutable cluster-level rates, pools and die geometry for one stage."""
+
+    replica: int
+    stage: int
+    dies: tuple
+    geometry: tuple
+    rates: dict
+    names: dict
+    resources: tuple
+    stage_pools: dict
+    pools: dict
+    pool_units: dict
+    pool_units_by_name: dict
+    units: dict
+    compute_peaks: dict
+    pool_capacities: dict
+    service_modes: dict
+    work_units: dict
+    store_queues: dict
+    physical_mechanisms: Any
+
+    @property
+    def profile_key(self) -> tuple:
+        return (int(self.stage), self.geometry)
+
+
+def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
+                         replicas=None) -> tuple[StageProfile, ...]:
+    """Resolve every stage's immutable hardware binding exactly once."""
+    p = case.runtime.parallel
+    width = p.tp * p.pcp
+    selected = range(p.dp) if replicas is None else tuple(replicas)
+    profiles: list[StageProfile] = []
+    for replica in selected:
+        for stage in range(p.pp):
+            start = (int(replica) * p.pp + stage) * width
+            dies = tuple(case.machine.dies[start:start + width])
+            if len(dies) != width:
+                raise ModelingError("placement_exceeds_physical_devices")
+            geometry = _execution_geometry(dies[0])
+            if any(_execution_geometry(die) != geometry for die in dies[1:]):
+                raise ModelingError(
+                    "representative_shard_requires_matching_resource_geometry:"
+                    f"replica={replica}:stage={stage};"
+                    "heterogeneous_owners_require_per_rank_execution")
+            roles = dict(dies[0].rates)
+            work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
+            rates = {
+                role: (min(dict(die.rates)[role] for die in dies) / 1000,
+                       work_units.get(role, "work"))
+                for role in roles
+            }
+            rates.update({"cube": (1, "peak_ms"), "host": (1, "ms")})
+            names: dict[str, str] = {}
+            stage_resources: list[Resource] = []
+            for kind, (rate, unit) in rates.items():
+                label = {"cube": "matrix", "hbm": "memory"}.get(kind, kind)
+                name = f"{namespace}{label}@r{replica}:s{stage}"
+                stage_resources.append(Resource(
+                    name, rate, unit, "fifo" if kind == "host" else "fair",
+                    dies[0].units(kind)))
+                names[kind] = name
+            stage_pools: dict[str, str] = {}
+            pools: dict[str, float] = {}
+            pool_units: dict[str, int] = {}
+            for pool in dict(dies[0].buffers):
+                key = f"{namespace}{pool}@r{replica}:s{stage}"
+                pools[key] = min(dict(die.buffers)[pool] for die in dies)
+                pool_units[key] = dies[0].pool_units(pool)
+                stage_pools[str(pool)] = key
+            compute_peaks = {
+                dtype: min(die.peak(dtype) for die in dies)
+                for dtype, _ in dies[0].compute_peaks
+                if dtype not in dict(dies[0].compute_peak_aliases)
+            }
+            service_modes = {
+                mode: (role, min(dict(die.service_modes)[mode][1] for die in dies))
+                for mode, (role, _) in dies[0].service_modes
+            }
+            store_queues = {
+                name: dict(queue) for name, queue in dies[0].store_queues
+                if all(dict(die.store_queues).get(name) == queue for die in dies)
+            }
+            profiles.append(StageProfile(
+                replica=int(replica), stage=int(stage), dies=dies,
+                geometry=geometry, rates=rates, names=names,
+                resources=tuple(stage_resources), stage_pools=stage_pools,
+                pools=pools, pool_units=pool_units,
+                units={role: dies[0].units(role) for role in names},
+                pool_units_by_name={pool: dies[0].pool_units(pool)
+                                    for pool in dict(dies[0].buffers)},
+                compute_peaks=compute_peaks,
+                pool_capacities={pool: min(dict(die.buffers)[pool] for die in dies)
+                                 for pool in dict(dies[0].buffers)},
+                service_modes=service_modes, work_units=work_units,
+                store_queues=store_queues,
+                physical_mechanisms=dies[0].physical_mechanisms,
+            ))
+    return tuple(profiles)
+
+
+@dataclass(frozen=True)
 class SubmissionPolicy:
     graph_replay_ms: float | None = None
     scheduler_ms: float = 0
@@ -530,7 +648,7 @@ def _bind_native_resource_view(program, resource_names, engine):
     """Shallow launch-local resource view; cached program is not mutated."""
     if not resource_names:
         return program
-    from .piecewise.compiler import NativeProgram
+    from .program import NativeProgram
     inner = copy(program.program)
     names = dict(getattr(inner, "names", {}) or {})
     rates = dict(getattr(inner, "rates", {}) or {})
@@ -546,7 +664,7 @@ def _bind_native_resource_view(program, resource_names, engine):
     inner.names = names
     inner.rates = rates
     inner.units = units
-    return NativeProgram(inner, program.work, program.duration)
+    return NativeProgram(inner, program.work)
 
 
 def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
@@ -562,7 +680,7 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
     that rank's own program finish; the cohort join waits every real finish.
 
     ``launches`` is a sequence of mappings (or attribute objects) with:
-      program: piecewise.compiler.NativeProgram
+      program: NativeProgram
       name: unique launch name
       ready: actual local ready Event
       rank_index: launch-local EP rank index
@@ -573,8 +691,8 @@ def launch_native_cohort(engine, launches, *, name_prefix="native_cohort",
     Returns finishes, per-rank parents, the genuine global join, launch-local
     handles, and unresolved peer labels.
     """
-    from .piecewise.compiler import NativeProgram
-    from .piecewise.families_moe_mc2 import Mc2LaunchView
+    from .program import NativeProgram
+    from .mc2_program import Mc2LaunchView
 
     def field(raw, key, default=None):
         return (raw.get(key, default) if isinstance(raw, _AbcMapping)
@@ -1101,6 +1219,117 @@ class _ServiceSetupProgram:
         return self.body.start(engine, name, ready=setup, owner=owner)
 
 
+class _LedgerBoundCost:
+    """CostModel view whose diagnostic records belong to one execution.
+
+    Pricing logic and immutable hardware/service declarations stay on the
+    shared model; every mutable counter, mapping, invocation and regime record
+    goes to this execution's private ``CostLedger``.  This is the read/write
+    boundary that keeps an isolated row's ``basis`` isolated while preserving
+    the historical ``execution.cost`` public surface.
+    """
+
+    def __init__(self, model, ledger):
+        self.model, self.ledger = model, ledger
+
+    @property
+    def case(self):
+        return self.model.case
+
+    @property
+    def primitives(self):
+        return self.model.primitives
+
+    @property
+    def counts(self):
+        return self.ledger.counts
+
+    @property
+    def services(self):
+        return self.ledger.services
+
+    @property
+    def mappings(self):
+        return self.ledger.mappings
+
+    @property
+    def invocations(self):
+        return self.ledger.invocations
+
+    @property
+    def regimes(self):
+        return self.ledger.regimes
+
+    @property
+    def joint_native(self):
+        return self.ledger.joint_native
+
+    @property
+    def diagnostic_primitive_lookups(self):
+        return self.ledger.diagnostic_primitive_lookups
+
+    @property
+    def diagnostic_primitive_hits(self):
+        return self.ledger.diagnostic_primitive_hits
+
+    def price(self, op, scope):
+        return self.model.price(op, scope, ledger=self.ledger)
+
+    def lookup_diagnostic(self, op, scope):
+        return self.model.lookup_diagnostic(op, scope, ledger=self.ledger)
+
+    def record_mapping(self, mapping):
+        return self.model.record_mapping(mapping, ledger=self.ledger)
+
+    def record_service(self, curve, basis, *, capacity_limited=False):
+        return self.model.record_service(
+            curve, basis, capacity_limited=capacity_limited, ledger=self.ledger)
+
+    def record_invocation(self, record):
+        return self.model.record_invocation(record, ledger=self.ledger)
+
+    def record_regime(self, *args, **kwargs):
+        return self.model.record_regime(*args, ledger=self.ledger, **kwargs)
+
+    def record_joint_native(self, selection, reference_cost):
+        return self.model.record_joint_native(
+            selection, reference_cost, ledger=self.ledger)
+
+    def summary(self, ledger=None):
+        return self.model.summary(self.ledger if ledger is None else ledger)
+
+    def __getattr__(self, name):
+        return getattr(self.model, name)
+
+
+def _ledger_recorder(method, ledger):
+    """Bind one CostModel recorder to this execution's private ledger."""
+    def record(*args, **kwargs):
+        return method(*args, ledger=ledger, **kwargs)
+    return record
+
+
+@dataclass(frozen=True)
+class _CollectivePlanBinding:
+    """One selected collective algorithm and its lazily built topology plan.
+
+    ``algorithm`` lets a recipe consume the exact plan execution selected
+    instead of re-deriving it; a prebuilt plan keeps the public ledger on the
+    same physical messages.
+    """
+
+    algorithm: str
+    plan: object | None = None
+    factory: object | None = None
+
+    def __call__(self):
+        if self.plan is not None:
+            return self.plan
+        if self.factory is None:
+            raise ModelingError("collective_plan_factory_missing")
+        return self.factory()
+
+
 class Execution:
     # Identical private schedules replay across ranks and later layers.
     # Experimental: off in the shipped default. Opt-in only; no shape or input auto-enable.
@@ -1117,8 +1346,16 @@ class Execution:
         legacy_diagnostics: bool | None = None,
         fragment_state=None, memory=None,
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
+        bindings=None, ledger=None, isolated_replica: int | None = None,
     ):
+        from .cost import CostLedger
         self.case, self.cost = case, cost
+        self.bindings = bindings
+        # Mutable diagnostic records belong to this execution, not to the
+        # shared immutable pricing model.
+        self.ledger = ledger if ledger is not None else CostLedger()
+        self.cost_model = cost
+        self.cost = _LedgerBoundCost(cost, self.ledger)
         self.namespace = namespace
         self.memory = memory
         if legacy_diagnostics is None:
@@ -1166,46 +1403,48 @@ class Execution:
         resources.extend(offload_resources(
             self.offload_policy, namespace, case.runtime.parallel.dp, case.runtime.parallel.pp))
         p = case.runtime.parallel
-        width = p.tp * p.pcp
-        for replica in range(p.dp):
-            resources.append(Resource(f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
-            for stage in range(p.pp):
-                start = (replica * p.pp + stage) * width
-                dies = tuple(case.machine.dies[start:start + width])
-                if len(dies) != width:
-                    raise ModelingError("placement_exceeds_physical_devices")
-                geometry = _execution_geometry(dies[0])
-                if any(_execution_geometry(die) != geometry for die in dies[1:]):
-                    raise ModelingError(
-                        "representative_shard_requires_matching_resource_geometry:"
-                        f"replica={replica}:stage={stage};"
-                        "heterogeneous_owners_require_per_rank_execution")
-                self.stage_dies[replica, stage] = dies
-                roles = dict(dies[0].rates)
-                work_units = {**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)}
-                rates = {role: (min(dict(d.rates)[role] for d in dies) / 1000,
-                                work_units.get(role, "work")) for role in roles}
-                rates.update({"cube": (1, "peak_ms"), "host": (1, "ms")})
-                names = {}
-                for kind, (rate, unit) in rates.items():
-                    label = {"cube": "matrix", "hbm": "memory"}.get(kind, kind)
-                    name = f"{namespace}{label}@r{replica}:s{stage}"
-                    resources.append(Resource(
-                        name, rate, unit, "fifo" if kind == "host" else "fair",
-                        dies[0].units(kind)))
-                    names[kind] = name
-                self.stage_names[replica, stage] = names
-                stage_pools = {}
-                for pool in dict(dies[FIRST].buffers):
-                    key = f"{namespace}{pool}@r{replica}:s{stage}"
-                    pools[key] = min(dict(d.buffers)[pool] for d in dies)
-                    pool_units[key] = dies[FIRST].pool_units(pool)
-                    stage_pools[str(pool)] = key
-                self.stage_pools[replica, stage] = stage_pools
-        self.topology = Topology(
-            case.machine, p, namespace,
-            collective_startup_mode=case.runtime.collective_startup_mode)
-        resources.extend(self.topology.resources())
+        selected_replica = (
+            None if isolated_replica is None else int(isolated_replica))
+        self.stage_profiles: dict[tuple[int, int], StageProfile] = {}
+        profiles = None
+        if (bindings is not None and not namespace
+                and getattr(bindings, "stage_profiles", ())):
+            profiles = tuple(
+                profile for profile in bindings.stage_profiles
+                if selected_replica is None or profile.replica == selected_replica)
+        if not profiles:
+            profiles = build_stage_profiles(
+                case, namespace,
+                replicas=(None if selected_replica is None
+                          else (selected_replica,)))
+        if selected_replica is not None and not profiles:
+            raise ModelingError("isolated_replica_out_of_range")
+        active_ranks: set[int] = set()
+        scheduler_replicas: set[int] = set()
+        for profile in profiles:
+            replica, stage = profile.replica, profile.stage
+            if replica not in scheduler_replicas:
+                resources.append(Resource(
+                    f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
+                scheduler_replicas.add(replica)
+            self.stage_dies[replica, stage] = profile.dies
+            self.stage_names[replica, stage] = profile.names
+            self.stage_pools[replica, stage] = profile.stage_pools
+            self.stage_profiles[replica, stage] = profile
+            resources.extend(profile.resources)
+            pools.update(profile.pools)
+            pool_units.update(profile.pool_units)
+            active_ranks.update(int(die.rank) for die in profile.dies)
+        self.topology = (
+            bindings.topology
+            if bindings is not None and bindings.topology is not None
+            and not namespace
+            else Topology(case.machine, p, namespace,
+                          collective_startup_mode=case.runtime.collective_startup_mode))
+        if selected_replica is None:
+            resources.extend(self.topology.resources())
+        else:
+            resources.extend(self.topology.resources_for_ranks(active_ranks))
         if engine is None and self.memory is not None:
             # A Memory ledger already adopted by one RuntimeState owns that
             # single causal root.  Re-using the ledger therefore means re-using
@@ -1215,6 +1454,10 @@ class Execution:
             bound = getattr(self.memory, "runtime_state", None)
             if isinstance(bound, Engine):
                 engine = bound
+        self._engine_resource_templates = tuple(resources)
+        self._engine_pool_templates = dict(pools)
+        self._engine_pool_unit_templates = dict(pool_units)
+        self._engine_trace_limit = int(trace_limit)
         if engine is not None:
             engine.extend(resources, pools, pool_units)
         self.engine = engine if engine is not None else Engine(
@@ -1250,6 +1493,10 @@ class Execution:
         self._compact_step: bool = False
         self._last_invocation_record = None
         self._service_identity_cache: dict = {}
+        # Per-execution occurrence -> canonical metadata projection.  The
+        # identity guard makes this a pure memo of one immutable declaration,
+        # not a cross-case prediction cache.
+        self._op_key_cache: dict = {}
         self._transport_options: dict = {}
         self.replay_counts = {"record": 0, "shadow": 0, "replay": 0, "real": 0}
         self._trace_key = None
@@ -1302,6 +1549,48 @@ class Execution:
                        if isinstance(profile, _AbcMapping) else ()):
             service = normalize_resource_service(record)
             self.resource_services[service.service_id] = service
+
+    def reset_engine(self) -> None:
+        """Renew only the mutable Engine root for the next isolated price."""
+        from .cost import CostLedger
+        self.ledger = CostLedger()
+        self.cost = _LedgerBoundCost(self.cost_model, self.ledger)
+        self.recipes_used = {}
+        self.engine = Engine(
+            list(self._engine_resource_templates),
+            pools=dict(self._engine_pool_templates),
+            pool_units=dict(self._engine_pool_unit_templates),
+            trace_limit=self._engine_trace_limit)
+        if self.memory is not None:
+            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
+                raise ModelingError("execution_memory_ledger_conflict")
+        self.engine.ensure_state_ledger(None)
+        self.resource_rates = ResourceRates(self.engine.resources)
+        self.stage_contexts = {key: self._stage_context(key, dies)
+                               for key, dies in self.stage_dies.items()}
+        self._collectives = None
+        self._cohort_views = None
+        self.native_group_joins = {}
+        self.native_group_launches = {}
+        self._service_identity_cache = {}
+        self._prev_lazy_dag = None
+        self._prev_lazy_entries = None
+        self._prev_add_topology = None
+
+    def _op_key(self, op):
+        key = self._op_key_cache.get(id(op))
+        if key is not None and key[FIRST] is op:
+            return key[SECOND]
+        from .physical_key import operator_metadata_key
+        value = operator_metadata_key(op.metadata, op.stage, op.layer)
+        if len(self._op_key_cache) >= _META_CACHE_LIMIT:
+            self._op_key_cache.clear()
+        self._op_key_cache[id(op)] = (op, value)
+        return value
+
+    def ledger_recorder(self, method):
+        """Bind one CostModel recorder to this execution's private ledger."""
+        return _ledger_recorder(method, self.ledger)
 
     @property
     def fragment_state(self):
@@ -1469,7 +1758,7 @@ class Execution:
                    for item in participants):
                 programs = {item.replica: self.lower_program(
                     item.context, item.recipe) for item in participants}
-                from .piecewise.compiler import NativeProgram
+                from .program import NativeProgram
                 if all(isinstance(program, NativeProgram)
                        and hasattr(program.program, "start_with_handles")
                        for program in programs.values()):
@@ -1804,7 +2093,7 @@ class Execution:
             started[0] = True
             programs = {item.replica: self.lower_program(
                 item.context, item.recipe) for item in participants}
-            from .piecewise.compiler import NativeProgram
+            from .program import NativeProgram
             if not all(isinstance(program, NativeProgram)
                        and hasattr(program.program, "start_with_handles")
                        for program in programs.values()):
@@ -2022,7 +2311,7 @@ class Execution:
                            intra_latency_ms=None, inter_latency_ms=None,
                            resource_names=None):
         """Immutable per-launch rank/topology view; cached program untouched."""
-        from .piecewise.families_moe_mc2 import Mc2LaunchView
+        from .mc2_program import Mc2LaunchView
         peer_count = int(getattr(inner, "peer_count", 0) or 0)
         if peer_count <= 0 or rank_index is None:
             return None
@@ -2088,7 +2377,7 @@ class Execution:
         ``handles`` are the program's launch-local peer send/receive/check/
         retire and phase-complete Events on this same Engine.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         phase_ready = self._phase_scope(program, peer_ready)
         phase_send = self._phase_scope(program, peer_send)
         start = local_ready if local_ready is not None else ready
@@ -2147,7 +2436,7 @@ class Execution:
         actual peer Events.  Every other program keeps the common cohort
         barrier, so ordinary aggregate recipes are unchanged.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         if isinstance(program, NativeProgram) and (
                 peer_ready is not None or peer_send is not None):
             start = local_ready if local_ready is not None else ready
@@ -2187,7 +2476,7 @@ class Execution:
         placeholder cohort, so it is reported separately from a complete
         cross-DP rendezvous instead of being labelled by family.
         """
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         if not isinstance(program, NativeProgram):
             return
         inner = program.program
@@ -2326,12 +2615,13 @@ class Execution:
                 op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
                 op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
                 op.link_scope, op.source_boundary, op.returns,
-                _op_meta_key(op), context.setup_ms, context.minimum_ms,
+                self._op_key(op), context.setup_ms, context.minimum_ms,
                 (inv_t.startup_ms, inv_t.minimum_ms) if inv_t is not None else None,
                 _freeze_key(context.joint_native_service),
                 tuple(sorted(context.work.items())),
                 live_rates,
                 context.group_buffers,
+                getattr(context.physical_mechanisms, "signature", None),
             )
             token = _rank_token(context)
             replayable = (
@@ -2526,7 +2816,9 @@ class Execution:
             op.launch_shape, op.flops, op.matrix_flops, op.mte2_bytes,
             op.mte3_bytes, op.vector_ops, op.hbm_bytes, op.link_bytes,
             op.link_scope, op.source_boundary, op.returns,
-            _op_meta_key(op),
+            self._op_key(op),
+            getattr(geom, "physical_mechanisms").signature
+            if getattr(geom, "physical_mechanisms", None) is not None else None,
         )
         if prep_key in self._prepare_cache:
             cached_op, meta_diff, recipe = self._prepare_cache[prep_key]
@@ -2578,27 +2870,46 @@ class Execution:
 
     def _stage_context(self, key, dies):
         replica, stage = key
-        names = self.stage_names[key]
+        profile = self.stage_profiles.get(key)
+        if profile is None:
+            names = self.stage_names[key]
+            return RecipeContext(
+                None, {}, names, self.resource_rates,
+                dies[FIRST].aic_count,
+                pool_names={pool: f"{self.namespace}{pool}@r{replica}:s{stage}"
+                            for pool in dict(dies[FIRST].buffers)},
+                resource_units={role: dies[FIRST].units(role) for role in names},
+                compute_peaks={dtype: min(d.peak(dtype) for d in dies)
+                               for dtype, _ in dies[FIRST].compute_peaks
+                               if dtype not in dict(dies[FIRST].compute_peak_aliases)},
+                pool_units={pool: dies[FIRST].pool_units(pool)
+                            for pool in dict(dies[FIRST].buffers)},
+                pool_capacities={pool: min(dict(d.buffers)[pool] for d in dies)
+                                 for pool in dict(dies[FIRST].buffers)},
+                record_mapping=self.cost.record_mapping,
+                service_modes={mode: (role, min(dict(d.service_modes)[mode][SECOND] for d in dies))
+                               for mode, (role, _) in dies[FIRST].service_modes},
+                record_service=self.cost.record_service,
+                work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
+                store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
+                              if all(dict(d.store_queues).get(name) == queue for d in dies)},
+                physical_mechanisms=dies[FIRST].physical_mechanisms,
+            )
         return RecipeContext(
-            None, {}, names, self.resource_rates,
-            dies[FIRST].aic_count,
-            pool_names={pool: f"{self.namespace}{pool}@r{replica}:s{stage}"
-                        for pool in dict(dies[FIRST].buffers)},
-            resource_units={role: dies[FIRST].units(role) for role in names},
-            compute_peaks={dtype: min(d.peak(dtype) for d in dies)
-                           for dtype, _ in dies[FIRST].compute_peaks
-                           if dtype not in dict(dies[FIRST].compute_peak_aliases)},
-            pool_units={pool: dies[FIRST].pool_units(pool)
-                        for pool in dict(dies[FIRST].buffers)},
-            pool_capacities={pool: min(dict(d.buffers)[pool] for d in dies)
-                             for pool in dict(dies[FIRST].buffers)},
+            None, {}, profile.names, self.resource_rates,
+            profile.dies[FIRST].aic_count,
+            pool_names=dict(profile.stage_pools),
+            resource_units=dict(profile.units),
+            compute_peaks=dict(profile.compute_peaks),
+            pool_units=dict(profile.pool_units_by_name),
+            pool_capacities=dict(profile.pool_capacities),
             record_mapping=self.cost.record_mapping,
-            service_modes={mode: (role, min(dict(d.service_modes)[mode][SECOND] for d in dies))
-                           for mode, (role, _) in dies[FIRST].service_modes},
+            service_modes=dict(profile.service_modes),
             record_service=self.cost.record_service,
-            work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
-            store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
-                          if all(dict(d.store_queues).get(name) == queue for d in dies)},
+            work_units=dict(profile.work_units),
+            store_queues={name: dict(queue)
+                          for name, queue in profile.store_queues.items()},
+            physical_mechanisms=profile.physical_mechanisms,
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
@@ -2632,7 +2943,7 @@ class Execution:
             _DEVICE_UNITS_CACHE[id(device)] = units_key
         sid_key = (
             replica, op.stage, device.rank, device.compute_units,
-            units_key[1],
+            units_key[SECOND],
             op.family, op.recipe, op.dtype, op.layout, scope,
             meta.get("kernel"), meta.get("kernel_name"),
             _freeze_key(meta.get("implementation")),
@@ -2641,7 +2952,7 @@ class Execution:
             # One metadata projection for both the prepared-program and the
             # service-identity caches: it is layer-normalized, so two layers
             # with the same declared kernel share the resolved identity.
-            _op_meta_key(op),
+            self._op_key(op),
         )
         sid = self._service_identity_cache.get(sid_key)
         if sid is None:
@@ -2653,6 +2964,25 @@ class Execution:
         context = replace(template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel")
+        # A topology-declared direct mesh owns the physical plan for this
+        # invocation.  Bind it before the ledger so execution, the isolated
+        # row and the public accounting entry point consume one plan.
+        algorithm = getattr(recipe, "algorithm", "ring")
+        if (algorithm == "ring" and getattr(recipe, "mesh_capable", False)
+                and self.topology.declares_direct_mesh(op, replica)):
+            algorithm = "direct_mesh"
+        if algorithm == "direct_mesh":
+            plan = self.topology.joint_plan(
+                op, {replica: cost.work.get("link", ZERO)},
+                algorithm=algorithm, transport=transport_options)
+            self.topology.bind_direct_mesh(op, replica, plan)
+            plan_binding = _CollectivePlanBinding(algorithm, plan=plan)
+        else:
+            plan_binding = _CollectivePlanBinding(
+                algorithm,
+                factory=lambda: self.topology.joint_plan(
+                    op, {replica: cost.work.get("link", ZERO)},
+                    algorithm=algorithm, transport=transport_options))
         demands, frames, setup = {}, {}, 0.0
         if "peer_traffic" in dict(op.metadata) and not cost.work.get("link", 0):
             # A zero sender still participates and receives; validate its row.
@@ -2682,7 +3012,6 @@ class Execution:
         physical = max((value / self.engine.resources[key].rate for key, value in demands.items()), default=0)
         # Context binding also serves independently constructed source phases;
         # native binding must not require an unrelated source-dispatch registration.
-        algorithm = getattr(recipe, "algorithm", "ring")
         context = replace(
             context, work=demands,
             minimum_ms=measured if self.legacy_diagnostics else 0.0,
@@ -2690,9 +3019,7 @@ class Execution:
             service_identity={**dict(context.service_identity),
                               "transport_options": transport_options},
             transaction_frames=frames,
-            collective_plan=lambda: self.topology.joint_plan(
-                op, {replica: cost.work.get("link", 0)}, algorithm=algorithm,
-                transport=transport_options))
+            collective_plan=plan_binding)
         # A declared service regime is a property of the declared kernel, not
         # of the diagnostic profile: ordinary production consults it too. A
         # case that declares no rule has nothing to resolve, so it is not
@@ -2897,7 +3224,7 @@ class Execution:
         host_submits: list[tuple[int, int, Event]] = []
         step_holder: dict[str, Any] = {}
         owner = f"replica:{replica}"
-        from .piecewise.compiler import NativeProgram
+        from .program import NativeProgram
         compact_exec = (
             not self.legacy_diagnostics
             and (not engine.trace.maxlen or n_ops > engine.trace.maxlen)
@@ -3051,7 +3378,7 @@ class Execution:
                 else:
                     stg_id_cache = stage_id_caches[op.stage]
                     hit = stg_id_cache.get(id(op))
-                    if hit is not None and hit[0] is op:
+                    if hit is not None and hit[FIRST] is op:
                         entry = hit[1]
                     else:
                         live_rates = stage_rates_map[op.stage]
@@ -3061,31 +3388,33 @@ class Execution:
                             op.semantic_shape, op.local_shape, op.padded_shape, op.launch_shape,
                             op.flops, op.matrix_flops, op.mte2_bytes, op.mte3_bytes,
                             op.vector_ops, op.hbm_bytes, op.link_bytes, op.link_scope,
-                            op.source_boundary, op.returns, _op_meta_key(op),
+                            op.source_boundary, op.returns, self._op_key(op),
                         )
                         entry = lazy_cache.get(lazy_key)
                         if entry is not None and entry is not False:
                             if len(stg_id_cache) >= 16384:
                                 stg_id_cache.clear()
                             stg_id_cache[id(op)] = (op, entry)
-                if entry is not None and entry is not False and entry[1] is not False:
+                if (entry is not None and entry is not False
+                        and entry[SECOND] is not False):
                     if cur_l_entries is not None:
                         cur_l_entries[idx] = entry
                     (res_op_tmpl, _mdiff, _rmem, _rec, _ctx_tmpl,
-                     submit, transport_options, inv_cell, _rname, _oname, _wdeltas) = entry[0]
+                     submit, transport_options, inv_cell, _rname, _oname,
+                     _wdeltas) = entry[FIRST]
                     cost_counts["analytic_work"] += 1
                     if not same_step_op:
                         trans_opts[(scope_str, op.op_id, replica)] = transport_options
                     if inv_cell is not None:
                         if inv_cell[2] is cost_invs and inv_cell[3] is not None:
                             inv_cell[3]["invocations"] += 1
-                        elif inv_cell[0] in cost_invs:
+                        elif inv_cell[FIRST] in cost_invs:
                             li = cost_invs[inv_cell[0]]
                             inv_cell[2] = cost_invs
                             inv_cell[3] = li
                             li["invocations"] += 1
                         else:
-                            self.cost.record_invocation(inv_cell[1])
+                            self.cost.record_invocation(inv_cell[SECOND])
                             inv_cell[2] = cost_invs
                             inv_cell[3] = cost_invs.get(inv_cell[0])
                     res_stg = res_op_tmpl.stage
@@ -3640,11 +3969,34 @@ class Execution:
 
         cohort_views = self._cohort_views
         if cohort_views is None:
-            cohort_views = (
-                {int(rank): work.plan.requests for rank in self.topology.ranks(replica, ZERO)}
-                if work.plan.requests or work.mode != "graph"
-                else {}
-            )
+            parallel = self.case.runtime.parallel
+            local_width = max(int(parallel.tp), int(parallel.o_proj_tp),
+                              int(parallel.linear_proj_tp),
+                              int(parallel.lm_head_tp))
+            if (int(parallel.tp) == ONE and local_width > ONE
+                    and (work.plan.requests or work.mode != "graph")):
+                # A homogeneous single-replica evaluation still represents the
+                # complete node-local TP cohort.  Populate every peer's actual
+                # request rows so the rewritten GEMM receives the full node
+                # token count with 1/local_width features, not 1/local_width
+                # of the tokens.
+                from .local_tp_groups import local_tp_replica_cohorts
+                cohorts = local_tp_replica_cohorts(
+                    self.case.machine, parallel)
+                peers = next((group for group in cohorts if replica in group),
+                             (replica,))
+                cohort_views = {
+                    int(rank): work.plan.requests
+                    for peer in peers
+                    for rank in self.topology.ranks(peer, ZERO)
+                }
+            else:
+                cohort_views = (
+                    {int(rank): work.plan.requests
+                     for rank in self.topology.ranks(replica, ZERO)}
+                    if work.plan.requests or work.mode != "graph"
+                    else {}
+                )
         ops = lower_local_projection_tp(
             work.ops, model=self.case.model, runtime=self.case.runtime,
             machine=self.case.machine, replica=replica,
@@ -3702,8 +4054,8 @@ class Execution:
             if not op.metadata:
                 return True
             hit = safe_cache.get(id(op))
-            if hit is not None and hit[0] is op:
-                return hit[1]
+            if hit is not None and hit[FIRST] is op:
+                return hit[SECOND]
             meta = _metadata_dict(op)
             ok = (_declaration_of(op) is None
                   and meta.get("group_axis") not in {"ep", "local_tp"}
@@ -4136,4 +4488,5 @@ class Execution:
                 "joint_collective_stats": dict(self.joint_collective_stats)}
                if (self._joint_collective_trace is not None
                    and self.joint_collective_stats["observations"]) else {}),
+
         }

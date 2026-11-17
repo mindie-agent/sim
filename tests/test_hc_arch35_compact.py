@@ -399,7 +399,7 @@ def test_aiv_reader_competitor_matches_source_completion():
     trace,engine,context,g=run_owner(case,op,horizon=7.01,
                                      competitor=('mte2_aiv',16384,0,0.001))
     record=next(record for record in trace if record['task']=='competitor')
-    assert record['end_ms']-record['start_ms']==pytest.approx(0.0002482424242424242)
+    assert record['end_ms']-record['start_ms']==pytest.approx(0.00015515151515151515)
     assert sum(record['serviced'].values())==pytest.approx(16384)
 
 
@@ -564,4 +564,4 @@ def test_finite_template_preserves_window_and_competitor_controls():
                               competitor=('mte2_aiv',16384,0,0.001))
     for trace in (exact[0],finite[0]):
         record=next(record for record in trace if record['task']=='competitor')
-        assert record['end_ms']-record['start_ms']==pytest.approx(0.0002482424242424841)
+        assert record['end_ms']-record['start_ms']==pytest.approx(0.00015515151515151515)

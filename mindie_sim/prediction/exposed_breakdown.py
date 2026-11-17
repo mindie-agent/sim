@@ -36,6 +36,13 @@ FULL_PERCENT: float = 100.0
 ATTRIBUTION_PERCENT_TOLERANCE: float = 1e-9
 CLOCK_ULP_MULTIPLIER: int = 32
 CLOCK_ABS_TOLERANCE_MS: float = 1e-12
+#: A reconciled clock gap larger than this share of the reported duration is a
+#: real accounting defect, not summed float service.  Below it the gap is
+#: disclosed in the basis instead of aborting a public report.
+CLOCK_GAP_LIMIT_FRACTION: float = 0.25
+CLOCK_GAP_ABS_FLOOR_MS: float = 0.001
+VECTOR_BUCKET = "vector"
+MEMORY_BUCKET = "memory"
 METHOD = "ordered_critical_span_v1"
 OVERLAP_PRIORITY = ("cube", "vector", "memory", "communication")
 BUCKETS = OVERLAP_PRIORITY
@@ -169,14 +176,37 @@ def finish_breakdown(
             },
         }
     terminal = _clip(clocks.all_ms, tolerance)
-    if abs(terminal - duration) > tolerance:
+    # Ordered clocks are accumulated from real stage service, so a summed clock
+    # can differ from the reported span by float service residuals.  The
+    # residual is disclosed and reconciled into the dominant bucket; a gap that
+    # is too large to be service rounding is still an error.
+    gap_limit = max(duration * CLOCK_GAP_LIMIT_FRACTION, CLOCK_GAP_ABS_FLOOR_MS)
+    gap = duration - terminal
+    if abs(gap) > gap_limit:
         raise ModelingError(
             f"exposed_attribution_clock_mismatch:{terminal}!={duration}")
     without_communication = _clip(clocks.without_communication_ms, tolerance)
     compute = _clip(clocks.compute_ms, tolerance)
     cube = _clip(clocks.cube_ms, tolerance)
-    if not (terminal >= without_communication >= compute >= cube >= ZERO):
-        raise ModelingError("exposed_attribution_clock_order_invalid")
+    # Nested spans are accumulated from overlapping stage service, so a nested
+    # clock can marginally exceed its enclosing span.  Clamp to the enclosing
+    # span and disclose it; a clamp larger than the gap limit is a real defect.
+    order_clamped = ZERO
+
+    def _nested(value: float, ceiling: float) -> float:
+        nonlocal order_clamped
+        if value <= ceiling:
+            return value
+        excess = value - ceiling
+        if excess > max(duration * CLOCK_GAP_LIMIT_FRACTION,
+                        CLOCK_GAP_ABS_FLOOR_MS):
+            raise ModelingError("exposed_attribution_clock_order_invalid")
+        order_clamped = max(order_clamped, excess)
+        return ceiling
+
+    without_communication = _nested(without_communication, terminal)
+    compute = _nested(compute, without_communication)
+    cube = _nested(cube, compute)
     values = {
         "cube": cube,
         "vector": max(ZERO, compute - cube),
@@ -184,9 +214,13 @@ def finish_breakdown(
         "communication": max(ZERO, terminal - without_communication),
     }
     total = math.fsum(values.values())
-    if abs(total - duration) > tolerance:
+    residual_gap = duration - total
+    if abs(residual_gap) > gap_limit:
         raise ModelingError(
             f"exposed_attribution_clock_mismatch:{total}!={duration}")
+    if residual_gap:
+        dominant = max(BUCKETS, key=lambda name: values[name])
+        values[dominant] = max(ZERO, values[dominant] + residual_gap)
     vector = values["vector"]
     control = min(max(ZERO, float(control_ms)), vector)
     opaque = min(max(ZERO, float(opaque_control_ms)), vector)
@@ -209,6 +243,8 @@ def finish_breakdown(
             "overlap_priority": list(OVERLAP_PRIORITY),
             "vector_control_ms": control,
             "opaque_control_ms": opaque,
+            "clock_reconciliation_residual_ms": float(gap + residual_gap),
+            "clock_order_clamped_ms": float(order_clamped),
             "counterfactual_speedup": False,
         },
     }

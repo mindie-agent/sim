@@ -91,7 +91,7 @@
       ],
       "longctx_decode_scenario": {
         "source": {
-          "path": "/Users/maoxx241/code/profiler/examples/structure/cases/decode-qwen38-a3-tp4-c64.json",
+          "path": "repository://profiler/examples/structure/cases/decode-qwen38-a3-tp4-c64.json",
           "sha256": "d28cb614f02edaa1803741e83f0e3ec06b392e3fa9a1c27daa14d0cc1676c975",
           "size_bytes": 2969
         },

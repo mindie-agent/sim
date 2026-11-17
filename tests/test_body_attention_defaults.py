@@ -10,7 +10,7 @@ from test_prediction_system import case
 
 
 @pytest.mark.parametrize("sku", ("Ascend910_9362", "Ascend950DT_9582"))
-def test_gqa_body_default_executes_private_pipes_and_preserves_explicit_envelope(sku):
+def test_gqa_body_default_executes_private_pipes_and_preserves_explicit_recipe(sku):
     raw = case(output=1)
     raw["machine"] = {"backend": "ascend", "sku": sku, "num_devices": 1}
     report = predict(raw, scope="body", tokens=4, context=128, sequences=2)
@@ -19,9 +19,10 @@ def test_gqa_body_default_executes_private_pipes_and_preserves_explicit_envelope
     assert report["execution"]["serviced"]["mte1@r0:s0"] > 0
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
     explicit = deepcopy(raw)
-    explicit["runtime"]["kernels"] = {"recipes": {"flash_attention": {"kind": "envelope"}}}
+    explicit["runtime"]["kernels"] = {"recipes": {
+        "flash_attention": dict(report["default_mechanisms"]["gqa_tiles"])}}
     prior = predict(explicit, scope="body", tokens=4, context=128, sequences=2)
-    assert all(row["program"] == "ResourceEnvelope" for row in prior["timeline"]
+    assert all(row["program"] == "StagedGQADecode" for row in prior["timeline"]
                if row["family"] == "attention")
     for key in ("flops", "hbm_bytes", "link_bytes"):
         assert prior["execution"]["work"][key] == report["execution"]["work"][key]
@@ -73,7 +74,8 @@ def test_wide_head_defaults_fit_resident_and_overlapping_tile_buffers(dtype, sku
     assert report["default_mechanisms"]["gqa_tiles"]["key_tile"] < 128
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
     assert report["body_forward_ms"] > 0
-    raw["runtime"]["kernels"] = {"recipes": {"flash_attention": {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"recipes": {
+        "flash_attention": dict(report["default_mechanisms"]["gqa_tiles"])}}
     control = predict(raw, scope="body", tokens=4, context=256, sequences=2)
     for key in ("flops", "hbm_bytes", "link_bytes"):
         assert control["execution"]["work"][key] == report["execution"]["work"][key]
@@ -128,6 +130,10 @@ def test_kimi_body_defaults_install_kda_and_attention_residual(sku, expected_kda
 
     raw = compose_case("kimi-k3", hardware=sku, tp=8, dp=1, ep=8, num_devices=8, quant="w4a8", layers=8)
     raw.setdefault("runtime", {}).setdefault("metadata", {})["image_id"] = family_attnres.SOURCE["image_id"]
+    # Compose records the catalog's source choices; this test exercises the
+    # body-default installer itself, so start from an undeclared lowering set.
+    for name in ("kda", "attention_residual"):
+        raw["runtime"].setdefault("kernels", {}).setdefault("lowerings", {}).pop(name, None)
     effective, report = attention_defaults(parse_case(raw), "decode", tokens=1)
     lowerings = effective.runtime.kernels.get("lowerings", {})
     kda_entry = lowerings.get("kda")
@@ -151,7 +157,8 @@ def test_attention_residual_default_preserves_explicit_member_programs(recipe):
     from mindie_sim.compose import compose_case
 
     raw = compose_case("kimi-k3", hardware="a3", tp=8, ep=8, layers=4)
-    raw["runtime"]["kernels"] = {"recipes": {recipe: {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"recipes": {recipe: {
+        "kind": "tiled_pointwise", "input_bytes_per_element": 2, "outputs": []}}}
     ops = target_operators(raw, phase="decode", tokens=1, context=4)
     assert any(op.recipe == recipe for op in ops)
     assert not any(op.recipe == "attn_res_fwd" for op in ops)
@@ -167,12 +174,12 @@ def test_explicit_kda_scan_family_keeps_the_requested_execution(sku):
 
     raw = compose_case("kimi-k3", hardware=sku, tp=8, dp=1, ep=1,
                        num_devices=8, quant="w4a8", layers=1)
-    raw["runtime"]["kernels"] = {"families": {"recurrent_scan": {"kind": "envelope"}}}
+    raw["runtime"]["kernels"] = {"families": {"recurrent_scan": {"kind": "recurrent_scan"}}}
     ops = target_operators(raw, phase="decode", tokens=1, context=128)
     selected = next(row for row in ops.default_selection["selections"]
                     if row["family"] == "kda_decode")
     assert selected["reason"] == "explicit_implementation_preserved"
     scans = [row for row in operator_costs(raw, ops)["operators"]
              if row["operator"]["family"] == "recurrent_scan"]
-    assert scans and all(row["program"] == "ResourceEnvelope" for row in scans)
+    assert scans and all(row["program"] == "RecurrentScan" for row in scans)
     assert all(row["duration_ms"] > 0 and not row["live_tasks"] for row in scans)

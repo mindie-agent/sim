@@ -1,7 +1,7 @@
 {
   "schema": "mindie-fai-host-mapping-control/1",
   "boundary": "one_isolated_gqa_operator",
-  "case": "/Users/maoxx241/code/profiler/examples/structure/cases/longctx-a3-qwen36-tp4-source-model.json",
+  "case": "repository://profiler/examples/structure/cases/longctx-a3-qwen36-tp4-source-model.json",
   "case_sha256": "e77b14955f72c696d5d62e7ebf12b77484275dfd133d5319b2755d1afe63500d",
   "host_schedule": "ops-transformer a3925fd49 FAInfer flash decode; 512-row macro partitions",
   "device_program": "staged_gqa_decode analytical128-row pipeline, not full native instruction reconstruction",

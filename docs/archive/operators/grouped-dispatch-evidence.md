@@ -90,7 +90,7 @@ the missing kernel-level timeline for those standalone replay events.
 ## Compatible source branch
 
 The inspected source is
-`/Users/maoxx241/code/refs/ops-transformer` at
+`repository://refs/ops-transformer` at
 `a3925fd49cd256ad478d2faf983bf2961b8ae2c8`, committed August 29, 2026.
 Its configured origin is the CANN `ops-transformer` repository on GitCode.
 The report records hashes for every cited file.

@@ -217,15 +217,15 @@ library, per-event tiling identity or scalar flags.
 ## Verification
 
 ```sh
-PYTHONPATH=/Users/maoxx241/code/sim-kimi-attnres-20261029 \
-  /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=repository://sim-kimi-attnres-20261029 \
+  repository://sim-rewrite-20261027/.venv/bin/python \
   -m pytest -q tests/test_attnres_prefix.py
 ```
 
 A compact public control is `examples/source-families/attnres-prefix-control.json`:
 
 ```sh
-PYTHONPATH=. /Users/maoxx241/code/sim-rewrite-20261027/.venv/bin/python \
+PYTHONPATH=. repository://sim-rewrite-20261027/.venv/bin/python \
   -m mindie_sim graph examples/source-families/attnres-prefix-control.json \
   --phase prefill --tokens 64 --scope body
 ```
@@ -243,7 +243,7 @@ scalar combinations for the historical descriptors:
 PYTHONPATH=. python tools/verify_attnres.py \
   --case examples/cases/kimi-k3-a5-current-checkpoint-conditional.json \
   --tokens-local 1 1024 --optimize-prefill \
-  --capture-evidence /Users/maoxx241/code/profiler/examples/structure/acceptance-20261029/kimi-attnres-boundary.json \
+  --capture-evidence repository://profiler/examples/structure/acceptance-20261029/kimi-attnres-boundary.json \
   -o data/verification/attnres-source-candidates-20261029.json
 ```
 

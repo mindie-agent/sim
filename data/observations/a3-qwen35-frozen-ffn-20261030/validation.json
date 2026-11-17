@@ -4,17 +4,17 @@
   "base_revision": "13f4ab91",
   "base_case_sha256": "1fa00563314b0897a52818969392641d5f947119beb9fba4357fd4b808987160",
   "candidate_case": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
+    "path": "repository://sim-serving-host-io-20261030/examples/cases/longctx-decode-20261030/a3-qwen35-frozen-ffn/qwen35-a3-tp4-frozen-ffn.json",
     "sha256": "7550696cc80966e09519ac9ad54bd47769102bfecea8ae2b2d57721a17e09994",
     "size_bytes": 264893
   },
   "parameters": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/parameters.json",
     "sha256": "9bdb420ab66a42f42257fac8fdbf6364530e5e870af83c54b3fa00a2932f41e9",
     "size_bytes": 104353
   },
   "old_operator_evidence": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/operator-evidence.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/parameters/a3-native-decode-20261030/operator-evidence.json",
     "sha256": "2294818d7befce67a2d443c604661718c0ea1674080e701209d8639cb49d15f8",
     "size_bytes": 652045
   },
@@ -671,7 +671,7 @@
   "domain_changes": 0,
   "three_rule_baseline_revision": "c4e91818",
   "helper_source_contract": {
-    "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/helper-source-contract.json",
+    "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/helper-source-contract.json",
     "sha256": "0793a5a7ea6d684b5f9f5069f1fcf74cb1923cf8add4a6d876d781ce771ab1e4",
     "size_bytes": 20597
   },
@@ -690,7 +690,7 @@
         "sha256": "c43ca21f5aabc8f4e1a0d9e9aa5476c6bea141ff7b2398bc7736d1fa94ab607a"
       },
       "ledger": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b1.json",
+        "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b1.json",
         "sha256": "99e4dc7f06270f234a588f35f95ce9a25b178d567053f6771accfb8e3cea4de8",
         "size_bytes": 111529
       },
@@ -4136,7 +4136,7 @@
         "sha256": "af27e304a2059bb15def5ad8830663a0bf5fb4923971f0909ee40239d92e95e3"
       },
       "ledger": {
-        "path": "/Users/maoxx241/code/sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b4.json",
+        "path": "repository://sim-serving-host-io-20261030/data/observations/a3-qwen35-frozen-ffn-20261030/native-b4.json",
         "sha256": "7bc5baad383347c23c1b24ba8e055f176a18ccccb8ccb3bfba79c1fdbb21ba70",
         "size_bytes": 112906
       },
