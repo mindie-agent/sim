@@ -47,7 +47,13 @@ def test_public_serving_axes_preserve_work_and_show_strict_bottleneck_response(a
     reports = [predict(scaled_case(raw, axis, scale), lower=resource_lower(axis))
                for scale in (.5, 1, 2)]
     times = [r["metrics"]["makespan_ms"] for r in reports]
-    if axis == "network" and not pd:
+    if axis == "hbm":
+        # Below the declared sustainable DRAM rate the raw bus binds; at and
+        # above it the fixed service ceiling caps makespan.
+        assert times[0] >= times[1] == times[2]
+        assert compare_sweep(reports)["status"] == "plateau"
+    elif axis == "network" and not pd:
+        # A one-device colocated case has no inter-node traffic.
         assert times[0] == times[1] == times[2]
         assert compare_sweep(reports)["status"] == "plateau"
     else:

@@ -8,6 +8,7 @@
 [Side-Effect Policy] Pure plans and the common causal Engine, no observations.
 """
 from bisect import bisect_right
+from collections import Counter
 from dataclasses import dataclass
 from functools import lru_cache
 
@@ -45,7 +46,8 @@ DEFAULT_MQSMLA_HEADS = 64
 MQSMLA_HEAD_WIDTH = 512
 MQSMLA_ROPE_WIDTH = 64
 CUBE_HEAD_TILE_ALIGN = 16
-VALID_LOCAL_HEAD_COUNTS = frozenset({8, 16, 32, 64})
+MIN_PADDED_LOCAL_HEADS = 8
+HEAD_GROUP_START = 0
 # Packed row widths: FP8 values plus one BF16 scale per 32 values, and two FP4
 # values per byte plus one BF16 scale per 16 values.
 ORIGINAL_CACHE_ROW_BYTES = 544
@@ -69,6 +71,17 @@ SELECTIVE_FD_ORIGINAL_ROWS = 128
 SELECTIVE_FD_COMPRESSED_ROWS = 512
 # Distinct (branch, rows, first, last, addressing, heads) phase payloads.
 TILE_PHASE_CACHE_SIZE = 512
+OWNER_STAGE_CACHE_SIZE = 16
+
+
+def supported_heads(heads):
+    """Keep the padded eight-head shard and complete 16-head cube faces."""
+    return (heads == MIN_PADDED_LOCAL_HEADS
+            or heads >= CUBE_HEAD_TILE_ALIGN and heads % CUBE_HEAD_TILE_ALIGN == HEAD_GROUP_START)
+
+
+def _phase_key(stream, head_counts, index):
+    return (*stream.key(index), head_counts[bisect_right(stream.ends, index)])
 
 
 def selective_fd_excluded(cores, rows):
@@ -245,7 +258,7 @@ def build(op, geometry):
     shape = dict(op.metadata)["mqsmla_geometry"]
     requested = str(shape.get("addressing", "scalar"))
     heads = int(shape["heads"])
-    if (heads not in VALID_LOCAL_HEAD_COUNTS or shape["width"] != MQSMLA_HEAD_WIDTH
+    if (not supported_heads(heads) or shape["width"] != MQSMLA_HEAD_WIDTH
             or shape["metadata_support_fd"]):
         raise ModelingError("mqsmla_source_geometry_or_branch_unsupported")
     if requested == "scalar":
@@ -265,8 +278,12 @@ def build(op, geometry):
     # one geometry; do not silently price its split reduction as whole rows.
     if selective_fd_excluded(cores, rows):
         raise ModelingError("mqsmla_selective_72_row_fd_branch_not_modeled")
+    head_groups = tuple(min(DEFAULT_MQSMLA_HEADS, heads - start)
+                        for start in range(HEAD_GROUP_START, heads, DEFAULT_MQSMLA_HEADS))
+    row_heads = tuple(group for _ in rows for group in head_groups)
+    rows = tuple(row for row in rows for _ in head_groups)
     ownership = owner_ranges(len(rows), cores)
-    streams = tuple((owner, OwnerTiles.create(rows[start:end]))
+    streams = tuple((owner, OwnerTiles.create(rows[start:end]), row_heads[start:end])
                     for owner, start, end in ownership)
     for pool, amount in BUFFERS.items():
         units = geometry.resource_units.get("vector", cores) if pool == "ub" else cores
@@ -280,20 +297,20 @@ def build(op, geometry):
         if geometry.resource_units.get(role) != cores:
             raise ModelingError("mqsmla_requires_private_aic:" + role)
     total = Work()
-    for _, stream in streams:
-        for index in range(stream.count):
-            for _, work in tile_phases(*stream.key(index), addressing=addressing,
-                                       heads=heads):
-                total += work
+    counts = Counter(_phase_key(stream, head_counts, index)
+                     for _, stream, head_counts in streams for index in range(stream.count))
+    for key, count in counts.items():
+        for _, work in tile_phases(*key[:4], addressing=addressing, heads=key[-1]):
+            total += work.scaled(count)
 
     def program(context):
-        def one(owner, stream):
-            def stages(index):
-                key = stream.key(index)
+        def one(owner, stream, head_counts):
+            @lru_cache(maxsize=OWNER_STAGE_CACHE_SIZE)
+            def cached_stages(key):
                 result = []
                 previous = None
-                for name, work in tile_phases(*key, addressing=addressing,
-                                              heads=heads):
+                for name, work in tile_phases(*key[:4], addressing=addressing,
+                                              heads=key[-1]):
                     if name in {"query", "sinks"}:
                         after = ()
                     elif name.startswith("addr_index_"):
@@ -329,6 +346,9 @@ def build(op, geometry):
                     previous = name
                 return tuple(result)
 
+            def stages(index):
+                return cached_stages(_phase_key(stream, head_counts, index))
+
             allocations = tuple(context.allocate(
                 f"mqsmla{owner}_{pool}", pool, amount,
                 (2 * owner, 2 * owner + 1) if pool == "ub" else (owner,))
@@ -341,7 +361,8 @@ def build(op, geometry):
                 Stage("tiles", after=("reserve",), program=PipelineProgram(stream.count, 2, stages)),
                 Stage("release", after=("tiles",), free=allocations),
             ))
-        return ParallelProgram(tuple(one(owner, stream) for owner, stream in streams))
+        return ParallelProgram(tuple(one(owner, stream, head_counts)
+                                     for owner, stream, head_counts in streams))
 
     return OperatorPlan(total, program, {
         "source_execution_domain": "mixed", "source_program": SOURCE,

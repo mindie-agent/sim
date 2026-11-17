@@ -100,6 +100,18 @@ def _gdn_store_default(case, kernels):
     return None
 
 
+def _collective_defaults(case):
+    """Consume adapter-declared protocols without overriding caller recipes."""
+    protocols = dict(case.machine.collective_protocols)
+    mode = case.runtime.collective_startup_mode
+    kernels = deepcopy(case.runtime.kernels)
+    families = kernels.setdefault("families", {})
+    for family in ("alltoall", "alltoallv"):
+        if protocols.get(family) == "concurrent" and mode in {"topology", "concurrent"}:
+            families.setdefault(family, {"kind": "direct_peer_collective"})
+    return replace(case, runtime=replace(case.runtime, kernels=kernels))
+
+
 DEFAULT_SCOPE = "body"
 
 
@@ -172,6 +184,7 @@ def effective_body_declaration(case, phase, *, tokens=ONE, scope=DEFAULT_SCOPE,
     if not enabled:
         return case, {"profile": "explicit_declaration_preserved",
                       "scope": str(scope), "reason": "body_defaults_disabled"}
+    case = _collective_defaults(case)
     policy = execution_policy(case)
     declared_lowerings = frozenset(dict(case.runtime.kernels.get("lowerings", {}) or {}))
     case, selection = attention_defaults(case, phase, tokens=tokens)
@@ -262,6 +275,7 @@ def service_program_defaults(case):
     preserved verbatim.  The case is returned unchanged (a new runtime dict is
     built) when an install is required, so the caller's input is not mutated.
     """
+    case = _collective_defaults(case)
     kernels = case.runtime.kernels
     if "matmul" in (kernels.get("programs") or {}):
         return case
@@ -467,11 +481,13 @@ def _kda_default(case, phase, tokens, kernels):
                      & recipes.keys()) or per_request_scan or
                 "recurrent_vector" in kernels.get("programs", {}) or
                 bool(case.runtime.tensor_layouts) or raw_bf16_generic)
+    from mindie_sim.catalog.paired_sfa import execution
+    recurrent_sharded = execution(case.model).get("recurrent_context_sharded") is not False
     pipes = {"hbm", "vector", "mte2_aiv", "mte3"}
     reason = ("explicit_implementation_preserved" if explicit else
               # The source recurrence is a decode-only, single-context domain.
               "kda_source_requires_decode_only_pcp1" if (
-                  parallel.pcp != 1 or parallel.cp != 1) else
+                  parallel.pcp != ONE or parallel.cp != ONE and recurrent_sharded) else
               "partitioned_kda_caller_domain" if phase != "decode" and parallel.pcp != 1 else
               "decode_profile_only" if phase != "decode" or not 1 <= tokens <= KDA_SOURCE_MAX_QUERY_TOKENS else
               "kda_requires_bf16_inputs_and_state" if case.model.activation_dtype != "bf16"

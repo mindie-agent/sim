@@ -43,7 +43,7 @@ from .accel_tables import (
 
 #: ``auto`` keeps smaller Engines on pure Python: zero build and marshalling.
 AUTO_MIN_TASKS = 64
-
+AUTO_GRAPH_MIN_TASKS = 16
 #: Frontier-shaped reasons: recoverable in ``auto`` once the boundary drains.
 #: Explicit ``c`` and capability failures stay disabled for the Engine's life.
 _TRANSIENT_AUTO_REASONS = frozenset({
@@ -72,9 +72,10 @@ class NativeBackend:
         "epoch_tasks", "epoch_edges", "_engine_finalizer", "__weakref__",
         "applying", "callback_dirty", "coupled_seqs", "pending_handback",
         "draining", "aborted_publication", "needs_settle", "fair_prio",
-        "has_fair_res",
+        "has_fair_res", "min_tasks",
     )
-    def __init__(self, status: dict | None, mode: str = "auto") -> None:
+    def __init__(self, status: dict | None, mode: str = "auto", *,
+                 eager_attach: bool = False) -> None:
         self.library = None
         self.arena = None
         self.status_dict = dict(status or {})
@@ -86,6 +87,7 @@ class NativeBackend:
         self.native_boundaries = 0
         self.fallbacks = 0
         self.mode = mode
+        self.min_tasks = AUTO_GRAPH_MIN_TASKS if mode == "auto" and eager_attach else AUTO_MIN_TASKS
         self.enabled = False
         self.res_names: tuple[str, ...] = ()
         self.pending: list = []
@@ -125,7 +127,7 @@ class NativeBackend:
     def try_attach(self, engine) -> bool:
         if self.enabled:
             return True
-        if self.mode == "auto" and engine._sequence < AUTO_MIN_TASKS:
+        if self.mode == "auto" and engine._sequence < self.min_tasks:
             self.disabled_reason = "auto_tiny_workload"
             return False
         if self.arena is None:
@@ -263,7 +265,7 @@ class NativeBackend:
             self.disable(engine, "mixed_priority")
             return False
         if not self.enabled:
-            if engine._sequence < AUTO_MIN_TASKS:
+            if engine._sequence < self.min_tasks:
                 return False
             if engine._active or engine._native_slots:
                 # Transient: the next pure burst may adopt.  Staying dormant
@@ -680,7 +682,7 @@ class NativeBackend:
 _IDLE_COUNTERS = {"native_calls": 0, "native_steps": 0, "native_boundaries": 0,
                   "fallbacks": 0, "mirrored_live": 0}
 
-def make_backend(requested: str | None = None):
+def make_backend(requested: str | None = None, *, eager_attach: bool = False):
     """Return ``(backend_or_none, telemetry)`` for one Engine."""
     mode = resolve_mode(requested)
     if mode == "python":
@@ -710,13 +712,13 @@ def make_backend(requested: str | None = None):
             "requested": mode, "build": status, "epoch_enabled": EPOCH_ENABLED,
             **_IDLE_COUNTERS,
         }
-    # ``auto`` defers compilation until a workload is large enough to amortize it.
-    backend = NativeBackend(None, "auto")
+    eager = bool(eager_attach and accel_loader.cached_library_ready())
+    backend = NativeBackend(None, "auto", eager_attach=eager)
+    reason = "auto_ready" if eager else "auto_deferred"
     return backend, {
-        "accel_backend": "python", "backend_reason": "auto_deferred",
+        "accel_backend": "python", "backend_reason": reason,
         "requested": mode, "build": None, "epoch_enabled": EPOCH_ENABLED,
-        "enabled": False, "disabled_reason": "auto_deferred",
-        **_IDLE_COUNTERS,
+        "enabled": False, "disabled_reason": reason, **_IDLE_COUNTERS,
     }
 def accel_status(engine=None) -> dict:
     """Honest backend telemetry: discovery, library and live coverage."""

@@ -160,4 +160,8 @@ def test_situ_mx_source_profile_removes_only_local_activation_intermediate(profi
     after = graph_costs(selected, physical, external_inputs=external, isolated=False)
     a, b = before["execution"]["serviced"], after["execution"]["serviced"]
     assert a["vector@r0:s0"] == b["vector@r0:s0"]
-    assert a["memory@r0:s0"] - b["memory@r0:s0"] == pytest.approx(2 * activation.mte3_bytes)
+    # The removed intermediate is a physical HBM write; service units are
+    # normalized by the declared sustainable DRAM rate, so compare work.
+    assert (before["execution"]["work"]["hbm_bytes"]
+            - after["execution"]["work"]["hbm_bytes"]
+            == pytest.approx(2 * activation.mte3_bytes))

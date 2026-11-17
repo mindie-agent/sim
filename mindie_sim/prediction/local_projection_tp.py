@@ -332,6 +332,8 @@ def lower_local_projection_tp_cohort(
 
     validate_local_projection_tp(SimpleNamespace(runtime=runtime, machine=machine))
     topo = Topology(machine, runtime.parallel)
+    identifiers = [tuple(op.op_id for op in ops) for ops in graphs.values()]
+    homogeneous = all(ids == identifiers[ZERO] for ids in identifiers)
     ordered_occ: list[tuple[int, str]] = []
     template_by_occ: dict[tuple[int, str], tuple[OpSpec, frozenset[str]]] = {}
     peer_rows: dict[tuple[int, str], dict[int, int]] = {}
@@ -346,7 +348,9 @@ def lower_local_projection_tp_cohort(
             key = (int(op.stage), op.op_id)
             if key not in template_by_occ:
                 ordered_occ.append(key)
-                template_by_occ[key] = (op, frozenset(x.op_id for x in seq[idx + ONE:]))
+                template_by_occ[key] = (
+                    op, frozenset() if homogeneous else
+                    frozenset(x.op_id for x in seq[idx + ONE:]))
             grp_div = max(ONE, int(meta.get("matrix_groups", ONE))) if _partition_kind(role, meta) == ROLE_GROUP_A else ONE
             tok_m = int(op.local_shape[ZERO]) // grp_div
             for rk in topo.ranks(int(r), int(op.stage)):

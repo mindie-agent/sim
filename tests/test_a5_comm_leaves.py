@@ -113,9 +113,11 @@ def test_public_a5_ccu_leaf_changes_route_sharing_and_completion_with_placement(
     server_wire = sum(value for name, value in
                       reports["a5_server"]["execution"]["serviced"].items()
                       if name.startswith("link:"))
+    # A per-port link owns the same payload on its TX and RX endpoints; the
+    # per-pair route owns one directed pair. Compare one direction.
     pod_wire = sum(value for name, value in
                    reports["a5_pod"]["execution"]["serviced"].items()
-                   if name.startswith("link:"))
+                   if name.startswith("link:") and ":tx:port" in name)
     assert server_wire == pytest.approx(pod_wire)
     assert reports["a5_server"]["duration_ms"] != reports["a5_pod"]["duration_ms"]
     # The declared T06 startup is a separate gate, never folded into link work.

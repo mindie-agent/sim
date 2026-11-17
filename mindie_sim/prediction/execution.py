@@ -1353,7 +1353,7 @@ class Execution:
         fragment_state=None, memory=None,
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
         bindings=None, ledger=None, isolated_replica: int | None = None,
-        evaluation=None,
+        evaluation=None, accel_eager_attach: bool = False,
     ):
         from .cost import CostLedger
         self.case, self.cost = case, cost
@@ -1390,6 +1390,7 @@ class Execution:
         self.on_operator = on_operator
         self.lazy_frontier = bool(lazy_frontier)
         self.host_lookahead = max(1, int(host_lookahead))
+        self.accel_eager_attach = bool(accel_eager_attach)
         self.recipes = recipes or RecipeBook.from_mapping(case.runtime.kernels)
         from .invocation_binding import InvocationPolicy
         self.invocations = InvocationPolicy(case.runtime.kernels.get("invocations", ()))
@@ -1474,7 +1475,8 @@ class Execution:
         if engine is not None:
             engine.extend(resources, pools, pool_units)
         self.engine = engine if engine is not None else Engine(
-            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit)
+            resources, pools=pools, pool_units=pool_units, trace_limit=trace_limit,
+            accel_eager_attach=self.accel_eager_attach)
         if self.memory is not None:
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
@@ -1573,7 +1575,8 @@ class Execution:
             list(self._engine_resource_templates),
             pools=dict(self._engine_pool_templates),
             pool_units=dict(self._engine_pool_unit_templates),
-            trace_limit=self._engine_trace_limit)
+            trace_limit=self._engine_trace_limit,
+            accel_eager_attach=self.accel_eager_attach)
         if self.memory is not None:
             if not self.engine.bind_memory(self.memory, pools=("hbm",)):
                 raise ModelingError("execution_memory_ledger_conflict")
@@ -2916,12 +2919,8 @@ class Execution:
                 metadata=meta,
             ), recipe
         res_op, recipe = self.recipes.prepare(op, geom)
-        from .collective_waves import RECIPE as STARTUP_WAVES, startup_waves_selected
-        if (not getattr(recipe, "source_bound", False)
-                and not getattr(recipe, "native", False)
-                and not getattr(recipe, "algorithm", None)
-                and startup_waves_selected(res_op, startup_mode)):
-            recipe = STARTUP_WAVES
+        from .collective_waves import startup_waves_recipe
+        recipe = startup_waves_recipe(res_op, recipe, startup_mode)
         stage_dies = self.stage_dies.get((replica, res_op.stage))
         if stage_dies:
             from .matrix_precision import resolve_matrix_precision
@@ -3000,10 +2999,9 @@ class Execution:
         from .services import service_identity
         from .kernel_groups import declaration
         from .matrix_precision import execution_compute_peaks, resolve_matrix_precision
-        from .collective_waves import RECIPE as STARTUP_WAVES
-        from .collective_waves import startup_waves_selected
-        if startup_waves_selected(op, self.case.runtime.collective_startup_mode):
-            recipe = STARTUP_WAVES
+        from .collective_waves import startup_waves_recipe
+        recipe = startup_waves_recipe(
+            op, recipe, self.case.runtime.collective_startup_mode)
         dies = self.stage_dies[replica, op.stage]
         op = resolve_matrix_precision(
             op, devices=dies,
@@ -3048,6 +3046,9 @@ class Execution:
         context = replace(template, op=op, native_work=cost.work, compute_peaks=peaks,
             service_identity=sid,
             service_boundary="resource_phase" if declared else "device_kernel")
+        bind_context = getattr(recipe, "bind_context", None)
+        if bind_context is not None:
+            context = bind_context(context)
         # A topology-declared direct mesh owns the physical plan for this
         # invocation.  Bind it before the ledger so execution, the isolated
         # row and the public accounting entry point consume one plan.

@@ -28,6 +28,9 @@ from .graph_projection import (
 from .operator_analysis import cohort_operator_costs, operator_costs, physical_id, _replay_scope
 from .native_binding import bind_native_call
 from .program import RecipeBook
+
+#: A multi-layer graph that amortizes eager callback-free native adoption.
+EAGER_GRAPH_MIN_OPS = 512
 from .structure import parse_case
 from .exposed_breakdown import (
     CLOCK_GAP_ABS_FLOOR_MS, CLOCK_GAP_LIMIT_FRACTION, ExposedClocks,
@@ -308,10 +311,13 @@ def graph_costs(case, ops, *, recipes=None, primitives=None, external_inputs=Non
 
     from .cost import CostLedger
     cost = ctx.cost
+    op_count = (sum(len(group) for group in ops.values())
+                if isinstance(ops, Mapping) else len(ops))
     execution = Execution(case, cost, recipes=book, bindings=ctx.bindings,
                           ledger=CostLedger(), include_submission=include_submission,
                           on_operator=None if fast_span_only else observe,
-                          trace_limit=trace_limit, evaluation=ctx)
+                          trace_limit=trace_limit, evaluation=ctx,
+                          accel_eager_attach=op_count >= EAGER_GRAPH_MIN_OPS)
     # Physical-work coalescing is exact; only an explicit legacy diagnostic run
     # keeps the uncoalesced per-tile shape.
     execution._compact_step = not execution.legacy_diagnostics

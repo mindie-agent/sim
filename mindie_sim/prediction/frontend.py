@@ -90,7 +90,7 @@ def _without_service_fragments(regions):
         for op in region.ops:
             deps = tuple(dict.fromkeys(
                 parent for dep in op.deps for parent in aliases.get(dep, (dep,))))
-            if op.family in SERVICE_FAMILIES:
+            if op.family in SERVICE_FAMILIES and op.family != "acceptance":
                 aliases[op.op_id] = deps
                 continue
             kept.append(replace(op, deps=deps))
@@ -765,6 +765,16 @@ class Frontend:
         # phase belongs to the active cohort, not a fictitious "idle" kernel.
         mode = selected_mode(plan if plan.requests else replace(
             plan, requests=tuple(global_views or ())))
+        if assembly == "model":
+            from math import floor
+            mean = float(runtime.mtp_acceptance_length)
+            plan = replace(plan, requests=tuple(
+                replace(view,
+                        draft_advanced_tokens=min(
+                            view.q_len + view.draft_proposal_tokens,
+                            max(ONE, floor((index + ONE) * mean) - floor(index * mean))))
+                if view.draft_proposal_tokens and not view.draft_advanced_tokens
+                else view for index, view in enumerate(plan.requests)))
         views = tuple(replace(view, q_len=view.q_len + view.draft_proposal_tokens)
                       for view in plan.requests)
         valid = sum(view.logical_q_len for view in views)
@@ -868,7 +878,8 @@ class Frontend:
                                    routing_views=eff_routing_views,
                                    physical_rank=physical_rank,
                                    query_position=eff_query_pos,
-                                   include_recover_commits=(assembly == "service"),
+                                   include_recover_commits=(assembly == "service" or any(
+                                       view.draft_proposal_tokens for view in plan.requests)),
                                    machine=machine)
         ops.extend(body)
         if pcp_prefill:
@@ -910,7 +921,7 @@ class Frontend:
         ops.append(replace(committed, family="token_commit"))
         if deferred_commits:
             intents = tuple(op for op in ops if is_recover_ssm_intent(op))
-            if intents and assembly == "model":
+            if intents and assembly == "model" and not proposal_count:
                 ops = list(_strip_recover_intents(ops))
             elif intents:
                 spec_views = tuple(

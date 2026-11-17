@@ -37,8 +37,10 @@ def physical_id(op):
 
 
 def requires_collective_cohort(case, op, recipe):
+    from .collective_waves import startup_waves_recipe
     from .local_tp_groups import local_tp_spans_dp
 
+    recipe = startup_waves_recipe(op, recipe, case.runtime.collective_startup_mode)
     axis = dict(op.metadata).get("group_axis")
     return bool(
         getattr(recipe, "algorithm", None)

@@ -28,7 +28,7 @@ from mindie_sim.prediction.family_mqsmla import (
     FORMATS as MQSMLA_CACHE_FORMATS,
     RECIPE as MQSMLA_RECIPE,
     UNIT_CONTEXT_PARALLEL,
-    VALID_LOCAL_HEAD_COUNTS as MQSMLA_LOCAL_HEAD_COUNTS,
+    supported_heads as mqsmla_supported_heads,
 )
 from mindie_sim.catalog.cache_format import CacheFormat, cache_format
 from mindie_sim.schema.common import ModelingError
@@ -130,7 +130,7 @@ def is_a5_v41_packed_cache_stack(*, backend, arch, layer_plans, activation_dtype
 
 def local_heads_supported(layer_plans, tp) -> bool:
     degree = max(int(tp), 1)
-    return all(plan.num_heads // degree in MQSMLA_LOCAL_HEAD_COUNTS
+    return all(mqsmla_supported_heads(plan.num_heads // degree)
                for plan in layer_plans)
 
 

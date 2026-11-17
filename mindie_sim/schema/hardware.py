@@ -976,7 +976,7 @@ class Hardware:
                        if raw.get(k) is not None
                    )),
                    collective_protocols=_collective_protocols(
-                       raw_in.get("collective_protocols", ())))
+                       raw.get("collective_protocols", ())))
 
     def to_dict(self):
         return {"name": self.name, "architecture": self.arch_family, "hardware_key": self.hardware_key,

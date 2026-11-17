@@ -201,6 +201,7 @@ def _resolve_va_lowerings(
     model_spec: ModelSpec, parallel: Mapping[str, int], sku: str, lowering_passes: tuple[str, ...],
 ) -> dict[str, Any]:
     from mindie_sim.schema.parallel import ParallelSpec
+    from mindie_sim.catalog.paired_sfa import execution
     is_a5 = _arch_key(sku) == "a5"
     p_cfg = ParallelSpec(
         dp=int(parallel.get("dp", 1)), tp=int(parallel.get("tp", 1)),
@@ -209,7 +210,9 @@ def _resolve_va_lowerings(
     )
     lowerings: dict[str, Any] = {}
     if (any(p.attention == "kda" for p in model_spec.layer_plans)
-            and p_cfg.pcp >= 1 and p_cfg.cp == 1):
+            and p_cfg.pcp >= DEFAULT_PARALLEL
+            and (p_cfg.cp == DEFAULT_PARALLEL
+                 or execution(model_spec).get("recurrent_context_sharded") is False)):
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
         lowerings["kda"] = {
@@ -569,7 +572,7 @@ def compose_case(
     linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
     redundant_experts_per_rank: int = DEFAULT_REDUNDANT_EXPERTS,
-    collective_startup_mode: str = "legacy",
+    collective_startup_mode: str | None = None,
     matrix_compute_policy: str = "auto",
     recover_ssm: bool = False,
     prefix_cache_mode: str = "private",
@@ -921,7 +924,9 @@ def compose_case(
             "lm_head_tp": int(lm_head_tp),
             "redundant_experts_per_rank": int(redundant_experts_per_rank),
         },
-        "collective_startup_mode": str(collective_startup_mode),
+        "collective_startup_mode": (
+            str(collective_startup_mode) if collective_startup_mode is not None
+            else "topology" if machine.get("collective_protocols") else "legacy"),
         "matrix_compute_policy": str(matrix_compute_policy),
         "recover_ssm": bool(recover_ssm),
         "prefix_cache_mode": str(prefix_cache_mode),

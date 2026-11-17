@@ -23,7 +23,7 @@ from mindie_sim.catalog.context_parallel import (
     dsa_cp_token_ranges, owned_positions, split_causal_pairs, split_pcp_pairs,
 )
 from mindie_sim.schema.common import ModelingError, dtype_bytes
-from .batch_prefix_indexer import apply_indexer_prefix_reads
+from .batch_prefix_indexer import RECIPE_NAME as BATCH_INDEXER_RECIPE
 from .mechanism import OperatorPlan, Work
 from .mla_structure import declare_indexer
 from .ownership import read_role, unit_group
@@ -32,6 +32,8 @@ from .engine import Allocation
 
 KEY_TILE = 128
 INDEX_QUERY_TILE = 128
+INDEX_NO_ROWS = 0
+INDEX_IDENTITY_COMPRESSION = 1
 DEFAULT_BLOCK_SIZE = 128
 CANDIDATE_BYTES = 8
 FP32_BYTES = 4
@@ -305,70 +307,59 @@ def selected_pairs(parts, ratio, topk, *, noncausal=False, kv_len=None):
     )
 
 
-def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
-                     kv_len=None, cp=MIN_INDEX_FACTOR, interleave=INDEX_QUERY_TILE,
-                     compression=MIN_INDEX_FACTOR):
-    """(unique key rows, tile refill rows) consumed by one view's query tiles.
+def _index_owner_rows(tokens, compression, cp, interleave):
+    ratio = max(INDEX_IDENTITY_COMPRESSION, int(compression))
+    rows = completed_rows(tokens, ratio)
+    block = max(INDEX_IDENTITY_COMPRESSION, int(interleave) // ratio)
+    return max(owned_positions(INDEX_NO_ROWS, rows - INDEX_IDENTITY_COMPRESSION,
+                               cp, block, rank)
+               for rank in range(cp))
 
-    Every query tile still issues its own per-query arithmetic; only the
-    external HBM fetch is reduced to the physical union of the tile key sets.
-    ``refills`` is the sum of each tile's consumed set (MTE2 service).  The
-    declared ``compression`` converts logical query-key positions into physical
-    compressed index rows before any union is taken.
-    """
-    tile = max(1, int(query_tile))
-    union_rows = 0
-    refill_rows = 0
+
+def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
+                     kv_len=None, cp=INDEX_IDENTITY_COMPRESSION,
+                     interleave=INDEX_QUERY_TILE,
+                     compression=INDEX_IDENTITY_COMPRESSION):
+    """Union rows and per-query-tile refills in compressed, rank-owned rows."""
+    tile = max(INDEX_IDENTITY_COMPRESSION, int(query_tile))
+    union_rows = refill_rows = INDEX_NO_ROWS
     for query, context in parts:
         query = int(query)
-        if query <= 0:
-            continue
-        if int(cp) > 1:
-            # Context-parallel index keys are interleaved by rank; the owner
-            # pays only its own visible key rows for each query token.
-            for offset in range(1, query + 1):
-                horizon = int(context) + offset
-                if kv_len is not None:
-                    horizon = min(horizon, int(kv_len))
-                horizon //= max(MIN_INDEX_FACTOR, int(compression))
-                owned = [owned_positions(
-                    EMPTY_INDEX_ROWS, horizon, int(cp),
-                    max(MIN_INDEX_FACTOR, int(interleave) // compression), rank)
-                    for rank in range(int(cp))]
-                owner_rows = max(owned) if owned else 0
-                union_rows = max(union_rows, owner_rows)
-                refill_rows += owner_rows
-            continue
-        if noncausal:
-            horizon = int(kv_len if kv_len is not None else context + query)
-            horizon //= max(MIN_INDEX_FACTOR, int(compression))
-            tiles = (query + tile - 1) // tile
-            union_rows = max(union_rows, horizon)
-            refill_rows += tiles * horizon
-            continue
-        start = 0
-        while start < query:
+        for start in range(INDEX_NO_ROWS, query, tile):
             end = min(query, start + tile)
-            horizon = int(context) + end
+            horizon = int(context) + (query if noncausal else end)
             if kv_len is not None:
-                horizon = min(horizon, int(kv_len))
-            horizon //= max(MIN_INDEX_FACTOR, int(compression))
-            union_rows = max(union_rows, horizon)
-            refill_rows += horizon
-            start = end
+                horizon = int(kv_len) if noncausal else min(horizon, int(kv_len))
+            owner_rows = _index_owner_rows(horizon, compression, int(cp), interleave)
+            union_rows = max(union_rows, owner_rows)
+            refill_rows += owner_rows
     return union_rows, refill_rows
 
 
 def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
-                          cp=MIN_INDEX_FACTOR, interleave=INDEX_QUERY_TILE,
-                          compression=MIN_INDEX_FACTOR):
-    """Precharge each request's physical union; the prefix planner shares it."""
-    windows = tuple(index_key_window(
-        visible_parts(view), query_tile=query_tile, noncausal=noncausal,
-        kv_len=view.kv_len, cp=cp, interleave=interleave,
-        compression=compression) for view in views)
-    return (sum(rows for rows, _ in windows),
-            sum(refills for _, refills in windows))
+                          cp=INDEX_IDENTITY_COMPRESSION,
+                          interleave=INDEX_QUERY_TILE,
+                          compression=INDEX_IDENTITY_COMPRESSION, share_prefix=True):
+    """Deduplicate HBM prefixes only; private suffixes and tile refills add."""
+    groups: dict[object, int] = {}
+    private_rows = refills = INDEX_NO_ROWS
+    for view in views:
+        union_rows, view_refills = index_key_window(
+            visible_parts(view), query_tile=query_tile, noncausal=noncausal,
+            kv_len=view.kv_len, cp=cp, interleave=interleave,
+            compression=compression)
+        refills += view_refills
+        prefix = min(int(getattr(view, "prefix_tokens", INDEX_NO_ROWS)
+                         or INDEX_NO_ROWS),
+                     int(view.context)) if share_prefix else INDEX_NO_ROWS
+        prefix = max(INDEX_NO_ROWS, prefix) // interleave * interleave
+        shared = min(union_rows,
+                     _index_owner_rows(prefix, compression, cp, interleave))
+        key = str(getattr(view, "prefix_key", "")
+                  or getattr(view, "prefix_cache_key", ""))
+        groups[key] = max(groups.get(key, INDEX_NO_ROWS), shared)
+        private_rows += union_rows - shared
+    return private_rows + sum(groups.values()), refills
 
 
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
@@ -383,23 +374,13 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     ratio = max(1, plan.compress_ratio)
     block_size = max(
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
-    rows_by_view: list[int] = []
-    shared_by_view: list[int] = []
     pairs_by_view: list[int] = []
     for view in views:
         parts = visible_parts(view)
         v_rows = int(selected_pairs(
             parts, ratio, cand_window,
             noncausal=bool(plan.noncausal_attention), kv_len=view.kv_len))
-        raw_pref = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0),
-                                 int(view.context)))
-        aligned_pref = ((raw_pref // block_size) * block_size) // ratio
-        physical_rows, _ = index_key_window(
-            parts, noncausal=bool(plan.noncausal_attention),
-            kv_len=view.kv_len, compression=ratio)
         pairs_by_view.append(v_rows)
-        rows_by_view.append(physical_rows)
-        shared_by_view.append(min(physical_rows, aligned_pref))
     local = score_rows is not None
     rows = max(float(EMPTY_INDEX_ROWS), float(score_rows)) if local \
         else float(sum(pairs_by_view))
@@ -407,12 +388,18 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
     row_b = index_row_bytes(model, plan.index_dim)
     # External HBM is the physical union of the tile key sets (deduplicated
     # only across a shared prefix); MTE2 keeps each tile's fetch service.
-    cp = int(getattr(parallel, "cp", 1) or 1)
-    interleave = int(getattr(runtime, "kv_block_size", INDEX_QUERY_TILE)
-                     or INDEX_QUERY_TILE)
-    union_rows, refill_rows = unique_index_key_rows(
-        views, noncausal=bool(plan.noncausal_attention), cp=cp,
-        interleave=interleave, compression=ratio)
+    cp = int(parallel.cp) if local else INDEX_IDENTITY_COMPRESSION
+    cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
+    cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
+    pinned = "indexer" in cfg_fam or "index_scores" in cfg_rec
+    shared_reads = (runtime is not None and runtime.prefix_cache_mode == "shared"
+                    and runtime.prefix_read_mode != "per_sequence" and not pinned)
+    read_args = dict(noncausal=bool(plan.noncausal_attention), cp=cp,
+                     interleave=block_size, compression=ratio)
+    private_rows, refill_rows = unique_index_key_rows(
+        views, share_prefix=False, **read_args)
+    union_rows, _ = unique_index_key_rows(
+        views, share_prefix=shared_reads, **read_args)
     hbm_rows = float(union_rows)
     if l2_bytes is not None and float(l2_bytes) > 0.0:
         working = hbm_rows * row_b
@@ -430,19 +417,17 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                               ("index_context_partitions", cp),
                               ("index_candidate_filter", bool(plan.candidate_filter)),
                               ("index_head_reduction", "complete_local")))
-    if (not local and shard == MIN_INDEX_FACTOR and cp == MIN_INDEX_FACTOR
-            and b.ops and not plan.candidate_filter):
-        cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
-        cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
-        pinned = "indexer" in cfg_fam or "index_scores" in cfg_rec
-        b.ops[-1] = apply_indexer_prefix_reads(
-            b.ops[-1], views=views, rows_by_view=rows_by_view,
-            shared_rows_by_view=shared_by_view, row_bytes=float(row_b),
-            layer_index=plan.index, runtime=runtime, compression_ratio=ratio,
-            kernel_reuse="native_per_sequence" if pinned else "tile",
-            allow_recipe_rebind=not pinned,
-            hbm_component=hbm_rows * row_b / divisor,
-            mte2_component=float(refill_rows) * row_b / divisor)
+    if shared_reads and union_rows < private_rows:
+        # The HBM union is already charged. Do not apply a second prefix plan
+        # based on per-token score arithmetic to these per-tile key reads.
+        op = b.ops[-1]
+        b.ops[-1] = replace(op, recipe=BATCH_INDEXER_RECIPE, metadata=op.metadata + (
+            ("component", "index_k"), ("prefix_read_reuse_applied", True),
+            ("prefix_read_mode", "tile"),
+            ("prefix_read_logical_bytes", private_rows * row_b / divisor),
+            ("prefix_read_hbm_bytes", hbm_rows * row_b / divisor),
+            ("prefix_read_l2_core_bytes", refill_rows * row_b / divisor),
+        ))
     topk = b.work("index_topk", (scores,), (valid, plan.index_topk),
                  vector=rows * math.log2(max(MIN_LOG_TOPK, plan.index_topk)) / divisor,
                  read=rows * FP32_BYTES / divisor,
@@ -887,8 +872,11 @@ def batch_ops(ops, outputs, *, runtime, views, prefix):
 
 
 def batch_general_mla_ops(ops, outputs, *, views, prefix, runtime, policy):
-    """Combine remaining compatible analytic MLA attention ops when fused_batch is enabled."""
-    if len(outputs) < MIN_BATCH_MEMBERS or (policy is not None and not policy.fused_batch):
+    """Combine compatible analytic MLA work in a non-eager invocation."""
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
+    if len(outputs) < MIN_BATCH_MEMBERS or raw_eager:
         return outputs
     cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
     cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
@@ -900,20 +888,47 @@ def batch_general_mla_ops(ops, outputs, *, views, prefix, runtime, policy):
             or any(op.plan_required or op.source_boundary or op.recipe in cfg_rec
                    for op in members)):
         return outputs
-    # Only pure analytic envelope members of one phase share one invocation.
-    # A generic decode schedule or an indexed geometry carries its own private
-    # query/topk recipe; merging it would execute only the first member.
+    # Dense schedules use batch_ops; sparse analytic work preserves every
+    # query and its geometry below, including explicit indexed programs.
     first_phase = members[0].phase
     if any(op.phase != first_phase for op in members) or any(
-            dict(op.metadata).get("program_kind")
-            or dict(op.metadata).get("latent_attention_schedule")
-            or dict(op.metadata).get("indexed_attention_geometry")
+            dict(op.metadata).get("program_kind") == "dense_latent_attention_generic"
             for op in members):
         return outputs
     ids = {op.op_id for op in members}
     reqs = tuple(dict.fromkeys(req for op in members for req in op.requests))
     deps = tuple(dict.fromkeys(dep for op in members for dep in op.deps))
     first_meta = dict(members[0].metadata)
+    geometries = [dict(op.metadata).get("indexed_attention_geometry") for op in members]
+    if all(geometries):
+        geometry = dict(geometries[0])
+        sequences = tuple(pair for item in geometries for pair in
+                          item.get("sequences", ((item.get("query"), item.get("context")),)))
+        geometry.pop("query", None)
+        geometry.pop("context", None)
+        geometry["sequences"] = sequences
+        first_meta["indexed_attention_geometry"] = geometry
+    for key in ("indexed_gather_rows", "dense_window_sweep_rows",
+                "selection_index_read_bytes"):
+        first_meta[key] = sum(dict(op.metadata).get(key, 0) for op in members)
+    tensor = dict(first_meta.get("attention_tensor_view", {}))
+    for key in ("query_shape", "query_rope_shape", "output_shape"):
+        if key in tensor:
+            axis = 1 if key == "output_shape" and tensor["kind"] == "dense_paged_latent" else 0
+            shape = list(tensor[key])
+            shape[axis] = sum(dict(op.metadata)["attention_tensor_view"][key][axis]
+                              for op in members)
+            tensor[key] = tuple(shape)
+    if tensor:
+        tensor["batch_count"] = len(members)
+        first_meta["attention_tensor_view"] = tensor
+    traffic = dict(first_meta.get("attention_traffic_plan", {}))
+    if traffic:
+        for key in traffic:
+            if key != "residency_basis":
+                traffic[key] = sum(dict(op.metadata)["attention_traffic_plan"][key]
+                                   for op in members)
+        first_meta["attention_traffic_plan"] = traffic
     first_meta["request_shapes"] = tuple((v.q_len, v.context) for v in views)
     first_meta["logical_pairs"] = sum(
         float(dict(op.metadata).get("logical_pairs", 0.0)) for op in members)

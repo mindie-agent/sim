@@ -433,7 +433,7 @@ def alltoall(*, prefix, plan, deps, stage, requests, tokens, model, parallel, mo
     exchange_partitions = source_partitions
     ep_scale = tokens * plan.top_k * (parallel.ep - 1) / parallel.ep / exchange_partitions
     dispatch_exchange_bytes, combine_exchange_bytes = ep_scale * dispatch_row_bytes, ep_scale * combine_row_bytes
-    collective_meta = (("group_axis", "ep"), ("steps", max(0, parallel.ep - 1)),
+    collective_meta = (("group_axis", "ep"),
                        ("source_assignment_partitions", source_partitions),
                        ("traffic_model", "uniform_peer_payload"), ("routing_basis", routing_basis))
     def masked_collective(op, reverse=False):

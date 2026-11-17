@@ -4,6 +4,9 @@ from dataclasses import replace
 
 import pytest
 
+#: A5 sustainable DRAM service is declared at 0.8316 of the raw HBM peak.
+A5_DRAM_SERVICE_SCALE = 1 / 0.8316
+
 from mindie_sim import graph_costs, operator_costs, predict, target_operators
 from mindie_sim.prediction.cost import primitive_key
 from mindie_sim.prediction.mechanism import OperatorPlan, PlannedRecipe, Work
@@ -44,11 +47,12 @@ def test_a5_ordinary_class_minima_are_inclusive_once_and_keep_dma_outside():
     # it does not pay both or append that value after useful resource work.
     large = replace(mixed, hbm_bytes=4e8)
     result = graph_costs(raw, (large,), input_ready_ms=7, trace_limit=100)
-    assert result["duration_ms"] == pytest.approx(.1)
-    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(4e8)
+    assert result["duration_ms"] == pytest.approx(.1 * A5_DRAM_SERVICE_SCALE)
+    assert result["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
+        4e8 * A5_DRAM_SERVICE_SCALE)
     assert not any(event["task"].endswith(":startup") for event in result["events"])
     dma = operator_costs(raw, (op("dma", memory=400),))["operators"][0]
-    assert dma["duration_ms"] == pytest.approx(1e-7)
+    assert dma["duration_ms"] == pytest.approx(1e-7 * A5_DRAM_SERVICE_SCALE)
     assert result["execution"]["live_tasks"] == result["execution"]["live_programs"] == 0
 
 
@@ -71,8 +75,9 @@ def test_a5_quantized_and_empty_classes_are_explicit_boundaries_not_stacked_floo
     # A large declared call pays max(body, minimum), not body + floor.
     big = replace(declared, hbm_bytes=4e8)
     report = graph_costs(raw, (big,), input_ready_ms=3, isolated=False)
-    assert report["duration_ms"] == pytest.approx(.1)
-    assert report["execution"]["serviced"]["memory@r0:s0"] == 4e8
+    assert report["duration_ms"] == pytest.approx(.1 * A5_DRAM_SERVICE_SCALE)
+    assert report["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
+        4e8 * A5_DRAM_SERVICE_SCALE)
     assert report["execution"]["live_tasks"] == report["execution"]["live_programs"] == 0
 
 

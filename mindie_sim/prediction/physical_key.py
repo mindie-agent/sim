@@ -20,7 +20,8 @@
     inequality of references, aliasing and ownership relationships therefore
     survive the normalization.
   * Layer-indexed state references (``kda.layer[L]`` / ``gdn.layer[L]``) and the
-    integer ``stage``/``layer`` leaves of ``state_accesses`` are relative to the
+    integer ``stage``/``layer`` leaves of ``state_accesses`` and
+    ``fused_origin_scopes`` are relative to the
     operator that owns them, for the same injective reason.
   * Unknown metadata is retained unchanged.  An unrecognized identity-bearing
     field can only prevent deduplication; it can never cause a false merge.
@@ -46,7 +47,7 @@ from typing import Any
 
 
 #: Version tag of the physical identity projection.
-IDENTITY_VERSION = "physical-key/3"
+IDENTITY_VERSION = "physical-key/4"
 
 #: Fields excluded from physical identity.  They name one occurrence, not work.
 OCCURRENCE_FIELDS = frozenset({
@@ -69,6 +70,9 @@ REFERENCE_KEYS = frozenset({
     "gdn_state_effects",
     "input_conversion_subgraphs",
     "inverse_index_producer",
+    "kda_recurrent_params",
+    "recover_ssm_geometry",
+    "prefix_cache_reads",
     "kda_state_contract",
     "kda_state_effects",
     "memory_accesses",
@@ -100,10 +104,12 @@ STATE_LAYER_FIELD = "layer"
 #: layers compare equal instead of producing one recipe per layer.
 NONNEGATIVE_ANCHOR_FLOOR = 0
 
-_STAGE_GROUP = 1
-_LAYER_GROUP = 2
+_STAGE_GROUP = 2
+_LAYER_GROUP = 3
 _LAYER_REFERENCE_GROUP = 2
-_OCCURRENCE = re.compile(r"(?<![\w.])s(\d+)\.l(\d+)\.")
+_STATE_FAMILY_GROUP = 1
+_OCCURRENCE = re.compile(
+    r"(?<![\w.])(?P<draft>draft(?:\d+|_prefill)\.)?s(\d+)\.l(\d+)(?=\.|$)")
 _LAYER_REFERENCE = re.compile(r"(?<![\w.])(kda|gdn)\.layer\[(\d+)\]")
 
 #: Identity field order.  A stable declaration, not a per-call inspection.
@@ -129,11 +135,11 @@ def is_reference_key(key: str) -> bool:
 def normalize_reference(value: str, stage: int, layer: int) -> str:
     """Rename occurrence prefixes relative to one anchor, preserving offsets."""
     def _rename(match: "re.Match[str]") -> str:
-        return (f"s{int(match.group(_STAGE_GROUP)) - int(stage)}"
-                f".l{int(match.group(_LAYER_GROUP)) - int(layer)}.")
+        return (f"{match.group('draft') or ''}s{int(match.group(_STAGE_GROUP)) - int(stage)}"
+                f".l{int(match.group(_LAYER_GROUP)) - int(layer)}")
 
     def _layer(match: "re.Match[str]") -> str:
-        family = match.group(_STAGE_GROUP)
+        family = match.group(_STATE_FAMILY_GROUP)
         return (f"{family}.layer["
                 f"{int(match.group(_LAYER_REFERENCE_GROUP)) - int(layer)}]")
 
@@ -143,14 +149,13 @@ def normalize_reference(value: str, stage: int, layer: int) -> str:
 
 def _normalize_mapping_entry(key: Any, item: Any, stage: int,
                              layer: int) -> tuple[str, Any]:
-    """One mapping leaf: relative anchor for ``stage``/``layer`` integers."""
+    """One mapping leaf: relative anchor for stage/layer ordinals."""
     name = str(key)
-    if (name == STATE_STAGE_FIELD and type(item) is int
-            and item >= NONNEGATIVE_ANCHOR_FLOOR):
-        return name, int(item) - int(stage)
-    if (name == STATE_LAYER_FIELD and type(item) is int
-            and item >= NONNEGATIVE_ANCHOR_FLOOR):
-        return name, int(item) - int(layer)
+    if type(item) is int and item >= NONNEGATIVE_ANCHOR_FLOOR:
+        if name == STATE_STAGE_FIELD:
+            return name, int(item) - int(stage)
+        if name in {STATE_LAYER_FIELD, "layer_index"}:
+            return name, int(item) - int(layer)
     return name, normalize_graph_value(item, stage, layer)
 
 
@@ -200,7 +205,7 @@ def _normalized_metadata(metadata: Any, stage: int, layer: int) -> tuple:
         name = str(key)
         if name in PAIRING_ONLY_KEYS:
             continue
-        if name == STATE_ACCESS_KEY:
+        if name in {STATE_ACCESS_KEY, "fused_origin_scopes"}:
             normalized.append((name, _relative_state_accesses(value, stage, layer)))
         elif is_reference_key(name):
             normalized.append((name, normalize_graph_value(value, stage, layer)))

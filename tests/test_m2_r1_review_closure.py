@@ -122,8 +122,9 @@ def test_pooled_indexer_cold_scan_charges_visited_pool_rows():
     assert scores.hbm_bytes - scores.mte3_bytes - weighted_read == pytest.approx(
         POOL_UNIQUE_ROWS * INDEX_ROW_BYTES)
     topk = next(op for op in ops if op.recipe == "index_pool_topk")
-    assert topk.mte2_bytes == pytest.approx(
-        ATOMIC_BYTES * metadata["scanned_pools"])
+    # The non-eager fused plan keeps the FP32 score tile in UB; only raw eager
+    # execution round-trips the score plane and per-head indices through HBM.
+    assert topk.mte2_bytes == 0.0
 
 
 # --------------------------------------------------------------------------- #
@@ -200,10 +201,10 @@ def test_weighted_query_scoring_is_vector_arithmetic_not_bf16_cube():
     assert scores.flops == 0
     assert scores.matrix_flops == ()
     assert scores.vector_ops == pytest.approx(2 * scanned * INDEX_DIM)
-    assert scores.mte3_bytes == pytest.approx(ATOMIC_BYTES * scanned)
-    assert metadata["score_materialization"] == "separate_fp32_score_then_topk"
+    assert scores.mte3_bytes == 0.0
+    assert metadata["score_materialization"] == "ub_online_topk"
     topk = next(op for op in ops if op.recipe == "index_pool_topk")
-    assert topk.mte2_bytes == pytest.approx(ATOMIC_BYTES * scanned)
+    assert topk.mte2_bytes == 0.0
 
 
 # --------------------------------------------------------------------------- #

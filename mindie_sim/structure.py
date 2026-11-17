@@ -284,7 +284,7 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
     for replica, operators in sorted(graphs.items()):
         outputs_by_id, metadata_by_id = {}, {}
         for op in operators:
-            if op.phase != phase:
+            if op.phase != phase and not (phase == "decode" and op.phase == "draft"):
                 raise ValueError(f"structure_phase_mismatch:{op.op_id}:{op.phase}:{phase}")
             expanded = book.expand((op,)) if expand_calls else (op,)
             meta = metadata(op)

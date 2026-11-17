@@ -105,7 +105,7 @@ def test_public_selector_preserves_default_and_executes_exact_protocol_bytes():
     assert result["execution"]["live_tasks"] == default_result["execution"]["live_tasks"] == 0
 
 
-def test_body_transport_selection_preserves_separate_bf16_mtp_protocol():
+def test_body_transport_selection_preserves_expert_quant_and_explicit_mtp_scope():
     root = Path(__file__).resolve().parents[1]
     raw = json.loads((root / "tests/fixtures/verification/"
                      "v4flash-communication-case.json").read_text())
@@ -113,9 +113,12 @@ def test_body_transport_selection_preserves_separate_bf16_mtp_protocol():
     parsed = parse_case(raw)
     view = RequestView("one", 4, 0, True, "prefill", draft_prepare=True)
     frontend = Frontend()
-    # An unscoped selection must not quietly become BF16 in the MTP layer.
-    with pytest.raises(ModelingError, match="requires_int8_activations"):
-        frontend(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)
+    # An expert draft preserves its declared INT8 expert operands.
+    unscoped = frontend(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)
+    draft = [op for op in unscoped.ops
+             if op.recipe == "expert_quantized_dispatch" and op.phase == "draft_prefill"]
+    assert len(draft) == 1
+    assert dict(draft[0].metadata)["payload_dtype"] == "int8"
     raw["runtime"]["kernels"]["moe_transport"]["layer_scopes"] = ["body"]
     parsed = parse_case(raw)
     work = frontend(IterationPlan((view,)), parsed.model, parsed.runtime, parsed.machine)

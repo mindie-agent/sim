@@ -303,13 +303,33 @@ QUANTIZATION_PRESETS: dict[str, Any] = {
 }
 
 
-def quant_preset(name: str) -> QuantSpec:
+def quant_preset(name: str, *, model=None) -> QuantSpec:
     """Resolve a case-declared quantization preset; unknown names are refused."""
     key = str(name or "").strip().lower()
     builder = QUANTIZATION_PRESETS.get(key)
     if builder is None:
         raise ValueError(f"quantization_preset_unknown:{name}")
-    return builder()
+    quant = builder()
+    if (builder is _quant_qwen_mxfp8 and model is not None
+            and dict(model.metadata).get("source_model_type") == "glm5_next_text"):
+        native = {"weight_format": "bf16", "activation_format": "bf16"}
+        quant = replace(
+            quant,
+            exclusions=("norm", "lm_head", "embedding", "vision", "projector",
+                        "router", "conv_weight_f32", "conv_weight_bf16"),
+            category_overrides={
+                "kda": native, "mla_absorb": native, "indexer": native,
+                "indexer_fp8": native, "dspark_input": native,
+                "mla": {"weight_format": "fp8_e4m3", "activation_format": "fp8_e4m3"},
+            },
+            source=merge_source({
+                "quant_method": "mxfp8",
+                "checkpoint": "Eco-Tech/GLM-5.3-Flash-w8a8-mxfp8",
+                "weight_block_size": "1x32", "scale_fmt": "ue8m0",
+            }),
+            notes=("MLA projections and body/MTP experts use MXFP8; "
+                   "KDA, absorbed MLA, indexer and MTP input stay FLOAT",))
+    return quant
 
 
 def _quant_bf16(c: Mapping[str, Any], *, name: str) -> QuantSpec:

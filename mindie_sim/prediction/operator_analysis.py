@@ -9,6 +9,7 @@
 from copy import deepcopy
 from dataclasses import replace
 from collections.abc import Mapping
+import math
 
 from .analysis_inputs import (
     FIRST_PARTICIPANT, UNIFORM_COUNT_CARDINALITY,
@@ -71,6 +72,25 @@ def _group_sequences(sequences, group, parallel):
 
 
 MODEL_SCOPE = "model"
+ANALYSIS_ZERO = 0
+ANALYSIS_ONE = 1
+
+
+def _analysis_draft_view(view, case, scope, index):
+    """Tokens are the verify width; split out its declared proposal rows."""
+    if scope != MODEL_SCOPE or view.phase != "decode" or view.padding:
+        return view
+    declared = int(dict(case.runtime.metadata).get("draft_proposal_tokens", ANALYSIS_ZERO))
+    proposals = min(declared, max(ANALYSIS_ZERO, view.q_len - ANALYSIS_ONE))
+    if not proposals:
+        return view
+    mean = min(float(view.q_len), max(float(ANALYSIS_ONE),
+                                     case.runtime.mtp_acceptance_length))
+    advanced = math.floor((index + ANALYSIS_ONE) * mean) - math.floor(index * mean)
+    return replace(view, q_len=view.q_len - proposals,
+                   draft_proposal_tokens=proposals, draft_advanced_tokens=advanced,
+                   draft_accepted_tokens=advanced - ANALYSIS_ONE)
+
 
 
 class ModelGraphSet(dict):
@@ -122,6 +142,8 @@ def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body
         )
         for index in range(max(0, view_count))
     )
+    views = tuple(_analysis_draft_view(view, case, scope, index)
+                  for index, view in enumerate(views))
     case = _media_case(case, views, scope, media_tokens_per_sequence)
     from .local_tp_groups import local_tp_spans_dp
     if (len(group) > 1
@@ -374,6 +396,9 @@ def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                 phase, draft_prepare=draft_prepare,
                 **_analysis_prefix_fields(case, i, context),
             ) for i in range(count))
+        logical_views[replica] = tuple(
+            _analysis_draft_view(view, case, scope, index)
+            for index, view in enumerate(logical_views[replica]))
         if count == 0 and pad_idle:
             # A physical graph row is not a logical request.  A zero-length
             # padded view lets GraphPolicy select the declared capture bucket;
@@ -568,6 +593,10 @@ def model_program(value, *, phase, tokens, context=0, sequences=1,
         ) for index in range(counts[replica]))
         for replica in participants
     }
+    views_by_replica = {
+        replica: tuple(_analysis_draft_view(view, case, assembly, index)
+                       for index, view in enumerate(views))
+        for replica, views in views_by_replica.items()}
     plan = IterationPlan(views_by_replica[selected])
     global_views = (tuple(view for replica in participants
                           for view in views_by_replica[replica])

@@ -44,7 +44,9 @@ def _serving_kda_source(runtime, model, views, plan):
     if runtime is None:
         return None
     parallel = getattr(runtime, "parallel", None)
-    if int(getattr(parallel, "cp", 1) or 1) > 1:
+    from mindie_sim.catalog.paired_sfa import execution
+    if (int(getattr(parallel, "cp", ONE) or ONE) > ONE
+            and execution(model).get("recurrent_context_sharded") is not False):
         return None
     opts = resolve(plan, arch=dict(runtime.metadata).get("arch_family"),
                    phase=(views[0].phase if views else ""), kernels=runtime.kernels,

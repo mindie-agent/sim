@@ -296,8 +296,9 @@ def export_subgraphs(nodes, declarations, memberships, entry_dependencies):
                     pending.append(dependency)
         ordered = [by_id[node_id] for node_id in sorted(members, key=position.__getitem__)]
         first = ordered[0]
-        if any((node["replica"], node["stage"], node["phase"]) !=
-               (first["replica"], first["stage"], first["phase"])
+        if any((node["replica"], node["stage"]) != (first["replica"], first["stage"])
+               or (node["phase"] != first["phase"]
+                   and not {node["phase"], first["phase"]} <= {"decode", "draft"})
                for node in ordered):
             raise ValueError(f"structure_subgraph_crosses_placement:{local_id}")
         owners = set()

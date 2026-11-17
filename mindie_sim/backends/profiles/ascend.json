@@ -6491,7 +6491,7 @@
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
-          "rate": 2217600000000.0
+          "rate": 3326400000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",
@@ -6934,7 +6934,7 @@
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
-          "rate": 2217600000000.0
+          "rate": 3326400000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",
@@ -7902,7 +7902,7 @@
         },
         "mte2_aic_dram": {
           "resource": "mte2_aic",
-          "rate": 887040000000.0
+          "rate": 1330560000000.0
         },
         "mte2_aiv_l2": {
           "resource": "mte2_aiv",

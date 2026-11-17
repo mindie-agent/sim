@@ -33,6 +33,7 @@ MX_SCALE_GROUP_SIZE = 32
 MX_SCALE_PACK_FACTOR = 2
 GDN_DEFAULT_CHUNK_SIZE = 64
 MAX_RECURRENT_DECODE_QUERY = 8
+SERIAL_CONTEXT_DEGREE = 1
 
 PASS_PRIORITY_ORDER: tuple[str, ...] = (
     "activation_quantization",
@@ -218,7 +219,11 @@ def _apply_recurrent_decode(rt: dict[str, Any], ctx: MechanismContext) -> None:
     is_a5 = ctx.arch == "a5"
     cp = int(ctx.parallel.get("cp", ctx.parallel.get("dcp", 1)))
     pcp = int(ctx.parallel.get("pcp", 1))
-    if any(p.attention == "kda" for p in ctx.model.layer_plans) and pcp >= 1 and cp == 1:
+    from mindie_sim.catalog.paired_sfa import execution
+    if (any(p.attention == "kda" for p in ctx.model.layer_plans)
+            and pcp >= SERIAL_CONTEXT_DEGREE
+            and (cp == SERIAL_CONTEXT_DEGREE
+                 or execution(ctx.model).get("recurrent_context_sharded") is False)):
         _set_lowering(rt, "kda", {
             "cases": [{
                 "domain": {
@@ -281,9 +286,6 @@ def _apply_gdn_chunk64(rt: dict[str, Any], ctx: MechanismContext) -> None:
 
 def _apply_recover_ssm(rt: dict[str, Any], ctx: MechanismContext) -> None:
     if "recover_ssm" in ctx.caller_explicit:
-        return
-    if dict(ctx.model.metadata).get("cache_allocator") == "paired_sfa":
-        # paired_sfa_recover_ssm_layout_not_declared guard in paired_sfa.py
         return
     meta = dict(rt.get("metadata") or {})
     if int(meta.get("draft_proposal_tokens", 0) or 0) > 0:

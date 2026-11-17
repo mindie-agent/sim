@@ -17,6 +17,7 @@ from mindie_sim.catalog.cache import completed_rows, index_row_bytes, index_sele
 from mindie_sim.schema.common import dtype_bytes, ModelingError
 from .batch_prefix_attention import (
     annotate_sparse_prefix_unknown, apply_attention_prefix_reads,
+    apply_sparse_prefix_reads,
 )
 from .implementations import select
 from .implementation_selection import is_automatic_lowering
@@ -597,7 +598,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
         kv_hbm_total = 0.0
         kv_mte2_total = 0.0
         kv_components: dict[str, tuple[float, float]] = {}
-        kv_row_b = plan.cache_row_elements * dtype_bytes(quant.kv_dtype)
+        kv_row_b = cache_format(model, "mla_kv").row_bytes(plan.cache_row_elements)
         for rec in view_records:
             orig_idx = rec["orig_idx"]
             view = rec["view"]
@@ -762,12 +763,25 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             pinned_attn = "attention" in cfg_fam or any(
                 item in cfg_rec for item in
                 ("latent_attention0", "latent_attention_batch"))
-            out_set = set(grp_outputs)
+            if gathered_dcp:
+                grp_outputs = latent_dcp.attention_batch(
+                    b, grp_outputs, grp_views, plan=plan, heads=heads,
+                    local_heads=logical_heads, cp=eff_cp, rows=q)
+            out_set = ({prefix + ".latent_attention_batch"} if gathered_dcp
+                       else set(grp_outputs))
             for idx_op, op_item in enumerate(b.ops):
                 if op_item.op_id not in out_set or op_item.source_boundary:
                     continue
                 if topk:
-                    b.ops[idx_op] = annotate_sparse_prefix_unknown(op_item, runtime)
+                    b.ops[idx_op] = (
+                        apply_sparse_prefix_reads(
+                            op_item, views=grp_views, row_bytes=float(kv_row_b),
+                            runtime=runtime, hierarchy=hierarchy,
+                            kv_hbm_bytes=kv_hbm_total,
+                            kv_mte2_bytes=kv_mte2_total)
+                        if len(grp_outputs) == 1 and eff_cp == 1
+                        and plan.cache_kind == "dense"
+                        else annotate_sparse_prefix_unknown(op_item, runtime))
                 elif len(grp_outputs) == 1:
                     b.ops[idx_op] = apply_attention_prefix_reads(
                         op_item, views=grp_views, sweeps_by_view=sweeps_by_view,
@@ -796,7 +810,8 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
                             kv_hbm_bytes=component[0],
                             kv_mte2_bytes=component[1])
         if eff_cp > 1 and grp_outputs:
-            out_set = set(grp_outputs)
+            out_set = ({prefix + ".latent_attention_batch"} if gathered_dcp
+                       else set(grp_outputs))
             for idx_op, op_item in enumerate(b.ops):
                 if op_item.op_id not in out_set:
                     continue
@@ -819,10 +834,6 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             b.ops.extend(merged)
             grp_outputs = [merged_last]
         outputs.extend(grp_outputs)
-    if gathered_dcp and not selected:
-        outputs = latent_dcp.attention_batch(
-            b, outputs, views, plan=plan, heads=heads,
-            local_heads=logical_heads, cp=cp, rows=q)
     heads = logical_heads
     if latent:
         outputs = [b.matrix("v_expand", outputs, q * heads, plan.v_head_dim,

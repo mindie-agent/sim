@@ -47,7 +47,7 @@ def test_index_key_window_counts_physical_compressed_rows():
     assert rows == logical // 32
 
 
-def test_unique_index_key_rows_precharges_each_request():
+def test_unique_index_key_rows_deduplicates_only_the_shared_prefix():
     from mindie_sim.prediction.generic_latent_attention import unique_index_key_rows
     from mindie_sim.schema.workload import RequestView
 
@@ -57,10 +57,14 @@ def test_unique_index_key_rows_precharges_each_request():
         for i in range(2)
     )
     union, refills = unique_index_key_rows(views, compression=32)
-    # Both requests keep their own precharged window; only the prefix planner
-    # may share the immutable prefix once.
-    assert union == 2 * ((128 + 1) // 32)
-    assert refills == union
+    # #53/#54 unify the shared prefix in the HBM union; every view still
+    # pays its own precharged tile refill service.
+    assert union == (128 + 1) // 32
+    assert refills == 2 * union
+    private, private_refills = unique_index_key_rows(
+        views, compression=32, share_prefix=False)
+    assert private == 2 * union
+    assert private_refills == refills
 
 
 def test_shared_prefix_planner_separates_component_and_row_bytes():

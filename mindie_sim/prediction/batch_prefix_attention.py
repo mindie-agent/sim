@@ -250,3 +250,51 @@ def annotate_sparse_prefix_unknown(op: Any, runtime: Any) -> Any:
     })
     return replace(
         op, metadata=tuple(sorted(metadata.items(), key=lambda pair: pair[0])))
+
+
+def apply_sparse_prefix_reads(op, *, views, row_bytes, runtime, hierarchy,
+                              kv_hbm_bytes, kv_mte2_bytes):
+    """Bound unknown selections by their physical shared/private KV union."""
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
+    if (getattr(runtime, "prefix_cache_mode", "private") != "shared"
+            or getattr(runtime, "prefix_read_mode", "auto") == "per_sequence"
+            or raw_eager):
+        return annotate_sparse_prefix_unknown(op, runtime)
+    shared, private = {}, 0
+    for view in views:
+        if view.q_len <= 0 or view.padding:
+            continue
+        prefix = min(max(0, int(view.prefix_tokens)), int(view.context))
+        key = canonical_prefix_cache_key("shared", view.prefix_cache_key)
+        shared[key] = max(shared.get(key, 0), prefix)
+        private += max(0, int(view.kv_len) - prefix)
+    # With no row IDs the complete candidate plane is a conservative union
+    # bound. Never assume each query selects the same TopK rows.
+    working_set = min(float(kv_mte2_bytes),
+                      (sum(shared.values()) + private) * row_bytes)
+    retained = min(working_set, float(hierarchy.effective_l2_bytes))
+    spill = (max(0.0, 1.0 - retained / working_set)
+             if working_set else 0.0)
+    external = min(float(kv_hbm_bytes), working_set
+                   + max(0.0, kv_mte2_bytes - working_set) * spill)
+    metadata = dict(op.metadata)
+    metadata.update(
+        sparse_selection_unknown=True,
+        prefix_read_reuse_applied=external < kv_hbm_bytes,
+        prefix_read_reason="shared_sparse_candidate_working_set_with_l2_spill",
+        prefix_read_hbm_bytes=external,
+        prefix_read_l2_core_bytes=float(kv_mte2_bytes),
+        prefix_cache_reads={"working_set_bytes": working_set,
+                            "l2_capacity_bytes": float(hierarchy.effective_l2_bytes),
+                            "spill_fraction": spill})
+    traffic = dict(metadata.get("attention_traffic_plan", {}))
+    if traffic:
+        traffic.update(hbm_read_bytes=external,
+                       l2_hit_bytes=max(0.0, kv_mte2_bytes - external),
+                       working_set_bytes=working_set,
+                       residency_basis=metadata["prefix_read_reason"])
+        metadata["attention_traffic_plan"] = traffic
+    return replace(op, hbm_bytes=op.hbm_bytes - kv_hbm_bytes + external,
+                   metadata=tuple(metadata.items()))

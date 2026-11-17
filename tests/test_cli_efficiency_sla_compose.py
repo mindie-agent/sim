@@ -320,8 +320,8 @@ def test_a5_dt_glm53_moe_dispatch_combine_modeling() -> None:
     for hw, exp_disp_ideal_us, exp_comb_ideal_us, exp_disp_us, exp_comb_us in (
         # Ideal link time uses the declared usable capacity (nameplate peak x
         # declared utilization), not the raw provider peak.
-        ("a5-pod-dt", 0.1327764705882353, 0.2575058823529412,
-         94.63277647058824, 94.75750588235295),
+        ("a5-pod-dt", 8.364917647058823, 16.222870588235295,
+         9.864917647058826, 17.7228705882353),
         # M2 R1 allocates each directed link/pipe independently; the server
         # tier's asymmetric per-port resources no longer average into one
         # category share, so the serialized-hop service is re-anchored.
@@ -423,7 +423,9 @@ def _assert_expert_exchange_links(ops, ep):
     assert exchanges
     for op in exchanges:
         metadata = dict(op.metadata)
-        assert metadata["steps"] == ep - 1
+        # Collective rounds are owned by the startup-wave plan, not a per-op
+        # ``steps`` multiplier on the payload.
+        assert "steps" not in metadata
         expected = (op.local_shape[0] * (ep - 1) / ep * metadata["row_bytes"]
                     / metadata["source_assignment_partitions"])
         assert op.link_bytes == pytest.approx(expected, rel=1e-12)

@@ -13,6 +13,9 @@ from pathlib import Path
 
 import pytest
 
+#: A5 sustainable DRAM service is declared at 0.8316 of the raw HBM peak.
+A5_DRAM_SERVICE_SCALE = 1 / 0.8316
+
 from mindie_sim import graph_costs, operator_costs, target_graphs
 from mindie_sim.prediction.matrix_epilogue import (
     MatrixEpilogue, plan_matrix_epilogue, reconcile_native_scale_storage,
@@ -262,8 +265,10 @@ def test_real_quantize_producer_feeds_the_corrected_matrix_plan():
         f"r0:{producer.op_id}"]
     assert timeline[matrix.op_id]["ready_ms"] == pytest.approx(
         timeline[producer.op_id]["complete_ms"])
+    # The matrix payload stays byte-exact; the vector quantize producer is
+    # normalized by the declared sustainable DRAM service ceiling.
     assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
-        matrix.hbm_bytes + producer.hbm_bytes, rel=1e-12)
+        matrix.hbm_bytes + producer.hbm_bytes * A5_DRAM_SERVICE_SCALE, rel=1e-12)
     assert matrix.hbm_bytes == CAPTURED_INPUT_BYTES
 
 
@@ -365,7 +370,8 @@ def test_graph_helper_normalizes_same_object_and_detects_producer_conflict():
     assert timeline[normalized.op_id]["program"] == "TiledMatmul"
     assert timeline[normalized.op_id]["predecessors"] == [f"r0:{producer.op_id}"]
     assert joint["execution"]["serviced"]["memory@r0:s0"] == pytest.approx(
-        normalized.hbm_bytes + producer.hbm_bytes, rel=1e-12)
+        normalized.hbm_bytes + producer.hbm_bytes * A5_DRAM_SERVICE_SCALE,
+        rel=1e-12)
     bad_metadata = dict(producer.metadata)
     bad_metadata.update({"activation_scale_bytes": 8,
                          "activation_scale_format": "bf16"})

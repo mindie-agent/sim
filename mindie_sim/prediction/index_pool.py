@@ -511,6 +511,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     score_dtype = "fp32"
     score_elem_b = dtype_bytes(score_dtype)
     members, entries = [], []
+    runtime_meta = dict(getattr(runtime, "metadata", ()) or ())
+    raw_eager = bool(runtime_meta.get("raw_eager")
+                     or runtime_meta.get("execution_policy", {}).get("raw_eager"))
     materialized_scores = False
     if score_mode == "linear_weighted_query":
         query_f32 = b.vector(
@@ -530,10 +533,9 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             write=tokens * width * FP32_BYTES, family="indexer", dtype="fp32",
             metadata=common)
         members.extend((query_f32, weights_f32, weighted)); entries.extend((query_f32, weights_f32))
-        # The declared weighted-query implementation is FP32 vector arithmetic;
-        # it is not a BF16 Cube matmul and the score tile is materialized unless
-        # one executable fused plan owns the tile and the TopK state in UB.
-        materialized_scores = True
+        # Non-eager scoring and online TopK retain their tile in UB.
+        # Raw eager execution materializes the FP32 scores between calls.
+        materialized_scores = raw_eager
         scores = b.work(
             "index_pool_scores", (weighted, cache), (tokens, width),
             flops=0.0,
@@ -541,9 +543,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
             vector=FLOPS_PER_FMA * scanned * width,
             read=float(scanned) * row_bytes + tokens * width * FP32_BYTES,
             hbm_read=l2_bounded_pool_read + tokens * width * FP32_BYTES,
-            write=scanned * score_elem_b, family="indexer", dtype=score_dtype,
+            write=scanned * score_elem_b if materialized_scores else 0.0,
+            family="indexer", dtype=score_dtype,
             metadata=common + (("score_materialization",
-                                "separate_fp32_score_then_topk"),))
+                                "separate_fp32_score_then_topk" if materialized_scores
+                                else "ub_online_topk"),))
         entries.append(scores)
     else:
         matrix = ()
@@ -571,18 +575,19 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
         "index_pool_topk", (scores,), (tokens, pool_topk),
         vector=scanned * math.log2(max(2, pool_topk)),
         read=topk_score_read,
-        write=tokens * pool_topk * INT32_BYTES,
+        write=tokens * pool_topk * INT32_BYTES if raw_eager else 0.0,
         family="topk", dtype=score_dtype, metadata=common + (
             ("selection_output_dtype", "int32"),
             ("score_materialization",
              "separate_fp32_score_then_topk" if materialized_scores
-             else "per_head_mma")))
+             else ("ub_online_topk" if score_mode == "linear_weighted_query"
+                   else "per_head_mma"))))
     tail_rows = sum(g.causal_tail_tokens for g in geometry)
     has_output = (selected > 0 or tail_rows > 0) and tokens > 0
     packed = b.work(
         "index_topk", (topk,), (tokens, output_width),
         vector=selected * plan.index_kpool * 2 + (tokens * output_width if has_output else 0),
-        read=tokens * pool_topk * INT32_BYTES if (selected > 0 and tokens > 0) else 0,
+        read=tokens * pool_topk * INT32_BYTES if (raw_eager and selected > 0 and tokens > 0) else 0,
         write=tokens * output_width * INT32_BYTES if has_output else 0,
         family="topk", dtype="int32", metadata=common + (
             ("selection_output_dtype", "int32"), ("selection_capacity", output_width),

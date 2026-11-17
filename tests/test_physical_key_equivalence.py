@@ -1,6 +1,5 @@
 """Canonical physical identity preserves physical information and aliasing."""
 from dataclasses import replace
-import re
 
 from mindie_sim.compose import compose_case
 from mindie_sim.prediction.operator_analysis import target_graphs
@@ -24,13 +23,6 @@ def _graph(layers=4):
                                sequences=1, scope="body")[0]
 
 
-def _layer_normalized(_op, value):
-    """Normalize every layer ordinal a cross-layer fusion origin records."""
-    text = value if isinstance(value, str) else repr(value)
-    return re.sub(r's0\.l\d+\.', "s0.lN.",
-                  re.sub(r"['\"]layer['\"],\s*\d+", "layer,N", text))
-
-
 def test_corresponding_layers_share_one_physical_identity():
     _case, ops = _graph()
     by_recipe = {}
@@ -42,18 +34,9 @@ def test_corresponding_layers_share_one_physical_identity():
     for group in repeated:
         corresponding = [op for op in group if op.layer > 0]
         assert len(corresponding) > 1
-        # The fused residual-norm boundary records the producing layer; the
-        # physical identity is the same once that ordinal is normalized.
-        signatures = {_layer_normalized(op, physical_signature(op))
-                      for op in corresponding}
-        assert len(signatures) == 1
-        assert len({_layer_normalized(op, physical_key(op))
-                    for op in corresponding}) == 1
-        # ``physical_id`` hashes the raw key, so the fused cross-layer ordinal
-        # keeps one distinct id per distinct raw key; the normalized key above
-        # is the identity invariant.
-        assert len({physical_id(op) for op in corresponding}) == len(
-            {physical_key(op) for op in corresponding})
+        assert len({physical_signature(op) for op in corresponding}) == 1
+        assert len({physical_key(op) for op in corresponding}) == 1
+        assert len({physical_id(op) for op in corresponding}) == 1
 
 
 def test_shape_dtype_bytes_state_and_local_tp_change_identity():
@@ -75,7 +58,9 @@ def _rotate(value, stage, layer, target_layer):
     if isinstance(value, str):
         return value.replace(f"s{stage}.l{layer}.", f"s{stage}.l{target_layer}.")
     if isinstance(value, dict):
-        return {key: _rotate(item, stage, layer, target_layer)
+        return {key: item + target_layer - layer
+                if key in {"layer", "layer_index"} and type(item) is int
+                else _rotate(item, stage, layer, target_layer)
                 for key, item in value.items()}
     if isinstance(value, (list, tuple)):
         return tuple(_rotate(item, stage, layer, target_layer) for item in value)

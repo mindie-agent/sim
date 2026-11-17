@@ -578,12 +578,13 @@ def stage_cache_components(
     if draft_kind and getattr(model, "auxiliary", None) is not None:
         from mindie_sim.catalog.draft import optional_draft_spec
         draft = optional_draft_spec(model, draft_kind)
-        row = ((draft.kv_cache_elements or draft.kv_lora_rank + draft.qk_rope_head_dim)
-               if draft.attention_kind == "mla"
-               else 2 * local_kv_heads(draft.num_kv_heads, parallel.tp) * draft.head_dim)
-        seq = block_round(max(0, int(sequence_tokens)), interleave) if capacity_padded else max(0, int(sequence_tokens))
-        stages[-1]["draft_kv"] = stages[-1].get("draft_kv", 0.0) + float(
-            seq * row * kv_element_bytes(model) * draft.layers
+        from mindie_sim.catalog.paired_sfa import draft_row
+        row_bytes = draft_row(model, draft, tp=parallel.tp)
+        seq = max(ZERO, int(sequence_tokens))
+        seq = (_context_shard_blocks(seq, interleave, parallel.cp) if capacity_padded
+               else seq / parallel.cp)
+        stages[-ONE]["draft_kv"] = stages[-ONE].get("draft_kv", ZERO) + float(
+            seq * row_bytes * draft.layers
         )
     return stages
 

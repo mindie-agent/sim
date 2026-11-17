@@ -122,8 +122,11 @@ def test_graph_carrier_keeps_current_hardware_and_explicit_book_or_recipe_overri
     assert slow_service["mte1@r0:s0"] == pytest.approx(76576)
     assert slow_service["mte2_aic@r0:s0"] == pytest.approx(72448)
     for key in set(fast_service) | set(slow_service):
-        if key not in {"mte1@r0:s0", "mte2_aic@r0:s0"}:
+        if key not in {"mte1@r0:s0", "mte2_aic@r0:s0", "memory@r0:s0"}:
             assert slow_service.get(key) == pytest.approx(fast_service.get(key))
+    # DRAM service modes normalize byte service to the raw HBM bus rate;
+    # changing that bus rate changes service units, never native byte work.
+    assert fast_service["memory@r0:s0"] > slow_service["memory@r0:s0"]
     assert slowed["execution"]["work"] == automatic["execution"]["work"]
     explicit = RecipeBook(families={"attention": TiledFlashAndPagedAttentionRecipe()})
     override = _graph(raw, graphs, recipes=explicit)

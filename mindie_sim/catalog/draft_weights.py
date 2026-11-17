@@ -61,7 +61,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
                    "mla", "out_tp"),
                 _t("draft_wkv", wkv_rows, h, "mla"),
                 _t("draft_kv_b", draft.num_heads * (draft.qk_nope_head_dim + draft.v_head_dim),
-                   draft.kv_lora_rank, "mla", "out_tp"),
+                   draft.kv_lora_rank, "mla_absorb", "out_tp"),
             ])
             if draft.o_groups:
                 group_width = draft.num_heads * draft.head_dim // draft.o_groups

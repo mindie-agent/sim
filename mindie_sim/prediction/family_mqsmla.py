@@ -19,7 +19,7 @@ from .mqsmla import (
     MQSMLA_ROPE_WIDTH,
     ORIGINAL_CACHE_ROW_BYTES,
     SOURCE,
-    VALID_LOCAL_HEAD_COUNTS,
+    supported_heads,
     build,
     query_rows,
     selective_fd_excluded,
@@ -48,7 +48,7 @@ def recipes():
 
 def query_shape(views, plan, *, topk_present=False):
     """The exact per-row geometry the builder will consume."""
-    effective_ratio = (plan.compress_ratio if topk_present
+    effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     return {
         "sequences": tuple((int(v.q_len), int(v.context)) for v in views),
@@ -74,7 +74,7 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
     cp = int(getattr(parallel, "cp", UNIT_CONTEXT_PARALLEL) or UNIT_CONTEXT_PARALLEL)
     if cp != UNIT_CONTEXT_PARALLEL:
         return "mqsmla_requires_context_parallel_cp1"
-    if plan.num_heads // tp not in VALID_LOCAL_HEAD_COUNTS:
+    if not supported_heads(plan.num_heads // tp):
         return "mqsmla_local_heads_outside_source_tp_tiling"
     groups = int(getattr(plan, "o_groups", 0) or 0)
     if groups and groups % tp:
@@ -124,7 +124,7 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     heads = plan.num_heads // tp_degree
     rows = tuple((v.q_len, v.context) for v in views)
     active_q = sum(q for q, _ in rows)
-    effective_ratio = (plan.compress_ratio if topk_present
+    effective_ratio = (plan.compress_ratio if topk_present or plan.owns_long_kv
                        else NO_COMPRESSED_ROWS)
     shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,

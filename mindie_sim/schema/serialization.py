@@ -175,7 +175,7 @@ def apply_model_overrides(model, raw):
 
         try:
             quant = (_quant_bf16({}, name="bf16") if str(declared).lower() in {"none", "bf16", "bf16_qwen"}
-                     else quant_preset(str(declared)))
+                     else quant_preset(str(declared), model=model))
         except ValueError as exc:
             raise ModelingError(str(exc)) from exc
         # A weight preset does not erase the catalog model's declared

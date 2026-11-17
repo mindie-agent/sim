@@ -99,7 +99,11 @@ def test_index_history_is_sharded_but_recurrent_heads_are_not():
     owned = [sum(owned_positions(0, 131072 + offset, 8, 1536, rank)
                  for _ in range(2) for offset in range(1, 5))
              for rank in range(8)]
-    assert scan.mte2_bytes == max(owned) * 130
+    # Score arithmetic is per token; the four queries occupy one tile.
+    assert scan.flops == 2 * max(owned) * 32 * 128
+    tile_rows = [2 * owned_positions(0, 131072 + 4 - 1, 8, 1536, rank)
+                 for rank in range(8)]
+    assert scan.mte2_bytes == max(tile_rows) * 130
     candidate = next(op for op in graph if op.recipe == "candidate_gather")
     assert candidate.link_bytes == 8 * 2048 * 8 * 7
     kda = [op for op in graph if op.family in {"recurrent_vector", "recurrent_scan"}]

@@ -87,7 +87,7 @@ class Engine(
         pools: Mapping[str, float] | None = None, trace_limit: int = 0,
         pool_units: Mapping[str, int] | None = None,
         zero_progress_limit: int = DEFAULT_ZERO_PROGRESS_LIMIT,
-        backend: str | None = None,
+        backend: str | None = None, accel_eager_attach: bool = False,
     ):
         if not isinstance(zero_progress_limit, int) or isinstance(
                 zero_progress_limit, bool) or zero_progress_limit < 1:
@@ -111,7 +111,8 @@ class Engine(
         self._empty_task: _PreparedTask = _EMPTY_TASK
         self.memory_ledger_error: str | None = None
         from .accel_bridge import make_backend
-        self._accel, self._accel_telemetry = make_backend(backend)
+        self._accel, self._accel_telemetry = make_backend(
+            backend, eager_attach=bool(accel_eager_attach))
         self._fifo_live = 0
         self._inline_blocked = 0
         self._fifo_names: frozenset[str] = frozenset()

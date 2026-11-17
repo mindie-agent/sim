@@ -16,6 +16,7 @@ from .structure_groups import declare_group
 
 IMPLEMENTATION = "vllm_ascend_mla_prolog_v3"
 ABSORBED_CATEGORY = "mla_absorb"
+CACHE_GROUP_SIZE = 128
 SOURCE = {
     "repository": "vllm-ascend",
     "revision": "175ef4d49c2072f9233619636f0309f4f88b4e2c",
@@ -53,7 +54,7 @@ def prepare_model(model, runtime):
 
 
 def validate(*, plan, parallel, model, quant, lowering_passes,
-             cache_layout=None, cache_group_size=128):
+             cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import LAYOUT, view
     packed = cache_layout == LAYOUT
     if cache_layout not in (None, LAYOUT) or (packed and quant.kv_dtype != "int8"):
@@ -64,7 +65,7 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
             raise ModelingError("mla_prolog_packed_requires_int8_projection_operands")
     if (plan.mla_variant != "latent_mla" or plan.cache_kind != "dense"
             or parallel.cp != 1 or parallel.pcp < 1
-            or model.activation_dtype != "bf16" or (quant.kv_dtype != "bf16" and not packed)
+            or model.activation_dtype != "bf16" or (quant.kv_dtype not in {"bf16", "fp8_e4m3"} and not packed)
             or quant.format_for("mla") not in {"bf16", "int8", "fp8_e4m3"}):
         raise ModelingError("mla_prolog_v3_declared_operand_domain_unsupported")
     projection_activation = compute_dtype_for(quant, "mla")[1]
@@ -80,7 +81,7 @@ def validate(*, plan, parallel, model, quant, lowering_passes,
 
 
 def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
-            q_a, q_b, kv_a, q_absorb, cache_layout=None, cache_group_size=128):
+            q_a, q_b, kv_a, q_absorb, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import LAYOUT, SOURCE as PACKED_SOURCE, view as packed_view
     packed = cache_layout == LAYOUT
     cache = packed_view(plan.kv_lora_rank, plan.qk_rope_head_dim, cache_group_size) if packed else None
@@ -127,7 +128,7 @@ def declare(ops, *, prefix, plan, model, parallel, quant, tokens, members,
     )
 
 
-def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_size=128):
+def cache_store(builder, *, deps, rows, plan, cache_layout=None, cache_group_size=CACHE_GROUP_SIZE):
     from .mla_prolog_packed import LAYOUT, store
     if cache_layout == LAYOUT:
         return store(builder, "kv_store", deps, rows, plan)

@@ -235,13 +235,18 @@ def test_public_a5_graph_same_traffic_different_sharing_domains():
     assert any("intra_4p" in name for name in server)
     assert any("intra_node" in name for name in server)
     assert not any("intra_4p" in name for name in pod)
-    # M2 names directed per-pair UB resources; a pair is counted once and the
-    # same 8 MB directed transfer has the same service in both sharing domains.
-    assert not any(":tx:port" in name or ":rx:port" in name
-                   for name in server | pod)
-    assert all(":pair" in name for name in server | pod)
-    assert (reports["a5_server"]["execution"]["serviced"]["link:d2d_intra_4p:0:pair0>1"]
-            == reports["a5_pod"]["execution"]["serviced"]["link:d2d_intra_node:0:pair0>1"])
+    # The server preset uses directed per-pair UB resources; the pod preset
+    # exposes each rank endpoint as one TX and one RX port.  Both carry the
+    # same 8 MB per-rank payload once in one direction.
+    assert all(":pair" in name for name in server)
+    assert any(":tx:port" in name for name in pod)
+    server_wire = sum(value for name, value in
+                      reports["a5_server"]["execution"]["serviced"].items()
+                      if name.startswith("link:"))
+    pod_wire = sum(value for name, value in
+                   reports["a5_pod"]["execution"]["serviced"].items()
+                   if name.startswith("link:") and ":tx:port" in name)
+    assert server_wire == pytest.approx(pod_wire)
     assert reports["a5_server"]["duration_ms"] != reports["a5_pod"]["duration_ms"]
 
 

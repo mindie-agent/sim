@@ -77,6 +77,16 @@ def wave_offsets(group_size: int, rounds: int):
             yield wave, offset
 
 
+def startup_waves_recipe(op, recipe, runtime_mode):
+    """Resolve the same generic replacement before and after preparation."""
+    if (not getattr(recipe, "source_bound", False)
+            and not getattr(recipe, "native", False)
+            and not getattr(recipe, "algorithm", None)
+            and startup_waves_selected(op, runtime_mode)):
+        return RECIPE
+    return recipe
+
+
 def startup_waves_selected(op: Any, runtime_mode: str) -> bool:
     """True for an unbound generic all-to-all with waves or explicit steps."""
     if getattr(op, "source_boundary", ""):

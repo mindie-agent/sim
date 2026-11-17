@@ -120,15 +120,17 @@ def test_catalog_pool_cache_keeps_full_token_kv_and_real_gate_parameters():
         assert term_bytes(prepared, parsed.model.quant, parsed.runtime.parallel, source=True) == 0
 
 
+@pytest.mark.parametrize('raw_eager', [False, True])
 @pytest.mark.parametrize('batch', [1, 4, 8])
-def test_real_q6_buckets_scan_all_pools_and_keep_2051_capacity(batch):
-    ops = {op.recipe: op for op in layer(case(), batch)}
+def test_real_q6_buckets_scan_all_pools_and_keep_2051_capacity(batch, raw_eager):
+    raw = case()
+    raw['runtime'].setdefault('metadata', {})['raw_eager'] = raw_eager
+    ops = {op.recipe: op for op in layer(raw, batch)}
     scanned = batch * sum((131201 + i) // 4 for i in range(1, 7))
     scores = ops['index_pool_scores']; meta = dict(scores.metadata)
     assert meta['scanned_pools'] == scanned
-    # The declared weighted-query contraction is FP32 vector arithmetic; it is
-    # not a BF16 Cube matmul, and the score tile is materialized separately
-    # from the TopK invocation unless one executable plan owns both in UB.
+    # FP32 contraction work is unchanged. Only raw eager execution sends
+    # the score plane and intermediate pool indices through HBM.
     assert scores.flops == 0
     assert scores.matrix_flops == ()
     assert scores.vector_ops == 2 * scanned * 128
@@ -138,15 +140,21 @@ def test_real_q6_buckets_scan_all_pools_and_keep_2051_capacity(batch):
     assert meta['score_unique_pool_rows'] == unique
     assert meta['score_logical_pool_read_bytes'] == scanned * 256
     assert meta['score_l2_hit_bytes'] == (scanned - unique) * 256
-    assert meta['score_materialization'] == 'separate_fp32_score_then_topk'
+    assert meta['score_materialization'] == (
+        'separate_fp32_score_then_topk' if raw_eager else 'ub_online_topk')
     weighted_read = scores.mte2_bytes - scanned * 256
     assert weighted_read > 0
     assert scores.mte2_bytes == scanned * 256 + weighted_read
-    assert scores.hbm_bytes == unique * 256 + weighted_read + 4 * scanned
-    assert scores.mte3_bytes == 4 * scanned
+    score_bytes = 4 * scanned if raw_eager else 0
+    assert scores.hbm_bytes == unique * 256 + weighted_read + score_bytes
+    assert scores.mte3_bytes == score_bytes
     topk = ops['index_pool_topk']
-    assert topk.mte2_bytes == 4 * scanned
-    assert topk.hbm_bytes == 4 * scanned + topk.mte3_bytes
+    assert topk.mte2_bytes == score_bytes
+    assert topk.hbm_bytes == score_bytes + topk.mte3_bytes
+    assert topk.mte3_bytes == (topk.local_shape[0] * 512 * 4 if raw_eager else 0)
+    packed = ops['index_topk']
+    assert packed.mte2_bytes == topk.mte3_bytes
+    assert packed.mte3_bytes == packed.local_shape[0] * 2051 * 4
     assert ops['index_pool_topk'].local_shape == (batch * 6, 512)
     assert ops['index_topk'].local_shape == (batch * 6, 2051)
     assert dict(ops['index_topk'].metadata)['selected_token_rows'] == batch * (6 * 2048 + 11)
