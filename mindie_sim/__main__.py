@@ -14,6 +14,7 @@ from pathlib import Path
 import sys
 
 from . import predict
+from .cli_sku import SKU_COMMANDS, add_sku_commands, run_sku_command
 from .prediction.structure import parse_case
 from .prediction.primitives import PrimitiveKey, PrimitiveStore
 
@@ -55,10 +56,6 @@ def read_json(path, *, bounded=False):
         return load_cli_json(path)
     with path.open(encoding="utf-8") as stream:
         return json.load(stream)
-
-
-#: Default latency budget of a multi-SKU comparison (ms).
-DEFAULT_COMPARE_SLA_MS = 50.0
 
 
 def emit(value, output):
@@ -376,39 +373,7 @@ def parser():
                      help="worker budget for the flat (sku, scenario) pool")
     sla.add_argument("--output", "-o")
     add_runtime_arguments(sla, command="sla")
-    compare = sub.add_parser(
-        "compare-skus",
-        help="compare two or more hardware SKUs under one model/deployment config")
-    compare.add_argument("--model", required=True)
-    compare.add_argument("--skus", nargs="+", required=True,
-                         help="SKU names (a3, a5, ...) or custom hardware JSON paths")
-    for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--num-devices",
-                 "--layers"):
-        compare.add_argument(flag, type=int, default=None)
-    compare.add_argument("--sla-ms", type=float,
-                         default=DEFAULT_COMPARE_SLA_MS)
-    compare.add_argument("--max-batch", type=int, default=None)
-    compare.add_argument("--sensitivity", choices=("baseline", "full"),
-                         default="baseline")
-    compare.add_argument("--scope", choices=("body", "model"), default="body")
-    compare.add_argument("--phase", choices=("decode", "prefill"), default="decode")
-    compare.add_argument("--context", type=int, default=None)
-    compare.add_argument("--query-tokens", type=int, default=None)
-    compare.add_argument("--quant", default=None,
-                         help="explicit quantization override for every SKU")
-    compare.add_argument("--jobs", default="auto")
-    compare.add_argument("--no-advisory", dest="emit_advisory",
-                         action="store_false")
-    compare.add_argument("--output", "-o")
-    doctor = sub.add_parser(
-        "doctor", help="probe CPU/RAM/C11 readiness and print agent offload guidance")
-    doctor.add_argument("--no-compile", dest="compile_accel",
-                        action="store_false")
-    doctor.add_argument("--output", "-o")
-    guide = sub.add_parser("remote-guide", help="alias of `doctor` for agent offload")
-    guide.add_argument("--no-compile", dest="compile_accel",
-                       action="store_false")
-    guide.add_argument("--output", "-o")
+    add_sku_commands(sub)
     accel = sub.add_parser("build-accel", help="compile or verify the C11 runtime kernel")
     accel.add_argument("--force", action="store_true", help="recompile even when cached")
     accel.add_argument("--check", action="store_true", help="verify cached artifact without compiling")
@@ -684,27 +649,8 @@ def run(args):
         result["sensitivity"] = args.sensitivity
         result["jobs"] = jobs
         return result
-    if args.command == "compare-skus":
-        from .sku_comparison import compare_skus
-        options = {flag: getattr(args, flag.lstrip("-").replace("-", "_"), None)
-                   for flag in ("tp", "dp", "ep", "pp", "pcp", "num_devices",
-                                "layers")}
-        if args.max_batch is None:
-            from .prediction.efficiency import DEFAULT_MAX_SEQUENCES
-            max_batch = DEFAULT_MAX_SEQUENCES
-        else:
-            max_batch = args.max_batch
-        return compare_skus(
-            args.model, args.skus, sla_ms=args.sla_ms, max_batch=max_batch,
-            sensitivity=args.sensitivity, scope=args.scope, phase=args.phase,
-            context=args.context, query_tokens_per_sequence=args.query_tokens,
-            quant=args.quant, jobs=args.jobs,
-            emit_advisory=bool(args.emit_advisory), **options)
-    if args.command in {"doctor", "remote-guide"}:
-        from .runtime_advisor import doctor_report
-        report = doctor_report(compile_accel=bool(args.compile_accel))
-        report["command"] = args.command
-        return report
+    if args.command in SKU_COMMANDS:
+        return run_sku_command(args)
     if args.command == "build-accel":
         from .prediction.runtime.accel_build import build_accel
 
