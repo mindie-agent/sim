@@ -20,10 +20,11 @@ _MLAPO_ENV = {**_ENV, "VLLM_ASCEND_ENABLE_MLAPO": "1"}
 MTP_STANDARD_PROPOSAL_TOKENS = 3
 MTP_DSPARK_PROPOSAL_TOKENS = 5
 MTP_KIMI_K3_PROPOSAL_TOKENS = 7
+PAIRED_SFA_DOC_BLOCK_SIZE = 544
 
 
 def _p(quant_by_arch, mtp, doc, *, mlapo=False, sp=True, mso=False,
-       engram_offload=False, support="vllm_ascend_main"):
+       engram_offload=False, support="vllm_ascend_main", kv_block_size=None):
     return {
         "quant": quant_by_arch,
         "graph_capture_mode": "full",
@@ -33,6 +34,7 @@ def _p(quant_by_arch, mtp, doc, *, mlapo=False, sp=True, mso=False,
         "multistream_overlap_shared_expert": mso,
         "engram_cpu_offload": engram_offload,
         "framework_support": support,
+        "kv_block_size": kv_block_size,
         "env": _MLAPO_ENV if mlapo else _ENV,
         "source": {
             "repository": _REPO,
@@ -79,7 +81,8 @@ VA_RECOMMENDED_PROFILES = {
     "kimi-k3": _p({"a2": "w4a8", "a3": "w4a8"},
                   MTP_KIMI_K3_PROPOSAL_TOKENS, "Kimi-K3.md", mlapo=True),
     "kimi-k3.1": _p({"a3": "w4a8"}, MTP_STANDARD_PROPOSAL_TOKENS,
-                    "Kimi-K3.1-Pro.md", mlapo=True, mso=True),
+                    "Kimi-K3.1-Pro.md", mlapo=True, mso=True,
+                    kv_block_size=PAIRED_SFA_DOC_BLOCK_SIZE),
     "qwen3-235b-a22b": _p({"a2": "w8a8", "a3": "w8a8"}, 0, "Qwen3-MoE.md"),
     "qwen3-30b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, 0, "Qwen3-MoE.md"),
     "qwen3-next-80b-a3b": _p({"a2": "w8a8", "a3": "w8a8"}, 1, "Qwen3-Next.md"),
@@ -136,6 +139,8 @@ def simulation_config(canonical, sku, arch):
                                if "compilation_config" in profile else None),
         "sp": documented_sp,
         "mtp_proposal_tokens": int(profile.get("mtp_proposal_tokens", 0)),
+        **({"kv_block_size": profile["kv_block_size"]}
+           if profile.get("kv_block_size") else {}),
         "multistream_overlap_shared_expert": bool(
             profile.get("multistream_overlap_shared_expert", False)),
         "engram_cpu_offload": bool(profile.get("engram_cpu_offload", False)),

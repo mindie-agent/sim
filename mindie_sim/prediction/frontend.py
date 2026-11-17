@@ -992,7 +992,7 @@ class Frontend:
         layers = model.layer_plans
         if (len(layers) <= 2 or local_tokens <= 0 or scope != "none"
                 or before or has_after_draft or pcp_prefill
-                or runtime.parallel.pp != 1):
+                or runtime.enable_dbo or runtime.parallel.pp != 1):
             return None
         fusions_cfg = runtime.kernels.get("fusions") or ()
         if "residual_norm" in fusions_cfg:
@@ -1363,7 +1363,7 @@ class Frontend:
                 cache_ids=caches, topk_ids=topks, index_cache_ids=indices_map,
                 candidate_ids=candidates, stage_of=lambda _l: 0,
                 cp_interleave_size=runtime.kv_block_size, runtime=runtime,
-                policy=self.attention_policy,
+                policy=self.attention_policy, machine=machine,
             )
             post_a, cur_prev = residual.after(
                 {**common, "prefix": name + ".attention", "structure_block": "attention"},

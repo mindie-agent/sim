@@ -114,20 +114,16 @@ def compute_sweep_candidate_id(
     model = parsed.model
     runtime = parsed.runtime
     engram = getattr(model, "engram", None)
-    model_runtime = (
-        str(model.name), int(model.layers), int(model.hidden_size),
-        int(model.num_heads), int(model.num_kv_heads), int(model.num_experts),
-        str(getattr(model, "quantization", getattr(model, "quant", ""))),
-        bool(getattr(runtime, "engram_cpu_offload", False)),
-        str(getattr(engram, "storage_mode", "") if engram else ""),
-        _runtime_features(runtime),
-    )
+    model_runtime = {
+        "model": model.to_dict(),
+        "runtime": runtime.to_dict(),
+        "workload": parsed.workload.to_dict(),
+    }
     derivation = _derivation(parsed)
     base_sku = (str(derivation["base"]) if derivation
                 else str(parsed.machine.sku))
     derived_sku = str(parsed.machine.sku)
-    die_digest = _digest(parsed.machine.dies[0].to_dict()
-                         if parsed.machine.dies else {})
+    die_digest = _digest(parsed.machine.to_dict())
     hardware_identity = {
         "base_sku": base_sku, "derived_sku": derived_sku,
         "derivation": derivation, "num_devices": int(cand_devices),

@@ -752,3 +752,19 @@ You are contributing incremental Ascend hardware calibration (`A2` / `A3` / `A5`
      5. `python3 scripts/verify_m2.py --output state/m2/audit.json`
      6. `PYTHONDONTWRITEBYTECODE=1 python3 -B -m pytest -q -n auto --dist worksteal -p no:cacheprovider -m "not live_npu"`
 ````
+
+## Onboarding Runtime Stacks & Three-State Feature Tracks
+
+The simulator separates **what the hardware can do** from **what a serving stack has shipped**. Every optimization is a framework-neutral `OptimizationMechanism` (Layer 1) that a `RuntimeStackProfile` (Layer 2) binds to one of three explicit states:
+
+| Track | Meaning | Selection |
+| :--- | :--- | :--- |
+| `merged` | Exactly what the stack's `main` branch runs today (default `vllm-ascend`) | `--feature-track merged` |
+| `unmerged_pr` | `merged` plus audited in-flight PRs modeled by their real physical mechanism | `--feature-track unmerged_pr` |
+| `expected_ideal` | Every structurally compatible mechanism, regardless of a served PR | `--feature-track expected_ideal` |
+
+`mindie-sim feature-tracks --model <name> --hardware a5 --tp 8 --ep 8` prints the four-level waterfall (`current_merged` -> `current_unmerged_pr` -> `expected_ideal` -> `hardware_roofline`), and `--enable-opt` / `--disable-opt` isolate one mechanism for What-If A/B evaluation.
+
+1. **Pure JSON onboarding (zero Python changes)**: write a `mindie-sim.stack-manifest/1` document declaring `name`, `repository`, and `bindings` (`mechanism_id` from `list_optimization_mechanisms()`, `state: "merged" | "unmerged_pr"`, `ref: "<org>/<repo>#<PR>"`, optional `models` / `archs` / `options`), then pass `--stack-manifest my_stack.json` to `mindie-sim compose` or `mindie-sim feature-tracks` (or `runtime_stack="my_stack.json"` in Python).
+2. **Registering new physical mechanisms**: call `register_optimization_mechanism(OptimizationMechanism(...))` with real `OpSpec` / lowering-pass / `Software` transformations executed by the canonical engine. Never encode a latency multiplier; a mechanism must remove modeled traffic, fuse a declared boundary, or change a real `Software` field.
+3. **Syncing open vs merged PRs**: run `python3 scripts/audit_stack_prs.py --stack <name> --repo <owner/repo>` (or `--offline-fixture snapshot.json` in CI) to detect PRs that merged onto `main` (promote `unmerged_pr` -> `merged`) and newly opened performance PRs that are not cataloged yet.

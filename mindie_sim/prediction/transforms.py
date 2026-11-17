@@ -26,6 +26,18 @@ from .implementations import (
     semantic_attrs, typed_outputs,
     typed_roles, typed_value,
 )
+from .passes_ffn_fusion import (
+    activation_quant_fusion,
+    gmm_swiglu_quant_fusion,
+    moe_tail_residual_fusion,
+)
+from .passes_mhc_recurrent import (
+    MHC_DEFAULT_CUTOFF_ROWS,
+    gdn_projection_overlap,
+    kda_in_kernel_l2norm,
+    mhc_boundary_fusion_overlap,
+    qkv_norm_rope_fusion,
+)
 
 
 def _value_map(ops):
@@ -744,6 +756,17 @@ LOWERING_PASSES = {
     "activation_quantization": activation_quantization,
     "norm_quant": norm_quant,
     "residual_norm": residual_norm,
+    "mhc_boundary_pr": partial(mhc_boundary_fusion_overlap,
+                               max_rows=MHC_DEFAULT_CUTOFF_ROWS,
+                               require_captured=True),
+    "mhc_boundary_ideal": partial(mhc_boundary_fusion_overlap,
+                                  max_rows=0, require_captured=False),
+    "activation_quant": activation_quant_fusion,
+    "gmm_swiglu_quant": gmm_swiglu_quant_fusion,
+    "qkv_norm_rope": qkv_norm_rope_fusion,
+    "kda_in_kernel_l2norm": kda_in_kernel_l2norm,
+    "gdn_projection_overlap": gdn_projection_overlap,
+    "moe_tail_residual": moe_tail_residual_fusion,
 }
 
 

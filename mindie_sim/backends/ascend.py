@@ -220,18 +220,12 @@ def _merge_channels(raw, profile):
         # value beside an explicitly resolved semantic.  Drop only the
         # placeholder; a genuinely invalid standalone user value still fails
         # the validation below.
-        if (patch.get("semantics") in _LINK_SEMANTICS
-                and patch.get("channel_semantics") in {"unknown", "none"}):
-            patch.pop("channel_semantics", None)
-        if (patch.get("channel_semantics") == "none"
-                and base[name].get("channel_semantics") == "none"
-                and all(patch.get(field) is None for field in _BW_FIELDS)):
-            patch.pop("channel_semantics", None)
-        if "links" not in raw:
-            for field in ("channel_semantics", "semantics"):
-                if field in patch and patch[field] not in _LINK_SEMANTICS:
-                    raise ModelingError(
-                        f"transfer_channel_semantics_unsupported:{name}:{patch[field]}")
+        for field in ("channel_semantics", "semantics"):
+            if patch.get(field) in {"unknown", "none"}:
+                patch.pop(field)
+            elif field in patch and patch[field] not in _LINK_SEMANTICS:
+                raise ModelingError(
+                    f"transfer_channel_semantics_unsupported:{name}:{patch[field]}")
         if set(patch) & set(_BW_FIELDS):
             explicit.add(name)
         declared[name] = set(patch)

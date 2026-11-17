@@ -471,7 +471,7 @@ def compose_case(
     max_num_seqs: int | None = None,
     max_num_batched_tokens: int | None = None,
     max_model_len: int | None = None,
-    block_size: int = DEFAULT_BLOCK_SIZE,
+    block_size: int | None = None,
     enable_chunked_prefill: bool = True,
     async_scheduling: bool = False,
     graph_capture_mode: str | None = None,
@@ -522,6 +522,10 @@ def compose_case(
     hbm_efficiency: Any = None,
     mte2_ceiling_bytes_per_s: float | None = None,
     mte2_efficiency: Any = None,
+    runtime_stack: str | Path | Mapping[str, Any] = "vllm-ascend",
+    feature_track: str = "merged",
+    optimizations: Sequence[str] = (),
+    exclude_optimizations: Sequence[str] = (),
 ) -> dict[str, Any]:
     """Synthesize and validate a complete simulation Case dictionary."""
     for name, val in (("tp", tp), ("dp", dp), ("ep", ep), ("pp", pp), ("pcp", pcp), ("dcp", dcp)):
@@ -642,6 +646,9 @@ def compose_case(
                   and not raw_eager)
     if raw_eager and va_recommended:
         raise ModelingError("raw_eager_conflicts_with_explicit_fusion")
+    ascend_backend = backend == "ascend"
+    explicit_graph_capture = graph_capture_mode is not None
+    explicit_sp = sp is not None
     model_spec = _resolve_model_spec(model)
     model_limit = _resolve_max_position_embeddings(model, model_spec)
     va_profile: dict[str, Any] | None = None
@@ -664,6 +671,20 @@ def compose_case(
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
     )
+    # ``block_size=None`` resolves the documented page size and, for
+    # ``paired_sfa`` caches, the recurrent-state minimum; an explicit caller
+    # value is preserved verbatim so an invalid page still fails honestly.
+    if block_size is not None:
+        resolved_block_size = int(block_size)
+    else:
+        resolved_block_size = int(
+            (va_profile or {}).get("kv_block_size") or DEFAULT_BLOCK_SIZE)
+        if dict(model_spec.metadata).get("cache_allocator") == "paired_sfa":
+            from mindie_sim.catalog.paired_sfa import minimum_block_size
+            resolved_block_size = max(
+                resolved_block_size,
+                minimum_block_size(model_spec, tp=tp,
+                                  proposals=int(mtp_proposal_tokens)))
     # These are caller opt-ins: the profile exposes the documented capability
     # as provenance, but enabling an overlap/offload path changes the pinned
     # physical decomposition and must be an explicit composition choice.
@@ -833,7 +854,7 @@ def compose_case(
         "max_num_seqs": resolved_max_seqs,
         "max_num_batched_tokens": resolved_max_batched,
         "max_model_len": resolved_max_model_len,
-        "kv_block_size": int(block_size),
+        "kv_block_size": int(resolved_block_size),
         "enable_chunked_prefill": bool(enable_chunked_prefill),
         "async_scheduling": bool(async_scheduling),
         "graph_mode": str(graph_capture_mode),
@@ -907,6 +928,45 @@ def compose_case(
             existing_low = dict(kernels_dict.get("lowerings", {}))
             kernels_dict["lowerings"] = {**lowerings, **existing_low}
             runtime_dict["kernels"] = kernels_dict
+
+    # Two-layer feature tracks: resolve the selected runtime stack's merged /
+    # unmerged-PR / architectural-ideal mechanism set on top of the documented
+    # profile base.  ``va_recommended=False`` with the default ``merged`` track
+    # keeps zero automatic stack fusions, preserving the caller's bare case.
+    if ascend_backend and not raw_eager:
+        from mindie_sim.feature_mechanisms import MechanismContext
+        from mindie_sim.stack_tracks import (
+            apply_resolved_mechanisms, normalize_feature_track,
+            resolve_runtime_stack, resolve_stack_track,
+        )
+
+        canonical_track = normalize_feature_track(feature_track)
+        if (va_recommended is not False or bool(optimizations)
+                or bool(exclude_optimizations) or canonical_track != "merged"):
+            stack_profile = resolve_runtime_stack(runtime_stack)
+            stack_model_key = str(
+                (va_profile or {}).get("canonical_model") or model_spec.name)
+            caller_explicit = frozenset(
+                name for name, explicit in (
+                    ("graph_capture_mode", explicit_graph_capture),
+                    ("sp", explicit_sp),
+                    ("multistream_overlap_shared_expert",
+                     multistream_overlap_shared_expert is not None),
+                    ("moe_comm_mode", moe_comm_mode is not None),
+                    ("recover_ssm", recover_ssm is True),
+                ) if explicit)
+            mechanism_ctx = MechanismContext(
+                model=model_spec, sku=sku, arch=_arch_key(sku),
+                parallel=dict(runtime_dict["parallel"]),
+                caller_explicit=caller_explicit, options={})
+            resolved_track = resolve_stack_track(
+                stack_profile, track=canonical_track, model_key=stack_model_key,
+                ctx=mechanism_ctx, optimizations=optimizations,
+                exclude_optimizations=exclude_optimizations)
+            apply_resolved_mechanisms(runtime_dict, resolved_track, mechanism_ctx)
+            runtime_meta = dict(runtime_dict.get("metadata") or {})
+            runtime_meta["feature_track_report"] = resolved_track
+            runtime_dict["metadata"] = runtime_meta
 
     case_dict: dict[str, Any] = {
         "model": model_dict,

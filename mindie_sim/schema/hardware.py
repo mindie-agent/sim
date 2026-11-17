@@ -709,6 +709,17 @@ class Hardware:
         backend = raw_in.get("backend")
         raw_records = list(raw_in.get("devices", raw_in.get("dies", ())) or ())
         raw = materialize(raw_in)
+        allowed_semantics = {
+            "shared", "per_port", "per_pair", "direct", "fully_connected",
+            "mesh", "switched", "unknown", "none",
+        }
+        for name, channel in (raw.get("transfer_channels") or {}).items():
+            if not isinstance(channel, Mapping):
+                continue
+            for field in ("channel_semantics", "semantics"):
+                if field in channel and channel[field] not in allowed_semantics:
+                    raise ModelingError(
+                        f"transfer_channel_semantics_unsupported:{name}:{channel[field]}")
         count = int(raw.get("num_devices", len(raw.get("devices", raw.get("dies", ()))) or 1))
         ranks_per_node = int(raw.get("ranks_per_node", count))
         package = int(raw.get("dies_per_package", 1))

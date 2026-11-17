@@ -73,19 +73,31 @@ def _geometry(views, plan):
     return tuple(_selection_for(view, plan) for view in views)
 
 
-def _visited_pool_rows(views, plan):
-    """Complete pool IDs actually visited, deduplicating shared prefixes only."""
+def _visited_pool_rows(views, plan, *, runtime=None):
+    """Count visited private rows and the union of shared prefix rows."""
+    from mindie_sim.schema.runtime_features import canonical_prefix_cache_key
+
     pool = max(1, int(plan.index_kpool))
-    groups = {}
-    for position, view in enumerate(views):
+    shared = (getattr(runtime, "prefix_cache_mode", "private") == "shared"
+              and getattr(runtime, "prefix_read_mode", "auto") != "per_sequence")
+    groups, private_rows = {}, 0
+    for view in views:
         if int(view.q_len) <= 0:
             continue
-        rows = (int(view.context) + int(view.q_len)) // pool
-        prefix = int(getattr(view, "prefix_tokens", 0) or 0)
-        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > 0 \
-            else (position, str(view.request_id))
-        groups[key] = max(groups.get(key, 0), rows)
-    return sum(groups.values())
+        ranges = tuple((start, end) for start, end in
+                       (getattr(view, "query_ranges", ()) or ()) if end > start)
+        last = max((end for _, end in ranges), default=int(view.q_len))
+        extent = (view.kv_len if plan.noncausal_attention
+                  else int(view.context) + last)
+        rows = max(0, int(extent) // pool)
+        prefix = max(0, int(getattr(view, "prefix_tokens", 0) or 0))
+        shared_rows = min(rows, prefix // pool) if shared else 0
+        private_rows += rows - shared_rows
+        if shared_rows:
+            key = canonical_prefix_cache_key(
+                "shared", getattr(view, "prefix_cache_key", ""))
+            groups[key] = max(groups.get(key, 0), shared_rows)
+    return private_rows + sum(groups.values())
 
 
 def _causal_token_pairs(views, *, noncausal=False):
@@ -456,7 +468,7 @@ def producer(b, *, source, views, plan, model, quant, padded_tokens,
 
 def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               score_mode="linear_weighted_query",
-              score_implementation="declared", l2_bytes=None):
+              score_implementation="declared", l2_bytes=None, runtime=None):
     """Use source linear scoring; per-head MMA is an explicit alternative."""
     if score_mode not in {"per_head_relu", "linear_weighted_query"}:
         raise ModelingError("index_pool_unknown_score_mode")
@@ -471,7 +483,7 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     pool_topk = plan.index_topk // plan.index_kpool
     output_width = plan.index_topk + (plan.index_kpool - 1 if plan.index_kpool_always_select_tail else 0)
     row_bytes = float(index_row_bytes(b.model, width))
-    unique_pool_rows = _visited_pool_rows(views, plan)
+    unique_pool_rows = _visited_pool_rows(views, plan, runtime=runtime)
     l2_bounded_pool_read = float(unique_pool_rows) * row_bytes
     if l2_bytes is not None and float(l2_bytes) > 0.0:
         if l2_bounded_pool_read > float(l2_bytes):

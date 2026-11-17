@@ -47,6 +47,7 @@ def _tightened_caps(caps, extra):
 class SteadyMatmul(MappedMatmul):
     """Keep exact nominal K-loop dependencies and a compact contended body."""
 
+    traffic_rewrite_capable: bool = True
     compact_output_tiles: bool = True
     #: Eligible one-tile owners reuse the finite template path.  Multi-tile
     #: owner_run stays its existing real KernelProgram branch.

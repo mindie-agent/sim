@@ -201,6 +201,12 @@ def compose_case_kwargs(namespace: argparse.Namespace) -> dict[str, Any]:
         "hbm_efficiency": namespace.hbm_efficiency,
         "mte2_ceiling_bytes_per_s": namespace.mte2_ceiling_bytes_per_s,
         "mte2_efficiency": namespace.mte2_efficiency,
+        "block_size": getattr(namespace, "block_size", None),
+        "runtime_stack": (getattr(namespace, "stack_manifest", None)
+                          or getattr(namespace, "stack", None) or "vllm-ascend"),
+        "feature_track": getattr(namespace, "feature_track", None) or "merged",
+        "optimizations": tuple(getattr(namespace, "enable_opt", ()) or ()),
+        "exclude_optimizations": tuple(getattr(namespace, "disable_opt", ()) or ()),
     }
 
 

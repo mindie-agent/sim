@@ -174,6 +174,7 @@ def _b1_pareto(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 def _screen_row_meta(row: dict[str, Any], cache: SweepEvaluationCache,
                      meta: Mapping[str, Any]) -> dict[str, Any]:
     merged = dict(meta)
+    row.update(merged.pop("derived_row_fields", {}))
     merged["cache_stats"] = cache.stats()
     row["sweep_meta"] = merged
     return row
@@ -227,7 +228,7 @@ def sweep_topologies_iter(
         raise ValueError("num_devices_and_grid_are_mutually_exclusive")
     if hardware_derivations:
         base = parse_case(case)
-        for derivation in hardware_derivations:
+        for derivation_index, derivation in enumerate(hardware_derivations):
             from mindie_sim.hardware_derivation import derived_machine
             declare = dict(derivation)
             sku = str(declare.pop("sku", base.machine.sku or "derived"))
@@ -248,7 +249,9 @@ def sweep_topologies_iter(
                     two_stage=two_stage,
                     candidate_timeout_s=candidate_timeout_s,
                     deadline_monotonic=deadline_monotonic,
-                    output_jsonl=None, resume=False,
+                    output_jsonl=output_jsonl,
+                    resume=(resume or (output_jsonl is not None
+                                       and derivation_index > 0)),
                     progress_callback=progress_callback):
                 row["derived_sku"] = sku
                 row["derivation"] = {
@@ -270,7 +273,7 @@ def sweep_topologies_iter(
         emitted_tokens_per_seq=None)
     grids = devices_grid or ((num_devices,) if num_devices is not None
                              else (len(parsed.machine.dies),))
-    for grid in grids:
+    for grid_index, grid in enumerate(grids):
         if grid is None:
             continue
         for row in _sweep_one_device_count(
@@ -288,7 +291,8 @@ def sweep_topologies_iter(
                 two_stage=two_stage,
                 candidate_timeout_s=candidate_timeout_s,
                 deadline_monotonic=deadline_monotonic,
-                output_jsonl=output_jsonl, resume=resume,
+                output_jsonl=output_jsonl,
+                resume=(resume or (output_jsonl is not None and grid_index > 0)),
                 progress_callback=progress_callback, base_q=base_q,
                 base_emit=base_emit, locked_plan=_locked_plan,
                 pinned_devices=(num_devices is not None
@@ -388,9 +392,20 @@ def _sweep_one_device_count(parsed, cache, *, devices, candidates, sla_ms,
                 "two_stage": bool(two_stage),
                 "parallel_signature": str(fixed_parallel or {}),
             }
-            if resume and cand_id in checkpoint and not (
-                    two_stage and checkpoint[cand_id].get("evaluation_stage")
-                    == B1_STAGE):
+            if dict(parsed.machine.assumptions).get("derivation.base"):
+                die = parsed.machine.dies[0] if parsed.machine.dies else None
+                meta["derived_row_fields"] = {
+                    "derived_sku": parsed.machine.sku,
+                    "derivation": {
+                        "sku": parsed.machine.sku,
+                        "aic_count": die.compute_units if die else None,
+                        "aiv_count": dict(die.resource_units).get("vector") if die else None,
+                        "memory_bytes": die.memory_bytes if die else None,
+                        "assumptions": dict(parsed.machine.assumptions),
+                    },
+                }
+            if resume and cand_id in checkpoint and (
+                    checkpoint[cand_id].get("evaluation_stage") != B1_STAGE):
                 row = dict(checkpoint[cand_id])
                 row["resumed_from_checkpoint"] = True
                 row["elapsed_ms"] = 0.0

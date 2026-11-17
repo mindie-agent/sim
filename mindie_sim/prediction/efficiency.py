@@ -1221,12 +1221,20 @@ def evaluate_target_efficiency(
         launch_ms=float(row.get("fixed_ms") or ZERO_FLOAT),
         occurrences=max(ONE, int(row.get("occurrences", ONE) or ONE)),
     ) for index, row in enumerate(operators))
-    targets = RooflineTargets(
-        cube=target_cube_mfu, vector=target_vec_mfu, hbm=target_mbu,
-        link=target_link_util if target_link_util is not None else ONE_FLOAT)
-    roofline = critical_path_roofline(PhysicalWorkGraph(nodes), targets)
+    ideal = critical_path_roofline(PhysicalWorkGraph(nodes), RooflineTargets())
+    target_nodes = tuple(PhysicalWorkNode(
+        node_id=node.node_id,
+        cube_ms=float(row["target_pipe_requirement_ms"]["cube"]),
+        vector_ms=float(row["target_pipe_requirement_ms"]["vec"]),
+        hbm_ms=float(row["target_pipe_requirement_ms"]["hbm"]),
+        link_ms=float(row["target_pipe_requirement_ms"]["link"]),
+        launch_ms=float(row["raw_target_duration_ms"]),
+        occurrences=node.occurrences,
+    ) for node, row in zip(nodes, operators))
+    roofline = critical_path_roofline(
+        PhysicalWorkGraph(target_nodes), RooflineTargets())
     cur_step = float(result["current_step_duration_ms"])
-    physical_ideal = max(roofline.physical_ideal_ms, ZERO_FLOAT)
+    physical_ideal = max(ideal.physical_ideal_ms, ZERO_FLOAT)
     raw_target = max(roofline.target_duration_ms, physical_ideal)
     target_step = (raw_target if mode == "exact_target"
                    else max(physical_ideal, min(cur_step, raw_target)))
@@ -1241,6 +1249,9 @@ def evaluate_target_efficiency(
         "target_step_basis": "dag_critical_path_and_resource_conservation",
     })
     safe_target = max(target_step, EPSILON)
+    for suffix in ("mbu", "cube_mfu", "vec_mfu", "roofline_efficiency"):
+        result["target_network_" + suffix] = (
+            result["current_network_" + suffix] * cur_step / safe_target)
     result["saved_ms"] = cur_step - target_step
     result["speedup_ratio"] = cur_step / safe_target
     result["step_speedup"] = result["speedup_ratio"]

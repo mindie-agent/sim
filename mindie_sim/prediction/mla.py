@@ -411,7 +411,7 @@ def mla(*, prefix, plan, views, stage, deps, model, parallel, quant, mode,
             topk = pool_module.selection(
                 b, query=q_index, weights=weights, cache=index_store,
                 views=views, plan=plan, quant=quant, padded_tokens=q,
-                l2_bytes=getattr(b, "l2_bytes", None),
+                l2_bytes=getattr(b, "l2_bytes", None), runtime=runtime,
                 **(pool_binding.options if pool_binding else {}))
         else:
             quant_indexer = (select(runtime.kernels.get("lowerings", {}),

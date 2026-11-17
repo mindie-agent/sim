@@ -20,6 +20,18 @@ from .study import study
 from .prediction.call import call_costs
 from .prediction.call_builders import build_call
 from .compose import compose_case, resolve_hardware_sku
+from .feature_mechanisms import (
+    OptimizationMechanism,
+    list_optimization_mechanisms,
+    register_optimization_mechanism,
+)
+from .feature_waterfall import compare_feature_tracks
+from .stack_tracks import (
+    RuntimeStackProfile,
+    StackMechanismBinding,
+    load_runtime_stack_manifest,
+    register_runtime_stack,
+)
 from .hardware_derivation import derive_hardware_sku
 from .hardware_efficiency import EfficiencyCurve
 from .custom_hardware import (
@@ -116,4 +128,9 @@ __all__ = [
     "Case", "Software", "Hardware", "Device", "Link",
     "ModelSpec", "LayerPlan", "RequestSpec", "WorkloadSpec", "SloSpec",
     "ParallelSpec", "ModelingError",
+    "OptimizationMechanism", "register_optimization_mechanism",
+    "list_optimization_mechanisms",
+    "RuntimeStackProfile", "StackMechanismBinding",
+    "register_runtime_stack", "load_runtime_stack_manifest",
+    "compare_feature_tracks",
 ]

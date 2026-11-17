@@ -103,6 +103,21 @@ ACLNN_MATRIX_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16",
 ACLNN_VECTOR_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16",
                                  "fp32", "float32"})
 ACLNN_ATTENTION_DTYPES = frozenset({"bf16", "bfloat16", "fp16", "float16"})
+ACLNN_ATTENTION_QUERY_DTYPES = ACLNN_VECTOR_DTYPES | frozenset({
+    "fp8", "fp8_e4m3", "fp8_e5m2", "int8",
+})
+ACLNN_ATTENTION_KV_DTYPES = ACLNN_ATTENTION_QUERY_DTYPES | frozenset({
+    "int4", "mxfp4",
+})
+MATRIX_MIN_RANK = 2
+MATMUL_SHAPE_DIMS = 3
+ATTN_UNBATCHED_RANK = 3
+ATTN_BATCHED_RANK = 4
+FLOPS_PER_FMA = 2
+ATTENTION_SOFTMAX_OPS_PER_PAIR = 5
+RMSNORM_OPS_PER_ELEM = 5
+ADD_RMSNORM_OPS_PER_ELEM = 6
+DYNAMIC_QUANT_OPS_PER_ELEM = 4
 
 
 def _mapping(value, reason):
@@ -288,17 +303,27 @@ def _quant_spec(symbol, kind, arguments):
     quantized = kind == ACLNN_GROUPED_KIND or "QuantBatchMatmul" in symbol
     activation = _dtype(
         arguments.get("activation_dtype") or arguments.get("dtype")
+        or _optional_tensor_dtype(
+            arguments, ("x", "input", "a"), ACLNN_MATRIX_DTYPES,
+            "aclnn_call_activation_dtype_unsupported")
         or ("int8" if quantized else ACLNN_DEFAULT_DTYPE),
         ACLNN_MATRIX_DTYPES, "aclnn_call_activation_dtype_unsupported")
     default_weight = ("int8" if quantized and activation == "int8"
                       else activation)
     weight = _dtype(
-        arguments.get("weight_dtype", default_weight),
+        arguments.get("weight_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("weight", "w", "b"), ACLNN_MATRIX_DTYPES,
+            "aclnn_call_weight_dtype_unsupported")
+        or default_weight,
         ACLNN_MATRIX_DTYPES, "aclnn_call_weight_dtype_unsupported")
     output = _dtype(
-        arguments.get("output_dtype", "bf16"),
-        frozenset({"bf16", "bfloat16", "fp16", "float16", "fp32", "float32"}),
-        "aclnn_call_output_dtype_unsupported")
+        arguments.get("output_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("output", "out", "y"), ACLNN_VECTOR_DTYPES,
+            "aclnn_call_output_dtype_unsupported")
+        or "bf16",
+        ACLNN_VECTOR_DTYPES, "aclnn_call_output_dtype_unsupported")
     return QuantSpec(
         name="aclnn_grouped_matmul" if kind == ACLNN_GROUPED_KIND
         else "aclnn_quant_batch_matmul_v3" if quantized else "aclnn_matmul",
@@ -608,18 +633,13 @@ def _attention_op(arguments, symbol, recipe):
                                         "aclnn_attention_sparse_mode_invalid")
                    if sparse_mode is not None else None)
     top_left_causal = sparse_mode in (0, 2)
-    if paged:
-        pairs = query_tokens * key_tokens
-    elif causal and query_tokens <= key_tokens:
-        pairs = (
-            query_tokens * (query_tokens + 1) // 2
-            if top_left_causal
-            else query_tokens * (key_tokens - query_tokens)
-            + query_tokens * (query_tokens + 1) // 2
-        )
-    elif causal:
-        pairs = (key_tokens * (key_tokens + 1) // 2
-                 + (query_tokens - key_tokens) * key_tokens)
+    if causal:
+        visible = min(query_tokens, key_tokens)
+        if top_left_causal:
+            pairs = (visible * (visible + 1) // 2
+                     + (query_tokens - visible) * key_tokens)
+        else:
+            pairs = visible * key_tokens - visible * (visible - 1) // 2
     else:
         pairs = query_tokens * key_tokens
     query_dtype = _dtype(

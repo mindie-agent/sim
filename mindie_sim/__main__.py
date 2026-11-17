@@ -222,9 +222,45 @@ def parser():
     compose.add_argument("--tpot-slo-ms", type=float)
     compose.add_argument("--va-recommended", action="store_true",
                          help="apply a documented vllm-ascend simulation subset; preserve quant without a hardware-specific reference")
+    compose.add_argument("--stack", default="vllm-ascend",
+                         help="registered runtime stack name or manifest path")
+    compose.add_argument("--stack-manifest", default=None,
+                         help="explicit JSON stack manifest path")
+    compose.add_argument("--feature-track", default="merged",
+                         choices=("merged", "unmerged_pr", "expected_ideal"))
+    compose.add_argument("--enable-opt", action="append", default=[],
+                         help="enable individual OptimizationMechanism ID (repeatable)")
+    compose.add_argument("--disable-opt", action="append", default=[],
+                         help="exclude individual OptimizationMechanism ID (repeatable)")
+    compose.add_argument("--block-size", type=int, default=None,
+                         help="explicit KV block size (auto-resolved when omitted)")
     compose.add_argument("--output", "-o")
     from .cli_options import add_runtime_arguments
     add_runtime_arguments(compose, command="compose")
+    feature_tracks = sub.add_parser(
+        "feature-tracks",
+        help="4-level waterfall (merged -> unmerged_pr -> expected_ideal -> roofline)")
+    feature_tracks.add_argument("--model", required=True)
+    feature_tracks.add_argument("--hardware", default="a3")
+    feature_tracks.add_argument("--stack", default="vllm-ascend")
+    feature_tracks.add_argument("--stack-manifest", default=None)
+    feature_tracks.add_argument("--phase", choices=("decode", "prefill"), default="decode")
+    feature_tracks.add_argument("--tokens", type=int, default=1)
+    from .feature_waterfall import (
+        DEFAULT_WATERFALL_CONTEXT, DEFAULT_WATERFALL_SEQUENCES,
+    )
+    feature_tracks.add_argument("--context", type=int,
+                                default=DEFAULT_WATERFALL_CONTEXT)
+    feature_tracks.add_argument("--sequences", type=int,
+                                default=DEFAULT_WATERFALL_SEQUENCES)
+    feature_tracks.add_argument("--scope", choices=("body", "model"), default="body")
+    for flag in ("--tp", "--dp", "--ep", "--pp", "--pcp", "--dcp",
+                 "--num-devices", "--layers", "--mtp-tokens"):
+        feature_tracks.add_argument(flag, type=int, default=None)
+    feature_tracks.add_argument("--quant", default=None)
+    feature_tracks.add_argument("--no-ablate-prs", dest="ablate_prs",
+                                action="store_false")
+    feature_tracks.add_argument("--output", "-o")
     sweep = sub.add_parser("sweep", help="multi-topology parallel sharding and P/D disaggregation Pareto solver")
     sweep.add_argument("case")
     sweep.add_argument("--mode", choices=("topology", "pd"), default="topology")
@@ -436,6 +472,20 @@ def run(args):
         return compose_case(
             model=args.model, hardware=args.hardware or "a3",
             **compose_case_kwargs(args),
+        )
+    if args.command == "feature-tracks":
+        from .feature_waterfall import compare_feature_tracks
+        return compare_feature_tracks(
+            args.model, args.hardware, runtime_stack=(
+                args.stack_manifest or args.stack),
+            phase=args.phase, tokens=args.tokens, context=args.context,
+            sequences=args.sequences, scope=args.scope,
+            ablate_prs=bool(args.ablate_prs),
+            tp=args.tp or 1, dp=args.dp or 1, ep=args.ep or 1,
+            pp=args.pp or 1, pcp=args.pcp or 1, dcp=args.dcp or 1,
+            num_devices=args.num_devices, layers=args.layers,
+            quant=args.quant,
+            mtp_proposal_tokens=args.mtp_tokens or 0,
         )
     if args.command == "sweep":
         from .sweep import sweep_pd_disaggregation_ratios, sweep_topologies
