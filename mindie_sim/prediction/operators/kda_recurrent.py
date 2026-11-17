@@ -46,9 +46,6 @@ SOURCE = {
 }
 _BYTES = {"bf16": 2, "fp16": 2, "fp32": 4}
 ZERO_WORK = 0.0
-ZERO = 0
-ONE = 1
-FIRST = 0
 A5_AIC_UNITS = 32
 A5_AIV_UNITS = 64
 A5_UB_BYTES = 253952
@@ -359,7 +356,7 @@ def summarize_work(params, geometry, *, execution=SourceExecution()):
     if "ub" not in geometry.buffers:
         raise ModelingError("recurrent_kda_requires_declared_ub_capacity")
     profile = buffer_profile(p, geometry.buffers["ub"])
-    read = read_role(geometry.resource_units, aiv=FIRST)
+    read = read_role(geometry.resource_units, aiv=0)
     work = Work()
     for owner in range(blocks):
         for q, heads, beta_count in scheduled_runs(
@@ -379,14 +376,14 @@ def build(op, geometry, *, compact=True, execution=SourceExecution()):
     if "ub" not in geometry.buffers:
         raise ModelingError("recurrent_kda_requires_declared_ub_capacity")
     profile = buffer_profile(p, geometry.buffers["ub"])
-    read = read_role(geometry.resource_units, aiv=FIRST)
+    read = read_role(geometry.resource_units, aiv=0)
     def runs(owner):
         return scheduled_runs(p.lengths, p.heads, blocks, owner, compact=compact,
                               beta_per_head=execution.beta_per_head)
     work = summarize_work(p, geometry, execution=execution)
     cycles = []
     for owner in range(blocks):
-        count = sum(ONE for _ in runs(owner))
+        count = sum(1 for _ in runs(owner))
         cycles.append(count)
     cycles = tuple(cycles)
     fragments = state_fragments(op)
@@ -761,8 +758,8 @@ def _value_versions(values, targets, count):
     return None
 
 
-def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=ZERO,
-            layer=ZERO, phase="decode", stream="", notes=(), state_contexts=None,
+def make_op(params, *, op_id="kda_recurrent", deps=(), requests=(), stage=0,
+            layer=0, phase="decode", stream="", notes=(), state_contexts=None,
             state_targets=None, state_values=None, state_slots=None,
             state_ready=(), state_grants=(), state_decisions=(),
             state_generation=None):

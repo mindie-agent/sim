@@ -42,6 +42,14 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
 ZERO = 0
+DEEPSEEK_V4_COMPRESS_RATIO = 4
+DEEPSEEK_V41_COMPRESS_RATIO = 2
+DEEPSEEK_V4_COMPRESSOR_WIDTH = 2
+DEEPSEEK_V41_COMPRESSOR_STATE_ROWS = 32
+COMPRESSED_STATE_ROW_FACTOR = 2
+DEFAULT_CANDIDATE_BLOCK_SIZE = 8
+DEFAULT_CANDIDATE_TOPK_BLOCKS = 2048
+ENGRAM_SOURCE_ROW_BYTES = 264
 
 
 def _set_facts(model: ModelSpec, facts: Sequence[tuple[str, Any]]) -> None:
@@ -140,16 +148,25 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         cache_kind="window_compressed" if family in {"deepseek_v4", "deepseek_v41"} else "dense",
         compressor_kind=("gated_ring" if family == "deepseek_v41" else "weighted_pool")
                         if plan.compress_ratio else "none",
-        compressor_width=2 if family == "deepseek_v4" and plan.compress_ratio == 4 else 1,
-        compressor_state_rows=(32 if family == "deepseek_v41" and plan.compress_ratio == 2
-                               else plan.compress_ratio * (2 if plan.compress_ratio == 4 else 1)),
+        compressor_width=(DEEPSEEK_V4_COMPRESSOR_WIDTH
+                          if family == "deepseek_v4"
+                          and plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1),
+        compressor_state_rows=(
+            DEEPSEEK_V41_COMPRESSOR_STATE_ROWS
+            if family == "deepseek_v41"
+            and plan.compress_ratio == DEEPSEEK_V41_COMPRESS_RATIO
+            else plan.compress_ratio
+            * (COMPRESSED_STATE_ROW_FACTOR
+               if plan.compress_ratio == DEEPSEEK_V4_COMPRESS_RATIO else 1)),
         index_input="compressed" if family == "deepseek_v41" else "hidden",
         index_query_per_layer=family == "glm" and plan.attention == "mla" and plan.indexer,
         index_heads=plan.index_heads or _int(c, "index_n_heads"),
         index_dim=plan.index_dim or _int(c, "index_head_dim"),
         index_topk=plan.index_topk or _int(c, "index_topk"),
-        candidate_block_size=max(1, _int(c, "candidate_block_size", 8)),
-        candidate_topk_blocks=_int(c, "candidate_topk_blocks", 2048),
+        candidate_block_size=max(1, _int(c, "candidate_block_size",
+                                                DEFAULT_CANDIDATE_BLOCK_SIZE)),
+        candidate_topk_blocks=_int(c, "candidate_topk_blocks",
+                                               DEFAULT_CANDIDATE_TOPK_BLOCKS),
         qk_norm=(plan.qk_norm or (family == "qwen" and plan.attention == "gqa"))
         if family == "qwen" else False,
     ) for plan in plans]
@@ -265,7 +282,7 @@ def _build_model_spec(key: str, config: Mapping[str, Any]) -> ModelSpec:
         ("engram_tables", len(engram.tables) if engram else 0),
         ("engram_storage_mode", engram.storage_mode if engram else ""),
         ("engram_runtime_row_bytes", engram.row_bytes if engram else 0),
-        ("engram_source_row_bytes", 264 if engram else 0),
+        ("engram_source_row_bytes", ENGRAM_SOURCE_ROW_BYTES if engram else 0),
         ("state_bytes_per_request_unsharded", state_bytes),
         ("vision_config", dict(vision_raw) if isinstance(vision_raw, Mapping) else {}),
         ("vision_present", vision is not None),

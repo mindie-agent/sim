@@ -31,10 +31,6 @@ from .communication import CommunicationWork, MessageFlow, RoutedHop, RoutedMess
 from .engine import Resource
 from .peer_traffic import PeerTraffic
 
-ZERO = 0
-ONE = 1
-TWO = 2
-ZERO_FLOAT = 0.0
 MS_PER_S = 1000.0
 EIGHT_KIB = 8192
 
@@ -946,7 +942,7 @@ class Topology:
             except (TypeError, ValueError):
                 raise ModelingError(
                     f"transport_channel_alpha_invalid:{name}") from None
-            if not math.isfinite(amount) or amount < ZERO:
+            if not math.isfinite(amount) or amount < 0:
                 raise ModelingError(f"transport_channel_alpha_invalid:{name}")
             self._channel_startup_ms[str(name)] = amount / MS_PER_S
 
@@ -980,7 +976,7 @@ class Topology:
             stage = int(metadata.get("source_stage", op.stage))
         except (TypeError, ValueError):
             return family, ()
-        if not ZERO <= stage < self.parallel.pp:
+        if not 0 <= stage < self.parallel.pp:
             return family, ()
         phases = DIRECT_MESH_PHASES[family]
         local = set(self.ranks(replica, stage))
@@ -992,13 +988,13 @@ class Topology:
             # cohort stays on its declared joint path.
             if not set(ranks) <= local:
                 return family, ()
-            if not TWO <= len(ranks) <= DIRECT_MESH_MAX_PEERS:
+            if not 2 <= len(ranks) <= DIRECT_MESH_MAX_PEERS:
                 return family, ()
             nodes = {self._rank_node.get(rank, int(rank) // self._ranks_per_node)
                      for rank in ranks}
-            if len(nodes) != ONE:
+            if len(nodes) != 1:
                 return family, ()
-            rounds = len(phases) * (len(ranks) - ONE)
+            rounds = len(phases) * (len(ranks) - 1)
             if metadata.get("steps", rounds) != rounds:
                 return family, ()
             for source in ranks:
@@ -1011,15 +1007,15 @@ class Topology:
                         # An undeclared route is not a declared full mesh; the
                         # ordinary ledger still owns that routing failure.
                         return family, ()
-                    if len(path) != ONE:
+                    if len(path) != 1:
                         return family, ()
-                    if self.links[path[ZERO][ZERO]].semantics != "per_pair":
+                    if self.links[path[0][0]].semantics != "per_pair":
                         return family, ()
         return family, groups
 
     def declares_direct_mesh(self, op, replica) -> bool:
         """True when this invocation declares the direct K_8 pair mesh."""
-        return bool(self.direct_mesh_groups(op, replica)[ONE])
+        return bool(self.direct_mesh_groups(op, replica)[1])
 
     def bind_direct_mesh(self, op, replica, plan) -> None:
         """Publish the one mesh plan selected for an invocation."""
@@ -1035,8 +1031,8 @@ class Topology:
 
     def mesh_phase_startup_ms(self, links) -> float:
         """Declared per-phase protocol startup; unknown stays zero."""
-        return max((self._channel_startup_ms.get(str(link.channel), ZERO_FLOAT)
-                    for link in links), default=ZERO_FLOAT)
+        return max((self._channel_startup_ms.get(str(link.channel), 0.0)
+                    for link in links), default=0.0)
 
     def _work_with_capacity(self, work) -> TopologyCommunicationWork:
         rates = self._resource_rates
@@ -1083,22 +1079,27 @@ class Topology:
     def _has_endpoint_rate(self, link, rank: int) -> bool:
         return link.endpoint_capacity_bytes_per_ms(int(rank)) is not None
 
-    def resources(self):
-        if self._resource_cache is not None:
-            return self._resource_cache
+    def _build_resources(self, active: frozenset[int] | None = None):
         result = []
         for link in self.links.values():
             endpoint_ranks = sorted({int(rank) for rank, _ in link.endpoint_rates})
+            if active is not None and not (set(link.members) & active):
+                continue
             if link.semantics == "per_pair":
                 result.extend(Resource(
                     f"{self.namespace}link:{link.name}:pair{source}>{destination}",
                     link.capacity_bytes_per_ms, "bytes",
-                ) for source in link.members for destination in link.members if source != destination)
+                ) for source in link.members for destination in link.members
+                    if source != destination
+                    and (active is None or source in active or destination in active))
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in endpoint_ranks
+                              if active is None or rank in active
                               for direction in ("tx", "rx"))
             elif link.semantics in _PORT_SEMANTICS:
-                # Per-port semantics already expose every placement's tx/rx;
+                # Per-port semantics expose every placement's tx/rx.  A source
+                # on one isolated replica still needs its peers' destination
+                # port resources, so a touching link retains all its ports.
                 # endpoint_rates changes those resources, never a second copy.
                 result.extend(self._endpoint_resource(link, direction, rank)
                               for rank in link.members
@@ -1113,10 +1114,26 @@ class Topology:
             if link.switch_capacity_bytes_per_ms is not None:
                 result.append(Resource(f"{self.namespace}link:{link.name}:switch_plane",
                                        link.switch_capacity_bytes_per_ms, "bytes"))
-        self._resource_cache = tuple(result)
+        return tuple(result)
+
+    def resources(self):
+        if self._resource_cache is not None:
+            return self._resource_cache
+        self._resource_cache = self._build_resources()
         self._resource_rates = {resource.name: resource.rate
                                 for resource in self._resource_cache}
         return self._resource_cache
+
+    def resources_for_ranks(self, ranks):
+        """Link resources touching one replica, not the whole declared cluster."""
+        active = frozenset(int(rank) for rank in ranks)
+        cache = getattr(self, "_rank_resource_cache", None)
+        if cache is None:
+            cache = {}
+            self._rank_resource_cache = cache
+        if active not in cache:
+            cache[active] = self._build_resources(active)
+        return cache[active]
 
     def route(self, source, destination):
         key = source, destination
@@ -1580,19 +1597,19 @@ class Topology:
             names = DIRECT_MESH_PHASES[family]
             groups = []
             for ranks in unique_groups:
-                if len(ranks) <= ONE:
+                if len(ranks) <= 1:
                     continue
                 if len(ranks) > DIRECT_MESH_MAX_PEERS:
                     raise ModelingError(
                         f"direct_mesh_collective_exceeds_declared_peers:{len(ranks)}")
                 volumes = {rank: volume_by_rank[rank] for rank in ranks}
-                if len(set(volumes.values())) > ONE:
+                if len(set(volumes.values())) > 1:
                     raise ModelingError(
                         "direct_mesh_collective_requires_equal_per_rank_volume")
-                if len({self._rank_node[rank] for rank in ranks}) != ONE:
+                if len({self._rank_node[rank] for rank in ranks}) != 1:
                     raise ModelingError(
                         "direct_mesh_collective_requires_single_node_group")
-                rounds = len(names) * (len(ranks) - ONE)
+                rounds = len(names) * (len(ranks) - 1)
                 if metadata.get("steps", rounds) != rounds:
                     raise ModelingError(
                         "direct_mesh_collective_round_count_conflicts_with_declaration")
@@ -1602,10 +1619,10 @@ class Topology:
                         if source == destination:
                             continue
                         path = self.route(source, destination)
-                        if len(path) != ONE:
+                        if len(path) != 1:
                             raise ModelingError(
                                 "direct_mesh_collective_requires_one_hop_peer")
-                        link = self.links[path[ZERO][ZERO]]
+                        link = self.links[path[0][0]]
                         if link.semantics != "per_pair":
                             raise ModelingError(
                                 "direct_mesh_collective_requires_per_pair_links")

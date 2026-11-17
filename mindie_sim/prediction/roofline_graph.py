@@ -25,10 +25,6 @@ from typing import Iterable, Mapping
 
 from mindie_sim.schema.common import ModelingError
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 MS_PER_S = 1000.0
 UTILIZATION_TOLERANCE = 1e-9
 RESOURCES: tuple[str, ...] = ("cube", "vector", "hbm", "link")
@@ -55,14 +51,14 @@ RESOURCE_ID_SUFFIXES: tuple[str, ...] = ("_resource", "_physical_id", "_device")
 
 @dataclass(frozen=True)
 class RooflineTargets:
-    cube: float = ONE_FLOAT
-    vector: float = ONE_FLOAT
-    hbm: float = ONE_FLOAT
-    link: float = ONE_FLOAT
+    cube: float = 1.0
+    vector: float = 1.0
+    hbm: float = 1.0
+    link: float = 1.0
 
     def __post_init__(self):
-        if any(not math.isfinite(value) or value <= ZERO_FLOAT
-               or value > ONE_FLOAT
+        if any(not math.isfinite(value) or value <= 0.0
+               or value > 1.0
                for value in (self.cube, self.vector, self.hbm, self.link)):
             raise ModelingError("roofline_target_efficiency_must_be_in_unit_interval")
 
@@ -72,7 +68,7 @@ class RooflineTargets:
             "vector": self.vector,
             "hbm": self.hbm,
             "link": self.link,
-        }.get(resource, ONE_FLOAT)
+        }.get(resource, 1.0)
 
 
 @dataclass(frozen=True)
@@ -88,14 +84,14 @@ class PhysicalWorkNode:
     """
 
     node_id: str = ""
-    cube_ms: float = ZERO_FLOAT
-    vector_ms: float = ZERO_FLOAT
-    hbm_ms: float = ZERO_FLOAT
-    link_ms: float = ZERO_FLOAT
-    launch_ms: float = ZERO_FLOAT
-    fixed_ms: float = ZERO_FLOAT
+    cube_ms: float = 0.0
+    vector_ms: float = 0.0
+    hbm_ms: float = 0.0
+    link_ms: float = 0.0
+    launch_ms: float = 0.0
+    fixed_ms: float = 0.0
     predecessors: tuple[str, ...] = ()
-    occurrences: int = ONE
+    occurrences: int = 1
     resource_ids: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self):
@@ -110,13 +106,13 @@ class PhysicalWorkNode:
         else:
             normalized = ()
         object.__setattr__(self, "resource_ids", normalized)
-        if any(not math.isfinite(value) or value < ZERO_FLOAT
+        if any(not math.isfinite(value) or value < 0.0
                for value in (self.cube_ms, self.vector_ms, self.hbm_ms,
                              self.link_ms, self.launch_ms, self.fixed_ms)):
             raise ModelingError("physical_work_node_duration_must_be_nonnegative")
         if (isinstance(self.occurrences, bool)
                 or not isinstance(self.occurrences, int)
-                or self.occurrences < ONE):
+                or self.occurrences < 1):
             raise ModelingError(
                 "physical_work_node_occurrences_must_be_positive_integer")
         seen: dict[str, str] = {}
@@ -224,13 +220,13 @@ class LinkUtilization:
     span_ms: float
     maximum: float
     violations: tuple[str, ...]
-    nominal_peak_utilization: float = ZERO_FLOAT
-    configured_capacity_utilization: float = ZERO_FLOAT
-    useful_payload_throughput: float = ZERO_FLOAT
-    bus_wire_throughput: float = ZERO_FLOAT
+    nominal_peak_utilization: float = 0.0
+    configured_capacity_utilization: float = 0.0
+    useful_payload_throughput: float = 0.0
+    bus_wire_throughput: float = 0.0
 
     def __post_init__(self):
-        if self.span_ms < ZERO_FLOAT:
+        if self.span_ms < 0.0:
             raise ModelingError("link_utilization_span_must_be_nonnegative")
 
 
@@ -252,14 +248,14 @@ def _topological_order(nodes: Mapping[str, PhysicalWorkNode],
             if predecessor not in nodes:
                 raise ModelingError("physical_work_graph_edge_unknown_node")
             successors[predecessor].append(node_id)
-    ready = deque(node_id for node_id in nodes if indegree[node_id] == ZERO)
+    ready = deque(node_id for node_id in nodes if indegree[node_id] == 0)
     order: list[str] = []
     while ready:
         node_id = ready.popleft()
         order.append(node_id)
         for successor in successors[node_id]:
-            indegree[successor] -= ONE
-            if indegree[successor] == ZERO:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
                 ready.append(successor)
     if len(order) != len(nodes):
         raise ModelingError("physical_work_graph_cycle")
@@ -281,13 +277,13 @@ def _longest_path(nodes: Mapping[str, PhysicalWorkNode],
     best: dict[str, float] = {}
     path: dict[str, tuple[str, ...]] = {}
     for node_id in order:
-        finish, chosen = ZERO_FLOAT, ()
+        finish, chosen = 0.0, ()
         for predecessor in predecessors.get(node_id, ()):
             if best[predecessor] > finish:
                 finish, chosen = best[predecessor], path[predecessor]
         best[node_id] = weights[node_id] + finish
         path[node_id] = (*chosen, node_id)
-    maximum, critical = ZERO_FLOAT, ()
+    maximum, critical = 0.0, ()
     for node_id in order:
         if best[node_id] > maximum:
             maximum, critical = best[node_id], path[node_id]
@@ -304,7 +300,7 @@ def _resource_totals(
     for node in nodes:
         for resource in RESOURCES:
             service = node.service_ms(resource)
-            if service <= ZERO_FLOAT:
+            if service <= 0.0:
                 continue
             key = node.physical_resource_id(resource)
             previous = logical_by_key.get(key)
@@ -345,12 +341,12 @@ def critical_path_roofline(graph: PhysicalWorkGraph,
     logical_by_key, resource_totals = _resource_totals(graph.nodes)
     resource_cut_bounds = {
         key: (total / targets.for_resource(logical_by_key[key])
-              if total > ZERO_FLOAT else ZERO_FLOAT)
+              if total > 0.0 else 0.0)
         for key, total in resource_totals.items()
     }
-    physical_ideal = max(cp_ideal, max(resource_totals.values(), default=ZERO_FLOAT))
+    physical_ideal = max(cp_ideal, max(resource_totals.values(), default=0.0))
     target_bound = max(cp_target, max(resource_cut_bounds.values(),
-                                      default=ZERO_FLOAT))
+                                      default=0.0))
     target_bound = max(physical_ideal, target_bound)
     return RooflineResult(
         physical_ideal_ms=physical_ideal,
@@ -370,19 +366,19 @@ def link_utilization(wire_by_resource: Mapping[str, float],
                      span_ms: float) -> LinkUtilization:
     """Return raw per-resource utilization and any capacity violation."""
     span = float(span_ms)
-    if not math.isfinite(span) or span < ZERO_FLOAT:
+    if not math.isfinite(span) or span < 0.0:
         raise ModelingError("link_utilization_span_invalid")
     utilization = {}
     violations = []
     for resource, wire in wire_by_resource.items():
-        capacity = float(capacity_by_resource.get(resource, ZERO_FLOAT))
-        if capacity <= ZERO_FLOAT:
+        capacity = float(capacity_by_resource.get(resource, 0.0))
+        if capacity <= 0.0:
             raise ModelingError(f"link_utilization_capacity_missing:{resource}")
-        value = float(wire) / (capacity * span) if span > ZERO_FLOAT else ZERO_FLOAT
+        value = float(wire) / (capacity * span) if span > 0.0 else 0.0
         utilization[resource] = value
-        if value > ONE_FLOAT + UTILIZATION_TOLERANCE:
+        if value > 1.0 + UTILIZATION_TOLERANCE:
             violations.append(resource)
-    maximum = max(utilization.values(), default=ZERO_FLOAT)
+    maximum = max(utilization.values(), default=0.0)
     total_wire = math.fsum(float(value) for value in wire_by_resource.values())
     total_capacity = math.fsum(float(value) for value in capacity_by_resource.values())
     return LinkUtilization(
@@ -396,8 +392,8 @@ def link_utilization(wire_by_resource: Mapping[str, float],
         violations=tuple(violations),
         nominal_peak_utilization=maximum,
         configured_capacity_utilization=maximum,
-        useful_payload_throughput=(total_wire / span if span > ZERO_FLOAT else ZERO_FLOAT),
-        bus_wire_throughput=(total_capacity / span if span > ZERO_FLOAT else ZERO_FLOAT),
+        useful_payload_throughput=(total_wire / span if span > 0.0 else 0.0),
+        bus_wire_throughput=(total_capacity / span if span > 0.0 else 0.0),
     )
 
 
@@ -414,7 +410,7 @@ def _nonnegative_float(value: object, label: str) -> float:
     except (TypeError, ValueError):
         raise ModelingError(
             f"graph_from_occurrences_service_invalid:{label}") from None
-    if not math.isfinite(number) or number < ZERO_FLOAT:
+    if not math.isfinite(number) or number < 0.0:
         raise ModelingError(f"graph_from_occurrences_service_invalid:{label}")
     return number
 
@@ -457,10 +453,10 @@ def _occurrence_node_id(row: Mapping[str, object], index: int,
         return candidate
     base = str(explicit)
     candidate = base
-    suffix = ONE + ONE
+    suffix = 1 + 1
     while candidate in used:
         candidate = f"{base}#{suffix}"
-        suffix += ONE
+        suffix += 1
     used.add(candidate)
     return candidate
 
@@ -499,7 +495,7 @@ def graph_from_occurrences(
     has_dependency_field = tuple(
         _row_value(row, PREDECESSOR_KEYS, None) is not None
         for row in materialized)
-    if len(materialized) > ONE and not edge_list and not all(has_dependency_field):
+    if len(materialized) > 1 and not edge_list and not all(has_dependency_field):
         raise ModelingError("graph_from_occurrences_requires_explicit_edges")
     prepared = []
     used: set[str] = set()
@@ -511,7 +507,7 @@ def graph_from_occurrences(
     nodes = []
     for node_id, row, raw_predecessors in prepared:
         service = {
-            resource: _row_value(row, SERVICE_ROW_KEYS[resource], ZERO_FLOAT)
+            resource: _row_value(row, SERVICE_ROW_KEYS[resource], 0.0)
             for resource in RESOURCES
         }
         if service_by_id is not None and node_id in service_by_id:
@@ -520,9 +516,9 @@ def graph_from_occurrences(
                 value = _row_value(supplied, SERVICE_ROW_KEYS[resource], None)
                 if value is not None:
                     service[resource] = value
-        count = _row_value(row, OCCURRENCE_KEYS, ONE)
+        count = _row_value(row, OCCURRENCE_KEYS, 1)
         if (isinstance(count, bool) or not isinstance(count, int)
-                or count < ONE):
+                or count < 1):
             raise ModelingError(
                 f"graph_from_occurrences_occurrences_invalid:{node_id}")
         nodes.append(PhysicalWorkNode(
@@ -532,9 +528,9 @@ def graph_from_occurrences(
             hbm_ms=_nonnegative_float(service["hbm"], f"{node_id}:hbm"),
             link_ms=_nonnegative_float(service["link"], f"{node_id}:link"),
             fixed_ms=_nonnegative_float(
-                _row_value(row, FIXED_KEYS, ZERO_FLOAT), f"{node_id}:fixed"),
+                _row_value(row, FIXED_KEYS, 0.0), f"{node_id}:fixed"),
             launch_ms=_nonnegative_float(
-                _row_value(row, LAUNCH_KEYS, ZERO_FLOAT), f"{node_id}:launch"),
+                _row_value(row, LAUNCH_KEYS, 0.0), f"{node_id}:launch"),
             predecessors=tuple(
                 predecessor for predecessor in raw_predecessors
                 if predecessor in known),
@@ -556,11 +552,11 @@ def graph_from_rows(rows) -> PhysicalWorkGraph:
     nodes = tuple(
         PhysicalWorkNode(
             node_id=str(row.get("physical_id") or row.get("op_id") or index),
-            cube_ms=float(row.get("t_cube_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
-            vector_ms=float(row.get("t_vec_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
-            hbm_ms=float(row.get("t_hbm_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
-            link_ms=float(row.get("t_link_ideal_ms", ZERO_FLOAT) or ZERO_FLOAT),
-            launch_ms=float(row.get("fixed_ms", ZERO_FLOAT) or ZERO_FLOAT),
+            cube_ms=float(row.get("t_cube_ideal_ms", 0.0) or 0.0),
+            vector_ms=float(row.get("t_vec_ideal_ms", 0.0) or 0.0),
+            hbm_ms=float(row.get("t_hbm_ideal_ms", 0.0) or 0.0),
+            link_ms=float(row.get("t_link_ideal_ms", 0.0) or 0.0),
+            launch_ms=float(row.get("fixed_ms", 0.0) or 0.0),
         )
         for index, row in enumerate(rows)
     )

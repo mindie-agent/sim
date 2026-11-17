@@ -15,9 +15,6 @@ from dataclasses import dataclass
 from .physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 
-ZERO_FLOAT = 0.0
-ONE = 1
-ONE_FLOAT = 1.0
 HALF_SHARE = 0.5
 STREAM_LOAD_SHARE = 0.30
 STREAM_STORE_SHARE = 0.70
@@ -67,7 +64,7 @@ class AIVTiledVectorAndGatherRecipe:
             return "quantization"
         if family in NORM_FAMILIES or family in REDUCTION_FAMILIES:
             return "reduction"
-        if recipe in SCATTER_RECIPES and int(metadata.get("top_k", ONE) or ONE) > ONE:
+        if recipe in SCATTER_RECIPES and int(metadata.get("top_k", 1) or 1) > 1:
             return "atomic_scatter"
         if recipe in WRITE_ONLY_RECIPES:
             return "write_only"
@@ -83,92 +80,92 @@ class AIVTiledVectorAndGatherRecipe:
         write_share = io_weight(context, "hbm_write")
         if submode == "write_only":
             phases = (
-                Phase("tile_fill", {"vector": ONE_FLOAT,
-                                    IO_HBM_CATEGORY: ONE_FLOAT,
-                                    "mte3": ONE_FLOAT}),
+                Phase("tile_fill", {"vector": 1.0,
+                                    IO_HBM_CATEGORY: 1.0,
+                                    "mte3": 1.0}),
             )
         elif submode == "quantization":
             phases = (
                 Phase("row_load", {IO_HBM_CATEGORY: read_share,
-                                   "mte2": ONE_FLOAT}),
+                                   "mte2": 1.0}),
                 Phase("absmax_reduce", {"vector": HALF_SHARE},
                       after=("row_load",)),
                 Phase("scale_cast_store", {
                     "vector": HALF_SHARE,
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("absmax_reduce",)),
             )
         elif submode == "reduction":
             phases = (
                 Phase("row_load", {IO_HBM_CATEGORY: read_share,
-                                   "mte2": ONE_FLOAT}),
+                                   "mte2": 1.0}),
                 Phase("statistics", {"vector": HALF_SHARE},
                       after=("row_load",)),
                 Phase("normalize_store", {
                     "vector": HALF_SHARE,
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("statistics",)),
             )
         elif submode == "atomic_scatter":
             phases = (
                 Phase("row_load", {IO_HBM_CATEGORY: read_share,
-                                   "mte2": ONE_FLOAT}),
+                                   "mte2": 1.0}),
                 Phase("atomic_rmw", {"vector": HALF_SHARE},
                       after=("row_load",)),
                 Phase("combine_store", {
                     "vector": HALF_SHARE,
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("atomic_rmw",)),
             )
         elif submode == "recurrence":
             phases = (
                 Phase("history_load", {IO_HBM_CATEGORY: read_share,
-                                       "mte2": ONE_FLOAT}),
+                                       "mte2": 1.0}),
                 Phase("window_update", {"vector": HALF_SHARE},
                       after=("history_load",)),
                 Phase("history_store", {
                     "vector": HALF_SHARE,
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("window_update",)),
             )
         elif submode == "gather":
             phases = (
                 Phase("index_load", {IO_HBM_CATEGORY: read_share,
-                                     "mte2": ONE_FLOAT}),
-                Phase("gather_rows", {"vector": ONE_FLOAT},
+                                     "mte2": 1.0}),
+                Phase("gather_rows", {"vector": 1.0},
                       after=("index_load",)),
                 Phase("gather_store", {
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("gather_rows",)),
             )
         else:
             phases = (
                 Phase("tile_load", {IO_HBM_CATEGORY: read_share,
-                                    "mte2": ONE_FLOAT}),
-                Phase("tile_compute", {"vector": ONE_FLOAT,
-                                       "cube": ONE_FLOAT},
+                                    "mte2": 1.0}),
+                Phase("tile_compute", {"vector": 1.0,
+                                       "cube": 1.0},
                       after=("tile_load",)),
                 Phase("tile_store", {
                     IO_HBM_CATEGORY: write_share,
-                    "mte3": ONE_FLOAT,
+                    "mte3": 1.0,
                 }, after=("tile_compute",)),
             )
-        if any(float(value) > ZERO_FLOAT for key, value in context.work.items()
+        if any(float(value) > 0.0 for key, value in context.work.items()
                if "link" in str(key).split(":")):
             # A declared state/transfer payload still needs its physical link
             # service even when the value transform runs on AIV.
-            phases = phases + (Phase("link_service", {"link": ONE_FLOAT}),)
+            phases = phases + (Phase("link_service", {"link": 1.0}),)
         for pipe in ("mte1", "fixpipe"):
-            if any(float(value) > ZERO_FLOAT and str(key).startswith(pipe)
+            if any(float(value) > 0.0 and str(key).startswith(pipe)
                    for key, value in context.work.items()):
                 # A fused/vector op that declares local operand staging keeps
                 # that physical pipe service in its own phase.
-                phases = phases + (Phase(f"{pipe}_service", {pipe: ONE_FLOAT}),)
+                phases = phases + (Phase(f"{pipe}_service", {pipe: 1.0}),)
         return tiled_phased_program(
             context, phases, slots=self.slots, cap=self.tile_cap)
 

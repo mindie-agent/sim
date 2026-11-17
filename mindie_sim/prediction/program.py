@@ -23,8 +23,6 @@ from mindie_sim.schema.hardware import NATIVE_WORK_UNITS
 from mindie_sim.schema.operators import ProgramFragment
 from .engine import Allocation, Engine, Event
 from .ownership import unit_group
-ZERO = 0
-ZERO_FLOAT = 0.0
 
 
 _EMPTY_MAPPING = MappingProxyType({})
@@ -1402,13 +1400,13 @@ class RecipeContext:
             return "mte2"
         declared = str(dict(self.op.metadata or {}).get("read_pipe", "") or "")
         if declared in {"aic", "aiv"}:
-            return read_role(names, aiv=ZERO if declared == "aiv" else None)
+            return read_role(names, aiv=0 if declared == "aiv" else None)
         if aiv is None:
             matrix = tuple(getattr(self.op, "matrix_flops", ()) or ())
-            flops = float(getattr(self.op, "flops", ZERO_FLOAT) or ZERO_FLOAT)
-            vector = float(getattr(self.op, "vector_ops", ZERO_FLOAT) or ZERO_FLOAT)
-            aiv = not matrix and flops <= ZERO_FLOAT and vector > ZERO_FLOAT
-        return read_role(names, aiv=ZERO if aiv else None)
+            flops = float(getattr(self.op, "flops", 0.0) or 0.0)
+            vector = float(getattr(self.op, "vector_ops", 0.0) or 0.0)
+            aiv = not matrix and flops <= 0.0 and vector > 0.0
+        return read_role(names, aiv=0 if aiv else None)
 
     def bind(self, work) -> dict[str, float]:
         """Resolve typed stage work onto shared physical resources, in ms units."""
@@ -1420,7 +1418,7 @@ class RecipeContext:
                 raise ModelingError(f"compute_precision_rate_required:{dtype}")
             name = self.resource_names["cube"]
             demand[name] = demand.get(name, 0) + 1000 * flops / self.compute_peaks[dtype]
-        matrix_consumer = any(float(value) > ZERO_FLOAT
+        matrix_consumer = any(float(value) > 0.0
                               for value in work.matrix.values())
         for role, amount in work.resources.items():
             if not amount:

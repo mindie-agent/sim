@@ -19,10 +19,6 @@ from mindie_sim.schema.common import ModelingError
 from .mechanism import OperatorPlan, Work
 from .program import KernelProgram, PipelineProgram, Stage
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 MAX_TILES = 64
 MIN_TILE_BYTES = 4096
 DEFAULT_AIV_TILES = 64
@@ -42,7 +38,7 @@ class Phase:
 
 
 def _fraction(value: float, total: float) -> float:
-    return ZERO_FLOAT if total <= ZERO_FLOAT else float(value) / float(total)
+    return 0.0 if total <= 0.0 else float(value) / float(total)
 
 
 def work_from_op(op) -> Work:
@@ -52,12 +48,12 @@ def work_from_op(op) -> Work:
     for field, role in (("hbm_bytes", "hbm"), ("mte2_bytes", "mte2"),
                         ("mte3_bytes", "mte3"), ("vector_ops", "vector"),
                         ("link_bytes", "link")):
-        value = float(getattr(op, field, ZERO_FLOAT) or ZERO_FLOAT)
+        value = float(getattr(op, field, 0.0) or 0.0)
         if value:
-            resources[role] = resources.get(role, ZERO_FLOAT) + value
+            resources[role] = resources.get(role, 0.0) + value
     metadata = dict(getattr(op, "metadata", ()) or ())
     for role, value in dict(metadata.get("resource_work", {})).items():
-        resources[role] = resources.get(role, ZERO_FLOAT) + float(value)
+        resources[role] = resources.get(role, 0.0) + float(value)
     return Work(matrix, resources)
 
 
@@ -119,7 +115,7 @@ def _resource_categories(context) -> dict[str, str]:
         by_name[str(name)] = category
     result: dict[str, str] = {}
     for name, value in dict(context.work).items():
-        if float(value) <= ZERO_FLOAT:
+        if float(value) <= 0.0:
             continue
         key = str(name)
         if key.startswith("host") or key.startswith("scheduler@"):
@@ -145,27 +141,27 @@ def _phase_amounts(context, phases: Sequence[Phase]) -> list[dict[str, float]]:
     result = [dict() for _phase in phases]
     for name, category in categories.items():
         total = float(context.work[name])
-        if total <= ZERO_FLOAT:
+        if total <= 0.0:
             continue
-        weights = [max(ZERO_FLOAT, float(phase.weights.get(category, ZERO_FLOAT)))
+        weights = [max(0.0, float(phase.weights.get(category, 0.0)))
                    for phase in phases]
         denominator = math.fsum(weights)
-        if denominator <= ZERO_FLOAT:
+        if denominator <= 0.0:
             _unmodeled(context, "resource_without_consuming_phase", name)
         positive = [index for index, weight in enumerate(weights)
-                    if weight > ZERO_FLOAT]
-        last = positive[-ONE]
-        allocated = ZERO_FLOAT
+                    if weight > 0.0]
+        last = positive[-1]
+        allocated = 0.0
         for index, weight in enumerate(weights):
             if index == last:
                 amount = total - allocated
-            elif weight <= ZERO_FLOAT:
-                amount = ZERO_FLOAT
+            elif weight <= 0.0:
+                amount = 0.0
             else:
                 amount = total * weight / denominator
             allocated += amount
-            if amount > ZERO_FLOAT:
-                result[index][name] = result[index].get(name, ZERO_FLOAT) + amount
+            if amount > 0.0:
+                result[index][name] = result[index].get(name, 0.0) + amount
     return result
 
 
@@ -180,7 +176,7 @@ def phased_program(context, phases: Sequence[Phase], *,
     stages = []
     for phase, amount in zip(phases, amounts):
         work = {name: value for name, value in amount.items()
-                if value > ZERO_FLOAT}
+                if value > 0.0}
         stages.append(Stage(phase.name, work, after=phase.after,
                             keep_empty=True))
     return KernelProgram(tuple(stages),
@@ -191,18 +187,18 @@ def phased_program(context, phases: Sequence[Phase], *,
 def _tile_count(context, *, cap: int = MAX_TILES) -> int:
     op = context.op
     units = int(context.resource_units.get(
-        "vector", max(ONE, context.core_count)))
-    bytes_to_cover = max(float(getattr(op, "mte2_bytes", ZERO_FLOAT) or ZERO_FLOAT),
-                         float(getattr(op, "hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT))
-    needed = max(ONE, int(math.ceil(bytes_to_cover / MIN_TILE_BYTES)))
-    return max(ONE, min(cap, units, needed))
+        "vector", max(1, context.core_count)))
+    bytes_to_cover = max(float(getattr(op, "mte2_bytes", 0.0) or 0.0),
+                         float(getattr(op, "hbm_bytes", 0.0) or 0.0))
+    needed = max(1, int(math.ceil(bytes_to_cover / MIN_TILE_BYTES)))
+    return max(1, min(cap, units, needed))
 
 
 def tiled_phased_program(context, phases: Sequence[Phase], *,
                          slots: int = DEFAULT_PIPELINE_SLOTS, cap: int = MAX_TILES) -> KernelProgram:
     """Run the same phase DAG as a bounded finite tile pipeline."""
     count = _tile_count(context, cap=cap)
-    if count <= ONE:
+    if count <= 1:
         return phased_program(context, phases)
     amounts = _phase_amounts(context, phases)
 
@@ -210,15 +206,15 @@ def tiled_phased_program(context, phases: Sequence[Phase], *,
         stages = []
         for phase, amount in zip(phases, amounts):
             start = float(index) / count
-            end = float(index + ONE) / count
+            end = float(index + 1) / count
             work = {name: value * (end - start)
                     for name, value in amount.items()
-                    if value > ZERO_FLOAT}
+                    if value > 0.0}
             stages.append(Stage(phase.name, work, after=phase.after,
                                 keep_empty=True))
         return stages
 
-    pipeline = PipelineProgram(count, max(ONE, int(slots)), tile,
+    pipeline = PipelineProgram(count, max(1, int(slots)), tile,
                                minimum_ms=context.minimum_ms)
     return KernelProgram((Stage("setup", latency=context.setup_ms),
                           Stage("tiles", after=("setup",), program=pipeline)),
@@ -228,15 +224,15 @@ def tiled_phased_program(context, phases: Sequence[Phase], *,
 def io_weight(context, category: str) -> float:
     """Fraction of HBM traffic that is a payload read or write."""
     op = context.op
-    total = float(getattr(op, "hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT)
-    if total <= ZERO_FLOAT:
-        return ONE_FLOAT
-    write = float(getattr(op, "mte3_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+    total = float(getattr(op, "hbm_bytes", 0.0) or 0.0)
+    if total <= 0.0:
+        return 1.0
+    write = float(getattr(op, "mte3_bytes", 0.0) or 0.0)
     if category == IO_HBM_CATEGORY:
-        return ONE_FLOAT
+        return 1.0
     if category == "hbm_write":
-        return min(ONE_FLOAT, max(ZERO_FLOAT, write / total))
-    return min(ONE_FLOAT, max(ZERO_FLOAT, (total - write) / total))
+        return min(1.0, max(0.0, write / total))
+    return min(1.0, max(0.0, (total - write) / total))
 
 
 def build_plan(recipe, op, geometry) -> OperatorPlan:

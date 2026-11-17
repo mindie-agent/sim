@@ -18,11 +18,14 @@ from .indexer_representation import index_representation
 from .mla_native import index_layer_norm
 from .structure_groups import declare_group
 
-ZERO = 0
-ONE = 1
-TWO = 2
-FOUR = 4
-ZERO_FLOAT = 0.0
+FLOPS_PER_FMA = 2
+FP32_BYTES = int(dtype_bytes("fp32"))
+INT32_BYTES = int(dtype_bytes("int32"))
+
+
+def _op_dtype(b, op_id: str, fallback: str) -> str:
+    op = next((item for item in reversed(b.ops) if item.op_id == op_id), None)
+    return str(op.dtype) if (op is not None and op.dtype) else fallback
 
 
 SOURCE = {
@@ -72,22 +75,22 @@ def _geometry(views, plan):
 
 def _visited_pool_rows(views, plan):
     """Complete pool IDs actually visited, deduplicating shared prefixes only."""
-    pool = max(ONE, int(plan.index_kpool))
+    pool = max(1, int(plan.index_kpool))
     groups = {}
     for position, view in enumerate(views):
-        if int(view.q_len) <= ZERO:
+        if int(view.q_len) <= 0:
             continue
         rows = (int(view.context) + int(view.q_len)) // pool
-        prefix = int(getattr(view, "prefix_tokens", ZERO) or ZERO)
-        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > ZERO \
+        prefix = int(getattr(view, "prefix_tokens", 0) or 0)
+        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > 0 \
             else (position, str(view.request_id))
-        groups[key] = max(groups.get(key, ZERO), rows)
+        groups[key] = max(groups.get(key, 0), rows)
     return sum(groups.values())
 
 
 def _causal_token_pairs(views, *, noncausal=False):
     """Visible token pairs. Owned spans use their global start, not q_len at context."""
-    total = ZERO
+    total = 0
     for view in views:
         ranges = getattr(view, "query_ranges", ()) or ()
         if noncausal:
@@ -95,11 +98,11 @@ def _causal_token_pairs(views, *, noncausal=False):
             total += q_cnt * view.kv_len
         elif ranges:
             total += sum((end - start) * (view.context + start)
-                         + (end - start) * (end - start + ONE) // TWO
+                         + (end - start) * (end - start + 1) // 2
                          for start, end in ranges)
         else:
             query = view.q_len
-            total += query * view.context + query * (query + ONE) // TWO
+            total += query * view.context + query * (query + 1) // 2
     return total
 
 
@@ -470,11 +473,11 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
     row_bytes = float(index_row_bytes(b.model, width))
     unique_pool_rows = _visited_pool_rows(views, plan)
     l2_bounded_pool_read = float(unique_pool_rows) * row_bytes
-    if l2_bytes is not None and float(l2_bytes) > ZERO_FLOAT:
+    if l2_bytes is not None and float(l2_bytes) > 0.0:
         if l2_bounded_pool_read > float(l2_bytes):
-            spill = max(ZERO_FLOAT, ONE - float(l2_bytes) / l2_bounded_pool_read)
+            spill = max(0.0, 1 - float(l2_bytes) / l2_bounded_pool_read)
             l2_bounded_pool_read += (
-                max(ZERO_FLOAT, float(scanned) * row_bytes - l2_bounded_pool_read)
+                max(0.0, float(scanned) * row_bytes - l2_bounded_pool_read)
                 * spill)
     common = (("pool_size", plan.index_kpool), ("score_mode", score_mode),
               ("score_implementation", score_implementation),
@@ -482,82 +485,93 @@ def selection(b, *, query, weights, cache, views, plan, quant, padded_tokens,
               ("score_unique_pool_rows", unique_pool_rows),
               ("score_logical_pool_read_bytes", float(scanned) * row_bytes),
               ("score_l2_hit_bytes", max(
-                  ZERO_FLOAT, float(scanned) * row_bytes - l2_bounded_pool_read)),
+                  0.0, float(scanned) * row_bytes - l2_bounded_pool_read)),
               ("valid_query_rows", valid), ("padded_query_rows", tokens),
               ("causal_token_pairs", _causal_token_pairs(views, noncausal=bool(plan.noncausal_attention))),
               ("scanned_pools", scanned), ("selected_pools", selected),
               ("selected_token_rows", valid_indices),
               ("native_owner_schedule", "not_selected"),
               ("implementation_basis", "analytic_resource_phases"), ("native_source", SOURCE))
+    query_dtype = _op_dtype(b, query, quant.index_dtype)
+    weights_dtype = _op_dtype(b, weights, quant.index_dtype)
+    query_elem_b = dtype_bytes(query_dtype)
+    weights_elem_b = dtype_bytes(weights_dtype)
+    score_dtype = "fp32"
+    score_elem_b = dtype_bytes(score_dtype)
     members, entries = [], []
+    materialized_scores = False
     if score_mode == "linear_weighted_query":
         query_f32 = b.vector(
             "index_pool_query_fp32", (query,), tokens * heads * width, 1,
             family="cast", dtype="fp32", shape=(tokens, heads, width),
-            read_bytes_override=tokens * heads * width * dtype_bytes(quant.index_dtype),
-            write_bytes_override=tokens * heads * width * 4, metadata=common)
+            read_bytes_override=tokens * heads * width * query_elem_b,
+            write_bytes_override=tokens * heads * width * FP32_BYTES, metadata=common)
         weights_f32 = b.vector(
             "index_pool_weights_fp32", (weights,), tokens * heads, 1,
             family="cast", dtype="fp32", shape=(tokens, heads),
-            read_bytes_override=tokens * heads * dtype_bytes(quant.index_dtype),
-            write_bytes_override=tokens * heads * 4, metadata=common)
+            read_bytes_override=tokens * heads * weights_elem_b,
+            write_bytes_override=tokens * heads * FP32_BYTES, metadata=common)
         weighted = b.work(
             "index_pool_weighted_query", (query_f32, weights_f32), (tokens, width),
-            vector=tokens * heads * width * TWO,
-            read=tokens * heads * (width + ONE) * FOUR,
-            write=tokens * width * FOUR, family="indexer", dtype="fp32", metadata=common)
+            vector=tokens * heads * width * FLOPS_PER_FMA,
+            read=tokens * heads * (width + 1) * FP32_BYTES,
+            write=tokens * width * FP32_BYTES, family="indexer", dtype="fp32",
+            metadata=common)
         members.extend((query_f32, weights_f32, weighted)); entries.extend((query_f32, weights_f32))
         # The declared weighted-query implementation is FP32 vector arithmetic;
         # it is not a BF16 Cube matmul and the score tile is materialized unless
         # one executable fused plan owns the tile and the TopK state in UB.
+        materialized_scores = True
         scores = b.work(
             "index_pool_scores", (weighted, cache), (tokens, width),
-            flops=ZERO_FLOAT,
+            flops=0.0,
             matrix_flops=(),
-            vector=TWO * scanned * width,
-            read=float(scanned) * row_bytes + tokens * width * FOUR,
-            hbm_read=l2_bounded_pool_read + tokens * width * FOUR,
-            write=FOUR * scanned, family="indexer", dtype="fp32",
+            vector=FLOPS_PER_FMA * scanned * width,
+            read=float(scanned) * row_bytes + tokens * width * FP32_BYTES,
+            hbm_read=l2_bounded_pool_read + tokens * width * FP32_BYTES,
+            write=scanned * score_elem_b, family="indexer", dtype=score_dtype,
             metadata=common + (("score_materialization",
                                 "separate_fp32_score_then_topk"),))
         entries.append(scores)
     else:
         matrix = ()
-        score_flops = ZERO_FLOAT
+        score_flops = 0.0
         if score_implementation == "per_head_mma":
-            score_flops = float(TWO * scanned * heads * width)
-            matrix = ((quant.index_dtype, score_flops),)
+            score_flops = float(FLOPS_PER_FMA * scanned * heads * width)
+            matrix = ((query_dtype, score_flops),)
+        materialized_scores = not matrix
+        qw_bytes = tokens * heads * (width * query_elem_b + weights_elem_b)
         scores = b.work(
             "index_pool_scores", (query, weights, cache), (tokens, heads, width),
             flops=score_flops, matrix_flops=matrix,
-            vector=scanned * heads * TWO,
-            read=float(scanned) * row_bytes
-                 + tokens * heads * (width + ONE) * dtype_bytes(quant.index_dtype),
-            hbm_read=l2_bounded_pool_read
-                 + tokens * heads * (width + ONE) * dtype_bytes(quant.index_dtype),
-            write=FOUR * scanned if not matrix else ZERO_FLOAT,
-            family="indexer", dtype=quant.index_dtype,
+            vector=scanned * heads * FLOPS_PER_FMA,
+            read=float(scanned) * row_bytes + qw_bytes,
+            hbm_read=l2_bounded_pool_read + qw_bytes,
+            write=scanned * score_elem_b if materialized_scores else 0.0,
+            family="indexer", dtype=query_dtype,
             metadata=common + (("score_materialization",
                                 "per_head_mma" if matrix else
                                 "separate_fp32_score_then_topk"),))
         entries.append(scores)
     members.append(scores)
-    int32_bytes = dtype_bytes("int32")
+    topk_score_read = scanned * score_elem_b if materialized_scores else 0.0
     topk = b.work(
         "index_pool_topk", (scores,), (tokens, pool_topk),
-        vector=scanned * math.log2(max(TWO, pool_topk)),
-        read=FOUR * scanned,
-        write=tokens * pool_topk * int32_bytes,
-        family="topk", dtype="fp32", metadata=common + (
+        vector=scanned * math.log2(max(2, pool_topk)),
+        read=topk_score_read,
+        write=tokens * pool_topk * INT32_BYTES,
+        family="topk", dtype=score_dtype, metadata=common + (
             ("selection_output_dtype", "int32"),
-            ("score_materialization", "separate_fp32_score_then_topk")))
+            ("score_materialization",
+             "separate_fp32_score_then_topk" if materialized_scores
+             else "per_head_mma")))
     tail_rows = sum(g.causal_tail_tokens for g in geometry)
     has_output = (selected > 0 or tail_rows > 0) and tokens > 0
     packed = b.work(
         "index_topk", (topk,), (tokens, output_width),
         vector=selected * plan.index_kpool * 2 + (tokens * output_width if has_output else 0),
-        read=tokens * pool_topk * int32_bytes if (selected > 0 and tokens > 0) else 0,
-        write=tokens * output_width * int32_bytes if has_output else 0,
+        read=tokens * pool_topk * INT32_BYTES if (selected > 0 and tokens > 0) else 0,
+        write=tokens * output_width * INT32_BYTES if has_output else 0,
         family="topk", dtype="int32", metadata=common + (
             ("selection_output_dtype", "int32"), ("selection_capacity", output_width),
             ("causal_tail_rows", tail_rows),

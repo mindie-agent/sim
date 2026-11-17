@@ -17,29 +17,27 @@ from typing import Any, Mapping
 
 def local_query_heads(num_heads: int, tp: int) -> int:
     """Per-rank query heads; H must be divisible by TP (no padding)."""
-    heads, width = int(num_heads), max(ONE_VALUE, int(tp))
-    if heads <= ZERO_VALUE or heads % width != ZERO_VALUE:
+    heads, width = int(num_heads), max(1, int(tp))
+    if heads <= 0 or heads % width != 0:
         raise ModelingError(f"attention_query_heads_not_divisible:{heads}%{width}")
     return heads // width
 
 
 def local_kv_heads(num_kv_heads: int, tp: int) -> int:
     """Per-rank KV heads with explicit replication when K < TP."""
-    heads, width = int(num_kv_heads), max(ONE_VALUE, int(tp))
-    if heads <= ZERO_VALUE:
+    heads, width = int(num_kv_heads), max(1, int(tp))
+    if heads <= 0:
         raise ModelingError(f"attention_kv_heads_invalid:{heads}")
     if heads >= width:
-        if heads % width != ZERO_VALUE:
+        if heads % width != 0:
             raise ModelingError(f"attention_kv_heads_not_divisible:{heads}%{width}")
         return heads // width
-    if width % heads != ZERO_VALUE:
+    if width % heads != 0:
         raise ModelingError(
             f"attention_kv_head_replication_indivisible:{width}%{heads}")
-    return ONE_VALUE
+    return 1
 
 
-ZERO_VALUE = 0
-ONE_VALUE = 1
 
 _CP_PLAN_ALIASES = {
     "auto": "auto",

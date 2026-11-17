@@ -38,9 +38,6 @@ from .communication import CommunicationWork, MessageFlow
 from .topology import (TransportOptions, chunk_count, chunk_size_at,
                        chunk_sizes)
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
 
 
 def resolve_transport_options(recipe, op):
@@ -413,10 +410,10 @@ class DirectMeshPhase:
     payload_bytes: float
     topology: object = field(repr=False, compare=False)
     phase: str = "peer_phase"
-    startup_ms: float = ZERO_FLOAT
+    startup_ms: float = 0.0
 
     def message_flows(self):
-        if not self.payload_bytes or len(self.ranks) <= ONE:
+        if not self.payload_bytes or len(self.ranks) <= 1:
             return
         for source in self.ranks:
             for destination in self.ranks:
@@ -429,7 +426,7 @@ class DirectMeshPhase:
 
     def start_participants(self, engine, name, ready_by_rank, *, owner=""):
         initial = _ready_by_rank(self.ranks, ready_by_rank)
-        if not self.payload_bytes or len(self.ranks) <= ONE:
+        if not self.payload_bytes or len(self.ranks) <= 1:
             return initial
         # One physical phase startup, paid once by the whole cohort.  Distinct
         # rank readiness stays a real dependency of that startup gate.
@@ -519,7 +516,7 @@ class DirectMeshPlanPhase:
             group.phase(self.phase).start(
                 engine, f"{name}:group{index}", ready, owner=owner)
             for index, group in enumerate(self.plan.groups)
-            if len(group.ranks) > ONE
+            if len(group.ranks) > 1
         ]
         if not parts:
             return ready
@@ -543,7 +540,7 @@ class DirectMeshPlan:
 
     @property
     def phase_names(self):
-        return (tuple(phase.phase for phase in self.groups[ZERO].phases)
+        return (tuple(phase.phase for phase in self.groups[0].phases)
                 if self.groups else ())
 
     def phase_program(self, name: str):
@@ -585,25 +582,25 @@ class DirectMeshPlan:
         """
         useful_by_rank, useful, wire = {}, {}, {}
         transactions, frames = {}, {}
-        messages, routed_useful, physical_wire = ZERO, ZERO_FLOAT, ZERO_FLOAT
-        max_path_latency = ZERO_FLOAT
+        messages, routed_useful, physical_wire = 0, 0.0, 0.0
+        max_path_latency = 0.0
         for group in self.groups:
             for rank, volume in group.volumes:
-                useful_by_rank[rank] = useful_by_rank.get(rank, ZERO_FLOAT) + volume
+                useful_by_rank[rank] = useful_by_rank.get(rank, 0.0) + volume
             for phase in group.phases:
                 for route in phase.routed_messages():
-                    messages += ONE
-                    path_latency = ZERO_FLOAT
+                    messages += 1
+                    path_latency = 0.0
                     for hop in route.hops:
                         routed_useful += hop.useful_bytes
                         physical_wire += hop.wire_bytes
                         useful[hop.resource] = (
-                            useful.get(hop.resource, ZERO_FLOAT) + hop.useful_bytes)
+                            useful.get(hop.resource, 0.0) + hop.useful_bytes)
                         wire[hop.resource] = (
-                            wire.get(hop.resource, ZERO_FLOAT) + hop.wire_bytes)
+                            wire.get(hop.resource, 0.0) + hop.wire_bytes)
                         transactions[hop.resource] = (
                             None if hop.transactions is None
-                            else transactions.get(hop.resource, ZERO)
+                            else transactions.get(hop.resource, 0)
                             + hop.transactions)
                         if hop.transaction_frame is not None:
                             frames[hop.resource] = hop.transaction_frame
@@ -611,7 +608,7 @@ class DirectMeshPlan:
                     max_path_latency = max(max_path_latency, path_latency)
         return CommunicationWork(
             useful_by_rank, useful, wire, transactions, frames, messages,
-            ZERO_FLOAT, routed_useful, physical_wire, max_path_latency)
+            0.0, routed_useful, physical_wire, max_path_latency)
 
     def wire_by_resource(self):
         return dict(self.accounting().wire_by_resource)
@@ -623,7 +620,7 @@ class DirectMeshPlan:
         for group in self.groups:
             for phase in group.phases:
                 for route in phase.routed_messages():
-                    if len(route.hops) != ONE:
+                    if len(route.hops) != 1:
                         raise ModelingError(
                             "direct_mesh_collective_requires_one_hop_peer")
 

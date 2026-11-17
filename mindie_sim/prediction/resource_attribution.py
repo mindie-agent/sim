@@ -36,10 +36,6 @@ from .roofline_graph import (
     physical_graph_order,
 )
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 DEFAULT_CUBE_COVER = 1.0
 DEFAULT_VECTOR_COVER = 1.0
 EXPOSURE_RECONCILE_FRACTION = 1e-3
@@ -69,22 +65,22 @@ def estimate_exposed_hbm(memory_ms: float, cube_ms: float, vector_ms: float, *,
                          vector_cover_fraction: float) -> float:
     """Return ``max(0, mem - eta_C*cube - eta_V*vector)`` without clipping inputs."""
     values = (memory_ms, cube_ms, vector_ms)
-    if any(not math.isfinite(value) or value < ZERO_FLOAT for value in values):
+    if any(not math.isfinite(value) or value < 0.0 for value in values):
         raise ModelingError("exposed_hbm_requires_nonnegative_finite_service")
     for name, value in (("cube_cover_fraction", cube_cover_fraction),
                         ("vector_cover_fraction", vector_cover_fraction)):
-        if not math.isfinite(value) or value < ZERO_FLOAT or value > ONE_FLOAT:
+        if not math.isfinite(value) or value < 0.0 or value > 1.0:
             raise ModelingError(f"exposed_hbm_cover_fraction_invalid:{name}")
     covered = (float(cube_cover_fraction) * float(cube_ms)
                + float(vector_cover_fraction) * float(vector_ms))
-    return max(ZERO_FLOAT, float(memory_ms) - covered)
+    return max(0.0, float(memory_ms) - covered)
 
 
 def join_clocks(terminal_clocks: Sequence[ExposedClocks]) -> ExposedClocks:
     """Componentwise maximum of terminal clocks; empty terminals are all zero."""
     clocks = tuple(terminal_clocks)
     if not clocks:
-        return ExposedClocks(ZERO_FLOAT, ZERO_FLOAT, ZERO_FLOAT, ZERO_FLOAT)
+        return ExposedClocks(0.0, 0.0, 0.0, 0.0)
     for clock in clocks:
         if not isinstance(clock, ExposedClocks):
             raise ModelingError("resource_attribution_clock_required")
@@ -124,7 +120,7 @@ def node_local_clocks(node: PhysicalWorkNode) -> ExposedClocks:
         memory_ms=node.service_ms("hbm"),
         communication_ms=node.service_ms("link"),
     )
-    control = max(ZERO_FLOAT, node.ideal_ms - service.all_ms)
+    control = max(0.0, node.ideal_ms - service.all_ms)
     return ExposedClocks(
         service.all_ms + control,
         service.without_communication_ms + control,
@@ -142,16 +138,16 @@ def _clock_order(nodes: Iterable[str],
         indegree[node_id] = len(predecessors.get(node_id, ()))
         for predecessor in predecessors.get(node_id, ()):
             successors[predecessor].append(node_id)
-    ready = [node_id for node_id in keys if indegree[node_id] == ZERO]
+    ready = [node_id for node_id in keys if indegree[node_id] == 0]
     order: list[str] = []
-    cursor = ZERO
+    cursor = 0
     while cursor < len(ready):
         node_id = ready[cursor]
-        cursor += ONE
+        cursor += 1
         order.append(node_id)
         for successor in successors[node_id]:
-            indegree[successor] -= ONE
-            if indegree[successor] == ZERO:
+            indegree[successor] -= 1
+            if indegree[successor] == 0:
                 ready.append(successor)
     if len(order) != len(keys):
         raise ModelingError("realized_clock_dag_cycle")
@@ -191,15 +187,15 @@ def realized_clock_dag(
         normalized[node_id] = tuple(selected)
     order = _clock_order(local_by_node, normalized)
     clocks: dict[str, ExposedClocks] = {}
-    successors = {node_id: ZERO for node_id in local_by_node}
+    successors = {node_id: 0 for node_id in local_by_node}
     for node_id in order:
         clocks[node_id] = advance_clocks(
             [clocks[predecessor] for predecessor in normalized[node_id]],
             local_by_node[node_id])
         for predecessor in normalized[node_id]:
-            successors[predecessor] += ONE
+            successors[predecessor] += 1
     terminals = [clocks[node_id] for node_id in order
-                 if successors[node_id] == ZERO]
+                 if successors[node_id] == 0]
     return clocks, join_clocks(terminals)
 
 
@@ -217,21 +213,21 @@ def fixed_plan_exposure(plan: PhysicalWorkGraph) -> Mapping[str, object]:
         baseline[node_id] = node.ideal_ms + max(
             (baseline[predecessor]
              for predecessor in predecessors.get(node_id, ())),
-            default=ZERO_FLOAT)
+            default=0.0)
         zero_own = float(node.occurrences) * max(
             node.launch_ms,
             node.fixed_ms + max(node.cube_ms, node.vector_ms, node.link_ms))
         zero_hbm[node_id] = zero_own + max(
             (zero_hbm[predecessor]
              for predecessor in predecessors.get(node_id, ())),
-            default=ZERO_FLOAT)
-    baseline_span = max(baseline.values(), default=ZERO_FLOAT)
-    zero_span = max(zero_hbm.values(), default=ZERO_FLOAT)
+            default=0.0)
+    baseline_span = max(baseline.values(), default=0.0)
+    zero_span = max(zero_hbm.values(), default=0.0)
     delta = exposed_hbm_delta_ms(baseline_span, zero_span)
     return {
         "baseline_ms": baseline_span,
         "zero_hbm_service_ms": zero_span,
-        "delta_h_ms": (delta if delta is not None else ZERO_FLOAT),
+        "delta_h_ms": (delta if delta is not None else 0.0),
         "available": delta is not None,
         "basis": "same_plan_same_dependencies_zero_hbm_service",
     }
@@ -253,7 +249,7 @@ def exposed_hbm_delta_ms(baseline_ms, zero_hbm_ms) -> float | None:
             number = float(value)
         except (TypeError, ValueError):
             return None
-        if not math.isfinite(number) or number < ZERO_FLOAT:
+        if not math.isfinite(number) or number < 0.0:
             return None
         numbers.append(number)
     baseline, zero = numbers
@@ -261,7 +257,7 @@ def exposed_hbm_delta_ms(baseline_ms, zero_hbm_ms) -> float | None:
                     EXPOSURE_RECONCILE_FRACTION * max(baseline, zero))
     if zero > baseline + tolerance:
         return None
-    return max(ZERO_FLOAT, baseline - zero)
+    return max(0.0, baseline - zero)
 
 
 def attribute_stage_dag(
@@ -291,7 +287,7 @@ def attribute_stage_dag(
         except (TypeError, ValueError):
             raise ModelingError(
                 "attribute_stage_dag_duration_invalid") from None
-        if not math.isfinite(span) or span < ZERO_FLOAT:
+        if not math.isfinite(span) or span < 0.0:
             raise ModelingError("attribute_stage_dag_duration_invalid")
         available = _boundary_reconciles(modeled_span, span)
         evidence = "executed"
@@ -325,7 +321,7 @@ def attribute_stage_dag(
             basis="unavailable_service_clock_boundary")
         return result
     control_ms = math.fsum(
-        max(ZERO_FLOAT,
+        max(0.0,
             node.ideal_ms - max(node.service_ms(resource)
                                 for resource in RESOURCES))
         for node in plan.nodes)
@@ -346,7 +342,7 @@ def attribute_stage_dag(
         "link": {"service_ms": service["link"],
                  "exposed_ms": values["communication"]},
         "control": {
-            "launch_or_idle_ms": max(ZERO_FLOAT, span - modeled_span),
+            "launch_or_idle_ms": max(0.0, span - modeled_span),
             "fixed_or_launch_service_ms": control_ms,
         },
     }
@@ -373,15 +369,15 @@ def attribute_resource_exposure(report: Mapping[str, object],
     if not isinstance(plan, PhysicalWorkGraph):
         raise ModelingError("resource_attribution_requires_physical_graph")
     span_raw = report.get("graph_duration_ms",
-                          report.get("duration_ms", ZERO_FLOAT))
+                          report.get("duration_ms", 0.0))
     try:
-        span = float(span_raw or ZERO_FLOAT)
+        span = float(span_raw or 0.0)
     except (TypeError, ValueError):
         raise ModelingError(
             "resource_attribution_duration_invalid") from None
-    if not math.isfinite(span) or span < ZERO_FLOAT:
+    if not math.isfinite(span) or span < 0.0:
         raise ModelingError("resource_attribution_duration_invalid")
-    if span <= ZERO_FLOAT:
+    if span <= 0.0:
         return {
             "available": False,
             "buckets": None,
@@ -408,10 +404,10 @@ def attribute_resource_exposure(report: Mapping[str, object],
             "basis": "unavailable_unreconciled_execution_boundary",
         }
     logical = float(report.get("logical_hbm_bytes",
-                               report.get("hbm_bytes", ZERO_FLOAT))
-                    or ZERO_FLOAT)
-    physical = float(report.get("hbm_bytes", ZERO_FLOAT) or ZERO_FLOAT)
-    l2_hit = float(report.get("l2_hit_bytes", ZERO_FLOAT) or ZERO_FLOAT)
+                               report.get("hbm_bytes", 0.0))
+                    or 0.0)
+    physical = float(report.get("hbm_bytes", 0.0) or 0.0)
+    l2_hit = float(report.get("l2_hit_bytes", 0.0) or 0.0)
     buckets = dict(attribution["buckets"])
     buckets["hbm"] = {
         "logical_bytes": logical,

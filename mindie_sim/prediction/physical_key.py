@@ -108,8 +108,6 @@ IDENTITY_FIELDS = (
     "layout",
 )
 OPTIONAL_IDENTITY_FIELDS = ("returns", "source_boundary")
-ZERO = 0
-ONE = 1
 ASCII = "utf-8"
 
 
@@ -145,7 +143,7 @@ def normalize_graph_value(value: Any, stage: int, layer: int) -> Any:
         return tuple(sorted(
             ((str(key), normalize_graph_value(item, stage, layer))
              for key, item in value.items()),
-            key=lambda item: item[ZERO]))
+            key=lambda item: item[0]))
     if isinstance(value, (list, tuple)):
         return tuple(normalize_graph_value(item, stage, layer) for item in value)
     if isinstance(value, (set, frozenset)):
@@ -171,7 +169,7 @@ def _relative_state_accesses(value: Any, stage: int, layer: int) -> Any:
                 row[key] = int(leaf) - int(layer)
             else:
                 row[key] = normalize_graph_value(leaf, stage, layer)
-        entries.append(tuple(sorted(row.items(), key=lambda pair: str(pair[ZERO]))))
+        entries.append(tuple(sorted(row.items(), key=lambda pair: str(pair[0]))))
     return tuple(entries)
 
 
@@ -189,7 +187,7 @@ def _normalized_metadata(metadata: Any, stage: int, layer: int) -> tuple:
             normalized.append((name, normalize_graph_value(value, stage, layer)))
         else:
             normalized.append((name, _hashable(value)))
-    return tuple(sorted(normalized, key=lambda item: item[ZERO]))
+    return tuple(sorted(normalized, key=lambda item: item[0]))
 
 
 def _hashable(value: Any) -> Any:
@@ -197,7 +195,7 @@ def _hashable(value: Any) -> Any:
     if isinstance(value, Mapping):
         return tuple(sorted(((str(key), _hashable(item))
                              for key, item in value.items()),
-                            key=lambda item: item[ZERO]))
+                            key=lambda item: item[0]))
     if isinstance(value, (list, tuple)):
         return tuple(_hashable(item) for item in value)
     if isinstance(value, (set, frozenset)):
@@ -205,9 +203,21 @@ def _hashable(value: Any) -> Any:
     return value
 
 
+_METADATA_MEMO: dict[tuple[int, int, int], tuple[Any, tuple]] = {}
+_METADATA_MEMO_LIMIT = 8192
+
+
 def operator_metadata_key(metadata: Any, stage: int, layer: int) -> tuple:
     """Canonical hashable projection of one operator's metadata."""
-    return _normalized_metadata(metadata, stage, layer)
+    identity = (id(metadata), int(stage), int(layer))
+    hit = _METADATA_MEMO.get(identity)
+    if hit is not None and hit[0] is metadata:
+        return hit[1]
+    value = _normalized_metadata(metadata, stage, layer)
+    if len(_METADATA_MEMO) >= _METADATA_MEMO_LIMIT:
+        _METADATA_MEMO.clear()
+    _METADATA_MEMO[identity] = (metadata, value)
+    return value
 
 
 def physical_key(op: Any) -> tuple:
@@ -232,9 +242,21 @@ def canonical_json(key: Any) -> str:
                       ensure_ascii=False, allow_nan=False)
 
 
+_SIGNATURE_MEMO: dict[int, tuple[Any, str]] = {}
+_SIGNATURE_MEMO_LIMIT = 4096
+
+
 def physical_signature(op: Any) -> str:
-    """Deterministic serialization of the physical key."""
-    return canonical_json(physical_key(op))
+    """Deterministic serialization of the physical key (identity-guarded memo)."""
+    identity = id(op)
+    hit = _SIGNATURE_MEMO.get(identity)
+    if hit is not None and hit[0] is op:
+        return hit[1]
+    value = canonical_json(physical_key(op))
+    if len(_SIGNATURE_MEMO) >= _SIGNATURE_MEMO_LIMIT:
+        _SIGNATURE_MEMO.clear()
+    _SIGNATURE_MEMO[identity] = (op, value)
+    return value
 
 
 def physical_id(op: Any) -> str:

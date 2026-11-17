@@ -17,10 +17,6 @@ from typing import Mapping
 from .common import ModelingError
 
 
-ZERO = 0
-ONE = 1
-FIRST = 0
-SECOND = 1
 PAIR_LEN = 2
 TRIPLE_LEN = 3
 DEFAULT_CACHE_LINE_BYTES = 128
@@ -51,14 +47,14 @@ def _frozen_mapping(value) -> Mapping:
 
 
 def _positive_int(value, name: str) -> int:
-    if isinstance(value, bool) or int(value) < ONE:
+    if isinstance(value, bool) or int(value) < 1:
         raise ModelingError(f"physical_mechanism_positive_integer_required:{name}")
     return int(value)
 
 
 def _fraction(value, name: str) -> float:
     parsed = float(value)
-    if parsed <= ZERO or parsed > ONE:
+    if parsed <= 0 or parsed > 1:
         raise ModelingError(f"physical_mechanism_fraction_invalid:{name}")
     return parsed
 
@@ -68,7 +64,7 @@ def _pairs(value, name: str) -> tuple[tuple[int, int], ...]:
     for item in value:
         if len(item) != PAIR_LEN:
             raise ModelingError(f"physical_mechanism_pair_required:{name}")
-        result.append((_positive_int(item[FIRST], name), _positive_int(item[SECOND], name)))
+        result.append((_positive_int(item[0], name), _positive_int(item[1], name)))
     if not result:
         raise ModelingError(f"physical_mechanism_pair_list_empty:{name}")
     return tuple(result)
@@ -95,7 +91,7 @@ class MemoryHierarchySpec:
 
     def __post_init__(self):
         object.__setattr__(self, "l2_capacity_bytes",
-                           max(ZERO, int(self.l2_capacity_bytes)))
+                           max(0, int(self.l2_capacity_bytes)))
         object.__setattr__(self, "cache_line_bytes",
                            _positive_int(self.cache_line_bytes, "cache_line_bytes"))
         object.__setattr__(self, "l2_effective_fraction",
@@ -217,11 +213,11 @@ class PhysicalMechanismSpec:
         }
 
 
-def default_physical_mechanisms(*, l2_capacity_bytes: int = ZERO) -> PhysicalMechanismSpec:
+def default_physical_mechanisms(*, l2_capacity_bytes: int = 0) -> PhysicalMechanismSpec:
     """Conservative declaration for a legacy profile without typed mechanisms."""
     return PhysicalMechanismSpec(
         MemoryHierarchySpec(
-            l2_capacity_bytes=max(ZERO, int(l2_capacity_bytes)),
+            l2_capacity_bytes=max(0, int(l2_capacity_bytes)),
             l2_effective_fraction=DEFAULT_L2_EFFECTIVE_FRACTION,
             cache_line_bytes=DEFAULT_CACHE_LINE_BYTES,
             write_allocate=True,
@@ -247,7 +243,7 @@ def _pairs_from(value, default):
     return tuple(tuple(item) for item in value)
 
 
-def parse_physical_mechanisms(value, *, fallback_l2_bytes: int = ZERO) -> PhysicalMechanismSpec:
+def parse_physical_mechanisms(value, *, fallback_l2_bytes: int = 0) -> PhysicalMechanismSpec:
     """Parse one device declaration, retaining strict typed validation."""
     if value is None:
         return default_physical_mechanisms(l2_capacity_bytes=fallback_l2_bytes)

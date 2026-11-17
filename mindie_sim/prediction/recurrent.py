@@ -43,6 +43,9 @@ def _serving_kda_source(runtime, model, views, plan):
     from .kda_source import resolve
     if runtime is None:
         return None
+    parallel = getattr(runtime, "parallel", None)
+    if int(getattr(parallel, "cp", 1) or 1) > 1:
+        return None
     opts = resolve(plan, arch=dict(runtime.metadata).get("arch_family"),
                    phase=(views[0].phase if views else ""), kernels=runtime.kernels,
                    activation_dtype=model.activation_dtype, views=views)

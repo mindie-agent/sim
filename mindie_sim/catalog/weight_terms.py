@@ -13,7 +13,6 @@ from mindie_sim.catalog.types import QuantSpec
 ZERO = 0
 ONE = 1
 FIRST = 0
-ZERO_FLOAT = 0.0
 NODE_RANKS_DEFAULT = 1
 
 
@@ -124,9 +123,9 @@ def term_bytes(
     node_ranks: int = NODE_RANKS_DEFAULT, *, source: bool = False,
 ) -> float:
     if source and not term.source_owned:
-        return ZERO_FLOAT
+        return 0.0
     if not source and not term.runtime_owned:
-        return ZERO_FLOAT
+        return 0.0
     rows, cols, count = _sharded_shape(term, parallel, node_ranks)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)
@@ -141,9 +140,9 @@ def term_payload_bytes(
 ) -> float:
     """Packed payload bytes of one term (quant scales/zero-points excluded)."""
     if source and not term.source_owned:
-        return ZERO_FLOAT
+        return 0.0
     if not source and not term.runtime_owned:
-        return ZERO_FLOAT
+        return 0.0
     rows, cols, count = _sharded_shape(term, parallel, node_ranks)
     if not source and term.runtime_dtype:
         return float(rows * cols * count) * dtype_bytes(term.runtime_dtype)

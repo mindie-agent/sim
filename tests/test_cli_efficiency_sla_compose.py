@@ -544,10 +544,8 @@ def test_feature_superposition_pp_pcp_mc2_dspark_mtp_sp() -> None:
                and "norm1" in op.op_id][0]
     no_norm = [op for op in ops_no if op.layer == 0 and op.recipe == "rmsnorm"
                and "norm1" in op.op_id][0]
-    sp_residual = [op for op in ops_sp if op.layer == 0
-                   and op.recipe == "residual_add"][0]
-    no_residual = [op for op in ops_no if op.layer == 0
-                   and op.recipe == "residual_add"][0]
+    sp_residual = [op for op in ops_sp if op.recipe == "residual_add"][0]
+    no_residual = [op for op in ops_no if op.recipe == "residual_add"][0]
     assert sp_norm.local_shape[0] * tp53 == no_norm.local_shape[0]
     assert sp_norm.vector_ops * tp53 == pytest.approx(no_norm.vector_ops, rel=1e-12)
     assert sp_residual.vector_ops * tp53 == pytest.approx(no_residual.vector_ops,

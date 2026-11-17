@@ -7,17 +7,15 @@
 [Side-Effect Policy] Appends only to the caller-owned operator list.
 """
 from mindie_sim.catalog.ops import gemm_op, vector_op, cache_store_op, barrier_op
+from mindie_sim.schema.common import dtype_bytes
 
-ONE = 1
-ZERO = 0
-TWO = 2
 NORM_OPS = 5
 ROPE_OPS = 6
 
 
 def prepare(ops, *, projection, model, draft, rows, query_rows,
             prefix, stage, requests):
-    common = dict(stage=stage, layer=-ONE, requests=requests, phase="draft")
+    common = dict(stage=stage, layer=-1, requests=requests, phase="draft")
     norm = vector_op(
         op_id=prefix + "context_norm", deps=(projection.op_id,),
         elements=rows * draft.hidden_size, ops_per_element=NORM_OPS,
@@ -36,7 +34,7 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
         # Source .contiguous() copies the KV suffix out of fused QKV-A.
         copied = vector_op(
             op_id=name + ".kv_copy", deps=(qkv.op_id,),
-            elements=rows * kv_width, ops_per_element=ZERO,
+            elements=rows * kv_width, ops_per_element=0,
             dtype="bf16", family="elementwise", recipe="draft_context_kv_copy",
             **layer_common)
         normalized = vector_op(
@@ -49,15 +47,17 @@ def prepare(ops, *, projection, model, draft, rows, query_rows,
             elements=rows * draft.qk_rope_head_dim, ops_per_element=ROPE_OPS,
             dtype="bf16", family="rotary", recipe="draft_context_rope",
             **layer_common)
+        kv_dtype = str(getattr(model, "kv_dtype", "") or "bf16")
         stored = cache_store_op(
             op_id=name + ".store", deps=(rotary.op_id,), rows=rows,
-            row_bytes=kv_width * TWO, dtype="bf16", kind="draft_context",
+            row_bytes=int(kv_width * dtype_bytes(kv_dtype)), dtype=kv_dtype,
+            kind="draft_context",
             recipe="draft_context_store", **layer_common)
         ops.extend((qkv, copied, normalized, rotary, stored))
         stores.append(stored.op_id)
     embedding = vector_op(
         op_id=prefix + "query_embedding", deps=(), elements=query_rows * draft.hidden_size,
-        ops_per_element=ZERO, dtype="bf16", family="embedding",
+        ops_per_element=0, dtype="bf16", family="embedding",
         recipe="draft_query_embedding", **common)
     ready = barrier_op(
         op_id=prefix + "context_query_ready", deps=(*stores, embedding.op_id),

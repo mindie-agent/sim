@@ -16,8 +16,6 @@ from dataclasses import dataclass
 from .physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 PRODUCTS_SHARE = 0.45
 WY_SHARE = 0.25
 INVERSE_SHARE = 0.20
@@ -50,7 +48,7 @@ class ChunkedLinearAttentionRecipe:
         phases = (
             Phase("chunk_load", {
                 IO_HBM_CATEGORY: read_share,
-                "mte2": ONE_FLOAT,
+                "mte2": 1.0,
             }),
             Phase("chunk_products", {
                 "cube": PRODUCTS_SHARE,
@@ -70,7 +68,7 @@ class ChunkedLinearAttentionRecipe:
                 "cube": OUTPUT_SHARE,
                 "vector": OUTPUT_VECTOR_SHARE,
                 IO_HBM_CATEGORY: write_share,
-                "mte3": ONE_FLOAT,
+                "mte3": 1.0,
             }, after=("recurrent_state",)),
         )
         return tiled_phased_program(

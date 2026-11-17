@@ -54,8 +54,13 @@ from .prediction.speculation import compute_speculative_accept_step
 from .sweep import (
     compute_pareto_frontier,
     enumerate_parallel_candidates,
+    reconstruct_sweep_summary,
+    solve_hardware_sla_throughput,
     sweep_pd_disaggregation_ratios,
     sweep_topologies,
+    sweep_topologies_iter,
+    sweep_topology_grid,
+    sweep_topology_grid_iter,
 )
 from .public import (
     CORE_PROVIDER,
@@ -98,6 +103,9 @@ __all__ = [
     "analyze_shared_expert_overlap", "OffloadPolicy",
     "compute_speculative_accept_step",
     "enumerate_parallel_candidates", "sweep_topologies",
+    "sweep_topology_grid", "sweep_topologies_iter",
+    "sweep_topology_grid_iter", "reconstruct_sweep_summary",
+    "solve_hardware_sla_throughput",
     "sweep_pd_disaggregation_ratios", "compute_pareto_frontier",
     "CORE_PROVIDER", "ENTRY_POINT_GROUP", "INTERFACE_VERSION",
     "ExecutionEnvironment", "USER_PROFILE_SCHEMA",

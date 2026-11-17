@@ -33,6 +33,10 @@ def _align(value, multiple):
     return math.ceil(value / multiple) * multiple
 
 
+UB_ALIGN_BYTES = 32
+EXPERT_STATUS_RECORD_BYTES = UB_ALIGN_BYTES
+
+
 @dataclass(frozen=True)
 class RowLayout:
     width: int

@@ -22,8 +22,6 @@ from mindie_sim.schema.case import Case as CaseSpec
 from .primitives import PrimitiveKey, PrimitiveStore, PrimitiveTiming
 
 MAX_RECORDED_MAPPINGS = 32
-ZERO = 0
-ZERO_FLOAT = 0.0
 MATRIX_FLOPS_REL_TOL = 1e-9
 
 
@@ -157,7 +155,7 @@ class CostLedger:
         self.diagnostic_primitive_hits = 0
 
     def account(self, basis: str) -> None:
-        self.counts[basis] = self.counts.get(basis, ZERO) + COUNT_STEP
+        self.counts[basis] = self.counts.get(basis, 0) + COUNT_STEP
 
     def summary(self, model: "CostModel") -> dict[str, Any]:
         return model.summary(self)
@@ -293,9 +291,9 @@ class CostModel:
 
     def price(self, op: OpSpec, replay_scope: str, *, ledger: CostLedger | None = None) -> OpCost:
         matrix_sum = (sum(float(value) for _, value in op.matrix_flops)
-                      if op.matrix_flops else ZERO_FLOAT)
+                      if op.matrix_flops else 0.0)
         declared_flops = float(op.flops)
-        if (op.matrix_flops and declared_flops > ZERO_FLOAT
+        if (op.matrix_flops and declared_flops > 0.0
                 and not math.isclose(matrix_sum, declared_flops,
                                      rel_tol=MATRIX_FLOPS_REL_TOL)):
             raise ValueError("matrix_precision_work_must_sum_to_operator_flops")
@@ -310,7 +308,7 @@ class CostModel:
             if value:
                 work[resource] = value
         for resource, amount in dict(metadata.get("resource_work", {})).items():
-            if resource == "cube" and cube_flops > ZERO_FLOAT:
+            if resource == "cube" and cube_flops > 0.0:
                 continue
             work[resource] = work.get(resource, 0) + amount
         result = OpCost(op, None, {k: float(v) for k, v in work.items() if v})
@@ -327,7 +325,7 @@ class CostModel:
                 "work_unit": curve.work_unit, "identity": data["identity"],
                 "boundary": curve.boundary, "active_units": curve.active_units,
                 "provenance": data["provenance"], "queries": {},
-                "capacity_limited_queries": ZERO,
+                "capacity_limited_queries": 0,
             }
         record = services[curve.model_id]
         record["queries"][basis] = record["queries"].get(basis, 0) + 1
@@ -350,7 +348,7 @@ class CostModel:
         key = record["id"]
         invocations = ledger.invocations
         if key not in invocations:
-            invocations[key] = {**record, "invocations": ZERO}
+            invocations[key] = {**record, "invocations": 0}
         invocations[key]["invocations"] += COUNT_STEP
 
     def record_regime(self, model, key, basis, *, duration_us=None, coordinate_values=None,
@@ -405,11 +403,11 @@ class CostModel:
         counts = ledger.counts
         counts[reference_cost.basis] -= COUNT_STEP
         counts["joint_native_service"] = counts.get(
-            "joint_native_service", ZERO) + COUNT_STEP
+            "joint_native_service", 0) + COUNT_STEP
         key = declaration["native_kernel"], declaration["resource"]
         row = ledger.joint_native.setdefault(key, {
-            **declaration, "invocations": ZERO, "analytical_reference_work": {},
-            "replaced_primitive_count": ZERO,
+            **declaration, "invocations": 0, "analytical_reference_work": {},
+            "replaced_primitive_count": 0,
             "execution_basis": "declared_joint_native_service_queue",
             "unmodeled": ["internal_resource_occupancy", "internal_buffer_occupancy"]})
         row["invocations"] += 1

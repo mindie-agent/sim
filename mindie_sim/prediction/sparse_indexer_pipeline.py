@@ -17,8 +17,6 @@ from dataclasses import dataclass
 from .physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, tiled_phased_program)
 
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 QUERY_LOAD_SHARE = 0.30
 KEY_LOAD_SHARE = 0.70
 SCORE_CUBE_SHARE = 1.0
@@ -52,7 +50,7 @@ class TiledSparseIndexerRecipe:
                   after=("query_load", "key_load")),
             Phase("topk_update", {"vector": TOPK_VECTOR_SHARE},
                   after=("score",)),
-            Phase("store", {IO_HBM_CATEGORY: write_share, "mte3": ONE_FLOAT},
+            Phase("store", {IO_HBM_CATEGORY: write_share, "mte3": 1.0},
                   after=("topk_update",)),
         )
         return tiled_phased_program(

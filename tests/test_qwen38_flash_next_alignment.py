@@ -75,10 +75,14 @@ def test_qwen38_flash_next_ple_weights_sharding_quant_offload_and_text_only():
     lm_only_cfg = json.loads(json.dumps(raw_cfg))
     lm_only_cfg["language_model_only"] = True
 
-    int8_m = parse_case(compose_case(int8_cfg, hardware="a3", tp=8, ep=8, num_devices=8)).model
-    mxfp8_m = parse_case(compose_case(mxfp8_cfg, hardware="a5", tp=8, ep=8, num_devices=8)).model
-    lm_only_m = parse_case(compose_case(lm_only_cfg, hardware="a3", tp=8, ep=8, num_devices=8)).model
-    base_m = parse_case(compose_case("qwen3.8-flash-next", hardware="a3", tp=8, ep=8, num_devices=8)).model
+    int8_m = parse_case(compose_case(int8_cfg, hardware="a3", tp=8, ep=8, num_devices=8,
+                                  va_recommended=False)).model
+    mxfp8_m = parse_case(compose_case(mxfp8_cfg, hardware="a5", tp=8, ep=8, num_devices=8,
+                                  va_recommended=False)).model
+    lm_only_m = parse_case(compose_case(lm_only_cfg, hardware="a3", tp=8, ep=8, num_devices=8,
+                                  va_recommended=False)).model
+    base_m = parse_case(compose_case("qwen3.8-flash-next", hardware="a3", tp=8, ep=8,
+                                  num_devices=8, va_recommended=False)).model
 
     w_base = stage_weight_bytes(base_m, ParallelSpec(tp=8, ep=8))[0]
     w_int8 = stage_weight_bytes(int8_m, ParallelSpec(tp=8, ep=8))[0]

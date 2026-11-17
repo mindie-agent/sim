@@ -19,9 +19,6 @@ from mindie_sim.schema.common import ModelingError
 from .matrix_mapping import matrix_geometry
 from .program import KernelProgram, ParallelProgram, Stage
 
-ZERO = 0
-ONE = 1
-SECOND = 1
 FP32_BYTES = 4
 MS_PER_SECOND = 1000
 DRAM_SERVICE_MODE = "mte2_aic_dram"
@@ -47,7 +44,7 @@ def _local_geometry(context, recipe, geometry):
         areas = []
         for count, _m_extent, _n_extent, area in geometry.owners:
             count = int(count)
-            if count < ONE or area <= ZERO:
+            if count < 1 or area <= 0:
                 continue
             share = float(area) / float(count)
             areas.extend([share] * count)
@@ -57,24 +54,24 @@ def _local_geometry(context, recipe, geometry):
         raise ModelingError("split_k_requires_three_local_dimensions")
     total_m, n, k = local[-LOCAL_SHAPE_DIMS:]
     area = float(total_m) * float(n)
-    return float(total_m), float(n), float(k), ([area] if area > ZERO else [])
+    return float(total_m), float(n), float(k), ([area] if area > 0 else [])
 
 
 def _k_slices(k: float, count: int) -> tuple[int, ...]:
     """Disjoint integer K slices whose sum is exactly ``K``."""
-    total = max(ZERO, int(k))
-    parts = max(ONE, int(count))
+    total = max(0, int(k))
+    parts = max(1, int(count))
     base, extra = divmod(total, parts)
-    slices = tuple(base + (ONE if index < extra else ZERO)
+    slices = tuple(base + (1 if index < extra else 0)
                    for index in range(parts))
-    return tuple(value for value in slices if value > ZERO)
+    return tuple(value for value in slices if value > 0)
 
 
 def _allocate(total: float, weights: list[float]) -> list[float]:
     """Allocate ``total`` by weight with the final share closing any rounding."""
     if not weights:
         return []
-    shares = [float(total) * weight for weight in weights[:-ONE]]
+    shares = [float(total) * weight for weight in weights[:-1]]
     shares.append(float(total) - sum(shares))
     return shares
 
@@ -83,9 +80,9 @@ def _per_owner_cap(context, owners: int) -> dict[str, float]:
     """Service-mode bytes/second as a bytes/ms cap for one active owner."""
     mode = dict(context.service_modes).get(DRAM_SERVICE_MODE)
     hbm = context.resource_names.get("hbm")
-    if not mode or hbm is None or owners < ONE:
+    if not mode or hbm is None or owners < 1:
         return {}
-    rate = float(mode[SECOND]) / (MS_PER_SECOND * float(int(owners)))
+    rate = float(mode[1]) / (MS_PER_SECOND * float(int(owners)))
     return {hbm: rate}
 
 
@@ -99,13 +96,13 @@ def _tile_merge_program(context, names, area: float, vector_share,
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
     stages = []
     predecessor = ()
-    if hbm is not None and partial_read > ZERO:
+    if hbm is not None and partial_read > 0:
         stages.append(Stage("partial_read", {hbm: partial_read}, caps=caps))
         predecessor = ("partial_read",)
     merged = {}
     if vector is not None:
-        amount = vector_share + float(area) * float(merges - ONE)
-        if amount > ZERO:
+        amount = vector_share + float(area) * float(merges - 1)
+        if amount > 0:
             merged[vector] = amount
     if merged:
         stages.append(Stage("reduce", merged, after=predecessor,
@@ -113,9 +110,9 @@ def _tile_merge_program(context, names, area: float, vector_share,
                                                  ("vector",))))
         predecessor = ("reduce",)
     store = {}
-    if mte3 is not None and mte3_share > ZERO:
+    if mte3 is not None and mte3_share > 0:
         store[mte3] = mte3_share
-    if hbm is not None and hbm_write_share > ZERO:
+    if hbm is not None and hbm_write_share > 0:
         store[hbm] = hbm_write_share
     if store:
         stages.append(Stage("final_store", store, after=predecessor, caps=caps,
@@ -140,13 +137,13 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
             "partial_read_bytes": float(partial_bytes),
             "final_write_bytes": float(final_write),
             "merge_vector_ops": float(vector_merge),
-            "merge_latency_ms": ZERO,
+            "merge_latency_ms": 0,
             "declared_cube_work": float(cube_total),
             "issued_cube_work": float(cube_total),
             "issued_hbm_work": float(declared_hbm + partial_bytes + partial_bytes),
             "issued_vector_work": float(issued_vector),
             "tasks": len(tasks),
-            "output_tiles": int(len(tasks) // max(ONE, len(slices))),
+            "output_tiles": int(len(tasks) // max(1, len(slices))),
             "basis": "explicit_gm_fp32_partials_dp4",
         },
     })
@@ -155,7 +152,7 @@ def _record_traffic(record, *, split_count, slices, tasks, partial_bytes,
 def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
                    record=None) -> KernelProgram:
     """Lower one underfilled output grid onto output-tile x K-slice tasks."""
-    count = max(ONE, int(split_count))
+    count = max(1, int(split_count))
     names = context.resource_names
     hbm, vector, mte3 = names.get("hbm"), names.get("vector"), names.get("mte3")
     cube = names.get("cube")
@@ -166,40 +163,40 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
     slices = _k_slices(k, count)
     volume = total_m * n * k
     tasks, weights = [], []
-    if volume > ZERO:
+    if volume > 0:
         for tile_index, area in enumerate(areas):
             for k_slice in slices:
                 weight = area * float(k_slice) / volume
-                if weight > ZERO:
+                if weight > 0:
                     tasks.append((tile_index, area, float(k_slice)))
                     weights.append(weight)
     if not tasks:
         return KernelProgram((Stage("setup", latency=context.setup_ms),),
                              minimum_ms=context.minimum_ms)
-    cores = max(ONE, int(context.core_count))
+    cores = max(1, int(context.core_count))
     splits = len(slices)
     split_keys = _split_keys(context, hbm, vector, mte3, cube)
-    hbm_total = float(context.work.get(hbm, ZERO)) if hbm is not None else ZERO
-    mte3_total = float(context.work.get(mte3, ZERO)) if mte3 is not None else ZERO
+    hbm_total = float(context.work.get(hbm, 0)) if hbm is not None else 0
+    mte3_total = float(context.work.get(mte3, 0)) if mte3 is not None else 0
     hbm_write = min(hbm_total, mte3_total)
-    hbm_read = max(ZERO, hbm_total - hbm_write)
-    cube_total = float(context.work.get(cube, ZERO)) if cube is not None else ZERO
-    vector_total = (float(context.work.get(vector, ZERO))
-                    if vector is not None else ZERO)
+    hbm_read = max(0, hbm_total - hbm_write)
+    cube_total = float(context.work.get(cube, 0)) if cube is not None else 0
+    vector_total = (float(context.work.get(vector, 0))
+                    if vector is not None else 0)
     loads = [{} for _ in tasks]
     for key, value in split_keys.items():
         for index, share in enumerate(_allocate(value, weights)):
-            if share > ZERO:
+            if share > 0:
                 loads[index][key] = share
-    if hbm is not None and hbm_read > ZERO:
+    if hbm is not None and hbm_read > 0:
         for index, share in enumerate(_allocate(hbm_read, weights)):
-            if share > ZERO:
-                loads[index][hbm] = loads[index].get(hbm, ZERO) + share
+            if share > 0:
+                loads[index][hbm] = loads[index].get(hbm, 0) + share
     cubes = _allocate(cube_total, weights)
     partial_write = (float(FP32_BYTES) * float(splits) * total_m * n
-                     if hbm is not None else ZERO)
-    vector_merge = (float(splits - ONE) * total_m * n
-                    if vector is not None else ZERO)
+                     if hbm is not None else 0)
+    vector_merge = (float(splits - 1) * total_m * n
+                    if vector is not None else 0)
     split_caps = _per_owner_cap(context, len(tasks))
     merge_caps = _per_owner_cap(context, len(areas))
     load_roles = tuple(role for role in ("mte1", "mte2_aic", "mte2")
@@ -212,17 +209,17 @@ def splitk_program(context, split_count: int, *, recipe=None, geometry=None,
                         caps=(split_caps if loads[index] else {}),
                         placement=_placement(context, index, cores, load_roles))]
         predecessor = "load"
-        if cube is not None and cubes[index] > ZERO:
+        if cube is not None and cubes[index] > 0:
             stages.append(Stage("mma", {cube: cubes[index]}, after=(predecessor,),
                                 placement=_placement(context, index, cores, mma_roles)))
             predecessor = "mma"
-        if hbm is not None and area > ZERO:
+        if hbm is not None and area > 0:
             write = float(FP32_BYTES) * area
             stages.append(Stage("partial_write", {hbm: write},
                                 after=(predecessor,), caps=split_caps))
         return KernelProgram(tuple(stages))
 
-    tile_areas = [areas[tile] for tile in sorted({task[ZERO] for task in tasks})]
+    tile_areas = [areas[tile] for tile in sorted({task[0] for task in tasks})]
     tile_weights = [area / (total_m * n) for area in tile_areas]
     vector_shares = _allocate(vector_total, tile_weights)
     mte3_shares = _allocate(mte3_total, tile_weights)

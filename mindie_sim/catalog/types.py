@@ -37,8 +37,6 @@ from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 ZERO = 0
 ZERO_MHC_LOWRANK = ZERO
-ZERO_VALUE = 0
-ONE_VALUE = 1
 
 _FP32_CATEGORIES = {
     "param_fp32", "mhc", "ape", "conv_weight_f32", "a_log", "dt_bias",
@@ -611,11 +609,11 @@ class DraftSpec:
     layer_plans: tuple[Any, ...] = ()
     execution_mode: str = "stack"
     input_application: str = "per_proposal"
-    input_count: int = ONE_VALUE
+    input_count: int = 1
     embedding_owned: bool = False
-    embedding_count: int = ZERO_VALUE
+    embedding_count: int = 0
     output_head_owned: bool = False
-    output_head_count: int = ZERO_VALUE
+    output_head_count: int = 0
     source: tuple[tuple[str, str], ...] = ()
     notes: tuple[str, ...] = ()
 

@@ -15,9 +15,7 @@ from mindie_sim.schema.parallel import ParallelSpec
 
 ZERO = 0
 ONE = 1
-TWO = 2
 #: ``WeightTerm.groups``/``units``/``unit_width`` for a term with no grouping.
-NONE = 0
 
 def _local_draft_experts(num_experts: int, ep: int) -> int:
     """Experts held on one EP rank.
@@ -113,7 +111,7 @@ def _draft_attention_terms(draft: DraftSpec, quant: QuantSpec) -> list[WeightTer
         terms.extend([
             _t("draft_enorm", h, ONE, "linear_param_bf16"),
             _t("draft_hnorm", h, ONE, "linear_param_bf16"),
-            _t("draft_eh_proj", h, TWO * h, "linear_param_bf16", "replicated"),
+            _t("draft_eh_proj", h, 2 * h, "linear_param_bf16", "replicated"),
         ])
     if draft.mhc_lowrank <= ZERO:
         terms.extend([_t("draft_input_norm", h, ONE, "norm"),
@@ -216,7 +214,7 @@ def draft_terms(
         if draft.embedding_owned and int(draft.embedding_count) > ZERO:
             terms.append(WeightTerm(
                 "draft_embedding", draft.vocab_size, h, "embedding",
-                "embedding", int(draft.embedding_count), NONE, NONE, NONE,
+                "embedding", int(draft.embedding_count), 0, 0, 0,
                 False, True))
         for _ in range(max(ZERO, draft.layers)):
             terms.extend(_draft_attention_terms(draft, model.quant or QuantSpec("bf16")))
@@ -226,7 +224,7 @@ def draft_terms(
                 if int(draft.output_head_count) > ZERO:
                     terms.append(WeightTerm(
                         "draft_output_head", draft.vocab_size, h, "lm_head",
-                        "replicated", ONE, NONE, NONE, NONE, False, True))
+                        "replicated", ONE, 0, 0, 0, False, True))
         if draft.mhc_lowrank > ZERO:
             from mindie_sim.catalog.qwen4_exp import lowrank_hc_draft_head_terms
             terms.extend(lowrank_hc_draft_head_terms(draft))

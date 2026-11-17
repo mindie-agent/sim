@@ -42,7 +42,7 @@ enum {
     MSIM_COMP_STRIDE = 3,     /* u64 cells per completion record */
     MSIM_SVC_STRIDE = 3,      /* f64 cells per per-link service record */
     MSIM_MAX_T = 65536,       /* reusable task slots per context */
-    MSIM_MAX_R = 32,
+    MSIM_MAX_R = 128,
     MSIM_MAX_U = 64,
     MSIM_MAX_L = 262144,      /* live link cells per context */
     MSIM_MAX_F = 65536,       /* one flow per live link at most */

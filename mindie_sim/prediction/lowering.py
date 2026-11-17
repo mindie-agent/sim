@@ -11,7 +11,6 @@ from mindie_sim.catalog.ops import gemm_op, vector_op, comm_op, cache_store_op
 from mindie_sim.schema.operators import OpSpec
 from mindie_sim.catalog.quant import projection_quant
 
-ZERO = 0
 
 
 class Builder:
@@ -58,8 +57,8 @@ class Builder:
             metadata=tuple(sorted({"group_axis": axis, **metadata}.items())), **self.common,
         ))
 
-    def work(self, name, deps, shape, *, flops=ZERO, matrix_flops=(), vector=ZERO,
-             read=ZERO, write=ZERO, hbm_read=None, family="attention", dtype=None,
+    def work(self, name, deps, shape, *, flops=0, matrix_flops=(), vector=0,
+             read=0, write=0, hbm_read=None, family="attention", dtype=None,
              recipe=None, metadata=()):
         # ``read`` is the operand-fetch service (MTE2).  ``hbm_read`` overrides
         # the external HBM component when one physical working set feeds many

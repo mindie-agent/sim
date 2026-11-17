@@ -35,8 +35,6 @@ from typing import Any, Callable, Mapping, Sequence
 from mindie_sim.schema.common import ModelingError
 
 
-ZERO = 0
-ONE = 1
 MIN_RUN_LENGTH = 2
 
 
@@ -75,7 +73,7 @@ def _relative(value: Any, index: int) -> tuple:
     if value is None:
         return ABSENT
     resolved = int(value)
-    if resolved < ZERO:
+    if resolved < 0:
         return ABSENT
     return (LAYER_DELTA, resolved - int(index))
 
@@ -88,7 +86,7 @@ def _plan_template(plan: Any) -> tuple:
     # one pattern, a cross-layer owner is a distinct one.  ``or -1`` collapsed a
     # genuine owner of layer 0 into "no owner", so the sentinel is an explicit
     # labelled tuple instead.
-    index = int(getattr(plan, "index", ZERO))
+    index = int(getattr(plan, "index", 0))
     ownership = tuple(_relative(getattr(plan, field, None), index)
                       for field in OWNERSHIP_FIELDS)
     native = getattr(plan, "native_layer_id", None)
@@ -102,7 +100,7 @@ def _op_run_key(op: Any, plan: Any) -> tuple:
     # physical_key already normalizes occurrence references relative to this
     # operator, so identical layers produce the same ordered key sequence.
     return (
-        int(getattr(op, "stage", ZERO)),
+        int(getattr(op, "stage", 0)),
         str(getattr(op, "stream", "") or ""),
         str(getattr(op, "dtype", "") or ""),
         _plan_template(plan),
@@ -121,8 +119,8 @@ def layer_templates(ops: Sequence[Any],
     by_layer: dict[int, list[Any]] = {}
     order: list[int] = []
     for op in ops:
-        layer = int(getattr(op, "layer", -ONE))
-        if layer < ZERO:
+        layer = int(getattr(op, "layer", -1))
+        if layer < 0:
             continue
         if layer not in by_layer:
             by_layer[layer] = []
@@ -172,16 +170,16 @@ def homogeneous_layer_runs(ops: Sequence[Any],
     templates = layer_templates(ops, plans)
     if not templates:
         return ()
-    layers = sorted({int(getattr(op, "layer", -ONE)) for op in ops
-                     if int(getattr(op, "layer", -ONE)) >= ZERO})
+    layers = sorted({int(getattr(op, "layer", -1)) for op in ops
+                     if int(getattr(op, "layer", -1)) >= 0})
     plans = tuple(plans or ())
     plan_for = {int(getattr(plan, "index", index)): plan
                 for index, plan in enumerate(plans)}
     runs: list[LayerRun] = []
-    start, key = ZERO, templates[ZERO]
-    for position in range(ONE, len(templates)):
-        cut = _run_cut(templates[position - ONE], templates[position],
-                       plan_for.get(layers[position - ONE]),
+    start, key = 0, templates[0]
+    for position in range(1, len(templates)):
+        cut = _run_cut(templates[position - 1], templates[position],
+                       plan_for.get(layers[position - 1]),
                        plan_for.get(layers[position]))
         if cut is not None:
             runs.append(LayerRun(start, position - start, key,

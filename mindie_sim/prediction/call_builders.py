@@ -62,16 +62,6 @@ def _quantized_grouped_source(arguments):
 ACLNN_ABI_SCHEMA = "mindie-sim.aclnn-abi/1"
 ACLNN_NAMESPACE = "aclnn"
 ACLNN_DEFAULT_DTYPE = "bf16"
-ZERO = 0
-ONE = 1
-TWO = 2
-THREE = 3
-FOUR = 4
-ZERO_FLOAT = 0.0
-THREE_FLOAT = 3.0
-FOUR_FLOAT = 4.0
-FIVE_FLOAT = 5.0
-SIX_FLOAT = 6.0
 ACLNN_MATRIX_KIND = "matrix"
 ACLNN_GROUPED_KIND = "grouped"
 ACLNN_ATTENTION_KIND = "attention"
@@ -128,13 +118,13 @@ def _text(value, reason):
 
 
 def _positive_integer(value, reason):
-    if isinstance(value, bool) or not isinstance(value, int) or value < ONE:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
         raise ModelingError(reason)
     return value
 
 
 def _nonnegative_integer(value, reason):
-    if isinstance(value, bool) or not isinstance(value, int) or value < ZERO:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ModelingError(reason)
     return value
 
@@ -175,7 +165,7 @@ def _symbol(arguments):
                or raw.get("symbol"))
     symbol = _text(raw, "aclnn_call_requires_api_symbol")
     if symbol.startswith(ACLNN_NAMESPACE + "."):
-        symbol = symbol.split(".", ONE)[ONE]
+        symbol = symbol.split(".", 1)[1]
     return symbol
 
 
@@ -216,7 +206,7 @@ def _tensor(arguments, *names):
 
 
 def _leading_product(shape):
-    return math.prod(shape[:-TWO]) if len(shape) > TWO else ONE
+    return math.prod(shape[:-2]) if len(shape) > 2 else 1
 
 
 def _expert_rows(arguments):
@@ -243,27 +233,27 @@ def _matrix_geometry(arguments, kind):
     if w_shape is None and arguments.get("weight_shape") is not None:
         w_shape = _shape(arguments["weight_shape"], "weight_shape")
     transpose_b = bool(arguments.get("transpose_b", False))
-    batch, m, k = ONE, None, None
+    batch, m, k = 1, None, None
     shape = arguments.get("shape")
     if x_shape is None and shape is not None:
         shape = _shape(shape, "shape")
-        if len(shape) != THREE:
+        if len(shape) != MATMUL_SHAPE_DIMS:
             raise ModelingError("aclnn_matmul_shape_requires_m_n_k")
         m, n, k = shape
         shape = None
     else:
         n = None
     if x_shape is not None:
-        if len(x_shape) < TWO:
+        if len(x_shape) < MATRIX_MIN_RANK:
             raise ModelingError("aclnn_matmul_requires_rank_at_least_two_activation")
         batch = _leading_product(x_shape)
-        m, k = x_shape[-TWO:]
-    weight_count = ONE
+        m, k = x_shape[-2:]
+    weight_count = 1
     if w_shape is not None:
-        if len(w_shape) < TWO:
+        if len(w_shape) < MATRIX_MIN_RANK:
             raise ModelingError("aclnn_matmul_requires_rank_at_least_two_weight")
         weight_count = _leading_product(w_shape)
-        first, second = w_shape[-TWO:]
+        first, second = w_shape[-2:]
         n = first if transpose_b else second
         weight_k = second if transpose_b else first
         if k is not None and weight_k != k:
@@ -271,24 +261,24 @@ def _matrix_geometry(arguments, kind):
         k = weight_k if k is None else k
     rows = _expert_rows(arguments) if kind == ACLNN_GROUPED_KIND else None
     if rows is not None:
-        m, groups = sum(rows), sum(ONE for value in rows if value)
+        m, groups = sum(rows), sum(1 for value in rows if value)
     else:
         if kind == ACLNN_GROUPED_KIND:
             groups = _positive_integer(
                 arguments.get("groups", weight_count),
                 "aclnn_grouped_matmul_requires_positive_groups")
         else:
-            groups = max(ONE, weight_count)
-        if kind == ACLNN_GROUPED_KIND and weight_count not in (ONE, groups):
+            groups = max(1, weight_count)
+        if kind == ACLNN_GROUPED_KIND and weight_count not in (1, groups):
             raise ModelingError("aclnn_grouped_matmul_weight_group_mismatch")
     m = _positive_integer(arguments.get("m", m),
                           "aclnn_matmul_requires_positive_m") * (
-                              batch if rows is None else ONE)
+                              batch if rows is None else 1)
     n = _positive_integer(arguments.get("n", n),
                           "aclnn_matmul_requires_positive_n")
     k = _positive_integer(arguments.get("k", k),
                           "aclnn_matmul_requires_positive_k")
-    if kind != ACLNN_GROUPED_KIND and weight_count not in (ONE, batch):
+    if kind != ACLNN_GROUPED_KIND and weight_count not in (1, batch):
         raise ModelingError("aclnn_matmul_weight_batch_mismatch")
     return m, n, k, groups
 
@@ -348,11 +338,21 @@ def _build_matrix(arguments, symbol, kind, recipe, family):
     quant, activation = _quant_spec(symbol, kind, arguments)
     metadata = _matrix_metadata(symbol, kind, arguments, m, n, k, groups)
     op = gemm_op(
-        op_id="aclnn_call", deps=(), stage=ZERO, layer=ZERO, requests=(),
+        op_id="aclnn_call", deps=(), stage=0, layer=0, requests=(),
         m=m, n=n, k=k, quant=quant, category="linear",
         phase=_phase(arguments.get("phase")), recipe=recipe, family=family,
         weight_count=groups, activation_dtype=activation, metadata=metadata)
     return op, groups
+
+
+def _optional_tensor_dtype(arguments, names, allowed, reason):
+    tensors = arguments.get("tensors")
+    if isinstance(tensors, Mapping):
+        for name in names:
+            raw = tensors.get(name)
+            if isinstance(raw, Mapping) and raw.get("dtype"):
+                return _dtype(raw["dtype"], allowed, reason)
+    return None
 
 
 def _tensor_dtype(arguments, names, fallback):
@@ -377,19 +377,19 @@ def _vector_geometry(arguments):
                 break
     if shape is not None:
         rows = arguments.get("rows", arguments.get(
-            "tokens", shape[-TWO] if len(shape) > ONE else ONE))
+            "tokens", shape[-2] if len(shape) > 1 else 1))
         columns = arguments.get(
             "columns", arguments.get(
                 "cols", arguments.get(
                     "hidden", arguments.get(
-                        "width", shape[-ONE] if len(shape) > ONE
-                        else shape[ZERO]))))
+                        "width", shape[-1] if len(shape) > 1
+                        else shape[0]))))
         return _positive_integer(rows, "aclnn_vector_requires_positive_rows"), \
             _positive_integer(columns, "aclnn_vector_requires_positive_columns")
     if "elements" in arguments:
         elements = _positive_integer(arguments["elements"],
                                      "aclnn_vector_requires_positive_elements")
-        return ONE, elements
+        return 1, elements
     return (_positive_integer(arguments.get("rows", arguments.get("tokens")),
                               "aclnn_vector_requires_positive_rows"),
             _positive_integer(arguments.get(
@@ -407,23 +407,23 @@ def _vector_work(kind, arguments):
         gamma_bytes = columns * act_bytes
         read = elements * act_bytes + gamma_bytes
         write = elements * act_bytes + rows * dtype_bytes("fp32")
-        return dtype, elements, FIVE_FLOAT, read, write, (rows, columns), {
+        return dtype, elements, RMSNORM_OPS_PER_ELEM, read, write, (rows, columns), {
             "reduction_width": columns, "norm_has_weight": True}
     if kind == "add_rmsnorm":
         dtype = _tensor_dtype(arguments, ("x", "residual", "gamma"),
                               ACLNN_DEFAULT_DTYPE)
         act_bytes = dtype_bytes(dtype)
-        read = TWO * elements * act_bytes + columns * act_bytes
-        write = TWO * elements * act_bytes + rows * dtype_bytes("fp32")
-        return dtype, elements, SIX_FLOAT, read, write, (rows, columns), {
+        read = 2 * elements * act_bytes + columns * act_bytes
+        write = 2 * elements * act_bytes + rows * dtype_bytes("fp32")
+        return dtype, elements, ADD_RMSNORM_OPS_PER_ELEM, read, write, (rows, columns), {
             "reduction_width": columns, "norm_has_weight": True,
             "norm_has_residual": True}
     if kind == "swiglu":
         dtype = _tensor_dtype(arguments, ("x", "input", "gate"), ACLNN_DEFAULT_DTYPE)
         act_bytes = dtype_bytes(dtype)
-        read = TWO * elements * act_bytes
+        read = 2 * elements * act_bytes
         write = elements * act_bytes
-        return dtype, elements, FIVE_FLOAT, read, write, (rows, columns), {
+        return dtype, elements, RMSNORM_OPS_PER_ELEM, read, write, (rows, columns), {
             "activation_kind": "swiglu", "gate_layout": "gate_first"}
     if kind == "quantize":
         dtype = _tensor_dtype(arguments, ("x", "input"), ACLNN_DEFAULT_DTYPE)
@@ -432,7 +432,7 @@ def _vector_work(kind, arguments):
                         "aclnn_dynamic_quant_output_dtype_unsupported")
         read = elements * dtype_bytes(dtype)
         write = elements * dtype_bytes(output) + rows * dtype_bytes("fp32")
-        return dtype, elements, THREE_FLOAT, read, write, (rows, columns), {
+        return dtype, elements, DYNAMIC_QUANT_OPS_PER_ELEM, read, write, (rows, columns), {
             "input_format": dtype, "output_format": output,
             "activation_scale_format": "fp32", "activation_scale_shape": (rows,)}
     if kind == "tensor_copy":
@@ -442,7 +442,7 @@ def _vector_work(kind, arguments):
                         "aclnn_inplace_copy_output_dtype_unsupported")
         read = elements * dtype_bytes(dtype)
         write = elements * dtype_bytes(target)
-        return dtype, elements, ZERO_FLOAT, read, write, (rows, columns), {
+        return dtype, elements, 0.0, read, write, (rows, columns), {
             "input_format": dtype, "output_format": target,
             "copy_semantics": "inplace_copy_into_destination"}
     raise ModelingError(f"aclnn_vector_kind_unsupported:{kind}")
@@ -459,7 +459,7 @@ def _build_vector(arguments, symbol, vector_kind, recipe, family):
         *tuple(sorted(extra.items())),
     )
     op = vector_op(
-        op_id="aclnn_call", deps=(), stage=ZERO, layer=ZERO, requests=(),
+        op_id="aclnn_call", deps=(), stage=0, layer=0, requests=(),
         elements=elements, ops_per_element=ops_per_element, dtype=dtype,
         family=family, phase=_phase(arguments.get("phase")), recipe=recipe,
         shape=shape, read_bytes_override=float(read),
@@ -489,7 +489,7 @@ def _attention_geometry(arguments):
                 query = _shape(arguments[name], name)
                 break
     if query is None:
-        batch = _positive_integer(arguments.get("batch", ONE),
+        batch = _positive_integer(arguments.get("batch", 1),
                                   "aclnn_attention_requires_positive_batch")
         heads = _positive_integer(
             _first_integer(arguments, "heads", "num_heads"),
@@ -505,14 +505,18 @@ def _attention_geometry(arguments):
         head_dim = _positive_integer(
             _first_integer(arguments, "head_dim", "d"),
             "aclnn_attention_requires_positive_head_dim")
+        v_head_dim = _positive_integer(
+            _first_integer(arguments, "v_head_dim", "value_head_dim",
+                           default=head_dim),
+            "aclnn_attention_requires_positive_v_head_dim")
         kv_heads = _positive_integer(
             _first_integer(arguments, "kv_heads", default=heads),
             "aclnn_attention_requires_positive_kv_heads")
-        return batch, heads, query_tokens, key_tokens, head_dim, kv_heads
-    if len(query) == FOUR:
+        return batch, heads, query_tokens, key_tokens, head_dim, v_head_dim, kv_heads
+    if len(query) == ATTN_BATCHED_RANK:
         batch, heads, query_tokens, head_dim = query
-    elif len(query) == THREE:
-        batch, heads, query_tokens, head_dim = ONE, *query
+    elif len(query) == ATTN_UNBATCHED_RANK:
+        batch, heads, query_tokens, head_dim = 1, *query
     else:
         raise ModelingError("aclnn_attention_query_requires_rank_three_or_four")
     key_tokens = _first_integer(arguments, "key_tokens", "kv_len",
@@ -531,30 +535,63 @@ def _attention_geometry(arguments):
                 key_shape = _shape(arguments[name], name)
                 break
     if key_shape is not None:
-        if len(key_shape) == FOUR:
+        if len(key_shape) == ATTN_BATCHED_RANK:
             key_batch, shape_heads, shape_tokens, shape_dim = key_shape
-        elif len(key_shape) == THREE:
-            key_batch, shape_heads, shape_tokens, shape_dim = ONE, *key_shape
+        elif len(key_shape) == ATTN_UNBATCHED_RANK:
+            key_batch, shape_heads, shape_tokens, shape_dim = 1, *key_shape
         else:
             raise ModelingError("aclnn_attention_key_requires_rank_three_or_four")
         if key_batch != batch or shape_dim != head_dim:
             raise ModelingError("aclnn_attention_key_geometry_mismatch")
         key_tokens = shape_tokens if key_tokens is None else key_tokens
         kv_heads = shape_heads if kv_heads is None else kv_heads
+    value_shape = None
+    if isinstance(tensors, Mapping):
+        for name in ("value", "v", "value_shape", "v_shape"):
+            raw = tensors.get(name)
+            if raw is not None:
+                value_shape = _shape(raw, name)
+                break
+    if value_shape is None:
+        for name in ("value_shape", "v_shape"):
+            if arguments.get(name) is not None:
+                value_shape = _shape(arguments[name], name)
+                break
+    v_head_dim = _first_integer(arguments, "v_head_dim", "value_head_dim",
+                               default=None)
+    if value_shape is not None:
+        if len(value_shape) == ATTN_BATCHED_RANK:
+            value_batch, value_heads, value_tokens, shape_v_dim = value_shape
+        elif len(value_shape) == ATTN_UNBATCHED_RANK:
+            value_batch, value_heads, value_tokens, shape_v_dim = 1, *value_shape
+        else:
+            raise ModelingError("aclnn_attention_value_requires_rank_three_or_four")
+        if value_batch != batch:
+            raise ModelingError("aclnn_attention_value_geometry_mismatch")
+        key_tokens = value_tokens if key_tokens is None else key_tokens
+        if value_tokens != key_tokens:
+            raise ModelingError("aclnn_attention_value_geometry_mismatch")
+        kv_heads = value_heads if kv_heads is None else kv_heads
+        if value_heads != kv_heads:
+            raise ModelingError("aclnn_attention_value_geometry_mismatch")
+        v_head_dim = shape_v_dim
     key_tokens = _positive_integer(
         query_tokens if key_tokens is None else key_tokens,
         "aclnn_attention_requires_positive_key_tokens")
     kv_heads = _positive_integer(
         heads if kv_heads is None else kv_heads,
         "aclnn_attention_requires_positive_kv_heads")
-    if batch < ONE or heads < ONE or query_tokens < ONE or head_dim < ONE:
+    v_head_dim = _positive_integer(
+        head_dim if v_head_dim is None else v_head_dim,
+        "aclnn_attention_requires_positive_v_head_dim")
+    if batch < 1 or heads < 1 or query_tokens < 1 or head_dim < 1:
         raise ModelingError("aclnn_attention_requires_positive_geometry")
-    return batch, heads, query_tokens, key_tokens, head_dim, kv_heads
+    return batch, heads, query_tokens, key_tokens, head_dim, v_head_dim, kv_heads
 
 
 def _attention_op(arguments, symbol, recipe):
     from mindie_sim.schema.operators import OpSpec
-    batch, heads, query_tokens, key_tokens, head_dim, kv_heads = \
+    batch, heads, query_tokens, key_tokens, head_dim, v_head_dim, kv_heads = \
         _attention_geometry(arguments)
     attrs = arguments.get("attrs")
     attrs = (_mapping(attrs, "aclnn_attention_attrs_requires_mapping")
@@ -565,37 +602,73 @@ def _attention_op(arguments, symbol, recipe):
     paged = block_size is not None
     block_size = (_positive_integer(block_size,
                                     "aclnn_attention_block_size_invalid")
-                  if paged else ZERO)
+                  if paged else 0)
+    sparse_mode = attrs.get("sparse_mode", arguments.get("sparse_mode"))
+    sparse_mode = (_nonnegative_integer(sparse_mode,
+                                        "aclnn_attention_sparse_mode_invalid")
+                   if sparse_mode is not None else None)
+    top_left_causal = sparse_mode in (0, 2)
     if paged:
         pairs = query_tokens * key_tokens
     elif causal and query_tokens <= key_tokens:
-        pairs = query_tokens * (query_tokens + ONE) // TWO
+        pairs = (
+            query_tokens * (query_tokens + 1) // 2
+            if top_left_causal
+            else query_tokens * (key_tokens - query_tokens)
+            + query_tokens * (query_tokens + 1) // 2
+        )
     elif causal:
-        pairs = (key_tokens * (key_tokens + ONE) // TWO
+        pairs = (key_tokens * (key_tokens + 1) // 2
                  + (query_tokens - key_tokens) * key_tokens)
     else:
         pairs = query_tokens * key_tokens
-    dtype = _tensor_dtype(arguments, ("query", "q", "key", "value"),
-                          ACLNN_DEFAULT_DTYPE)
-    if dtype not in ACLNN_ATTENTION_DTYPES:
-        raise ModelingError(f"aclnn_attention_dtype_unsupported:{dtype}")
-    act_bytes = dtype_bytes(dtype)
-    query_bytes = batch * heads * query_tokens * head_dim * act_bytes
-    kv_bytes = TWO * batch * kv_heads * key_tokens * head_dim * act_bytes
-    flops = FOUR_FLOAT * batch * heads * pairs * head_dim
-    vector_ops = FIVE_FLOAT * batch * heads * pairs
+    query_dtype = _dtype(
+        arguments.get("query_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("query", "q"), ACLNN_ATTENTION_QUERY_DTYPES,
+            "aclnn_attention_query_dtype_unsupported")
+        or ACLNN_DEFAULT_DTYPE,
+        ACLNN_ATTENTION_QUERY_DTYPES, "aclnn_attention_query_dtype_unsupported")
+    key_dtype = _dtype(
+        arguments.get("key_dtype") or arguments.get("kv_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("key", "k"), ACLNN_ATTENTION_KV_DTYPES,
+            "aclnn_attention_kv_dtype_unsupported")
+        or query_dtype,
+        ACLNN_ATTENTION_KV_DTYPES, "aclnn_attention_kv_dtype_unsupported")
+    value_dtype = _dtype(
+        arguments.get("value_dtype") or arguments.get("kv_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("value", "v"), ACLNN_ATTENTION_KV_DTYPES,
+            "aclnn_attention_kv_dtype_unsupported")
+        or key_dtype,
+        ACLNN_ATTENTION_KV_DTYPES, "aclnn_attention_kv_dtype_unsupported")
+    output_dtype = _dtype(
+        arguments.get("output_dtype")
+        or _optional_tensor_dtype(
+            arguments, ("output", "out"), ACLNN_ATTENTION_QUERY_DTYPES,
+            "aclnn_attention_output_dtype_unsupported")
+        or query_dtype,
+        ACLNN_ATTENTION_QUERY_DTYPES, "aclnn_attention_output_dtype_unsupported")
+    query_bytes = batch * heads * query_tokens * head_dim * dtype_bytes(query_dtype)
+    key_bytes = batch * kv_heads * key_tokens * head_dim * dtype_bytes(key_dtype)
+    value_bytes = batch * kv_heads * key_tokens * v_head_dim * dtype_bytes(value_dtype)
+    kv_bytes = key_bytes + value_bytes
+    output_bytes = batch * heads * query_tokens * v_head_dim * dtype_bytes(output_dtype)
+    flops = float(FLOPS_PER_FMA * batch * heads * pairs * (head_dim + v_head_dim))
+    vector_ops = float(ATTENTION_SOFTMAX_OPS_PER_PAIR * batch * heads * pairs)
     view = {
         "kind": "paged_gqa" if paged else "dense_gqa",
         "logical_layout": "TND",
         "kv_storage": "paged" if paged else "contiguous",
         "query_shape": [batch, heads, query_tokens, head_dim],
         "key_shape": [batch, kv_heads, key_tokens, head_dim],
-        "value_shape": [batch, kv_heads, key_tokens, head_dim],
-        "output_shape": [batch, heads, query_tokens, head_dim],
-        "query_dtype": dtype, "key_dtype": dtype,
-        "value_dtype": dtype, "output_dtype": dtype,
+        "value_shape": [batch, kv_heads, key_tokens, v_head_dim],
+        "output_shape": [batch, heads, query_tokens, v_head_dim],
+        "query_dtype": query_dtype, "key_dtype": key_dtype,
+        "value_dtype": value_dtype, "output_dtype": output_dtype,
         "key_tail_shape": [block_size or key_tokens, kv_heads * head_dim],
-        "value_tail_shape": [block_size or key_tokens, kv_heads * head_dim],
+        "value_tail_shape": [block_size or key_tokens, kv_heads * v_head_dim],
         "batch_count": batch, "causal": causal,
     }
     if paged:
@@ -608,20 +681,23 @@ def _attention_op(arguments, symbol, recipe):
         ("attention_geometry", {
             "batch": batch, "heads": heads, "kv_heads": kv_heads,
             "query_tokens": query_tokens, "key_tokens": key_tokens,
-            "head_dim": head_dim, "causal": causal, "paged": paged,
-            "block_size": block_size or None}),
+            "head_dim": head_dim, "v_head_dim": v_head_dim,
+            "causal": causal, "paged": paged, "block_size": block_size or None,
+            "sparse_mode": sparse_mode, "top_left_causal": top_left_causal,
+            "query_dtype": query_dtype, "key_dtype": key_dtype,
+            "value_dtype": value_dtype, "output_dtype": output_dtype}),
     )
     return OpSpec(
         op_id="aclnn_call", family="attention", phase=_phase(arguments.get("phase")),
-        stage=ZERO, layer=ZERO, requests=(),
+        stage=0, layer=0, requests=(),
         semantic_shape=(batch, heads, query_tokens, head_dim),
         local_shape=(batch, heads, query_tokens, head_dim),
         padded_shape=(batch, heads, query_tokens, head_dim),
         launch_shape=(batch, heads, query_tokens, head_dim),
         flops=flops, vector_ops=vector_ops,
-        hbm_bytes=query_bytes + kv_bytes + query_bytes,
-        mte2_bytes=query_bytes + kv_bytes, mte3_bytes=query_bytes,
-        dtype=dtype, recipe=recipe, metadata=metadata)
+        hbm_bytes=query_bytes + kv_bytes + output_bytes,
+        mte2_bytes=query_bytes + kv_bytes, mte3_bytes=output_bytes,
+        dtype=query_dtype, recipe=recipe, metadata=metadata)
 
 
 def _source(arguments):

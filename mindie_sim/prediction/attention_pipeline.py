@@ -16,9 +16,6 @@ from .physical_recipe_base import (COMPUTE_CATEGORIES, IO_HBM_CATEGORY, Phase,
                                    build_plan, io_weight, tiled_phased_program)
 from .program import KernelProgram
 
-ZERO_FLOAT = 0.0
-ONE = 1
-ONE_FLOAT = 1.0
 Q_LOAD_SHARE = 0.25
 KV_LOAD_SHARE = 0.75
 QK_SHARE = 0.55
@@ -54,7 +51,7 @@ class TiledFlashAndPagedAttentionRecipe:
             Phase("normalize_store", {
                 "vector": NORMALIZE_SHARE,
                 IO_HBM_CATEGORY: write_share,
-                "mte3": ONE_FLOAT,
+                "mte3": 1.0,
             }, after=("pv",)),
         )
         return tiled_phased_program(
@@ -63,14 +60,14 @@ class TiledFlashAndPagedAttentionRecipe:
     def lower_single(self, context) -> KernelProgram:
         """Diagnostic single-tile lowering retaining the same phase DAG."""
         return tiled_phased_program(context, (
-            Phase("q_load", {IO_HBM_CATEGORY: ONE_FLOAT, "mte2": ONE_FLOAT}),
+            Phase("q_load", {IO_HBM_CATEGORY: 1.0, "mte2": 1.0}),
             Phase("kv_load", {}),
             Phase("qk", {"cube": QK_SHARE}, after=("q_load", "kv_load")),
             Phase("online_softmax", {"vector": SOFTMAX_SHARE}, after=("qk",)),
             Phase("pv", {"cube": PV_SHARE}, after=("online_softmax",)),
             Phase("normalize_store", {"vector": NORMALIZE_SHARE,
-                                      "mte3": ONE_FLOAT}, after=("pv",)),
-        ), slots=self.slots, cap=max(ONE, context.core_count))
+                                      "mte3": 1.0}, after=("pv",)),
+        ), slots=self.slots, cap=max(1, context.core_count))
 
 
 TiledAttentionRecipe = TiledFlashAndPagedAttentionRecipe

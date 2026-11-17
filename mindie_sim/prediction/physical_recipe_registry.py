@@ -23,8 +23,6 @@ from .sparse_indexer_pipeline import TiledSparseIndexerRecipe
 from .topology_collective import TopologyCollectiveRecipe
 from .vector_pipeline import AIVTiledVectorAndGatherRecipe
 
-ZERO = 0
-ONE = 1
 
 
 @dataclass(frozen=True)
@@ -52,7 +50,7 @@ class ControlSyncRecipe:
         payload = {}
         for name, value in declared.items():
             amount = float(value)
-            if amount <= ZERO_FLOAT:
+            if amount <= 0.0:
                 continue
             key = str(name)
             if key.startswith("host") or key.startswith("scheduler@"):
@@ -71,10 +69,10 @@ class ControlSyncRecipe:
         # bookkeeping then belongs to that caller's submission boundary.
         # The same host service can be published under a logical role and its
         # physical name; the control pays that service once, not per alias.
-        latency = float(max(control.values())) if control else ZERO_FLOAT
+        latency = float(max(control.values())) if control else 0.0
         return KernelProgram((Stage("arrive", keep_empty=True),
                               Stage("publish", after=("arrive",), latency=latency,
-                                    keep_empty=latency <= ZERO_FLOAT)),
+                                    keep_empty=latency <= 0.0)),
                              minimum_ms=context.minimum_ms)
 
 
@@ -96,10 +94,9 @@ INDEXER_TOPK_RECIPES = frozenset({
 LINEAR_FAMILIES = frozenset({
     "recurrent_local", "recurrent_output", "triangular_solve",
 })
-ZERO_FLOAT = 0.0
 COLLECTIVE_FAMILIES = frozenset({
-    "allgather", "allreduce", "alltoall", "alltoallv", "reduce_scatter",
-    "tp_allreduce", "engram_broadcast", "engram_ids",
+    "allgather", "allreduce", "alltoall", "alltoallv", "dcp_allgather",
+    "reduce_scatter", "tp_allreduce", "engram_broadcast", "engram_ids",
 })
 VECTOR_FAMILIES = frozenset({
     "activation", "add", "add_rmsnorm", "add_rmsnorm_quant", "attention_merge", "attention_residual", "cache_store", "cast", "conv1d", "copy", "elementwise",

@@ -31,9 +31,6 @@ from mindie_sim.schema.model import LayerPlan, ModelSpec
 from mindie_sim.schema.common import ModelingError
 
 ZERO = 0
-ONE = 1
-TWO = 2
-NEG_ONE = -1
 KV_CACHE_PLANES = 2
 NORM_WEIGHT_OFFSET = 1.0
 STEP5_NEXTN_BLOCKS = 3
@@ -292,8 +289,8 @@ def _gemma4(key: str, config: Mapping[str, Any]) -> ModelSpec:
             native_layer_id=index, scope="body",
         ))
     gemma_facts = {
-        "gemma4": ONE, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
-        "gemma4_ple_width": ple_width, "gemma4_ple_tables": ONE,
+        "gemma4": 1, "gemma4_ple": int(ple), "gemma4_ple_layers": (),
+        "gemma4_ple_width": ple_width, "gemma4_ple_tables": 1,
         "gemma4_ple_gated": True,
         "gemma4_ple_vocab": _int(c, "vocab_size_per_layer_input") or vocab,
         "gemma4_k_eq_v_all": ZERO,
@@ -363,13 +360,13 @@ def _minimax_m3(key: str, config: Mapping[str, Any]) -> ModelSpec:
             qk_norm=qk_norm, q_output_gate=gate, ffn_activation="silu",
             indexer=active, indexer_type="full" if active else "none",
             owns_index_k=active,
-            index_k_owner_layer_id=index if active else NEG_ONE,
+            index_k_owner_layer_id=index if active else (-1),
             owns_topk=active,
-            topk_owner_layer_id=index if active else NEG_ONE,
+            topk_owner_layer_id=index if active else (-1),
             index_heads=index_heads if active else ZERO,
             index_dim=index_dim if active else ZERO,
             index_topk=(topk_blocks + local_blocks) * block if active else ZERO,
-            candidate_block_size=block if active else ONE,
+            candidate_block_size=block if active else 1,
             candidate_topk_blocks=(topk_blocks + local_blocks if active
                                    else ZERO),
             kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
@@ -445,7 +442,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             num_experts=experts if moe else ZERO,
             top_k=top_k if moe else ZERO,
             moe_intermediate_size=moe_i if moe else ZERO,
-            num_shared_experts=ONE if moe else ZERO,
+            num_shared_experts=1 if moe else ZERO,
             shared_intermediate_size=shared_i if moe else ZERO,
             router_input_size=hidden if moe else ZERO,
             router_mode="softmax",
@@ -455,15 +452,15 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
             indexer=sparse_layer,
             indexer_type="full" if sparse_layer else "none",
             owns_index_k=sparse_layer,
-            index_k_owner_layer_id=index if sparse_layer else NEG_ONE,
+            index_k_owner_layer_id=index if sparse_layer else (-1),
             owns_topk=sparse_layer,
-            topk_owner_layer_id=index if sparse_layer else NEG_ONE,
+            topk_owner_layer_id=index if sparse_layer else (-1),
             index_heads=idx_heads if sparse_layer else ZERO,
             index_dim=idx_dim if sparse_layer else ZERO,
             index_topk=topk_regions * block if sparse_layer else ZERO,
-            index_kpool=block if sparse_layer else ONE,
-            index_kpool_compress=bool(sparse_layer and block > ONE),
-            candidate_block_size=block if sparse_layer else ONE,
+            index_kpool=block if sparse_layer else 1,
+            index_kpool_compress=bool(sparse_layer and block > 1),
+            candidate_block_size=block if sparse_layer else 1,
             candidate_topk_blocks=topk_regions if sparse_layer else ZERO,
             kv_cache_elements=KV_CACHE_PLANES * kv_heads * head_dim,
             kv_owner_layer_id=index, owns_long_kv=True,
@@ -482,7 +479,7 @@ def _step5(key: str, config: Mapping[str, Any]) -> ModelSpec:
         key, "step5", config, c, plans, attention="gqa", ffn="moe",
         heads=heads, kv_heads=kv_heads, head_dim=head_dim, hidden=hidden,
         intermediate=intermediate, vocab=vocab, experts=experts,
-        top_k=top_k, moe_i=moe_i, shared=ONE, gaps=tuple(gaps), facts=None,
+        top_k=top_k, moe_i=moe_i, shared=1, gaps=tuple(gaps), facts=None,
         auxiliary=auxiliary,
     )
 
@@ -529,10 +526,10 @@ def _step5_auxiliary(c, plans, *, hidden: int, heads: int, kv_heads: int,
         attention_kind="gqa", q_output_gate=bool(gate),
         num_experts=ZERO, top_k=ZERO, expert_intermediate_size=ZERO,
         target_layer_ids=targets or tuple(range(nextn)),
-        sliding_window=window, block_size=ONE,
+        sliding_window=window, block_size=1,
         target_shared_embedding=False, target_shared_lm_head=False,
         input_mode="normalized_concat", execution_mode="cyclic_nextn",
-        embedding_owned=True, embedding_count=ONE,
+        embedding_owned=True, embedding_count=1,
         output_head_owned=True, output_head_count=nextn,
         vocab_size=vocab, pp_capability=STEP5_PP_CAPABILITY,
         layer_plans=draft_plans,

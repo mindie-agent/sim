@@ -38,18 +38,13 @@ from mindie_sim.schema.parallel import ParallelSpec
 _DEFAULT_MT = 128
 _DEFAULT_NT = 128
 _DEFAULT_KV_TILE = 128
-_DEFAULT_CORES = 24
+_FALLBACK_AIC_CORES = 24
+_DEFAULT_MC2_CHUNKS = 4
+_SUMMARY_CACHE_LIMIT = 32
 _DEFAULT_MOE_ROWS = 128
 _DEFAULT_SPLIT_TARGET = 4096
 _DEFAULT_MAX_SPLITS = 8
 
-_ZERO = 0
-_ONE = 1
-_TWO = 2
-_FOUR = 4
-_THIRTY_TWO = 32
-_ZERO_FLOAT = 0.0
-_ONE_FLOAT = 1.0
 
 def _declared_kda_use_beta_sigmoid(runtime: Any) -> int | None:
     """Return the declared KDA option, or None when the case does not set it.
@@ -71,7 +66,7 @@ def _declared_kda_use_beta_sigmoid(runtime: Any) -> int | None:
     if not isinstance(options, Mapping) or "use_beta_sigmoid" not in options:
         return None
     value = options["use_beta_sigmoid"]
-    if isinstance(value, bool) or (isinstance(value, int) and value in (_ZERO, _ONE)):
+    if isinstance(value, bool) or (isinstance(value, int) and value in (0, 1)):
         return int(value)
     raise ModelingError("kda_use_beta_sigmoid_invalid")
 
@@ -184,13 +179,13 @@ def _model_source_metadata(model: Any) -> dict[str, Any]:
                 meta[key] = value
         value = source.get("routed_scaling_factor")
         if (isinstance(value, (int, float)) and not isinstance(value, bool)
-                and math.isfinite(float(value)) and float(value) > _ZERO):
+                and math.isfinite(float(value)) and float(value) > 0):
             meta["routed_scaling_factor"] = float(value)
         source_block = source.get("glm51_source")
         if isinstance(source_block, Mapping):
             meta["glm51_source"] = dict(source_block)
     eps = getattr(model, "norm_eps", None)
-    if isinstance(eps, (int, float)) and not isinstance(eps, bool) and eps > _ZERO:
+    if isinstance(eps, (int, float)) and not isinstance(eps, bool) and eps > 0:
         meta["norm_eps"] = float(eps)
     return meta
 
@@ -214,8 +209,8 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
     index_path = source_path.parent / "quant_model_weights.safetensors.index.json"
     qstat = _source_stat(quant_path)
     istat = _source_stat(index_path)
-    key = (str(quant_path), *(qstat or (-_ONE, -_ONE)), str(index_path),
-           *(istat or (-_ONE, -_ONE)))
+    key = (str(quant_path), *(qstat or (-1, -1)), str(index_path),
+           *(istat or (-1, -1)))
     cached = _NORMAL_SUMMARY_CACHE.get(key)
     if cached is not None:
         return cached
@@ -262,7 +257,7 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
         for qkey in quant_keys:
             match = re.match(r"model\.layers\.(\d+)\.", qkey)
             if match:
-                layers.append(int(match.group(_ONE)))
+                layers.append(int(match.group(1)))
         layers = sorted(set(layers))
         weight_map: dict[str, Any] = {}
         if idx_status == "ok" and isinstance(index, Mapping):
@@ -311,7 +306,7 @@ def _normal_summary(source_path: Path) -> dict[str, Any]:
         summary["trained_layernorm_bias"] = any(
             roles.get(name, {}).get("state") == "loaded"
             for name in ("input_layernorm", "post_attention_layernorm"))
-    if len(_NORMAL_SUMMARY_CACHE) >= _THIRTY_TWO:
+    if len(_NORMAL_SUMMARY_CACHE) >= _SUMMARY_CACHE_LIMIT:
         _NORMAL_SUMMARY_CACHE.clear()
     _NORMAL_SUMMARY_CACHE[key] = summary
     del quant, index
@@ -329,17 +324,17 @@ def _normal_source_metadata(model: Any, runtime: Any = None) -> dict[str, Any]:
         meta.get("glm51_source"), Mapping) else {}
     model_type = str(meta.get("source_model_type") or "")
     classes = {
-        "qwen3_5_text": ("AscendGemmaRMSNorm", _ONE_FLOAT, "input_layernorm.initial"),
-        "glm_moe_dsa": ("AscendRMSNorm", _ZERO_FLOAT, "fused_residual"),
+        "qwen3_5_text": ("AscendGemmaRMSNorm", 1.0, "input_layernorm.initial"),
+        "glm_moe_dsa": ("AscendRMSNorm", 0.0, "fused_residual"),
     }
     resolved = classes.get(model_type, (None, None, None))
     explicit_class = str(meta.get("rms_norm_source_class") or "") or None
     explicit_offset = meta.get("rms_norm_source_weight_offset")
     explicit_role = str(meta.get("rms_norm_source_role") or "") or None
-    source_class = explicit_class or resolved[_ZERO]
-    offset = explicit_offset if explicit_offset is not None else resolved[_ONE]
-    role = explicit_role or resolved[_TWO]
-    conflict = bool(explicit_class and resolved[_ZERO] and explicit_class != resolved[_ZERO])
+    source_class = explicit_class or resolved[0]
+    offset = explicit_offset if explicit_offset is not None else resolved[1]
+    role = explicit_role or resolved[2]
+    conflict = bool(explicit_class and resolved[0] and explicit_class != resolved[0])
     normal: dict[str, Any] = {
         "source_model_type": model_type or None,
         "source_class": source_class,
@@ -413,26 +408,26 @@ def _runtime_metadata(runtime: Any, machine: Any = None, model: Any = None) -> t
         meta["pool_key_indexer"] = "vllm_ascend_cann_keypool_caller"
     # Deployment block size.  Attention uses it only for incremental q=1
     # page-table index traffic.  A missing or zero value stays off that path.
-    block = getattr(runtime, "kv_block_size", _ZERO) or _ZERO
-    if isinstance(block, bool) or not isinstance(block, int) or block < _ZERO:
+    block = getattr(runtime, "kv_block_size", 0) or 0
+    if isinstance(block, bool) or not isinstance(block, int) or block < 0:
         raise ModelingError("kv_block_size_invalid")
-    if block > _ZERO:
+    if block > 0:
         meta["kv_block_size"] = block
-    if "cp_kv_cache_interleave_size" not in meta and block > _ZERO:
+    if "cp_kv_cache_interleave_size" not in meta and block > 0:
         meta["cp_kv_cache_interleave_size"] = block
-    max_model_len = getattr(runtime, "max_model_len", _ZERO) or _ZERO
-    if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < _ZERO:
+    max_model_len = getattr(runtime, "max_model_len", 0) or 0
+    if isinstance(max_model_len, bool) or not isinstance(max_model_len, int) or max_model_len < 0:
         raise ModelingError("max_model_len_invalid")
-    if max_model_len > _ZERO:
+    if max_model_len > 0:
         meta["max_model_len"] = max_model_len
     # Source MC2 capacity reads the configured scheduler budgets directly.
     # These are runtime declarations, not timing inputs; a missing value keeps
     # the historical static recipe and the selector's own branch.
     for key in ("max_num_batched_tokens", "max_num_seqs"):
-        value = getattr(runtime, key, _ZERO) or _ZERO
-        if isinstance(value, bool) or not isinstance(value, int) or value < _ZERO:
+        value = getattr(runtime, key, 0) or 0
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
             raise ModelingError(f"runtime_{key}_invalid")
-        if value > _ZERO:
+        if value > 0:
             meta[key] = value
     kernels = getattr(runtime, "kernels", None)
     if isinstance(kernels, Mapping) and "sequence_parallel" in kernels:
@@ -458,6 +453,14 @@ def _runtime_metadata(runtime: Any, machine: Any = None, model: Any = None) -> t
                     meta["native_fusion_profiles"] = tuple(sorted(
                         (str(key), str(value)) for key, value in profiles.items()))
     return tuple(sorted(meta.items()))
+def _machine_aic_cores(machine: Any) -> int:
+    """Declared Cube AIC count of the actual host, else the portable fallback."""
+    dies = getattr(machine, "dies", ()) if machine is not None else ()
+    if dies and getattr(dies[0], "aic_count", 0):
+        return int(dies[0].aic_count)
+    return _FALLBACK_AIC_CORES
+
+
 @dataclass(frozen=True)
 class FeatureConfig:
     """Normalised projection of Runtime/ParallelSpec/QuantSpec.
@@ -467,13 +470,13 @@ class FeatureConfig:
     tiles that the static contract must fix.
     """
 
-    tp: int = _ONE
-    ep: int = _ONE
-    etp: int = _ONE
-    pp: int = _ONE
-    dp: int = _ONE
-    cp: int = _ONE
-    pcp: int = _ONE
+    tp: int = 1
+    ep: int = 1
+    etp: int = 1
+    pp: int = 1
+    dp: int = 1
+    cp: int = 1
+    pcp: int = 1
     cp_plan: str = "none"
     activation_dtype: str = "bf16"
     quant_activation_format: str = ""
@@ -487,13 +490,13 @@ class FeatureConfig:
     multistream_attention_indexer: bool = False
     multistream_window_compressed: bool = False
     moe_recipe: str = "alltoall"
-    mc2_chunks: int = _FOUR
+    mc2_chunks: int = _DEFAULT_MC2_CHUNKS
     lowering_passes: tuple[str, ...] = ("activation_quantization",)
     implementation: str = "analytical"
     final_norm_scope: str = "all"
     token_tile: int = _DEFAULT_MT
     kv_tile: int = _DEFAULT_KV_TILE
-    cores: int = _DEFAULT_CORES
+    cores: int = _FALLBACK_AIC_CORES
     moe_row_tile: int = _DEFAULT_MOE_ROWS
     split_target: int = _DEFAULT_SPLIT_TARGET
     max_splits: int = _DEFAULT_MAX_SPLITS
@@ -502,12 +505,12 @@ class FeatureConfig:
     def __post_init__(self) -> None:
         for name in ("tp", "ep", "etp", "pp", "dp", "cp", "pcp"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < _ONE:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ModelingError(f"feature_parallel_invalid:{name}")
         for name in ("token_tile", "kv_tile", "cores", "moe_row_tile",
                      "split_target", "max_splits"):
             value = getattr(self, name)
-            if isinstance(value, bool) or not isinstance(value, int) or value < _ONE:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ModelingError(f"feature_tile_invalid:{name}")
         for name in ("activation_dtype", "weight_dtype", "kv_dtype", "index_dtype"):
             dtype_bytes(getattr(self, name))
@@ -520,7 +523,7 @@ class FeatureConfig:
         if self.moe_recipe not in {"alltoall", "mc2", "tp_join_reduce",
                                    "local_expert_reduce"}:
             raise ModelingError(f"feature_moe_recipe_invalid:{self.moe_recipe}")
-        if self.mc2_chunks < _ONE:
+        if self.mc2_chunks < 1:
             raise ModelingError("feature_mc2_chunks_invalid")
         object.__setattr__(self, "graph_buckets", tuple(sorted(set(self.graph_buckets))))
         object.__setattr__(self, "lowering_passes", tuple(self.lowering_passes))
@@ -538,29 +541,29 @@ class FeatureConfig:
         return self.dp * self.pp * self.tp * self.pcp
 
     @property
-    def etp_width(self) -> int: return max(_ONE, self.etp)
+    def etp_width(self) -> int: return max(1, self.etp)
 
     @property
-    def max_bucket(self) -> int: return max(self.graph_buckets) if self.graph_buckets else _ZERO
+    def max_bucket(self) -> int: return max(self.graph_buckets) if self.graph_buckets else 0
 
-    def project(self, *, tp: int = _ZERO, dp: int = _ZERO, ep: int = _ZERO, pp: int = _ZERO,
-                cores: int = _ZERO, graph_buckets: Iterable[int] | None = None,
+    def project(self, *, tp: int = 0, dp: int = 0, ep: int = 0, pp: int = 0,
+                cores: int = 0, graph_buckets: Iterable[int] | None = None,
                 kv_dtype: str = "", kv_bf16_override: bool = False) -> "FeatureConfig":
-        tp_v, dp_v = max(_ONE, tp or self.tp), max(_ONE, dp or self.dp)
-        ep_v = max(_ONE, int(ep or self.ep))
+        tp_v, dp_v = max(1, tp or self.tp), max(1, dp or self.dp)
+        ep_v = max(1, int(ep or self.ep))
         # ETP is the remaining TP shard of each expert, not DP*TP/EP.  EP
         # groups already live in the DP*TP domain; EP beyond TP leaves ETP=1.
-        etp_v = (tp_v if ep_v <= _ONE else
-                 (tp_v // ep_v if ep_v <= tp_v and tp_v % ep_v == _ZERO else _ONE))
+        etp_v = (tp_v if ep_v <= 1 else
+                 (tp_v // ep_v if ep_v <= tp_v and tp_v % ep_v == 0 else 1))
         meta = dict(self.metadata)
-        if kv_bf16_override: meta["kv_bf16_override"] = _ONE
+        if kv_bf16_override: meta["kv_bf16_override"] = 1
         updates: dict[str, Any] = dict(tp=tp_v, dp=dp_v, ep=ep_v, etp=etp_v,
-                                       pp=max(_ONE, pp or self.pp),
+                                       pp=max(1, pp or self.pp),
                                        graph_buckets=(tuple(self.graph_buckets)
                                                       if graph_buckets is None or not tuple(graph_buckets)
                                                       else tuple(graph_buckets)),
                                        metadata=tuple(sorted(meta.items())))
-        if cores > _ZERO: updates["cores"] = int(cores)
+        if cores > 0: updates["cores"] = int(cores)
         if kv_dtype: updates["kv_dtype"] = kv_dtype
         return replace(self, **updates)
 
@@ -571,12 +574,12 @@ class FeatureConfig:
         if not isinstance(parallel, ParallelSpec):
             raise ModelingError("feature_parallel_record_invalid")
         quant = getattr(model, "quant", None) if model is not None else None
-        declared_etp = int(getattr(parallel, "etp", _ZERO) or _ZERO)
-        if declared_etp < _ONE:
-            declared_etp = (parallel.tp if parallel.ep <= _ONE else
+        declared_etp = int(getattr(parallel, "etp", 0) or 0)
+        if declared_etp < 1:
+            declared_etp = (parallel.tp if parallel.ep <= 1 else
                             (parallel.tp // parallel.ep
-                             if parallel.ep <= parallel.tp and parallel.tp % parallel.ep == _ZERO
-                             else _ONE))
+                             if parallel.ep <= parallel.tp and parallel.tp % parallel.ep == 0
+                             else 1))
         return cls(
             tp=parallel.tp, ep=parallel.ep, etp=declared_etp,
             pp=parallel.pp, dp=parallel.dp, cp=parallel.cp, pcp=parallel.pcp,
@@ -595,9 +598,10 @@ class FeatureConfig:
             multistream_attention_indexer=bool(getattr(runtime, "multistream_attention_indexer", False)),
             multistream_window_compressed=bool(getattr(runtime, "multistream_window_compressed", False)),
             moe_recipe=str(getattr(runtime, "moe_recipe", "alltoall")),
-            mc2_chunks=int(getattr(runtime, "mc2_chunks", _FOUR)),
+            mc2_chunks=int(getattr(runtime, "mc2_chunks", _DEFAULT_MC2_CHUNKS)),
             lowering_passes=tuple(getattr(runtime, "lowering_passes", ("activation_quantization",))),
             final_norm_scope=str(getattr(runtime, "final_norm_scope", "all")),
+            cores=_machine_aic_cores(machine),
             metadata=_runtime_metadata(runtime, machine, model),
         )
 
@@ -615,18 +619,19 @@ class FeatureConfig:
             index_dtype=((getattr(quant, "index_dtype", "") if quant else "")
                          or "int8"),
             quant=quant,
-            cp_plan=(("dcp" if int(overrides.get("cp", _ONE) or _ONE) > _ONE else "none")
+            cp_plan=(("dcp" if int(overrides.get("cp", 1) or 1) > 1 else "none")
                      if "cp_plan" not in overrides else str(overrides["cp_plan"])),
             metadata=tuple(sorted({**_identity_metadata(machine, model),
                                   **_model_source_metadata(model)}.items())),
         )
+        base.setdefault("cores", _machine_aic_cores(machine))
         if "etp" not in overrides:
-            tp = int(overrides.get("tp", _ONE) or _ONE)
-            dp = int(overrides.get("dp", _ONE) or _ONE)
-            ep = int(overrides.get("ep", _ONE) or _ONE)
-            base["etp"] = ((tp if ep <= _ONE else
-                            (tp // ep if ep <= tp and tp % ep == _ZERO else _ONE))
-                           if tp > _ZERO else _ONE)
+            tp = int(overrides.get("tp", 1) or 1)
+            dp = int(overrides.get("dp", 1) or 1)
+            ep = int(overrides.get("ep", 1) or 1)
+            base["etp"] = ((tp if ep <= 1 else
+                            (tp // ep if ep <= tp and tp % ep == 0 else 1))
+                           if tp > 0 else 1)
         base.update(overrides)
         return cls(**base)
 

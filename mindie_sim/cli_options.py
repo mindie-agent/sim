@@ -50,7 +50,6 @@ CLI_MTP_ACCEPT = 1.0
 CLI_TTFT_MS = 5000.0
 CLI_TPOT_MS = 50.0
 SINGLE_RECORD = 1
-FIRST = 0
 DEFAULT_SKU = "derived-sku"
 FEATURE_KEYS = (
     "o_proj_tp", "linear_proj_tp", "lm_head_tp", "redundant_experts_per_rank",
@@ -136,7 +135,7 @@ def load_hardware_derivation(path: str | Path) -> dict[str, Any]:
             document = next(iter(records.values()))
             break
         if isinstance(records, list) and len(records) == SINGLE_RECORD:
-            document = records[FIRST]
+            document = records[0]
             break
     if not isinstance(document, Mapping):
         raise ModelingError("hardware_derivation_document_invalid")

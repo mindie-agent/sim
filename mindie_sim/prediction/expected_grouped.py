@@ -10,51 +10,44 @@
 from dataclasses import dataclass, replace
 import math
 
-ZERO = 0
-ONE = 1
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 ROW_TILE = 128
 FRACTAL = 16
-LAST = -1
-SECOND_LAST = -2
-LAST_THREE = -3
 
 
 def inclusion_probability(probabilities, *, tokens):
     """Exact ``1 - (1-p)^tokens`` with stable endpoint handling."""
     result = []
     for value in probabilities:
-        p = min(ONE_FLOAT, max(ZERO_FLOAT, float(value)))
-        if p <= ZERO_FLOAT:
-            result.append(ZERO_FLOAT)
-        elif p >= ONE:
-            result.append(ONE_FLOAT)
+        p = min(1.0, max(0.0, float(value)))
+        if p <= 0.0:
+            result.append(0.0)
+        elif p >= 1:
+            result.append(1.0)
         else:
             result.append(-math.expm1(float(tokens) * math.log1p(-p)))
     return tuple(result)
 
 
-def touched_weight_bytes(probabilities, *, tokens, weight_bytes, scale_bytes=ZERO):
+def touched_weight_bytes(probabilities, *, tokens, weight_bytes, scale_bytes=0):
     """Expected cold weight bytes over experts that receive at least one row."""
     touched = inclusion_probability(probabilities, tokens=tokens)
     return math.fsum(a * (float(weight_bytes) + float(scale_bytes))
-                     for a in touched), sum(ONE for a in touched if a > ZERO_FLOAT)
+                     for a in touched), sum(1 for a in touched if a > 0.0)
 
 
 def row_tile_moments(probabilities, *, tokens, row_tile=ROW_TILE):
     """Expected row-tile count and occupied-row moment per expert."""
     result = []
     for value in probabilities:
-        p = min(ONE_FLOAT, max(ZERO_FLOAT, float(value)))
+        p = min(1.0, max(0.0, float(value)))
         tile_probability = []
-        occupied = ZERO_FLOAT
-        for start in range(ZERO, int(tokens), int(row_tile)):
+        occupied = 0.0
+        for start in range(0, int(tokens), int(row_tile)):
             stop = min(int(tokens), start + int(row_tile))
             tile_probability.append(
-                ONE - (ONE - p) ** stop if p < ONE else ONE)
-            for row in range(start + ONE, stop + ONE):
-                occupied += (ONE - (ONE - p) ** row) if p < ONE else ONE
+                1 - (1 - p) ** stop if p < 1 else 1)
+            for row in range(start + 1, stop + 1):
+                occupied += (1 - (1 - p) ** row) if p < 1 else 1
         result.append((tuple(tile_probability), occupied))
     return tuple(result)
 
@@ -68,12 +61,12 @@ class ExpectedGroupedMatmul:
         meta = dict(op.metadata)
         histogram = meta.get("expert_rows") or meta.get("rows_by_expert")
         if histogram:
-            group_rows = tuple(max(ZERO, int(value)) for value in histogram)
-            active = sum(ONE for value in group_rows if value > ZERO)
+            group_rows = tuple(max(0, int(value)) for value in histogram)
+            active = sum(1 for value in group_rows if value > 0)
             rows = sum(group_rows)
             banks = len(group_rows)
-            per_bank = (max(group_rows) if group_rows else ZERO)
-            slots = max(ONE, rows)
+            per_bank = (max(group_rows) if group_rows else 0)
+            slots = max(1, rows)
         else:
             active = meta["expected_active_experts"]
             rows = meta["expected_rows"]
@@ -84,7 +77,7 @@ class ExpectedGroupedMatmul:
             banks = math.ceil(active)
             per_bank = math.ceil(rows / active)
             slots = banks * per_bank
-        _, n, k = op.local_shape[LAST_THREE:]
+        _, n, k = op.local_shape[(-3):]
         meta.update(matrix_groups=banks, matrix_mapping_domain="expected_expert_banks")
         if "matrix_epilogue" in meta:
             epilogue = dict(meta["matrix_epilogue"])
@@ -100,12 +93,12 @@ class ExpectedGroupedMatmul:
                 "expected_rows": rows, "expected_active_experts": active,
                 "conditional_mean_rows": rows / active,
                 "bank_slots": banks, "rows_per_bank_slot": per_bank,
-                "semantic_rows": op.local_shape[LAST_THREE], "scheduling_rows": slots,
+                "semantic_rows": op.local_shape[(-3)], "scheduling_rows": slots,
                 "work_policy": "preserve_semantic_arithmetic_and_payload_moments",
                 "private_service_policy": "derive_owner_copies_and_compute_width_from_rounded_grid",
                 "schedule": ("exact_histogram_owner_tail" if group_rows is not None
                              else "capacity_rounded_conditional_mean_not_sampled_histogram"),
-                "outer_invocations": ONE,
+                "outer_invocations": 1,
             })
         mapped_context = replace(context, op=mapped)
         if group_rows is not None:

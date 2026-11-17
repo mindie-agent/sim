@@ -24,8 +24,6 @@ from .program import (KernelProgram, ParallelProgram, PipelineProgram,
                       PipelineTemplateProgram, Stage)
 
 DEFAULT_SPLIT_K = 1
-ONE = 1
-SECOND = 1
 MS_PER_SECOND = 1000
 
 
@@ -125,9 +123,9 @@ class SteadyMatmul(MappedMatmul):
         inputs, weights = epilogue.operands(op)
         dram_mode = dict(context.service_modes).get("mte2_aic_dram")
         single_m_hbm_cap = (
-            {names["hbm"]: float(dram_mode[SECOND])
-             / (MS_PER_SECOND * max(ONE, int(context.core_count)))}
-            if (nm == ONE and dram_mode and "hbm" in names) else {})
+            {names["hbm"]: float(dram_mode[1])
+             / (MS_PER_SECOND * max(1, int(context.core_count)))}
+            if (nm == 1 and dram_mode and "hbm" in names) else {})
         operand_read = read_role(names)
         scale_read = read_role(names, aiv=0)
         width = dtype_bytes(meta.get("compute_format", op.dtype or "bf16"))

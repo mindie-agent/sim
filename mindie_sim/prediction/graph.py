@@ -11,8 +11,6 @@ from __future__ import annotations
 from dataclasses import replace
 import math
 
-ZERO = 0
-ZERO_FLOAT = 0.0
 TOLERANCE = 1e-12
 SHAPE_TRAILING_DIMS = 3
 ROWS_DIM = -3
@@ -37,10 +35,10 @@ def annotate_geometry(ops, *, active_rows, physical_rows):
         if (isinstance(epilogue, dict) and len(shape) >= SHAPE_TRAILING_DIMS
                 and active_rows and physical_rows
                 and int(active_rows) != int(physical_rows)):
-            operations = float(epilogue.get("operations_per_output", ZERO_FLOAT)
-                               or ZERO_FLOAT)
+            operations = float(epilogue.get("operations_per_output", 0.0)
+                               or 0.0)
             rows, cols = int(shape[ROWS_DIM]), int(shape[COLS_DIM])
-            if operations > ZERO and cols > ZERO:
+            if operations > 0 and cols > 0:
                 active_work = operations * int(active_rows) * cols
                 physical_work = operations * int(physical_rows) * cols
                 if (math.isclose(float(op.vector_ops), active_work,

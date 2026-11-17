@@ -28,10 +28,6 @@ from .program import KernelProgram
 from .mc2_program import Mc2LaunchView, _peer_class_for
 from .mc2_program_state import Mc2ProgramState
 
-_ZERO = 0
-_ONE = 1
-_ZERO_FLOAT = 0.0
-_ONE_FLOAT = 1.0
 
 class _Mc2Program(Mc2ProgramState):
     """Execute the selected native phase programs on the common Engine.
@@ -55,23 +51,23 @@ class _Mc2Program(Mc2ProgramState):
         group = tuple(transport.get("group") or ())
         local_indices = {int(item) for item in
                          (transport.get("sources") or ())}
-        if not local_indices and _ZERO <= int(view.rank) < len(group):
+        if not local_indices and 0 <= int(view.rank) < len(group):
             local_indices = {int(view.rank)}
         work = {}
         peer_events = {}
         parent_events = []
-        frames = _ZERO
-        edges = _ZERO
-        tx_bytes = _ZERO_FLOAT
-        rx_bytes = _ZERO_FLOAT
-        useful_bytes = _ZERO_FLOAT
+        frames = 0
+        edges = 0
+        tx_bytes = 0.0
+        rx_bytes = 0.0
+        useful_bytes = 0.0
         endpoint_memory = {
             int(rank): str(name) for rank, name in
             (transport.get("destination_memory") or {}).items() if name}
         endpoint_resources = set(endpoint_memory.values())
         for _si, _di, source, destination, useful, cell_frames in self.transport_cells(
                 transport, count=count):
-            if not callable(route) or useful <= _ZERO:
+            if not callable(route) or useful <= 0:
                 continue
             message = route(MessageFlow(source, destination, float(useful)))
             previous = (prerequisite,)
@@ -81,10 +77,10 @@ class _Mc2Program(Mc2ProgramState):
                 demand = {str(name): float(amount)
                           for name, amount in hop.demand.items() if amount}
                 if (endpoint
-                        and hop_index == len(message.hops) - _ONE
+                        and hop_index == len(message.hops) - 1
                         and source != destination
                         and (not group or group[source] != group[destination])):
-                    demand[endpoint] = demand.get(endpoint, _ZERO_FLOAT) + float(useful)
+                    demand[endpoint] = demand.get(endpoint, 0.0) + float(useful)
                 service = engine.submit(
                     f"{name}:{phase.name}:{source}->{destination}:"
                     f"hop{hop_index}:service",
@@ -92,7 +88,7 @@ class _Mc2Program(Mc2ProgramState):
                 if first_service is None:
                     first_service = service
                 for key, amount in demand.items():
-                    work[key] = work.get(key, _ZERO_FLOAT) + amount
+                    work[key] = work.get(key, 0.0) + amount
                     if key in endpoint_resources:
                         continue
                     lowered = key.lower()
@@ -108,7 +104,7 @@ class _Mc2Program(Mc2ProgramState):
                     f"hop{hop_index}:arrival",
                     latency=float(hop.latency_ms), after=(service,))
                 previous = (arrival,)
-            arrival = previous[_ZERO]
+            arrival = previous[0]
             final = arrival
             promise = dict(placeholders or {}).get(
                 (_si, _di, phase.name))
@@ -120,7 +116,7 @@ class _Mc2Program(Mc2ProgramState):
                     engine.resolve(item))
             parent_events.append(final)
             frames += int(cell_frames)
-            edges += _ONE
+            edges += 1
             useful_bytes += float(useful)
             if not count and source in local_indices:
                 peer_events[destination] = {
@@ -129,10 +125,10 @@ class _Mc2Program(Mc2ProgramState):
                     "retire": (final if final is not arrival else None),
                     "class": view.class_for(
                         view.peer_labels.index(destination)
-                        if destination in view.peer_labels else _ZERO,
+                        if destination in view.peer_labels else 0,
                         destination),
-                    "pipe": None, "latency_ms": float(message.hops[-_ONE].latency_ms)
-                    if message.hops else _ZERO_FLOAT,
+                    "pipe": None, "latency_ms": float(message.hops[-1].latency_ms)
+                    if message.hops else 0.0,
                     "frames": int(cell_frames), "bytes": float(useful),
                     "send_placeholder": None, "remote_send": None,
                 }
@@ -184,16 +180,16 @@ class _Mc2Program(Mc2ProgramState):
             return self._with_route(self.view)
         if not isinstance(launch, Mc2LaunchView):
             raise ModelingError("mc2_launch_view_required")
-        if len(launch.peer_labels) != max(_ZERO, self.peer_count - _ONE):
+        if len(launch.peer_labels) != max(0, self.peer_count - 1):
             raise ModelingError("mc2_launch_view_peer_count_mismatch")
         if launch.peer_weights:
             if (len(launch.peer_weights) != len(launch.peer_labels)
-                    or sum(launch.peer_weights, Fraction(_ZERO)) != _ONE):
+                    or sum(launch.peer_weights, Fraction(0)) != 1):
                 raise ModelingError("mc2_launch_view_peer_weights_invalid")
         elif launch.peer_labels:
             launch = replace(
                 launch,
-                peer_weights=tuple(Fraction(_ONE, len(launch.peer_labels))
+                peer_weights=tuple(Fraction(1, len(launch.peer_labels))
                                    for _ in launch.peer_labels))
         return self._with_route(launch)
 
@@ -280,7 +276,7 @@ class _Mc2Program(Mc2ProgramState):
                 # One genuinely source-shaped complete branch: combine
                 # success-flag retry with exactly one active owner.  Other
                 # owners/unsupported phases keep the existing causal wait.
-                retry = bool(owners == (_ZERO,)
+                retry = bool(owners == (0,)
                              and any(str(stage.name).startswith("owner0:")
                                      and str(stage.name).endswith(
                                          ("read_flags", "compare_flags"))
@@ -308,7 +304,7 @@ class _Mc2Program(Mc2ProgramState):
                         compare_stage = replace(
                             compare_stage, after=(read_stage.name,))
                         failure_work = {
-                            str(role): (_ONE_FLOAT if "pipe_s" in str(role)
+                            str(role): (1.0 if "pipe_s" in str(role)
                                         else float(amount))
                             for role, amount in dict(success_sff.work).items()}
                         init_program = KernelProgram((init_stage,))
@@ -351,15 +347,15 @@ class _Mc2Program(Mc2ProgramState):
                     if pname == "count_status_exchange"
                     and destination in count_local
                     and source != destination}
-                status_records = max(_ZERO, int(self.experts))
+                status_records = max(0, int(self.experts))
                 quotient, remainder = (
-                    divmod(status_records, len(active)) if active else (_ZERO, _ZERO))
+                    divmod(status_records, len(active)) if active else (0, 0))
                 for index, owner in enumerate(active):
                     start = (index * quotient
                              + min(index, remainder))
                     end = start + quotient + int(index < remainder)
                     required_sources = {
-                        row % max(_ONE, int(self.peer_count))
+                        row % max(1, int(self.peer_count))
                         for row in range(start, end)}
                     incoming = tuple(dict.fromkeys(
                         ev for (source, destination, pname), ev
@@ -411,10 +407,10 @@ class _Mc2Program(Mc2ProgramState):
                 def owner_try(spec, after_event, *, phase_name=phase_name,
                               remaining=remaining, count_done=count_done):
                     owner, incoming, failed, tail = spec
-                    attempt = [_ZERO]
+                    attempt = [0]
                     def finish(_event):
-                        remaining[_ZERO] -= _ONE
-                        if remaining[_ZERO] == _ZERO:
+                        remaining[0] -= 1
+                        if remaining[0] == 0:
                             engine.resolve(count_done)
                     def start_gate(previous, *, owner=owner,
                                    incoming=incoming, failed=failed,
@@ -426,7 +422,7 @@ class _Mc2Program(Mc2ProgramState):
                             read_event = failed.start(
                                 engine,
                                 f"{name}:{phase_name}:owner{owner}:"
-                                f"failed{attempt[_ZERO]}",
+                                f"failed{attempt[0]}",
                                 _event)
                             def read_done(_read, *, owner=owner,
                                           complete=complete, tail=tail,
@@ -442,14 +438,14 @@ class _Mc2Program(Mc2ProgramState):
                                         owner="receive_count_success",
                                         on_complete=finish)
                                 else:
-                                    attempt[_ZERO] += _ONE
+                                    attempt[0] += 1
                                     start_gate(_read)
                             engine.submit(
                                 f"{name}:{phase_name}:owner{owner}:read_done",
                                 after=(read_event,), owner="receive_count_try",
                                 on_complete=read_done)
                         engine.submit(
-                            f"{name}:{phase_name}:owner{owner}:gate{attempt[_ZERO]}",
+                            f"{name}:{phase_name}:owner{owner}:gate{attempt[0]}",
                             after=(previous,), owner="receive_count_try",
                             on_complete=gate)
                     start_gate(after_event)
@@ -460,14 +456,14 @@ class _Mc2Program(Mc2ProgramState):
             elif retry:
                 phase_name = phase.name
                 done = engine.future(f"{name}:{phase_name}:success")
-                attempts = [_ZERO]
+                attempts = [0]
                 def next_try(after_event, *, phase_name=phase_name,
                              init_program=init_program,
                              read_compare_program=read_compare_program,
                              success_sff_program=success_sff_program,
                              failure_sff_program=failure_sff_program,
                              required_incoming=incoming, done_event=done):
-                    attempt = attempts[_ZERO]
+                    attempt = attempts[0]
                     init = init_program.start(
                         engine, f"{name}:{phase_name}:failed{attempt}:init",
                         after_event)
@@ -498,7 +494,7 @@ class _Mc2Program(Mc2ProgramState):
                                     on_complete=lambda _done: engine.resolve(
                                         done_event))
                             else:
-                                attempts[_ZERO] += _ONE
+                                attempts[0] += 1
                                 sff = failure_sff_program.start(
                                     engine,
                                     f"{name}:{phase_name}:failed{attempt}:sff",
@@ -535,7 +531,7 @@ class _Mc2Program(Mc2ProgramState):
                     if key not in {"event", "peer_events"}}
                 for key, amount in details["work"].items():
                     handles["transport_work"][key] = (
-                        handles["transport_work"].get(key, _ZERO_FLOAT) + amount)
+                        handles["transport_work"].get(key, 0.0) + amount)
                 if details["peer_events"]:
                     handles["peer_events"][phase.name] = dict(
                         details["peer_events"])
@@ -546,7 +542,7 @@ class _Mc2Program(Mc2ProgramState):
                 # task after link/propagation, never at send.
                 peer_events = []
                 for peer, frames in view.payload_frames:
-                    if frames <= _ZERO or peer not in view.peer_labels:
+                    if frames <= 0 or peer not in view.peer_labels:
                         continue
                     index = view.peer_labels.index(peer)
                     klass = view.class_for(index, peer)
@@ -625,23 +621,23 @@ class _Mc2Program(Mc2ProgramState):
                 for klass, members in class_peers.items():
                     class_weight[klass] = sum(
                         (view.peer_weights[index] for index, _ in members),
-                        Fraction(_ZERO))
+                        Fraction(0))
                 peer_events = []
                 for klass, members in class_peers.items():
                     if not members:
                         continue
                     pipe = "link_hccs" if klass == "hccs" else "link_roce"
-                    total = _as_fraction(link.get(pipe, _ZERO))
-                    if (total <= _ZERO and "link" in link and
-                            sum(_ONE for items in class_peers.values() if items) == _ONE):
+                    total = _as_fraction(link.get(pipe, 0))
+                    if (total <= 0 and "link" in link and
+                            sum(1 for items in class_peers.values() if items) == 1):
                         # A one-class synthetic supply declares only `link`.
-                        total = _as_fraction(link.get("link", _ZERO))
+                        total = _as_fraction(link.get("link", 0))
                     key = dict(view.resource_names).get(
                         pipe, self.names.get(pipe, pipe))
                     for index, peer in members:
                         weight = (view.peer_weights[index] /
                                   class_weight[klass]
-                                  if class_weight[klass] else Fraction(_ZERO))
+                                  if class_weight[klass] else Fraction(0))
                         send = send_by_peer.get(peer)
                         if send is None:
                             send = source_map.get(
@@ -741,7 +737,7 @@ class _Mc2Program(Mc2ProgramState):
                 for pipe, amount in link.items():
                     key = dict(view.resource_names).get(
                         pipe, self.names.get(pipe, pipe))
-                    link_work[key] = link_work.get(key, Fraction(_ZERO)) + amount
+                    link_work[key] = link_work.get(key, Fraction(0)) + amount
                 event = engine.submit(
                     f"{name}:{phase.name}:link",
                     work={pipe: float(amount)

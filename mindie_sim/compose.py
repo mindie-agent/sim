@@ -43,7 +43,7 @@ from mindie_sim.backends.nvidia import (
     profiles as nvidia_profiles,
 )
 from mindie_sim.catalog.specs import build_model_spec
-from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec
+from mindie_sim.catalog.types import AuxiliarySpec, DraftSpec, QuantSpec, merge_source
 from mindie_sim.model_catalog import (
     ARCHITECTURE_PRESET_ALIASES,
     ARCHITECTURE_PRESET_CATALOG,
@@ -59,6 +59,15 @@ from mindie_sim.schema.model import ModelSpec
 from mindie_sim.schema.serialization import apply_model_overrides
 from mindie_sim.va_profiles import VA_RECOMMENDED_PROFILES, simulation_config
 
+
+MX_GROUP_SIZE = 32
+MX_SCALE_PACK = 2
+NOMINAL_HOST_MEM_BPS = 64_000_000_000.0
+NOMINAL_HOST_VEC_OPS = 50_000_000_000.0
+NOMINAL_H2D_BPS = 32_000_000_000.0
+BYTES_PER_GB = 1_000_000_000.0
+NEXTN_DEFAULT_HEAD_DIM = 192
+PP_CAP_DEFAULT = (1, 2, 4, 8, 16)
 
 HARDWARE_ALIASES: dict[str, str] = {
     "a2": "Ascend910B4", "910b": "Ascend910B4", "910b4": "Ascend910B4",
@@ -187,7 +196,8 @@ def _resolve_va_lowerings(
         cp=int(parallel.get("cp", parallel.get("dcp", 1))), pcp=int(parallel.get("pcp", 1)),
     )
     lowerings: dict[str, Any] = {}
-    if any(p.attention == "kda" for p in model_spec.layer_plans) and p_cfg.pcp >= 1:
+    if (any(p.attention == "kda" for p in model_spec.layer_plans)
+            and p_cfg.pcp >= 1 and p_cfg.cp == 1):
         # This source kernel owns complete decode batches with q1-q8. Prefill,
         # mixed batches and longer queries retain explicit semantic work.
         lowerings["kda"] = {
@@ -231,8 +241,19 @@ def _resolve_va_lowerings(
             and not normalization.get("norm_weight_offset", 0.0)
             and not any(p.qk_norm for p in model_spec.layer_plans)):
         lowerings["add_rmsnorm"] = "vllm_ascend_native_norm"
-        if "activation_quantization" in lowering_passes and model_spec.quant.activation_format == "int8":
-            lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+        if "activation_quantization" in lowering_passes and model_spec.quant is not None:
+            q = model_spec.quant
+            is_mx_fp8 = (
+                q.activation_format == "fp8_e4m3"
+                and q.activation_group_size == MX_GROUP_SIZE
+                and q.activation_scale_format == "fp8_e8m0"
+                and q.activation_scale_pack == MX_SCALE_PACK
+            )
+            if q.activation_format == "int8":
+                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+            elif is_mx_fp8:
+                lowerings["add_rmsnorm_quant"] = "vllm_ascend_native_norm"
+                lowerings["rmsnorm_quant"] = "vllm_ascend_native_norm"
     return lowerings
 
 
@@ -478,6 +499,10 @@ def compose_case(
     pp_layer_partition: Sequence[int] | None = None,
     enable_shared_expert_dp: bool = False,
     *,
+    multistream_overlap_shared_expert: bool | None = None,
+    engram_cpu_offload: bool | None = None,
+    enable_dbo: bool = False,
+    moe_comm_mode: str | None = None,
     o_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     linear_proj_tp: int = DEFAULT_LOCAL_WIDTH,
     lm_head_tp: int = DEFAULT_LOCAL_WIDTH,
@@ -639,6 +664,11 @@ def compose_case(
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
     )
+    # These are caller opt-ins: the profile exposes the documented capability
+    # as provenance, but enabling an overlap/offload path changes the pinned
+    # physical decomposition and must be an explicit composition choice.
+    resolved_mso = bool(multistream_overlap_shared_expert)
+    resolved_engram_offload = bool(engram_cpu_offload)
     sp_source = (
         "raw_eager" if raw_eager else
         "explicit" if sp is not None and va_recommended is not False else
@@ -676,6 +706,39 @@ def compose_case(
         "priority": ("raw_eager > explicit caller > documented profile > "
                      "structural fusion defaults"),
     }
+
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO and model_spec.auxiliary is None:
+        from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+        facts = dict(model_spec.catalog_facts)
+        nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
+        moe_ref = next((p for p in model_spec.layer_plans if p.ffn == "moe"), None)
+        if (nextn <= 0 and moe_ref is not None and moe_ref.attention == "mla"
+                and moe_ref.q_lora_rank > 0):
+            nextn = 1
+        if nextn > 0 and moe_ref is not None and moe_ref.attention == "mla":
+            qk_dim = moe_ref.qk_nope_head_dim + moe_ref.qk_rope_head_dim
+            draft = DraftSpec(
+                kind="mtp", layers=nextn, hidden_size=model_spec.hidden_size,
+                intermediate_size=moe_ref.moe_intermediate_size,
+                num_heads=moe_ref.num_heads, num_kv_heads=DEFAULT_PARALLEL,
+                head_dim=qk_dim or NEXTN_DEFAULT_HEAD_DIM,
+                q_width=moe_ref.num_heads * qk_dim, kv_width=qk_dim,
+                attention_kind="mla", kv_cache_elements=moe_ref.kv_cache_elements,
+                weight_category="mtp", q_lora_rank=moe_ref.q_lora_rank,
+                kv_lora_rank=moe_ref.kv_lora_rank,
+                qk_nope_head_dim=moe_ref.qk_nope_head_dim,
+                qk_rope_head_dim=moe_ref.qk_rope_head_dim,
+                v_head_dim=moe_ref.v_head_dim, num_experts=moe_ref.num_experts,
+                top_k=moe_ref.top_k,
+                expert_intermediate_size=moe_ref.moe_intermediate_size,
+                num_shared_experts=moe_ref.num_shared_experts,
+                target_shared_embedding=True, target_shared_lm_head=True,
+                base_logits=True, pp_capability=PP_CAP_DEFAULT,
+                vocab_size=model_spec.vocab_size,
+                source=merge_source({"kind": "standard_deepseek_nextn_mtp"}),
+            )
+            model_spec = declare_native_auxiliary_plans(
+                replace(model_spec, auxiliary=AuxiliarySpec(mtp=draft)))
 
     if int(mtp_proposal_tokens) > DEFAULT_ZERO:
         # Auxiliary structure is declared natively by the model adapter at load
@@ -728,6 +791,21 @@ def compose_case(
         **({"raw_eager": True} if raw_eager else {}),
         "execution_policy": dict(execution_policy),
     }
+    if resolved_engram_offload:
+        h2d_ch = dict((machine.get("transfer_channels") or {}).get("h2d") or {})
+        h2d_bps = (float(h2d_ch.get("effective_uni_bw_gbps") or 0.0)
+                   * BYTES_PER_GB)
+        dev = dict(machine.get("device") or {})
+        rates = dict(dev.get("rates") or {})
+        rates.setdefault("host_memory", NOMINAL_HOST_MEM_BPS)
+        rates.setdefault("host_vector", NOMINAL_HOST_VEC_OPS)
+        rates.setdefault("h2d", h2d_bps if h2d_bps > 0.0 else NOMINAL_H2D_BPS)
+        dev["rates"] = rates
+        machine = {**machine, "device": dev}
+    if resolved_mso:
+        runtime_meta["multistream_overlap_shared_expert"] = True
+    if moe_comm_mode is not None:
+        runtime_meta["moe_comm_mode"] = str(moe_comm_mode)
     if int(mtp_proposal_tokens) > DEFAULT_ZERO:
         runtime_meta["draft_mode"] = "mtp" if getattr(model_spec.auxiliary, "mtp", None) is not None else "dspark"
         runtime_meta["draft_proposal_tokens"] = int(mtp_proposal_tokens)
@@ -763,6 +841,12 @@ def compose_case(
         "mtp_acceptance_length": float(mtp_acceptance_length),
         "metadata": runtime_meta,
     }
+    if resolved_mso:
+        runtime_dict["multistream_overlap_shared_expert"] = True
+    if resolved_engram_offload:
+        runtime_dict["engram_cpu_offload"] = True
+    if enable_dbo:
+        runtime_dict["enable_dbo"] = True
     if graph_capture_mode == "full":
         runtime_dict["graph_capture_keys"] = capture_keys(
             resolved_max_seqs, mtp_proposal_tokens)
@@ -815,6 +899,9 @@ def compose_case(
         lowerings = _resolve_va_lowerings(
             model_spec, runtime_dict["parallel"], sku, passes,
         )
+        if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
+            passes = (*passes, "residual_norm")
+            runtime_dict["lowering_passes"] = list(passes)
         if lowerings:
             kernels_dict = dict(runtime_dict.get("kernels", {}))
             existing_low = dict(kernels_dict.get("lowerings", {}))
@@ -1434,6 +1521,9 @@ def apply_va_recommended(case: Mapping[str, Any]) -> dict[str, Any]:
         passes = ("activation_quantization", "norm_quant")
         rt["lowering_passes"] = list(passes)
     lowerings = _resolve_va_lowerings(parsed.model, par, sku, passes)
+    if "add_rmsnorm" in lowerings and "residual_norm" not in passes:
+        passes = (*passes, "residual_norm")
+        rt["lowering_passes"] = list(passes)
     if lowerings:
         existing_low = dict(kernels.get("lowerings", {}))
         kernels["lowerings"] = {**lowerings, **existing_low}

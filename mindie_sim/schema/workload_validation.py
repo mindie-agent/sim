@@ -29,15 +29,12 @@ from typing import Any
 
 from mindie_sim.schema.common import ModelingError
 
-_ZERO = 0
-_ZERO_FLOAT = 0.0
-_ONE = 1
 _MAX_NUMBER = (1 << 1024) - (1 << 971)
 
 _METADATA_PAIR_SIZE = 2
 
 
-def _request_int(name, value, *, minimum=_ZERO, reason="workload"):
+def _request_int(name, value, *, minimum=0, reason="workload"):
     """Require one exact bounded integer and return it without coercion."""
     if type(value) is not int or value < minimum or abs(value) > _MAX_NUMBER:
         raise ModelingError(
@@ -45,7 +42,7 @@ def _request_int(name, value, *, minimum=_ZERO, reason="workload"):
     return value
 
 
-def _request_number(name, value, *, minimum=_ZERO_FLOAT, reason="workload"):
+def _request_number(name, value, *, minimum=0.0, reason="workload"):
     """Require one finite non-negative number, returned as a float."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ModelingError(
@@ -72,10 +69,10 @@ def _validate_request(value):
     except TypeError as error:
         raise ModelingError("workload.request_id_invalid:unhashable") from error
     for name, minimum in (
-            ("prompt_tokens", _ONE), ("output_tokens", _ONE),
-            ("prefix_tokens", _ZERO), ("priority", _ZERO),
-            ("text_prompt_tokens", _ZERO), ("media_tokens", _ZERO),
-            ("chain_id", _ZERO)):
+            ("prompt_tokens", 1), ("output_tokens", 1),
+            ("prefix_tokens", 0), ("priority", 0),
+            ("text_prompt_tokens", 0), ("media_tokens", 0),
+            ("chain_id", 0)):
         _request_int(name, getattr(value, name, None), minimum=minimum)
     media_encoded = getattr(value, "media_encoded", None)
     if type(media_encoded) is not bool:
@@ -92,7 +89,7 @@ def _validate_request(value):
         raise ModelingError("workload.prefix_exceeds_prompt")
     if value.media_tokens > value.prompt_tokens:
         raise ModelingError("workload.media_exceeds_prompt")
-    if (value.text_prompt_tokens > _ZERO
+    if (value.text_prompt_tokens > 0
             and value.text_prompt_tokens + value.media_tokens != value.prompt_tokens):
         raise ModelingError("workload.text_media_prompt_mismatch")
     return times

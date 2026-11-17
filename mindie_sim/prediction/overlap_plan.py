@@ -16,9 +16,6 @@ from typing import Sequence
 from mindie_sim.schema.common import ModelingError
 from mindie_sim.schema.operators import OpSpec
 
-ZERO = 0
-ONE = 1
-TWO = 2
 
 
 @dataclass(frozen=True)
@@ -33,8 +30,8 @@ class SharedExpertRegion:
 
 @dataclass(frozen=True)
 class MicrobatchPolicy:
-    count: int = TWO
-    min_tokens: int = ONE
+    count: int = 2
+    min_tokens: int = 1
 
 
 @dataclass(frozen=True)
@@ -68,7 +65,7 @@ def build_microbatch_regions(views: Sequence[object], *,
                              policy: MicrobatchPolicy) -> tuple[MicrobatchRegion, ...]:
     """Partition independent request views into real microbatch cohorts."""
     views = tuple(views)
-    if policy.count < ONE:
+    if policy.count < 1:
         raise ModelingError("microbatch_policy_requires_positive_count")
     if not views:
         return ()
@@ -92,7 +89,7 @@ def validate_overlap_dependencies(ops: Sequence[OpSpec]) -> None:
         if _is_shared(op) and op.op_id not in ids:
             raise ModelingError(f"shared_expert_member_missing:{op.op_id}")
         if op.op_id.endswith(".join"):
-            if len(op.deps) < TWO:
+            if len(op.deps) < 2:
                 raise ModelingError(f"overlap_join_requires_both_branches:{op.op_id}")
             missing = set(op.deps) - ids
             if missing:

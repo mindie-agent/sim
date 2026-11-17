@@ -262,7 +262,8 @@ def budget_graph(chains=12):
 
 def canonical_qwen():
     from mindie_sim import compose_case, target_graphs
-    raw = compose_case("Qwen3.8-27B", hardware="a3", tp=4, layers=1)
+    raw = compose_case("Qwen3.8-27B", hardware="a3", tp=4, layers=1,
+                       quant="bf16", va_recommended=True)
     ops = target_graphs(raw, scope="body", phase="decode", tokens=16)[0]
     return raw, ops
 

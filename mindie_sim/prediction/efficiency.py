@@ -39,6 +39,8 @@ DEFAULT_MAX_SEQUENCES = 256
 DEFAULT_TARGET_MBU = 0.80
 DEFAULT_TARGET_CUBE_MFU = 0.75
 DEFAULT_TARGET_VEC_MFU = 0.65
+NON_MONOTONIC_PROBE_CAP = 4
+SLA_HEADROOM_PROBE_STEPS = 3
 
 from collections import defaultdict
 from collections.abc import Mapping, Sequence
@@ -1013,6 +1015,7 @@ def analyze_network_efficiency(
     operator_report: Mapping[str, Any] | None = None, graph_report: Mapping[str, Any] | None = None,
     observed_durations_ms: Mapping[str, float] | None = None, pmu_by_op: Mapping[str, Mapping[str, float]] | None = None,
     run_graph: bool = True, _precomputed_graph: tuple[Any, CaseSpec, dict[str, Any]] | None = None,
+    evaluation_context: Any | None = None,
 ) -> dict[str, Any]:
     """Compute whole-network 4D MFU/MBU/CV efficiency and bottleneck breakdowns."""
     _validate_geometry(phase, tokens, context, sequences, scope)
@@ -1024,7 +1027,8 @@ def analyze_network_efficiency(
         operator_report, auto_graph = _fast_operator_and_graph_reports(
             parsed, phase=phase, tokens=tokens, context=context,
             sequences=sequences, scope=scope, run_graph=run_graph,
-            precomputed_graph=_precomputed_graph, evaluation_context=evaluation)
+            precomputed_graph=_precomputed_graph,
+            evaluation_context=evaluation_context or evaluation)
         graph_report = auto_graph if graph_report is None else graph_report
 
     raw_rows = [r for r in operator_report["operators"] if r.get("replica", 0) == 0] or list(operator_report["operators"])
@@ -1680,8 +1684,12 @@ def solve_sla_sizing(
     target_cube_mfu: float = DEFAULT_TARGET_CUBE_MFU,
     target_vec_mfu: float = DEFAULT_TARGET_VEC_MFU,
     scenarios: Sequence[Mapping[str, Any]] | None = None, b1_analysis: Mapping[str, Any] | None = None,
+    evaluation_context: Any | None = None,
+    deadline_monotonic: float | None = None,
 ) -> dict[str, Any]:
     """Solve SLA-constrained maximum concurrency B*_SLA and throughput across hardware scenarios."""
+    from .evaluation import check_active_deadline
+    check_active_deadline()
     _check_pos_float("sla_ms", sla_ms)
     if isinstance(max_sequences_per_dp, bool) or not isinstance(max_sequences_per_dp, int) or max_sequences_per_dp < 1:
         raise ValueError(f"max_sequences_per_dp_must_be_positive_int:{max_sequences_per_dp}")
@@ -1723,16 +1731,24 @@ def solve_sla_sizing(
             scaled_cases[s_key] = scale_case_hardware(parsed, **dict(zip(_SCALE_KEYS, s_key)))
         return scaled_cases[s_key]
 
+    baseline_scales = tuple(1.0 for _ in _SCALE_KEYS)
+
     def get_bundle(s_key: tuple[float, ...], b: int) -> tuple[Any, CaseSpec, dict[str, Any]]:
+        check_active_deadline()
         if (s_key, b) not in graph_cache:
             if b not in graphs_by_b:
                 graphs_by_b[b] = target_graphs(parsed, phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope)
-            g, ec, gr = _lower_and_run_graph(get_scaled(s_key), phase=phase, tokens=q_tokens, context=context, sequences=b, scope=scope, run_graph=True, lowered_graphs=graphs_by_b[b])
+            context_reuse = evaluation_context if s_key == baseline_scales else None
+            g, ec, gr = _lower_and_run_graph(
+                get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
+                sequences=b, scope=scope, run_graph=True,
+                lowered_graphs=graphs_by_b[b], evaluation_context=context_reuse)
             assert gr is not None
             graph_cache[s_key, b] = (g, ec, gr)
         return graph_cache[s_key, b]
 
     def get_analysis(s_key: tuple[float, ...], b: int) -> dict[str, Any]:
+        check_active_deadline()
         if (s_key, b) not in analysis_cache:
             # ``b1_analysis`` is retained only for API compatibility.  It does not
             # carry the case plan/boundary identity needed to prove the same input,
@@ -1741,7 +1757,9 @@ def solve_sla_sizing(
             analysis_cache[s_key, b] = analyze_network_efficiency(
                 get_scaled(s_key), phase=phase, tokens=q_tokens, context=context,
                 sequences=b, scope=scope, run_graph=True,
-                _precomputed_graph=get_bundle(s_key, b))
+                _precomputed_graph=get_bundle(s_key, b),
+                evaluation_context=(evaluation_context
+                                    if s_key == baseline_scales else None))
         return analysis_cache[s_key, b]
 
     def eval_at(scen: Mapping[str, Any], s_key: tuple[float, ...], b: int, *, full: bool = False) -> dict[str, Any]:
@@ -1784,15 +1802,29 @@ def solve_sla_sizing(
             domain_cap, domain_reason = min(domain_cap, b - 1), str(exc)
             return False
 
+    memory_cache: dict[tuple[int, bool | None, float], Memory] = {}
+
+    def memory_for(tokens: int, async_scheduling: bool | None, scale: float) -> Memory:
+        key = (int(tokens), async_scheduling, float(scale))
+        if key not in memory_cache:
+            base_case = (scale_case_hardware(parsed, hbm_capacity_scale=scale)
+                         if scale != 1.0 else parsed)
+            if async_scheduling is not None:
+                base_case = replace(base_case, runtime=replace(
+                    base_case.runtime, async_scheduling=bool(async_scheduling)))
+            memory_cache[key] = Memory(base_case, workspace_tokens=int(tokens))
+        return memory_cache[key]
+
     def solve_one(scen: Mapping[str, Any]) -> dict[str, Any]:
         nonlocal base_b_hint
+        check_active_deadline()
         s_key = tuple(float(scen.get(k, 1.0)) for k in _SCALE_KEYS)
         if s_key[4] not in vram_by_cap:
-            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase)
-            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase)
+            b_sync = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=False, phase=phase, memory=memory_for(q_tokens, False, s_key[4]))
+            b_async = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, async_scheduling=True, phase=phase, memory=memory_for(q_tokens, True, s_key[4]))
             b_cfg = b_async if parsed.runtime.async_scheduling else b_sync
             if parsed.runtime.memory:
-                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase)
+                b_cfg = _vram_max_sequences_per_dp(parsed, context=context, tokens_per_seq=q_tokens, output_budget=output_budget, hbm_capacity_scale=s_key[4], emitted_tokens_per_seq=emit_tokens, phase=phase, memory=memory_for(q_tokens, None, s_key[4]))
             vram_by_cap[s_key[4]] = (b_cfg, b_sync, b_async)
         (b_vram, b_vram_sync, b_vram_async) = vram_by_cap[s_key[4]]
         if phase == "prefill":
@@ -1800,10 +1832,12 @@ def solve_sla_sizing(
             verify_tokens = decode_q_tokens
             b_life_sync = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
                                                       output_budget=output_budget, hbm_capacity_scale=s_key[4],
-                                                      emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=False, phase="decode")
+                                                      emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=False, phase="decode",
+                                                      memory=memory_for(verify_tokens, False, s_key[4]))
             b_life_async = _vram_max_sequences_per_dp(parsed, context=life_ctx, tokens_per_seq=verify_tokens,
                                                        output_budget=output_budget, hbm_capacity_scale=s_key[4],
-                                                       emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=True, phase="decode")
+                                                       emitted_tokens_per_seq=decode_emit_tokens, async_scheduling=True, phase="decode",
+                                                       memory=memory_for(verify_tokens, True, s_key[4]))
             b_lifecycle = b_life_async if parsed.runtime.async_scheduling else b_life_sync
         else:
             life_ctx = context
@@ -1945,7 +1979,7 @@ def solve_sla_sizing(
 
         bounded_probes = []
         if b1_ms > sla_ms:
-            probe_ceiling = min(eff_max, 4)
+            probe_ceiling = min(eff_max, NON_MONOTONIC_PROBE_CAP)
             probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(2, probe_ceiling + 1)}
             bounded_probes = list(probe_results)
             feasible_above = [probe for probe, ok in probe_results.items() if ok]
@@ -1981,7 +2015,7 @@ def solve_sla_sizing(
             eval_sla = eval_at(scen, s_key, max(1, b_sla), full=True)
 
         if b_sla > 0 and b_sla < min(b_max, domain_cap) and bucket_keys:
-            ceiling = min(min(b_max, domain_cap), b_sla + 3)
+            ceiling = min(min(b_max, domain_cap), b_sla + SLA_HEADROOM_PROBE_STEPS)
             probe_results = {probe: try_step_ok(scen, s_key, probe, seen=evaluated_b, checks=candidate_checks, capacity_max=b_joint) for probe in range(b_sla + 1, ceiling + 1)}
             bounded_probes.extend(probe_results)
             feasible_above = [probe for probe, ok in probe_results.items() if ok]
@@ -2168,3 +2202,6 @@ def solve_sla_sizing(
                        "bounded_non_monotonic_dispatch_probe": True,
                        "status_interpretation": "feasible_candidate_found_or_explicit_sla_capacity_domain_infeasibility"},
             "async_scheduling_memory": async_mem_summary, "scenarios": results}
+
+
+solve_hardware_sla_throughput = solve_sla_sizing

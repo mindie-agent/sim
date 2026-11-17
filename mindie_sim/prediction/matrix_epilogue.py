@@ -16,8 +16,6 @@ import math
 from mindie_sim.schema.common import ModelingError, dtype_bytes
 
 
-ZERO = 0
-ZERO_FLOAT = 0.0
 TOLERANCE = 1e-12
 SUPPORTED_EPILOGUES = ("row_column_scale",)
 TYPED_SCALE_SLOTS = ("activation", "weight", "weight_scale", "activation_scale")
@@ -100,7 +98,7 @@ def _declared_epilogue(op):
     result = MatrixEpilogue(*(float(raw[key]) for key in
                               ("row_scale_bytes", "column_scale_bytes",
                                "operations_per_output")))
-    if any(not math.isfinite(value) or value < ZERO_FLOAT for value in
+    if any(not math.isfinite(value) or value < 0.0 for value in
            (result.row_scale_bytes, result.column_scale_bytes,
             result.operations_per_output)):
         raise ModelingError("matrix_epilogue_work_must_be_finite_nonnegative")
@@ -115,10 +113,10 @@ def _declared_epilogue(op):
         # rows remain an explicit error.
         metadata = dict(op.metadata)
         declared = {
-            int(metadata.get("graph_active_query_rows", ZERO) or ZERO),
-            int(metadata.get("graph_physical_query_rows", ZERO) or ZERO),
+            int(metadata.get("graph_active_query_rows", 0) or 0),
+            int(metadata.get("graph_physical_query_rows", 0) or 0),
         }
-        if not any(row > ZERO and math.isclose(
+        if not any(row > 0 and math.isclose(
                 op.vector_ops, result.operations_per_output * row * n,
                 rel_tol=TOLERANCE, abs_tol=TOLERANCE) for row in declared):
             raise ModelingError(

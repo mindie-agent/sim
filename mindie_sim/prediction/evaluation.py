@@ -30,6 +30,8 @@ from __future__ import annotations
 
 from collections import OrderedDict
 from dataclasses import dataclass, field
+from contextvars import ContextVar
+import time
 import hashlib
 import json
 from typing import Any, Mapping
@@ -38,8 +40,6 @@ from mindie_sim.schema.case import Case as CaseSpec
 
 
 BOUNDED_CACHE_LIMIT = 4096
-ZERO = 0
-ONE = 1
 SIGNATURE_JSON_FLAGS = {"sort_keys": True, "separators": (",", ":"), "default": str}
 
 
@@ -61,20 +61,20 @@ class BoundedCache:
     __slots__ = ("_data", "limit", "hits", "misses", "evictions")
 
     def __init__(self, limit: int = BOUNDED_CACHE_LIMIT) -> None:
-        self.limit = max(ONE, int(limit))
+        self.limit = max(1, int(limit))
         self._data: "OrderedDict[Any, Any]" = OrderedDict()
-        self.hits = ZERO
-        self.misses = ZERO
-        self.evictions = ZERO
+        self.hits = 0
+        self.misses = 0
+        self.evictions = 0
 
     def get(self, key: Any, default: Any = None) -> Any:
         try:
             value = self._data.pop(key)
         except KeyError:
-            self.misses += ONE
+            self.misses += 1
             return default
         self._data[key] = value
-        self.hits += ONE
+        self.hits += 1
         return value
 
     def put(self, key: Any, value: Any) -> Any:
@@ -83,7 +83,7 @@ class BoundedCache:
         self._data[key] = value
         while len(self._data) > self.limit:
             self._data.popitem(last=False)
-            self.evictions += ONE
+            self.evictions += 1
         return value
 
     __setitem__ = put
@@ -180,6 +180,18 @@ def _runtime_signature(case: CaseSpec) -> tuple:
     )
 
 
+#: Cooperative per-candidate/outer sweep deadline.  Every pricing loop polls
+#: this value; no signal handler, thread or subprocess is involved.
+ACTIVE_DEADLINE_MONO: ContextVar[float | None] = ContextVar(
+    "mindie_sim_deadline_mono", default=None)
+
+
+def check_active_deadline() -> None:
+    deadline = ACTIVE_DEADLINE_MONO.get()
+    if deadline is not None and time.monotonic() > deadline:
+        raise TimeoutError("simulation_deadline_exceeded")
+
+
 @dataclass(frozen=True)
 class ExecutionBindings:
     """Immutable bindings shared by graph, operator, cohort and efficiency runs."""
@@ -191,6 +203,7 @@ class ExecutionBindings:
     pools: tuple = ()
     topology: Any = None
     recipes: Any = None
+    stage_profiles: tuple = ()
 
     @classmethod
     def create(cls, case: CaseSpec, recipes: Any = None) -> "ExecutionBindings":
@@ -204,11 +217,20 @@ class ExecutionBindings:
             hardware.digest(), geometry, _runtime_signature(case),
             tuple(getattr(item, "name", str(item)) for item in topology.resources()),
         )
+        from .execution import build_stage_profiles
+        profiles = build_stage_profiles(case, "")
         return cls(hardware=hardware, resource_signature=signature,
-                   stage_geometry=geometry, topology=topology, recipes=recipes)
+                   stage_geometry=geometry, topology=topology, recipes=recipes,
+                   stage_profiles=profiles)
 
     def signature_for(self, stage: int, replica: int) -> tuple:
         return (self.resource_signature, int(stage), int(replica))
+
+    def profile_key(self, replica: int, stage: int) -> tuple:
+        for profile in self.stage_profiles:
+            if profile.replica == int(replica) and profile.stage == int(stage):
+                return profile.profile_key
+        return (self.resource_signature, int(replica), int(stage))
 
     def with_recipes(self, recipes: Any) -> "ExecutionBindings":
         if recipes is self.recipes:
@@ -216,7 +238,8 @@ class ExecutionBindings:
         return ExecutionBindings(
             hardware=self.hardware, resource_signature=self.resource_signature,
             stage_geometry=self.stage_geometry, resources=self.resources,
-            pools=self.pools, topology=self.topology, recipes=recipes)
+            pools=self.pools, topology=self.topology, recipes=recipes,
+            stage_profiles=self.stage_profiles)
 
 
 @dataclass
@@ -234,8 +257,8 @@ class EvaluationContext:
     #: reused across evaluations of the same declaration.
     recipe_origin: str = "caller"
     construction_counts: dict[str, int] = field(
-        default_factory=lambda: {"cost_models": ONE, "bindings": ONE,
-                                 "contexts": ONE})
+        default_factory=lambda: {"cost_models": 1, "bindings": 1,
+                                 "contexts": 1})
 
     @classmethod
     def create(cls, case: CaseSpec, recipes: Any = None,

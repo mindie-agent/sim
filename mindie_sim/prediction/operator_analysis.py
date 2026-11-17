@@ -22,8 +22,6 @@ from .body_defaults import (TargetGraphSet, TargetOperators, consume_target_decl
                             effective_body_declaration)
 from .graph import annotate_geometry
 
-ZERO = 0
-ONE = 1
 
 
 def _analysis_prefix_fields(case, index: int, context: int) -> dict:
@@ -31,7 +29,7 @@ def _analysis_prefix_fields(case, index: int, context: int) -> dict:
     if not requests:
         return {}
     spec = requests[index % len(requests)]
-    declared = max(ZERO, min(int(context), int(getattr(spec, "prefix_tokens", ZERO) or ZERO)))
+    declared = max(0, min(int(context), int(getattr(spec, "prefix_tokens", 0) or 0)))
     key = str(getattr(spec, "prefix_cache_key", "") or "")
     if not declared and not key:
         return {}
@@ -86,7 +84,7 @@ class ModelGraphSet(dict):
         return self.programs[replica]
 
 
-def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="body",
+def target_operators(case, *, phase, tokens, context=0, sequences=1, scope="body",
                      media_tokens_per_sequence=None, resource_fusion=True,
                      draft_prepare=False, apply_body_defaults=True,
                      routing_views=None, physical_rank=None, query_position=None,
@@ -112,11 +110,11 @@ def target_operators(case, *, phase, tokens, context=ZERO, sequences=ONE, scope=
             draft_prepare=draft_prepare,
             **_analysis_prefix_fields(case, index, context),
         )
-        for index in range(max(ZERO, view_count))
+        for index in range(max(0, view_count))
     )
     case = _media_case(case, views, scope, media_tokens_per_sequence)
     from .local_tp_groups import local_tp_spans_dp
-    if (len(group) > ONE
+    if (len(group) > 1
             and (case.runtime.kernels.get("sequence_parallel")
                  or local_tp_spans_dp(case.runtime.parallel))):
         # A single rank cannot resolve cross-DP SP without the complete
@@ -179,7 +177,7 @@ def _check_draft_preparation(case, phase, scope, enabled):
 
 
 def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
-                cohort_tokens=None, phase=None, replica=ZERO, active_rows=None,
+                cohort_tokens=None, phase=None, replica=0, active_rows=None,
                 source_rows_by_replica=None, routing_global_tokens=None,
                 routing_views=None, physical_rank=None, query_position=None,
                 model_programs=None, layer_limit=None):
@@ -238,7 +236,7 @@ def _target_ops(case, views, scope, *, global_views=None, resource_fusion=True,
         if pcp_cohort else global_tokens
     )
     ops, _ = frontend.body(case.model, case.runtime, local, ready="analysis_input",
-                          tokens=local_tokens, mode=views[ZERO].phase if views else phase,
+                          tokens=local_tokens, mode=views[0].phase if views else phase,
                           global_tokens=body_global_tokens, replica=replica,
                           source_rows_by_replica=source_rows_by_replica,
                           routing_global_tokens=routing_global_tokens,
@@ -329,7 +327,7 @@ def _routing_views_for(value, replica):
     return value
 
 
-def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="model",
+def target_graphs(case, *, phase, tokens, context=0, sequences=1, scope="model",
                   media_tokens_per_sequence=None, resource_fusion=True,
                   draft_prepare=False, apply_body_defaults=True,
                   padded_idle=False, routing_views=None, physical_rank=None,
@@ -476,7 +474,7 @@ def target_graphs(case, *, phase, tokens, context=ZERO, sequences=ONE, scope="mo
     graphs = lower_local_projection_tp_cohort(
         graphs, model=case.model, runtime=case.runtime, machine=case.machine)
     reuse_mode = str(getattr(case.runtime, "homogeneous_graph_reuse", "off"))
-    if len(graphs) > ONE and reuse_mode != "off":
+    if len(graphs) > 1 and reuse_mode != "off":
         # The same ordinary cohort producer proves and rebinds replicas; a
         # "require" declaration therefore fails before pricing an unproved
         # asymmetric cohort instead of silently running full duplicates.
@@ -506,8 +504,8 @@ def model_graphs(value, *, phase, tokens, context=0, sequences=1, scope="model",
         pure_model=True, **options)
 
 
-def model_program(value, *, phase, tokens, context=ZERO, sequences=ONE,
-                  assembly="model", selected_replica=ZERO, cohort=None,
+def model_program(value, *, phase, tokens, context=0, sequences=1,
+                  assembly="model", selected_replica=0, cohort=None,
                   apply_body_defaults=False, **options):
     """Assemble a pure-model forward through the existing ``Frontend.program``.
 
@@ -601,9 +599,9 @@ def _cost_row(execution, op, recipe, context, *, identity, count, duration,
            if context.joint_native_service is not None else {}),
         **_service_regime_row(context, duration),
         "service_delta": {
-            key: serviced.get(key, ZERO) - context.work.get(key, ZERO)
+            key: serviced.get(key, 0) - context.work.get(key, 0)
             for key in serviced.keys() | context.work.keys()
-            if serviced.get(key, ZERO) != context.work.get(key, ZERO)},
+            if serviced.get(key, 0) != context.work.get(key, 0)},
         "duration_ms": duration, "total_ms": duration * count,
         "input_ready_ms": input_ready_ms, "service_before_input": early_service,
         "serviced": {key: value for key, value in serviced.items() if value},
@@ -615,13 +613,74 @@ def _cost_row(execution, op, recipe, context, *, identity, count, duration,
     }
 
 
+def _remap_replica_refs(value, source: int, target: int):
+    """Rename one replica's resource scope, recursively, without touching work."""
+    if source == target:
+        return value
+    old, new = f"@r{source}:", f"@r{target}:"
+    if isinstance(value, str):
+        return value.replace(old, new)
+    if isinstance(value, Mapping):
+        return {_remap_replica_refs(key, source, target):
+                _remap_replica_refs(item, source, target)
+                for key, item in value.items()}
+    if isinstance(value, list):
+        return [_remap_replica_refs(item, source, target) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_remap_replica_refs(item, source, target) for item in value)
+    return value
+
+
+_REPLICA_SCOPED_FIELDS = (
+    "serviced", "service_before_input", "peak_buffers", "remaining_buffers",
+    "peak_buffers_per_unit",
+)
+
+
+def _remap_replica_scopes(row, source: int, target: int):
+    """Rename only resource-keyed row fields; operator metadata is current."""
+    if source == target:
+        return row
+    old, new = f"@r{source}:", f"@r{target}:"
+    for key in _REPLICA_SCOPED_FIELDS:
+        value = row.get(key)
+        if isinstance(value, Mapping):
+            row[key] = {str(name).replace(old, new): item
+                        for name, item in value.items()}
+    if "communication" in row:
+        row["communication"] = _remap_replica_refs(
+            row["communication"], int(source), int(target))
+    return row
+
+
+def _cached_operator_row(cached, op, identity, replica, count):
+    """Restore current declaration identity on a homogeneously priced row."""
+    row = dict(cached)
+    row["operator"] = replace(op, deps=(), requests=()).to_dict()
+    row["physical_id"] = identity
+    row = _remap_replica_scopes(row, 0, int(replica))
+    basis = row.get("basis")
+    old_id = str(dict(cached.get("operator") or {}).get("op_id") or "")
+    if isinstance(basis, Mapping) and old_id and old_id != op.op_id:
+        occurrences = basis.get("operator_occurrences")
+        if isinstance(occurrences, Mapping) and old_id in occurrences:
+            occurrences = dict(occurrences)
+            occurrences[op.op_id] = occurrences.pop(old_id)
+            basis = dict(basis)
+            basis["operator_occurrences"] = occurrences
+            row["basis"] = basis
+    row["occurrences"] = int(count)
+    row["total_ms"] = float(cached["duration_ms"]) * int(count)
+    return row
+
+
 def _communication_description(accounting, recipe):
     describe = getattr(recipe, "accounting_description", None)
     return describe(accounting) if describe else accounting.to_dict()
 
 
 def cohort_operator_costs(case, ops, *, recipes, primitives=None,
-                          replay_scope="none", input_ready_ms=ZERO,
+                          replay_scope="none", input_ready_ms=0,
                           evaluation=None):
     """Isolate one complete transport cohort, attributing wire to source ranks."""
     from .cost import CostLedger
@@ -777,7 +836,7 @@ def _replay_scope(ops, declared):
 
 
 def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=None,
-                    input_ready_ms=ZERO, replica=ZERO, evaluation=None):
+                    input_ready_ms=0, replica=0, evaluation=None):
     """Price local operators or complete replica->operators cohort mappings."""
     from .program import RecipeBook
     if input_ready_ms < 0 or not math.isfinite(input_ready_ms):
@@ -813,24 +872,28 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         groups[key]["count"] += 1
     rows = []
     isolated_cache = getattr(ctx, "isolated_results", None)
+    execution = None
     for group in groups.values():
         op = group["op"]
         signature = physical_signature(op)
-        cache_key = (int(replica), str(op.op_id), signature, replay_scope,
+        identity = physical_id(op)
+        profile_key = ctx.bindings.profile_key(replica, op.stage)
+        cache_key = (profile_key, int(op.stage), signature, replay_scope,
                      float(input_ready_ms))
         if isolated_cache is not None:
             cached = isolated_cache.get(cache_key)
             if cached is not None:
-                rows.append({**dict(cached),
-                             "occurrences": int(group["count"]),
-                             "total_ms": float(cached["duration_ms"])
-                             * int(group["count"])})
+                rows.append(_cached_operator_row(
+                    cached, op, identity, replica, int(group["count"])))
                 continue
         from .cost import CostLedger
-        execution = Execution(
-            case, ctx.cost, recipes=recipes,
-            bindings=ctx.bindings, ledger=CostLedger())
-        identity = physical_id(op)
+        if execution is None:
+            execution = Execution(
+                case, ctx.cost, recipes=recipes,
+                bindings=ctx.bindings, ledger=CostLedger(),
+                isolated_replica=int(replica))
+        else:
+            execution.reset_engine()
         op, recipe = execution.prepare(op, replica)
         if requires_collective_cohort(case, op, recipe):
             raise ValueError(
@@ -869,7 +932,9 @@ def operator_costs(case, ops, *, recipes=None, primitives=None, replay_scope=Non
         }
         rows.append(row)
         if isolated_cache is not None:
-            isolated_cache.put(cache_key, row)
+            isolated_cache.put(
+                cache_key,
+                _remap_replica_scopes(dict(row), int(replica), 0))
     from .exposed_breakdown import unavailable_breakdown
     return {
         "schema": "mindie-sim.operators/1",

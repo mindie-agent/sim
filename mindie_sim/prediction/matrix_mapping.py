@@ -23,12 +23,6 @@ from .matrix_epilogue import MatrixEpilogue
 from .ownership import read_role
 
 
-ZERO = 0
-ONE = 1
-FIRST = 0
-LAST = -1
-SECOND_LAST = -2
-LAST_THREE = -3
 REFILL_M = 128
 MIN_NARROW_N = 32
 MAX_SPLIT_K = 32
@@ -520,10 +514,10 @@ def mapping_bound(context, recipe, *, geometry=None):
     demands = {}
     for role, values in (
         (read_role(names), private),
-        (read_role(names, aiv=FIRST), scales),
+        (read_role(names, aiv=0), scales),
         ("mte1", inner),
         ("mte3", [context.op.mte3_bytes * area / (total_m * n) for _, _, _, area in owners]),
-        ("cube", [context.work.get(names["cube"], ZERO) * area / (total_m * n)
+        ("cube", [context.work.get(names["cube"], 0) * area / (total_m * n)
                   for _, _, _, area in owners]),
         ("vector", [epilogue.operations_per_output * area for _, _, _, area in owners]),
     ):
@@ -585,9 +579,9 @@ def _op_matrix_key(op):
     return (
         op.local_shape, op.semantic_shape, op.padded_shape,
         op.dtype, op.mte2_bytes, op.mte3_bytes, op.vector_ops,
-        meta.get("matrix_groups", ONE), meta.get("compute_format"), meta.get("output_format"),
-        meta.get("packed_weight_bytes", ZERO), meta.get("row_scale_bytes", ZERO),
-        meta.get("column_scale_bytes", ZERO), meta.get("epilogue_ops_per_element", ZERO),
+        meta.get("matrix_groups", 1), meta.get("compute_format"), meta.get("output_format"),
+        meta.get("packed_weight_bytes", 0), meta.get("row_scale_bytes", 0),
+        meta.get("column_scale_bytes", 0), meta.get("epilogue_ops_per_element", 0),
         MatrixEpilogue.from_op(op),
     )
 
@@ -621,16 +615,16 @@ class MappedMatmul:
         selected = None
         selected_geometry = None
         meta = dict(context.op.metadata)
-        groups = int(meta.get("matrix_groups", ONE))
-        if groups < ONE or context.op.local_shape[LAST_THREE] % groups:
+        groups = int(meta.get("matrix_groups", 1))
+        if groups < 1 or context.op.local_shape[(-3)] % groups:
             raise ModelingError("matrix_groups_require_equal_integer_rows")
         compute_format = meta.get("compute_format", context.op.dtype or "bf16")
-        m = context.op.local_shape[LAST_THREE] // groups
-        n = context.op.local_shape[SECOND_LAST]
+        m = context.op.local_shape[(-3)] // groups
+        n = context.op.local_shape[(-2)]
         default_grid = math.ceil(m / REFILL_M) * math.ceil(n / REFILL_M) * groups
         a5_l2_supply = (
-            float(context.rates.get("mte2_aic", ZERO)) >= A5_L2_MTE2_RATE
-            or float(context.compute_peaks.get("bf16", ZERO)) >= A5_BF16_PEAK_FLOOR)
+            float(context.rates.get("mte2_aic", 0)) >= A5_L2_MTE2_RATE
+            or float(context.compute_peaks.get("bf16", 0)) >= A5_BF16_PEAK_FLOOR)
         automatic_subtiles = a5_l2_supply and (
             self.candidates is None
             or m < context.core_count * REFILL_M
@@ -649,13 +643,13 @@ class MappedMatmul:
             del is_narrow
             cm = min(self.compute_m, tm)
             cn = min(self.compute_n, tn)
-            k = context.op.local_shape[LAST]
+            k = context.op.local_shape[(-1)]
             output_tiles = (math.ceil(m / tm) * math.ceil(n / tn) * groups)
-            split_k = ONE
+            split_k = 1
             if output_tiles < context.core_count and k > tk:
                 split_k = min(
                     k // tk,
-                    max(ONE, context.core_count // max(ONE, output_tiles)),
+                    max(1, context.core_count // max(1, output_tiles)),
                     MAX_SPLIT_K,
                 )
             recipe = HierarchicalMatmul(
@@ -663,7 +657,7 @@ class MappedMatmul:
                 self.slots, self.compute_slots, self.reuse_inputs,
                 self.reuse_weights, split_k)
             if min(tm, tn, tk, self.compute_m, self.compute_n,
-                   self.slots, self.compute_slots) < ONE:
+                   self.slots, self.compute_slots) < 1:
                 raise ModelingError("matrix_tile_dimensions_and_slots_must_be_positive")
             if tm % cm or tn % cn:
                 raise ModelingError("matrix_refill_tiles_must_be_multiples_of_compute_tiles")
@@ -696,9 +690,9 @@ class MappedMatmul:
         if selected is None:
             raise ModelingError(f"matrix_no_feasible_declared_mapping:"
                                 f"shape={context.op.local_shape}:groups={groups}:dtype={context.op.dtype}")
-        res = selected[ONE], {
+        res = selected[1], {
             "basis": "declared_candidates_resource_lower_bound",
-            "shape": list(context.op.local_shape[LAST_THREE:]),
+            "shape": list(context.op.local_shape[(-3):]),
             "groups": groups,
             "default_128_grid_tiles": default_grid,
             "physical_compute_owners": context.core_count,
@@ -706,13 +700,13 @@ class MappedMatmul:
                                if automatic_subtiles else "explicit_only"),
             "underfilled_grid_candidates": bool(underfilled),
             "geometry": selected_geometry.to_dict(),
-            "selected": asdict(selected[ONE]), "candidates": records,
+            "selected": asdict(selected[1]), "candidates": records,
             "compute_precision_peaks": dict(context.compute_peaks),
             "capacity_screening": "declared_pools_only",
             "declared_pools": dict(context.pool_capacities),
             "read_role_bindings": {
                 "matrix_operands": read_role(context.resource_names),
-                "output_scales": read_role(context.resource_names, aiv=FIRST),
+                "output_scales": read_role(context.resource_names, aiv=0),
             },
             "unmodeled_transfer_roles": [role for role in (
                                         "mte1", read_role(context.resource_names),

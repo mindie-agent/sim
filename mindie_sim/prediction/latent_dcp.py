@@ -31,8 +31,6 @@ ZERO = 0
 def enabled(model, parallel, views, runtime=None):
     selected = bool(execution(model).get("dcp_query_gather"))
     nonlocal_phase = any(view.phase != "decode" for view in views)
-    if selected and nonlocal_phase and (parallel.cp > ONE or parallel.pcp != ONE):
-        raise ModelingError("gathered_head_dcp_requires_decode_pcp1")
     if not selected or nonlocal_phase:
         return False
     # Decode may use DCP even when physical PCP participants remain: every

@@ -19,14 +19,11 @@ from .physical_recipe_base import (IO_HBM_CATEGORY, Phase, build_plan,
                                    io_weight, phased_program)
 from .program import KernelProgram, Stage
 
-ZERO_FLOAT = 0.0
-ONE_FLOAT = 1.0
 HALF_SHARE = 0.5
 PACK_READ_SHARE = 0.25
 UNPACK_WRITE_SHARE = 0.25
 REDUCE_VECTOR_SHARE = 0.50
 MESH_ALGORITHM = "direct_mesh"
-LAST = -1
 ALLREDUCE_FAMILIES = frozenset({"allreduce", "tp_allreduce"})
 SINGLE_PHASE_FAMILIES = frozenset({
     "allgather", "reduce_scatter", "alltoall", "engram_broadcast", "engram_ids",
@@ -34,13 +31,13 @@ SINGLE_PHASE_FAMILIES = frozenset({
 
 
 def _pack_phase(read_share):
-    return Phase("pack", {IO_HBM_CATEGORY: read_share, "mte2": ONE_FLOAT})
+    return Phase("pack", {IO_HBM_CATEGORY: read_share, "mte2": 1.0})
 
 
 def _unpack_phase(write_share, after):
     return Phase("unpack_store", {
         IO_HBM_CATEGORY: write_share,
-        "mte3": ONE_FLOAT,
+        "mte3": 1.0,
     }, after=after)
 
 
@@ -50,10 +47,10 @@ def _mesh_phases(context, phases, family):
     write_share = io_weight(context, "hbm_write")
     result = [_pack_phase(read_share)]
     reduce = (REDUCE_VECTOR_SHARE if family in ALLREDUCE_FAMILIES
-              else ONE_FLOAT)
+              else 1.0)
     for name in phases:
-        result.append(Phase(name, {"vector": reduce}, after=(result[LAST].name,)))
-    result.append(_unpack_phase(write_share, after=(result[LAST].name,)))
+        result.append(Phase(name, {"vector": reduce}, after=(result[(-1)].name,)))
+    result.append(_unpack_phase(write_share, after=(result[(-1)].name,)))
     return tuple(result)
 
 
@@ -89,7 +86,7 @@ class TopologyCollectiveRecipe:
             return _with_setup(context, phases)
         phases = (
             _pack_phase(read_share),
-            Phase("peer_exchange", {"link": ONE_FLOAT},
+            Phase("peer_exchange", {"link": 1.0},
                   after=("pack",)),
             _unpack_phase(write_share, after=("peer_exchange",)),
         )
@@ -121,7 +118,7 @@ def _lower_mesh(context, plan):
 
 def _with_setup(context, phases):
     program = phased_program(context, phases)
-    if context.setup_ms > ZERO_FLOAT:
+    if context.setup_ms > 0.0:
         return KernelProgram((
             Stage("setup", latency=context.setup_ms),
             Stage("body", after=("setup",), program=program),

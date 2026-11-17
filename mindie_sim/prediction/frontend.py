@@ -45,7 +45,6 @@ from .implementation_selection import (
 from .recover_ssm_commit import bind_recover_ssm_commits, is_recover_ssm_intent
 from .recover_ssm_work import recover_ssm_enabled
 
-SEVEN = 7
 
 ZERO = 0
 ONE = 1
@@ -57,7 +56,6 @@ _ENV_FEATURES = 4
 ZERO_FLOAT = 0.0
 FINAL_LAYER = -1
 MIN_DBO_MICROBATCHES = 2
-EIGHT = 8
 
 
 def _scope(ops, block, role="body"):
@@ -1122,7 +1120,7 @@ class Frontend:
         )
         reused_archs = {}
         if (dispatch_fast_step and can_reuse_prev and decode_sig is not None
-                and prev_state[SEVEN] == decode_sig):
+                and prev_state[7] == decode_sig):
             prev_tmpls_fast = prev_state[2]
             for akey in unique_archs:
                 if akey[0].attention in {"gdn", "kda", "projection_only", "unmodeled"}:
@@ -1139,7 +1137,7 @@ class Frontend:
                     recipe="structural", replay_scope=scope,
                     implementation_selections=(prev_sel_c[2] if prev_sel_c is not None else ()),
                 )
-            if not selections and prev_state[EIGHT]:
+            if not selections and prev_state[8]:
                 prev_raw_pre, layer_offsets, prev_attn_splits, prev_final_ops = prev_state[8]
                 active_fast = [
                     rep_idx for akey, rep_idx in unique_archs.items()

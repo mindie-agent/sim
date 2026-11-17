@@ -89,12 +89,9 @@ _DEVICE_UNITS_CACHE: dict = {}
 _META_CACHE_LIMIT = 32768
 ZERO = 0
 ONE = 1
-TWO = 2
-THREE = 3
 FIRST = 0
 SECOND = 1
 HOST_LOOKAHEAD_DEFAULT = 8
-ZERO_FLOAT = 0.0
 
 
 def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
@@ -103,7 +100,7 @@ def meta_scan_flags(metadata) -> tuple[bool, bool, bool]:
         return False, False, False
     hit = _META_SCAN_CACHE.get(id(metadata))
     if hit is not None and hit[FIRST] is metadata:
-        return hit[SECOND], hit[TWO], hit[THREE]
+        return hit[SECOND], hit[2], hit[3]
     if isinstance(metadata, _AbcMapping):
         has_reb = any(k in _SCAN_REBIND_KEYS for k in metadata)
         has_rev = bool(metadata.get("reverse_of_collective"))
@@ -415,6 +412,109 @@ def _execution_geometry(device):
         tuple(sorted((role, dict(device.work_units).get(role, NATIVE_WORK_UNITS.get(role, "work")))
                      for role in roles | dict(device.service_modes).keys())),
     )
+
+
+@dataclass(frozen=True)
+class StageProfile:
+    """Immutable cluster-level rates, pools and die geometry for one stage."""
+
+    replica: int
+    stage: int
+    dies: tuple
+    geometry: tuple
+    rates: dict
+    names: dict
+    resources: tuple
+    stage_pools: dict
+    pools: dict
+    pool_units: dict
+    pool_units_by_name: dict
+    units: dict
+    compute_peaks: dict
+    pool_capacities: dict
+    service_modes: dict
+    work_units: dict
+    store_queues: dict
+    physical_mechanisms: Any
+
+    @property
+    def profile_key(self) -> tuple:
+        return (int(self.stage), self.geometry)
+
+
+def build_stage_profiles(case: CaseSpec, namespace: str = "", *,
+                         replicas=None) -> tuple[StageProfile, ...]:
+    """Resolve every stage's immutable hardware binding exactly once."""
+    p = case.runtime.parallel
+    width = p.tp * p.pcp
+    selected = range(p.dp) if replicas is None else tuple(replicas)
+    profiles: list[StageProfile] = []
+    for replica in selected:
+        for stage in range(p.pp):
+            start = (int(replica) * p.pp + stage) * width
+            dies = tuple(case.machine.dies[start:start + width])
+            if len(dies) != width:
+                raise ModelingError("placement_exceeds_physical_devices")
+            geometry = _execution_geometry(dies[0])
+            if any(_execution_geometry(die) != geometry for die in dies[1:]):
+                raise ModelingError(
+                    "representative_shard_requires_matching_resource_geometry:"
+                    f"replica={replica}:stage={stage};"
+                    "heterogeneous_owners_require_per_rank_execution")
+            roles = dict(dies[0].rates)
+            work_units = {**NATIVE_WORK_UNITS, **dict(dies[0].work_units)}
+            rates = {
+                role: (min(dict(die.rates)[role] for die in dies) / 1000,
+                       work_units.get(role, "work"))
+                for role in roles
+            }
+            rates.update({"cube": (1, "peak_ms"), "host": (1, "ms")})
+            names: dict[str, str] = {}
+            stage_resources: list[Resource] = []
+            for kind, (rate, unit) in rates.items():
+                label = {"cube": "matrix", "hbm": "memory"}.get(kind, kind)
+                name = f"{namespace}{label}@r{replica}:s{stage}"
+                stage_resources.append(Resource(
+                    name, rate, unit, "fifo" if kind == "host" else "fair",
+                    dies[0].units(kind)))
+                names[kind] = name
+            stage_pools: dict[str, str] = {}
+            pools: dict[str, float] = {}
+            pool_units: dict[str, int] = {}
+            for pool in dict(dies[0].buffers):
+                key = f"{namespace}{pool}@r{replica}:s{stage}"
+                pools[key] = min(dict(die.buffers)[pool] for die in dies)
+                pool_units[key] = dies[0].pool_units(pool)
+                stage_pools[str(pool)] = key
+            compute_peaks = {
+                dtype: min(die.peak(dtype) for die in dies)
+                for dtype, _ in dies[0].compute_peaks
+                if dtype not in dict(dies[0].compute_peak_aliases)
+            }
+            service_modes = {
+                mode: (role, min(dict(die.service_modes)[mode][1] for die in dies))
+                for mode, (role, _) in dies[0].service_modes
+            }
+            store_queues = {
+                name: dict(queue) for name, queue in dies[0].store_queues
+                if all(dict(die.store_queues).get(name) == queue for die in dies)
+            }
+            profiles.append(StageProfile(
+                replica=int(replica), stage=int(stage), dies=dies,
+                geometry=geometry, rates=rates, names=names,
+                resources=tuple(stage_resources), stage_pools=stage_pools,
+                pools=pools, pool_units=pool_units,
+                units={role: dies[0].units(role) for role in names},
+                pool_units_by_name={pool: dies[0].pool_units(pool)
+                                    for pool in dict(dies[0].buffers)},
+                compute_peaks=compute_peaks,
+                pool_capacities={pool: min(dict(die.buffers)[pool] for die in dies)
+                                 for pool in dict(dies[0].buffers)},
+                service_modes=service_modes, work_units=work_units,
+                store_queues=store_queues,
+                physical_mechanisms=dies[0].physical_mechanisms,
+            ))
+    return tuple(profiles)
 
 
 @dataclass(frozen=True)
@@ -1246,7 +1346,7 @@ class Execution:
         legacy_diagnostics: bool | None = None,
         fragment_state=None, memory=None,
         lazy_frontier: bool = True, host_lookahead: int = HOST_LOOKAHEAD_DEFAULT,
-        bindings=None, ledger=None,
+        bindings=None, ledger=None, isolated_replica: int | None = None,
     ):
         from .cost import CostLedger
         self.case, self.cost = case, cost
@@ -1303,49 +1403,48 @@ class Execution:
         resources.extend(offload_resources(
             self.offload_policy, namespace, case.runtime.parallel.dp, case.runtime.parallel.pp))
         p = case.runtime.parallel
-        width = p.tp * p.pcp
-        for replica in range(p.dp):
-            resources.append(Resource(f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
-            for stage in range(p.pp):
-                start = (replica * p.pp + stage) * width
-                dies = tuple(case.machine.dies[start:start + width])
-                if len(dies) != width:
-                    raise ModelingError("placement_exceeds_physical_devices")
-                geometry = _execution_geometry(dies[0])
-                if any(_execution_geometry(die) != geometry for die in dies[1:]):
-                    raise ModelingError(
-                        "representative_shard_requires_matching_resource_geometry:"
-                        f"replica={replica}:stage={stage};"
-                        "heterogeneous_owners_require_per_rank_execution")
-                self.stage_dies[replica, stage] = dies
-                roles = dict(dies[0].rates)
-                work_units = {**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)}
-                rates = {role: (min(dict(d.rates)[role] for d in dies) / 1000,
-                                work_units.get(role, "work")) for role in roles}
-                rates.update({"cube": (1, "peak_ms"), "host": (1, "ms")})
-                names = {}
-                for kind, (rate, unit) in rates.items():
-                    label = {"cube": "matrix", "hbm": "memory"}.get(kind, kind)
-                    name = f"{namespace}{label}@r{replica}:s{stage}"
-                    resources.append(Resource(
-                        name, rate, unit, "fifo" if kind == "host" else "fair",
-                        dies[0].units(kind)))
-                    names[kind] = name
-                self.stage_names[replica, stage] = names
-                stage_pools = {}
-                for pool in dict(dies[FIRST].buffers):
-                    key = f"{namespace}{pool}@r{replica}:s{stage}"
-                    pools[key] = min(dict(d.buffers)[pool] for d in dies)
-                    pool_units[key] = dies[FIRST].pool_units(pool)
-                    stage_pools[str(pool)] = key
-                self.stage_pools[replica, stage] = stage_pools
+        selected_replica = (
+            None if isolated_replica is None else int(isolated_replica))
+        self.stage_profiles: dict[tuple[int, int], StageProfile] = {}
+        profiles = None
+        if (bindings is not None and not namespace
+                and getattr(bindings, "stage_profiles", ())):
+            profiles = tuple(
+                profile for profile in bindings.stage_profiles
+                if selected_replica is None or profile.replica == selected_replica)
+        if not profiles:
+            profiles = build_stage_profiles(
+                case, namespace,
+                replicas=(None if selected_replica is None
+                          else (selected_replica,)))
+        if selected_replica is not None and not profiles:
+            raise ModelingError("isolated_replica_out_of_range")
+        active_ranks: set[int] = set()
+        scheduler_replicas: set[int] = set()
+        for profile in profiles:
+            replica, stage = profile.replica, profile.stage
+            if replica not in scheduler_replicas:
+                resources.append(Resource(
+                    f"{namespace}scheduler@r{replica}", 1, "ms", "fifo"))
+                scheduler_replicas.add(replica)
+            self.stage_dies[replica, stage] = profile.dies
+            self.stage_names[replica, stage] = profile.names
+            self.stage_pools[replica, stage] = profile.stage_pools
+            self.stage_profiles[replica, stage] = profile
+            resources.extend(profile.resources)
+            pools.update(profile.pools)
+            pool_units.update(profile.pool_units)
+            active_ranks.update(int(die.rank) for die in profile.dies)
         self.topology = (
             bindings.topology
             if bindings is not None and bindings.topology is not None
             and not namespace
             else Topology(case.machine, p, namespace,
                           collective_startup_mode=case.runtime.collective_startup_mode))
-        resources.extend(self.topology.resources())
+        if selected_replica is None:
+            resources.extend(self.topology.resources())
+        else:
+            resources.extend(self.topology.resources_for_ranks(active_ranks))
         if engine is None and self.memory is not None:
             # A Memory ledger already adopted by one RuntimeState owns that
             # single causal root.  Re-using the ledger therefore means re-using
@@ -1355,6 +1454,10 @@ class Execution:
             bound = getattr(self.memory, "runtime_state", None)
             if isinstance(bound, Engine):
                 engine = bound
+        self._engine_resource_templates = tuple(resources)
+        self._engine_pool_templates = dict(pools)
+        self._engine_pool_unit_templates = dict(pool_units)
+        self._engine_trace_limit = int(trace_limit)
         if engine is not None:
             engine.extend(resources, pools, pool_units)
         self.engine = engine if engine is not None else Engine(
@@ -1446,6 +1549,33 @@ class Execution:
                        if isinstance(profile, _AbcMapping) else ()):
             service = normalize_resource_service(record)
             self.resource_services[service.service_id] = service
+
+    def reset_engine(self) -> None:
+        """Renew only the mutable Engine root for the next isolated price."""
+        from .cost import CostLedger
+        self.ledger = CostLedger()
+        self.cost = _LedgerBoundCost(self.cost_model, self.ledger)
+        self.recipes_used = {}
+        self.engine = Engine(
+            list(self._engine_resource_templates),
+            pools=dict(self._engine_pool_templates),
+            pool_units=dict(self._engine_pool_unit_templates),
+            trace_limit=self._engine_trace_limit)
+        if self.memory is not None:
+            if not self.engine.bind_memory(self.memory, pools=("hbm",)):
+                raise ModelingError("execution_memory_ledger_conflict")
+        self.engine.ensure_state_ledger(None)
+        self.resource_rates = ResourceRates(self.engine.resources)
+        self.stage_contexts = {key: self._stage_context(key, dies)
+                               for key, dies in self.stage_dies.items()}
+        self._collectives = None
+        self._cohort_views = None
+        self.native_group_joins = {}
+        self.native_group_launches = {}
+        self._service_identity_cache = {}
+        self._prev_lazy_dag = None
+        self._prev_lazy_entries = None
+        self._prev_add_topology = None
 
     def _op_key(self, op):
         key = self._op_key_cache.get(id(op))
@@ -2740,28 +2870,46 @@ class Execution:
 
     def _stage_context(self, key, dies):
         replica, stage = key
-        names = self.stage_names[key]
+        profile = self.stage_profiles.get(key)
+        if profile is None:
+            names = self.stage_names[key]
+            return RecipeContext(
+                None, {}, names, self.resource_rates,
+                dies[FIRST].aic_count,
+                pool_names={pool: f"{self.namespace}{pool}@r{replica}:s{stage}"
+                            for pool in dict(dies[FIRST].buffers)},
+                resource_units={role: dies[FIRST].units(role) for role in names},
+                compute_peaks={dtype: min(d.peak(dtype) for d in dies)
+                               for dtype, _ in dies[FIRST].compute_peaks
+                               if dtype not in dict(dies[FIRST].compute_peak_aliases)},
+                pool_units={pool: dies[FIRST].pool_units(pool)
+                            for pool in dict(dies[FIRST].buffers)},
+                pool_capacities={pool: min(dict(d.buffers)[pool] for d in dies)
+                                 for pool in dict(dies[FIRST].buffers)},
+                record_mapping=self.cost.record_mapping,
+                service_modes={mode: (role, min(dict(d.service_modes)[mode][SECOND] for d in dies))
+                               for mode, (role, _) in dies[FIRST].service_modes},
+                record_service=self.cost.record_service,
+                work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
+                store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
+                              if all(dict(d.store_queues).get(name) == queue for d in dies)},
+                physical_mechanisms=dies[FIRST].physical_mechanisms,
+            )
         return RecipeContext(
-            None, {}, names, self.resource_rates,
-            dies[FIRST].aic_count,
-            pool_names={pool: f"{self.namespace}{pool}@r{replica}:s{stage}"
-                        for pool in dict(dies[FIRST].buffers)},
-            resource_units={role: dies[FIRST].units(role) for role in names},
-            compute_peaks={dtype: min(d.peak(dtype) for d in dies)
-                           for dtype, _ in dies[FIRST].compute_peaks
-                           if dtype not in dict(dies[FIRST].compute_peak_aliases)},
-            pool_units={pool: dies[FIRST].pool_units(pool)
-                        for pool in dict(dies[FIRST].buffers)},
-            pool_capacities={pool: min(dict(d.buffers)[pool] for d in dies)
-                             for pool in dict(dies[FIRST].buffers)},
+            None, {}, profile.names, self.resource_rates,
+            profile.dies[FIRST].aic_count,
+            pool_names=dict(profile.stage_pools),
+            resource_units=dict(profile.units),
+            compute_peaks=dict(profile.compute_peaks),
+            pool_units=dict(profile.pool_units_by_name),
+            pool_capacities=dict(profile.pool_capacities),
             record_mapping=self.cost.record_mapping,
-            service_modes={mode: (role, min(dict(d.service_modes)[mode][SECOND] for d in dies))
-                           for mode, (role, _) in dies[FIRST].service_modes},
+            service_modes=dict(profile.service_modes),
             record_service=self.cost.record_service,
-            work_units={**NATIVE_WORK_UNITS, **dict(dies[FIRST].work_units)},
-            store_queues={name: dict(queue) for name, queue in dies[FIRST].store_queues
-                          if all(dict(d.store_queues).get(name) == queue for d in dies)},
-            physical_mechanisms=dies[FIRST].physical_mechanisms,
+            work_units=dict(profile.work_units),
+            store_queues={name: dict(queue)
+                          for name, queue in profile.store_queues.items()},
+            physical_mechanisms=profile.physical_mechanisms,
         )
 
     def _context(self, op: Any, replica: int, scope: str, *, recipe=None) -> RecipeContext:
@@ -2866,7 +3014,7 @@ class Execution:
         # native binding must not require an unrelated source-dispatch registration.
         context = replace(
             context, work=demands,
-            minimum_ms=measured if self.legacy_diagnostics else ZERO_FLOAT,
+            minimum_ms=measured if self.legacy_diagnostics else 0.0,
             setup_ms=setup,
             service_identity={**dict(context.service_identity),
                               "transport_options": transport_options},
@@ -3258,7 +3406,7 @@ class Execution:
                     if not same_step_op:
                         trans_opts[(scope_str, op.op_id, replica)] = transport_options
                     if inv_cell is not None:
-                        if inv_cell[TWO] is cost_invs and inv_cell[THREE] is not None:
+                        if inv_cell[2] is cost_invs and inv_cell[3] is not None:
                             inv_cell[3]["invocations"] += 1
                         elif inv_cell[FIRST] in cost_invs:
                             li = cost_invs[inv_cell[0]]

@@ -21,6 +21,9 @@ from .prediction.primitives import PrimitiveKey, PrimitiveStore
 MAX_CLI_JSON_BYTES = 50 * 1024**2
 
 
+SWEEP_DEFAULT_MAX_SEQUENCES = 256
+
+
 class CliUsageError(RuntimeError):
     """Local usage rejection; never a profiler runtime dependency."""
 
@@ -238,6 +241,21 @@ def parser():
     sweep.add_argument("--scope", choices=("body", "model"), default="body")
     sweep.add_argument("--allow-pp", action="store_true")
     sweep.add_argument("--allow-pcp", action="store_true")
+    sweep.add_argument("--allow-dcp", action="store_true")
+    sweep.add_argument("--dcp-candidates", default=None,
+                       help="comma-separated DCP degrees")
+    sweep.add_argument("--num-devices-grid", default=None,
+                       help="comma-separated device counts, e.g. 2,4,8")
+    sweep.add_argument("--tokens-per-seq", type=int)
+    sweep.add_argument("--max-sequences-per-dp", type=int,
+                       default=SWEEP_DEFAULT_MAX_SEQUENCES)
+    sweep.add_argument("--candidates", default=None,
+                       help="JSON list of explicit candidate mappings")
+    sweep.add_argument("--two-stage", action="store_true")
+    sweep.add_argument("--candidate-timeout-s", type=float, default=None)
+    sweep.add_argument("--output-jsonl", default=None)
+    sweep.add_argument("--resume", action="store_true")
+    sweep.add_argument("--progress", action="store_true")
     sweep.add_argument("--output", "-o")
     add_runtime_arguments(sweep, command="sweep")
     sweep.add_argument("--hardware-derivations", default=None,
@@ -432,14 +450,42 @@ def run(args):
                 ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
             )
         from .cli_options import load_hardware_derivations
+        if args.resume and not args.output_jsonl:
+            raise CliUsageError("--resume requires --output-jsonl")
+        grids = ([int(item) for item in str(args.num_devices_grid).split(",")
+                  if item.strip()]
+                 if args.num_devices_grid else None)
+        dcp_candidates = ([int(item) for item in str(args.dcp_candidates).split(",")
+                            if item.strip()]
+                           if args.dcp_candidates else None)
+        explicit = (read_json(args.candidates) if args.candidates else None)
         derivations = (load_hardware_derivations(args.hardware_derivations)
                        if args.hardware_derivations else None)
+        progress = None
+        if args.progress:
+            def progress(row):
+                print(
+                    f"{row.get('candidate_id', '')} "
+                    f"{row.get('status', '')} "
+                    f"{row.get('evaluation_stage', '')} "
+                    f"d={row.get('num_devices', '')} "
+                    f"b1={row.get('step_ms_at_b1')}",
+                    file=sys.stderr, flush=True)
         return sweep_topologies(
-            case_data, num_devices=args.num_devices, sla_ms=args.sla_ms,
-            context=args.context, output_budget=args.output_budget,
+            case_data, candidates=explicit,
+            num_devices=args.num_devices, num_devices_grid=grids,
+            sla_ms=args.sla_ms, context=args.context,
+            tokens_per_seq=args.tokens_per_seq,
+            output_budget=args.output_budget,
+            max_sequences_per_dp=args.max_sequences_per_dp,
             phase=args.phase, scope=args.scope,
             allow_pp=args.allow_pp, allow_pcp=args.allow_pcp,
+            allow_dcp=args.allow_dcp, dcp_candidates=dcp_candidates,
             hardware_derivations=derivations,
+            two_stage=args.two_stage,
+            candidate_timeout_s=args.candidate_timeout_s,
+            output_jsonl=args.output_jsonl, resume=args.resume,
+            progress_callback=progress,
         )
     if args.command == "efficiency":
         from .prediction.efficiency import analyze_network_efficiency, fit_efficiency_targets

@@ -216,6 +216,17 @@ def _merge_channels(raw, profile):
         if unknown:
             field = sorted(unknown)[0]
             raise ModelingError(f"transfer_channel_field_unknown:{name}:{field}")
+        # A resized/materialized profile may carry a placeholder provenance
+        # value beside an explicitly resolved semantic.  Drop only the
+        # placeholder; a genuinely invalid standalone user value still fails
+        # the validation below.
+        if (patch.get("semantics") in _LINK_SEMANTICS
+                and patch.get("channel_semantics") in {"unknown", "none"}):
+            patch.pop("channel_semantics", None)
+        if (patch.get("channel_semantics") == "none"
+                and base[name].get("channel_semantics") == "none"
+                and all(patch.get(field) is None for field in _BW_FIELDS)):
+            patch.pop("channel_semantics", None)
         if "links" not in raw:
             for field in ("channel_semantics", "semantics"):
                 if field in patch and patch[field] not in _LINK_SEMANTICS:

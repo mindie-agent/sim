@@ -37,14 +37,22 @@ __all__ = [
     "Mc2LaunchView", "native_program_from_contract",
 ]
 
-_ZERO = 0
-_ONE = 1
-_TWO = 2
-_SIXTY_FOUR = 64
-_ONE_TWENTY_EIGHT = 128
-_THOUSAND = 1000
-_ZERO_FLOAT = 0.0
 _EPS = 1e-12
+AIV_PER_AIC = 2
+MIN_MC2_AIV_UNITS = 2
+NATIVE_PROGRAM_CACHE_MAXSIZE = 128
+US_PER_MS = 1000
+
+
+def _resolve_aiv_units(units_map: Mapping[str, int], *, core_count: int = 0) -> int:
+    """Vector AIV count: declared vector units, else AIC count * AIV_PER_AIC."""
+    vector = int(units_map.get("vector", 0) or 0)
+    if vector > 0:
+        return max(MIN_MC2_AIV_UNITS, vector)
+    aic = int(core_count or units_map.get("cube", 0) or 0)
+    if aic > 0:
+        return max(MIN_MC2_AIV_UNITS, aic * AIV_PER_AIC)
+    raise ModelingError("mc2_vector_units_undeclared")
 
 
 def _as_fraction(value: Any) -> Fraction:
@@ -67,7 +75,7 @@ def _as_fraction(value: Any) -> Fraction:
     raise ModelingError(f"expression_non_numeric:{value!r}")
 
 
-def _link_work(plan, ep: int, node_ranks: int = _ZERO):
+def _link_work(plan, ep: int, node_ranks: int = 0):
     """Add source-directed peer wire on the real intra/inter link classes.
 
     A fullmesh source sends to every peer.  When the EP group spans nodes, the
@@ -76,23 +84,23 @@ def _link_work(plan, ep: int, node_ranks: int = _ZERO):
     undeclared topology keeps one intra-node link class.
     """
     phases = []
-    peers = max(_ZERO, int(ep) - _ONE)
-    local_peers = (max(_ZERO, min(int(ep), int(node_ranks)) - _ONE)
-                   if node_ranks and int(node_ranks) > _ONE else peers)
+    peers = max(0, int(ep) - 1)
+    local_peers = (max(0, min(int(ep), int(node_ranks)) - 1)
+                   if node_ranks and int(node_ranks) > 1 else peers)
     remote_peers = peers - local_peers
     for phase in plan.phases:
         work = dict(phase.work)
         if phase.name in {"payload_exchange", "count_status_exchange"} and peers:
             # The source plan owns send/recv HBM and MTE3.  The peer wire is
             # the same record outside this rank; the diagonal stays local.
-            remote = _as_fraction(work.get("mte3", _ZERO)) * Fraction(peers, ep)
+            remote = _as_fraction(work.get("mte3", 0)) * Fraction(peers, ep)
             if remote_peers:
-                work["link_hccs"] = (work.get("link_hccs", Fraction(_ZERO))
+                work["link_hccs"] = (work.get("link_hccs", Fraction(0))
                                      + remote * Fraction(local_peers, peers))
-                work["link_roce"] = (work.get("link_roce", Fraction(_ZERO))
+                work["link_roce"] = (work.get("link_roce", Fraction(0))
                                      + remote * Fraction(remote_peers, peers))
             else:
-                work["link_hccs"] = (work.get("link_hccs", Fraction(_ZERO))
+                work["link_hccs"] = (work.get("link_hccs", Fraction(0))
                                      + remote)
         phases.append(replace(phase, work=tuple(work.items())))
     return tuple(phases)
@@ -106,11 +114,11 @@ def _peer_class_for(rank, index, peer, *, node_ranks, peer_count, classes):
     declared = dict(classes or {})
     if peer in declared:
         return declared[peer]
-    if rank >= _ZERO and node_ranks > _ZERO:
+    if rank >= 0 and node_ranks > 0:
         return ("hccs" if peer // node_ranks == rank // node_ranks
                 else "roce")
-    local = (min(max(_ONE, int(peer_count)), node_ranks) - _ONE
-             if node_ranks > _ZERO else max(_ZERO, int(peer_count) - _ONE))
+    local = (min(max(1, int(peer_count)), node_ranks) - 1
+             if node_ranks > 0 else max(0, int(peer_count) - 1))
     return "hccs" if index < local else "roce"
 
 @dataclass(frozen=True)
@@ -120,19 +128,19 @@ class Mc2LaunchView:
     peer_labels: tuple[int, ...]
     peer_classes: tuple[tuple[int, str], ...] = ()
     peer_weights: tuple[Fraction, ...] = ()
-    node_ranks: int = _ZERO
-    intra_latency_ms: Fraction = Fraction(_ZERO)
-    inter_latency_ms: Fraction = Fraction(_ZERO)
+    node_ranks: int = 0
+    intra_latency_ms: Fraction = Fraction(0)
+    inter_latency_ms: Fraction = Fraction(0)
     resource_names: tuple[tuple[str, str], ...] = ()
     payload_frames: tuple[tuple[int, int], ...] = ()
-    payload_packet_bytes: int = _ZERO
+    payload_packet_bytes: int = 0
     payload_basis: str = "unknown"
-    payload_local_frames: int = _ZERO
+    payload_local_frames: int = 0
 
     def class_for(self, index: int, peer: int) -> str:
         return _peer_class_for(
             self.rank, index, peer, node_ranks=self.node_ranks,
-            peer_count=len(self.peer_labels) + _ONE,
+            peer_count=len(self.peer_labels) + 1,
             classes=self.peer_classes)
 
     def latency_for(self, klass: str) -> Fraction:
@@ -148,23 +156,23 @@ def _subtract_endpoint_hbm(program, resource, amount):
     first owner. If the phase has less HBM work than the represented inbound
     cells, keep the original aggregate and report no move.
     """
-    if amount <= _ZERO:
-        return program, _ZERO_FLOAT
+    if amount <= 0:
+        return program, 0.0
     hbm_stages = [
-        (stage, float(dict(stage.work).get(resource, _ZERO_FLOAT)))
+        (stage, float(dict(stage.work).get(resource, 0.0)))
         for stage in program.stages
-        if float(dict(stage.work).get(resource, _ZERO_FLOAT)) > _ZERO]
+        if float(dict(stage.work).get(resource, 0.0)) > 0]
     total = sum(value for _, value in hbm_stages)
-    if total <= _ZERO or amount > total + _EPS:
-        return program, _ZERO_FLOAT
+    if total <= 0 or amount > total + _EPS:
+        return program, 0.0
     remaining = float(amount)
     last_hbm = max(index for index, stage in enumerate(program.stages)
-                   if float(dict(stage.work).get(resource, _ZERO_FLOAT)) > _ZERO)
+                   if float(dict(stage.work).get(resource, 0.0)) > 0)
     stages = []
     for index, stage in enumerate(program.stages):
         work = dict(stage.work)
-        present = float(work.get(resource, _ZERO_FLOAT))
-        if present > _ZERO:
+        present = float(work.get(resource, 0.0))
+        if present > 0:
             if index == last_hbm:
                 take = remaining
             else:
@@ -186,15 +194,15 @@ def _mapped_work(work: dict[str, Any], rates: dict[str, float]) -> dict[str, Fra
     mapped: dict[str, Fraction] = {}
     for pipe, amount in work.items():
         exact = _as_fraction(amount)
-        if exact <= _ZERO:
+        if exact <= 0:
             continue
         key = str(pipe)
         if key not in names and key in {"mte2_aiv", "mte2_aic"} and "mte2" in names:
             key = "mte2"
-        mapped[key] = mapped.get(key, Fraction(_ZERO)) + exact
+        mapped[key] = mapped.get(key, Fraction(0)) + exact
     return mapped
 
-@lru_cache(maxsize=_ONE_TWENTY_EIGHT)
+@lru_cache(maxsize=NATIVE_PROGRAM_CACHE_MAXSIZE)
 def _native_program(raw_items, aiv, rates_items, units_items, service_items,
                     latencies, node_ranks, peer_weights, rank, peer_classes,
                     resource_names, payload_frames, payload_basis,
@@ -210,13 +218,13 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
     from .mc2_program_launch import _Mc2Program
     raw = dict(raw_items)
     plan = contract(raw, aiv)
-    phases = _link_work(plan, max(_ONE, int(raw["ep"])), int(node_ranks))
+    phases = _link_work(plan, max(1, int(raw["ep"])), int(node_ranks))
     base_roles = {"vector", "mte2_aiv", "mte3", "hbm", "link"}
     all_roles = (set(dict(rates_items)) | set(dict(units_items)) | base_roles
                  | {str(name) for name, _mode in service_items})
     geometry = Geometry(
-        compute_units=max(_TWO, aiv),
-        resource_units={role: max(_TWO, int(dict(units_items).get(role, aiv)))
+        compute_units=max(MIN_MC2_AIV_UNITS, aiv),
+        resource_units={role: max(MIN_MC2_AIV_UNITS, int(dict(units_items).get(role, aiv)))
                         for role in all_roles})
     plans = {}
     for phase in phases:
@@ -242,20 +250,20 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
         for index, (peer, frames) in enumerate(payload_frames):
             klass = _peer_class_for(
                 int(rank), index, int(peer), node_ranks=int(node_ranks),
-                peer_count=max(_ONE, int(raw["ep"])), classes=peer_classes)
+                peer_count=max(1, int(raw["ep"])), classes=peer_classes)
             key = "link_hccs" if klass == "hccs" else "link_roce"
-            totals[key] = (totals.get(key, Fraction(_ZERO))
+            totals[key] = (totals.get(key, Fraction(0))
                            + Fraction(int(frames) * packet))
         # Keep the named phase present even for a zero-frame representative
         # rank: another replica still owns directed frames in this cohort.
-        link_by_phase["payload_exchange"] = totals or {"link": Fraction(_ZERO)}
+        link_by_phase["payload_exchange"] = totals or {"link": Fraction(0)}
     elif not payload_frames and "unknown" in str(payload_basis).lower():
         # No scoped source route: no invented directed payload wire.
         link_by_phase.pop("payload_exchange", None)
     rates = dict(rates_items)
     units = dict(units_items)
     for name in rates:
-        units.setdefault(name, max(_TWO, int(aiv)))
+        units.setdefault(name, max(MIN_MC2_AIV_UNITS, int(aiv)))
     names = {name: name for name in rates}
     for alias in ("mte2_aiv", "mte2_aic"):
         if alias not in names and "mte2" in names:
@@ -276,27 +284,27 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
         physical_links = sorted(
             (name for name in rates if "link" in str(name).lower()),
             key=lambda name: (":rx:" in str(name).lower(), str(name)))
-        link_fallback = physical_links[_ZERO] if physical_links else ""
+        link_fallback = physical_links[0] if physical_links else ""
     for alias in ("link_hccs", "link_roce"):
         if alias not in rates and link_fallback:
             names[alias] = link_fallback
-            units.setdefault(alias, units.get(link_fallback, max(_TWO, int(aiv))))
+            units.setdefault(alias, units.get(link_fallback, max(MIN_MC2_AIV_UNITS, int(aiv))))
     phase_work: dict[str, Fraction] = {}
     for phase in phases:
         for pipe, amount in plans[phase.name].work.resources.items():
             for key, value in _mapped_work({pipe: amount}, rates).items():
-                phase_work[key] = phase_work.get(key, Fraction(_ZERO)) + value
+                phase_work[key] = phase_work.get(key, Fraction(0)) + value
     work = dict(phase_work)
     for links in link_by_phase.values():
         for pipe, amount in links.items():
             if amount:
                 key = names.get(pipe, pipe)
-                work[key] = work.get(key, Fraction(_ZERO)) + amount
+                work[key] = work.get(key, Fraction(0)) + amount
     program = _Mc2Program(
         phases=phases, plans=plans, link_by_phase=link_by_phase,
-        latency=latencies[_ZERO], rates=rates, units=units, names=names,
+        latency=latencies[0], rates=rates, units=units, names=names,
         service_modes=dict(service_items), latencies=latencies,
-        peer_count=max(_ONE, int(raw["ep"])), rank=int(rank),
+        peer_count=max(1, int(raw["ep"])), rank=int(rank),
         peer_weights=peer_weights, node_ranks=int(node_ranks),
         peer_classes=peer_classes, resource_names=resource_names,
         payload_frames=payload_frames,
@@ -307,8 +315,8 @@ def _native_program(raw_items, aiv, rates_items, units_items, service_items,
         route_reverse=bool(raw.get("route_reverse", False)),
         exact_payload=bool(exact_payload),
         route_matrix_bytes=raw.get("route_matrix_bytes"),
-        uniform_payload_bytes=raw.get("uniform_payload_bytes", _ZERO),
-        experts=raw.get("experts", _ZERO),
+        uniform_payload_bytes=raw.get("uniform_payload_bytes", 0),
+        experts=raw.get("experts", 0),
         transport_basis=raw.get("payload_basis", payload_basis))
     program._phase_work = phase_work
     program.work = tuple(sorted(work.items()))
@@ -330,8 +338,8 @@ def _transport_latencies(context, ep: int) -> tuple[Fraction, Fraction]:
     exposes the same physical links through its service identity.  Neither is
     a fitted or inferred residual.
     """
-    if ep <= _ONE:
-        return Fraction(_ZERO), Fraction(_ZERO)
+    if ep <= 1:
+        return Fraction(0), Fraction(0)
     transport = _transport_identity(context)
     links = tuple(transport.get("links") or ())
     def pick(terms):
@@ -342,13 +350,13 @@ def _transport_latencies(context, ep: int) -> tuple[Fraction, Fraction]:
             name = str(link.get("name", "")).lower()
             if not any(term in name for term in terms):
                 continue
-            latency = link.get("propagation_us", link.get("latency_us", _ZERO))
-            values.append(_as_fraction(latency) / _THOUSAND)
+            latency = link.get("propagation_us", link.get("latency_us", 0))
+            values.append(_as_fraction(latency) / US_PER_MS)
         return max(values) if values else None
     intra = pick(("hccs", "intra", "local", "same_node", "same-node"))
     inter = pick(("roce", "inter", "remote", "superpod"))
     if intra is None:
-        intra = Fraction(_ZERO)
+        intra = Fraction(0)
     if inter is None:
         inter = intra
     return intra, inter
@@ -362,7 +370,7 @@ def _transport_peer_classes(context, rank, ep):
         if not isinstance(placement, Mapping):
             continue
         try:
-            nodes[int(placement["rank"])] = int(placement.get("node", _ZERO))
+            nodes[int(placement["rank"])] = int(placement.get("node", 0))
         except (KeyError, TypeError, ValueError):
             continue
     if rank not in nodes:
@@ -380,26 +388,26 @@ def native_program_from_contract(raw, context):
     link classes come from the actual RecipeContext.
     """
     data = dict(raw)
-    ep = max(_ONE, int(data["ep"]))
-    rank = int(data.get("route_rank", _ZERO))
+    ep = max(1, int(data["ep"]))
+    rank = int(data.get("route_rank", 0))
     matrix = data.get("route_matrix")
     exact = matrix is not None
     frames = ()
-    local_frames = _ZERO
+    local_frames = 0
     if exact:
         cells = tuple(tuple(int(value) for value in row) for row in matrix)
         reverse = bool(data.get("route_reverse", False))
-        if _ZERO <= rank < len(cells):
+        if 0 <= rank < len(cells):
             frames = tuple(sorted(
                 (peer, cells[peer][rank] if reverse else cells[rank][peer])
                 for peer in range(len(cells))
                 if peer != rank
-                and (cells[peer][rank] if reverse else cells[rank][peer]) > _ZERO))
+                and (cells[peer][rank] if reverse else cells[rank][peer]) > 0))
             local_frames = cells[rank][rank]
     basis = str(data.get("payload_basis") or "unknown")
     if exact and not frames:
         basis = "actual_zero"
-    node_ranks = int(_transport_identity(context).get("ranks_per_node", _ZERO) or _ZERO)
+    node_ranks = int(_transport_identity(context).get("ranks_per_node", 0) or 0)
     latencies = _transport_latencies(context, ep)
     resources = tuple(sorted(
         (str(name), str(value))
@@ -414,8 +422,8 @@ def native_program_from_contract(raw, context):
         (str(name), (str(role), float(rate)))
         for name, (role, rate) in dict(
             getattr(context, "service_modes", {}) or {}).items()))
-    aiv = max(_TWO, int(getattr(context, "core_count", _ZERO)
-                     or dict(units).get("vector", _SIXTY_FOUR) or _SIXTY_FOUR))
+    aiv = _resolve_aiv_units(
+        dict(units), core_count=int(getattr(context, "core_count", 0) or 0))
     program, _work = _native_program(
         tuple(sorted(data.items())), aiv, rates, units, services, latencies,
         node_ranks, None, rank, _transport_peer_classes(context, rank, ep),
