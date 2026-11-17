@@ -25,7 +25,7 @@ from typing import Any
 
 from mindie_sim.prediction.capacity import Memory
 from mindie_sim.prediction.efficiency import (
-    DEFAULT_SLA_SCENARIOS, _lower_and_run_graph, _resolve_speculative_tokens,
+    DEFAULT_SLA_SCENARIOS, _resolve_speculative_tokens,
     _vram_max_sequences_per_dp, capacity_window, solve_sla_sizing,
 )
 from mindie_sim.prediction.evaluation import (
@@ -67,6 +67,7 @@ DEFAULT_KV_TRANSFER_BW_GBPS = 100.0
 LOCKED_PROGRAM_ERROR = "fixed_plan_sweep_not_implemented"
 MS_PER_S = 1000.0
 PARETO_EPS = 1e-12
+SCREEN_BATCH = 1
 BASELINE_SCENARIO: tuple[dict[str, Any], ...] = (
     {"id": "baseline", "label": "1x Baseline", "hbm_bw_scale": 1.0,
      "cube_flops_scale": 1.0, "vector_ops_scale": 1.0, "link_bw_scale": 1.0},
@@ -429,51 +430,64 @@ def b1_screen(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
               emit_tokens: float, sla_ms: float, b_vram_max: int,
               max_sequences_per_dp: int, output_budget: int = 0,
               static: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Rank one candidate by its isolated operator sum; never run the graph.
+
+    The isolated operator sum ignores multi-stream overlap, so it cannot
+    reject a candidate on SLA before finalist evaluation.  It is a screening
+    estimate only; ``full_row`` owns every SLA and capacity verdict.
+    """
+    from .prediction.operator_analysis import target_graphs
+    from .prediction.body_defaults import consume_target_declaration
+    from .prediction.efficiency import _fast_operator_and_graph_reports
+
     static = dict(static or {})
     start = time.monotonic()
     check_active_deadline()
-    _graphs, _case, graph = _lower_and_run_graph(
+    graphs = target_graphs(
         cand_case, phase=phase, tokens=q_tokens, context=context,
-        sequences=1, scope=scope, run_graph=True, evaluation_context=ctx)
-    assert graph is not None
-    step = float(graph["duration_ms"])
+        sequences=SCREEN_BATCH, scope=scope)
+    effective = consume_target_declaration(cand_case, graphs)
+    # The precomputed declaration keeps ``_fast_operator_and_graph_reports``
+    # from re-entering ``_lower_and_run_graph``'s kernel-group branch.
+    operators, _ = _fast_operator_and_graph_reports(
+        effective, phase=phase, tokens=q_tokens, context=context,
+        sequences=SCREEN_BATCH, scope=scope, run_graph=False,
+        precomputed_graph=(graphs, effective, None), evaluation_context=ctx)
+    step = float(operators["operator_sum_ms"])
     tps = (cand_p.dp * float(emit_tokens) * MS_PER_S / step
            if step > 0.0 else 0.0)
     eff_max = max(0, min(int(max_sequences_per_dp), int(b_vram_max)))
-    pass_sla = bool(step <= sla_ms)
-    row = {
-        **dict(common), "status": ("screened_b1_pass" if pass_sla
-                                    else "sla_or_vram_exceeded"),
-        "feasible": False, "reason": None if pass_sla else "b1_sla_exceeded",
-        "rejection_reason": (None if pass_sla else
-                             f"b1_sla_exceeded:{step:.3f}>{sla_ms:.3f}"),
+    return {
+        **dict(common), "status": "screened", "feasible": False,
+        "reason": None, "rejection_reason": None,
         "evaluation_stage": B1_STAGE, "is_screening_estimate": True,
-        "b1_feasible": bool(pass_sla), "b1_sla_pass": bool(pass_sla),
+        "evaluation_boundary": "b1_isolated_operator_sum",
+        "b1_feasible": True, "b1_sla_pass": True,
         "b1_pareto_optimal": False,
-        "feasibility_status": ("b1_screen_pass_pending_full_sla" if pass_sla
-                               else "b1_sla_rejected"),
+        "feasibility_status": "b1_screen_pass_pending_full_sla",
         "plan_mode": "reselected_parallel",
-        "evaluation_boundary": "b1_single_step_graph_and_static_capacity",
         "weight_bytes_per_die": static.get("weight_bytes"),
         "kv_bytes_per_token_per_die": static.get("kv_bytes_per_token"),
         "b_sla": 0, "b_vram_max": int(b_vram_max), "b_feasible": 0,
         "b_sla_is_proven_max": False, "total_feasible_concurrency": 0,
         "latency_candidate": None, "feasible_candidate": None,
         "step_ms_at_b1": step, "step_ms_feasible": None,
-        "tps_at_b1": tps, "tps_feasible": 0.0, "tps_per_die": 0.0,
+        "tps_at_b1": tps, "tps_screen_b1": tps,
+        "tps_feasible": 0.0, "tps_per_die": 0.0,
         "max_concurrency_bound": eff_max * int(cand_p.dp),
-        "upper_tps_per_die": ((eff_max * tps) / float(common["num_devices"])
+        "upper_tps_per_die": (eff_max * tps / float(common["num_devices"])
                               if common["num_devices"] else 0.0),
+        "operator_sum_screen_ms": step,
+        "graph_step_ms": None,
+        "graph_ttft_ms": (step if (phase, scope) == ("prefill", "model")
+                          else None),
         "network_mbu": None, "network_cube_mfu": None,
         "network_vec_mfu": None, "network_link_util": None,
-        "search": {"method": "b1_single_step_screen",
-                   "evaluated_candidates": [1],
+        "search": {"method": "b1_isolated_operator_sum",
+                   "evaluated_candidates": [SCREEN_BATCH],
                    "b_sla_is_proven_max": False},
         "elapsed_ms": (time.monotonic() - start) * MS_PER_S,
     }
-    if not pass_sla:
-        row["reason"] = "b1_sla_exceeded"
-    return row
 
 
 def full_row(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
@@ -533,9 +547,28 @@ def full_row(parsed: CaseSpec, cand_case: CaseSpec, cand_p: ParallelSpec,
         "search": scen.get("search"),
         "elapsed_ms": (time.monotonic() - start) * MS_PER_S,
     }
+    # ``graph_step_ms`` is the B1 model-graph span for this candidate; neither
+    # field claims a serving latency.  ``graph_ttft_ms`` is only the B1
+    # model-prefill span.
+    row["graph_step_ms"] = row.get("step_ms_at_b1")
+    row["graph_ttft_ms"] = (row.get("step_ms_at_b1")
+                            if (phase, scope) == ("prefill", "model") else None)
     if screening:
         row["b1_pareto_optimal"] = True
     return row
+
+
+def select_finalists(
+    promoted: Sequence[Mapping[str, Any]], finalist_top_k: int,
+) -> list[Mapping[str, Any]]:
+    """Global top-K screen ranking across device grids and derivations."""
+    ranked = [
+        row for row in promoted
+        if row.get("operator_sum_screen_ms") is not None
+    ]
+    ranked.sort(key=lambda row: (float(row["operator_sum_screen_ms"]),
+                                 str(row.get(CANDIDATE_ID_KEY, ""))))
+    return ranked[:int(finalist_top_k)]
 
 
 def project_replica_row(base: Mapping[str, Any], *,
@@ -637,10 +670,11 @@ def enumerate_case_candidates(
 __all__ = [
     "BASELINE_SCENARIO", "B1_STAGE", "CANDIDATE_ID_HEX_LEN",
     "DEFAULT_CONTEXT", "DEFAULT_MAX_SEQUENCES", "DEFAULT_OUTPUT_BUDGET",
-    "DEFAULT_SLA_MS", "FULL_STAGE", "LOCKED_PROGRAM_ERROR",
+    "DEFAULT_SLA_MS", "FULL_STAGE", "LOCKED_PROGRAM_ERROR", "SCREEN_BATCH",
     "SweepEvaluationCache", "b1_screen", "build_candidate_case",
     "candidate_devices", "compute_pareto_frontier",
     "compute_sweep_candidate_id", "enumerate_case_candidates", "full_row",
-    "parallel_report", "project_replica_row", "set_deadline", "static_row",
-    "timeout_row", "validate_candidate_statically",
+    "parallel_report", "project_replica_row", "select_finalists",
+    "set_deadline", "static_row", "timeout_row",
+    "validate_candidate_statically",
 ]

@@ -23,6 +23,53 @@ from .operators.mc2_mx_quant import mx32_work
 from .moe_comm_selection import MC2, MoeCommConfig
 
 NETWORK = "arch35_fullmesh_peer_channel"
+NO_ASSIGNMENTS = 0
+EXPLICIT_ROUTING_LOWERINGS = frozenset(
+    {"route_pack", "route_unpack", "moe_init_routing"})
+
+
+def _received_quantizer(pack_quant, gate, dispatch_id, rows, width):
+    """Keep receiver conversion when native dispatch publishes float rows."""
+    from mindie_sim.catalog.ops import vector_op
+
+    meta = dict(pack_quant.metadata)
+    source_rows = float(meta.get("source_rows") or NO_ASSIGNMENTS)
+    if source_rows <= NO_ASSIGNMENTS:
+        raise ModelingError("mc2_pack_quantizer_requires_source_rows")
+    scale = float(rows) / source_rows
+    scale_shape = tuple(meta["activation_scale_shape"])
+    _, *scale_tail = scale_shape
+    meta.update(
+        source_rows=rows,
+        activation_scale_shape=(math.ceil(rows), *scale_tail),
+        activation_scale_bytes=float(meta["activation_scale_bytes"]) * scale,
+        quantization_scope="moe_received_expert_input",
+    )
+    quantizer = vector_op(
+        op_id=dispatch_id + ".received_quantize", deps=(dispatch_id,),
+        stage=pack_quant.stage, layer=pack_quant.layer,
+        requests=pack_quant.requests, phase=pack_quant.phase,
+        family=pack_quant.family, recipe=pack_quant.recipe,
+        dtype=pack_quant.dtype,
+        elements=math.ceil(rows) * width, ops_per_element=NO_ASSIGNMENTS,
+        vector_ops_override=pack_quant.vector_ops * scale,
+        read_bytes_override=pack_quant.mte2_bytes * scale,
+        write_bytes_override=pack_quant.mte3_bytes * scale,
+        shape=(math.ceil(rows), width), returns=pack_quant.returns,
+        metadata=tuple(meta.items()),
+    )
+    gate_meta = dict(gate.metadata)
+    if gate_meta.get("activation_format") != meta["output_format"]:
+        raise ModelingError("mc2_received_quantizer_format_mismatch")
+    gate_meta.update(
+        activation_producer="explicit_routing_quantization",
+        activation_payload_producer=quantizer.op_id,
+        activation_scale_producer=quantizer.op_id,
+    )
+    return quantizer, replace(
+        gate, deps=tuple(quantizer.op_id if dep == dispatch_id else dep
+                         for dep in gate.deps),
+        metadata=tuple(gate_meta.items()))
 
 
 def select(kernels):
@@ -94,6 +141,10 @@ def select_common(runtime, features=None, *, tokens, top_k, experts, ep):
     explicit = select(kernels)
     if explicit is not None:
         return explicit
+    if EXPLICIT_ROUTING_LOWERINGS & set(kernels.get("lowerings") or {}):
+        # An explicitly lowered routing/init kernel owns the expert input
+        # representation; automatic MC2 selection must not replace it.
+        return None
     rmeta = dict(getattr(runtime, "metadata", ()) or ())
     radditional = rmeta.get("additional_config")
     radditional = dict(radditional) if isinstance(radditional, dict) else {}
@@ -142,6 +193,15 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     by_id = {op.op_id: op for op in ops}
     pack, dispatch, combine, unpack = (by_id[prefix + suffix]
                                       for suffix in (".pack", ".dispatch", ".combine", ".unpack"))
+    pack_quant = by_id.get(prefix + ".pack.quantize")
+    if pack_quant is not None and (
+            pack_quant.plan_required
+            or pack_quant.deps != (pack.op_id,)
+            or dict(pack_quant.metadata).get("quantization_scope")
+            != "moe_dispatch_expert_input"
+            or any(pack_quant.op_id in item.deps and item.op_id != dispatch.op_id
+                   for item in ops)):
+        raise ModelingError("mc2_cannot_absorb_external_pack_quantizer")
     source_metadata = source_routing.to_dict() if source_routing is not None else None
     # TPxDP without an explicit slice still publishes one source rank's rows.
     if source_routing is not None:
@@ -158,6 +218,13 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
                                    if valid_tokens is not None else tokens)
     send = valid_source_tokens * top_k
     quant = selected.get("dispatch_quant", "none")
+    received_quant = None
+    if pack_quant is not None and quant == "none" and received_assignments:
+        gate = by_id.get(prefix + ".expert_up")
+        if gate is None or gate.deps != (dispatch.op_id,):
+            raise ModelingError("mc2_received_quantizer_requires_direct_expert")
+        received_quant, by_id[gate.op_id] = _received_quantizer(
+            pack_quant, gate, dispatch.op_id, received_assignments, width)
     payload_dtype = {"mx": "fp8_e4m3", "per_token_int8": "int8"}.get(quant, dtype)
     quant_mode = "per_token" if quant == "per_token_int8" else quant
     layouts = (dispatch_layout(width, input_dtype=dtype, payload_dtype=payload_dtype,
@@ -394,11 +461,14 @@ def lower(ops, *, runtime, prefix, tokens, top_k, width, experts, ep,
     for op in ops:
         if op.op_id == pack.op_id:
             result.append(dispatch_op)
+            if received_quant is not None:
+                result.append(received_quant)
             continue
         if op.op_id == unpack.op_id:
             result.append(combine_op)
             continue
-        if op.op_id in {dispatch.op_id, combine.op_id}:
+        if (op.op_id in {dispatch.op_id, combine.op_id}
+                or (pack_quant is not None and op.op_id == pack_quant.op_id)):
             continue
         current = by_id[op.op_id]
         deps = tuple(redirect.get(dependency, dependency)

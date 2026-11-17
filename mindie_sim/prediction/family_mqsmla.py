@@ -31,6 +31,8 @@ FP4_COMPRESSED_GROUP_SIZE = 16
 SINGLE_KV_HEAD = 1
 UNIT_CONTEXT_PARALLEL = 1
 MIN_ACTIVE_ROWS = 1
+QUERY_ORIGIN = 0
+NO_COMPRESSED_ROWS = 0
 VALID_ADDRESSING = frozenset({"scalar", "auto", "vector"})
 FORMATS = {
     "window": {"dtype": "fp8_e4m3", "group_size": FP8_WINDOW_GROUP_SIZE,
@@ -49,8 +51,8 @@ def query_shape(views, plan, *, topk_present=False):
     return {
         "sequences": tuple((int(v.q_len), int(v.context)) for v in views),
         "window": plan.window,
-        "ratio": plan.compress_ratio,
-        "topk": plan.index_topk if topk_present else 0,
+        "ratio": plan.compress_ratio if topk_present else NO_COMPRESSED_ROWS,
+        "topk": plan.index_topk if topk_present else NO_COMPRESSED_ROWS,
     }
 
 
@@ -83,8 +85,8 @@ def unsupported_reason(*, views, plan, parallel, model, padded_tokens,
     valid_rows = sum(int(v.q_len) for v in views)
     if valid_rows < MIN_ACTIVE_ROWS or padded_tokens < valid_rows:
         return "mqsmla_binding_requires_positive_padded_rows"
-    if any(v.phase != "decode"
-           or (v.query_ranges and v.query_ranges != ((0, v.q_len),))
+    if any(v.phase != "decode" or v.padding
+           or (v.query_ranges and v.query_ranges != ((QUERY_ORIGIN, v.q_len),))
            for v in views):
         return "mqsmla_binding_requires_contiguous_unpadded_decode_rows"
     if cores is not None:
@@ -120,7 +122,8 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     heads = plan.num_heads // tp_degree
     rows = tuple((v.q_len, v.context) for v in views)
     active_q = sum(q for q, _ in rows)
-    shape = {"sequences": rows, "window": plan.window, "ratio": plan.compress_ratio,
+    shape = {"sequences": rows, "window": plan.window,
+             "ratio": plan.compress_ratio if topk_present else NO_COMPRESSED_ROWS,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
              "addressing": str(dict(getattr(selection, "options", {}) or {}).get(

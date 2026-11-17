@@ -318,8 +318,11 @@ def parser():
     sweep.add_argument("--candidates", default=None,
                        help="JSON list of explicit candidate mappings")
     sweep.add_argument("--two-stage", action="store_true")
+    sweep.add_argument("--finalist-top-k", type=int, default=None)
     sweep.add_argument("--candidate-timeout-s", type=float, default=None)
     sweep.add_argument("--output-jsonl", default=None)
+    sweep.add_argument("--checkpoint-jsonl", default=None)
+    sweep.add_argument("--isolate-workers", action="store_true")
     sweep.add_argument("--resume", action="store_true")
     sweep.add_argument("--progress", action="store_true")
     sweep.add_argument("--output", "-o")
@@ -525,8 +528,9 @@ def run(args):
                 ttft_sla_ms=args.ttft_sla_ms, tpot_sla_ms=args.tpot_sla_ms,
             )
         from .cli_options import load_hardware_derivations
-        if args.resume and not args.output_jsonl:
-            raise CliUsageError("--resume requires --output-jsonl")
+        if args.resume and not (args.output_jsonl or args.checkpoint_jsonl):
+            raise CliUsageError(
+                "--resume requires --checkpoint-jsonl or --output-jsonl")
         grids = ([int(item) for item in str(args.num_devices_grid).split(",")
                   if item.strip()]
                  if args.num_devices_grid else None)
@@ -558,8 +562,12 @@ def run(args):
             allow_dcp=args.allow_dcp, dcp_candidates=dcp_candidates,
             hardware_derivations=derivations,
             two_stage=args.two_stage,
+            finalist_top_k=args.finalist_top_k,
             candidate_timeout_s=args.candidate_timeout_s,
-            output_jsonl=args.output_jsonl, resume=args.resume,
+            output_jsonl=args.output_jsonl,
+            checkpoint_jsonl=args.checkpoint_jsonl,
+            isolate_workers=args.isolate_workers,
+            resume=args.resume,
             progress_callback=progress,
         )
     if args.command == "efficiency":

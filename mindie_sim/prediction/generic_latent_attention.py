@@ -38,6 +38,8 @@ FP32_BYTES = 4
 INT32_BYTES = 4
 MIN_LOG_TOPK = 2
 MIN_BATCH_MEMBERS = 2
+EMPTY_INDEX_ROWS = 0
+MIN_INDEX_FACTOR = 1
 # A packed index row stores two 4-bit elements per byte. Its score reduction
 # consumes a dequantized FP4 payload, so the declared compute identity is the
 # dequantized BF16 path (the same convention ``compute_dtype_for`` applies to
@@ -304,12 +306,15 @@ def selected_pairs(parts, ratio, topk, *, noncausal=False, kv_len=None):
 
 
 def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
-                     kv_len=None, cp=1, interleave=INDEX_QUERY_TILE):
+                     kv_len=None, cp=MIN_INDEX_FACTOR, interleave=INDEX_QUERY_TILE,
+                     compression=MIN_INDEX_FACTOR):
     """(unique key rows, tile refill rows) consumed by one view's query tiles.
 
     Every query tile still issues its own per-query arithmetic; only the
     external HBM fetch is reduced to the physical union of the tile key sets.
-    ``refills`` is the sum of each tile's consumed set (MTE2 service).
+    ``refills`` is the sum of each tile's consumed set (MTE2 service).  The
+    declared ``compression`` converts logical query-key positions into physical
+    compressed index rows before any union is taken.
     """
     tile = max(1, int(query_tile))
     union_rows = 0
@@ -325,15 +330,18 @@ def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
                 horizon = int(context) + offset
                 if kv_len is not None:
                     horizon = min(horizon, int(kv_len))
-                owned = [owned_positions(0, horizon, int(cp),
-                                         int(interleave), rank)
-                         for rank in range(int(cp))]
+                horizon //= max(MIN_INDEX_FACTOR, int(compression))
+                owned = [owned_positions(
+                    EMPTY_INDEX_ROWS, horizon, int(cp),
+                    max(MIN_INDEX_FACTOR, int(interleave) // compression), rank)
+                    for rank in range(int(cp))]
                 owner_rows = max(owned) if owned else 0
                 union_rows = max(union_rows, owner_rows)
                 refill_rows += owner_rows
             continue
         if noncausal:
             horizon = int(kv_len if kv_len is not None else context + query)
+            horizon //= max(MIN_INDEX_FACTOR, int(compression))
             tiles = (query + tile - 1) // tile
             union_rows = max(union_rows, horizon)
             refill_rows += tiles * horizon
@@ -344,6 +352,7 @@ def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
             horizon = int(context) + end
             if kv_len is not None:
                 horizon = min(horizon, int(kv_len))
+            horizon //= max(MIN_INDEX_FACTOR, int(compression))
             union_rows = max(union_rows, horizon)
             refill_rows += horizon
             start = end
@@ -351,20 +360,15 @@ def index_key_window(parts, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
 
 
 def unique_index_key_rows(views, *, query_tile=INDEX_QUERY_TILE, noncausal=False,
-                          cp=1, interleave=INDEX_QUERY_TILE):
-    """Physical union and tile refills, deduplicating only shared prefixes."""
-    groups: dict[object, int] = {}
-    refills = 0
-    for position, view in enumerate(views):
-        union_rows, view_refills = index_key_window(
-            visible_parts(view), query_tile=query_tile, noncausal=noncausal,
-            kv_len=view.kv_len, cp=cp, interleave=interleave)
-        refills += view_refills
-        prefix = int(getattr(view, "prefix_tokens", 0) or 0)
-        key = (str(getattr(view, "prefix_key", "") or ""),) if prefix > 0 \
-            else (position, str(view.request_id))
-        groups[key] = max(groups.get(key, 0), union_rows)
-    return sum(groups.values()), refills
+                          cp=MIN_INDEX_FACTOR, interleave=INDEX_QUERY_TILE,
+                          compression=MIN_INDEX_FACTOR):
+    """Precharge each request's physical union; the prefix planner shares it."""
+    windows = tuple(index_key_window(
+        visible_parts(view), query_tile=query_tile, noncausal=noncausal,
+        kv_len=view.kv_len, cp=cp, interleave=interleave,
+        compression=compression) for view in views)
+    return (sum(rows for rows, _ in windows),
+            sum(refills for _, refills in windows))
 
 
 def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
@@ -381,6 +385,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         1, int(getattr(runtime, "kv_block_size", DEFAULT_BLOCK_SIZE) or DEFAULT_BLOCK_SIZE))
     rows_by_view: list[int] = []
     shared_by_view: list[int] = []
+    pairs_by_view: list[int] = []
     for view in views:
         parts = visible_parts(view)
         v_rows = int(selected_pairs(
@@ -389,11 +394,15 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
         raw_pref = max(0, min(int(getattr(view, "prefix_tokens", 0) or 0),
                                  int(view.context)))
         aligned_pref = ((raw_pref // block_size) * block_size) // ratio
-        q_cnt = sum(q_part for q_part, _ in parts)
-        rows_by_view.append(v_rows)
-        shared_by_view.append(min(v_rows, aligned_pref))
+        physical_rows, _ = index_key_window(
+            parts, noncausal=bool(plan.noncausal_attention),
+            kv_len=view.kv_len, compression=ratio)
+        pairs_by_view.append(v_rows)
+        rows_by_view.append(physical_rows)
+        shared_by_view.append(min(physical_rows, aligned_pref))
     local = score_rows is not None
-    rows = max(0.0, float(score_rows)) if local else float(sum(rows_by_view))
+    rows = max(float(EMPTY_INDEX_ROWS), float(score_rows)) if local \
+        else float(sum(pairs_by_view))
     divisor = 1 if local else max(1, int(shard))
     row_b = index_row_bytes(model, plan.index_dim)
     # External HBM is the physical union of the tile key sets (deduplicated
@@ -403,7 +412,7 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                      or INDEX_QUERY_TILE)
     union_rows, refill_rows = unique_index_key_rows(
         views, noncausal=bool(plan.noncausal_attention), cp=cp,
-        interleave=interleave)
+        interleave=interleave, compression=ratio)
     hbm_rows = float(union_rows)
     if l2_bytes is not None and float(l2_bytes) > 0.0:
         working = hbm_rows * row_b
@@ -416,15 +425,20 @@ def semantic_index_selection(b, *, deps, views, plan, model, quant, parallel,
                     read=float(refill_rows) * row_b / divisor,
                     hbm_read=hbm_rows * row_b / divisor,
                     write=rows * FP32_BYTES / divisor, family="indexer",
-                    dtype=index_arithmetic_dtype(model, quant))
-    if not local and shard == 1 and b.ops:
+                    dtype=index_arithmetic_dtype(model, quant),
+                    metadata=(("index_score_shards", max(MIN_INDEX_FACTOR, int(shard))),
+                              ("index_context_partitions", cp),
+                              ("index_candidate_filter", bool(plan.candidate_filter)),
+                              ("index_head_reduction", "complete_local")))
+    if (not local and shard == MIN_INDEX_FACTOR and cp == MIN_INDEX_FACTOR
+            and b.ops and not plan.candidate_filter):
         cfg_fam = runtime.kernels.get("families", {}) if runtime else {}
         cfg_rec = runtime.kernels.get("recipes", {}) if runtime else {}
         pinned = "indexer" in cfg_fam or "index_scores" in cfg_rec
         b.ops[-1] = apply_indexer_prefix_reads(
             b.ops[-1], views=views, rows_by_view=rows_by_view,
             shared_rows_by_view=shared_by_view, row_bytes=float(row_b),
-            layer_index=plan.index, runtime=runtime,
+            layer_index=plan.index, runtime=runtime, compression_ratio=ratio,
             kernel_reuse="native_per_sequence" if pinned else "tile",
             allow_recipe_rebind=not pinned,
             hbm_component=hbm_rows * row_b / divisor,

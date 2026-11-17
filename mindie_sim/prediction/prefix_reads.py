@@ -184,7 +184,7 @@ def plan_prefix_reads(
     core = ZERO
     logical_rows = math.fsum(_logical_rows(access) for access in accesses)
     unique_rows = ZERO
-    groups: dict[tuple[int, str], tuple[int, float]] = {}
+    groups: dict[tuple[int, str, str, float], tuple[int, float]] = {}
     for access in accesses:
         context = max(ZERO, int(access.context_tokens))
         rows = _logical_rows(access)
@@ -195,7 +195,8 @@ def plan_prefix_reads(
         core += private * float(access.row_bytes)
         unique_rows += private
         if prefix > ZERO:
-            key = (int(access.layer), str(access.prefix_key))
+            key = (int(access.layer), str(access.component),
+                   str(access.prefix_key), float(access.row_bytes))
             previous = groups.get(key)
             if previous is None or prefix > previous[ZERO]:
                 groups[key] = (prefix, float(access.row_bytes))
@@ -246,6 +247,11 @@ def apply_prefix_read_plan(op: Any, plan: PrefixReadPlan, *,
                           if hbm_component is None else float(hbm_component))
         mte2_precharged = (float(plan.logical_query_bytes)
                            if mte2_component is None else float(mte2_component))
+        if ((hbm_component is not None and
+             not ZERO_FLOAT <= hbm_precharged <= hbm + SAVINGS_EPS)
+                or (mte2_component is not None and
+                    not ZERO_FLOAT <= mte2_precharged <= mte2 + SAVINGS_EPS)):
+            raise ModelingError("prefix_read_component_exceeds_declared_work")
         hbm = hbm - hbm_precharged + float(plan.unique_hbm_bytes)
         mte2 = mte2 - mte2_precharged + float(plan.l2_to_core_bytes)
         if hbm < -SAVINGS_EPS or mte2 < -SAVINGS_EPS:
