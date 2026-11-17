@@ -45,7 +45,9 @@ def _merge_math_rollup(total, part):
             continue
         for key in ('subgraph_occurrences', 'member_node_count'):
             current[key] += row[key]
-        for key in ('realized_hbm_bytes', 'parallel_comm_bytes'):
+        for key in ('realized_hbm_bytes', 'parallel_comm_bytes',
+                    'algebraic_cube_flops', 'algebraic_vector_ops',
+                    'minimal_boundary_hbm_bytes'):
             current[key] = (None if current[key] is None or row[key] is None
                             else current[key] + row[key])
         current['unavailable_reasons'] = list(dict.fromkeys(

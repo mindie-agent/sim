@@ -7,13 +7,14 @@
   and ``mindie-profiler``.
 
 [Invariants]
-  * Fusion never changes algebraic compute. Algebraic counters are therefore
-    populated only from an immutable pre-lowering ledger; until that producer
-    exists they stay ``None`` with ``algebraic_work_unavailable`` and physical
+  * Fusion never changes algebraic compute. Algebraic counters come from the
+    untouched pre-lowering semantic member nodes, so a fused resource boundary
+    changes realized bytes but never the semantic Cube/Vector totals; physical
     counters are never renamed into algebraic ones.
-  * Boundary HBM bytes require an explicit access ledger (storage identity,
-    direction and byte interval) plus a cold-HBM basis. Missing page/cache
-    extents stay ``None`` with an explicit reason instead of an invented zero.
+  * Boundary HBM bytes are the unfused semantic member bytes minus the internal
+    producer/consumer round-trips that a selected fusion keeps on chip. An
+    incomplete semantic ledger stays ``None`` with an explicit reason instead
+    of an invented zero.
   * ``effective_physical_work`` charges every unfused semantic node once and
     every selected native fusion once; a partially selected fusion has unknown
     realized work rather than a proportional invention.
@@ -76,6 +77,14 @@ DECLARATION_FAMILIES: dict[str, str] = {
     "kda": "recurrent_gdn_kda",
 }
 WORK_FIELDS = ("hbm_bytes", "flops", "vector_ops", "link_bytes")
+SEMANTIC_WORK_FIELDS = ("flops", "vector_ops", "hbm_bytes", "mte2_bytes", "mte3_bytes")
+CANONICAL_DTYPE_FAMILIES = {
+    "fp8_e4m3": "fp8",
+    "fp8_e5m2": "fp8",
+    "fp4_e2m1": "fp4",
+    "mxfp4": "fp4",
+    "int8_w8a8": "int8",
+}
 ALGEBRAIC_WORK_UNAVAILABLE = "algebraic_work_unavailable"
 BOUNDARY_LEDGER_UNAVAILABLE = "boundary_access_ledger_unavailable"
 ROLLUP_SCOPE = "declared_semantic_subgraph_union"
@@ -264,6 +273,104 @@ def exclusive_family_members(groups, family_for):
     return by_family
 
 
+def _finite_work(work: Mapping[str, Any], field: str) -> bool:
+    value = work.get(field)
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and value >= 0)
+
+
+def semantic_subgraph_ledger(
+    report: Mapping[str, Any], member_ids, *, external_outputs=None,
+    realized_hbm_bytes: float | None = None,
+) -> dict[str, Any] | None:
+    """Closed-form semantic Cube/Vector work and minimal boundary HBM bytes.
+
+    The pre-lowering semantic members are the immutable program: a selected
+    native fusion replaces their physical boundary, never their algebraic work.
+    Internal producer writes and consumer reads disappear from the boundary
+    ledger, capped by the consumers' declared MTE2 capacity. An incomplete
+    member ledger returns ``None`` rather than a partial or invented total.
+    """
+    nodes = {node["node_id"]: node for node in report["nodes"]}
+    members = tuple(member_ids)
+    if not members:
+        return None
+    for member in members:
+        node = nodes.get(member)
+        if node is None or not isinstance(node.get("deps"), (list, tuple)):
+            return None
+        work = node.get("physical_work")
+        if not isinstance(work, Mapping):
+            return None
+        if not all(_finite_work(work, field) for field in SEMANTIC_WORK_FIELDS):
+            return None
+        if not isinstance(work.get("matrix_flops"), Mapping):
+            return None
+
+    algebraic_cube_flops = sum(
+        float(nodes[member]["physical_work"]["flops"]) for member in members)
+    by_dtype: dict[str, float] = defaultdict(float)
+    for member in members:
+        work = nodes[member]["physical_work"]
+        matrix_flops = work["matrix_flops"]
+        if matrix_flops:
+            for dtype, value in matrix_flops.items():
+                if value > 0:
+                    by_dtype[str(dtype)] += float(value)
+            continue
+        flops = float(work["flops"])
+        if flops > 0:
+            operator = nodes[member].get("operator")
+            dtype = (operator.get("dtype") if isinstance(operator, Mapping) else None)
+            by_dtype[str(dtype or "unknown")] += flops
+
+    member_set = set(members)
+    internal_consumers = {
+        member: [consumer for consumer in members
+                 if member in nodes[consumer]["deps"]]
+        for member in members
+    }
+    if external_outputs is not None:
+        ext_out = set(external_outputs)
+    else:
+        ext_out = {
+            member for member in members
+            if any(member in (node.get("deps") or ())
+                   for node_id, node in nodes.items() if node_id not in member_set)
+            or not internal_consumers[member]
+        }
+
+    unfused_hbm = sum(
+        float(nodes[member]["physical_work"]["hbm_bytes"]) for member in members)
+    eliminated_internal = 0.0
+    for member in members:
+        if member in ext_out or not internal_consumers[member]:
+            continue
+        work = nodes[member]["physical_work"]
+        write_bytes = float(work["mte3_bytes"])
+        consumer_cap = sum(
+            float(nodes[consumer]["physical_work"]["mte2_bytes"])
+            for consumer in internal_consumers[member])
+        read_bytes = min(len(internal_consumers[member]) * write_bytes, consumer_cap)
+        eliminated_internal += write_bytes + read_bytes
+
+    boundary_hbm = max(0.0, unfused_hbm - eliminated_internal)
+    if realized_hbm_bytes is not None:
+        boundary_hbm = min(boundary_hbm, float(realized_hbm_bytes))
+    return {
+        "algebraic_cube_flops": algebraic_cube_flops,
+        "algebraic_cube_flops_by_dtype": dict(sorted(by_dtype.items())),
+        "algebraic_vector_ops": sum(
+            float(nodes[member]["physical_work"]["vector_ops"]) for member in members),
+        "boundary_hbm": boundary_hbm,
+        "boundary_breakdown_bytes": {
+            "unfused_member_hbm_bytes": unfused_hbm,
+            "eliminated_internal_roundtrip_bytes": unfused_hbm - boundary_hbm,
+            "minimal_boundary_hbm_bytes": boundary_hbm,
+        },
+    }
+
+
 def _parameterization(report: Mapping[str, Any], group: Mapping[str, Any]) -> dict[str, Any]:
     """Declared parameterization provenance; unknown entries stay ``None``."""
     model = report.get("model") or {}
@@ -312,8 +419,25 @@ def _comm_by_domain(report: Mapping[str, Any], member_ids) -> dict[str, float] |
 
 def _summary(report: Mapping[str, Any], group: Mapping[str, Any]) -> SubgraphMathSummary:
     totals, reasons = effective_physical_work(report, group["node_ids"])
-    reasons = (*reasons, ALGEBRAIC_WORK_UNAVAILABLE, BOUNDARY_LEDGER_UNAVAILABLE)
     realized = None if totals is None else totals["hbm_bytes"]
+    ledger = semantic_subgraph_ledger(
+        report, group["node_ids"],
+        external_outputs=group.get("external_outputs"),
+        realized_hbm_bytes=realized,
+    )
+    if ledger is None:
+        reasons = (*reasons, ALGEBRAIC_WORK_UNAVAILABLE, BOUNDARY_LEDGER_UNAVAILABLE)
+        cube = by_dtype = vector = boundary = breakdown = None
+    else:
+        cube = ledger["algebraic_cube_flops"]
+        by_dtype = ledger["algebraic_cube_flops_by_dtype"]
+        vector = ledger["algebraic_vector_ops"]
+        boundary = ledger["boundary_hbm"]
+        breakdown = ledger["boundary_breakdown_bytes"]
+    overhead = efficiency = None
+    if realized is not None and boundary is not None:
+        overhead = max(0.0, realized - boundary)
+        efficiency = boundary / realized if realized > 0 else 1.0
     return SubgraphMathSummary(
         subgraph_id=str(group.get("subgraph_id")),
         subgraph_kind=str(group.get("role") or group.get("family") or "unknown"),
@@ -321,14 +445,17 @@ def _summary(report: Mapping[str, Any], group: Mapping[str, Any]) -> SubgraphMat
         phase=str(group.get("phase") or (report.get("execution") or {}).get("phase") or ""),
         layer_multiplicity=1,
         parameterization=_parameterization(report, group),
-        algebraic_cube_flops=None,
-        algebraic_cube_flops_by_dtype=None,
-        algebraic_vector_ops=None,
-        minimal_boundary_hbm_bytes=None,
+        algebraic_cube_flops=cube,
+        algebraic_cube_flops_by_dtype=by_dtype,
+        algebraic_vector_ops=vector,
+        minimal_boundary_hbm_bytes=boundary,
         realized_hbm_bytes=realized,
         unavailable_reasons=reasons,
         parallel_comm_bytes=None if totals is None else totals["link_bytes"],
         parallel_comm_by_domain=_comm_by_domain(report, group["node_ids"]),
+        boundary_breakdown_bytes=breakdown,
+        fusion_hbm_overhead_bytes=overhead,
+        fusion_byte_efficiency=efficiency,
     )
 
 
@@ -357,16 +484,28 @@ def build_subgraph_math_rollup(report: Mapping[str, Any]) -> dict[str, Any]:
     for family in sorted(families):
         realized = 0.0
         link = 0.0
+        cube = 0.0
+        vector = 0.0
+        boundary = 0.0
         complete = True
         reasons: list[str] = []
         for key, ids in sorted(scopes[family].items(), key=lambda item: str(item[0])):
-            totals, why = effective_physical_work(report, ids)
+            ordered_ids = tuple(sorted(ids))
+            totals, why = effective_physical_work(report, ordered_ids)
+            ledger = semantic_subgraph_ledger(report, ordered_ids)
             if totals is None:
                 complete = False
                 reasons.extend(why)
                 break
+            if ledger is None:
+                complete = False
+                reasons.extend((ALGEBRAIC_WORK_UNAVAILABLE, BOUNDARY_LEDGER_UNAVAILABLE))
+                break
             realized += totals["hbm_bytes"]
             link += totals["link_bytes"]
+            cube += ledger["algebraic_cube_flops"]
+            vector += ledger["algebraic_vector_ops"]
+            boundary += ledger["boundary_hbm"]
         occurrences = sum(1 for group in groups
                           if semantic_family_of_group(group) == family)
         rollup[family] = {
@@ -374,11 +513,10 @@ def build_subgraph_math_rollup(report: Mapping[str, Any]) -> dict[str, Any]:
             "member_node_count": len(families[family]),
             "realized_hbm_bytes": realized if complete else None,
             "parallel_comm_bytes": link if complete else None,
-            "algebraic_cube_flops": None,
-            "algebraic_vector_ops": None,
-            "minimal_boundary_hbm_bytes": None,
-            "unavailable_reasons": list(dict.fromkeys(
-                (*reasons, ALGEBRAIC_WORK_UNAVAILABLE, BOUNDARY_LEDGER_UNAVAILABLE))),
+            "algebraic_cube_flops": cube if complete else None,
+            "algebraic_vector_ops": vector if complete else None,
+            "minimal_boundary_hbm_bytes": boundary if complete else None,
+            "unavailable_reasons": list(dict.fromkeys(reasons)),
         }
     uncovered = sorted({
         node_id for group in groups if semantic_family_of_group(group) is None
@@ -406,6 +544,14 @@ def attach_subgraph_math(payload: dict[str, Any]) -> dict[str, Any]:
     return payload
 
 
+def _dtype_peak(peaks_by_dtype: Mapping[str, Any], dtype: str):
+    """Exact declared peak first, then the canonical dtype-family peak."""
+    peak = peaks_by_dtype.get(dtype)
+    if peak is not None:
+        return peak
+    return peaks_by_dtype.get(CANONICAL_DTYPE_FAMILIES.get(dtype, ""))
+
+
 def evaluate_subgraph_efficiency(
     summary, *, duration_s, hardware_peaks,
     observed_hbm_bytes=None, invocations=1,
@@ -429,14 +575,21 @@ def evaluate_subgraph_efficiency(
         return work / (duration_s * peak)
 
     cube = None
-    if summary.algebraic_cube_flops_by_dtype is not None:
+    by_dtype = summary.algebraic_cube_flops_by_dtype
+    if by_dtype is not None:
         peaks_by_dtype = hardware_peaks.get("compute_peaks") or {}
-        terms = [
-            ratio(total(work), peaks_by_dtype.get(dtype))
-            for dtype, work in summary.algebraic_cube_flops_by_dtype.items()
-        ]
-        if all(term is not None for term in terms):
-            cube = sum(terms)
+        cube_flops = summary.algebraic_cube_flops or 0.0
+        if not by_dtype and cube_flops == 0.0:
+            # A pure Vector subgraph issues no Cube work: its Cube MFU is a real
+            # observed zero, not an unavailable ledger.
+            cube = 0.0
+        else:
+            terms = [
+                ratio(total(work), _dtype_peak(peaks_by_dtype, str(dtype)))
+                for dtype, work in by_dtype.items()
+            ]
+            if all(term is not None for term in terms):
+                cube = sum(terms)
 
     boundary = total(summary.minimal_boundary_hbm_bytes)
     realized = (
@@ -472,5 +625,5 @@ __all__ = [
     "attach_subgraph_math", "boundary_bytes", "build_subgraph_math_rollup",
     "compute_subgraph_math_summaries", "effective_physical_work",
     "evaluate_subgraph_efficiency", "exclusive_family_members",
-    "semantic_family_of_group",
+    "semantic_family_of_group", "semantic_subgraph_ledger",
 ]
