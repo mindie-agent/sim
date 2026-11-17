@@ -368,3 +368,26 @@ def test_runtime_advisor_bounds_workers_and_reports_truthfully(monkeypatch):
     assert status["accel_backend"] == "python"
     assert status["native_steps"] == 0
     assert status["python_steps"] == 0
+
+
+def test_compare_skus_without_sla_publishes_efficiency_only():
+    result = compare_skus(DSV41_MODEL, ["a3", "a5"], tp=8, ep=8,
+                          num_devices=8, layers=SMALL_GRAPH_LAYERS,
+                          sla_ms=None, jobs=1, emit_advisory=False)
+    assert result["sla_ms"] is None
+    assert result["scenarios_evaluated"] == ["baseline"]
+    assert [row["sla_scenarios"] for row in result["skus"]] == [[], []]
+    assert len(result["comparisons"]) == 1
+    assert result["comparisons"][0]["step_speedup_x"] is not None
+
+
+def test_cli_compare_skus_no_sla_skips_the_sla_search():
+    from mindie_sim.__main__ import parser, run
+    args = parser().parse_args([
+        "compare-skus", "--model", DSV41_MODEL, "--skus", "a3", "a5",
+        "--layers", str(SMALL_GRAPH_LAYERS), "--no-sla", "--jobs", "1",
+        "--no-advisory",
+    ])
+    result = run(args)
+    assert result["sla_ms"] is None
+    assert [row["sla_scenarios"] for row in result["skus"]] == [[], []]

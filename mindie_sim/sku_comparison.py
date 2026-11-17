@@ -266,10 +266,14 @@ def compare_skus(
         if row.get("accel_status") is not None:
             target.setdefault("accel_statuses", []).append(row["accel_status"])
     for row in reports:
-        ordered = [row["sla_scenario"], *row.get("sla_scenarios", [])]
+        # ``sla_ms=None`` comparisons publish efficiency only: there is no
+        # baseline scenario to order or to express gains against.
+        if "sla_scenario" not in row:
+            row.setdefault("sla_scenarios", [])
+            continue
+        ordered = [row.pop("sla_scenario"), *row.get("sla_scenarios", [])]
         row["sla_scenarios"] = ordered
         apply_sla_baseline_gains(ordered, ordered[0])
-        row.pop("sla_scenario", None)
     reference = reports[0]
     comparisons = []
     for candidate in reports[1:]:

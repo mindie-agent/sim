@@ -33,6 +33,8 @@ def add_sku_commands(subparsers) -> None:
         compare.add_argument(flag, type=int, default=None)
     compare.add_argument("--sla-ms", type=float,
                          default=DEFAULT_COMPARE_SLA_MS)
+    compare.add_argument("--no-sla", dest="run_sla", action="store_false",
+                         help="skip the SLA search and compare efficiency only")
     compare.add_argument("--max-batch", type=int, default=None)
     compare.add_argument("--sensitivity", choices=("baseline", "full"),
                          default="baseline")
@@ -68,8 +70,9 @@ def run_sku_command(args):
                                 "layers")}
         max_batch = (DEFAULT_MAX_SEQUENCES if args.max_batch is None
                      else args.max_batch)
+        sla_ms = args.sla_ms if args.run_sla else None
         return compare_skus(
-            args.model, args.skus, sla_ms=args.sla_ms, max_batch=max_batch,
+            args.model, args.skus, sla_ms=sla_ms, max_batch=max_batch,
             sensitivity=args.sensitivity, scope=args.scope, phase=args.phase,
             context=args.context, query_tokens_per_sequence=args.query_tokens,
             quant=args.quant, jobs=args.jobs,
