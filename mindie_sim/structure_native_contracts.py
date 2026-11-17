@@ -22,6 +22,8 @@ FLOATING_CACHE_DTYPES = frozenset({"bf16", "fp16", "bfloat16", "float16"})
 MQSMLA_WINDOW_ROW_BYTES = 544
 MQSMLA_COMPRESSED_ROW_BYTES = 320
 MQSMLA_HEAD_WIDTH = 512
+MQSMLA_QUERY_RANK = 3
+MQSMLA_CACHE_DTYPE = "uint8"
 
 
 def shared_kv_native_name(view):
@@ -305,34 +307,35 @@ def gemma_norm_contract(op):
 
 def _mqsmla_attention_contract(op, view):
     """One packed-cache batch kernel per layer, not a captured binary ABI."""
+    if not isinstance(view, dict):
+        return None
     meta = op["metadata"]
     binding = meta.get("implementation_binding", {})
-    if (not view or view.get("kind") != "mixed_quant_shared_kv"
-            or meta.get("native_kind") != MQSMLA_NATIVE_KIND
+    if (meta.get("native_kind") != MQSMLA_NATIVE_KIND
             or binding.get("implementation") != MQSMLA_RECIPE
             or binding.get("capture_binary_identity") != "not_established"
-            or op.get("source_boundary") != "kernel"
-            or view.get("original_cache_row_bytes") != MQSMLA_WINDOW_ROW_BYTES
-            or view.get("compressed_cache_row_bytes") != MQSMLA_COMPRESSED_ROW_BYTES):
+            or op.get("source_boundary") != "kernel"):
         return None
     shape = tuple(view.get("query_shape", ()))
-    output = tuple(view.get("output_shape", ()))
-    if (len(shape) != 3 or output != shape or shape[0] < 1
-            or shape[2] != MQSMLA_HEAD_WIDTH
+    if (len(shape) != MQSMLA_QUERY_RANK
+            or any(type(dim) is not int or dim <= 0 for dim in shape)
+            or shape[-1] != MQSMLA_HEAD_WIDTH
+            or tuple(view.get("output_shape", ())) != shape
             or view.get("query_dtype") != "bf16"
-            or view.get("output_dtype") != "bf16"):
+            or view.get("output_dtype") != "bf16"
+            or view.get("original_cache_row_bytes") != MQSMLA_WINDOW_ROW_BYTES
+            or type(view.get("compressed_cache")) is not bool):
         return None
-    regions = dict(view.get("cache_representations") or {})
-    window = dict(regions.get("window") or {})
-    compressed = dict(regions.get("compressed_kv") or {})
-    if not window or not compressed:
-        return None
+    compressed = ((), None, None)
+    if view["compressed_cache"]:
+        if view.get("compressed_cache_row_bytes") != MQSMLA_COMPRESSED_ROW_BYTES:
+            return None
+        compressed = (((1, MQSMLA_COMPRESSED_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"))
     query = (shape, "bf16", "ND")
     return (
         "sparse_attention_active", MQSMLA_NATIVE_KIND, (query,),
-        (((1, MQSMLA_WINDOW_ROW_BYTES), str(window["dtype"]), "ND"),
-         ((1, MQSMLA_COMPRESSED_ROW_BYTES), str(compressed["dtype"]), "ND")),
-        (output, "bf16", "ND"),
+        (((1, MQSMLA_WINDOW_ROW_BYTES), MQSMLA_CACHE_DTYPE, "ND"), compressed),
+        query,
     )
 
 

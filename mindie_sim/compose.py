@@ -86,6 +86,18 @@ HARDWARE_ALIASES: dict[str, str] = {
     "a5-server-pr-pcie-16p": "Ascend950PR_9579",
 }
 
+# Raw Ascend runtime / plog chip tokens resolve to the same two A5 packages as
+# the documented product aliases. Adding a chip token here never adds a SKU.
+HARDWARE_ALIASES.update(dict.fromkeys(
+    ("950pr", "ascend950pr", "950pr_a5", "ascend950pr_a5"),
+    HARDWARE_ALIASES["a5-server-pr"],
+))
+HARDWARE_ALIASES.update(dict.fromkeys(
+    ("950dt", "950dt_a5", "ascend950dt_a5",
+     "910_9599", "ascend910_9599"),
+    HARDWARE_ALIASES["a5"],
+))
+
 HARDWARE_TOPOLOGY_ALIASES: dict[str, tuple[str, str]] = {
     "800i-a2": ("Ascend910B4", "a2_standard"),
     "800i-a3": ("Ascend910_9392", "a3_16p"),
@@ -440,12 +452,58 @@ def _resolve_max_position_embeddings(
 
 
 def _apply_structural_overrides(
-    model_spec: ModelSpec, *, layers: int | None, n_routed_experts: int | None, num_experts_per_tok: int | None,
+    model_spec: ModelSpec, *, layers: int | None, n_routed_experts: int | None,
+    num_experts_per_tok: int | None, promote_dense_to_moe: bool = False,
 ) -> ModelSpec:
-    if layers is None and n_routed_experts is None and num_experts_per_tok is None:
+    if (layers is None and n_routed_experts is None and num_experts_per_tok is None
+            and not promote_dense_to_moe):
         return model_spec
     return customize_model_spec(
-        model_spec, layers=layers, n_routed_experts=n_routed_experts, num_experts_per_tok=num_experts_per_tok,
+        model_spec, layers=layers, n_routed_experts=n_routed_experts,
+        num_experts_per_tok=num_experts_per_tok,
+        promote_dense_to_moe=promote_dense_to_moe,
+    )
+
+
+def prepare_speculation(model: ModelSpec, proposals: int, *,
+                        allow_synthetic_gqa: bool = False) -> ModelSpec:
+    """Declare a native draft only when the model already owns one.
+
+    A synthetic one-layer GQA MTP is available exclusively behind an explicit
+    ``allow_synthetic_gqa`` opt-in so a plain composition never fabricates an
+    auxiliary branch. Native MLA synthesis stays in ``compose_case`` where the
+    target geometry and context validation already live.
+    """
+    if proposals <= 0:
+        return model
+
+    aux = model.auxiliary
+    if aux is not None and aux.standalone_draft:
+        raise ModelingError("standalone_draft_requires_target_model")
+    if aux is not None and (aux.mtp is not None or aux.dspark is not None):
+        return model
+    if model.attention == "mla":
+        return model
+    if not allow_synthetic_gqa or model.attention != "gqa":
+        raise ModelingError("draft_structure_required_for_mtp_proposal_tokens")
+
+    from mindie_sim.catalog.draft import declare_native_auxiliary_plans
+
+    draft = DraftSpec(
+        kind="mtp", layers=1,
+        hidden_size=model.hidden_size,
+        intermediate_size=model.intermediate_size,
+        num_heads=model.num_heads,
+        num_kv_heads=model.num_kv_heads,
+        head_dim=model.head_dim,
+        q_width=model.num_heads * model.head_dim,
+        kv_width=2 * model.num_kv_heads * model.head_dim,
+        target_layer_ids=(model.layers - 1,),
+        activation_dtype=model.activation_dtype,
+        source=(("kind", "explicit_synthetic_gqa_mtp"),),
+    )
+    return declare_native_auxiliary_plans(
+        replace(model, auxiliary=replace(aux or AuxiliarySpec(), mtp=draft))
     )
 
 
@@ -465,6 +523,8 @@ def compose_case(
     layers: int | None = None,
     n_routed_experts: int | None = None,
     num_experts_per_tok: int | None = None,
+    promote_dense_to_moe: bool = False,
+    allow_synthetic_gqa_draft: bool = False,
     prompt_tokens: int = DEFAULT_PROMPT_TOKENS,
     output_tokens: int = DEFAULT_OUTPUT_TOKENS,
     concurrency: int = DEFAULT_CONCURRENCY,
@@ -675,6 +735,13 @@ def compose_case(
         layers=layers,
         n_routed_experts=n_routed_experts,
         num_experts_per_tok=num_experts_per_tok,
+        promote_dense_to_moe=promote_dense_to_moe,
+    )
+    # An explicit opt-in may declare one synthetic GQA draft; an undeclared
+    # auxiliary structure otherwise fails here instead of being fabricated.
+    model_spec = prepare_speculation(
+        model_spec, int(mtp_proposal_tokens),
+        allow_synthetic_gqa=allow_synthetic_gqa_draft,
     )
     # ``block_size=None`` resolves the documented page size and, for
     # ``paired_sfa`` caches, the recurrent-state minimum; an explicit caller
@@ -733,7 +800,9 @@ def compose_case(
                      "structural fusion defaults"),
     }
 
-    if int(mtp_proposal_tokens) > DEFAULT_ZERO and model_spec.auxiliary is None:
+    aux = model_spec.auxiliary
+    needs_draft = aux is None or (aux.mtp is None and aux.dspark is None)
+    if int(mtp_proposal_tokens) > DEFAULT_ZERO and needs_draft:
         from mindie_sim.catalog.draft import declare_native_auxiliary_plans
         facts = dict(model_spec.catalog_facts)
         nextn = int(facts.get("num_nextn_predict_layers", 0) or 0)
@@ -779,15 +848,17 @@ def compose_case(
             raise ModelingError("invalid_mtp_acceptance_length")
 
     required_len = int(prompt_tokens) + int(output_tokens) + max(0, int(mtp_proposal_tokens))
+    # The catalog context limit is checked before an explicit max_model_len, so
+    # supplying one cannot bypass the model's own maximum position embeddings.
+    if model_limit > 0 and required_len > model_limit:
+        raise ModelingError(
+            f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
+        )
     if max_model_len is not None:
         if int(max_model_len) < required_len:
             raise ModelingError(f"max_model_len_smaller_than_workload:{max_model_len}<{required_len}")
         resolved_max_model_len = int(max_model_len)
     else:
-        if model_limit > 0 and required_len > model_limit:
-            raise ModelingError(
-                f"workload_exceeds_model_max_position_embeddings:{required_len}>{model_limit}"
-            )
         resolved_max_model_len = max(32768, required_len)
 
     model_dict = _to_jsonable(model_spec)

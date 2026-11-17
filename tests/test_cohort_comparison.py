@@ -412,11 +412,14 @@ def test_equal_tensor_work_with_different_explicit_recipes_is_not_a_cohort(profi
     original = next(op for op in target_graphs(
         case, phase="decode", tokens=1, scope="body")[0] if op.family == "rmsnorm")
     operators = [
-        replace(original, op_id="norm_a", deps=(), layer=0, recipe="envelope_norm"),
+        replace(original, op_id="norm_a", deps=(), layer=0, recipe="row_tiled_norm"),
         replace(original, op_id="norm_b", deps=(), layer=1, recipe="tiled_norm"),
     ]
     kernels = {"recipes": {
-        "envelope_norm": {"kind": "envelope"},
+        "row_tiled_norm": {"kind": "tiled_pointwise", "input_bytes_per_element": 2,
+                           "outputs": [{"bytes_per_element": 2}],
+                           "parameter_bytes_per_col": 2, "tile_rows": 6144,
+                           "tile_cols": 1},
         "tiled_norm": {"kind": "tiled_pointwise", "input_bytes_per_element": 2,
                        "outputs": [{"bytes_per_element": 2}], "parameter_bytes_per_col": 2,
                        "tile_rows": 1, "tile_cols": 6144},
@@ -442,7 +445,10 @@ def test_same_recipe_name_with_different_binding_changes_identity_and_rejects_ol
     profiler_api,
 ):
     envelope = _norm_case()
-    envelope["runtime"]["kernels"] = {"recipes": {"rmsnorm": {"kind": "envelope"}}}
+    envelope["runtime"]["kernels"] = {"recipes": {"rmsnorm": {
+        "kind": "tiled_pointwise", "input_bytes_per_element": 2,
+        "outputs": [{"bytes_per_element": 2}], "parameter_bytes_per_col": 2,
+        "tile_rows": 6144, "tile_cols": 1}}}
     tiled = deepcopy(envelope)
     tiled["runtime"]["kernels"]["recipes"]["rmsnorm"] = {
         "kind": "tiled_pointwise", "input_bytes_per_element": 2,

@@ -1,0 +1,950 @@
+{
+ "schema": "mindie-observed-contract-fixtures/1",
+ "provenance": "Captured native tensor descriptors retained in mindie-profiler tests/fixtures; not synthesized from a declaration.",
+ "exact_matches": [
+  {
+   "kind": "FusedInferAttentionScore",
+   "input_shapes": [
+    [
+     8192,
+     4,
+     256
+    ],
+    [
+     8192,
+     1,
+     256
+    ],
+    [
+     8192,
+     1,
+     256
+    ],
+    [
+     2048,
+     2048
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ]
+   ],
+   "input_dtypes": [
+    "DT_BF16",
+    "DT_BF16",
+    "DT_BF16",
+    "INT8",
+    "INT64",
+    "INT64"
+   ],
+   "input_formats": [
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     8192,
+     4,
+     256
+    ],
+    []
+   ],
+   "output_dtypes": [
+    "DT_BF16",
+    "FLOAT"
+   ],
+   "output_formats": [
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "attention_active_qkv",
+    "FusedInferAttentionScore",
+    [
+     [
+      [
+       8192,
+       4,
+       256
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       8192,
+       1,
+       256
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       8192,
+       1,
+       256
+      ],
+      "bf16",
+      "ND"
+     ]
+    ],
+    [
+     [
+      [
+       8192,
+       4,
+       256
+      ],
+      "bf16",
+      "ND"
+     ]
+    ]
+   ],
+   "model": "qwen3.5-35b-a3b",
+   "hardware": "a3",
+   "tp": 4,
+   "phase": "prefill",
+   "tokens": 8192,
+   "context": 0,
+   "layers": 4,
+   "capture_name": "a3_qwen35"
+  },
+  {
+   "kind": "ScatterPaKvCache",
+   "input_shapes": [
+    [
+     2097152
+    ],
+    [
+     1748828160
+    ],
+    [
+     8192
+    ],
+    [
+     2097152
+    ],
+    [
+     1748795392
+    ],
+    [],
+    [],
+    []
+   ],
+   "input_dtypes": [
+    "DT_BF16",
+    "DT_BF16",
+    "INT32",
+    "DT_BF16",
+    "DT_BF16",
+    "INT64",
+    "INT64",
+    "INT64"
+   ],
+   "input_formats": [
+    "NCL",
+    "NCHW",
+    "ND",
+    "NCL",
+    "NCHW",
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     1748828160
+    ],
+    [
+     1748795392
+    ]
+   ],
+   "output_dtypes": [
+    "DT_BF16",
+    "DT_BF16"
+   ],
+   "output_formats": [
+    "NCHW",
+    "NCHW"
+   ],
+   "contract": [
+    "kv_cache_store_active_elements",
+    "ScatterPaKvCache",
+    [
+     [
+      2097152,
+      "bf16"
+     ],
+     [
+      2097152,
+      "bf16"
+     ]
+    ],
+    [
+     8192
+    ]
+   ],
+   "model": "qwen3.5-35b-a3b",
+   "hardware": "a3",
+   "tp": 4,
+   "phase": "prefill",
+   "tokens": 8192,
+   "context": 0,
+   "layers": 4,
+   "capture_name": "a3_qwen35"
+  },
+  {
+   "kind": "FusedInferAttentionScore",
+   "input_shapes": [
+    [
+     8192,
+     6,
+     256
+    ],
+    [
+     8192,
+     1,
+     256
+    ],
+    [
+     8192,
+     1,
+     256
+    ],
+    [
+     2048,
+     2048
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ]
+   ],
+   "input_dtypes": [
+    "DT_BF16",
+    "DT_BF16",
+    "DT_BF16",
+    "INT8",
+    "INT64",
+    "INT64"
+   ],
+   "input_formats": [
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     8192,
+     6,
+     256
+    ],
+    []
+   ],
+   "output_dtypes": [
+    "DT_BF16",
+    "FLOAT"
+   ],
+   "output_formats": [
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "attention_active_qkv",
+    "FusedInferAttentionScore",
+    [
+     [
+      [
+       8192,
+       6,
+       256
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       8192,
+       1,
+       256
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       8192,
+       1,
+       256
+      ],
+      "bf16",
+      "ND"
+     ]
+    ],
+    [
+     [
+      [
+       8192,
+       6,
+       256
+      ],
+      "bf16",
+      "ND"
+     ]
+    ]
+   ],
+   "model": "qwen3.6-27b",
+   "hardware": "a3",
+   "tp": 4,
+   "phase": "prefill",
+   "tokens": 8192,
+   "context": 0,
+   "layers": 4,
+   "capture_name": "a3_qwen36"
+  },
+  {
+   "kind": "SparseAttnSharedkv",
+   "input_shapes": [
+    [
+     4096,
+     8,
+     512
+    ],
+    [
+     4260,
+     128,
+     1,
+     512
+    ],
+    [],
+    [],
+    [],
+    [
+     1,
+     1024
+    ],
+    [],
+    [
+     2
+    ],
+    [
+     2
+    ],
+    [],
+    [],
+    [
+     1
+    ],
+    [
+     8
+    ],
+    [
+     1024
+    ]
+   ],
+   "input_dtypes": [
+    "DT_BF16",
+    "DT_BF16",
+    "DT_UNDEFINED",
+    "DT_UNDEFINED",
+    "DT_UNDEFINED",
+    "INT32",
+    "DT_UNDEFINED",
+    "INT32",
+    "INT32",
+    "DT_UNDEFINED",
+    "DT_UNDEFINED",
+    "INT32",
+    "FLOAT",
+    "INT32"
+   ],
+   "input_formats": [
+    "ND",
+    "ND",
+    "NULL",
+    "NULL",
+    "NULL",
+    "ND",
+    "NULL",
+    "ND",
+    "ND",
+    "NULL",
+    "NULL",
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     4096,
+     8,
+     512
+    ],
+    []
+   ],
+   "output_dtypes": [
+    "DT_BF16",
+    "FLOAT"
+   ],
+   "output_formats": [
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "sparse_attention_active",
+    "SparseAttnSharedkv",
+    [
+     [
+      [
+       4096,
+       8,
+       512
+      ],
+      "bf16",
+      "ND"
+     ]
+    ],
+    [
+     [
+      [
+       1,
+       512
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [],
+      null,
+      null
+     ]
+    ],
+    [
+     [
+      4096,
+      8,
+      512
+     ],
+     "bf16",
+     "ND"
+    ]
+   ],
+   "model": "deepseek-v4-flash",
+   "hardware": "a3",
+   "tp": 8,
+   "phase": "prefill",
+   "tokens": 4096,
+   "context": 0,
+   "layers": 1,
+   "capture_name": "a3_deepseek_v4f"
+  },
+  {
+   "kind": "SparseFlashAttention",
+   "input_shapes": [
+    [
+     4096,
+     8,
+     512
+    ],
+    [
+     703,
+     128,
+     1,
+     512
+    ],
+    [
+     703,
+     128,
+     1,
+     512
+    ],
+    [
+     4096,
+     1,
+     2048
+    ],
+    [
+     1,
+     576
+    ],
+    [
+     1
+    ],
+    [
+     1
+    ],
+    [
+     4096,
+     8,
+     64
+    ],
+    [
+     703,
+     128,
+     1,
+     64
+    ]
+   ],
+   "input_dtypes": [
+    "DT_BF16",
+    "DT_BF16",
+    "DT_BF16",
+    "INT32",
+    "INT32",
+    "INT32",
+    "INT32",
+    "DT_BF16",
+    "DT_BF16"
+   ],
+   "input_formats": [
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     4096,
+     8,
+     512
+    ],
+    [],
+    []
+   ],
+   "output_dtypes": [
+    "DT_BF16",
+    "FLOAT",
+    "FLOAT"
+   ],
+   "output_formats": [
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "sparse_attention_active",
+    "SparseFlashAttention",
+    [
+     [
+      [
+       4096,
+       8,
+       512
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       4096,
+       8,
+       64
+      ],
+      "bf16",
+      "ND"
+     ]
+    ],
+    [
+     [
+      [
+       1,
+       512
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       1,
+       512
+      ],
+      "bf16",
+      "ND"
+     ],
+     [
+      [
+       1,
+       64
+      ],
+      "bf16",
+      "ND"
+     ]
+    ],
+    [
+     [
+      4096,
+      8,
+      512
+     ],
+     "bf16",
+     "ND"
+    ]
+   ],
+   "model": "glm-5",
+   "hardware": "a3",
+   "tp": 8,
+   "phase": "prefill",
+   "tokens": 4096,
+   "context": 0,
+   "layers": 1,
+   "capture_name": "a3_glm53"
+  },
+  {
+   "kind": "DynamicMxQuant",
+   "input_shapes": [
+    [
+     1,
+     5120
+    ]
+   ],
+   "input_dtypes": [
+    "DT_BF16"
+   ],
+   "input_formats": [
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     1,
+     5120
+    ],
+    [
+     1,
+     80,
+     2
+    ]
+   ],
+   "output_dtypes": [
+    "DT_FLOAT8_E4M3FN",
+    "DT_FLOAT8_E8M0"
+   ],
+   "output_formats": [
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "DynamicMxQuant",
+    [
+     1,
+     5120
+    ],
+    "bf16",
+    "fp8_e4m3",
+    [
+     1,
+     80,
+     2
+    ],
+    "fp8_e8m0"
+   ],
+   "model": "deepseek-v4.1",
+   "hardware": "a5",
+   "tp": 8,
+   "phase": "decode",
+   "tokens": 1,
+   "context": 4096,
+   "layers": 1,
+   "capture_name": "decode_forward/v41_dp8_first_body.csv"
+  },
+  {
+   "kind": "LayerNormV3",
+   "input_shapes": [
+    [
+     4096,
+     128
+    ],
+    [
+     128
+    ],
+    [
+     128
+    ]
+   ],
+   "input_dtypes": [
+    "FLOAT",
+    "FLOAT",
+    "FLOAT"
+   ],
+   "input_formats": [
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "output_shapes": [
+    [
+     4096,
+     128
+    ],
+    [
+     4096,
+     1
+    ],
+    [
+     4096,
+     1
+    ]
+   ],
+   "output_dtypes": [
+    "FLOAT",
+    "FLOAT",
+    "FLOAT"
+   ],
+   "output_formats": [
+    "ND",
+    "ND",
+    "ND"
+   ],
+   "contract": [
+    "layernorm_active",
+    "LayerNormV3",
+    [
+     [
+      4096,
+      128
+     ],
+     "fp32",
+     "ND"
+    ],
+    [
+     [
+      128
+     ],
+     "fp32",
+     "ND"
+    ],
+    [
+     [
+      128
+     ],
+     "fp32",
+     "ND"
+    ],
+    [
+     [
+      4096,
+      128
+     ],
+     "fp32",
+     "ND"
+    ]
+   ],
+   "model": "deepseek-v3.2",
+   "hardware": "a3",
+   "tp": 8,
+   "phase": "prefill",
+   "tokens": 4096,
+   "context": 0,
+   "layers": 1,
+   "capture_name": "fusion_contracts/a3_glm53_prefill.csv"
+  }
+ ],
+ "captured_inventory": [
+  {
+   "family": "kv_cache_store_active",
+   "kind": "ReshapeAndCacheNdKernel",
+   "capture": "attention_cache_contracts/qwen3_8b_s1.csv"
+  },
+  {
+   "family": "attention_active_qkv",
+   "kind": "FusedInferAttentionScore",
+   "capture": "attention_cache_contracts/qwen3_8b_s1.csv"
+  },
+  {
+   "family": "attention_paged_mla_qk_rope",
+   "kind": "FusedInferAttentionScore",
+   "capture": "attention_cache_contracts/a5_kimi_mla31.csv"
+  },
+  {
+   "family": "mla_prolog_active",
+   "kind": "MlaPrologV3",
+   "capture": "attention_cache_contracts/a3_glm53_decode.csv"
+  },
+  {
+   "family": "lightning_indexer_active",
+   "kind": "LightningIndexer",
+   "capture": "attention_cache_contracts/a3_glm53_decode.csv"
+  },
+  {
+   "family": "native_tensor_abi",
+   "kind": "KvRmsNormRopeCache",
+   "capture": "attention_cache_contracts/dsv2lite_s1.csv"
+  },
+  {
+   "family": "sparse_attention_active",
+   "kind": "SparseAttnSharedkv",
+   "capture": "attention_cache_contracts/a3_deepseek_v4f.csv"
+  },
+  {
+   "family": "kv_cache_store_active_elements",
+   "kind": "ScatterPaKvCache",
+   "capture": "attention_cache_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "attention_paged_active_qkv",
+   "kind": "FusedInferAttentionScore",
+   "capture": "attention_cache_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "slice_copy",
+   "kind": "Slice",
+   "capture": "structure_contracts/a5_tensor_contracts.csv"
+  },
+  {
+   "family": "swiglu",
+   "kind": "SwiGlu",
+   "capture": "structure_contracts/a5_tensor_contracts.csv"
+  },
+  {
+   "family": "matrix",
+   "kind": "MatMulV3",
+   "capture": "scoped_structure/a5_qwen30b_e16k4_prefill_64k.csv"
+  },
+  {
+   "family": "grouped_matrix",
+   "kind": "GroupedMatmul",
+   "capture": "scoped_structure/a5_qwen30b_e16k4_prefill_64k.csv"
+  },
+  {
+   "family": "router_selection_active",
+   "kind": "MoeGatingTopK",
+   "capture": "scoped_structure/a3_qwen35_tp8_prefill_full_tail_decode_mixed.csv"
+  },
+  {
+   "family": "dynamic_quant_active",
+   "kind": "DynamicQuant",
+   "capture": "scoped_structure/a3_qwen35_tp8_prefill_full_tail_decode_mixed.csv"
+  },
+  {
+   "family": "grouped_mlp_parameters_active",
+   "kind": "GroupedMatmulSwigluQuant",
+   "capture": "scoped_structure/a3_qwen35_tp8_prefill_full_tail_decode_mixed.csv"
+  },
+  {
+   "family": "dequant_swiglu_quant_active",
+   "kind": "DequantSwigluQuant",
+   "capture": "mixed_step_body/a3_glm53_decode.csv"
+  },
+  {
+   "family": "recurrent_vector",
+   "kind": "RecurrentGatedDeltaRule",
+   "capture": "mixed_step_body/a5_qwen38.csv"
+  },
+  {
+   "family": "rmsnorm",
+   "kind": "RmsNorm",
+   "capture": "graph_execution/op_summary.csv"
+  },
+  {
+   "family": "dynamic_quant_v2_active",
+   "kind": "DynamicQuantV2",
+   "capture": "graph_execution/op_summary.csv"
+  },
+  {
+   "family": "transpose_batchmatmul_active",
+   "kind": "TransposeBatchMatMul",
+   "capture": "native_observations/a3_sharedkv_mla_abi.csv"
+  },
+  {
+   "family": "quant_lightning_indexer_active",
+   "kind": "VllmAscendQuantLightningIndexerV2",
+   "capture": "native_observations/a3_sharedkv_mla_abi.csv"
+  },
+  {
+   "family": "CausalConv1d",
+   "kind": "CausalConv1d",
+   "capture": "decode_forward/a3_kimi4_c32_first_full_body.csv"
+  },
+  {
+   "family": "recurrent_kda_parameters_active",
+   "kind": "RecurrentKda",
+   "capture": "decode_forward/a3_kimi4_c32_first_full_body.csv"
+  },
+  {
+   "family": "add_rmsnorm_dynamic_quant_active",
+   "kind": "AddRmsNormDynamicQuant",
+   "capture": "decode_forward/qwen36_a5_hcom_layer.csv"
+  },
+  {
+   "family": "add_rmsnorm",
+   "kind": "AddRmsNorm",
+   "capture": "decode_forward/qwen36_a5_hcom_layer.csv"
+  },
+  {
+   "family": "DynamicMxQuant",
+   "kind": "DynamicMxQuant",
+   "capture": "decode_forward/v41_dp8_first_body.csv"
+  },
+  {
+   "family": "hyper_connection_active",
+   "kind": "HcPost",
+   "capture": "decode_forward/v41_dp8_first_body.csv"
+  },
+  {
+   "family": "AddRmsNormDynamicMxQuant",
+   "kind": "AddRmsNormDynamicMxQuant",
+   "capture": "decode_forward/qwen38_a5_hccl_launch_layer.csv"
+  },
+  {
+   "family": "compressor_active",
+   "kind": "Compressor",
+   "capture": "decode_forward/v4f_a3_mhc_verify.csv"
+  },
+  {
+   "family": "gated_norm_active_rows",
+   "kind": "layer_norm_gated_fwd_kernel",
+   "capture": "body_fused/kimi_a5_norm_gate.csv"
+  },
+  {
+   "family": "layernorm_active",
+   "kind": "LayerNormV3",
+   "capture": "fusion_contracts/a3_glm53_prefill.csv"
+  },
+  {
+   "family": "situ_mxquant_active",
+   "kind": "SituMxQuant",
+   "capture": "fusion_contracts/kimi_matrix_branches.csv"
+  },
+  {
+   "family": "gdn_gating",
+   "kind": "fused_gdn_gating_kernel",
+   "capture": "fusion_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "ChunkGatedDeltaRuleFwdPrepare",
+   "kind": "ChunkGatedDeltaRuleFwdPrepare",
+   "capture": "fusion_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "ChunkFwdH",
+   "kind": "ChunkFwdH",
+   "capture": "fusion_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "ChunkFwdO",
+   "kind": "ChunkFwdO",
+   "capture": "fusion_contracts/a5_qwen38.csv"
+  },
+  {
+   "family": "rmsnorm_mxquant_active",
+   "kind": "RmsNormDynamicMxQuant",
+   "capture": "fusion_contracts/a5_kimi_k3.csv"
+  }
+ ]
+}

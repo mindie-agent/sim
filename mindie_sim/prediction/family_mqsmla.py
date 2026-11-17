@@ -46,10 +46,11 @@ def recipes():
 
 def query_shape(views, plan, *, topk_present=False):
     """The exact per-row geometry the builder will consume."""
+    effective_ratio = plan.compress_ratio if topk_present else 0
     return {
         "sequences": tuple((int(v.q_len), int(v.context)) for v in views),
         "window": plan.window,
-        "ratio": plan.compress_ratio,
+        "ratio": effective_ratio,
         "topk": plan.index_topk if topk_present else 0,
     }
 
@@ -120,7 +121,8 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
     heads = plan.num_heads // tp_degree
     rows = tuple((v.q_len, v.context) for v in views)
     active_q = sum(q for q, _ in rows)
-    shape = {"sequences": rows, "window": plan.window, "ratio": plan.compress_ratio,
+    effective_ratio = plan.compress_ratio if topk_present else 0
+    shape = {"sequences": rows, "window": plan.window, "ratio": effective_ratio,
              "topk": plan.index_topk if topk_present else 0, "heads": heads,
              "width": MQSMLA_HEAD_WIDTH, "metadata_support_fd": False,
              "addressing": str(dict(getattr(selection, "options", {}) or {}).get(
@@ -140,7 +142,8 @@ def lower_attention(ops, outputs, *, selection, views, plan, topk_present, prefi
                 "output_shape": query,
                 "query_dtype": "bf16", "output_dtype": "bf16",
                 "original_cache_row_bytes": ORIGINAL_CACHE_ROW_BYTES,
-                "compressed_cache_row_bytes": COMPRESSED_CACHE_ROW_BYTES},
+                "compressed_cache_row_bytes": COMPRESSED_CACHE_ROW_BYTES,
+                "compressed_cache": effective_ratio > 0},
             "native_kind": "MqsmlaKernel___call__"}
     result = replace(members[0], op_id=prefix + ".mqsmla", recipe=RECIPE,
                      deps=tuple(dict.fromkeys(dep for op in members for dep in op.deps)),

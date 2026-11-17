@@ -55,8 +55,10 @@ def test_resolve_hardware_sku_aliases_and_errors() -> None:
     assert resolve_hardware_sku("a5-pod-pr") == "Ascend950PR_9579"
     assert resolve_hardware_sku("Ascend950DT_9582") == "Ascend950DT_9582"
     assert set(HARDWARE_ALIASES).issuperset({"a2", "a3", "a5", "910b4", "910_9392"})
-    with pytest.raises(ModelingError, match="unknown_hardware_sku"):
-        resolve_hardware_sku("910_9599")
+    # Raw runtime/plog chip tokens resolve to the same A5 package (P1-03).
+    assert resolve_hardware_sku("910_9599") == "Ascend950DT_9582"
+    assert resolve_hardware_sku("950pr_a5") == "Ascend950PR_9579"
+    assert resolve_hardware_sku("910_9599") in {"Ascend950DT_9582"}
 
     with pytest.raises(ModelingError, match="unknown_hardware_sku"):
         resolve_hardware_sku("unknown_gpu_999")

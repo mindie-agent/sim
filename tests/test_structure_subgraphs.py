@@ -260,7 +260,8 @@ def test_group_expands_real_source_call_members_without_duplicating_work_or_drop
     changed = export_op_structure(changed_work, **declaration)["subgraphs"]
     without_work = lambda groups: [
         {key: value for key, value in group.items()
-         if key not in {"physical_signature", "physical_work"}} for group in groups]
+         if key not in {"physical_signature", "physical_work", "math_summary"}}
+        for group in groups]
     assert without_work(changed) == without_work(report["subgraphs"])
     assert changed[0]["physical_signature"] != group["physical_signature"]
     assert changed[0]["physical_work"]["flops"] > group["physical_work"]["flops"]

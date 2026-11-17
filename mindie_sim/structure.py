@@ -34,6 +34,7 @@ from .structure_implementations import (
     native_implementation, operator_structure, region_structure,
 )
 from .structure_physical import node_physical, subgraph_physical
+from .subgraph_math import attach_subgraph_math
 from .structure_subgraphs import (
     export_subgraphs, layer_structure, metadata, subgraph_comparison_scope,
 )
@@ -462,6 +463,10 @@ def export_op_structure(ops, *, model, execution, kernels=None, source=None,
         "resource_operators": resource_operators,
         "external_inputs": sorted(external),
     }
+    # Structural math belongs to the structural record: attach it before the
+    # digest so a verifier re-hashes exactly these fields. It reuses this graph;
+    # no causal Engine and no second export runs here.
+    attach_subgraph_math(payload)
     encoded_payload = json.dumps(
         payload, sort_keys=True, separators=(",", ":"), allow_nan=False
     ).encode("utf-8")

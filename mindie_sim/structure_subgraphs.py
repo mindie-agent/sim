@@ -13,7 +13,8 @@ from .structure_matrix_contracts import mxfp4_reference_coverage
 from .structure_native_contracts import grouped_situ_contract
 
 # Qwen low-rank hyper-connection kernels own their declared tensor boundary.
-LOW_RANK_HC_NATIVE_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
+QWEN4_HC_KINDS = frozenset({"Qwen4ExpGatedResidualMix", "Qwen4ExpHcCombine"})
+LOW_RANK_HC_NATIVE_KINDS = QWEN4_HC_KINDS
 
 
 def metadata(op):
@@ -44,6 +45,10 @@ def layer_structure(model, layer):
 
 
 def subgraph_contract(declaration):
+    # The Qwen4 low-rank HC boundary has no verified active ABI projection yet;
+    # its native correspondence is retained without a fabricated tensor view.
+    if (declaration.get("implementation") or {}).get("native_kind") in QWEN4_HC_KINDS:
+        return None
     if declaration.get("coverage", {}).get("kind") == "multi_launch_stage_unknown":
         return None
     view, role = declaration["tensor_view"], declaration["role"]

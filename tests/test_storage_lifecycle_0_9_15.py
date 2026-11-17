@@ -563,7 +563,9 @@ def test_temp_cleanup_retains_a_path_until_removal_succeeds(monkeypatch):
 def test_round6_fallback_keeps_a_fake_host_sentinel(monkeypatch):
     """The F10 fallback test must never delete a real host reproducer root."""
     pytest.importorskip("mindie_profiler")
-    import test_nr_s6_round6_closure as round6
+    # The round-6 closure probe is an optional external test module; skip when
+    # a standalone checkout does not carry it.
+    round6 = pytest.importorskip("test_nr_s6_round6_closure")
 
     fake_default = round6._fake_mprof_root()
     sentinel = fake_default / "host-sentinel.txt"
